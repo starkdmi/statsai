@@ -1,0 +1,42 @@
+[workspace]
+members = [
+  "crates/ai-stats-core",
+  "crates/ai-stats-adapters",
+  "crates/ai-stats-store",
+  "crates/ai-stats-sync",
+  "crates/ai-stats-daemon",
+  "crates/ai-stats-sdk",
+  "crates/ai-stats-cli",
+  "crates/ai-stats-pricing",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/starkdmi/ai-stats"
+authors = ["Dmitry Starkov"]
+description = "Local-first AI usage statistics CLI/SDK/daemon"
+keywords = ["ai", "cli", "usage", "statistics", "llm", "tokens", "coding"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+schemars = { version = "0.8", features = ["chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "1"
+tiny_http = "0.12"
+walkdir = "2"
+notify = "7"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

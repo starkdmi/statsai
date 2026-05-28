@@ -1,0 +1,18 @@
+[package]
+name = "ai-stats-sync"
+description = "Sync sink traits and local sinks for ai-stats."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ai-stats-core = { path = "../ai-stats-core" }
+anyhow.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tiny_http.workspace = true

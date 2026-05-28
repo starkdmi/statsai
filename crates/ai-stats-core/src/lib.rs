@@ -1,0 +1,1315 @@
+//! Core schemas and ID helpers for `ai-stats`.
+
+use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+
+pub const USAGE_EVENT_SCHEMA_VERSION: &str = "usage_event.v1";
+pub const USAGE_SUMMARY_SCHEMA_VERSION: &str = "usage_summary.v1";
+pub const REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION: &str = "reported_usage_summary_input.v1";
+pub const SOURCE_LOCATION_SCHEMA_VERSION: &str = "source_location.v1";
+pub const PROVIDER_ACCOUNT_SCHEMA_VERSION: &str = "provider_account.v1";
+pub const SUBSCRIPTION_SCHEMA_VERSION: &str = "subscription.v1";
+pub const DAILY_ROLLUP_SCHEMA_VERSION: &str = "daily_rollup.v1";
+pub const SYNC_BATCH_SCHEMA_VERSION: &str = "sync_batch.v1";
+pub const SYNC_ACK_SCHEMA_VERSION: &str = "sync_ack.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct SourceId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct ProviderAccountId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct SubscriptionId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct EventId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct SummaryId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    LocalAdapter,
+    LocalSummary,
+    LocalApi,
+    ProviderApi,
+    CliProbe,
+    SdkInstrumented,
+    ExternalReport,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LocationOrigin {
+    Default,
+    Configured,
+    Env,
+    Discovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentitySource {
+    ProviderAuth,
+    ProviderApi,
+    CliProbe,
+    SourceConfig,
+    UserConfigured,
+    ManualHint,
+    LocalAuth,
+    CookieOauth,
+    Unresolved,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingPeriod {
+    Monthly,
+    Annual,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionStatus {
+    Active,
+    Paused,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyMode {
+    MetadataOnly,
+    TitlesLabels,
+    EnrichedSummaries,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SourceLocation {
+    pub schema_version: String,
+    pub source_id: SourceId,
+    pub provider: String,
+    pub source_kind: SourceKind,
+    pub location_origin: LocationOrigin,
+    pub adapter_id: Option<String>,
+    pub adapter_version: Option<String>,
+    pub path_hash: Option<String>,
+    pub path_label: Option<String>,
+    pub account_hint: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderAccount {
+    pub schema_version: String,
+    pub provider_account_id: ProviderAccountId,
+    pub provider: String,
+    pub identity_source: IdentitySource,
+    pub provider_user_id_hash: Option<String>,
+    pub email_hash: Option<String>,
+    pub org_id_hash: Option<String>,
+    pub account_label: Option<String>,
+    pub plan_name: Option<String>,
+    pub confidence: Confidence,
+    pub source_ids: Vec<SourceId>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Subscription {
+    pub schema_version: String,
+    pub subscription_id: SubscriptionId,
+    pub provider: String,
+    pub provider_account_id: Option<ProviderAccountId>,
+    pub source_ids: Vec<SourceId>,
+    pub plan_name: String,
+    pub price: f64,
+    pub currency: String,
+    pub billing_period: BillingPeriod,
+    pub paid_at: Option<DateTime<Utc>>,
+    pub renewal_day: Option<u8>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub status: SubscriptionStatus,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EventSource {
+    pub adapter_id: String,
+    pub adapter_version: String,
+    pub source_kind: SourceKind,
+    pub location_origin: Option<LocationOrigin>,
+    pub source_type: String,
+    pub source_path_hash: Option<String>,
+    pub source_record_id: Option<String>,
+    pub parse_confidence: Confidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub local_session_id_hash: Option<String>,
+    pub title: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub duration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ModelInfo {
+    pub name: Option<String>,
+    pub normalized_name: Option<String>,
+    pub provider_model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct UsageCounts {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub requests: Option<u64>,
+    pub local_prompt_eval_tokens: Option<u64>,
+    pub local_eval_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RuntimeInfo {
+    pub runtime_name: Option<String>,
+    pub host_id: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub prompt_eval_duration_ms: Option<u64>,
+    pub eval_duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CostInfo {
+    pub currency: String,
+    pub estimated_api_equivalent_usd: Option<f64>,
+    pub provider_reported_usd: Option<f64>,
+    pub pricing_source: Option<String>,
+    pub pricing_version: Option<String>,
+    pub confidence: Confidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ParseEvidence {
+    pub event_key_version: String,
+    pub source_file_path_hash: Option<String>,
+    pub source_line_number: Option<u64>,
+    pub source_record_id: Option<String>,
+    pub model_inferred: bool,
+    pub timestamp_inferred: bool,
+    pub account_identity_source: IdentitySource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectInfo {
+    pub project_id: String,
+    pub project_label: Option<String>,
+    pub repo_remote_hash: Option<String>,
+    pub repo_label: Option<String>,
+    pub branch_hash: Option<String>,
+    pub branch_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitInfo {
+    pub nearby_commit_hashes: Vec<String>,
+    pub nearby_commit_messages: Vec<String>,
+    pub correlation_confidence: Option<Confidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PrivacyInfo {
+    pub mode: PrivacyMode,
+    pub contains_prompt_text: bool,
+    pub contains_response_text: bool,
+    pub contains_file_paths: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UsageEvent {
+    pub schema_version: String,
+    pub event_id: EventId,
+    pub device_id: String,
+    pub provider: String,
+    pub source_id: SourceId,
+    pub provider_account_id: Option<ProviderAccountId>,
+    pub subscription_id: Option<SubscriptionId>,
+    pub source: EventSource,
+    pub session: SessionInfo,
+    pub model: Option<ModelInfo>,
+    pub usage: UsageCounts,
+    pub runtime: Option<RuntimeInfo>,
+    pub cost: CostInfo,
+    pub parse_evidence: Option<ParseEvidence>,
+    pub project: Option<ProjectInfo>,
+    pub git: Option<GitInfo>,
+    pub privacy: PrivacyInfo,
+    pub created_at: DateTime<Utc>,
+    pub imported_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SummaryMetadata {
+    pub summary_format: String,
+    pub summary_version: Option<String>,
+    pub total_sessions: Option<u64>,
+    pub total_messages: Option<u64>,
+    pub last_computed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UsageSummary {
+    pub schema_version: String,
+    pub summary_id: SummaryId,
+    pub device_id: String,
+    pub provider: String,
+    pub source_id: SourceId,
+    pub provider_account_id: Option<ProviderAccountId>,
+    pub source: EventSource,
+    pub model: Option<ModelInfo>,
+    pub usage: UsageCounts,
+    pub cost: CostInfo,
+    pub parse_evidence: Option<ParseEvidence>,
+    pub privacy: PrivacyInfo,
+    pub period_start: Option<DateTime<Utc>>,
+    pub period_end: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+    pub metadata: SummaryMetadata,
+    pub imported_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncBatch {
+    pub schema_version: String,
+    pub batch_id: String,
+    pub device_id: String,
+    pub sources: Vec<SourceLocation>,
+    pub accounts: Vec<ProviderAccount>,
+    pub subscriptions: Vec<Subscription>,
+    pub events: Vec<UsageEvent>,
+    pub summaries: Vec<UsageSummary>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncEntityCounts {
+    pub sources: u64,
+    pub accounts: u64,
+    pub subscriptions: u64,
+    pub events: u64,
+    pub summaries: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncRejectedRecord {
+    pub kind: String,
+    pub id: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncAck {
+    pub schema_version: String,
+    pub batch_id: String,
+    pub accepted: SyncEntityCounts,
+    pub duplicates: SyncEntityCounts,
+    pub rejected: Vec<SyncRejectedRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DailyRollup {
+    pub schema_version: String,
+    pub date: String,
+    pub device_id: String,
+    pub total_input_tokens: u64,
+    pub total_cache_creation_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub total_events: u64,
+    pub total_sessions: u64,
+    pub estimated_cost_usd: Option<f64>,
+    pub by_provider: Option<String>,
+    pub by_account: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SourceLocation {
+    #[must_use]
+    pub fn local_adapter(
+        provider: impl Into<String>,
+        adapter_id: impl Into<String>,
+        adapter_version: impl Into<String>,
+        path: &Path,
+        location_origin: LocationOrigin,
+        account_hint: Option<String>,
+    ) -> Self {
+        let provider = provider.into();
+        let adapter_id = adapter_id.into();
+        let adapter_version = adapter_version.into();
+        let path_hash = path_hash(path);
+        let now = Utc::now();
+        let source_id = source_id(&provider, SourceKind::LocalAdapter, &path_hash);
+
+        Self {
+            schema_version: SOURCE_LOCATION_SCHEMA_VERSION.to_string(),
+            source_id,
+            provider,
+            source_kind: SourceKind::LocalAdapter,
+            location_origin,
+            adapter_id: Some(adapter_id),
+            adapter_version: Some(adapter_version),
+            path_hash: Some(path_hash),
+            path_label: Some(canonical_display(path)),
+            account_hint,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[must_use]
+    pub fn external_report(
+        provider: impl Into<String>,
+        adapter_id: impl Into<String>,
+        adapter_version: impl Into<String>,
+        path: &Path,
+        account_hint: Option<String>,
+    ) -> Self {
+        let provider = provider.into();
+        let adapter_id = adapter_id.into();
+        let adapter_version = adapter_version.into();
+        let path_hash = path_hash(path);
+        let now = Utc::now();
+        let source_id = source_id(&provider, SourceKind::ExternalReport, &path_hash);
+
+        Self {
+            schema_version: SOURCE_LOCATION_SCHEMA_VERSION.to_string(),
+            source_id,
+            provider,
+            source_kind: SourceKind::ExternalReport,
+            location_origin: LocationOrigin::Configured,
+            adapter_id: Some(adapter_id),
+            adapter_version: Some(adapter_version),
+            path_hash: Some(path_hash),
+            path_label: Some(canonical_display(path)),
+            account_hint,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[must_use]
+    pub fn reported_usage(
+        provider: impl Into<String>,
+        source_kind: SourceKind,
+        adapter_id: impl Into<String>,
+        adapter_version: impl Into<String>,
+        evidence_key: impl AsRef<str>,
+        path_label: Option<String>,
+        account_hint: Option<String>,
+    ) -> Self {
+        let provider = provider.into();
+        let adapter_id = adapter_id.into();
+        let adapter_version = adapter_version.into();
+        let path_hash = hash_text(evidence_key.as_ref());
+        let now = Utc::now();
+        let source_id = source_id(&provider, source_kind.clone(), &path_hash);
+
+        Self {
+            schema_version: SOURCE_LOCATION_SCHEMA_VERSION.to_string(),
+            source_id,
+            provider,
+            source_kind,
+            location_origin: LocationOrigin::Configured,
+            adapter_id: Some(adapter_id),
+            adapter_version: Some(adapter_version),
+            path_hash: Some(path_hash),
+            path_label,
+            account_hint,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+impl UsageCounts {
+    #[must_use]
+    pub fn computed_total(&self) -> u64 {
+        self.total_tokens.unwrap_or_else(|| {
+            self.input_tokens
+                .unwrap_or(0)
+                .saturating_add(self.output_tokens.unwrap_or(0))
+                .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+                .saturating_add(self.cache_read_tokens.unwrap_or(0))
+                .saturating_add(self.reasoning_tokens.unwrap_or(0))
+                .saturating_add(self.local_prompt_eval_tokens.unwrap_or(0))
+                .saturating_add(self.local_eval_tokens.unwrap_or(0))
+        })
+    }
+}
+
+#[must_use]
+pub fn hash_text(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    hex::encode(digest)
+}
+
+#[must_use]
+pub fn path_hash(path: &Path) -> String {
+    let canonical = canonical_display(path);
+    hash_text(&canonical)
+}
+
+#[must_use]
+pub fn source_id(provider: &str, source_kind: SourceKind, stable_key: &str) -> SourceId {
+    SourceId(format!(
+        "src_{}",
+        &hash_text(&format!("{provider}:{source_kind:?}:{stable_key}"))[..24]
+    ))
+}
+
+#[must_use]
+pub fn provider_account_id(provider: &str, stable_key: &str) -> ProviderAccountId {
+    ProviderAccountId(format!(
+        "acct_{}",
+        &hash_text(&format!("{provider}:{stable_key}"))[..24]
+    ))
+}
+
+#[must_use]
+pub fn subscription_id(
+    provider: &str,
+    account: Option<&ProviderAccountId>,
+    plan: &str,
+) -> SubscriptionId {
+    let account_key = account.map(|id| id.0.as_str()).unwrap_or("unlinked");
+    SubscriptionId(format!(
+        "sub_{}",
+        &hash_text(&format!("{provider}:{account_key}:{plan}"))[..24]
+    ))
+}
+
+#[must_use]
+pub fn event_id(
+    provider: &str,
+    source_id: &SourceId,
+    source_record_id: &str,
+    session_hash: Option<&str>,
+    timestamp: DateTime<Utc>,
+) -> EventId {
+    EventId(format!(
+        "evt_{}",
+        &hash_text(&format!(
+            "{provider}:{}:{source_record_id}:{}:{}",
+            source_id.0,
+            session_hash.unwrap_or(""),
+            timestamp.to_rfc3339()
+        ))[..32]
+    ))
+}
+
+#[must_use]
+pub fn semantic_event_id(provider: &str, source_id: &SourceId, semantic_key: &str) -> EventId {
+    EventId(format!(
+        "evt_{}",
+        &hash_text(&format!("{provider}:{}:{semantic_key}", source_id.0))[..32]
+    ))
+}
+
+#[must_use]
+pub fn summary_id(provider: &str, source_id: &SourceId, semantic_key: &str) -> SummaryId {
+    SummaryId(format!(
+        "sum_{}",
+        &hash_text(&format!("{provider}:{}:{semantic_key}", source_id.0))[..32]
+    ))
+}
+
+#[must_use]
+pub fn semantic_event_fingerprint(input: &SemanticFingerprintInput<'_>) -> String {
+    hash_text(&format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        input.provider,
+        input.source_id.0,
+        input.started_at.to_rfc3339(),
+        input.session_hash.unwrap_or(""),
+        input.model_name.unwrap_or("unknown"),
+        input.input_tokens.unwrap_or(0),
+        input.cache_read_tokens.unwrap_or(0),
+        input.cache_creation_tokens.unwrap_or(0),
+        input.output_tokens.unwrap_or(0),
+        input.reasoning_tokens.unwrap_or(0),
+        input.total_tokens
+    ))
+}
+
+pub struct SemanticFingerprintInput<'a> {
+    pub provider: &'a str,
+    pub source_id: &'a SourceId,
+    pub started_at: DateTime<Utc>,
+    pub session_hash: Option<&'a str>,
+    pub model_name: Option<&'a str>,
+    pub input_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub total_tokens: u64,
+}
+
+#[must_use]
+pub fn canonical_display(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| expand_home(path))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn expand_home(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(stripped) = text.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(stripped);
+        }
+    }
+    path.to_path_buf()
+}
+
+#[must_use]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[must_use]
+pub fn expand_home_path(value: &str) -> PathBuf {
+    if value == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+// ── Report building ────────────────────────────────────────────
+
+use chrono::Duration;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportPeriod {
+    LastDays(i64),
+    AllTime,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageTotals {
+    pub input_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub estimated_cost_usd: Option<f64>,
+}
+
+impl UsageTotals {
+    pub fn add_event(&mut self, event: &UsageEvent) {
+        self.input_tokens += event.usage.input_tokens.unwrap_or(0);
+        self.cache_creation_tokens += event.usage.cache_creation_tokens.unwrap_or(0);
+        self.cached_input_tokens += event.usage.cache_read_tokens.unwrap_or(0);
+        self.output_tokens += event.usage.output_tokens.unwrap_or(0);
+        self.reasoning_tokens += event.usage.reasoning_tokens.unwrap_or(0);
+        self.total_tokens += event.usage.computed_total();
+        if let Some(cost) = event.cost.estimated_api_equivalent_usd {
+            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0.0) + cost);
+        }
+    }
+
+    pub fn add_summary(&mut self, summary: &UsageSummary) {
+        self.input_tokens += summary.usage.input_tokens.unwrap_or(0);
+        self.cache_creation_tokens += summary.usage.cache_creation_tokens.unwrap_or(0);
+        self.cached_input_tokens += summary.usage.cache_read_tokens.unwrap_or(0);
+        self.output_tokens += summary.usage.output_tokens.unwrap_or(0);
+        self.reasoning_tokens += summary.usage.reasoning_tokens.unwrap_or(0);
+        self.total_tokens += summary.usage.computed_total();
+        if let Some(cost) = summary
+            .cost
+            .provider_reported_usd
+            .or(summary.cost.estimated_api_equivalent_usd)
+        {
+            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0.0) + cost);
+        }
+    }
+
+    pub fn add_totals(&mut self, other: &UsageTotals) {
+        self.input_tokens += other.input_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.total_tokens += other.total_tokens;
+        if let Some(cost) = other.estimated_cost_usd {
+            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0.0) + cost);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageReportRow {
+    pub provider: String,
+    pub account: String,
+    pub events: u64,
+    pub usage: UsageTotals,
+    pub sources: BTreeSet<String>,
+    pub paths: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SummaryReportRow {
+    pub provider: String,
+    pub account: String,
+    pub kind: String,
+    pub summaries: u64,
+    pub usage: UsageTotals,
+    pub direct_event_usage: UsageTotals,
+    pub exact_overlap_summaries: u64,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub sources: BTreeSet<String>,
+    pub paths: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageReport {
+    pub label: String,
+    pub since: Option<DateTime<Utc>>,
+    pub until: DateTime<Utc>,
+    pub rows: Vec<UsageReportRow>,
+    pub summary_rows: Vec<SummaryReportRow>,
+    pub total_events: u64,
+    pub total_usage: UsageTotals,
+    pub total_summary_usage: UsageTotals,
+}
+
+#[must_use]
+pub fn build_usage_report(
+    events: &[UsageEvent],
+    summaries: &[UsageSummary],
+    sources: &[SourceLocation],
+    accounts: &[ProviderAccount],
+    period: ReportPeriod,
+    now: DateTime<Utc>,
+) -> UsageReport {
+    let since = match period {
+        ReportPeriod::LastDays(days) => Some(now - Duration::days(days)),
+        ReportPeriod::AllTime => None,
+    };
+    let label = match period {
+        ReportPeriod::LastDays(7) => "last 7 days".to_string(),
+        ReportPeriod::LastDays(30) => "last 30 days".to_string(),
+        ReportPeriod::LastDays(days) => format!("last {days} days"),
+        ReportPeriod::AllTime => "all time".to_string(),
+    };
+
+    let source_by_id: BTreeMap<_, _> = sources
+        .iter()
+        .map(|source| (source.source_id.0.as_str(), source))
+        .collect();
+    let account_by_id: BTreeMap<_, _> = accounts
+        .iter()
+        .map(|account| (account.provider_account_id.0.as_str(), account))
+        .collect();
+    let mut rows: BTreeMap<(String, String), UsageReportRow> = BTreeMap::new();
+
+    for event in events {
+        if since.is_some_and(|since| event.session.started_at < since)
+            || event.session.started_at > now
+        {
+            continue;
+        }
+
+        let source = source_by_id.get(event.source_id.0.as_str()).copied();
+        let account = report_account_label(event, source, &account_by_id);
+        let key = (event.provider.clone(), account.clone());
+        let row = rows.entry(key).or_insert_with(|| UsageReportRow {
+            provider: event.provider.clone(),
+            account,
+            events: 0,
+            usage: UsageTotals::default(),
+            sources: BTreeSet::new(),
+            paths: BTreeSet::new(),
+        });
+        row.events += 1;
+        row.usage.add_event(event);
+        row.sources.insert(event.source_id.0.clone());
+        if let Some(source) = source {
+            row.paths.insert(preview_path_label(source));
+        }
+    }
+
+    let mut summary_rows: BTreeMap<(String, String, String), SummaryReportRow> = BTreeMap::new();
+    if matches!(period, ReportPeriod::AllTime) {
+        for summary in summaries {
+            if summary.observed_at > now {
+                continue;
+            }
+
+            let source = source_by_id.get(summary.source_id.0.as_str()).copied();
+            let account =
+                report_identity_label(summary.provider_account_id.as_ref(), source, &account_by_id);
+            let kind = summary.metadata.summary_format.clone();
+            let key = (summary.provider.clone(), account.clone(), kind.clone());
+            let direct_overlap_usage = direct_usage_for_summary(
+                summary,
+                &account,
+                events,
+                &source_by_id,
+                &account_by_id,
+                now,
+            );
+            let exact_overlap =
+                summary_usage_matches_direct_overlap(summary, &direct_overlap_usage);
+            let row = summary_rows
+                .entry(key.clone())
+                .or_insert_with(|| SummaryReportRow {
+                    provider: summary.provider.clone(),
+                    account,
+                    kind,
+                    summaries: 0,
+                    usage: UsageTotals::default(),
+                    direct_event_usage: UsageTotals::default(),
+                    exact_overlap_summaries: 0,
+                    observed_at: None,
+                    sources: BTreeSet::new(),
+                    paths: BTreeSet::new(),
+                });
+            row.summaries += 1;
+            row.usage.add_summary(summary);
+            row.direct_event_usage.add_totals(&direct_overlap_usage);
+            if exact_overlap {
+                row.exact_overlap_summaries += 1;
+            }
+            row.observed_at = Some(
+                row.observed_at
+                    .map(|observed_at| observed_at.max(summary.observed_at))
+                    .unwrap_or(summary.observed_at),
+            );
+            row.sources.insert(summary.source_id.0.clone());
+            if let Some(source) = source {
+                row.paths.insert(preview_path_label(source));
+            }
+        }
+    }
+
+    let mut rows: Vec<_> = rows.into_values().collect();
+    rows.sort_by(|left, right| {
+        right
+            .usage
+            .total_tokens
+            .cmp(&left.usage.total_tokens)
+            .then_with(|| left.account.cmp(&right.account))
+    });
+    let total_events = rows.iter().map(|row| row.events).sum();
+    let mut total_usage = UsageTotals::default();
+    for row in &rows {
+        total_usage.add_totals(&row.usage);
+    }
+    let mut summary_rows: Vec<_> = summary_rows.into_values().collect();
+    summary_rows.sort_by(|left, right| {
+        right
+            .usage
+            .total_tokens
+            .cmp(&left.usage.total_tokens)
+            .then_with(|| left.account.cmp(&right.account))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    let mut total_summary_usage = UsageTotals::default();
+    for row in &summary_rows {
+        total_summary_usage.add_totals(&row.usage);
+    }
+
+    UsageReport {
+        label,
+        since,
+        until: now,
+        rows,
+        summary_rows,
+        total_events,
+        total_usage,
+        total_summary_usage,
+    }
+}
+
+fn report_account_label(
+    event: &UsageEvent,
+    source: Option<&SourceLocation>,
+    accounts: &BTreeMap<&str, &ProviderAccount>,
+) -> String {
+    report_identity_label(event.provider_account_id.as_ref(), source, accounts)
+}
+
+fn direct_usage_for_summary(
+    summary: &UsageSummary,
+    summary_account: &str,
+    events: &[UsageEvent],
+    sources: &BTreeMap<&str, &SourceLocation>,
+    accounts: &BTreeMap<&str, &ProviderAccount>,
+    now: DateTime<Utc>,
+) -> UsageTotals {
+    let start = summary.period_start.unwrap_or(summary.observed_at);
+    let end = summary.period_end.unwrap_or(summary.observed_at).min(now);
+    let mut usage = UsageTotals::default();
+    for event in events {
+        if event.provider != summary.provider
+            || event.session.started_at < start
+            || event.session.started_at > end
+        {
+            continue;
+        }
+        let source = sources.get(event.source_id.0.as_str()).copied();
+        if report_account_label(event, source, accounts) != summary_account {
+            continue;
+        }
+        usage.add_event(event);
+    }
+    usage
+}
+
+fn summary_usage_matches_direct_overlap(summary: &UsageSummary, direct: &UsageTotals) -> bool {
+    if direct.total_tokens == 0 || summary.usage.computed_total() != direct.total_tokens {
+        return false;
+    }
+    let summary_input = summary.usage.input_tokens.unwrap_or(0);
+    let direct_input_matches = direct.input_tokens == summary_input
+        || direct
+            .input_tokens
+            .saturating_sub(direct.cached_input_tokens)
+            == summary_input;
+    direct_input_matches
+        && summary.usage.cache_creation_tokens.unwrap_or(0) == direct.cache_creation_tokens
+        && summary.usage.cache_read_tokens.unwrap_or(0) == direct.cached_input_tokens
+        && summary.usage.output_tokens.unwrap_or(0) == direct.output_tokens
+        && summary.usage.reasoning_tokens.unwrap_or(0) == direct.reasoning_tokens
+}
+
+fn report_identity_label(
+    provider_account_id: Option<&ProviderAccountId>,
+    source: Option<&SourceLocation>,
+    accounts: &BTreeMap<&str, &ProviderAccount>,
+) -> String {
+    if let Some(account_id) = provider_account_id {
+        if let Some(account) = accounts.get(account_id.0.as_str()) {
+            if let Some(label) = account.account_label.as_deref() {
+                return label.to_string();
+            }
+        }
+    }
+    if let Some(source) = source {
+        if let Some(label) = source.account_hint.as_deref() {
+            return label.to_string();
+        }
+    }
+    provider_account_id
+        .map(|id| id.0.clone())
+        .unwrap_or_else(|| "unmapped".to_string())
+}
+
+fn preview_path_label(source: &SourceLocation) -> String {
+    let path = source.path_label.as_deref().unwrap_or("unknown");
+    if let Some(home) = home_dir() {
+        let home = home.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(home.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_ids_are_stable_for_same_input() {
+        let a = source_id("codex", SourceKind::LocalAdapter, "abc");
+        let b = source_id("codex", SourceKind::LocalAdapter, "abc");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn source_ids_change_by_provider() {
+        let codex = source_id("codex", SourceKind::LocalAdapter, "abc");
+        let claude = source_id("claude_code", SourceKind::LocalAdapter, "abc");
+        assert_ne!(codex, claude);
+    }
+
+    #[test]
+    fn total_falls_back_to_parts() {
+        let usage = UsageCounts {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(2),
+            ..UsageCounts::default()
+        };
+        assert_eq!(usage.computed_total(), 17);
+    }
+
+    #[test]
+    fn schema_types_serialize() {
+        let schema = schemars::schema_for!(UsageEvent);
+        let json = serde_json::to_value(schema).expect("schema should serialize");
+        assert!(json.get("title").is_some());
+
+        let schema = schemars::schema_for!(UsageSummary);
+        let json = serde_json::to_value(schema).expect("summary schema should serialize");
+        assert!(json.get("title").is_some());
+    }
+
+    fn test_source(provider: &str, path: &str) -> SourceLocation {
+        SourceLocation::local_adapter(
+            provider,
+            "test",
+            "0",
+            Path::new(path),
+            LocationOrigin::Configured,
+            None,
+        )
+    }
+
+    fn test_event(
+        provider: &str,
+        source: &SourceLocation,
+        started_at: DateTime<Utc>,
+        tokens: u64,
+        cost: Option<f64>,
+    ) -> UsageEvent {
+        UsageEvent {
+            schema_version: USAGE_EVENT_SCHEMA_VERSION.to_string(),
+            event_id: event_id(provider, &source.source_id, "rec", None, started_at),
+            device_id: "d".to_string(),
+            provider: provider.to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: None,
+            subscription_id: None,
+            source: EventSource {
+                adapter_id: "test".to_string(),
+                adapter_version: "0".to_string(),
+                source_kind: SourceKind::LocalAdapter,
+                location_origin: Some(LocationOrigin::Configured),
+                source_type: "jsonl".to_string(),
+                source_path_hash: None,
+                source_record_id: Some("rec".to_string()),
+                parse_confidence: Confidence::High,
+            },
+            session: SessionInfo {
+                session_id: "s".to_string(),
+                local_session_id_hash: None,
+                title: None,
+                started_at,
+                ended_at: None,
+                duration_seconds: None,
+            },
+            model: None,
+            usage: UsageCounts {
+                input_tokens: Some(tokens / 2),
+                output_tokens: Some(tokens / 2),
+                total_tokens: Some(tokens),
+                ..UsageCounts::default()
+            },
+            runtime: None,
+            cost: CostInfo {
+                currency: "USD".to_string(),
+                estimated_api_equivalent_usd: cost,
+                provider_reported_usd: None,
+                pricing_source: None,
+                pricing_version: None,
+                confidence: Confidence::Low,
+            },
+            parse_evidence: None,
+            project: None,
+            git: None,
+            privacy: PrivacyInfo {
+                mode: PrivacyMode::MetadataOnly,
+                contains_prompt_text: false,
+                contains_response_text: false,
+                contains_file_paths: false,
+            },
+            created_at: started_at,
+            imported_at: started_at,
+        }
+    }
+
+    fn test_summary(
+        provider: &str,
+        source: &SourceLocation,
+        observed_at: DateTime<Utc>,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+        tokens: u64,
+    ) -> UsageSummary {
+        UsageSummary {
+            schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
+            summary_id: summary_id(provider, &source.source_id, "sum"),
+            device_id: "d".to_string(),
+            provider: provider.to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: None,
+            source: EventSource {
+                adapter_id: "test".to_string(),
+                adapter_version: "0".to_string(),
+                source_kind: SourceKind::LocalSummary,
+                location_origin: Some(LocationOrigin::Configured),
+                source_type: "cache".to_string(),
+                source_path_hash: None,
+                source_record_id: Some("rec".to_string()),
+                parse_confidence: Confidence::Medium,
+            },
+            model: None,
+            usage: UsageCounts {
+                input_tokens: Some(tokens),
+                total_tokens: Some(tokens),
+                ..UsageCounts::default()
+            },
+            cost: CostInfo {
+                currency: "USD".to_string(),
+                estimated_api_equivalent_usd: None,
+                provider_reported_usd: None,
+                pricing_source: None,
+                pricing_version: None,
+                confidence: Confidence::Low,
+            },
+            parse_evidence: None,
+            privacy: PrivacyInfo {
+                mode: PrivacyMode::MetadataOnly,
+                contains_prompt_text: false,
+                contains_response_text: false,
+                contains_file_paths: false,
+            },
+            period_start: Some(period_start),
+            period_end: Some(period_end),
+            observed_at,
+            metadata: SummaryMetadata {
+                summary_format: "stats_cache".to_string(),
+                summary_version: None,
+                total_sessions: Some(1),
+                total_messages: Some(10),
+                last_computed_at: Some(observed_at),
+            },
+            imported_at: observed_at,
+        }
+    }
+
+    fn mk_dt(year: i32, month: u32, day: u32) -> DateTime<Utc> {
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|dt| dt.and_utc())
+            .expect("valid date")
+    }
+
+    #[test]
+    fn report_empty_inputs_returns_zero_totals() {
+        let now = mk_dt(2026, 5, 25);
+        let report = build_usage_report(&[], &[], &[], &[], ReportPeriod::AllTime, now);
+        assert_eq!(report.total_events, 0);
+        assert_eq!(report.total_usage.total_tokens, 0);
+        assert!(report.rows.is_empty());
+        assert!(report.summary_rows.is_empty());
+    }
+
+    #[test]
+    fn report_filters_events_by_period() {
+        let now = mk_dt(2026, 5, 25);
+        let source = test_source("codex", "/tmp/codex");
+        let recent = test_event("codex", &source, mk_dt(2026, 5, 24), 100, None);
+        let old = test_event("codex", &source, mk_dt(2026, 5, 10), 200, None);
+
+        let report = build_usage_report(
+            &[recent, old],
+            &[],
+            &[source],
+            &[],
+            ReportPeriod::LastDays(7),
+            now,
+        );
+
+        assert_eq!(report.total_events, 1);
+        assert_eq!(report.total_usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn report_filters_out_future_events() {
+        let now = mk_dt(2026, 5, 25);
+        let source = test_source("codex", "/tmp/codex");
+        let future = test_event("codex", &source, mk_dt(2026, 6, 1), 100, None);
+        let present = test_event("codex", &source, now, 50, None);
+
+        let report = build_usage_report(
+            &[future, present],
+            &[],
+            &[source],
+            &[],
+            ReportPeriod::AllTime,
+            now,
+        );
+
+        assert_eq!(report.total_events, 1);
+        assert_eq!(report.total_usage.total_tokens, 50);
+    }
+
+    #[test]
+    fn report_groups_events_by_provider_and_account() {
+        let now = mk_dt(2026, 5, 25);
+        let src = test_source("codex", "/tmp/codex");
+        let e1 = test_event("codex", &src, now, 100, None);
+        let e2 = test_event("codex", &src, now, 200, None);
+
+        let report = build_usage_report(&[e1, e2], &[], &[src], &[], ReportPeriod::AllTime, now);
+
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].provider, "codex");
+        assert_eq!(report.rows[0].events, 2);
+        assert_eq!(report.rows[0].usage.total_tokens, 300);
+    }
+
+    #[test]
+    fn report_keeps_summaries_separate_from_events() {
+        let now = mk_dt(2026, 5, 25);
+        let src = test_source("claude_code", "/tmp/claude");
+        let event = test_event("claude_code", &src, now, 100, None);
+        let summary = test_summary(
+            "claude_code",
+            &src,
+            now,
+            mk_dt(2026, 5, 1),
+            mk_dt(2026, 5, 25),
+            500,
+        );
+
+        let report = build_usage_report(
+            &[event],
+            &[summary],
+            &[src],
+            &[],
+            ReportPeriod::AllTime,
+            now,
+        );
+
+        assert_eq!(report.total_usage.total_tokens, 100);
+        assert_eq!(report.total_summary_usage.total_tokens, 500);
+        assert_eq!(report.summary_rows.len(), 1);
+        // Direct event usage within summary period
+        assert_eq!(report.summary_rows[0].direct_event_usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn report_hides_summaries_in_non_alltime_periods() {
+        let now = mk_dt(2026, 5, 25);
+        let src = test_source("claude_code", "/tmp/claude");
+        let summary = test_summary(
+            "claude_code",
+            &src,
+            now,
+            mk_dt(2026, 5, 1),
+            mk_dt(2026, 5, 25),
+            500,
+        );
+
+        let report =
+            build_usage_report(&[], &[summary], &[src], &[], ReportPeriod::LastDays(7), now);
+
+        assert!(report.summary_rows.is_empty());
+    }
+
+    #[test]
+    fn report_uses_account_label_from_registry() {
+        let now = mk_dt(2026, 5, 25);
+        let src = test_source("codex", "/tmp/codex");
+        let acct_id = provider_account_id("codex", "stable");
+        let account = ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id: acct_id.clone(),
+            provider: "codex".to_string(),
+            identity_source: IdentitySource::UserConfigured,
+            provider_user_id_hash: None,
+            email_hash: None,
+            org_id_hash: None,
+            account_label: Some("work".to_string()),
+            plan_name: None,
+            confidence: Confidence::Medium,
+            source_ids: vec![src.source_id.clone()],
+            created_at: now,
+            updated_at: now,
+        };
+        let mut event = test_event("codex", &src, now, 50, None);
+        event.provider_account_id = Some(acct_id);
+
+        let report = build_usage_report(
+            &[event],
+            &[],
+            &[src],
+            &[account],
+            ReportPeriod::AllTime,
+            now,
+        );
+
+        assert_eq!(report.rows[0].account, "work");
+    }
+
+    #[test]
+    fn usage_totals_accumulate_cost() {
+        let now = mk_dt(2026, 5, 25);
+        let src = test_source("codex", "/tmp/codex");
+        let e1 = test_event("codex", &src, now, 100, Some(0.01));
+        let e2 = test_event("codex", &src, now, 200, Some(0.02));
+
+        let report = build_usage_report(&[e1, e2], &[], &[src], &[], ReportPeriod::AllTime, now);
+
+        assert_eq!(report.total_usage.estimated_cost_usd, Some(0.03));
+    }
+
+    #[test]
+    fn computed_total_does_not_overflow() {
+        let usage = UsageCounts {
+            input_tokens: Some(u64::MAX),
+            output_tokens: Some(u64::MAX),
+            ..UsageCounts::default()
+        };
+        let total = usage.computed_total();
+        assert_eq!(total, u64::MAX);
+    }
+}

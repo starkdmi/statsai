@@ -1,0 +1,11 @@
+[package]
+name = "ai-stats-pricing"
+description = "Model pricing helpers for ai-stats."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ai-stats-core = { path = "../ai-stats-core" }

@@ -1,0 +1,19 @@
+{
+  "schema_version": "sync_ack.v1",
+  "batch_id": "batch_fixture_minimal",
+  "accepted": {
+    "sources": 0,
+    "accounts": 0,
+    "subscriptions": 0,
+    "events": 0,
+    "summaries": 0
+  },
+  "duplicates": {
+    "sources": 0,
+    "accounts": 0,
+    "subscriptions": 0,
+    "events": 0,
+    "summaries": 0
+  },
+  "rejected": []
+}

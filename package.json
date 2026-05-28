@@ -1,0 +1,39 @@
+{
+  "name": "ai-stats",
+  "version": "0.0.1",
+  "description": "Local-first AI usage statistics CLI, SDK, daemon, and adapter framework.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates",
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "ai",
+    "stats",
+    "llm",
+    "models",
+    "analytics",
+    "usage",
+    "codex",
+    "claude",
+    "rust"
+  ],
+  "author": "Dmitry Starkov",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/starkdmi/ai-stats.git"
+  },
+  "bugs": {
+    "url": "https://github.com/starkdmi/ai-stats/issues"
+  },
+  "homepage": "https://github.com/starkdmi/ai-stats#readme"
+}

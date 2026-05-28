@@ -1,0 +1,18 @@
+[package]
+name = "ai-stats-sdk"
+description = "Public Rust SDK facade for ai-stats."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ai-stats-adapters = { path = "../ai-stats-adapters" }
+ai-stats-core = { path = "../ai-stats-core" }
+ai-stats-store = { path = "../ai-stats-store" }
+ai-stats-sync = { path = "../ai-stats-sync" }
+anyhow.workspace = true
+chrono.workspace = true
+schemars.workspace = true
+serde.workspace = true

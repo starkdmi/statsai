@@ -1,0 +1,19 @@
+[package]
+name = "ai-stats-adapters"
+description = "Provider adapters for ai-stats."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ai-stats-core = { path = "../ai-stats-core" }
+ai-stats-pricing = { path = "../ai-stats-pricing" }
+anyhow.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
