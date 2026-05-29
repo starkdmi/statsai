@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ai-stats login</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #172026;
+        background: #f5f7fa;
+      }
+      main {
+        width: min(420px, calc(100vw - 40px));
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 28px;
+      }
+      p {
+        line-height: 1.45;
+      }
+      button {
+        width: 100%;
+        height: 44px;
+        border: 0;
+        border-radius: 6px;
+        color: white;
+        background: #1769e0;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .muted {
+        color: #52616b;
+        font-size: 14px;
+      }
+      .error {
+        color: #a12718;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Sign in to ai-stats</h1>
+      <p class="muted">Use your Google account to connect this device for sync.</p>
+      <button id="login" type="button">Continue with Google</button>
+      <p id="status" class="muted"></p>
+    </main>
+
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+    <script>
+      const firebaseConfig = {
+        apiKey: "AIzaSyBiWB8m1Oq8tgLOxYslL67i77itmCvn4-4",
+        authDomain: "ai-stats-fire.firebaseapp.com",
+        projectId: "ai-stats-fire",
+        appId: "1:252748432339:web:1d39c8a7fc9e88e5ef6526"
+      };
+
+      const params = new URLSearchParams(window.location.search);
+      const redirectUri = validateLoopbackRedirect(params.get("redirect_uri"));
+      const state = params.get("state");
+      const statusEl = document.getElementById("status");
+      const loginButton = document.getElementById("login");
+
+      firebase.initializeApp(firebaseConfig);
+
+      function setStatus(message, isError = false) {
+        statusEl.textContent = message;
+        statusEl.className = isError ? "error" : "muted";
+      }
+
+      function validateLoopbackRedirect(value) {
+        if (!value) {
+          return null;
+        }
+        try {
+          const url = new URL(value);
+          const allowedHosts = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+          if (url.protocol !== "http:") {
+            return null;
+          }
+          if (!allowedHosts.has(url.hostname)) {
+            return null;
+          }
+          if (!url.port || (url.pathname !== "/callback" && url.pathname !== "/callback/")) {
+            return null;
+          }
+          if (url.username || url.password || url.search || url.hash) {
+            return null;
+          }
+          return url.toString();
+        } catch {
+          return null;
+        }
+      }
+
+      function postToCli(fields) {
+        const form = document.createElement("form");
+        form.method = "POST";
+        form.action = redirectUri;
+        form.style.display = "none";
+        for (const [name, value] of Object.entries(fields)) {
+          const input = document.createElement("input");
+          input.type = "hidden";
+          input.name = name;
+          input.value = value == null ? "" : String(value);
+          form.appendChild(input);
+        }
+        document.body.appendChild(form);
+        form.submit();
+      }
+
+      loginButton.addEventListener("click", async () => {
+        if (!redirectUri || !state) {
+          setStatus("Missing login callback information. Please rerun ai-stats auth login.", true);
+          return;
+        }
+        loginButton.disabled = true;
+        setStatus("Opening Google sign-in...");
+        try {
+          const provider = new firebase.auth.GoogleAuthProvider();
+          provider.addScope("email");
+          provider.addScope("profile");
+          const result = await firebase.auth().signInWithPopup(provider);
+          const user = result.user;
+          if (!user) {
+            throw new Error("Google sign-in did not return a user.");
+          }
+          const idToken = await user.getIdToken(true);
+          postToCli({
+            state,
+            idToken,
+            refreshToken: user.refreshToken,
+            uid: user.uid,
+            email: user.email || "",
+            expiresIn: 3600,
+            apiKey: firebaseConfig.apiKey
+          });
+        } catch (error) {
+          loginButton.disabled = false;
+          setStatus(error && error.message ? error.message : String(error), true);
+        }
+      });
+    </script>
+  </body>
+</html>
