@@ -1,12 +1,15 @@
 //! Local SQLite storage for `ai-stats`.
 
 use ai_stats_core::{
-    semantic_event_fingerprint, DailyRollup, ProviderAccount, SemanticFingerprintInput, SourceId,
-    SourceLocation, Subscription, SummaryId, UsageEvent, UsageSummary,
+    hash_text, semantic_event_fingerprint, summary_id, Confidence, CostInfo, DailyRollup,
+    EventSource, PrivacyInfo, PrivacyMode, ProviderAccount, SemanticFingerprintInput, SourceId,
+    SourceLocation, Subscription, SummaryId, SummaryMetadata, UsageCounts, UsageEvent,
+    UsageSummary, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +23,12 @@ pub struct SyncState {
     pub last_summary_observed_at: Option<DateTime<Utc>>,
     pub last_summary_id: Option<String>,
     pub failure_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanFileStateEntry {
+    pub cache_key: String,
+    pub cache_signature: String,
 }
 
 pub struct Store {
@@ -116,6 +125,38 @@ impl Store {
               PRIMARY KEY (date, device_id)
             );
             CREATE INDEX IF NOT EXISTS daily_rollups_date_idx ON daily_rollups (date);
+            CREATE TABLE IF NOT EXISTS firestore_rollups (
+              summary_id TEXT PRIMARY KEY,
+              provider TEXT NOT NULL,
+              source_id TEXT NOT NULL,
+              provider_account_id TEXT,
+              day_key TEXT NOT NULL,
+              observed_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              payload_hash TEXT NOT NULL,
+              dirty INTEGER NOT NULL DEFAULT 1,
+              payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS firestore_rollups_dirty_idx
+              ON firestore_rollups (dirty, updated_at, summary_id);
+            CREATE INDEX IF NOT EXISTS firestore_rollups_lookup_idx
+              ON firestore_rollups (provider, source_id, provider_account_id, day_key);
+            CREATE TABLE IF NOT EXISTS scan_file_state (
+              source_id TEXT NOT NULL,
+              cache_key TEXT NOT NULL,
+              cache_signature TEXT NOT NULL,
+              synced_at TEXT NOT NULL,
+              PRIMARY KEY (source_id, cache_key)
+            );
+            CREATE TABLE IF NOT EXISTS entity_sync_state (
+              sink TEXT NOT NULL,
+              target TEXT NOT NULL,
+              entity_kind TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              payload_hash TEXT NOT NULL,
+              synced_at TEXT NOT NULL,
+              PRIMARY KEY (sink, target, entity_kind, entity_id)
+            );
             CREATE TABLE IF NOT EXISTS sync_state (
               sink TEXT NOT NULL,
               target TEXT NOT NULL,
@@ -131,6 +172,71 @@ impl Store {
             "#,
         )?;
         Ok(())
+    }
+
+    pub fn pending_scan_file_entries(
+        &self,
+        source_id: &SourceId,
+        entries: &[ScanFileStateEntry],
+    ) -> Result<Vec<ScanFileStateEntry>> {
+        let mut pending = Vec::with_capacity(entries.len());
+        let mut stmt = self.conn.prepare(
+            "SELECT cache_signature FROM scan_file_state WHERE source_id = ?1 AND cache_key = ?2",
+        )?;
+        for entry in entries {
+            let existing = stmt
+                .query_row(params![&source_id.0, &entry.cache_key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?;
+            if existing.as_deref() != Some(entry.cache_signature.as_str()) {
+                pending.push(entry.clone());
+            }
+        }
+        Ok(pending)
+    }
+
+    pub fn record_scan_file_entries(
+        &self,
+        source_id: &SourceId,
+        entries: &[ScanFileStateEntry],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let synced_at = Utc::now().to_rfc3339();
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut stmt = self.conn.prepare(
+                r#"
+                INSERT INTO scan_file_state (source_id, cache_key, cache_signature, synced_at)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(source_id, cache_key) DO UPDATE SET
+                  cache_signature = excluded.cache_signature,
+                  synced_at = excluded.synced_at
+                "#,
+            )?;
+            for entry in entries {
+                stmt.execute(params![
+                    &source_id.0,
+                    &entry.cache_key,
+                    &entry.cache_signature,
+                    &synced_at
+                ])?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
     }
 
     pub fn upsert_source(&self, source: &SourceLocation) -> Result<()> {
@@ -244,7 +350,8 @@ impl Store {
         if let Some(existing_id) = self.find_semantic_duplicate_event_id(event, &fingerprint)? {
             let mut refreshed = event.clone();
             refreshed.event_id.0 = existing_id;
-            self.update_event_payload(&refreshed)?;
+            let dirty_keys = self.update_event_payload(&refreshed)?;
+            self.refresh_firestore_rollups_for_keys(&dirty_keys)?;
             return Ok(false);
         }
 
@@ -269,7 +376,12 @@ impl Store {
             ],
         )?;
         if changed == 0 {
-            self.update_event_payload(event)?;
+            let dirty_keys = self.update_event_payload(event)?;
+            self.refresh_firestore_rollups_for_keys(&dirty_keys)?;
+        } else {
+            self.refresh_firestore_rollups_for_keys(&BTreeSet::from([
+                firestore_rollup_bucket_key(event),
+            ]))?;
         }
         Ok(changed > 0)
     }
@@ -281,18 +393,22 @@ impl Store {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             let mut inserted = 0u64;
+            let mut dirty_keys = BTreeSet::new();
             for (index, event) in events.iter().enumerate() {
                 let fingerprint = &fingerprints[index];
                 if let Some(existing_id) = conflict_map.get(fingerprint) {
                     let mut refreshed = event.clone();
                     refreshed.event_id.0 = existing_id.clone();
-                    self.update_event_payload(&refreshed)?;
+                    dirty_keys.extend(self.update_event_payload(&refreshed)?);
                     continue;
                 }
-                if self.insert_event_in_batch(event, fingerprint)? {
+                let outcome = self.insert_event_in_batch(event, fingerprint)?;
+                if outcome.inserted {
                     inserted += 1;
                 }
+                dirty_keys.extend(outcome.dirty_keys);
             }
+            self.refresh_firestore_rollups_for_keys(&dirty_keys)?;
             Ok(inserted)
         })();
 
@@ -308,7 +424,13 @@ impl Store {
         }
     }
 
-    fn update_event_payload(&self, event: &UsageEvent) -> Result<()> {
+    fn update_event_payload(
+        &self,
+        event: &UsageEvent,
+    ) -> Result<BTreeSet<FirestoreRollupBucketKey>> {
+        let existing_bucket = self
+            .event_by_id(&event.event_id.0)?
+            .map(|existing| firestore_rollup_bucket_key(&existing));
         let payload = serde_json::to_string(event)?;
         let fingerprint = event_fingerprint(event);
         self.conn.execute(
@@ -334,15 +456,26 @@ impl Store {
                 &payload
             ],
         )?;
-        Ok(())
+        let mut dirty_keys = BTreeSet::new();
+        if let Some(existing_bucket) = existing_bucket {
+            dirty_keys.insert(existing_bucket);
+        }
+        dirty_keys.insert(firestore_rollup_bucket_key(event));
+        Ok(dirty_keys)
     }
 
-    fn insert_event_in_batch(&self, event: &UsageEvent, fingerprint: &str) -> Result<bool> {
+    fn insert_event_in_batch(
+        &self,
+        event: &UsageEvent,
+        fingerprint: &str,
+    ) -> Result<EventInsertOutcome> {
         if let Some(existing_id) = self.find_semantic_duplicate_event_id(event, fingerprint)? {
             let mut refreshed = event.clone();
             refreshed.event_id.0 = existing_id;
-            self.update_event_payload(&refreshed)?;
-            return Ok(false);
+            return Ok(EventInsertOutcome {
+                inserted: false,
+                dirty_keys: self.update_event_payload(&refreshed)?,
+            });
         }
 
         let payload = serde_json::to_string(event)?;
@@ -366,9 +499,15 @@ impl Store {
             ],
         )?;
         if changed == 0 {
-            self.update_event_payload(event)?;
+            return Ok(EventInsertOutcome {
+                inserted: false,
+                dirty_keys: self.update_event_payload(event)?,
+            });
         }
-        Ok(changed > 0)
+        Ok(EventInsertOutcome {
+            inserted: true,
+            dirty_keys: BTreeSet::from([firestore_rollup_bucket_key(event)]),
+        })
     }
 
     fn batch_load_conflicts(
@@ -429,6 +568,39 @@ impl Store {
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?;
         for row in rows {
+            let (event_id, payload) = row?;
+            if event_id == event.event_id.0 {
+                return Ok(None);
+            }
+            let candidate: UsageEvent = serde_json::from_str(&payload)?;
+            if semantically_same_event(&candidate, event) {
+                return Ok(Some(event_id));
+            }
+        }
+        if !uses_path_independent_codex_dedupe(event) {
+            return Ok(None);
+        }
+
+        let mut fallback = self.conn.prepare(
+            r#"
+            SELECT event_id, payload
+            FROM usage_events
+            WHERE provider = ?1
+              AND source_id = ?2
+              AND started_at = ?3
+              AND total_tokens = ?4
+            "#,
+        )?;
+        let fallback_rows = fallback.query_map(
+            params![
+                &event.provider,
+                &event.source_id.0,
+                event.session.started_at.to_rfc3339(),
+                safe_u64_to_i64(event.usage.computed_total()),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        for row in fallback_rows {
             let (event_id, payload) = row?;
             if event_id == event.event_id.0 {
                 return Ok(None);
@@ -507,6 +679,7 @@ impl Store {
                     params![&source_id.0],
                 )? as u64;
             }
+            self.delete_firestore_rollups_for_sources_in_tx(source_ids)?;
             Ok(deleted)
         })();
 
@@ -804,6 +977,259 @@ impl Store {
         Ok(count as u64)
     }
 
+    pub fn firestore_rollup_count(&self) -> Result<u64> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM firestore_rollups", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(count as u64)
+    }
+
+    pub fn dirty_firestore_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
+        self.firestore_rollup_summaries_by_sql(
+            "SELECT payload FROM firestore_rollups WHERE dirty = 1 ORDER BY updated_at, summary_id",
+        )
+    }
+
+    pub fn all_firestore_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
+        self.firestore_rollup_summaries_by_sql(
+            "SELECT payload FROM firestore_rollups ORDER BY updated_at, summary_id",
+        )
+    }
+
+    pub fn mark_firestore_rollups_synced(&self, summary_ids: &[SummaryId]) -> Result<()> {
+        if summary_ids.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            for summary_id in summary_ids {
+                self.conn.execute(
+                    "UPDATE firestore_rollups SET dirty = 0 WHERE summary_id = ?1",
+                    params![&summary_id.0],
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn mark_all_firestore_rollups_dirty(&self) -> Result<u64> {
+        let updated = self.conn.execute(
+            "UPDATE firestore_rollups SET dirty = 1, updated_at = ?1",
+            params![Utc::now().to_rfc3339()],
+        )? as u64;
+        Ok(updated)
+    }
+
+    pub fn rebuild_firestore_rollups(&self) -> Result<u64> {
+        let events = self.events()?;
+        let keys: BTreeSet<_> = events.iter().map(firestore_rollup_bucket_key).collect();
+
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            self.conn.execute("DELETE FROM firestore_rollups", [])?;
+            self.refresh_firestore_rollups_for_keys(&keys)?;
+            Ok(keys.len() as u64)
+        })();
+
+        match result {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(count)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn pending_sources_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        sources: &[SourceLocation],
+    ) -> Result<Vec<SourceLocation>> {
+        let mut changed = Vec::new();
+        for source in sources {
+            let payload = serde_json::to_string(source)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                "source",
+                &source.source_id.0,
+                &hash_text(&payload),
+            )? {
+                changed.push(source.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn pending_accounts_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        accounts: &[ProviderAccount],
+    ) -> Result<Vec<ProviderAccount>> {
+        let mut changed = Vec::new();
+        for account in accounts {
+            let payload = serde_json::to_string(account)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                "account",
+                &account.provider_account_id.0,
+                &hash_text(&payload),
+            )? {
+                changed.push(account.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn pending_subscriptions_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        subscriptions: &[Subscription],
+    ) -> Result<Vec<Subscription>> {
+        let mut changed = Vec::new();
+        for subscription in subscriptions {
+            let payload = serde_json::to_string(subscription)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                "subscription",
+                &subscription.subscription_id.0,
+                &hash_text(&payload),
+            )? {
+                changed.push(subscription.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn record_sources_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        sources: &[SourceLocation],
+    ) -> Result<()> {
+        if sources.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            for source in sources {
+                let payload = serde_json::to_string(source)?;
+                self.record_entity_synced(
+                    sink,
+                    target,
+                    "source",
+                    &source.source_id.0,
+                    &hash_text(&payload),
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn record_accounts_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        accounts: &[ProviderAccount],
+    ) -> Result<()> {
+        if accounts.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            for account in accounts {
+                let payload = serde_json::to_string(account)?;
+                self.record_entity_synced(
+                    sink,
+                    target,
+                    "account",
+                    &account.provider_account_id.0,
+                    &hash_text(&payload),
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn record_subscriptions_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        subscriptions: &[Subscription],
+    ) -> Result<()> {
+        if subscriptions.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            for subscription in subscriptions {
+                let payload = serde_json::to_string(subscription)?;
+                self.record_entity_synced(
+                    sink,
+                    target,
+                    "subscription",
+                    &subscription.subscription_id.0,
+                    &hash_text(&payload),
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
     pub fn compute_daily_rollup(&self, date: &str, device_id: &str) -> Result<DailyRollup> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -944,9 +1370,351 @@ impl Store {
         Ok(deleted)
     }
 
+    fn event_by_id(&self, event_id: &str) -> Result<Option<UsageEvent>> {
+        self.conn
+            .query_row(
+                "SELECT payload FROM usage_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .transpose()
+    }
+
+    fn firestore_rollup_summaries_by_sql(&self, sql: &str) -> Result<Vec<UsageSummary>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(serde_json::from_str(&row?)?);
+        }
+        Ok(summaries)
+    }
+
+    fn refresh_firestore_rollups_for_keys(
+        &self,
+        keys: &BTreeSet<FirestoreRollupBucketKey>,
+    ) -> Result<()> {
+        for key in keys {
+            self.refresh_firestore_rollup_for_key(key)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_firestore_rollup_for_key(&self, key: &FirestoreRollupBucketKey) -> Result<()> {
+        let events = self.firestore_rollup_events(key)?;
+        if events.is_empty() {
+            self.conn.execute(
+                "DELETE FROM firestore_rollups WHERE summary_id = ?1",
+                params![firestore_rollup_summary_id(key).0],
+            )?;
+            return Ok(());
+        }
+
+        let summary = build_firestore_rollup_summary(&events);
+        let payload = serde_json::to_string(&summary)?;
+        let payload_hash = hash_text(&payload);
+        let existing: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT payload_hash, dirty FROM firestore_rollups WHERE summary_id = ?1",
+                params![&summary.summary_id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        if existing
+            .as_ref()
+            .is_some_and(|(existing_hash, _)| existing_hash == &payload_hash)
+        {
+            return Ok(());
+        }
+
+        let dirty = existing.as_ref().map_or(1, |(_, dirty)| (*dirty).max(1));
+        self.conn.execute(
+            r#"
+            INSERT INTO firestore_rollups (
+              summary_id, provider, source_id, provider_account_id, day_key,
+              observed_at, updated_at, payload_hash, dirty, payload
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(summary_id) DO UPDATE SET
+              provider = excluded.provider,
+              source_id = excluded.source_id,
+              provider_account_id = excluded.provider_account_id,
+              day_key = excluded.day_key,
+              observed_at = excluded.observed_at,
+              updated_at = excluded.updated_at,
+              payload_hash = excluded.payload_hash,
+              dirty = excluded.dirty,
+              payload = excluded.payload
+            "#,
+            params![
+                &summary.summary_id.0,
+                &summary.provider,
+                &summary.source_id.0,
+                summary.provider_account_id.as_ref().map(|id| id.0.as_str()),
+                &key.day_key,
+                summary.observed_at.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+                &payload_hash,
+                dirty,
+                &payload,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn firestore_rollup_events(&self, key: &FirestoreRollupBucketKey) -> Result<Vec<UsageEvent>> {
+        let start = format!("{}T00:00:00+00:00", key.day_key);
+        let end = {
+            let day = NaiveDate::parse_from_str(&key.day_key, "%Y-%m-%d")?;
+            format!(
+                "{}T00:00:00+00:00",
+                (day + chrono::Duration::days(1)).format("%Y-%m-%d")
+            )
+        };
+        let sql = if key.provider_account_id.is_some() {
+            r#"
+            SELECT payload FROM usage_events
+            WHERE provider = ?1
+              AND source_id = ?2
+              AND provider_account_id = ?3
+              AND started_at >= ?4
+              AND started_at < ?5
+            ORDER BY started_at, event_id
+            "#
+        } else {
+            r#"
+            SELECT payload FROM usage_events
+            WHERE provider = ?1
+              AND source_id = ?2
+              AND provider_account_id IS NULL
+              AND started_at >= ?3
+              AND started_at < ?4
+            ORDER BY started_at, event_id
+            "#
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut events = Vec::new();
+        if let Some(provider_account_id) = key.provider_account_id.as_deref() {
+            let rows = stmt.query_map(
+                params![
+                    &key.provider,
+                    &key.source_id,
+                    provider_account_id,
+                    &start,
+                    &end
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            for row in rows {
+                events.push(serde_json::from_str(&row?)?);
+            }
+        } else {
+            let rows = stmt.query_map(
+                params![&key.provider, &key.source_id, &start, &end],
+                |row| row.get::<_, String>(0),
+            )?;
+            for row in rows {
+                events.push(serde_json::from_str(&row?)?);
+            }
+        }
+        Ok(events)
+    }
+
+    fn delete_firestore_rollups_for_sources_in_tx(&self, source_ids: &[SourceId]) -> Result<u64> {
+        let mut deleted = 0u64;
+        for source_id in source_ids {
+            deleted += self.conn.execute(
+                "DELETE FROM firestore_rollups WHERE source_id = ?1",
+                params![&source_id.0],
+            )? as u64;
+        }
+        Ok(deleted)
+    }
+
+    fn entity_requires_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        entity_kind: &str,
+        entity_id: &str,
+        payload_hash: &str,
+    ) -> Result<bool> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                r#"
+                SELECT payload_hash
+                FROM entity_sync_state
+                WHERE sink = ?1 AND target = ?2 AND entity_kind = ?3 AND entity_id = ?4
+                "#,
+                params![sink, target, entity_kind, entity_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(existing.as_deref() != Some(payload_hash))
+    }
+
+    fn record_entity_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        entity_kind: &str,
+        entity_id: &str,
+        payload_hash: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO entity_sync_state (
+              sink, target, entity_kind, entity_id, payload_hash, synced_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(sink, target, entity_kind, entity_id) DO UPDATE SET
+              payload_hash = excluded.payload_hash,
+              synced_at = excluded.synced_at
+            "#,
+            params![
+                sink,
+                target,
+                entity_kind,
+                entity_id,
+                payload_hash,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn checkpoint_wal(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FirestoreRollupBucketKey {
+    provider: String,
+    source_id: String,
+    provider_account_id: Option<String>,
+    day_key: String,
+}
+
+#[derive(Debug, Default)]
+struct EventInsertOutcome {
+    inserted: bool,
+    dirty_keys: BTreeSet<FirestoreRollupBucketKey>,
+}
+
+fn firestore_rollup_bucket_key(event: &UsageEvent) -> FirestoreRollupBucketKey {
+    FirestoreRollupBucketKey {
+        provider: event.provider.clone(),
+        source_id: event.source_id.0.clone(),
+        provider_account_id: event.provider_account_id.as_ref().map(|id| id.0.clone()),
+        day_key: event.session.started_at.date_naive().to_string(),
+    }
+}
+
+fn firestore_rollup_summary_id(key: &FirestoreRollupBucketKey) -> SummaryId {
+    summary_id(
+        &key.provider,
+        &SourceId(key.source_id.clone()),
+        &format!(
+            "daily_stats:{}:{}",
+            key.day_key,
+            key.provider_account_id.as_deref().unwrap_or("unlinked")
+        ),
+    )
+}
+
+fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
+    let first = events.first().expect("rollup bucket must contain events");
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cache_creation = 0u64;
+    let mut total_cache_read = 0u64;
+    let mut total_reasoning = 0u64;
+    let mut total_tokens = 0u64;
+    let mut total_events = 0u64;
+    let mut estimated_cost_usd = 0.0f64;
+    let mut observed_at = first.session.started_at;
+
+    for event in events {
+        total_input = total_input.saturating_add(event.usage.input_tokens.unwrap_or(0));
+        total_output = total_output.saturating_add(event.usage.output_tokens.unwrap_or(0));
+        total_cache_creation =
+            total_cache_creation.saturating_add(event.usage.cache_creation_tokens.unwrap_or(0));
+        total_cache_read =
+            total_cache_read.saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
+        total_reasoning = total_reasoning.saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
+        total_tokens = total_tokens.saturating_add(event.usage.computed_total());
+        total_events = total_events.saturating_add(1);
+        estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0.0);
+        if event.session.started_at > observed_at {
+            observed_at = event.session.started_at;
+        }
+    }
+
+    let day = first.session.started_at.date_naive();
+    let period_start = day
+        .and_hms_opt(0, 0, 0)
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+        .unwrap_or(first.session.started_at);
+    let period_end = period_start + chrono::Duration::days(1);
+    let bucket_key = firestore_rollup_bucket_key(first);
+
+    UsageSummary {
+        schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
+        summary_id: firestore_rollup_summary_id(&bucket_key),
+        device_id: first.device_id.clone(),
+        provider: first.provider.clone(),
+        source_id: first.source_id.clone(),
+        provider_account_id: first.provider_account_id.clone(),
+        source: EventSource {
+            source_record_id: None,
+            ..first.source.clone()
+        },
+        model: None,
+        usage: UsageCounts {
+            input_tokens: Some(total_input),
+            output_tokens: Some(total_output),
+            cache_creation_tokens: Some(total_cache_creation),
+            cache_read_tokens: Some(total_cache_read),
+            reasoning_tokens: Some(total_reasoning),
+            total_tokens: Some(total_tokens),
+            requests: Some(total_events),
+            local_prompt_eval_tokens: None,
+            local_eval_tokens: None,
+        },
+        cost: CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: Some(estimated_cost_usd),
+            provider_reported_usd: None,
+            pricing_source: Some("local_rollup".to_string()),
+            pricing_version: None,
+            confidence: Confidence::Medium,
+        },
+        parse_evidence: None,
+        privacy: PrivacyInfo {
+            mode: PrivacyMode::MetadataOnly,
+            contains_prompt_text: false,
+            contains_response_text: false,
+            contains_file_paths: false,
+        },
+        period_start: Some(period_start),
+        period_end: Some(period_end),
+        observed_at,
+        metadata: SummaryMetadata {
+            summary_format: "daily_rollup.v1".to_string(),
+            summary_version: Some("1".to_string()),
+            total_sessions: None,
+            total_messages: None,
+            last_computed_at: Some(observed_at),
+        },
+        imported_at: observed_at,
     }
 }
 
@@ -1009,7 +1777,7 @@ fn event_fingerprint(event: &UsageEvent) -> String {
         provider: &event.provider,
         source_id: &event.source_id,
         started_at: event.session.started_at,
-        session_hash: event.session.local_session_id_hash.as_deref(),
+        session_hash: session_hash_for_fingerprint(event),
         model_name: event
             .model
             .as_ref()
@@ -1024,10 +1792,16 @@ fn event_fingerprint(event: &UsageEvent) -> String {
 }
 
 fn semantically_same_event(left: &UsageEvent, right: &UsageEvent) -> bool {
+    let session_matches =
+        if uses_path_independent_codex_dedupe(left) && uses_path_independent_codex_dedupe(right) {
+            true
+        } else {
+            left.session.local_session_id_hash == right.session.local_session_id_hash
+        };
     left.provider == right.provider
         && left.source_id == right.source_id
         && left.session.started_at == right.session.started_at
-        && left.session.local_session_id_hash == right.session.local_session_id_hash
+        && session_matches
         && model_key(left) == model_key(right)
         && left.usage.input_tokens == right.usage.input_tokens
         && left.usage.cache_read_tokens == right.usage.cache_read_tokens
@@ -1044,15 +1818,32 @@ fn model_key(event: &UsageEvent) -> Option<&str> {
         .and_then(|model| model.normalized_name.as_deref().or(model.name.as_deref()))
 }
 
+fn session_hash_for_fingerprint(event: &UsageEvent) -> Option<&str> {
+    if uses_path_independent_codex_dedupe(event) {
+        None
+    } else {
+        event.session.local_session_id_hash.as_deref()
+    }
+}
+
+fn uses_path_independent_codex_dedupe(event: &UsageEvent) -> bool {
+    event.provider == "codex"
+        && event
+            .parse_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.source_record_id.as_deref())
+            .is_some_and(|record_id| record_id.contains(":codex_token_count:"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ai_stats_core::{
         event_id, summary_id, Confidence, CostInfo, EventSource, LocationOrigin, ModelInfo,
-        PrivacyInfo, PrivacyMode, SessionInfo, SourceKind, SummaryMetadata, UsageCounts,
-        UsageSummary, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+        ParseEvidence, PrivacyInfo, PrivacyMode, SessionInfo, SourceKind, SummaryMetadata,
+        UsageCounts, UsageSummary, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
     };
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use std::path::Path;
 
     #[test]
@@ -1168,6 +1959,90 @@ mod tests {
     }
 
     #[test]
+    fn refreshes_legacy_codex_token_count_duplicate_without_double_counting() {
+        let store = Store::in_memory().expect("store");
+        let source = ai_stats_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-token-count"),
+            LocationOrigin::Configured,
+            None,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut old_event = test_store_event(&source, now, "legacy-record");
+        old_event.session.session_id = "session-a".to_string();
+        old_event.session.local_session_id_hash = Some("session-a".to_string());
+        old_event.model = Some(ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        });
+        old_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v1".to_string(),
+            source_file_path_hash: Some("active-hash".to_string()),
+            source_line_number: Some(12),
+            source_record_id: Some(
+                "semantic_usage_event.v1:codex_token_count:session-a:1715510400000:gpt-5:12:0:3:0:15"
+                    .to_string(),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: ai_stats_core::IdentitySource::Unresolved,
+        });
+
+        let mut new_event = old_event.clone();
+        new_event.event_id = event_id("codex", &source.source_id, "modern-record", None, now);
+        new_event.session.session_id = "session-b".to_string();
+        new_event.session.local_session_id_hash = Some("session-b".to_string());
+        new_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v2".to_string(),
+            source_file_path_hash: Some("branch-hash".to_string()),
+            source_line_number: Some(48),
+            source_record_id: Some(
+                "semantic_usage_event.v2:codex_token_count:1715510400000:gpt-5:12:0:3:0:15"
+                    .to_string(),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: ai_stats_core::IdentitySource::Unresolved,
+        });
+
+        assert!(store.insert_event(&old_event).expect("insert old"));
+        let legacy_fingerprint = semantic_event_fingerprint(&SemanticFingerprintInput {
+            provider: &old_event.provider,
+            source_id: &old_event.source_id,
+            started_at: old_event.session.started_at,
+            session_hash: old_event.session.local_session_id_hash.as_deref(),
+            model_name: model_key(&old_event),
+            input_tokens: old_event.usage.input_tokens,
+            cache_read_tokens: old_event.usage.cache_read_tokens,
+            cache_creation_tokens: old_event.usage.cache_creation_tokens,
+            output_tokens: old_event.usage.output_tokens,
+            reasoning_tokens: old_event.usage.reasoning_tokens,
+            total_tokens: old_event.usage.computed_total(),
+        });
+        store
+            .conn
+            .execute(
+                "UPDATE usage_events SET semantic_fingerprint = ?1 WHERE event_id = ?2",
+                params![legacy_fingerprint, &old_event.event_id.0],
+            )
+            .expect("downgrade fingerprint");
+
+        assert!(!store
+            .insert_event(&new_event)
+            .expect("refresh legacy duplicate"));
+        assert_eq!(store.event_count().expect("count"), 1);
+        assert_eq!(
+            store.events().expect("events")[0].event_id,
+            old_event.event_id
+        );
+    }
+
+    #[test]
     fn insert_events_batches_in_one_transaction() {
         let store = Store::in_memory().expect("store");
         let source = ai_stats_core::SourceLocation::local_adapter(
@@ -1217,6 +2092,60 @@ mod tests {
     }
 
     #[test]
+    fn scan_file_state_tracks_only_changed_entries() {
+        let store = Store::in_memory().expect("store");
+        let source_id = SourceId("src_scan_cache".to_string());
+        let first = vec![
+            ScanFileStateEntry {
+                cache_key: "/tmp/a.jsonl".to_string(),
+                cache_signature: "sig-a-1".to_string(),
+            },
+            ScanFileStateEntry {
+                cache_key: "/tmp/b.jsonl".to_string(),
+                cache_signature: "sig-b-1".to_string(),
+            },
+        ];
+
+        let pending = store
+            .pending_scan_file_entries(&source_id, &first)
+            .expect("initial pending");
+        assert_eq!(pending, first);
+        store
+            .record_scan_file_entries(&source_id, &pending)
+            .expect("record");
+
+        let unchanged = store
+            .pending_scan_file_entries(&source_id, &first)
+            .expect("unchanged");
+        assert!(unchanged.is_empty());
+
+        let changed = vec![
+            ScanFileStateEntry {
+                cache_key: "/tmp/a.jsonl".to_string(),
+                cache_signature: "sig-a-2".to_string(),
+            },
+            ScanFileStateEntry {
+                cache_key: "/tmp/b.jsonl".to_string(),
+                cache_signature: "sig-b-1".to_string(),
+            },
+            ScanFileStateEntry {
+                cache_key: "/tmp/c.jsonl".to_string(),
+                cache_signature: "sig-c-1".to_string(),
+            },
+        ];
+        let pending = store
+            .pending_scan_file_entries(&source_id, &changed)
+            .expect("changed pending");
+        assert_eq!(pending.len(), 2);
+        assert!(pending
+            .iter()
+            .any(|entry| entry.cache_key == "/tmp/a.jsonl"));
+        assert!(pending
+            .iter()
+            .any(|entry| entry.cache_key == "/tmp/c.jsonl"));
+    }
+
+    #[test]
     fn sync_state_tracks_success_and_filters_after_cursor() {
         let store = Store::in_memory().expect("store");
         let source = ai_stats_core::SourceLocation::local_adapter(
@@ -1259,6 +2188,98 @@ mod tests {
             .expect("remaining");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].event_id, second.event_id);
+    }
+
+    #[test]
+    fn firestore_rollups_track_dirty_daily_buckets() {
+        let store = Store::in_memory().expect("store");
+        let source = ai_stats_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-firestore-rollups"),
+            LocationOrigin::Configured,
+            Some("personal".to_string()),
+        );
+        store.upsert_source(&source).expect("source");
+
+        let day = Utc
+            .with_ymd_and_hms(2026, 5, 28, 9, 0, 0)
+            .single()
+            .expect("day");
+        let account_id = ai_stats_core::provider_account_id("codex", "personal");
+        let mut first = test_store_event(&source, day, "record-a");
+        first.provider_account_id = Some(account_id.clone());
+        first.usage.total_tokens = Some(15);
+
+        assert!(store.insert_event(&first).expect("insert first"));
+        let dirty = store
+            .dirty_firestore_rollup_summaries()
+            .expect("dirty rollups after first");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].usage.total_tokens, Some(15));
+        assert_eq!(dirty[0].metadata.summary_format, "daily_rollup.v1");
+        assert_eq!(
+            dirty[0]
+                .period_start
+                .expect("period start")
+                .date_naive()
+                .to_string(),
+            "2026-05-28"
+        );
+
+        store
+            .mark_firestore_rollups_synced(&[dirty[0].summary_id.clone()])
+            .expect("mark clean");
+        assert!(store
+            .dirty_firestore_rollup_summaries()
+            .expect("no dirty after clean")
+            .is_empty());
+
+        let mut second = test_store_event(&source, day + chrono::Duration::hours(1), "record-b");
+        second.provider_account_id = Some(account_id);
+        second.usage.total_tokens = Some(25);
+
+        assert!(store.insert_event(&second).expect("insert second"));
+        let dirty = store
+            .dirty_firestore_rollup_summaries()
+            .expect("dirty rollups after second");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].usage.total_tokens, Some(40));
+        assert_eq!(dirty[0].usage.requests, Some(2));
+    }
+
+    #[test]
+    fn entity_sync_state_only_returns_changed_sources() {
+        let store = Store::in_memory().expect("store");
+        let mut source = ai_stats_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-sync-entities"),
+            LocationOrigin::Configured,
+            None,
+        );
+
+        let changed = store
+            .pending_sources_for_sync("firestore", "firestore:ai-stats-fire", &[source.clone()])
+            .expect("initial changed");
+        assert_eq!(changed.len(), 1);
+
+        store
+            .record_sources_synced("firestore", "firestore:ai-stats-fire", &[source.clone()])
+            .expect("record synced");
+        assert!(store
+            .pending_sources_for_sync("firestore", "firestore:ai-stats-fire", &[source.clone()])
+            .expect("unchanged")
+            .is_empty());
+
+        source.account_hint = Some("personal".to_string());
+        source.updated_at += chrono::Duration::seconds(1);
+        let changed = store
+            .pending_sources_for_sync("firestore", "firestore:ai-stats-fire", &[source])
+            .expect("changed after update");
+        assert_eq!(changed.len(), 1);
     }
 
     fn test_store_event(

@@ -22,7 +22,12 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 schemars.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+ureq.workspace = true
+tiny_http.workspace = true
+sha2.workspace = true
+percent-encoding.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

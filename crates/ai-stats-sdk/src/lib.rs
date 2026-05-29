@@ -225,7 +225,7 @@ mod tests {
             source_kind: SourceKind::Manual,
             source_name: "user_reported_usage".to_string(),
             evidence_id: Some("screenshot:2025-07-11".to_string()),
-            evidence_path: Some("/tmp/ccusage.png".to_string()),
+            evidence_path: Some("/tmp/user-report.png".to_string()),
             report_format: "manual_daily".to_string(),
             report_version: Some("manual.v1".to_string()),
             period_start: Some(

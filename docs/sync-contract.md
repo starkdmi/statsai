@@ -3,7 +3,9 @@
 `sync_batch.v1` is the first backend-facing contract for `ai-stats`.
 The collector owns local scanning, normalization, idempotent local storage, and
 privacy scrubbing. The backend owns authentication, validation, deduplication,
-rollups, and user-facing queries.
+rollups, and user-facing queries. The MVP Firebase path writes directly to
+Firestore under the authenticated user's namespace; a server-side ingestion
+gateway can be added later if deduplication or trusted rollups become necessary.
 
 ## Producer
 
@@ -11,6 +13,7 @@ The CLI produces a sync batch with:
 
 ```sh
 cargo run -p ai-stats-cli -- sync --sink stdout
+cargo run -p ai-stats-cli -- sync --sink firestore --since-last
 cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:3000/v1/sync/batches
 ```
 
@@ -40,9 +43,9 @@ Hashed path, account, source, event, and summary identifiers remain so the
 server can deduplicate records without seeing local file names or raw account
 labels.
 
-## Server Responsibilities
+## Local HTTP Endpoint
 
-A minimal backend ingestion endpoint should accept:
+An optional backend ingestion endpoint can accept:
 
 ```text
 POST /v1/sync/batches
@@ -58,13 +61,13 @@ cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8765/v
 cargo run -p ai-stats-cli -- sync --status
 ```
 
-The server should:
+Such a server should:
 
-- require an authenticated user or device token
-- accept `Authorization: Bearer <token>` when the collector is configured with `--auth-token` or `AI_STATS_SYNC_TOKEN`
+- require an authenticated Firebase user token
+- accept `Authorization: Bearer <firebase_id_token>` from stored auth, `--auth-token`, or `AI_STATS_SYNC_TOKEN`
 - validate the request body against `sync_batch.v1`
 - reject unsupported `schema_version` values
-- deduplicate sources, accounts, subscriptions, events, and summaries by their IDs
+- deduplicate sources, accounts, subscriptions, events, and summaries by their IDs when server-side deduplication is needed
 - treat collector IDs as stable client-provided IDs, not database primary keys exposed to users
 - compute daily and monthly rollups server-side from accepted events
 - return accepted, updated, duplicate, and rejected counts
@@ -105,10 +108,69 @@ the current source, account, and subscription metadata.
 The HTTP sink parses `sync_ack.v1` before updating local state. File and stdout
 sinks update state after their local write succeeds.
 
+## Firebase Production Backend
+
+The production MVP uses Firebase Auth plus direct Firestore writes. The CLI
+opens the hosted login page, stores Firebase credentials locally, refreshes ID
+tokens as needed, and writes synced data inside the authenticated user
+namespace:
+
+```text
+users/{uid}
+users/{uid}/devices/{deviceId}
+users/{uid}/syncBatches/{batchId}
+users/{uid}/sources/{sourceId}
+users/{uid}/accounts/{providerAccountId}
+users/{uid}/subscriptions/{subscriptionId}
+users/{uid}/events/{eventId}
+users/{uid}/summaries/{summaryId}
+```
+
+CLI login uses the hosted Firebase web app by default:
+
+```sh
+cargo run -p ai-stats-cli -- auth login
+cargo run -p ai-stats-cli -- auth status
+cargo run -p ai-stats-cli -- sync --sink firestore --since-last
+```
+
+The fallback `--client-id "$GOOGLE_CLIENT_ID"` login mode supports a custom
+Google OAuth Desktop client when needed. Firestore sync accepts
+`--firebase-project` and defaults to the configured `ai-stats-fire` project.
+Default Firestore sync mode is `stats`, which converts local events into daily
+rollup summaries before upload to reduce write volume. The CLI now persists
+those rollups locally and syncs only dirty rollups in `stats` mode instead of
+recomputing all summaries from raw events on every run. Hosted
+`--firestore-mode full` is gated off by default; use it only with the emulator
+or by explicitly setting `AI_STATS_ENABLE_HOSTED_FIRESTORE_FULL=1` for
+future/debug raw-event experiments.
+Large syncs are split into sub-batches (`--firestore-records-per-batch`) and
+each sub-batch uses Firestore commit chunks (`--firestore-commit-writes`).
+Successful sub-batches update local sync state immediately, so `--since-last`
+resumes from the last completed cursor after quota or network failures.
+Unchanged source/account/subscription metadata is skipped, and if nothing has
+changed locally the CLI performs no hosted Firestore writes.
+
+For local tests, set `FIRESTORE_EMULATOR_HOST=127.0.0.1:8080` and run against
+the Firebase emulator suite instead of production. Optionally set
+`AI_STATS_FIRESTORE_TEST_UID` to force a stable local UID without login.
+
+Auth token precedence for sync is:
+
+```text
+--auth-token > AI_STATS_SYNC_TOKEN > stored Firebase auth
+```
+
+Firestore rules allow authenticated users to read only their own namespace.
+Client writes are allowed only under selected user-owned collections
+(`devices`, `syncBatches`, `sources`, `accounts`, `subscriptions`, `summaries`).
+Hosted rules deny writes to `users/{uid}/events/*` to prevent accidental
+high-volume per-event sync on no-cost quota, and the CLI now blocks hosted
+direct `full` mode unless explicitly overridden.
+The HTTPS function remains optional scaffold for a later server-side gateway.
+
 ## Open Decisions
 
 - Whether the first backend stores sanitized event payloads as JSON blobs first,
   then promotes indexed columns later.
-- Whether periodic sync should send only new records after local sync state is
-  added, or continue sending full idempotent batches for the first backend MVP.
-- Whether auth starts with device tokens or OAuth device flow.
+- Whether periodic sync should use a launch agent/service, an app daemon, or both.

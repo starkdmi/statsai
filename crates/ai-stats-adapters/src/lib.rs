@@ -15,20 +15,46 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
 pub const CLAUDE_CODE_PROVIDER: &str = "claude_code";
 pub const CODEX_PROVIDER: &str = "codex";
-const EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
+const SESSION_SCOPED_EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
+const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v2";
+const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventDeduplication {
+    SessionScoped,
+    PathIndependent,
+}
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub device_id: String,
+    pub selected_cache_keys: Option<HashSet<String>>,
+}
+
+impl ScanOptions {
+    fn should_scan(&self, cache_key: &str) -> bool {
+        self.selected_cache_keys
+            .as_ref()
+            .is_none_or(|selected| selected.contains(cache_key))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanCandidateFile {
+    pub path: PathBuf,
+    pub cache_key: String,
+    pub cache_signature: String,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ScanDiagnostics {
     pub files_scanned: u64,
+    pub files_skipped_unchanged: u64,
     pub raw_rows: u64,
     pub candidate_usage_rows: u64,
     pub accepted_events: u64,
@@ -51,6 +77,7 @@ pub trait ProviderAdapter {
     fn version(&self) -> &'static str;
     fn provider(&self) -> &'static str;
     fn discover(&self) -> Vec<SourceLocation>;
+    fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>>;
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan>;
 }
 
@@ -99,6 +126,10 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         sources
     }
 
+    fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+        claude_scan_candidates(source, self.version())
+    }
+
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
         scan_claude_source(self, source, options)
     }
@@ -140,6 +171,10 @@ impl ProviderAdapter for CodexAdapter {
         }
 
         sources
+    }
+
+    fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+        codex_scan_candidates(source, self.version())
     }
 
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
@@ -214,67 +249,22 @@ fn scan_claude_source(
     source: &SourceLocation,
     options: &ScanOptions,
 ) -> Result<AdapterScan> {
+    let mut scan = AdapterScan::default();
     let Some(path_label) = source
         .path_label
         .as_deref()
         .filter(|label| !label.is_empty())
     else {
-        return Ok(AdapterScan::default());
+        return Ok(scan);
     };
     let root = normalize_claude_config_root(Path::new(path_label));
     if !root.exists() {
-        return Ok(AdapterScan::default());
+        return Ok(scan);
     }
 
-    let mut scan = AdapterScan::default();
     let projects = root.join("projects");
-    if projects.is_dir() {
-        let files = collect_jsonl_files(&projects)?;
-        let mut seen = HashSet::new();
-        {
-            let mut ctx = FileParseContext {
-                adapter,
-                source,
-                options,
-                scan: &mut scan,
-                seen: &mut seen,
-            };
-            for file in files {
-                ctx.scan.diagnostics.files_scanned += 1;
-                parse_claude_file(&mut ctx, &projects, &file)?;
-            }
-        }
-    }
-    parse_claude_stats_cache(adapter, source, options, &root, &mut scan)?;
-    scan.diagnostics.accepted_events = scan.events.len() as u64;
-    Ok(scan)
-}
-
-fn scan_codex_source(
-    adapter: &CodexAdapter,
-    source: &SourceLocation,
-    options: &ScanOptions,
-) -> Result<AdapterScan> {
-    let Some(path_label) = source
-        .path_label
-        .as_deref()
-        .filter(|label| !label.is_empty())
-    else {
-        return Ok(AdapterScan::default());
-    };
-    let root = PathBuf::from(path_label);
-    let mut roots = Vec::new();
-    for child in ["sessions", "archived_sessions"] {
-        let path = root.join(child);
-        if path.is_dir() {
-            roots.push(path);
-        }
-    }
-    if roots.is_empty() && root.is_dir() {
-        roots.push(root.clone());
-    }
-
-    let mut scan = AdapterScan::default();
+    let cache_namespace = scan_cache_namespace(source, adapter.version());
+    let event_files = claude_jsonl_candidates(&projects, &cache_namespace)?;
     let mut seen = HashSet::new();
     {
         let mut ctx = FileParseContext {
@@ -284,11 +274,60 @@ fn scan_codex_source(
             scan: &mut scan,
             seen: &mut seen,
         };
-        for usage_root in roots {
-            for file in collect_jsonl_files(&usage_root)? {
-                ctx.scan.diagnostics.files_scanned += 1;
-                parse_codex_file(&mut ctx, &root, &usage_root, &file)?;
+        for candidate in event_files {
+            if !options.should_scan(&candidate.cache_key) {
+                ctx.scan.diagnostics.files_skipped_unchanged += 1;
+                continue;
             }
+            ctx.scan.diagnostics.files_scanned += 1;
+            parse_claude_file(&mut ctx, &projects, &candidate.path)?;
+        }
+    }
+
+    if let Some(candidate) = claude_stats_cache_candidate(&root, &cache_namespace) {
+        if options.should_scan(&candidate.cache_key) {
+            scan.diagnostics.files_scanned += 1;
+            parse_claude_stats_cache(adapter, source, options, &candidate.path, &mut scan)?;
+        } else {
+            scan.diagnostics.files_skipped_unchanged += 1;
+        }
+    }
+    scan.diagnostics.accepted_events = scan.events.len() as u64;
+    Ok(scan)
+}
+
+fn scan_codex_source(
+    adapter: &CodexAdapter,
+    source: &SourceLocation,
+    options: &ScanOptions,
+) -> Result<AdapterScan> {
+    let mut scan = AdapterScan::default();
+    let Some(path_label) = source
+        .path_label
+        .as_deref()
+        .filter(|label| !label.is_empty())
+    else {
+        return Ok(scan);
+    };
+    let root = PathBuf::from(path_label);
+    let cache_namespace = scan_cache_namespace(source, adapter.version());
+    let mut seen = HashSet::new();
+    {
+        let mut ctx = FileParseContext {
+            adapter,
+            source,
+            options,
+            scan: &mut scan,
+            seen: &mut seen,
+        };
+        for candidate in codex_jsonl_candidates(source, &root, &cache_namespace)? {
+            if !options.should_scan(&candidate.cache_key) {
+                ctx.scan.diagnostics.files_skipped_unchanged += 1;
+                continue;
+            }
+            let usage_root = codex_usage_root_for_file(&root, &candidate.path);
+            ctx.scan.diagnostics.files_scanned += 1;
+            parse_codex_file(&mut ctx, &root, &usage_root, &candidate.path)?;
         }
     }
     if source.account_hint.is_none() {
@@ -322,6 +361,154 @@ fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort_by_cached_key(|path| path.to_string_lossy().into_owned());
     Ok(files)
+}
+
+fn claude_scan_candidates(
+    source: &SourceLocation,
+    adapter_version: &str,
+) -> Result<Vec<ScanCandidateFile>> {
+    let Some(path_label) = source
+        .path_label
+        .as_deref()
+        .filter(|label| !label.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let root = normalize_claude_config_root(Path::new(path_label));
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let cache_namespace = scan_cache_namespace(source, adapter_version);
+
+    let mut candidates = claude_jsonl_candidates(&root.join("projects"), &cache_namespace)?;
+    if let Some(candidate) = claude_stats_cache_candidate(&root, &cache_namespace) {
+        candidates.push(candidate);
+    }
+    Ok(candidates)
+}
+
+fn claude_jsonl_candidates(root: &Path, cache_namespace: &str) -> Result<Vec<ScanCandidateFile>> {
+    collect_jsonl_files(root)?
+        .into_iter()
+        .map(|path| Ok(scan_candidate(path, None, cache_namespace)))
+        .collect()
+}
+
+fn claude_stats_cache_candidate(root: &Path, cache_namespace: &str) -> Option<ScanCandidateFile> {
+    let path = root.join("stats-cache.json");
+    path.is_file()
+        .then(|| scan_candidate(path, None, cache_namespace))
+}
+
+fn codex_scan_candidates(
+    source: &SourceLocation,
+    adapter_version: &str,
+) -> Result<Vec<ScanCandidateFile>> {
+    let Some(path_label) = source
+        .path_label
+        .as_deref()
+        .filter(|label| !label.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let root = PathBuf::from(path_label);
+    let cache_namespace = scan_cache_namespace(source, adapter_version);
+    codex_jsonl_candidates(source, &root, &cache_namespace)
+}
+
+fn codex_jsonl_candidates(
+    source: &SourceLocation,
+    root: &Path,
+    cache_namespace: &str,
+) -> Result<Vec<ScanCandidateFile>> {
+    let mut roots = Vec::new();
+    for child in ["sessions", "archived_sessions"] {
+        let path = root.join(child);
+        if path.is_dir() {
+            roots.push(path);
+        }
+    }
+    if roots.is_empty() && root.is_dir() {
+        roots.push(root.to_path_buf());
+    }
+
+    let auth_dependency = source
+        .account_hint
+        .is_none()
+        .then(|| file_metadata_signature(&root.join("auth.json")));
+    let dependency = auth_dependency.as_deref();
+    let mut candidates = Vec::new();
+    for usage_root in roots {
+        for path in collect_jsonl_files(&usage_root)? {
+            candidates.push(scan_candidate(path, dependency, cache_namespace));
+        }
+    }
+    Ok(candidates)
+}
+
+fn codex_usage_root_for_file(root: &Path, path: &Path) -> PathBuf {
+    for child in ["sessions", "archived_sessions"] {
+        let usage_root = root.join(child);
+        if path.starts_with(&usage_root) {
+            return usage_root;
+        }
+    }
+    root.to_path_buf()
+}
+
+fn scan_candidate(
+    path: PathBuf,
+    dependency_signature: Option<&str>,
+    cache_namespace: &str,
+) -> ScanCandidateFile {
+    let cache_key = canonical_display(&path);
+    let file_signature = file_metadata_signature(&path);
+    let cache_signature = dependency_signature
+        .map(|dependency| hash_text(&format!("{cache_namespace}:{file_signature}:{dependency}")))
+        .unwrap_or_else(|| hash_text(&format!("{cache_namespace}:{file_signature}")));
+    ScanCandidateFile {
+        path,
+        cache_key,
+        cache_signature,
+    }
+}
+
+fn scan_cache_namespace(source: &SourceLocation, adapter_version: &str) -> String {
+    let adapter_id = source.adapter_id.as_deref().unwrap_or("");
+    let account_hint = source.account_hint.as_deref().unwrap_or("");
+    let path_hash = source.path_hash.as_deref().unwrap_or("");
+    hash_text(&format!(
+        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{adapter_version}:{account_hint}:{path_hash}",
+        source.provider, source.source_kind
+    ))
+}
+
+fn file_metadata_signature(path: &Path) -> String {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return "missing".to_string();
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok());
+    let (seconds, nanos) = modified
+        .map(|value| (value.as_secs(), value.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let created = metadata
+        .created()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok());
+    let (created_seconds, created_nanos) = created
+        .map(|value| (value.as_secs(), value.subsec_nanos()))
+        .unwrap_or((0, 0));
+    hash_text(&format!(
+        "meta.v2:{}:{}:{}:{}:{}",
+        metadata.len(),
+        seconds,
+        nanos,
+        created_seconds,
+        created_nanos
+    ))
 }
 
 struct FileParseContext<'a, A: ProviderAdapter + ?Sized> {
@@ -397,6 +584,7 @@ fn parse_claude_file(
                 line_number: index + 1,
                 model_inferred,
                 timestamp_inferred,
+                deduplication: EventDeduplication::SessionScoped,
             },
         );
         push_deduped(ctx.scan, ctx.seen, event);
@@ -409,17 +597,13 @@ fn parse_claude_stats_cache(
     adapter: &ClaudeCodeAdapter,
     source: &SourceLocation,
     options: &ScanOptions,
-    root: &Path,
+    path: &Path,
     scan: &mut AdapterScan,
 ) -> Result<()> {
-    let path = root.join("stats-cache.json");
     if !path.is_file() {
         return Ok(());
     }
-
-    scan.diagnostics.files_scanned += 1;
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let value: Value =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     let Some(model_usage) = value.get("modelUsage").and_then(Value::as_object) else {
@@ -432,7 +616,7 @@ fn parse_claude_stats_cache(
         .and_then(timestamp_from_scalar);
     let period_end = value.get("lastComputedDate").and_then(stats_cache_date_end);
     let observed_at = period_end
-        .or_else(|| file_modified_timestamp(&path))
+        .or_else(|| file_modified_timestamp(path))
         .unwrap_or_else(Utc::now);
     let metadata = SummaryMetadata {
         summary_format: "claude_stats_cache".to_string(),
@@ -444,7 +628,7 @@ fn parse_claude_stats_cache(
         total_messages: value.get("totalMessages").and_then(value_as_u64),
         last_computed_at: period_end,
     };
-    let file_path_hash = hash_text(&canonical_display(&path));
+    let file_path_hash = hash_text(&canonical_display(path));
 
     for (model_name, usage_value) in model_usage {
         scan.diagnostics.candidate_usage_rows += 1;
@@ -562,7 +746,8 @@ fn parse_codex_file(
             continue;
         }
 
-        let usage = if is_codex_token_count(&value) {
+        let is_token_count_event = is_codex_token_count(&value);
+        let usage = if is_token_count_event {
             let info = value.pointer("/payload/info");
             let total_usage = info
                 .and_then(|info| info.get("total_token_usage"))
@@ -639,7 +824,7 @@ fn parse_codex_file(
                 session_raw: event_session_raw,
                 project_key,
                 project_label: None,
-                event_kind: if is_codex_token_count(&value) {
+                event_kind: if is_token_count_event {
                     "codex_token_count"
                 } else {
                     "codex_headless_usage"
@@ -648,6 +833,11 @@ fn parse_codex_file(
                 line_number: index + 1,
                 model_inferred,
                 timestamp_inferred,
+                deduplication: if is_token_count_event {
+                    EventDeduplication::PathIndependent
+                } else {
+                    EventDeduplication::SessionScoped
+                },
             },
         );
         push_deduped(ctx.scan, ctx.seen, event);
@@ -681,6 +871,7 @@ struct ProviderEventParts<'a> {
     line_number: usize,
     model_inferred: bool,
     timestamp_inferred: bool,
+    deduplication: EventDeduplication,
 }
 
 fn usage_event<A: ProviderAdapter + ?Sized>(
@@ -695,18 +886,37 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
         .as_ref()
         .and_then(|model| model.normalized_name.as_deref().or(model.name.as_deref()))
         .unwrap_or("unknown");
-    let semantic_key = format!(
-        "{EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-        parts.event_kind,
-        session_hash,
-        parts.timestamp.timestamp_millis(),
-        model_key,
-        parts.usage.input_tokens.unwrap_or(0),
-        parts.usage.cache_read_tokens.unwrap_or(0),
-        parts.usage.output_tokens.unwrap_or(0),
-        parts.usage.reasoning_tokens.unwrap_or(0),
-        parts.usage.computed_total()
-    );
+    let (event_key_version, semantic_key) = match parts.deduplication {
+        EventDeduplication::SessionScoped => (
+            SESSION_SCOPED_EVENT_KEY_VERSION,
+            format!(
+                "{SESSION_SCOPED_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                parts.event_kind,
+                session_hash,
+                parts.timestamp.timestamp_millis(),
+                model_key,
+                parts.usage.input_tokens.unwrap_or(0),
+                parts.usage.cache_read_tokens.unwrap_or(0),
+                parts.usage.output_tokens.unwrap_or(0),
+                parts.usage.reasoning_tokens.unwrap_or(0),
+                parts.usage.computed_total()
+            ),
+        ),
+        EventDeduplication::PathIndependent => (
+            PATH_INDEPENDENT_EVENT_KEY_VERSION,
+            format!(
+                "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}",
+                parts.event_kind,
+                parts.timestamp.timestamp_millis(),
+                model_key,
+                parts.usage.input_tokens.unwrap_or(0),
+                parts.usage.cache_read_tokens.unwrap_or(0),
+                parts.usage.output_tokens.unwrap_or(0),
+                parts.usage.reasoning_tokens.unwrap_or(0),
+                parts.usage.computed_total()
+            ),
+        ),
+    };
     let event_id = semantic_event_id(adapter.provider(), &source.source_id, &semantic_key);
     let file_path_hash = hash_text(&canonical_display(parts.source_file));
     let source_record_id = format!("usage_key_{}", &hash_text(&semantic_key)[..32]);
@@ -755,7 +965,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
         runtime: None,
         cost,
         parse_evidence: Some(ParseEvidence {
-            event_key_version: EVENT_KEY_VERSION.to_string(),
+            event_key_version: event_key_version.to_string(),
             source_file_path_hash: Some(file_path_hash),
             source_line_number: Some(parts.line_number as u64),
             source_record_id: Some(semantic_key),
@@ -1213,6 +1423,7 @@ mod tests {
     fn options() -> ScanOptions {
         ScanOptions {
             device_id: "device".to_string(),
+            selected_cache_keys: None,
         }
     }
 
@@ -1341,6 +1552,50 @@ mod tests {
     }
 
     #[test]
+    fn claude_scan_respects_selected_cache_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let projects = dir.path().join("projects");
+        std::fs::create_dir_all(&projects).expect("projects");
+
+        let first = projects.join("a.jsonl");
+        let second = projects.join("b.jsonl");
+        std::fs::write(
+            &first,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        )
+        .expect("first");
+        std::fs::write(
+            &second,
+            "{\"timestamp\":\"2026-05-01T00:01:00Z\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n",
+        )
+        .expect("second");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+            None,
+        );
+        let selected = [canonical_display(&first)].into_iter().collect();
+        let scan = scan_claude_source(
+            &ClaudeCodeAdapter,
+            &source,
+            &ScanOptions {
+                device_id: "device".to_string(),
+                selected_cache_keys: Some(selected),
+            },
+        )
+        .expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.diagnostics.files_scanned, 1);
+        assert_eq!(scan.diagnostics.files_skipped_unchanged, 1);
+        assert_eq!(scan.events[0].usage.computed_total(), 3);
+    }
+
+    #[test]
     fn codex_source_scans_sessions_and_archived_sessions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
@@ -1373,6 +1628,236 @@ mod tests {
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
         assert_eq!(scan.events.len(), 2);
         assert_eq!(scan.diagnostics.raw_rows, 2);
+    }
+
+    #[test]
+    fn codex_scan_respects_selected_cache_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let first = sessions.join("a.jsonl");
+        let second = sessions.join("b.jsonl");
+        std::fs::write(
+            &first,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("first");
+        std::fs::write(
+            &second,
+            "{\"timestamp\":\"2026-05-01T00:01:00Z\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}\n",
+        )
+        .expect("second");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+            None,
+        );
+
+        let selected = [canonical_display(&second)].into_iter().collect();
+        let scan = scan_codex_source(
+            &CodexAdapter,
+            &source,
+            &ScanOptions {
+                device_id: "device".to_string(),
+                selected_cache_keys: Some(selected),
+            },
+        )
+        .expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.diagnostics.files_scanned, 1);
+        assert_eq!(scan.diagnostics.files_skipped_unchanged, 1);
+        assert_eq!(scan.events[0].usage.computed_total(), 7);
+    }
+
+    #[test]
+    fn codex_scan_candidates_change_when_auth_json_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let session_path = sessions.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("session");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            "{\"chatgpt_account_id\":\"acct-one\"}\n",
+        )
+        .expect("auth one");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+            None,
+        );
+
+        let first = codex_scan_candidates(&source, "test-adapter").expect("first candidates");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            dir.path().join("auth.json"),
+            "{\"chatgpt_account_id\":\"acct-two\"}\n",
+        )
+        .expect("auth two");
+        let second = codex_scan_candidates(&source, "test-adapter").expect("second candidates");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].cache_key, canonical_display(&session_path));
+        assert_ne!(first[0].cache_signature, second[0].cache_signature);
+    }
+
+    #[test]
+    fn codex_scan_candidates_change_when_account_hint_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let session_path = sessions.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("session");
+
+        let hinted = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+            Some("personal".to_string()),
+        );
+        let remapped = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+            Some("work".to_string()),
+        );
+
+        let first = codex_scan_candidates(&hinted, "test-adapter").expect("first candidates");
+        let second = codex_scan_candidates(&remapped, "test-adapter").expect("second candidates");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].cache_key, canonical_display(&session_path));
+        assert_ne!(first[0].cache_signature, second[0].cache_signature);
+    }
+
+    #[test]
+    fn codex_dedupes_copied_branch_history_and_keeps_branch_delta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+
+        let mut parent =
+            File::create(sessions.join("2026-05-12T08-00-00-parent.jsonl")).expect("parent");
+        writeln!(
+            parent,
+            r#"{{"timestamp":"2026-05-12T08:00:00.000Z","type":"turn_context","payload":{{"model":"gpt-5.2"}}}}"#
+        )
+        .expect("write parent context");
+        writeln!(
+            parent,
+            r#"{{"timestamp":"2026-05-12T08:01:00.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":200,"reasoning_output_tokens":20,"total_tokens":1200}}}}}}}}"#
+        )
+        .expect("write parent tokens");
+
+        let mut branch =
+            File::create(sessions.join("2026-05-12T08-02-00-branch.jsonl")).expect("branch");
+        writeln!(
+            branch,
+            r#"{{"timestamp":"2026-05-12T08:00:00.000Z","type":"turn_context","payload":{{"model":"gpt-5.2"}}}}"#
+        )
+        .expect("write branch context");
+        writeln!(
+            branch,
+            r#"{{"timestamp":"2026-05-12T08:01:00.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":200,"reasoning_output_tokens":20,"total_tokens":1200}}}}}}}}"#
+        )
+        .expect("write branch copied parent tokens");
+        writeln!(
+            branch,
+            r#"{{"timestamp":"2026-05-12T08:02:00.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":1600,"cached_input_tokens":300,"output_tokens":450,"reasoning_output_tokens":40,"total_tokens":2050}}}}}}}}"#
+        )
+        .expect("write branch delta tokens");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+            None,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(scan.diagnostics.duplicate_events, 1);
+
+        assert_eq!(scan.events[0].usage.input_tokens, Some(1000));
+        assert_eq!(scan.events[0].usage.cache_read_tokens, Some(100));
+        assert_eq!(scan.events[0].usage.output_tokens, Some(200));
+        assert_eq!(scan.events[0].usage.reasoning_tokens, Some(20));
+        assert_eq!(scan.events[0].usage.total_tokens, Some(1200));
+
+        assert_eq!(scan.events[1].usage.input_tokens, Some(600));
+        assert_eq!(scan.events[1].usage.cache_read_tokens, Some(200));
+        assert_eq!(scan.events[1].usage.output_tokens, Some(250));
+        assert_eq!(scan.events[1].usage.reasoning_tokens, Some(20));
+        assert_eq!(scan.events[1].usage.total_tokens, Some(850));
+    }
+
+    #[test]
+    fn codex_prefers_active_session_copy_over_archived_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        let archived = dir.path().join("archived_sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(&archived).expect("archived");
+
+        let active_path = sessions.join("dup.jsonl");
+        let archived_path = archived.join("dup.jsonl");
+        std::fs::write(
+            &active_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("active write");
+        std::fs::write(
+            &archived_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("archived write");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+            None,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+        let active_hash = hash_text(&canonical_display(&active_path));
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.diagnostics.duplicate_events, 1);
+        assert_eq!(
+            scan.events[0]
+                .parse_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.source_file_path_hash.as_deref()),
+            Some(active_hash.as_str())
+        );
     }
 
     #[test]

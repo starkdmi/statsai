@@ -146,13 +146,14 @@ fn content_type_json() -> Header {
 
 #[cfg(feature = "watch")]
 mod watch {
-    use ai_stats_adapters::{default_adapters, ProviderAdapter, ScanOptions};
+    use ai_stats_adapters::{default_adapters, ProviderAdapter, ScanCandidateFile, ScanOptions};
     use ai_stats_core::{
-        provider_account_id, IdentitySource, SourceLocation, UsageEvent, UsageSummary,
+        provider_account_id, IdentitySource, SourceKind, SourceLocation, UsageEvent, UsageSummary,
     };
-    use ai_stats_store::Store;
+    use ai_stats_store::{ScanFileStateEntry, Store};
     use anyhow::{Context, Result};
     use notify::{Event, EventKind, RecursiveMode, Watcher};
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -213,17 +214,26 @@ mod watch {
 
         if let Ok(configured) = store.list_sources() {
             for source in configured {
+                if source.source_kind != SourceKind::LocalAdapter {
+                    continue;
+                }
                 if let Some(label) = source.path_label.as_deref().filter(|p| !p.is_empty()) {
-                    paths.push(PathBuf::from(label));
+                    let path = PathBuf::from(label);
+                    if path.is_dir() && !paths.contains(&path) {
+                        paths.push(path);
+                    }
                 }
             }
         }
 
         for adapter in default_adapters() {
             for source in adapter.discover() {
+                if source.source_kind != SourceKind::LocalAdapter {
+                    continue;
+                }
                 if let Some(label) = source.path_label.as_deref().filter(|p| !p.is_empty()) {
                     let path = PathBuf::from(label);
-                    if !paths.contains(&path) {
+                    if path.is_dir() && !paths.contains(&path) {
                         paths.push(path);
                     }
                 }
@@ -246,29 +256,76 @@ mod watch {
         for adapter in &adapters {
             let sources = scan_sources_for_paths(adapter.as_ref(), &configured, changed);
             for source in sources {
+                let cache_candidates = match adapter.scan_candidates(&source) {
+                    Ok(candidates) => candidates,
+                    Err(e) => {
+                        eprintln!(
+                            "daemon: scan candidate discovery failed for {}: {e}",
+                            source.path_label.as_deref().unwrap_or("unknown")
+                        );
+                        continue;
+                    }
+                };
+                let file_cache_entries = scan_file_state_entries(&cache_candidates);
+                let pending_file_entries =
+                    match store.pending_scan_file_entries(&source.source_id, &file_cache_entries) {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            eprintln!(
+                                "daemon: scan cache lookup failed for {}: {e}",
+                                source.path_label.as_deref().unwrap_or("unknown")
+                            );
+                            continue;
+                        }
+                    };
+                if pending_file_entries.is_empty() {
+                    continue;
+                }
                 let options = ScanOptions {
                     device_id: device_id.to_string(),
+                    selected_cache_keys: Some(
+                        pending_file_entries
+                            .iter()
+                            .map(|entry| entry.cache_key.clone())
+                            .collect::<HashSet<_>>(),
+                    ),
                 };
                 match adapter.scan(&source, &options) {
                     Ok(mut scan) => {
                         apply_source_account_hint(&source, &mut scan.events, &mut scan.summaries);
-                        if !scan.events.is_empty() || !scan.summaries.is_empty() {
-                            let events = scan.events.len();
-                            let summaries = scan.summaries.len();
-                            if let Err(e) = store.insert_events(&scan.events) {
+                        let parsed_events = scan.events.len();
+                        let parsed_summaries = scan.summaries.len();
+                        let inserted_events = match store.insert_events(&scan.events) {
+                            Ok(count) => count,
+                            Err(e) => {
                                 eprintln!("daemon: insert events failed: {e}");
+                                continue;
                             }
-                            if let Err(e) = store.upsert_summaries(&scan.summaries) {
+                        };
+                        let written_summaries = match store.upsert_summaries(&scan.summaries) {
+                            Ok(count) => count,
+                            Err(e) => {
                                 eprintln!("daemon: insert summaries failed: {e}");
+                                continue;
                             }
-                            eprintln!(
-                                "daemon: rescanned {} ({}) — {} new events, {} summaries",
-                                source.provider,
-                                source.path_label.as_deref().unwrap_or("unknown"),
-                                events,
-                                summaries
-                            );
+                        };
+                        if let Err(e) =
+                            store.record_scan_file_entries(&source.source_id, &pending_file_entries)
+                        {
+                            eprintln!("daemon: update scan cache failed: {e}");
+                            continue;
                         }
+                        eprintln!(
+                            "daemon: rescanned {} ({}) — files={}, cached={}, parsed_events={}, inserted_events={}, parsed_summaries={}, summaries_written={}",
+                            source.provider,
+                            source.path_label.as_deref().unwrap_or("unknown"),
+                            scan.diagnostics.files_scanned,
+                            scan.diagnostics.files_skipped_unchanged,
+                            parsed_events,
+                            inserted_events,
+                            parsed_summaries,
+                            written_summaries
+                        );
                     }
                     Err(e) => {
                         eprintln!(
@@ -289,7 +346,11 @@ mod watch {
         let mut sources = Vec::new();
         for source in configured
             .iter()
-            .filter(|s| s.enabled && s.provider == adapter.provider())
+            .filter(|s| {
+                s.enabled
+                    && s.source_kind == SourceKind::LocalAdapter
+                    && s.provider == adapter.provider()
+            })
             .cloned()
         {
             if source.path_label.is_some() && source_in_changed_paths(&source, changed) {
@@ -297,7 +358,7 @@ mod watch {
             }
         }
         for source in adapter.discover() {
-            if source.path_label.is_none() {
+            if source.source_kind != SourceKind::LocalAdapter || source.path_label.is_none() {
                 continue;
             }
             if source_in_changed_paths(&source, changed)
@@ -340,6 +401,16 @@ mod watch {
         changed.iter().any(|changed_path| {
             changed_path.starts_with(&source_path) || source_path.starts_with(changed_path)
         })
+    }
+
+    fn scan_file_state_entries(candidates: &[ScanCandidateFile]) -> Vec<ScanFileStateEntry> {
+        candidates
+            .iter()
+            .map(|candidate| ScanFileStateEntry {
+                cache_key: candidate.cache_key.clone(),
+                cache_signature: candidate.cache_signature.clone(),
+            })
+            .collect()
     }
 }
 

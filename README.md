@@ -15,7 +15,7 @@ Status: early implementation. The public API is not stable yet.
 - abstract sync sinks for stdout/file today and Firebase/Supabase/HTTP later
 - a loopback-only daemon API for local widgets and toolbar integrations
 
-The first adapters target Claude Code JSONL usage roots and Codex session logs. External reports from tools like `ccusage`, screenshots transcribed by a user, or provider `/usage` summaries are supported as reported summary imports. They stay separate from trusted raw local events so reports can show direct usage and imported/manual gaps without double-counting.
+The first adapters target Claude Code JSONL usage roots and Codex session logs. External aggregate reports, manually transcribed screenshots, or provider `/usage` summaries are supported as reported summary imports. They stay separate from trusted raw local events so reports can show direct usage and imported/manual gaps without double-counting.
 
 ## Workspace
 
@@ -40,6 +40,10 @@ cargo run -p ai-stats-cli -- sync --sink file --output ./ai-stats-sync-batch.jso
 cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:3000/v1/sync/batches
 cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:3000/v1/sync/batches --since-last
 cargo run -p ai-stats-cli -- sync --status
+cargo run -p ai-stats-cli -- auth login
+cargo run -p ai-stats-cli -- auth status
+cargo run -p ai-stats-cli -- sync --sink firestore --since-last
+cargo run -p ai-stats-cli -- sync --sink firestore --since-last --firestore-mode stats
 cargo run -p ai-stats-cli -- schema sync-batch
 ```
 
@@ -50,6 +54,7 @@ codex account=work path=~/.codex-work usage_events=123 input=1,000,000 cached=80
 ```
 
 `scan` persists normalized events idempotently. Re-running it refreshes existing rows when adapter metadata improves, so new token split or estimated cost fields can be backfilled without duplicating events.
+Normal scans now keep a lightweight per-source file signature cache in SQLite and skip unchanged JSONL/stat summary files, so repeat scans usually only parse the currently active log files. The diagnostics line includes `cached=` for files skipped as unchanged.
 
 `report weekly`, `report monthly`, and `report all-time` group stored usage by provider and account. Text output is human-readable; `--json --verbose` includes source IDs, local path labels, token split totals, and `estimated_cost_usd` for SDKs or scripts.
 
@@ -64,3 +69,57 @@ Local paths are hashed in source identity fields. `path_label` exists for local 
 Estimated cost is API-equivalent, not a subscription invoice. It uses known provider pricing for recognized models and remains `unknown` when a local log does not prove the billable model.
 
 The backend-facing sync contract starts at `sync_batch.v1`. See `docs/sync-contract.md` for the current ingestion boundary, privacy defaults, and a minimal fixture.
+
+## Firebase Backend
+
+This repository includes Firebase scaffold files for production sync:
+
+- `web/login/`: hosted Firebase Auth login page for the CLI loopback flow
+- `firestore.rules`: user-scoped read/write rules for direct CLI sync
+- `functions/`: optional HTTPS ingestion scaffold for a later server-side sync gateway
+- `firebase.json`, `.firebaserc`: Firebase CLI project config
+
+Production login opens the hosted Firebase Auth page in the browser and stores
+Firebase credentials locally in `~/.ai-stats/auth.json`:
+
+```sh
+cargo run -p ai-stats-cli -- auth login
+cargo run -p ai-stats-cli -- auth status
+cargo run -p ai-stats-cli -- sync --sink firestore --since-last
+```
+
+After login, Firestore and HTTP sync automatically use the stored Firebase ID
+token unless `--auth-token` or `AI_STATS_SYNC_TOKEN` is supplied. The
+`--client-id "$GOOGLE_CLIENT_ID"` login path is still available as an escape
+hatch for a custom desktop OAuth client.
+
+Firestore sync sends writes through Firestore Commit API batches and prints
+progress by sub-batch/chunk. In the default `stats` mode, the CLI now maintains
+local daily rollup summaries and syncs only the dirty rollups instead of
+rescanning all raw events on every run. Unchanged source/account/subscription
+metadata is skipped, and an empty sync no longer writes bookkeeping docs.
+
+Default Firestore mode is `stats`, which uploads cached daily summary documents
+for production sync. Hosted `--firestore-mode full` is disabled by default as a
+guardrail because direct per-event writes are too expensive for the intended
+production flow. Use `--firestore-mode full` only with the emulator or by
+explicitly setting `AI_STATS_ENABLE_HOSTED_FIRESTORE_FULL=1` for future/debug
+experiments.
+
+If you already have a populated local store from older builds, run one full
+stats sync once to bootstrap the local rollup cache:
+
+```sh
+cargo run -p ai-stats-cli -- sync --sink firestore --firestore-mode stats
+```
+
+### Local Firebase Tests
+
+Use the Firestore emulator for local integration tests:
+
+```sh
+export FIRESTORE_EMULATOR_HOST="127.0.0.1:8080"
+export AI_STATS_FIRESTORE_TEST_UID="local-dev-user"
+firebase emulators:start --only firestore,auth
+cargo run -p ai-stats-cli -- sync --sink firestore --firestore-mode stats --since-last
+```

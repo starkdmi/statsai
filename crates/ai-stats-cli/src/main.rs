@@ -1,19 +1,26 @@
 use ai_stats_adapters::{
-    adapter_for_provider, default_adapters, ProviderAdapter, ScanDiagnostics, ScanOptions,
+    adapter_for_provider, default_adapters, ProviderAdapter, ScanCandidateFile, ScanDiagnostics,
+    ScanOptions,
 };
 use ai_stats_core::{
-    build_usage_report, home_dir, provider_account_id, subscription_id, BillingPeriod, Confidence,
-    CostInfo, IdentitySource, LocationOrigin, ProviderAccount, ReportPeriod, SourceKind,
-    SourceLocation, Subscription, SubscriptionStatus, SyncBatch, UsageCounts, UsageEvent,
-    UsageReport, UsageSummary, UsageTotals, PROVIDER_ACCOUNT_SCHEMA_VERSION,
-    REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
+    build_usage_report, hash_text, home_dir, provider_account_id, subscription_id, BillingPeriod,
+    Confidence, IdentitySource, LocationOrigin, ProviderAccount, ReportPeriod, SourceKind,
+    SourceLocation, Subscription, SubscriptionStatus, SyncBatch, UsageEvent, UsageReport,
+    UsageSummary, UsageTotals, PROVIDER_ACCOUNT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
     SYNC_BATCH_SCHEMA_VERSION,
+};
+#[cfg(test)]
+use ai_stats_core::{
+    summary_id, CostInfo, EventSource, PrivacyInfo, PrivacyMode, SummaryMetadata, UsageCounts,
+    USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use ai_stats_sdk::{
     build_reported_usage_summary, ReportedUsageSummaryInput, ReportedUsageSummaryRecord,
 };
-use ai_stats_store::Store;
-use ai_stats_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
+use ai_stats_store::{ScanFileStateEntry, Store};
+use ai_stats_sync::{
+    FileSink, FirestoreSendOptions, FirestoreSink, HttpSink, StdoutSink, SyncSink,
+};
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use chrono::Duration;
@@ -23,6 +30,9 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
+
+mod auth;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,13 +43,8 @@ use std::sync::{Arc, Mutex};
 struct Cli {
     #[arg(long, global = true, help = "Path to SQLite store")]
     store: Option<PathBuf>,
-    #[arg(
-        long,
-        global = true,
-        default_value = "local",
-        help = "Device identifier for multi-device sync"
-    )]
-    device_id: String,
+    #[arg(long, global = true, help = "Device identifier for multi-device sync")]
+    device_id: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -70,6 +75,27 @@ enum Command {
     Status,
     #[command(about = "Check environment and source paths")]
     Doctor,
+    #[command(about = "Authenticate with Firebase production backend")]
+    Auth(AuthCommand),
+}
+
+#[derive(Debug, Args)]
+struct AuthCommand {
+    #[command(subcommand)]
+    command: AuthSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthSubcommand {
+    #[command(about = "Log in with Google to get production credentials")]
+    Login {
+        #[arg(long, help = "Optional Google OAuth Client ID")]
+        client_id: Option<String>,
+    },
+    #[command(about = "Check authentication status")]
+    Status,
+    #[command(about = "Log out and clear stored credentials")]
+    Logout,
 }
 
 #[derive(Debug, Args)]
@@ -78,6 +104,11 @@ struct ScanCommand {
     provider: Option<String>,
     #[arg(long, help = "Preview without persisting to the store")]
     preview: bool,
+    #[arg(
+        long,
+        help = "Ignore the scan file cache and reparse all candidate files"
+    )]
+    no_cache: bool,
     #[arg(
         long,
         help = "Replace existing events for scanned sources before inserting"
@@ -202,23 +233,6 @@ enum ImportSubcommand {
         #[arg(long, help = "Show per-file import details")]
         verbose: bool,
     },
-    #[command(about = "Import ccusage text report")]
-    Ccusage {
-        #[arg(long, help = "Path to ccusage text report file or directory")]
-        path: PathBuf,
-        #[arg(long, default_value = "claude_code", help = "Provider to import as")]
-        provider: String,
-        #[arg(long, help = "Account label to attach")]
-        account: Option<String>,
-        #[arg(long, help = "Year for month/day-only summaries (e.g. 2026)")]
-        year: Option<i32>,
-        #[arg(long, help = "Replace existing matching summaries before import")]
-        replace: bool,
-        #[arg(long, help = "Preview without persisting")]
-        dry_run: bool,
-        #[arg(long, help = "Show per-file import details")]
-        verbose: bool,
-    },
 }
 
 #[derive(Debug, Args)]
@@ -232,15 +246,59 @@ struct SyncCommand {
     #[arg(
         long,
         default_value = "stdout",
-        help = "Sync sink (stdout, file, http)"
+        help = "Sync sink (stdout, file, http, firestore)"
     )]
     sink: String,
     #[arg(long, help = "Output path for file sink")]
     output: Option<PathBuf>,
     #[arg(long, help = "HTTP endpoint for the http sink")]
     endpoint: Option<String>,
-    #[arg(long, help = "Bearer token for the http sink")]
+    #[arg(
+        long,
+        help = "Bearer token override for the http sink or Firestore sync"
+    )]
     auth_token: Option<String>,
+    #[arg(
+        long,
+        help = "Explicit Firebase UID namespace for Firestore sync when using a manual token"
+    )]
+    firebase_uid: Option<String>,
+    #[arg(
+        long,
+        default_value = "ai-stats-fire",
+        help = "Firebase project ID for the firestore sink"
+    )]
+    firebase_project: String,
+    #[arg(
+        long,
+        default_value = "stats",
+        help = "Firestore payload mode (stats, full [emulator/debug only])"
+    )]
+    firestore_mode: String,
+    #[arg(
+        long,
+        default_value_t = 1000,
+        help = "Max event+summary records per firestore sub-batch"
+    )]
+    firestore_records_per_batch: usize,
+    #[arg(
+        long,
+        default_value_t = 200,
+        help = "Max document writes per Firestore commit request (1..450)"
+    )]
+    firestore_commit_writes: usize,
+    #[arg(
+        long,
+        default_value_t = 4,
+        help = "Retry attempts for retryable Firestore errors"
+    )]
+    firestore_retries: u32,
+    #[arg(
+        long,
+        default_value_t = 800,
+        help = "Initial backoff in milliseconds for Firestore retries"
+    )]
+    firestore_backoff_ms: u64,
     #[arg(
         long,
         help = "Send only records after this sink target's last successful sync"
@@ -248,7 +306,7 @@ struct SyncCommand {
     since_last: bool,
     #[arg(long, help = "Show recorded sync state instead of sending")]
     status: bool,
-    #[arg(long, help = "Preview the sync batch without writing")]
+    #[arg(long, help = "Build the sync batch without writing")]
     dry_run: bool,
 }
 
@@ -279,26 +337,38 @@ struct DaemonCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let store_path = cli.store.unwrap_or_else(default_store_path);
+    let device_id = cli.device_id.unwrap_or_else(default_device_id);
 
     match cli.command {
         Command::Schema(command) => schema(command),
         Command::Doctor => doctor(&store_path),
+        Command::Auth(command) => auth(command),
         command => {
             let store = Store::open(&store_path)?;
             match command {
-                Command::Scan(command) => scan(command, &store, &cli.device_id),
+                Command::Scan(command) => scan(command, &store, &device_id),
                 Command::Report(command) => report(command, &store),
                 Command::Source(command) => source(command, &store),
                 Command::Account(command) => account(command, &store),
                 Command::Subscription(command) => subscription(command, &store),
-                Command::Import(command) => import(command, &store, &cli.device_id),
+                Command::Import(command) => import(command, &store, &device_id),
                 Command::Export(command) => export(command, &store),
-                Command::Sync(command) => sync(command, &store, &cli.device_id),
-                Command::Daemon(command) => daemon(command, store, &cli.device_id),
+                Command::Sync(command) => sync(command, &store, &device_id),
+                Command::Daemon(command) => daemon(command, store, &device_id),
                 Command::Status => status(&store),
-                Command::Schema(_) | Command::Doctor => unreachable!("handled before store open"),
+                Command::Schema(_) | Command::Doctor | Command::Auth(_) => {
+                    unreachable!("handled before store open")
+                }
             }
         }
+    }
+}
+
+fn auth(command: AuthCommand) -> Result<()> {
+    match command.command {
+        AuthSubcommand::Login { client_id } => auth::login(client_id),
+        AuthSubcommand::Status => auth::status(),
+        AuthSubcommand::Logout => auth::logout(),
     }
 }
 
@@ -332,8 +402,23 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
             if source.path_label.is_none() {
                 source.path_label = path_label_from_hashless_source(&source);
             }
+            let cache_candidates = adapter.scan_candidates(&source)?;
+            let file_cache_entries = scan_file_state_entries(&cache_candidates);
+            let pending_file_entries = select_scan_file_entries(
+                store,
+                &source.source_id,
+                &file_cache_entries,
+                command.replace,
+                command.no_cache,
+            )?;
             let options = ScanOptions {
                 device_id: device_id.to_string(),
+                selected_cache_keys: (!command.no_cache).then(|| {
+                    pending_file_entries
+                        .iter()
+                        .map(|entry| entry.cache_key.clone())
+                        .collect()
+                }),
             };
             let mut scan = adapter.scan(&source, &options)?;
             apply_account_hint_to_events(&source, &mut scan.events);
@@ -349,12 +434,19 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
             }
             let source_event_count = scan.events.len() as u64;
             let source_summary_count = scan.summaries.len() as u64;
-
-            if !command.verbose
+            let touched_files = !pending_file_entries.is_empty();
+            let has_scan_activity = source_event_count > 0
+                || source_summary_count > 0
+                || scan.diagnostics.files_scanned > 0
+                || scan.diagnostics.files_skipped_unchanged > 0
+                || log_rows > 0;
+            let suppress_source_processing = !command.verbose
                 && !command.explain
                 && source_event_count == 0
                 && source_summary_count == 0
-            {
+                && !touched_files;
+
+            if !has_scan_activity {
                 continue;
             }
 
@@ -365,6 +457,10 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
             total_usage.add_totals(&source_usage);
             total_summary_usage.add_totals(&source_summary_usage);
             add_diagnostics(&mut total_diagnostics, &scan.diagnostics);
+
+            if suppress_source_processing {
+                continue;
+            }
 
             if command.preview {
                 print_scan_preview_line(
@@ -387,6 +483,12 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
             }
             inserted_count += store.insert_events(&scan.events)?;
             summary_written_count += store.upsert_summaries(&scan.summaries)?;
+            let cache_entries_to_record = if command.replace || command.no_cache {
+                &file_cache_entries
+            } else {
+                &pending_file_entries
+            };
+            store.record_scan_file_entries(&source.source_id, cache_entries_to_record)?;
         }
     }
 
@@ -611,20 +713,6 @@ fn import(command: ImportCommand, store: &Store, device_id: &str) -> Result<()> 
                 replace,
             )?;
         }
-        ImportSubcommand::Ccusage {
-            path,
-            provider,
-            account,
-            year,
-            replace,
-            dry_run,
-            verbose,
-        } => {
-            let provider = canonical_provider(&provider)?;
-            let reports =
-                parse_ccusage_text_reports(&path, &provider, account.as_deref(), year, device_id)?;
-            import_reported_summary_records(store, &reports, dry_run, verbose, replace)?;
-        }
     }
     Ok(())
 }
@@ -808,57 +896,140 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
         return sync_status(store);
     }
 
-    let target = sync_target(&command);
+    if hosted_firestore_full_mode_disabled(&command) {
+        bail!(
+            "hosted Firestore full mode is disabled; use --firestore-mode stats for production sync, the emulator for raw event testing, or set AI_STATS_ENABLE_HOSTED_FIRESTORE_FULL=1 to bypass this guardrail"
+        );
+    }
+
+    let firestore_auth = if command.sink == "firestore" {
+        Some(resolve_firestore_auth_context(&command)?)
+    } else {
+        None
+    };
+    let target = firestore_auth
+        .as_ref()
+        .map(|auth| firestore_sync_target(&command.firebase_project, &auth.uid))
+        .unwrap_or_else(|| sync_target(&command));
+    let firestore_stats_mode =
+        command.sink == "firestore" && command.firestore_mode.eq_ignore_ascii_case("stats");
     let state = if command.since_last {
         store.sync_state(&command.sink, &target)?
     } else {
         None
     };
-    let event_cursor = state.as_ref().and_then(|state| {
-        state
-            .last_event_started_at
-            .as_ref()
-            .zip(state.last_event_id.as_deref())
-    });
+    let event_cursor = if firestore_stats_mode {
+        None
+    } else {
+        state.as_ref().and_then(|state| {
+            state
+                .last_event_started_at
+                .as_ref()
+                .zip(state.last_event_id.as_deref())
+        })
+    };
     let summary_cursor = state.as_ref().and_then(|state| {
         state
             .last_summary_observed_at
             .as_ref()
             .zip(state.last_summary_id.as_deref())
     });
-    let events: Vec<_> = store
-        .events_after(event_cursor)?
-        .into_iter()
-        .map(sanitize_event_for_sync)
-        .collect();
+    let events: Vec<_> = if firestore_stats_mode {
+        Vec::new()
+    } else {
+        store
+            .events_after(event_cursor)?
+            .into_iter()
+            .map(sanitize_event_for_sync)
+            .collect()
+    };
     let summaries: Vec<_> = store
         .summaries_after(summary_cursor)?
         .into_iter()
         .map(sanitize_summary_for_sync)
+        .filter(|summary| !firestore_stats_mode || !is_daily_rollup_summary(summary))
         .collect();
-    let batch = SyncBatch {
+    let all_sources: Vec<_> = store
+        .list_sources()?
+        .into_iter()
+        .map(sanitize_source_for_sync)
+        .collect();
+    let all_accounts: Vec<_> = store
+        .list_accounts()?
+        .into_iter()
+        .map(sanitize_account_for_sync)
+        .collect();
+    let all_subscriptions: Vec<_> = store
+        .list_subscriptions()?
+        .into_iter()
+        .map(sanitize_subscription_for_sync)
+        .collect();
+    let sources = if command.sink == "firestore" {
+        store.pending_sources_for_sync(&command.sink, &target, &all_sources)?
+    } else {
+        all_sources
+    };
+    let accounts = if command.sink == "firestore" {
+        store.pending_accounts_for_sync(&command.sink, &target, &all_accounts)?
+    } else {
+        all_accounts
+    };
+    let subscriptions = if command.sink == "firestore" {
+        store.pending_subscriptions_for_sync(&command.sink, &target, &all_subscriptions)?
+    } else {
+        all_subscriptions
+    };
+    let mut batch = SyncBatch {
         schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
         batch_id: format!("batch_{}", Utc::now().timestamp_millis()),
         device_id: device_id.to_string(),
-        sources: store
-            .list_sources()?
-            .into_iter()
-            .map(sanitize_source_for_sync)
-            .collect(),
-        accounts: store
-            .list_accounts()?
-            .into_iter()
-            .map(sanitize_account_for_sync)
-            .collect(),
-        subscriptions: store
-            .list_subscriptions()?
-            .into_iter()
-            .map(sanitize_subscription_for_sync)
-            .collect(),
+        sources,
+        accounts,
+        subscriptions,
         events,
         summaries,
         created_at: Utc::now(),
     };
+
+    if firestore_stats_mode {
+        let should_bootstrap = !command.dry_run
+            && command.since_last
+            && store.firestore_rollup_count()? == 0
+            && store.event_count()? > 0;
+        if !command.dry_run && !command.since_last {
+            let rebuilt = store.rebuild_firestore_rollups()?;
+            let marked_dirty = store.mark_all_firestore_rollups_dirty()?;
+            eprintln!(
+                "firestore stats mode: rebuilt {} local daily summaries and marked {} dirty for full sync",
+                rebuilt, marked_dirty
+            );
+        } else if should_bootstrap {
+            let rebuilt = store.rebuild_firestore_rollups()?;
+            eprintln!(
+                "firestore stats mode: bootstrapped {} local daily summaries from existing events",
+                rebuilt
+            );
+        }
+
+        let rollups = if command.since_last {
+            store.dirty_firestore_rollup_summaries()?
+        } else {
+            store.all_firestore_rollup_summaries()?
+        };
+        eprintln!(
+            "firestore stats mode: prepared {} local daily summaries for sync",
+            rollups.len()
+        );
+        batch
+            .summaries
+            .extend(rollups.into_iter().map(sanitize_summary_for_sync));
+    } else if command.sink == "firestore" {
+        let mode = command.firestore_mode.to_ascii_lowercase();
+        match mode.as_str() {
+            "full" => {}
+            other => bail!("unsupported firestore mode {other}; expected stats or full"),
+        }
+    }
 
     if command.dry_run {
         eprintln!(
@@ -869,6 +1040,11 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
             batch.summaries.len()
         );
         return Ok(());
+    }
+
+    if command.sink == "firestore" {
+        let auth = firestore_auth.context("missing Firestore auth context")?;
+        return sync_firestore(command, store, device_id, target, batch, auth);
     }
 
     let result = match command.sink.as_str() {
@@ -887,7 +1063,8 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
                     .context("--endpoint is required when --sink http")?;
                 let auth_token = command
                     .auth_token
-                    .or_else(|| std::env::var("AI_STATS_SYNC_TOKEN").ok());
+                    .or_else(|| std::env::var("AI_STATS_SYNC_TOKEN").ok())
+                    .or_else(|| auth::get_or_refresh_token().ok().flatten());
                 let ack = HttpSink::new(endpoint, auth_token)?.send_with_ack(&batch)?;
                 println!("{}", serde_json::to_string_pretty(&ack)?);
                 Ok(Some(ack))
@@ -913,6 +1090,196 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
             Err(error)
         }
     }
+}
+
+fn sync_firestore(
+    command: SyncCommand,
+    store: &Store,
+    device_id: &str,
+    target: String,
+    batch: SyncBatch,
+    auth: FirestoreAuthContext,
+) -> Result<()> {
+    let sink = FirestoreSink::new(&command.firebase_project, auth.uid, auth.auth_token);
+    let options = FirestoreSendOptions {
+        commit_chunk_size: command.firestore_commit_writes.clamp(1, 450),
+        max_retries: command.firestore_retries,
+        initial_backoff: StdDuration::from_millis(command.firestore_backoff_ms.max(1)),
+        progress: true,
+    };
+
+    if batch.sources.is_empty()
+        && batch.accounts.is_empty()
+        && batch.subscriptions.is_empty()
+        && batch.events.is_empty()
+        && batch.summaries.is_empty()
+    {
+        eprintln!("firestore sync: nothing to send");
+        return Ok(());
+    }
+
+    let records_per_batch = command.firestore_records_per_batch.max(1);
+    let total_records = batch.events.len() + batch.summaries.len();
+    let total_writes =
+        total_records + batch.sources.len() + batch.accounts.len() + batch.subscriptions.len() + 2;
+    let sub_batches = if total_records == 0 {
+        1
+    } else {
+        total_records.div_ceil(records_per_batch)
+    };
+
+    eprintln!(
+        "firestore sync: {} event/summary records, {} estimated writes, {} sub-batches (commit writes <= {})",
+        total_records, total_writes, sub_batches, options.commit_chunk_size
+    );
+
+    let mut sent_events = 0usize;
+    let mut sent_summaries = 0usize;
+    let mut include_metadata = true;
+    let mut aggregate_ack = ai_stats_core::SyncAck {
+        schema_version: ai_stats_core::SYNC_ACK_SCHEMA_VERSION.to_string(),
+        batch_id: batch.batch_id.clone(),
+        accepted: ai_stats_core::SyncEntityCounts {
+            sources: 0,
+            accounts: 0,
+            subscriptions: 0,
+            events: 0,
+            summaries: 0,
+        },
+        duplicates: ai_stats_core::SyncEntityCounts {
+            sources: 0,
+            accounts: 0,
+            subscriptions: 0,
+            events: 0,
+            summaries: 0,
+        },
+        rejected: Vec::new(),
+    };
+
+    for index in 0..sub_batches {
+        let source_count = if include_metadata {
+            batch.sources.len()
+        } else {
+            0
+        };
+        let account_count = if include_metadata {
+            batch.accounts.len()
+        } else {
+            0
+        };
+        let subscription_count = if include_metadata {
+            batch.subscriptions.len()
+        } else {
+            0
+        };
+
+        let event_end = (sent_events + records_per_batch).min(batch.events.len());
+        let event_slice = &batch.events[sent_events..event_end];
+        let remaining = records_per_batch.saturating_sub(event_slice.len());
+        let summary_end = (sent_summaries + remaining).min(batch.summaries.len());
+        let summary_slice = &batch.summaries[sent_summaries..summary_end];
+
+        let sub_batch = SyncBatch {
+            schema_version: batch.schema_version.clone(),
+            batch_id: format!("{}_{}", batch.batch_id, index + 1),
+            device_id: device_id.to_string(),
+            sources: if include_metadata {
+                batch.sources.clone()
+            } else {
+                Vec::new()
+            },
+            accounts: if include_metadata {
+                batch.accounts.clone()
+            } else {
+                Vec::new()
+            },
+            subscriptions: if include_metadata {
+                batch.subscriptions.clone()
+            } else {
+                Vec::new()
+            },
+            events: event_slice.to_vec(),
+            summaries: summary_slice.to_vec(),
+            created_at: batch.created_at,
+        };
+
+        eprintln!(
+            "firestore sync: sending sub-batch {}/{} (sources={}, accounts={}, subscriptions={}, events={}, summaries={})",
+            index + 1,
+            sub_batches,
+            source_count,
+            account_count,
+            subscription_count,
+            sub_batch.events.len(),
+            sub_batch.summaries.len()
+        );
+
+        match sink.send_with_ack_and_options(&sub_batch, &options) {
+            Ok(ack) => {
+                aggregate_ack.accepted.sources += ack.accepted.sources;
+                aggregate_ack.accepted.accounts += ack.accepted.accounts;
+                aggregate_ack.accepted.subscriptions += ack.accepted.subscriptions;
+                aggregate_ack.accepted.events += ack.accepted.events;
+                aggregate_ack.accepted.summaries += ack.accepted.summaries;
+                aggregate_ack.duplicates.sources += ack.duplicates.sources;
+                aggregate_ack.duplicates.accounts += ack.duplicates.accounts;
+                aggregate_ack.duplicates.subscriptions += ack.duplicates.subscriptions;
+                aggregate_ack.duplicates.events += ack.duplicates.events;
+                aggregate_ack.duplicates.summaries += ack.duplicates.summaries;
+                aggregate_ack.rejected.extend(ack.rejected);
+
+                let passthrough_summaries: Vec<_> = sub_batch
+                    .summaries
+                    .iter()
+                    .filter(|summary| !is_daily_rollup_summary(summary))
+                    .cloned()
+                    .collect();
+                let rollup_summary_ids: Vec<_> = sub_batch
+                    .summaries
+                    .iter()
+                    .filter(|summary| is_daily_rollup_summary(summary))
+                    .map(|summary| summary.summary_id.clone())
+                    .collect();
+
+                store.record_sync_success(
+                    &command.sink,
+                    &target,
+                    &sub_batch.batch_id,
+                    &sub_batch.events,
+                    &passthrough_summaries,
+                )?;
+                store.mark_firestore_rollups_synced(&rollup_summary_ids)?;
+                store.record_sources_synced(&command.sink, &target, &sub_batch.sources)?;
+                store.record_accounts_synced(&command.sink, &target, &sub_batch.accounts)?;
+                store.record_subscriptions_synced(
+                    &command.sink,
+                    &target,
+                    &sub_batch.subscriptions,
+                )?;
+                sent_events = event_end;
+                sent_summaries = summary_end;
+                include_metadata = false;
+            }
+            Err(error) => {
+                let _ = store.record_sync_failure(&command.sink, &target);
+                return Err(error);
+            }
+        }
+    }
+
+    println!("{}", serde_json::to_string_pretty(&aggregate_ack)?);
+    Ok(())
+}
+
+fn hosted_firestore_full_mode_disabled(command: &SyncCommand) -> bool {
+    command.sink == "firestore"
+        && command.firestore_mode.eq_ignore_ascii_case("full")
+        && std::env::var("FIRESTORE_EMULATOR_HOST")
+            .ok()
+            .is_none_or(|value| value.trim().is_empty())
+        && std::env::var("AI_STATS_ENABLE_HOSTED_FIRESTORE_FULL")
+            .ok()
+            .is_none_or(|value| value.trim() != "1")
 }
 
 fn sync_status(store: &Store) -> Result<()> {
@@ -954,6 +1321,7 @@ fn sync_target(command: &SyncCommand) -> String {
             .endpoint
             .clone()
             .unwrap_or_else(|| "http".to_string()),
+        "firestore" => format!("firestore:{}", command.firebase_project),
         "file" => command
             .output
             .as_ref()
@@ -961,6 +1329,52 @@ fn sync_target(command: &SyncCommand) -> String {
             .unwrap_or_else(|| "ai-stats-sync-batch.json".to_string()),
         other => other.to_string(),
     }
+}
+
+#[derive(Debug, Clone)]
+struct FirestoreAuthContext {
+    auth_token: String,
+    uid: String,
+}
+
+fn resolve_firestore_auth_context(command: &SyncCommand) -> Result<FirestoreAuthContext> {
+    let using_emulator = std::env::var("FIRESTORE_EMULATOR_HOST")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let manual_auth_token = command
+        .auth_token
+        .clone()
+        .or_else(|| std::env::var("AI_STATS_SYNC_TOKEN").ok());
+    let auth_token = manual_auth_token
+        .clone()
+        .or_else(|| auth::get_or_refresh_token().ok().flatten())
+        .or_else(|| using_emulator.then(|| "owner".to_string()))
+        .context("Firebase login required; run `ai-stats auth login` first")?;
+    let uid = command
+        .firebase_uid
+        .clone()
+        .or_else(|| auth::user_id_from_token(&auth_token).ok().flatten())
+        .or_else(|| {
+            if manual_auth_token.is_none() {
+                auth::user_id().ok().flatten()
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            using_emulator.then(|| {
+                std::env::var("AI_STATS_FIRESTORE_TEST_UID")
+                    .unwrap_or_else(|_| "local-test-user".to_string())
+            })
+        })
+        .context(
+            "Firebase UID required for Firestore sync; rerun `ai-stats auth login`, provide --firebase-uid, or use a Firebase ID token whose UID can be derived locally",
+        )?;
+    Ok(FirestoreAuthContext { auth_token, uid })
+}
+
+fn firestore_sync_target(project: &str, uid: &str) -> String {
+    format!("firestore:{project}:{uid}")
 }
 
 fn format_cursor(date: Option<String>, id: Option<&str>) -> String {
@@ -1024,6 +1438,43 @@ fn doctor(store_path: &Path) -> Result<()> {
             sources.len(),
             empty
         );
+        for source in sources {
+            let candidates = adapter.scan_candidates(&source)?;
+            let file_cache_entries = scan_file_state_entries(&candidates);
+            let pending =
+                store.pending_scan_file_entries(&source.source_id, &file_cache_entries)?;
+            let pending_keys: BTreeSet<_> = pending
+                .iter()
+                .map(|entry| entry.cache_key.as_str())
+                .collect();
+            let cached: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| !pending_keys.contains(candidate.cache_key.as_str()))
+                .collect();
+            println!(
+                "  - {} account={} origin={} files={} pending={} cached={}",
+                preview_path_label(&source),
+                source.account_hint.as_deref().unwrap_or("unmapped"),
+                location_origin_label(&source.location_origin),
+                candidates.len(),
+                pending.len(),
+                cached.len()
+            );
+            if !pending.is_empty() {
+                println!(
+                    "    pending sample: {}",
+                    format_cache_key_sample(pending.iter().map(|entry| entry.cache_key.as_str()))
+                );
+            }
+            if !cached.is_empty() {
+                println!(
+                    "    cached sample: {}",
+                    format_cache_key_sample(
+                        cached.iter().map(|candidate| candidate.cache_key.as_str())
+                    )
+                );
+            }
+        }
     }
     println!("status: ok");
     Ok(())
@@ -1055,283 +1506,6 @@ fn read_reported_summary_inputs(path: &Path) -> Result<Vec<ReportedUsageSummaryI
     let inputs = serde_json::from_str::<Vec<ReportedUsageSummaryInput>>(&text)
         .with_context(|| format!("parse reported usage summary JSON {}", path.display()))?;
     Ok(inputs)
-}
-
-fn parse_ccusage_text_reports(
-    path: &Path,
-    provider: &str,
-    account: Option<&str>,
-    default_year: Option<i32>,
-    device_id: &str,
-) -> Result<Vec<ReportedImportReport>> {
-    let mut files = Vec::new();
-    if path.is_dir() {
-        for entry in std::fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) == Some("txt") {
-                files.push(path);
-            }
-        }
-        files.sort();
-    } else {
-        files.push(path.to_path_buf());
-    }
-
-    let mut reports = Vec::new();
-    for file in files {
-        let text =
-            std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-        let mut warnings = Vec::new();
-        let mut inputs = parse_ccusage_daily_rows(&text, provider, account, &file);
-        if inputs.is_empty() {
-            inputs.extend(parse_ccusage_simple_summary(
-                &text,
-                provider,
-                account,
-                default_year,
-                &file,
-                &mut warnings,
-            ));
-        }
-        if inputs.is_empty()
-            && text.contains("Claude Code Token Usage Report - Session Blocks")
-            && text.contains('…')
-        {
-            warnings.push(
-                "session-block table contains truncated token values; skipped to avoid importing approximate totals"
-                    .to_string(),
-            );
-        }
-        let records = inputs
-            .into_iter()
-            .map(|input| build_reported_usage_summary(input, device_id))
-            .collect::<Result<Vec<_>>>()?;
-        reports.push(ReportedImportReport {
-            path: file,
-            records,
-            warnings,
-        });
-    }
-    Ok(reports)
-}
-
-fn parse_ccusage_daily_rows(
-    text: &str,
-    provider: &str,
-    account: Option<&str>,
-    evidence_path: &Path,
-) -> Vec<ReportedUsageSummaryInput> {
-    text.lines()
-        .filter_map(|line| {
-            let columns = table_columns(line);
-            let date_text = columns.first()?;
-            let date = NaiveDate::parse_from_str(date_text, "%Y-%m-%d").ok()?;
-            if columns.len() < 8 {
-                return None;
-            }
-            let usage = UsageCounts {
-                input_tokens: parse_u64_column(&columns[2]),
-                output_tokens: parse_u64_column(&columns[3]),
-                cache_creation_tokens: parse_u64_column(&columns[4]),
-                cache_read_tokens: parse_u64_column(&columns[5]),
-                reasoning_tokens: None,
-                total_tokens: parse_u64_column(&columns[6]),
-                requests: None,
-                local_prompt_eval_tokens: None,
-                local_eval_tokens: None,
-            };
-            (usage.computed_total() > 0).then(|| {
-                let period_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-                let period_end = date.and_hms_opt(23, 59, 59).unwrap().and_utc();
-                reported_summary_input(ReportedSummaryParams {
-                    provider: provider.to_string(),
-                    account: account.map(ToOwned::to_owned),
-                    format: "ccusage_daily".to_string(),
-                    evidence_id: Some(format!("ccusage_daily:{}", date.format("%Y-%m-%d"))),
-                    evidence_path: Some(evidence_path.to_string_lossy().to_string()),
-                    period_start: Some(period_start),
-                    period_end: Some(period_end),
-                    usage,
-                    cost_usd: parse_cost_column(&columns[7]),
-                    model_name: None,
-                })
-            })
-        })
-        .collect()
-}
-
-fn parse_ccusage_simple_summary(
-    text: &str,
-    provider: &str,
-    account: Option<&str>,
-    default_year: Option<i32>,
-    evidence_path: &Path,
-    warnings: &mut Vec<String>,
-) -> Vec<ReportedUsageSummaryInput> {
-    let input = prefixed_number(text, "Input tokens:");
-    let output = prefixed_number(text, "Output tokens:");
-    let cache_create = prefixed_number(text, "Cache Create tokens:");
-    let cache_read = prefixed_number(text, "Cache Read tokens:");
-    let total = prefixed_number(text, "Total tokens:");
-    let cost = prefixed_cost(text, "Total cost:");
-    let usage = UsageCounts {
-        input_tokens: input,
-        output_tokens: output,
-        cache_creation_tokens: cache_create,
-        cache_read_tokens: cache_read,
-        reasoning_tokens: None,
-        total_tokens: total,
-        requests: None,
-        local_prompt_eval_tokens: None,
-        local_eval_tokens: None,
-    };
-    if usage.computed_total() == 0 {
-        return Vec::new();
-    }
-
-    let (period_start, period_end) = match (default_year, summary_month_day_range(text)) {
-        (Some(year), Some((month, start_day, end_day))) => {
-            let start = NaiveDate::from_ymd_opt(year, month, start_day)
-                .and_then(|date| date.and_hms_opt(0, 0, 0))
-                .map(|date| date.and_utc());
-            let end = NaiveDate::from_ymd_opt(year, month, end_day)
-                .and_then(|date| date.and_hms_opt(23, 59, 59))
-                .map(|date| date.and_utc());
-            (start, end)
-        }
-        (None, Some(_)) => {
-            warnings.push(
-                "summary has a month/day range but no year; pass --year to preserve the period"
-                    .to_string(),
-            );
-            (None, None)
-        }
-        _ => (None, None),
-    };
-
-    vec![reported_summary_input(ReportedSummaryParams {
-        provider: provider.to_string(),
-        account: account.map(ToOwned::to_owned),
-        format: "ccusage_summary".to_string(),
-        evidence_id: Some("ccusage_summary".to_string()),
-        evidence_path: Some(evidence_path.to_string_lossy().to_string()),
-        period_start,
-        period_end,
-        usage,
-        cost_usd: cost,
-        model_name: None,
-    })]
-}
-
-struct ReportedSummaryParams {
-    provider: String,
-    account: Option<String>,
-    format: String,
-    evidence_id: Option<String>,
-    evidence_path: Option<String>,
-    period_start: Option<DateTime<Utc>>,
-    period_end: Option<DateTime<Utc>>,
-    usage: UsageCounts,
-    cost_usd: Option<f64>,
-    model_name: Option<String>,
-}
-
-fn reported_summary_input(params: ReportedSummaryParams) -> ReportedUsageSummaryInput {
-    let model = params.model_name.map(|name| ai_stats_core::ModelInfo {
-        name: Some(name.clone()),
-        normalized_name: Some(name.clone()),
-        provider_model_id: Some(name),
-    });
-    ReportedUsageSummaryInput {
-        schema_version: REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION.to_string(),
-        provider: params.provider,
-        account_hint: params.account,
-        source_kind: SourceKind::ExternalReport,
-        source_name: "ccusage".to_string(),
-        evidence_id: params.evidence_id,
-        evidence_path: params.evidence_path,
-        report_format: params.format,
-        report_version: Some("ccusage_text.v1".to_string()),
-        period_start: params.period_start,
-        period_end: params.period_end,
-        observed_at: params.period_end,
-        model,
-        usage: params.usage,
-        cost: Some(CostInfo {
-            currency: "USD".to_string(),
-            estimated_api_equivalent_usd: None,
-            provider_reported_usd: params.cost_usd,
-            pricing_source: Some("ccusage_report".to_string()),
-            pricing_version: None,
-            confidence: if params.cost_usd.is_some() {
-                Confidence::Medium
-            } else {
-                Confidence::Low
-            },
-        }),
-        confidence: Some(Confidence::Medium),
-    }
-}
-
-fn table_columns(line: &str) -> Vec<String> {
-    line.split('│')
-        .skip(1)
-        .map(str::trim)
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn prefixed_number(text: &str, prefix: &str) -> Option<u64> {
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix(prefix).and_then(parse_u64_column))
-}
-
-fn prefixed_cost(text: &str, prefix: &str) -> Option<f64> {
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix(prefix).and_then(parse_cost_column))
-}
-
-fn parse_u64_column(value: &str) -> Option<u64> {
-    let text: String = value.chars().filter(|ch| ch.is_ascii_digit()).collect();
-    (!text.is_empty()).then(|| text.parse().ok()).flatten()
-}
-
-fn parse_cost_column(value: &str) -> Option<f64> {
-    let text: String = value
-        .chars()
-        .filter(|ch| ch.is_ascii_digit() || *ch == '.')
-        .collect();
-    (!text.is_empty()).then(|| text.parse().ok()).flatten()
-}
-
-fn summary_month_day_range(text: &str) -> Option<(u32, u32, u32)> {
-    let start = text.find('(')?;
-    let end = text[start..].find(')')? + start;
-    let value = text[start + 1..end].trim();
-    let mut parts = value.split_whitespace();
-    let month = month_number(parts.next()?)?;
-    let range = parts.next()?;
-    let (start_day, end_day) = range.split_once('-')?;
-    Some((month, start_day.parse().ok()?, end_day.parse().ok()?))
-}
-
-fn month_number(value: &str) -> Option<u32> {
-    match value.to_ascii_lowercase().as_str() {
-        "jan" | "january" => Some(1),
-        "feb" | "february" => Some(2),
-        "mar" | "march" => Some(3),
-        "apr" | "april" => Some(4),
-        "may" => Some(5),
-        "jun" | "june" => Some(6),
-        "jul" | "july" => Some(7),
-        "aug" | "august" => Some(8),
-        "sep" | "sept" | "september" => Some(9),
-        "oct" | "october" => Some(10),
-        "nov" | "november" => Some(11),
-        "dec" | "december" => Some(12),
-        _ => None,
-    }
 }
 
 fn print_report_table(report: &UsageReport, verbose: bool) {
@@ -1660,6 +1834,77 @@ fn default_store_path() -> PathBuf {
         .join("ai-stats.sqlite")
 }
 
+fn default_device_id() -> String {
+    if let Ok(value) = std::env::var("AI_STATS_DEVICE_ID") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+
+    let path = device_id_path();
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return existing.to_string();
+        }
+    }
+
+    // Persist a stable opaque ID instead of leaking hostnames to the backend.
+    let device_id = generate_device_id();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, format!("{device_id}\n"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    device_id
+}
+
+fn device_id_path() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ai-stats")
+        .join("device-id")
+}
+
+fn generate_device_id() -> String {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(read_hostname)
+        .unwrap_or_else(|| "unknown-host".to_string());
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown-user".to_string());
+    let home = home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .to_string_lossy()
+        .to_string();
+    let seed = format!(
+        "{}:{}:{}:{}:{}",
+        host,
+        user,
+        home,
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    format!("dev_{}", &hash_text(&seed)[..16])
+}
+
+fn read_hostname() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let host = String::from_utf8(output.stdout).ok()?;
+    let host = host.trim();
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 fn normalize_configured_source_path(provider: &str, path: &Path) -> Result<PathBuf> {
     let mut path = expand_cli_path(path)?;
     if provider_matches(provider, "claude_code")
@@ -1725,7 +1970,7 @@ fn print_scan_preview_line(
 ) {
     if verbose {
         println!(
-            "{} account={} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
+            "{} account={} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
             source.provider,
             source.account_hint.as_deref().unwrap_or("unmapped"),
             preview_path_label(source),
@@ -1744,6 +1989,7 @@ fn print_scan_preview_line(
             format_u64(diagnostics.skipped_zero_events),
             format_u64(diagnostics.invalid_rows),
             format_u64(diagnostics.files_scanned),
+            format_u64(diagnostics.files_skipped_unchanged),
             format_u64(diagnostics.timestamp_fallbacks),
             format_u64(diagnostics.model_fallbacks),
             location_origin_label(&source.location_origin),
@@ -1770,6 +2016,7 @@ fn print_scan_preview_line(
 
 fn add_diagnostics(target: &mut ScanDiagnostics, source: &ScanDiagnostics) {
     target.files_scanned += source.files_scanned;
+    target.files_skipped_unchanged += source.files_skipped_unchanged;
     target.raw_rows += source.raw_rows;
     target.candidate_usage_rows += source.candidate_usage_rows;
     target.accepted_events += source.accepted_events;
@@ -1806,8 +2053,9 @@ fn apply_account_hint_to_summaries(source: &SourceLocation, summaries: &mut [Usa
 
 fn print_scan_diagnostics_total(diagnostics: &ScanDiagnostics) {
     println!(
-        "diagnostics: files={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} timestamp_fallbacks={} model_fallbacks={}",
+        "diagnostics: files={} cached={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} timestamp_fallbacks={} model_fallbacks={}",
         format_u64(diagnostics.files_scanned),
+        format_u64(diagnostics.files_skipped_unchanged),
         format_u64(diagnostics.raw_rows),
         format_u64(diagnostics.candidate_usage_rows),
         format_u64(diagnostics.duplicate_events),
@@ -1816,6 +2064,43 @@ fn print_scan_diagnostics_total(diagnostics: &ScanDiagnostics) {
         format_u64(diagnostics.timestamp_fallbacks),
         format_u64(diagnostics.model_fallbacks)
     );
+}
+
+fn scan_file_state_entries(candidates: &[ScanCandidateFile]) -> Vec<ScanFileStateEntry> {
+    candidates
+        .iter()
+        .map(|candidate| ScanFileStateEntry {
+            cache_key: candidate.cache_key.clone(),
+            cache_signature: candidate.cache_signature.clone(),
+        })
+        .collect()
+}
+
+fn select_scan_file_entries(
+    store: &Store,
+    source_id: &ai_stats_core::SourceId,
+    file_cache_entries: &[ScanFileStateEntry],
+    replace: bool,
+    no_cache: bool,
+) -> Result<Vec<ScanFileStateEntry>> {
+    if replace || no_cache {
+        return Ok(file_cache_entries.to_vec());
+    }
+    store.pending_scan_file_entries(source_id, file_cache_entries)
+}
+
+fn format_cache_key_sample<'a>(keys: impl IntoIterator<Item = &'a str>) -> String {
+    let values: Vec<_> = keys.into_iter().map(abbreviate_home).collect();
+    if values.is_empty() {
+        return "none".to_string();
+    }
+    let sample: Vec<_> = values.iter().take(3).cloned().collect();
+    let remaining = values.len().saturating_sub(sample.len());
+    if remaining == 0 {
+        sample.join(", ")
+    } else {
+        format!("{} (+{} more)", sample.join(", "), remaining)
+    }
 }
 
 fn scan_sources_for_adapter(
@@ -1831,7 +2116,11 @@ fn scan_sources_for_adapter(
     }
     for mut source in configured_sources
         .iter()
-        .filter(|source| source.enabled && provider_matches(&source.provider, adapter.provider()))
+        .filter(|source| {
+            source.enabled
+                && provider_matches(&source.provider, adapter.provider())
+                && source.source_kind == SourceKind::LocalAdapter
+        })
         .cloned()
     {
         if source.path_label.is_none() {
@@ -1968,6 +2257,170 @@ fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
     event
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct FirestoreStatsAccumulator {
+    provider: String,
+    source_id: ai_stats_core::SourceId,
+    provider_account_id: Option<ai_stats_core::ProviderAccountId>,
+    source: EventSource,
+    period_start: DateTime<Utc>,
+    period_end: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    account_key: String,
+    day_key: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    reasoning_tokens: u64,
+    total_tokens: u64,
+    events: u64,
+    estimated_cost_usd: f64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FirestoreStatsBucketKey {
+    provider: String,
+    source_id: String,
+    account_key: String,
+    day_key: String,
+}
+
+#[cfg(test)]
+fn firestore_stats_bucket_key(event: &UsageEvent) -> FirestoreStatsBucketKey {
+    FirestoreStatsBucketKey {
+        provider: event.provider.clone(),
+        source_id: event.source_id.0.clone(),
+        account_key: event
+            .provider_account_id
+            .as_ref()
+            .map(|id| id.0.clone())
+            .unwrap_or_else(|| "unlinked".to_string()),
+        day_key: event.session.started_at.date_naive().to_string(),
+    }
+}
+
+#[cfg(test)]
+fn build_firestore_stats_summaries(events: &[UsageEvent], device_id: &str) -> Vec<UsageSummary> {
+    let mut buckets: BTreeMap<String, FirestoreStatsAccumulator> = BTreeMap::new();
+    for event in events {
+        let key = firestore_stats_bucket_key(event);
+        let day = event.session.started_at.date_naive();
+        let start = day
+            .and_hms_opt(0, 0, 0)
+            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+            .unwrap_or(event.session.started_at);
+        let end = start + chrono::Duration::days(1);
+        let entry = buckets
+            .entry(format!(
+                "{}|{}|{}|{}",
+                key.provider, key.source_id, key.account_key, key.day_key
+            ))
+            .or_insert_with(|| FirestoreStatsAccumulator {
+                provider: event.provider.clone(),
+                source_id: event.source_id.clone(),
+                provider_account_id: event.provider_account_id.clone(),
+                source: event.source.clone(),
+                period_start: start,
+                period_end: end,
+                observed_at: event.session.started_at,
+                account_key: key.account_key.clone(),
+                day_key: key.day_key.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 0,
+                events: 0,
+                estimated_cost_usd: 0.0,
+            });
+        entry.input_tokens = entry
+            .input_tokens
+            .saturating_add(event.usage.input_tokens.unwrap_or(0));
+        entry.output_tokens = entry
+            .output_tokens
+            .saturating_add(event.usage.output_tokens.unwrap_or(0));
+        entry.cache_creation_tokens = entry
+            .cache_creation_tokens
+            .saturating_add(event.usage.cache_creation_tokens.unwrap_or(0));
+        entry.cache_read_tokens = entry
+            .cache_read_tokens
+            .saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
+        entry.reasoning_tokens = entry
+            .reasoning_tokens
+            .saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
+        entry.total_tokens = entry
+            .total_tokens
+            .saturating_add(event.usage.computed_total());
+        entry.events = entry.events.saturating_add(1);
+        entry.estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0.0);
+        if event.session.started_at > entry.observed_at {
+            entry.observed_at = event.session.started_at;
+        }
+    }
+
+    buckets
+        .into_values()
+        .map(|bucket| UsageSummary {
+            schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
+            summary_id: summary_id(
+                &bucket.provider,
+                &bucket.source_id,
+                &format!("daily_stats:{}:{}", bucket.day_key, bucket.account_key),
+            ),
+            device_id: device_id.to_string(),
+            provider: bucket.provider,
+            source_id: bucket.source_id,
+            provider_account_id: bucket.provider_account_id,
+            source: EventSource {
+                source_record_id: None,
+                ..bucket.source
+            },
+            model: None,
+            usage: UsageCounts {
+                input_tokens: Some(bucket.input_tokens),
+                output_tokens: Some(bucket.output_tokens),
+                cache_creation_tokens: Some(bucket.cache_creation_tokens),
+                cache_read_tokens: Some(bucket.cache_read_tokens),
+                reasoning_tokens: Some(bucket.reasoning_tokens),
+                total_tokens: Some(bucket.total_tokens),
+                requests: Some(bucket.events),
+                local_prompt_eval_tokens: None,
+                local_eval_tokens: None,
+            },
+            cost: CostInfo {
+                currency: "USD".to_string(),
+                estimated_api_equivalent_usd: Some(bucket.estimated_cost_usd),
+                provider_reported_usd: None,
+                pricing_source: Some("local_rollup".to_string()),
+                pricing_version: None,
+                confidence: Confidence::Medium,
+            },
+            parse_evidence: None,
+            privacy: PrivacyInfo {
+                mode: PrivacyMode::MetadataOnly,
+                contains_prompt_text: false,
+                contains_response_text: false,
+                contains_file_paths: false,
+            },
+            period_start: Some(bucket.period_start),
+            period_end: Some(bucket.period_end),
+            observed_at: bucket.observed_at,
+            metadata: SummaryMetadata {
+                summary_format: "daily_rollup.v1".to_string(),
+                summary_version: Some("1".to_string()),
+                total_sessions: None,
+                total_messages: None,
+                last_computed_at: Some(Utc::now()),
+            },
+            imported_at: Utc::now(),
+        })
+        .collect()
+}
+
 fn sanitize_summary_for_sync(mut summary: UsageSummary) -> UsageSummary {
     summary.source.source_record_id = None;
     if let Some(evidence) = summary.parse_evidence.as_mut() {
@@ -1975,6 +2428,10 @@ fn sanitize_summary_for_sync(mut summary: UsageSummary) -> UsageSummary {
         evidence.source_record_id = None;
     }
     summary
+}
+
+fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
+    summary.metadata.summary_format == "daily_rollup.v1"
 }
 
 fn sanitize_subscription_for_sync(mut subscription: Subscription) -> Subscription {
@@ -2014,6 +2471,10 @@ mod tests {
 
         fn discover(&self) -> Vec<SourceLocation> {
             self.discovered.clone()
+        }
+
+        fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+            Ok(Vec::new())
         }
 
         fn scan(
@@ -2063,7 +2524,7 @@ mod tests {
         });
 
         let mut summary = test_summary("codex", &source, now, 100);
-        summary.source.source_record_id = Some("ccusage_jul11.txt:daily:2025-07-11".to_string());
+        summary.source.source_record_id = Some("reported_jul11.json:daily:2025-07-11".to_string());
         summary.parse_evidence = event.parse_evidence.clone();
 
         let event = sanitize_event_for_sync(event);
@@ -2096,7 +2557,7 @@ mod tests {
             SourceKind::ExternalReport,
             "reported-usage-summary",
             "0",
-            "ccusage",
+            "external-report",
             None,
             Some("personal".to_string()),
         );
@@ -2114,10 +2575,10 @@ mod tests {
             .expect("now");
         let mut reported = test_summary("claude_code", &source, now, 100);
         reported.source.source_kind = SourceKind::ExternalReport;
-        reported.metadata.summary_format = "ccusage_daily".to_string();
+        reported.metadata.summary_format = "external_daily".to_string();
         let mut local = test_summary("claude_code", &local_source, now, 200);
         local.source.source_kind = SourceKind::LocalSummary;
-        local.metadata.summary_format = "ccusage_daily".to_string();
+        local.metadata.summary_format = "external_daily".to_string();
         store.upsert_summary(&reported).expect("reported summary");
         store.upsert_summary(&local).expect("local summary");
 
@@ -2143,7 +2604,7 @@ mod tests {
             SourceKind::ExternalReport,
             "reported-usage-summary",
             "0",
-            "ccusage-file-a",
+            "reported-file-a",
             None,
             Some("personal".to_string()),
         );
@@ -2152,7 +2613,7 @@ mod tests {
             SourceKind::ExternalReport,
             "reported-usage-summary",
             "0",
-            "ccusage-file-b",
+            "reported-file-b",
             None,
             Some("personal".to_string()),
         );
@@ -2163,7 +2624,7 @@ mod tests {
 
         let mut matching = test_summary("claude_code", &source, now, 100);
         matching.source.source_kind = SourceKind::ExternalReport;
-        matching.metadata.summary_format = "ccusage_daily".to_string();
+        matching.metadata.summary_format = "external_daily".to_string();
         matching.period_start = Some(now - Duration::days(1));
         matching.period_end = Some(now);
 
@@ -2171,13 +2632,13 @@ mod tests {
         same_file_different_day.summary_id =
             summary_id("claude_code", &source.source_id, "other-day");
         same_file_different_day.source.source_kind = SourceKind::ExternalReport;
-        same_file_different_day.metadata.summary_format = "ccusage_daily".to_string();
+        same_file_different_day.metadata.summary_format = "external_daily".to_string();
         same_file_different_day.period_start = Some(now - Duration::days(2));
         same_file_different_day.period_end = Some(now - Duration::days(1));
 
         let mut same_period_different_file = test_summary("claude_code", &other_source, now, 300);
         same_period_different_file.source.source_kind = SourceKind::ExternalReport;
-        same_period_different_file.metadata.summary_format = "ccusage_daily".to_string();
+        same_period_different_file.metadata.summary_format = "external_daily".to_string();
         same_period_different_file.period_start = matching.period_start;
         same_period_different_file.period_end = matching.period_end;
 
@@ -2194,7 +2655,7 @@ mod tests {
             summary: matching.clone(),
         };
         let report = ReportedImportReport {
-            path: PathBuf::from("ccusage-file-a.txt"),
+            path: PathBuf::from("reported-file-a.json"),
             records: vec![incoming],
             warnings: Vec::new(),
         };
@@ -2367,6 +2828,36 @@ mod tests {
     }
 
     #[test]
+    fn non_local_sources_are_ignored_for_adapter_scans() {
+        let configured_local = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-local"),
+            LocationOrigin::Configured,
+            Some("personal".to_string()),
+        );
+        let configured_manual = SourceLocation::reported_usage(
+            "codex",
+            SourceKind::Manual,
+            "reported-usage-summary",
+            "0",
+            "manual-note",
+            None,
+            Some("personal".to_string()),
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: Vec::new(),
+        };
+
+        let sources =
+            scan_sources_for_adapter(&adapter, &[configured_local.clone(), configured_manual]);
+
+        assert_eq!(sources, vec![configured_local]);
+    }
+
+    #[test]
     fn apply_account_hint_attaches_manual_identity() {
         let adapter = adapter_for_provider("codex").expect("adapter");
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2391,6 +2882,7 @@ mod tests {
                 &source,
                 &ScanOptions {
                     device_id: "device".to_string(),
+                    selected_cache_keys: None,
                 },
             )
             .expect("scan");
@@ -2440,6 +2932,13 @@ mod tests {
                 output: Some(output.clone()),
                 endpoint: None,
                 auth_token: None,
+                firebase_uid: None,
+                firebase_project: "ai-stats-fire".to_string(),
+                firestore_mode: "stats".to_string(),
+                firestore_records_per_batch: 1000,
+                firestore_commit_writes: 200,
+                firestore_retries: 4,
+                firestore_backoff_ms: 800,
                 since_last: false,
                 status: false,
                 dry_run: true,
@@ -2450,6 +2949,134 @@ mod tests {
         .expect("sync dry run");
 
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn no_cache_scan_reselects_unchanged_files() {
+        let store = Store::in_memory().expect("store");
+        let source_id = ai_stats_core::SourceId("src-no-cache".to_string());
+        let entries = vec![
+            ScanFileStateEntry {
+                cache_key: "/tmp/a.jsonl".to_string(),
+                cache_signature: "sig-a-1".to_string(),
+            },
+            ScanFileStateEntry {
+                cache_key: "/tmp/b.jsonl".to_string(),
+                cache_signature: "sig-b-1".to_string(),
+            },
+        ];
+
+        let initial = select_scan_file_entries(&store, &source_id, &entries, false, false)
+            .expect("initial selection");
+        assert_eq!(initial, entries);
+        store
+            .record_scan_file_entries(&source_id, &entries)
+            .expect("record cache state");
+
+        let default_selection =
+            select_scan_file_entries(&store, &source_id, &entries, false, false)
+                .expect("default selection");
+        assert!(default_selection.is_empty());
+
+        let no_cache_selection =
+            select_scan_file_entries(&store, &source_id, &entries, false, true)
+                .expect("no-cache selection");
+        assert_eq!(no_cache_selection, entries);
+
+        let replace_selection = select_scan_file_entries(&store, &source_id, &entries, true, false)
+            .expect("replace selection");
+        assert_eq!(replace_selection, entries);
+    }
+
+    #[test]
+    fn firestore_sync_target_is_scoped_to_uid() {
+        assert_eq!(
+            firestore_sync_target("ai-stats-fire", "uid-123"),
+            "firestore:ai-stats-fire:uid-123"
+        );
+    }
+
+    #[test]
+    fn firestore_stats_summaries_roll_up_events_by_day_and_account() {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-firestore-stats"),
+            LocationOrigin::Configured,
+            Some("personal".to_string()),
+        );
+        let account = provider_account_id("codex", "personal");
+        let day1_a = Utc
+            .with_ymd_and_hms(2026, 5, 20, 10, 0, 0)
+            .single()
+            .expect("day1a");
+        let day1_b = Utc
+            .with_ymd_and_hms(2026, 5, 20, 11, 0, 0)
+            .single()
+            .expect("day1b");
+        let day2 = Utc
+            .with_ymd_and_hms(2026, 5, 21, 9, 0, 0)
+            .single()
+            .expect("day2");
+
+        let summaries = build_firestore_stats_summaries(
+            &[
+                test_event(
+                    "codex",
+                    &source,
+                    day1_a,
+                    Some(account.clone()),
+                    TokenParts {
+                        input: 10,
+                        output: 5,
+                        cached_input: 0,
+                        reasoning: 0,
+                        total: 15,
+                        cost: Some(0.10),
+                    },
+                ),
+                test_event(
+                    "codex",
+                    &source,
+                    day1_b,
+                    Some(account.clone()),
+                    TokenParts {
+                        input: 20,
+                        output: 10,
+                        cached_input: 0,
+                        reasoning: 0,
+                        total: 30,
+                        cost: Some(0.30),
+                    },
+                ),
+                test_event(
+                    "codex",
+                    &source,
+                    day2,
+                    Some(account),
+                    TokenParts {
+                        input: 7,
+                        output: 3,
+                        cached_input: 0,
+                        reasoning: 0,
+                        total: 10,
+                        cost: Some(0.05),
+                    },
+                ),
+            ],
+            "device",
+        );
+
+        assert_eq!(summaries.len(), 2);
+        let total_tokens: u64 = summaries
+            .iter()
+            .map(|summary| summary.usage.total_tokens.unwrap_or(0))
+            .sum();
+        assert_eq!(total_tokens, 55);
+        assert!(summaries
+            .iter()
+            .all(|summary| summary.metadata.summary_format == "daily_rollup.v1"));
     }
 
     #[test]
@@ -2617,86 +3244,6 @@ mod tests {
     }
 
     #[test]
-    fn ccusage_daily_report_imports_exact_token_splits() {
-        let evidence_path = Path::new("/tmp/ccusage.txt");
-        let text = "│ 2025-07-11 │ claude-sonnet │ 276,719 │ 1,075,310 │ 86,144,908 │ 1,558,827,137 │ 1,646,324,074 │ $2493.54 │";
-
-        let inputs = parse_ccusage_daily_rows(text, "claude_code", Some("personal"), evidence_path);
-
-        assert_eq!(inputs.len(), 1);
-        let record =
-            build_reported_usage_summary(inputs[0].clone(), "device").expect("reported summary");
-        let summary = &record.summary;
-        assert_eq!(summary.metadata.summary_format, "ccusage_daily");
-        assert_eq!(summary.usage.input_tokens, Some(276_719));
-        assert_eq!(summary.usage.output_tokens, Some(1_075_310));
-        assert_eq!(summary.usage.cache_creation_tokens, Some(86_144_908));
-        assert_eq!(summary.usage.cache_read_tokens, Some(1_558_827_137));
-        assert_eq!(summary.usage.total_tokens, Some(1_646_324_074));
-        assert_eq!(summary.cost.provider_reported_usd, Some(2493.54));
-        assert_eq!(
-            summary
-                .parse_evidence
-                .as_ref()
-                .map(|evidence| evidence.account_identity_source.clone()),
-            Some(IdentitySource::ManualHint)
-        );
-    }
-
-    #[test]
-    fn ccusage_simple_summary_uses_year_for_period() {
-        let evidence_path = Path::new("/tmp/claude-code-sep.txt");
-        let text = "\
-Claude Code Pro Summary (SEP 4-9)
-Input tokens: 46,127
-Output tokens: 213,223
-Cache Create tokens: 13,338,573
-Cache Read tokens: 165,270,503
-Total tokens: 178,868,426
-Total cost: $102.94
-";
-        let mut warnings = Vec::new();
-
-        let inputs = parse_ccusage_simple_summary(
-            text,
-            "claude_code",
-            Some("personal"),
-            Some(2025),
-            evidence_path,
-            &mut warnings,
-        );
-
-        assert!(warnings.is_empty());
-        assert_eq!(inputs.len(), 1);
-        let record =
-            build_reported_usage_summary(inputs[0].clone(), "device").expect("reported summary");
-        let summary = &record.summary;
-        assert_eq!(summary.metadata.summary_format, "ccusage_summary");
-        assert_eq!(summary.usage.input_tokens, Some(46_127));
-        assert_eq!(summary.usage.output_tokens, Some(213_223));
-        assert_eq!(summary.usage.cache_creation_tokens, Some(13_338_573));
-        assert_eq!(summary.usage.cache_read_tokens, Some(165_270_503));
-        assert_eq!(summary.usage.total_tokens, Some(178_868_426));
-        assert_eq!(summary.cost.provider_reported_usd, Some(102.94));
-        assert_eq!(
-            summary.period_start,
-            Some(
-                Utc.with_ymd_and_hms(2025, 9, 4, 0, 0, 0)
-                    .single()
-                    .expect("start")
-            )
-        );
-        assert_eq!(
-            summary.period_end,
-            Some(
-                Utc.with_ymd_and_hms(2025, 9, 9, 23, 59, 59)
-                    .single()
-                    .expect("end")
-            )
-        );
-    }
-
-    #[test]
     fn usage_report_keeps_summary_formats_separate() {
         let now = Utc
             .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
@@ -2712,13 +3259,13 @@ Total cost: $102.94
         );
         let mut stats_cache = test_summary("claude_code", &source, now, 500);
         stats_cache.metadata.summary_format = "claude_stats_cache".to_string();
-        let mut ccusage = test_summary("claude_code", &source, now, 300);
-        ccusage.summary_id = summary_id("claude_code", &source.source_id, "ccusage");
-        ccusage.metadata.summary_format = "ccusage_daily".to_string();
+        let mut external = test_summary("claude_code", &source, now, 300);
+        external.summary_id = summary_id("claude_code", &source.source_id, "external");
+        external.metadata.summary_format = "external_daily".to_string();
 
         let report = build_usage_report(
             &[],
-            &[stats_cache, ccusage],
+            &[stats_cache, external],
             std::slice::from_ref(&source),
             &[],
             ReportPeriod::AllTime,
@@ -2733,7 +3280,7 @@ Total cost: $102.94
         assert!(report
             .summary_rows
             .iter()
-            .any(|row| row.kind == "ccusage_daily" && row.usage.total_tokens == 300));
+            .any(|row| row.kind == "external_daily" && row.usage.total_tokens == 300));
     }
 
     struct TokenParts {

@@ -36,6 +36,8 @@ thiserror = "1"
 tiny_http = "0.12"
 walkdir = "2"
 notify = "7"
+ureq = { version = "2.9", features = ["json"] }
+percent-encoding = "2.3"
 
 [profile.release]
 lto = "thin"
