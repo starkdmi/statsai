@@ -32,6 +32,10 @@ The first adapters target Claude Code JSONL usage roots and Codex session logs. 
 ```sh
 cargo run -p ai-stats-cli -- scan --provider codex --preview
 cargo run -p ai-stats-cli -- source add --provider codex --path "$HOME/.codex-work" --account work
+cargo run -p ai-stats-cli -- source disable --source-id src_123
+cargo run -p ai-stats-cli -- source enable --source-id src_123
+cargo run -p ai-stats-cli -- source remove --source-id src_123
+cargo run -p ai-stats-cli -- source remove --source-id src_123 --delete-data
 cargo run -p ai-stats-cli -- account resolve --provider codex
 cargo run -p ai-stats-cli -- subscription add --provider claude --account personal --plan Pro --price 20 --paid-at 2026-05-15
 cargo run -p ai-stats-cli -- import summary --path ./reported_usage_summaries.json --dry-run --verbose
@@ -44,6 +48,7 @@ cargo run -p ai-stats-cli -- auth login
 cargo run -p ai-stats-cli -- auth status
 cargo run -p ai-stats-cli -- sync --sink firestore --since-last
 cargo run -p ai-stats-cli -- sync --sink firestore --since-last --firestore-mode stats
+cargo run -p ai-stats-cli -- sync --sink firestore --verify
 cargo run -p ai-stats-cli -- schema sync-batch
 ```
 
@@ -55,6 +60,7 @@ codex account=work path=~/.codex-work usage_events=123 input=1,000,000 cached=80
 
 `scan` persists normalized events idempotently. Re-running it refreshes existing rows when adapter metadata improves, so new token split or estimated cost fields can be backfilled without duplicating events.
 Normal scans now keep a lightweight per-source file signature cache in SQLite and skip unchanged JSONL/stat summary files, so repeat scans usually only parse the currently active log files. The diagnostics line includes `cached=` for files skipped as unchanged.
+Use `scan --no-cache` for a one-off forced reread without deleting existing data first, or `scan --replace` for a destructive source rebuild.
 
 `report weekly`, `report monthly`, and `report all-time` group stored usage by provider and account. Text output is human-readable; `--json --verbose` includes source IDs, local path labels, token split totals, and `estimated_cost_usd` for SDKs or scripts.
 
@@ -86,6 +92,7 @@ Firebase credentials locally in `~/.ai-stats/auth.json`:
 cargo run -p ai-stats-cli -- auth login
 cargo run -p ai-stats-cli -- auth status
 cargo run -p ai-stats-cli -- sync --sink firestore --since-last
+cargo run -p ai-stats-cli -- sync --sink firestore --verify
 ```
 
 After login, Firestore and HTTP sync automatically use the stored Firebase ID
@@ -112,6 +119,25 @@ stats sync once to bootstrap the local rollup cache:
 ```sh
 cargo run -p ai-stats-cli -- sync --sink firestore --firestore-mode stats
 ```
+
+Source management helpers:
+
+```sh
+cargo run -p ai-stats-cli -- source list
+cargo run -p ai-stats-cli -- source disable --source-id src_123
+cargo run -p ai-stats-cli -- source enable --source-id src_123
+cargo run -p ai-stats-cli -- source remove --source-id src_123
+cargo run -p ai-stats-cli -- source remove --source-id src_123 --delete-data
+```
+
+`source remove` deletes the source configuration. Add `--delete-data` to also
+remove local events, summaries, rollups, and scan-cache entries tied to that
+source from SQLite.
+
+`sync --verify` resolves the active Firebase target, shows local sync state,
+and fetches a small remote snapshot (`devices`, `syncBatches`, `sources`,
+`accounts`, `subscriptions`, `events`, `summaries`) so you can confirm what the
+backend sees without relying on the Firebase console UI.
 
 ### Local Firebase Tests
 

@@ -14,6 +14,7 @@ The CLI produces a sync batch with:
 ```sh
 cargo run -p ai-stats-cli -- sync --sink stdout
 cargo run -p ai-stats-cli -- sync --sink firestore --since-last
+cargo run -p ai-stats-cli -- sync --sink firestore --verify
 cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:3000/v1/sync/batches
 ```
 
@@ -132,6 +133,7 @@ CLI login uses the hosted Firebase web app by default:
 cargo run -p ai-stats-cli -- auth login
 cargo run -p ai-stats-cli -- auth status
 cargo run -p ai-stats-cli -- sync --sink firestore --since-last
+cargo run -p ai-stats-cli -- sync --sink firestore --verify
 ```
 
 The fallback `--client-id "$GOOGLE_CLIENT_ID"` login mode supports a custom
@@ -154,6 +156,12 @@ changed locally the CLI performs no hosted Firestore writes.
 For local tests, set `FIRESTORE_EMULATOR_HOST=127.0.0.1:8080` and run against
 the Firebase emulator suite instead of production. Optionally set
 `AI_STATS_FIRESTORE_TEST_UID` to force a stable local UID without login.
+
+`sync --verify` performs a lightweight inspection of the resolved Firestore
+target. It reports the local sync cursor/hash state, current dirty rollup
+counts, and a small remote snapshot of the user's `devices`, `syncBatches`,
+`sources`, `accounts`, `subscriptions`, `events`, and `summaries`
+subcollections.
 
 Auth token precedence for sync is:
 

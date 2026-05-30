@@ -239,6 +239,31 @@ impl Store {
         }
     }
 
+    pub fn delete_scan_file_entries_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut deleted = 0u64;
+            for source_id in source_ids {
+                deleted += self.conn.execute(
+                    "DELETE FROM scan_file_state WHERE source_id = ?1",
+                    params![&source_id.0],
+                )? as u64;
+            }
+            Ok(deleted)
+        })();
+
+        match result {
+            Ok(deleted) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
     pub fn upsert_source(&self, source: &SourceLocation) -> Result<()> {
         let payload = serde_json::to_string(source)?;
         self.conn.execute(
@@ -274,6 +299,39 @@ impl Store {
             sources.push(serde_json::from_str(&row?)?);
         }
         Ok(sources)
+    }
+
+    pub fn source(&self, source_id: &SourceId) -> Result<Option<SourceLocation>> {
+        self.conn
+            .query_row(
+                "SELECT payload FROM sources WHERE source_id = ?1",
+                params![&source_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| Ok(serde_json::from_str(&payload)?))
+            .transpose()
+    }
+
+    pub fn set_source_enabled(
+        &self,
+        source_id: &SourceId,
+        enabled: bool,
+    ) -> Result<Option<SourceLocation>> {
+        let Some(mut source) = self.source(source_id)? else {
+            return Ok(None);
+        };
+        source.enabled = enabled;
+        source.updated_at = Utc::now();
+        self.upsert_source(&source)?;
+        Ok(Some(source))
+    }
+
+    pub fn delete_source(&self, source_id: &SourceId) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM sources WHERE source_id = ?1",
+            params![&source_id.0],
+        )? > 0)
     }
 
     pub fn upsert_account(&self, account: &ProviderAccount) -> Result<()> {
@@ -2280,6 +2338,67 @@ mod tests {
             .pending_sources_for_sync("firestore", "firestore:ai-stats-fire", &[source])
             .expect("changed after update");
         assert_eq!(changed.len(), 1);
+    }
+
+    #[test]
+    fn source_lifecycle_updates_enabled_and_removes_scan_cache() {
+        let store = Store::in_memory().expect("store");
+        let source = ai_stats_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-source-lifecycle"),
+            LocationOrigin::Configured,
+            Some("personal".to_string()),
+        );
+        let source_id = source.source_id.clone();
+        store.upsert_source(&source).expect("source");
+        store
+            .record_scan_file_entries(
+                &source_id,
+                &[ScanFileStateEntry {
+                    cache_key: "/tmp/a.jsonl".to_string(),
+                    cache_signature: "sig-a-1".to_string(),
+                }],
+            )
+            .expect("record scan cache");
+
+        let disabled = store
+            .set_source_enabled(&source_id, false)
+            .expect("disable")
+            .expect("existing source");
+        assert!(!disabled.enabled);
+        assert!(store
+            .pending_scan_file_entries(
+                &source_id,
+                &[ScanFileStateEntry {
+                    cache_key: "/tmp/a.jsonl".to_string(),
+                    cache_signature: "sig-a-1".to_string(),
+                }],
+            )
+            .expect("cached")
+            .is_empty());
+
+        let deleted_scan_cache = store
+            .delete_scan_file_entries_for_sources(std::slice::from_ref(&source_id))
+            .expect("delete scan cache");
+        assert_eq!(deleted_scan_cache, 1);
+        assert!(
+            store
+                .pending_scan_file_entries(
+                    &source_id,
+                    &[ScanFileStateEntry {
+                        cache_key: "/tmp/a.jsonl".to_string(),
+                        cache_signature: "sig-a-1".to_string(),
+                    }],
+                )
+                .expect("pending after delete")
+                .len()
+                == 1
+        );
+
+        assert!(store.delete_source(&source_id).expect("delete source"));
+        assert!(store.source(&source_id).expect("reload").is_none());
     }
 
     fn test_store_event(

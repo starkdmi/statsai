@@ -26,7 +26,8 @@ use anyhow::{bail, Context, Result};
 use chrono::Duration;
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
-use serde_json::json;
+use serde::Serialize;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -168,6 +169,26 @@ enum SourceSubcommand {
         #[arg(long, help = "Account label to attach to events from this source")]
         account: Option<String>,
     },
+    #[command(about = "Enable a configured source")]
+    Enable {
+        #[arg(long, help = "Source identifier to enable")]
+        source_id: String,
+    },
+    #[command(about = "Disable a configured source")]
+    Disable {
+        #[arg(long, help = "Source identifier to disable")]
+        source_id: String,
+    },
+    #[command(about = "Remove a configured source")]
+    Remove {
+        #[arg(long, help = "Source identifier to remove")]
+        source_id: String,
+        #[arg(
+            long,
+            help = "Delete local events, summaries, rollups, and scan cache for this source"
+        )]
+        delete_data: bool,
+    },
     #[command(about = "List all configured sources")]
     List,
 }
@@ -306,6 +327,11 @@ struct SyncCommand {
     since_last: bool,
     #[arg(long, help = "Show recorded sync state instead of sending")]
     status: bool,
+    #[arg(
+        long,
+        help = "Inspect the resolved target and verify remote firestore access"
+    )]
+    verify: bool,
     #[arg(long, help = "Build the sync batch without writing")]
     dry_run: bool,
 }
@@ -574,6 +600,57 @@ fn source(command: SourceCommand, store: &Store) -> Result<()> {
             source.path_label = Some(path.to_string_lossy().to_string());
             store.upsert_source(&source)?;
             println!("{}", serde_json::to_string_pretty(&source)?);
+        }
+        SourceSubcommand::Enable { source_id } => {
+            let source_id = ai_stats_core::SourceId(source_id);
+            let source = store
+                .set_source_enabled(&source_id, true)?
+                .with_context(|| format!("unknown source {}", source_id.0))?;
+            println!("{}", serde_json::to_string_pretty(&source)?);
+        }
+        SourceSubcommand::Disable { source_id } => {
+            let source_id = ai_stats_core::SourceId(source_id);
+            let source = store
+                .set_source_enabled(&source_id, false)?
+                .with_context(|| format!("unknown source {}", source_id.0))?;
+            println!("{}", serde_json::to_string_pretty(&source)?);
+        }
+        SourceSubcommand::Remove {
+            source_id,
+            delete_data,
+        } => {
+            let source_id = ai_stats_core::SourceId(source_id);
+            let source = store
+                .source(&source_id)?
+                .with_context(|| format!("unknown source {}", source_id.0))?;
+            let deleted_events = if delete_data {
+                store.delete_events_for_sources(std::slice::from_ref(&source_id))?
+            } else {
+                0
+            };
+            let deleted_summaries = if delete_data {
+                store.delete_summaries_for_sources(std::slice::from_ref(&source_id))?
+            } else {
+                0
+            };
+            let deleted_scan_entries = if delete_data {
+                store.delete_scan_file_entries_for_sources(std::slice::from_ref(&source_id))?
+            } else {
+                0
+            };
+            let deleted = store.delete_source(&source_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "source_id": source_id.0,
+                    "deleted": deleted,
+                    "delete_data": delete_data,
+                    "deleted_events": deleted_events,
+                    "deleted_summaries": deleted_summaries,
+                    "deleted_scan_cache_entries": deleted_scan_entries,
+                    "source": source
+                }))?
+            );
         }
         SourceSubcommand::List => {
             println!("{}", serde_json::to_string_pretty(&store.list_sources()?)?);
@@ -892,6 +969,10 @@ fn export(command: ExportCommand, store: &Store) -> Result<()> {
 }
 
 fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
+    if command.verify {
+        return sync_verify(command, store, device_id);
+    }
+
     if command.status {
         return sync_status(store);
     }
@@ -1315,6 +1396,54 @@ fn sync_status(store: &Store) -> Result<()> {
     Ok(())
 }
 
+fn sync_verify(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
+    if command.sink != "firestore" {
+        bail!("--verify is currently supported only with --sink firestore");
+    }
+
+    let auth = resolve_firestore_auth_context(&command)?;
+    let target = firestore_sync_target(&command.firebase_project, &auth.uid);
+    let all_sources = store.list_sources()?;
+    let all_accounts = store.list_accounts()?;
+    let all_subscriptions = store.list_subscriptions()?;
+    let local_state = store.sync_state("firestore", &target)?;
+    let report = FirestoreVerifyReport {
+        sink: command.sink.clone(),
+        target: target.clone(),
+        project: command.firebase_project.clone(),
+        uid: auth.uid.clone(),
+        using_emulator: firestore_emulator_host().is_some(),
+        device_id: device_id.to_string(),
+        local: FirestoreLocalVerify {
+            sync_state: local_state.as_ref().map(sync_state_report),
+            total_sources: all_sources.len(),
+            enabled_sources: all_sources.iter().filter(|source| source.enabled).count(),
+            pending_sources: store
+                .pending_sources_for_sync("firestore", &target, &all_sources)?
+                .len(),
+            total_accounts: all_accounts.len(),
+            pending_accounts: store
+                .pending_accounts_for_sync("firestore", &target, &all_accounts)?
+                .len(),
+            total_subscriptions: all_subscriptions.len(),
+            pending_subscriptions: store
+                .pending_subscriptions_for_sync("firestore", &target, &all_subscriptions)?
+                .len(),
+            total_rollups: store.firestore_rollup_count()? as usize,
+            dirty_rollups: store.dirty_firestore_rollup_summaries()?.len(),
+        },
+        remote: firestore_remote_verify(
+            &command.firebase_project,
+            &auth.uid,
+            &auth.auth_token,
+            device_id,
+        )?,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 fn sync_target(command: &SyncCommand) -> String {
     match command.sink.as_str() {
         "http" => command
@@ -1335,6 +1464,72 @@ fn sync_target(command: &SyncCommand) -> String {
 struct FirestoreAuthContext {
     auth_token: String,
     uid: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FirestoreVerifyReport {
+    sink: String,
+    target: String,
+    project: String,
+    uid: String,
+    using_emulator: bool,
+    device_id: String,
+    local: FirestoreLocalVerify,
+    remote: FirestoreRemoteVerify,
+}
+
+#[derive(Debug, Serialize)]
+struct FirestoreLocalVerify {
+    sync_state: Option<SyncStateReport>,
+    total_sources: usize,
+    enabled_sources: usize,
+    pending_sources: usize,
+    total_accounts: usize,
+    pending_accounts: usize,
+    total_subscriptions: usize,
+    pending_subscriptions: usize,
+    total_rollups: usize,
+    dirty_rollups: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncStateReport {
+    last_success_at: String,
+    last_batch_id: String,
+    event_cursor: String,
+    summary_cursor: String,
+    failure_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FirestoreRemoteVerify {
+    device: Option<FirestoreDeviceSnapshot>,
+    recent_batches: Vec<FirestoreBatchSnapshot>,
+    collections: Vec<FirestoreCollectionSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+struct FirestoreDeviceSnapshot {
+    document_id: String,
+    last_batch_id: Option<String>,
+    last_synced_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FirestoreBatchSnapshot {
+    document_id: String,
+    batch_id: Option<String>,
+    device_id: Option<String>,
+    synced_at: Option<String>,
+    counts: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct FirestoreCollectionSnapshot {
+    collection: String,
+    returned_docs: usize,
+    has_more: bool,
+    sample_doc_ids: Vec<String>,
 }
 
 fn resolve_firestore_auth_context(command: &SyncCommand) -> Result<FirestoreAuthContext> {
@@ -1375,6 +1570,249 @@ fn resolve_firestore_auth_context(command: &SyncCommand) -> Result<FirestoreAuth
 
 fn firestore_sync_target(project: &str, uid: &str) -> String {
     format!("firestore:{project}:{uid}")
+}
+
+fn sync_state_report(state: &ai_stats_store::SyncState) -> SyncStateReport {
+    SyncStateReport {
+        last_success_at: state.last_success_at.to_rfc3339(),
+        last_batch_id: state.last_batch_id.clone(),
+        event_cursor: format_cursor(
+            state
+                .last_event_started_at
+                .as_ref()
+                .map(DateTime::to_rfc3339),
+            state.last_event_id.as_deref(),
+        ),
+        summary_cursor: format_cursor(
+            state
+                .last_summary_observed_at
+                .as_ref()
+                .map(DateTime::to_rfc3339),
+            state.last_summary_id.as_deref(),
+        ),
+        failure_count: state.failure_count,
+    }
+}
+
+fn firestore_remote_verify(
+    project: &str,
+    uid: &str,
+    auth_token: &str,
+    device_id: &str,
+) -> Result<FirestoreRemoteVerify> {
+    let device = firestore_get_document(
+        project,
+        &format!(
+            "users/{}/devices/{}",
+            sanitize_firestore_document_id(uid),
+            sanitize_firestore_document_id(device_id)
+        ),
+        auth_token,
+    )?
+    .map(|document| FirestoreDeviceSnapshot {
+        document_id: firestore_document_id(&document),
+        last_batch_id: firestore_string_field(
+            &document,
+            &["fields", "last_batch_id", "stringValue"],
+        ),
+        last_synced_at: firestore_string_field(
+            &document,
+            &["fields", "last_synced_at", "stringValue"],
+        ),
+    });
+
+    let batches = firestore_list_collection(project, uid, "syncBatches", 5, auth_token)?;
+    let mut recent_batches: Vec<_> = batches
+        .documents
+        .iter()
+        .map(|document| FirestoreBatchSnapshot {
+            document_id: firestore_document_id(document),
+            batch_id: firestore_string_field(document, &["fields", "batch_id", "stringValue"]),
+            device_id: firestore_string_field(document, &["fields", "device_id", "stringValue"]),
+            synced_at: firestore_string_field(document, &["fields", "synced_at", "stringValue"]),
+            counts: document.pointer("/fields/counts/mapValue/fields").cloned(),
+        })
+        .collect();
+    recent_batches.sort_by(|left, right| right.synced_at.cmp(&left.synced_at));
+
+    let mut collections = Vec::new();
+    for (name, page_size) in [
+        ("devices", 3usize),
+        ("syncBatches", 5usize),
+        ("sources", 3usize),
+        ("accounts", 3usize),
+        ("subscriptions", 3usize),
+        ("events", 1usize),
+        ("summaries", 3usize),
+    ] {
+        let listing = firestore_list_collection(project, uid, name, page_size, auth_token)?;
+        collections.push(FirestoreCollectionSnapshot {
+            collection: name.to_string(),
+            returned_docs: listing.documents.len(),
+            has_more: listing.next_page_token.is_some(),
+            sample_doc_ids: listing
+                .documents
+                .iter()
+                .map(firestore_document_id)
+                .collect(),
+        });
+    }
+
+    Ok(FirestoreRemoteVerify {
+        device,
+        recent_batches,
+        collections,
+    })
+}
+
+struct FirestoreListResponse {
+    documents: Vec<Value>,
+    next_page_token: Option<String>,
+}
+
+fn firestore_get_document(
+    project: &str,
+    relative_path: &str,
+    auth_token: &str,
+) -> Result<Option<Value>> {
+    let url = firestore_document_get_url(project, relative_path);
+    let mut request = ureq::get(&url);
+    if firestore_emulator_host().is_none() {
+        request = request.set("Authorization", &format!("Bearer {auth_token}"));
+    }
+    match request.call() {
+        Ok(response) => Ok(Some(firestore_response_json(response, "read document")?)),
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(error) => Err(firestore_request_error("read document", error)),
+    }
+}
+
+fn firestore_list_collection(
+    project: &str,
+    uid: &str,
+    collection: &str,
+    page_size: usize,
+    auth_token: &str,
+) -> Result<FirestoreListResponse> {
+    let url = firestore_collection_list_url(project, uid, collection, page_size);
+    let mut request = ureq::get(&url);
+    if firestore_emulator_host().is_none() {
+        request = request.set("Authorization", &format!("Bearer {auth_token}"));
+    }
+    let value = match request.call() {
+        Ok(response) => {
+            firestore_response_json(response, &format!("list collection {collection}"))?
+        }
+        Err(ureq::Error::Status(404, _)) => Value::Object(Default::default()),
+        Err(error) => {
+            return Err(firestore_request_error(
+                &format!("list collection {collection}"),
+                error,
+            ))
+        }
+    };
+    Ok(FirestoreListResponse {
+        documents: value
+            .get("documents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        next_page_token: value
+            .get("nextPageToken")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn firestore_request_error(action: &str, error: ureq::Error) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(code, response) => {
+            let body = response.into_string().unwrap_or_default();
+            anyhow::anyhow!("Firestore {action} failed (HTTP {code}): {body}")
+        }
+        other => anyhow::anyhow!("Firestore {action} failed: {other}"),
+    }
+}
+
+fn firestore_response_json(response: ureq::Response, action: &str) -> Result<Value> {
+    let body = response
+        .into_string()
+        .with_context(|| format!("read Firestore {action} response body"))?;
+    serde_json::from_str(&body).with_context(|| format!("parse Firestore {action} response JSON"))
+}
+
+fn firestore_collection_list_url(
+    project: &str,
+    uid: &str,
+    collection: &str,
+    page_size: usize,
+) -> String {
+    let prefix = firestore_document_path_prefix(project, uid);
+    format!("{prefix}/{collection}?pageSize={page_size}")
+}
+
+fn firestore_document_get_url(project: &str, relative_path: &str) -> String {
+    let base = firestore_api_base(project);
+    format!("{base}/{relative_path}")
+}
+
+fn firestore_document_path_prefix(project: &str, uid: &str) -> String {
+    let base = firestore_api_base(project);
+    format!("{base}/users/{}", sanitize_firestore_document_id(uid))
+}
+
+fn firestore_api_base(project: &str) -> String {
+    if let Some(host) = firestore_emulator_host() {
+        return format!("http://{host}/v1/projects/{project}/databases/(default)/documents");
+    }
+    format!("https://firestore.googleapis.com/v1/projects/{project}/databases/(default)/documents")
+}
+
+fn firestore_emulator_host() -> Option<String> {
+    std::env::var("FIRESTORE_EMULATOR_HOST")
+        .ok()
+        .map(|value| {
+            value
+                .trim()
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn sanitize_firestore_document_id(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
+    if safe && value != "." && value != ".." && !value.starts_with("__") && !value.ends_with("__") {
+        return value.to_string();
+    }
+
+    let mut output = String::with_capacity(4 + value.len() * 2);
+    output.push_str("hex_");
+    for byte in value.as_bytes() {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn firestore_document_id(document: &Value) -> String {
+    document
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(|name| name.rsplit('/').next())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn firestore_string_field(document: &Value, path: &[&str]) -> Option<String> {
+    let mut value = document;
+    for segment in path {
+        value = value.get(*segment)?;
+    }
+    value.as_str().map(ToOwned::to_owned)
 }
 
 fn format_cursor(date: Option<String>, id: Option<&str>) -> String {
@@ -2941,6 +3379,7 @@ mod tests {
                 firestore_backoff_ms: 800,
                 since_last: false,
                 status: false,
+                verify: false,
                 dry_run: true,
             },
             &store,
