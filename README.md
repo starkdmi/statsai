@@ -102,6 +102,12 @@ token unless `--auth-token` or `AI_STATS_SYNC_TOKEN` is supplied. The
 `--client-id "$GOOGLE_CLIENT_ID"` login path is still available as an escape
 hatch for a custom desktop OAuth client.
 
+When `FIREBASE_AUTH_EMULATOR_HOST` is set, `auth login` switches to Firebase
+Auth emulator mode instead. It prompts for an existing emulator user's
+email/password, signs in through the local emulator, and stores that session in
+a separate file under `~/.ai-stats/` so production and emulator auth do not
+overwrite each other.
+
 Firestore sync sends writes through Firestore Commit API batches and prints
 progress by sub-batch/chunk. In the default `stats` mode, the CLI now maintains
 local daily rollup summaries and syncs only the dirty rollups instead of
@@ -152,11 +158,17 @@ still stripping local source paths and plan-name details.
 
 ### Local Firebase Tests
 
-Use the Firestore emulator for local integration tests:
+Use real Firebase emulator auth + Firestore for local integration tests:
 
 ```sh
+export FIREBASE_AUTH_EMULATOR_HOST="127.0.0.1:9099"
 export FIRESTORE_EMULATOR_HOST="127.0.0.1:8080"
-export AI_STATS_FIRESTORE_TEST_UID="local-dev-user"
 firebase emulators:start --only firestore,auth
+cargo run -p ai-stats-cli -- auth login
+cargo run -p ai-stats-cli -- auth status
 cargo run -p ai-stats-cli -- sync --sink firestore --firestore-mode stats --since-last
+cargo run -p ai-stats-cli -- sync --sink firestore --verify
 ```
+
+Create the emulator user in the Firebase Emulator UI first, then use that same
+account from both the frontend and the CLI.

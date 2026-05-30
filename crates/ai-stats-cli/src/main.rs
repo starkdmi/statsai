@@ -88,14 +88,14 @@ struct AuthCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuthSubcommand {
-    #[command(about = "Log in with Google to get production credentials")]
+    #[command(about = "Log in to Firebase (hosted or auth emulator, based on env)")]
     Login {
         #[arg(long, help = "Optional Google OAuth Client ID")]
         client_id: Option<String>,
     },
-    #[command(about = "Check authentication status")]
+    #[command(about = "Check authentication status for the active auth backend")]
     Status,
-    #[command(about = "Log out and clear stored credentials")]
+    #[command(about = "Log out and clear stored credentials for the active auth backend")]
     Logout,
 }
 
@@ -1581,9 +1581,6 @@ struct FirestoreCollectionSnapshot {
 }
 
 fn resolve_firestore_auth_context(command: &SyncCommand) -> Result<FirestoreAuthContext> {
-    let using_emulator = std::env::var("FIRESTORE_EMULATOR_HOST")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
     let manual_auth_token = command
         .auth_token
         .clone()
@@ -1591,7 +1588,6 @@ fn resolve_firestore_auth_context(command: &SyncCommand) -> Result<FirestoreAuth
     let auth_token = manual_auth_token
         .clone()
         .or_else(|| auth::get_or_refresh_token().ok().flatten())
-        .or_else(|| using_emulator.then(|| "owner".to_string()))
         .context("Firebase login required; run `ai-stats auth login` first")?;
     let uid = command
         .firebase_uid
@@ -1603,12 +1599,6 @@ fn resolve_firestore_auth_context(command: &SyncCommand) -> Result<FirestoreAuth
             } else {
                 None
             }
-        })
-        .or_else(|| {
-            using_emulator.then(|| {
-                std::env::var("AI_STATS_FIRESTORE_TEST_UID")
-                    .unwrap_or_else(|_| "local-test-user".to_string())
-            })
         })
         .context(
             "Firebase UID required for Firestore sync; rerun `ai-stats auth login`, provide --firebase-uid, or use a Firebase ID token whose UID can be derived locally",
@@ -1724,10 +1714,7 @@ fn firestore_get_document(
     auth_token: &str,
 ) -> Result<Option<Value>> {
     let url = firestore_document_get_url(project, relative_path);
-    let mut request = ureq::get(&url);
-    if firestore_emulator_host().is_none() {
-        request = request.set("Authorization", &format!("Bearer {auth_token}"));
-    }
+    let request = firestore_request_with_auth(ureq::get(&url), auth_token);
     match request.call() {
         Ok(response) => Ok(Some(firestore_response_json(response, "read document")?)),
         Err(ureq::Error::Status(404, _)) => Ok(None),
@@ -1743,10 +1730,7 @@ fn firestore_list_collection(
     auth_token: &str,
 ) -> Result<FirestoreListResponse> {
     let url = firestore_collection_list_url(project, uid, collection, page_size);
-    let mut request = ureq::get(&url);
-    if firestore_emulator_host().is_none() {
-        request = request.set("Authorization", &format!("Bearer {auth_token}"));
-    }
+    let request = firestore_request_with_auth(ureq::get(&url), auth_token);
     let value = match request.call() {
         Ok(response) => {
             firestore_response_json(response, &format!("list collection {collection}"))?
@@ -1814,6 +1798,18 @@ fn firestore_api_base(project: &str) -> String {
         return format!("http://{host}/v1/projects/{project}/databases/(default)/documents");
     }
     format!("https://firestore.googleapis.com/v1/projects/{project}/databases/(default)/documents")
+}
+
+fn firestore_request_with_auth(request: ureq::Request, auth_token: &str) -> ureq::Request {
+    if firestore_should_attach_auth_header(auth_token) {
+        request.set("Authorization", &format!("Bearer {auth_token}"))
+    } else {
+        request
+    }
+}
+
+fn firestore_should_attach_auth_header(auth_token: &str) -> bool {
+    !auth_token.trim().is_empty()
 }
 
 fn firestore_emulator_host() -> Option<String> {
@@ -3490,6 +3486,14 @@ mod tests {
             firestore_sync_target("ai-stats-fire", "uid-123"),
             "firestore:ai-stats-fire:uid-123"
         );
+    }
+
+    #[test]
+    fn firestore_verify_reads_attach_auth_for_nonempty_tokens() {
+        assert!(firestore_should_attach_auth_header("emulator-id-token"));
+        assert!(firestore_should_attach_auth_header(" user-id-token "));
+        assert!(!firestore_should_attach_auth_header(""));
+        assert!(!firestore_should_attach_auth_header("   "));
     }
 
     #[test]

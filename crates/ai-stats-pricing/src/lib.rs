@@ -112,11 +112,11 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
 
     let input = usage.input_tokens.unwrap_or(0);
     let cached = usage.cache_read_tokens.unwrap_or(0);
-    let billable_input = input.saturating_sub(cached);
     let output = usage.output_tokens.unwrap_or(0);
-    let cost = (billable_input as f64 * pricing.input_per_million
+    let reasoning = usage.reasoning_tokens.unwrap_or(0);
+    let cost = (input as f64 * pricing.input_per_million
         + cached as f64 * pricing.cached_input_per_million
-        + output as f64 * pricing.output_per_million)
+        + (output + reasoning) as f64 * pricing.output_per_million)
         / 1_000_000.0;
 
     CostInfo {
@@ -234,13 +234,29 @@ mod tests {
             provider_model_id: Some("gpt-5".to_string()),
         };
         let usage = UsageCounts {
-            input_tokens: Some(1_000_000),
+            input_tokens: Some(200_000),
             cache_read_tokens: Some(800_000),
             output_tokens: Some(0),
             ..UsageCounts::default()
         };
         let cost = estimate_cost("codex", Some(&model), &usage);
-        // Billable input = 200K at $1.25/M = ~$0.25
-        assert!(cost.estimated_api_equivalent_usd.unwrap() < 0.5);
+        // Uncached input = 200K at $1.25/M, cached input = 800K at $0.125/M.
+        assert!((cost.estimated_api_equivalent_usd.unwrap() - 0.35).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reasoning_tokens_are_billed_as_output() {
+        let model = ai_stats_core::ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        };
+        let usage = UsageCounts {
+            output_tokens: Some(100_000),
+            reasoning_tokens: Some(50_000),
+            ..UsageCounts::default()
+        };
+        let cost = estimate_cost("codex", Some(&model), &usage);
+        assert!((cost.estimated_api_equivalent_usd.unwrap() - 1.5).abs() < 1e-9);
     }
 }

@@ -635,7 +635,7 @@ impl Store {
                 return Ok(Some(event_id));
             }
         }
-        if !uses_path_independent_codex_dedupe(event) {
+        if event.provider != "codex" {
             return Ok(None);
         }
 
@@ -2013,12 +2013,45 @@ fn semantically_same_event(left: &UsageEvent, right: &UsageEvent) -> bool {
         && left.session.started_at == right.session.started_at
         && session_matches
         && model_key(left) == model_key(right)
-        && left.usage.input_tokens == right.usage.input_tokens
-        && left.usage.cache_read_tokens == right.usage.cache_read_tokens
-        && left.usage.cache_creation_tokens == right.usage.cache_creation_tokens
-        && left.usage.output_tokens == right.usage.output_tokens
-        && left.usage.reasoning_tokens == right.usage.reasoning_tokens
+        && usage_counts_equivalent(&left.provider, &left.usage, &right.usage)
         && left.usage.computed_total() == right.usage.computed_total()
+}
+
+fn usage_counts_equivalent(provider: &str, left: &UsageCounts, right: &UsageCounts) -> bool {
+    if left.input_tokens == right.input_tokens
+        && left.cache_read_tokens == right.cache_read_tokens
+        && left.cache_creation_tokens == right.cache_creation_tokens
+        && left.output_tokens == right.output_tokens
+        && left.reasoning_tokens == right.reasoning_tokens
+    {
+        return true;
+    }
+    if provider != "codex" || left.cache_creation_tokens != right.cache_creation_tokens {
+        return false;
+    }
+
+    let left_matches_right_legacy = left.input_tokens
+        == right
+            .input_tokens
+            .map(|value| value.saturating_add(right.cache_read_tokens.unwrap_or(0)))
+        && left.output_tokens
+            == right
+                .output_tokens
+                .map(|value| value.saturating_add(right.reasoning_tokens.unwrap_or(0)))
+        && left.cache_read_tokens == right.cache_read_tokens
+        && left.reasoning_tokens == right.reasoning_tokens;
+    let right_matches_left_legacy = right.input_tokens
+        == left
+            .input_tokens
+            .map(|value| value.saturating_add(left.cache_read_tokens.unwrap_or(0)))
+        && right.output_tokens
+            == left
+                .output_tokens
+                .map(|value| value.saturating_add(left.reasoning_tokens.unwrap_or(0)))
+        && right.cache_read_tokens == left.cache_read_tokens
+        && right.reasoning_tokens == left.reasoning_tokens;
+
+    left_matches_right_legacy || right_matches_left_legacy
 }
 
 fn model_key(event: &UsageEvent) -> Option<&str> {
@@ -2250,6 +2283,62 @@ mod tests {
             store.events().expect("events")[0].event_id,
             old_event.event_id
         );
+    }
+
+    #[test]
+    fn refreshes_legacy_codex_usage_shape_after_normalization_without_double_counting() {
+        let store = Store::in_memory().expect("store");
+        let source = ai_stats_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-normalized"),
+            LocationOrigin::Configured,
+            None,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut old_event = test_store_event(&source, now, "legacy-inclusive");
+        old_event.model = Some(ModelInfo {
+            name: Some("gpt-5-codex".to_string()),
+            normalized_name: Some("gpt-5-codex".to_string()),
+            provider_model_id: Some("gpt-5-codex".to_string()),
+        });
+        old_event.usage = UsageCounts {
+            input_tokens: Some(100),
+            cache_read_tokens: Some(30),
+            output_tokens: Some(10),
+            reasoning_tokens: Some(5),
+            total_tokens: Some(110),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+
+        let mut new_event = old_event.clone();
+        new_event.event_id = event_id("codex", &source.source_id, "normalized", None, now);
+        new_event.usage = UsageCounts {
+            input_tokens: Some(70),
+            cache_read_tokens: Some(30),
+            output_tokens: Some(5),
+            reasoning_tokens: Some(5),
+            total_tokens: Some(110),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+
+        assert!(store.insert_event(&old_event).expect("insert old"));
+        assert!(!store
+            .insert_event(&new_event)
+            .expect("refresh normalized duplicate"));
+
+        let events = store.events().expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, old_event.event_id);
+        assert_eq!(events[0].usage.input_tokens, Some(70));
+        assert_eq!(events[0].usage.cache_read_tokens, Some(30));
+        assert_eq!(events[0].usage.output_tokens, Some(5));
+        assert_eq!(events[0].usage.reasoning_tokens, Some(5));
     }
 
     #[test]

@@ -28,6 +28,7 @@ ureq.workspace = true
 tiny_http.workspace = true
 sha2.workspace = true
 percent-encoding.workspace = true
+rpassword.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

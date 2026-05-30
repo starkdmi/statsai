@@ -3,9 +3,11 @@ use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 const DEFAULT_FIREBASE_API_KEY: &str = "AIzaSyBiWB8m1Oq8tgLOxYslL67i77itmCvn4-4";
+const DEFAULT_AUTH_EMULATOR_API_KEY: &str = "fake-api-key";
 const DEFAULT_AUTH_URL: &str = "https://ai-stats-fire.web.app/login/";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,21 +19,140 @@ pub struct AuthCredentials {
     pub uid: String,
     #[serde(default)]
     pub firebase_api_key: Option<String>,
+    #[serde(default)]
+    pub auth_emulator_host: Option<String>,
 }
 
 fn auth_path() -> PathBuf {
+    let base = auth_base_dir();
+    match auth_emulator_host() {
+        Some(host) => auth_path_for_backend(&base, Some(&host)),
+        None => default_auth_path(&base),
+    }
+}
+
+fn auth_base_dir() -> PathBuf {
     ai_stats_core::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".ai-stats")
-        .join("auth.json")
+}
+
+fn auth_path_for_backend(base: &std::path::Path, auth_emulator_host: Option<&str>) -> PathBuf {
+    match auth_emulator_host {
+        Some(host) => base.join(format!("auth-emulator-{}.json", sanitize_auth_host(host))),
+        None => base.join("auth.json"),
+    }
+}
+
+fn default_auth_path(base: &std::path::Path) -> PathBuf {
+    let production_path = auth_path_for_backend(base, None);
+    if production_path.exists() {
+        return production_path;
+    }
+
+    let mut emulator_paths = saved_emulator_auth_paths(base);
+    if emulator_paths.len() == 1 {
+        emulator_paths.remove(0)
+    } else {
+        production_path
+    }
+}
+
+fn saved_emulator_auth_paths(base: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+
+    let mut paths: Vec<_> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("auth-emulator-") && name.ends_with(".json"))
+        })
+        .collect();
+    paths.sort();
+    paths
 }
 
 pub fn login(client_id_arg: Option<String>) -> Result<()> {
+    if let Some(host) = auth_emulator_host() {
+        return login_with_auth_emulator(host);
+    }
+
     if let Some(client_id) = client_id_arg.or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok()) {
         return login_with_google_oauth_client(client_id);
     }
 
     login_with_hosted_firebase()
+}
+
+fn login_with_auth_emulator(host: String) -> Result<()> {
+    if std::env::var("GOOGLE_CLIENT_ID").is_ok() {
+        eprintln!(
+            "auth login: using Firebase Auth emulator because FIREBASE_AUTH_EMULATOR_HOST is set"
+        );
+    }
+    let email = prompt_line("Firebase Auth emulator email")?;
+    let password = prompt_password("Firebase Auth emulator password")?;
+    if email.trim().is_empty() {
+        bail!("email cannot be empty");
+    }
+    if password.is_empty() {
+        bail!("password cannot be empty");
+    }
+
+    let api_key = firebase_api_key_for_auth(Some(&host));
+    let sign_in_url = identity_toolkit_url(&host, "accounts:signInWithPassword", &api_key);
+    let response = ureq::post(&sign_in_url).send_json(serde_json::json!({
+        "email": email,
+        "password": password,
+        "returnSecureToken": true
+    }));
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            bail!(
+                "Firebase Auth emulator login failed (HTTP {}): {}",
+                code,
+                body
+            );
+        }
+        Err(error) => {
+            bail!("Firebase Auth emulator login failed: {}", error);
+        }
+    };
+
+    let json: serde_json::Value = response.into_json()?;
+    let firebase_id_token = json["idToken"]
+        .as_str()
+        .context("Missing idToken from Firebase Auth emulator response")?
+        .to_string();
+    let firebase_refresh_token = json["refreshToken"]
+        .as_str()
+        .context("Missing refreshToken from Firebase Auth emulator response")?
+        .to_string();
+    let uid = json["localId"]
+        .as_str()
+        .context("Missing localId (uid) from Firebase Auth emulator response")?
+        .to_string();
+    let expires_in: u64 = json["expiresIn"]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3600);
+    let creds = AuthCredentials {
+        firebase_refresh_token,
+        firebase_id_token,
+        expires_at_secs: Utc::now().timestamp() as u64 + expires_in,
+        email: email.clone(),
+        uid,
+        firebase_api_key: Some(api_key),
+        auth_emulator_host: Some(host.clone()),
+    };
+    save_credentials(creds)?;
+    println!("Auth backend: Firebase Auth emulator ({host})");
+    Ok(())
 }
 
 fn login_with_hosted_firebase() -> Result<()> {
@@ -200,6 +321,7 @@ fn login_with_google_oauth_client(client_id: String) -> Result<()> {
         email: email.clone(),
         uid,
         firebase_api_key: Some(firebase_api_key),
+        auth_emulator_host: None,
     };
 
     save_credentials(creds)?;
@@ -220,6 +342,11 @@ pub fn status() -> Result<()> {
     if creds.expires_at_secs > now {
         let mins_left = (creds.expires_at_secs - now) / 60;
         println!("Status: Logged in");
+        if let Some(host) = creds.auth_emulator_host.as_deref() {
+            println!("Mode:   Auth emulator ({host})");
+        } else {
+            println!("Mode:   Production Firebase");
+        }
         println!("Email:  {}", creds.email);
         println!("UID:    {}", creds.uid);
         println!(
@@ -228,6 +355,11 @@ pub fn status() -> Result<()> {
         );
     } else {
         println!("Status: Logged in (session expired, will refresh on next sync)");
+        if let Some(host) = creds.auth_emulator_host.as_deref() {
+            println!("Mode:   Auth emulator ({host})");
+        } else {
+            println!("Mode:   Production Firebase");
+        }
         println!("Email:  {}", creds.email);
     }
     Ok(())
@@ -262,12 +394,8 @@ pub fn get_or_refresh_token() -> Result<Option<String>> {
     let firebase_api_key = creds
         .firebase_api_key
         .clone()
-        .map(Ok)
-        .unwrap_or_else(firebase_api_key)?;
-    let refresh_url = format!(
-        "https://securetoken.googleapis.com/v1/token?key={}",
-        firebase_api_key
-    );
+        .unwrap_or_else(|| firebase_api_key_for_auth(creds.auth_emulator_host.as_deref()));
+    let refresh_url = secure_token_url(creds.auth_emulator_host.as_deref(), &firebase_api_key);
 
     let refresh_res = ureq::post(&refresh_url).send_form(&[
         ("grant_type", "refresh_token"),
@@ -353,6 +481,64 @@ fn firebase_api_key() -> Result<String> {
     Ok(std::env::var("FIREBASE_API_KEY").unwrap_or_else(|_| DEFAULT_FIREBASE_API_KEY.to_string()))
 }
 
+fn firebase_api_key_for_auth(auth_emulator_host: Option<&str>) -> String {
+    if auth_emulator_host.is_some() {
+        std::env::var("FIREBASE_API_KEY")
+            .unwrap_or_else(|_| DEFAULT_AUTH_EMULATOR_API_KEY.to_string())
+    } else {
+        std::env::var("FIREBASE_API_KEY").unwrap_or_else(|_| DEFAULT_FIREBASE_API_KEY.to_string())
+    }
+}
+
+pub fn auth_emulator_host() -> Option<String> {
+    std::env::var("FIREBASE_AUTH_EMULATOR_HOST")
+        .ok()
+        .map(|value| {
+            value
+                .trim()
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn sanitize_auth_host(host: &str) -> String {
+    host.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn identity_toolkit_url(host: &str, method: &str, api_key: &str) -> String {
+    format!("http://{host}/identitytoolkit.googleapis.com/v1/{method}?key={api_key}")
+}
+
+fn secure_token_url(auth_emulator_host: Option<&str>, api_key: &str) -> String {
+    if let Some(host) = auth_emulator_host {
+        format!("http://{host}/securetoken.googleapis.com/v1/token?key={api_key}")
+    } else {
+        format!("https://securetoken.googleapis.com/v1/token?key={api_key}")
+    }
+}
+
+fn prompt_line(label: &str) -> Result<String> {
+    print!("{label}: ");
+    io::stdout().flush()?;
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    Ok(value.trim().to_string())
+}
+
+fn prompt_password(label: &str) -> Result<String> {
+    rpassword::prompt_password(format!("{label}: ")).context("read password from terminal")
+}
+
 fn should_clear_cached_credentials(status_code: u16, body: &str) -> bool {
     if status_code != 400 && status_code != 401 {
         return false;
@@ -390,7 +576,7 @@ fn jwt_payload_json(token: &str) -> Result<Option<serde_json::Value>> {
 
 fn save_credentials(creds: AuthCredentials) -> Result<()> {
     let email = creds.email.clone();
-    let path = auth_path();
+    let path = auth_path_for_backend(&auth_base_dir(), creds.auth_emulator_host.as_deref());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -618,6 +804,7 @@ fn listen_for_firebase_callback(
             email,
             uid,
             firebase_api_key: Some(firebase_api_key),
+            auth_emulator_host: None,
         });
     }
     bail!("server shut down without receiving Firebase callback")
@@ -734,5 +921,67 @@ mod tests {
             400,
             "temporarily unavailable"
         ));
+    }
+
+    #[test]
+    fn auth_urls_switch_to_emulator_hosts() {
+        assert_eq!(
+            identity_toolkit_url("127.0.0.1:9099", "accounts:signInWithPassword", "fake-api-key"),
+            "http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake-api-key"
+        );
+        assert_eq!(
+            secure_token_url(Some("127.0.0.1:9099"), "fake-api-key"),
+            "http://127.0.0.1:9099/securetoken.googleapis.com/v1/token?key=fake-api-key"
+        );
+        assert_eq!(
+            secure_token_url(None, "real-key"),
+            "https://securetoken.googleapis.com/v1/token?key=real-key"
+        );
+    }
+
+    #[test]
+    fn sanitize_auth_host_makes_safe_filename_component() {
+        assert_eq!(sanitize_auth_host("127.0.0.1:9099"), "127_0_0_1_9099");
+        assert_eq!(sanitize_auth_host("localhost"), "localhost");
+    }
+
+    #[test]
+    fn default_auth_path_falls_back_to_single_emulator_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let emulator_path = auth_path_for_backend(dir.path(), Some("127.0.0.1:9099"));
+        std::fs::write(&emulator_path, "{}").expect("write emulator creds");
+
+        assert_eq!(default_auth_path(dir.path()), emulator_path);
+    }
+
+    #[test]
+    fn default_auth_path_prefers_production_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let production_path = auth_path_for_backend(dir.path(), None);
+        let emulator_path = auth_path_for_backend(dir.path(), Some("127.0.0.1:9099"));
+        std::fs::write(&production_path, "{}").expect("write production creds");
+        std::fs::write(&emulator_path, "{}").expect("write emulator creds");
+
+        assert_eq!(default_auth_path(dir.path()), production_path);
+    }
+
+    #[test]
+    fn default_auth_path_does_not_guess_between_multiple_emulator_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            auth_path_for_backend(dir.path(), Some("127.0.0.1:9099")),
+            "{}",
+        )
+        .expect("write first emulator creds");
+        std::fs::write(
+            auth_path_for_backend(dir.path(), Some("127.0.0.1:9199")),
+            "{}",
+        )
+        .expect("write second emulator creds");
+
+        assert_eq!(
+            default_auth_path(dir.path()),
+            auth_path_for_backend(dir.path(), None)
+        );
     }
 }

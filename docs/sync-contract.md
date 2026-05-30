@@ -143,6 +143,9 @@ cargo run -p ai-stats-cli -- sync --sink firestore --verify
 The fallback `--client-id "$GOOGLE_CLIENT_ID"` login mode supports a custom
 Google OAuth Desktop client when needed. Firestore sync accepts
 `--firebase-project` and defaults to the configured `ai-stats-fire` project.
+When `FIREBASE_AUTH_EMULATOR_HOST` is set, `auth login` instead signs in to the
+local Firebase Auth emulator with an existing email/password account and stores
+that emulator session separately from production auth.
 Default Firestore sync mode is `stats`, which converts local events into daily
 rollup summaries before upload to reduce write volume. The CLI now persists
 those rollups locally and syncs only dirty rollups in `stats` mode instead of
@@ -163,9 +166,10 @@ resumes from the last completed cursor after quota or network failures.
 Unchanged source/account/subscription metadata is skipped, and if nothing has
 changed locally the CLI performs no hosted Firestore writes.
 
-For local tests, set `FIRESTORE_EMULATOR_HOST=127.0.0.1:8080` and run against
-the Firebase emulator suite instead of production. Optionally set
-`AI_STATS_FIRESTORE_TEST_UID` to force a stable local UID without login.
+For local tests, set both `FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099` and
+`FIRESTORE_EMULATOR_HOST=127.0.0.1:8080`, create the user in the Firebase
+Emulator UI (or frontend), then log in with `ai-stats auth login` so the CLI
+uses the same emulated Firebase account as the app.
 
 `sync --verify` performs a lightweight inspection of the resolved Firestore
 target. It reports the local sync cursor/hash state, current dirty rollup

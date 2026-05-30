@@ -769,13 +769,10 @@ fn parse_codex_file(
             codex_headless_usage_value(&value).map(codex_usage_counts_from_value)
         };
 
-        let Some(mut usage) = usage else {
+        let Some(usage) = usage else {
             continue;
         };
         ctx.scan.diagnostics.candidate_usage_rows += 1;
-        if let Some(input) = usage.input_tokens {
-            usage.cache_read_tokens = usage.cache_read_tokens.map(|cached| cached.min(input));
-        }
         if usage.computed_total() == 0 {
             ctx.scan.diagnostics.skipped_zero_events += 1;
             continue;
@@ -1054,9 +1051,18 @@ fn claude_usage_counts_from_value(value: &Value) -> UsageCounts {
 }
 
 fn codex_usage_counts_from_value(value: &Value) -> UsageCounts {
-    let input = number_at_any(value, &["input_tokens", "prompt_tokens", "input"]);
-    let output = number_at_any(value, &["output_tokens", "completion_tokens", "output"]);
-    let cache_read = number_at_any(
+    let raw_input = number_at_any(value, &["input_tokens", "prompt_tokens", "input"]);
+    let raw_output = number_at_any(value, &["output_tokens", "completion_tokens", "output"]);
+    let raw_cache_creation = number_at_any(
+        value,
+        &[
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_creation_tokens",
+            "cacheCreationTokens",
+        ],
+    );
+    let raw_cache_read = number_at_any(
         value,
         &[
             "cached_input_tokens",
@@ -1064,28 +1070,17 @@ fn codex_usage_counts_from_value(value: &Value) -> UsageCounts {
             "cached_tokens",
         ],
     );
-    let reasoning = number_at_any(value, &["reasoning_output_tokens", "reasoning_tokens"]);
+    let raw_reasoning = number_at_any(value, &["reasoning_output_tokens", "reasoning_tokens"]);
     let total = number_at_any(value, &["total_tokens", "total"]);
-    let output = output.or_else(|| infer_missing_output(total, input, None, cache_read, reasoning));
 
-    UsageCounts {
-        input_tokens: input,
-        output_tokens: output,
-        cache_creation_tokens: None,
-        cache_read_tokens: cache_read,
-        reasoning_tokens: reasoning,
-        total_tokens: total.or_else(|| {
-            Some(
-                input.unwrap_or(0)
-                    + output.unwrap_or(0)
-                    + cache_read.unwrap_or(0)
-                    + reasoning.unwrap_or(0),
-            )
-        }),
-        requests: Some(1),
-        local_prompt_eval_tokens: None,
-        local_eval_tokens: None,
-    }
+    normalize_codex_usage_counts(
+        raw_input,
+        raw_output,
+        raw_cache_creation,
+        raw_cache_read,
+        raw_reasoning,
+        total,
+    )
 }
 
 fn infer_missing_output(
@@ -1102,6 +1097,66 @@ fn infer_missing_output(
             + reasoning.unwrap_or(0);
         (total > known).then_some(total - known)
     })
+}
+
+// Codex reports cached input and reasoning output as subsets of the top-level
+// input/output counters. Normalize that inclusive provider shape into the
+// additive contract used everywhere else in ai-stats.
+fn normalize_codex_usage_counts(
+    raw_input: Option<u64>,
+    raw_output: Option<u64>,
+    raw_cache_creation: Option<u64>,
+    raw_cache_read: Option<u64>,
+    raw_reasoning: Option<u64>,
+    total: Option<u64>,
+) -> UsageCounts {
+    let cache_creation = match (raw_input, raw_cache_creation) {
+        (Some(input), Some(cache_creation)) => Some(cache_creation.min(input)),
+        _ => raw_cache_creation,
+    };
+    let cache_read = match (raw_input, raw_cache_read) {
+        (Some(input), Some(cache_read)) => Some(cache_read.min(input)),
+        _ => raw_cache_read,
+    };
+    let reasoning = match (raw_output, raw_reasoning) {
+        (Some(output), Some(reasoning)) => Some(reasoning.min(output)),
+        _ => raw_reasoning,
+    };
+    let input = raw_input.map(|input| {
+        input
+            .saturating_sub(cache_creation.unwrap_or(0))
+            .saturating_sub(cache_read.unwrap_or(0))
+    });
+    let output = raw_output
+        .map(|output| output.saturating_sub(reasoning.unwrap_or(0)))
+        .or_else(|| infer_missing_output(total, input, cache_creation, cache_read, reasoning));
+    let total = total.or_else(|| {
+        (input.is_some()
+            || output.is_some()
+            || cache_creation.is_some()
+            || cache_read.is_some()
+            || reasoning.is_some())
+        .then_some(
+            input
+                .unwrap_or(0)
+                .saturating_add(output.unwrap_or(0))
+                .saturating_add(cache_creation.unwrap_or(0))
+                .saturating_add(cache_read.unwrap_or(0))
+                .saturating_add(reasoning.unwrap_or(0)),
+        )
+    });
+
+    UsageCounts {
+        input_tokens: input,
+        output_tokens: output,
+        cache_creation_tokens: cache_creation,
+        cache_read_tokens: cache_read,
+        reasoning_tokens: reasoning,
+        total_tokens: total,
+        requests: Some(1),
+        local_prompt_eval_tokens: None,
+        local_eval_tokens: None,
+    }
 }
 
 fn subtract_usage_counts(current: &UsageCounts, previous: Option<&UsageCounts>) -> UsageCounts {
@@ -1804,15 +1859,15 @@ mod tests {
         assert_eq!(scan.events.len(), 2);
         assert_eq!(scan.diagnostics.duplicate_events, 1);
 
-        assert_eq!(scan.events[0].usage.input_tokens, Some(1000));
+        assert_eq!(scan.events[0].usage.input_tokens, Some(900));
         assert_eq!(scan.events[0].usage.cache_read_tokens, Some(100));
-        assert_eq!(scan.events[0].usage.output_tokens, Some(200));
+        assert_eq!(scan.events[0].usage.output_tokens, Some(180));
         assert_eq!(scan.events[0].usage.reasoning_tokens, Some(20));
         assert_eq!(scan.events[0].usage.total_tokens, Some(1200));
 
-        assert_eq!(scan.events[1].usage.input_tokens, Some(600));
+        assert_eq!(scan.events[1].usage.input_tokens, Some(400));
         assert_eq!(scan.events[1].usage.cache_read_tokens, Some(200));
-        assert_eq!(scan.events[1].usage.output_tokens, Some(250));
+        assert_eq!(scan.events[1].usage.output_tokens, Some(230));
         assert_eq!(scan.events[1].usage.reasoning_tokens, Some(20));
         assert_eq!(scan.events[1].usage.total_tokens, Some(850));
     }
@@ -1884,6 +1939,8 @@ mod tests {
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
 
         assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].usage.input_tokens, Some(60));
+        assert_eq!(scan.events[0].usage.output_tokens, Some(5));
         assert_eq!(scan.events[0].usage.computed_total(), 100);
         assert_eq!(scan.events[0].usage.cache_read_tokens, Some(30));
         assert_eq!(scan.events[0].usage.reasoning_tokens, Some(5));
@@ -1918,8 +1975,8 @@ mod tests {
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
 
         assert_eq!(scan.events.len(), 2);
-        assert_eq!(scan.events[0].usage.input_tokens, Some(100));
-        assert_eq!(scan.events[1].usage.input_tokens, Some(150));
+        assert_eq!(scan.events[0].usage.input_tokens, Some(90));
+        assert_eq!(scan.events[1].usage.input_tokens, Some(130));
         assert_eq!(scan.events[1].usage.cache_read_tokens, Some(20));
         assert_eq!(scan.events[1].usage.output_tokens, Some(25));
         assert_eq!(scan.events[1].usage.total_tokens, Some(175));
@@ -1948,7 +2005,7 @@ mod tests {
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
 
         assert_eq!(scan.events.len(), 1);
-        assert_eq!(scan.events[0].usage.input_tokens, Some(10));
+        assert_eq!(scan.events[0].usage.input_tokens, Some(7));
         assert_eq!(scan.events[0].usage.output_tokens, Some(5));
         assert_eq!(scan.events[0].usage.cache_read_tokens, Some(3));
     }
@@ -2038,6 +2095,25 @@ mod tests {
     }
 
     #[test]
+    fn codex_usage_counts_normalize_inclusive_subtotals() {
+        let value: Value = serde_json::json!({
+            "input_tokens": 100,
+            "cached_input_tokens": 30,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 5,
+            "total_tokens": 110
+        });
+
+        let usage = codex_usage_counts_from_value(&value);
+
+        assert_eq!(usage.input_tokens, Some(70));
+        assert_eq!(usage.cache_read_tokens, Some(30));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.reasoning_tokens, Some(5));
+        assert_eq!(usage.computed_total(), 110);
+    }
+
+    #[test]
     fn codex_caps_cached_input_to_input() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
@@ -2059,6 +2135,7 @@ mod tests {
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
 
+        assert_eq!(scan.events[0].usage.input_tokens, Some(0));
         assert_eq!(scan.events[0].usage.cache_read_tokens, Some(10));
     }
 }
