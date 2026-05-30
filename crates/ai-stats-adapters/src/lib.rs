@@ -330,7 +330,7 @@ fn scan_codex_source(
             parse_codex_file(&mut ctx, &root, &usage_root, &candidate.path)?;
         }
     }
-    if source.account_hint.is_none() {
+    if source.account_alias.is_none() {
         if let Some(stable_identity) = codex_auth_stable_identity(&root) {
             let account_id = provider_account_id(CODEX_PROVIDER, &stable_identity);
             for event in &mut scan.events {
@@ -433,7 +433,7 @@ fn codex_jsonl_candidates(
     }
 
     let auth_dependency = source
-        .account_hint
+        .account_alias
         .is_none()
         .then(|| file_metadata_signature(&root.join("auth.json")));
     let dependency = auth_dependency.as_deref();
@@ -475,10 +475,10 @@ fn scan_candidate(
 
 fn scan_cache_namespace(source: &SourceLocation, adapter_version: &str) -> String {
     let adapter_id = source.adapter_id.as_deref().unwrap_or("");
-    let account_hint = source.account_hint.as_deref().unwrap_or("");
+    let account_alias = source.account_alias.as_deref().unwrap_or("");
     let path_hash = source.path_hash.as_deref().unwrap_or("");
     hash_text(&format!(
-        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{adapter_version}:{account_hint}:{path_hash}",
+        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{adapter_version}:{account_alias}:{path_hash}",
         source.provider, source.source_kind
     ))
 }
@@ -691,7 +691,7 @@ fn parse_claude_stats_cache(
                 source_record_id: Some(semantic_key),
                 model_inferred: false,
                 timestamp_inferred: period_start.is_none() || period_end.is_none(),
-                account_identity_source: if source.account_hint.is_some() {
+                account_identity_source: if source.account_alias.is_some() {
                     IdentitySource::ManualHint
                 } else {
                     IdentitySource::Unresolved
@@ -972,7 +972,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
             source_record_id: Some(semantic_key),
             model_inferred: parts.model_inferred,
             timestamp_inferred: parts.timestamp_inferred,
-            account_identity_source: if source.account_hint.is_some() {
+            account_identity_source: if source.account_alias.is_some() {
                 IdentitySource::ManualHint
             } else {
                 IdentitySource::Unresolved
@@ -1716,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_scan_candidates_change_when_account_hint_changes() {
+    fn codex_scan_candidates_change_when_account_alias_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).expect("sessions");

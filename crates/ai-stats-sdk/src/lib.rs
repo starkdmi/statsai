@@ -26,7 +26,8 @@ pub const REPORTED_USAGE_IMPORT_ADAPTER_ID: &str = "reported-usage-summary";
 pub struct ReportedUsageSummaryInput {
     pub schema_version: String,
     pub provider: String,
-    pub account_hint: Option<String>,
+    #[serde(default, alias = "account_hint")]
+    pub account_alias: Option<String>,
     pub source_kind: SourceKind,
     pub source_name: String,
     pub evidence_id: Option<String>,
@@ -78,7 +79,7 @@ pub fn build_reported_usage_summary(
                 "{}:{}:{}:{}",
                 input.provider,
                 input.source_name,
-                input.account_hint.as_deref().unwrap_or("unmapped"),
+                input.account_alias.as_deref().unwrap_or("unmapped"),
                 input.report_format
             )
         });
@@ -90,7 +91,7 @@ pub fn build_reported_usage_summary(
         env!("CARGO_PKG_VERSION"),
         &evidence_key,
         path_label.clone(),
-        input.account_hint.clone(),
+        input.account_alias.clone(),
     );
 
     let period_start_text = input
@@ -154,7 +155,7 @@ pub fn build_reported_usage_summary(
         provider: input.provider.clone(),
         source_id: source.source_id.clone(),
         provider_account_id: input
-            .account_hint
+            .account_alias
             .as_deref()
             .map(|account| provider_account_id(&input.provider, account)),
         source: EventSource {
@@ -183,7 +184,7 @@ pub fn build_reported_usage_summary(
             source_record_id: Some(semantic_key),
             model_inferred: false,
             timestamp_inferred: input.period_start.is_none() || input.period_end.is_none(),
-            account_identity_source: if input.account_hint.is_some() {
+            account_identity_source: if input.account_alias.is_some() {
                 IdentitySource::ManualHint
             } else {
                 IdentitySource::Unresolved
@@ -222,7 +223,7 @@ mod tests {
         let input = ReportedUsageSummaryInput {
             schema_version: REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION.to_string(),
             provider: "claude_code".to_string(),
-            account_hint: Some("personal".to_string()),
+            account_alias: Some("personal".to_string()),
             source_kind: SourceKind::Manual,
             source_name: "user_reported_usage".to_string(),
             evidence_id: Some("screenshot:2025-07-11".to_string()),
@@ -272,7 +273,7 @@ mod tests {
         let input = ReportedUsageSummaryInput {
             schema_version: REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION.to_string(),
             provider: "claude_code".to_string(),
-            account_hint: None,
+            account_alias: None,
             source_kind: SourceKind::LocalAdapter,
             source_name: "bad".to_string(),
             evidence_id: None,

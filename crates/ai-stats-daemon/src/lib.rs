@@ -292,7 +292,7 @@ mod watch {
                 };
                 match adapter.scan(&source, &options) {
                     Ok(mut scan) => {
-                        apply_source_account_hint(&source, &mut scan.events, &mut scan.summaries);
+                        apply_source_account_alias(&source, &mut scan.events, &mut scan.summaries);
                         let parsed_events = scan.events.len();
                         let parsed_summaries = scan.summaries.len();
                         let inserted_events = match store.insert_events(&scan.events) {
@@ -370,15 +370,15 @@ mod watch {
         sources
     }
 
-    fn apply_source_account_hint(
+    fn apply_source_account_alias(
         source: &SourceLocation,
         events: &mut [UsageEvent],
         summaries: &mut [UsageSummary],
     ) {
-        let Some(account_hint) = source.account_hint.as_deref() else {
+        let Some(account_alias) = source.account_alias.as_deref() else {
             return;
         };
-        let account_id = provider_account_id(&source.provider, account_hint);
+        let account_id = provider_account_id(&source.provider, account_alias);
         for event in events {
             event.provider_account_id = Some(account_id.clone());
             if let Some(evidence) = event.parse_evidence.as_mut() {

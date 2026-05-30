@@ -116,7 +116,8 @@ pub struct SourceLocation {
     pub adapter_version: Option<String>,
     pub path_hash: Option<String>,
     pub path_label: Option<String>,
-    pub account_hint: Option<String>,
+    #[serde(default, alias = "account_hint")]
+    pub account_alias: Option<String>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -382,7 +383,7 @@ impl SourceLocation {
         adapter_version: impl Into<String>,
         path: &Path,
         location_origin: LocationOrigin,
-        account_hint: Option<String>,
+        account_alias: Option<String>,
     ) -> Self {
         let provider = provider.into();
         let adapter_id = adapter_id.into();
@@ -401,7 +402,7 @@ impl SourceLocation {
             adapter_version: Some(adapter_version),
             path_hash: Some(path_hash),
             path_label: Some(canonical_display(path)),
-            account_hint,
+            account_alias,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -414,7 +415,7 @@ impl SourceLocation {
         adapter_id: impl Into<String>,
         adapter_version: impl Into<String>,
         path: &Path,
-        account_hint: Option<String>,
+        account_alias: Option<String>,
     ) -> Self {
         let provider = provider.into();
         let adapter_id = adapter_id.into();
@@ -433,7 +434,7 @@ impl SourceLocation {
             adapter_version: Some(adapter_version),
             path_hash: Some(path_hash),
             path_label: Some(canonical_display(path)),
-            account_hint,
+            account_alias,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -448,7 +449,7 @@ impl SourceLocation {
         adapter_version: impl Into<String>,
         evidence_key: impl AsRef<str>,
         path_label: Option<String>,
-        account_hint: Option<String>,
+        account_alias: Option<String>,
     ) -> Self {
         let provider = provider.into();
         let adapter_id = adapter_id.into();
@@ -467,7 +468,7 @@ impl SourceLocation {
             adapter_version: Some(adapter_version),
             path_hash: Some(path_hash),
             path_label,
-            account_hint,
+            account_alias,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -949,7 +950,7 @@ fn report_identity_label(
         }
     }
     if let Some(source) = source {
-        if let Some(label) = source.account_hint.as_deref() {
+        if let Some(label) = source.account_alias.as_deref() {
             return label.to_string();
         }
     }
@@ -1009,6 +1010,28 @@ mod tests {
         assert!(json.get("title").is_some());
     }
 
+    #[test]
+    fn source_location_deserializes_legacy_account_hint_field() {
+        let value = serde_json::json!({
+            "schema_version": SOURCE_LOCATION_SCHEMA_VERSION,
+            "source_id": "src_test",
+            "provider": "codex",
+            "source_kind": "local_adapter",
+            "location_origin": "configured",
+            "adapter_id": "codex-local-jsonl",
+            "adapter_version": "0.0.1",
+            "path_hash": "hash",
+            "path_label": "/tmp/test",
+            "account_hint": "personal",
+            "enabled": true,
+            "created_at": "2026-05-30T00:00:00Z",
+            "updated_at": "2026-05-30T00:00:00Z"
+        });
+
+        let source: SourceLocation = serde_json::from_value(value).expect("legacy source");
+        assert_eq!(source.account_alias.as_deref(), Some("personal"));
+    }
+
     fn test_source(provider: &str, path: &str) -> SourceLocation {
         SourceLocation::local_adapter(
             provider,
@@ -1054,7 +1077,6 @@ mod tests {
                 duration_seconds: None,
             },
             model: None,
-            models: Vec::new(),
             usage: UsageCounts {
                 input_tokens: Some(tokens / 2),
                 output_tokens: Some(tokens / 2),

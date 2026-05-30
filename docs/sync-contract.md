@@ -29,8 +29,7 @@ cargo run -p ai-stats-cli -- schema sync-batch
 The current sync path strips record-level local evidence before sending:
 
 - `SourceLocation.path_label`
-- `SourceLocation.account_hint`
-- `ProviderAccount.account_label`
+- `SourceLocation.account_alias`
 - `ProviderAccount.plan_name`
 - `UsageEvent.source.source_record_id`
 - `UsageEvent.parse_evidence.source_line_number`
@@ -41,8 +40,13 @@ The current sync path strips record-level local evidence before sending:
 - `Subscription.notes`
 
 Hashed path, account, source, event, and summary identifiers remain so the
-server can deduplicate records without seeing local file names or raw account
-labels.
+server can deduplicate records without seeing local file names or provider/user
+identifiers directly.
+
+For Firebase account docs, a user-defined account alias (the local `--account`
+value) is retained in `ProviderAccount.account_label` for display. This alias
+is intended to be a safe logical bucket like `personal` or `work`, not a
+provider-verified identity.
 
 ## Local HTTP Endpoint
 

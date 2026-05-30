@@ -52,6 +52,8 @@ cargo run -p ai-stats-cli -- sync --sink firestore --verify
 cargo run -p ai-stats-cli -- schema sync-batch
 ```
 
+`source add --account ...` uses a user-defined account alias, not a provider-verified identity. Aliases like `personal`, `work`, or `mini` are stable grouping buckets that determine how sources roll up into provider accounts locally and in Firestore.
+
 `scan --preview` reads configured and default local sources without writing to SQLite. It reports normalized usage events, not raw log rows, and shows the token split when the provider logs expose it:
 
 ```text
@@ -145,6 +147,8 @@ source from SQLite.
 and fetches a small remote snapshot (`devices`, `syncBatches`, `sources`,
 `accounts`, `subscriptions`, `events`, `summaries`) so you can confirm what the
 backend sees without relying on the Firebase console UI.
+Firestore account docs keep user-defined account aliases for display, while
+still stripping local source paths and plan-name details.
 
 ### Local Firebase Tests
 

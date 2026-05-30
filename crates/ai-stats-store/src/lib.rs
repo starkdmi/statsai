@@ -2508,7 +2508,7 @@ mod tests {
             .expect("unchanged")
             .is_empty());
 
-        source.account_hint = Some("personal".to_string());
+        source.account_alias = Some("personal".to_string());
         source.updated_at += chrono::Duration::seconds(1);
         let changed = store
             .pending_sources_for_sync("firestore", "firestore:ai-stats-fire", &[source])

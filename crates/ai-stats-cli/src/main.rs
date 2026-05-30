@@ -166,7 +166,10 @@ enum SourceSubcommand {
         provider: String,
         #[arg(long, help = "Path to the provider's local data directory")]
         path: PathBuf,
-        #[arg(long, help = "Account label to attach to events from this source")]
+        #[arg(
+            long,
+            help = "User-defined account alias to group this source under (e.g. personal, work)"
+        )]
         account: Option<String>,
     },
     #[command(about = "Enable a configured source")]
@@ -220,7 +223,7 @@ enum SubscriptionSubcommand {
     Add {
         #[arg(long, help = "Provider name (claude_code, codex)")]
         provider: String,
-        #[arg(long, help = "Account label to link this subscription to")]
+        #[arg(long, help = "Account alias to link this subscription to")]
         account: Option<String>,
         #[arg(long, help = "Plan name (e.g. Pro, Max, Team)")]
         plan: String,
@@ -452,8 +455,8 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
                 }),
             };
             let mut scan = adapter.scan(&source, &options)?;
-            apply_account_hint_to_events(&source, &mut scan.events);
-            apply_account_hint_to_summaries(&source, &mut scan.summaries);
+            apply_account_alias_to_events(&source, &mut scan.events);
+            apply_account_alias_to_summaries(&source, &mut scan.summaries);
             let log_rows = scan.diagnostics.raw_rows;
             let mut source_usage = UsageTotals::default();
             for event in &scan.events {
@@ -680,7 +683,7 @@ fn account(command: AccountCommand, store: &Store) -> Result<()> {
             let mut accounts: BTreeMap<String, ProviderAccount> = BTreeMap::new();
             for source in sources {
                 let stable = source
-                    .account_hint
+                    .account_alias
                     .as_deref()
                     .unwrap_or(&source.source_id.0);
                 let id = provider_account_id(&source.provider, stable);
@@ -697,7 +700,7 @@ fn account(command: AccountCommand, store: &Store) -> Result<()> {
                     schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
                     provider_account_id: id.clone(),
                     provider: source.provider.clone(),
-                    identity_source: if source.account_hint.is_some() {
+                    identity_source: if source.account_alias.is_some() {
                         IdentitySource::UserConfigured
                     } else {
                         IdentitySource::Unknown
@@ -705,9 +708,9 @@ fn account(command: AccountCommand, store: &Store) -> Result<()> {
                     provider_user_id_hash: None,
                     email_hash: None,
                     org_id_hash: None,
-                    account_label: source.account_hint.clone(),
+                    account_label: source.account_alias.clone(),
                     plan_name: None,
-                    confidence: if source.account_hint.is_some() {
+                    confidence: if source.account_alias.is_some() {
                         Confidence::Medium
                     } else {
                         Confidence::Low
@@ -1937,7 +1940,7 @@ fn doctor(store_path: &Path) -> Result<()> {
             println!(
                 "  - {} account={} origin={} files={} pending={} cached={}",
                 preview_path_label(&source),
-                source.account_hint.as_deref().unwrap_or("unmapped"),
+                source.account_alias.as_deref().unwrap_or("unmapped"),
                 location_origin_label(&source.location_origin),
                 candidates.len(),
                 pending.len(),
@@ -2455,7 +2458,7 @@ fn print_scan_preview_line(
         println!(
             "{} account={} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
             source.provider,
-            source.account_hint.as_deref().unwrap_or("unmapped"),
+            source.account_alias.as_deref().unwrap_or("unmapped"),
             preview_path_label(source),
             usage_events,
             summaries,
@@ -2482,7 +2485,7 @@ fn print_scan_preview_line(
         println!(
             "{} account={} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={}",
             source.provider,
-            source.account_hint.as_deref().unwrap_or("unmapped"),
+            source.account_alias.as_deref().unwrap_or("unmapped"),
             preview_path_label(source),
             usage_events,
             summaries,
@@ -2510,24 +2513,24 @@ fn add_diagnostics(target: &mut ScanDiagnostics, source: &ScanDiagnostics) {
     target.model_fallbacks += source.model_fallbacks;
 }
 
-fn apply_account_hint_to_events(source: &SourceLocation, events: &mut [UsageEvent]) {
-    let Some(account_hint) = source.account_hint.as_deref() else {
+fn apply_account_alias_to_events(source: &SourceLocation, events: &mut [UsageEvent]) {
+    let Some(account_alias) = source.account_alias.as_deref() else {
         return;
     };
     for event in events {
-        event.provider_account_id = Some(provider_account_id(&source.provider, account_hint));
+        event.provider_account_id = Some(provider_account_id(&source.provider, account_alias));
         if let Some(evidence) = event.parse_evidence.as_mut() {
             evidence.account_identity_source = IdentitySource::ManualHint;
         }
     }
 }
 
-fn apply_account_hint_to_summaries(source: &SourceLocation, summaries: &mut [UsageSummary]) {
-    let Some(account_hint) = source.account_hint.as_deref() else {
+fn apply_account_alias_to_summaries(source: &SourceLocation, summaries: &mut [UsageSummary]) {
+    let Some(account_alias) = source.account_alias.as_deref() else {
         return;
     };
     for summary in summaries {
-        summary.provider_account_id = Some(provider_account_id(&source.provider, account_hint));
+        summary.provider_account_id = Some(provider_account_id(&source.provider, account_alias));
         if let Some(evidence) = summary.parse_evidence.as_mut() {
             evidence.account_identity_source = IdentitySource::ManualHint;
         }
@@ -2721,12 +2724,17 @@ fn format_cost(cost: Option<f64>) -> String {
 
 fn sanitize_source_for_sync(mut source: SourceLocation) -> SourceLocation {
     source.path_label = None;
-    source.account_hint = None;
+    source.account_alias = None;
     source
 }
 
 fn sanitize_account_for_sync(mut account: ProviderAccount) -> ProviderAccount {
-    account.account_label = None;
+    if !matches!(
+        account.identity_source,
+        IdentitySource::UserConfigured | IdentitySource::ManualHint
+    ) {
+        account.account_label = None;
+    }
     account.plan_name = None;
     account
 }
@@ -3167,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn account_resolve_merges_sources_with_same_account_hint() {
+    fn account_resolve_merges_sources_with_same_account_alias() {
         let store = Store::in_memory().expect("store");
         let source_a = SourceLocation::local_adapter(
             "claude_code",
@@ -3276,7 +3284,7 @@ mod tests {
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].location_origin, LocationOrigin::Configured);
-        assert_eq!(sources[0].account_hint.as_deref(), Some("personal"));
+        assert_eq!(sources[0].account_alias.as_deref(), Some("personal"));
     }
 
     #[test]
@@ -3306,7 +3314,7 @@ mod tests {
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].location_origin, LocationOrigin::Configured);
-        assert_eq!(sources[0].account_hint.as_deref(), Some("personal"));
+        assert_eq!(sources[0].account_alias.as_deref(), Some("personal"));
         assert_eq!(
             sources[0].path_label.as_deref(),
             Some("/tmp/ai-stats-claude")
@@ -3344,7 +3352,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_account_hint_attaches_manual_identity() {
+    fn apply_account_alias_attaches_manual_identity() {
         let adapter = adapter_for_provider("codex").expect("adapter");
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
@@ -3372,7 +3380,7 @@ mod tests {
                 },
             )
             .expect("scan");
-        apply_account_hint_to_events(&source, &mut scan.events);
+        apply_account_alias_to_events(&source, &mut scan.events);
 
         assert_eq!(scan.events.len(), 1);
         assert_eq!(
@@ -3576,6 +3584,29 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_account_for_sync_preserves_user_alias() {
+        let account = ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id: provider_account_id("codex", "personal"),
+            provider: "codex".to_string(),
+            identity_source: IdentitySource::UserConfigured,
+            provider_user_id_hash: None,
+            email_hash: None,
+            org_id_hash: None,
+            account_label: Some("personal".to_string()),
+            plan_name: Some("Pro".to_string()),
+            confidence: Confidence::Medium,
+            source_ids: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let sanitized = sanitize_account_for_sync(account);
+        assert_eq!(sanitized.account_label.as_deref(), Some("personal"));
+        assert_eq!(sanitized.plan_name, None);
+    }
+
+    #[test]
     fn firestore_stats_summaries_roll_up_events_by_day_and_account() {
         let source = SourceLocation::local_adapter(
             "codex",
@@ -3659,7 +3690,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_report_filters_period_and_groups_by_source_account_hint() {
+    fn usage_report_filters_period_and_groups_by_source_account_alias() {
         let now = Utc
             .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
             .single()
@@ -3968,7 +3999,7 @@ mod tests {
             provider: provider.to_string(),
             source_id: source.source_id.clone(),
             provider_account_id: source
-                .account_hint
+                .account_alias
                 .as_deref()
                 .map(|hint| provider_account_id(provider, hint)),
             source: EventSource {
