@@ -173,6 +173,7 @@ pub fn build_reported_usage_summary(
             parse_confidence,
         },
         model: input.model,
+        models: Vec::new(),
         usage: input.usage,
         cost,
         parse_evidence: Some(ParseEvidence {

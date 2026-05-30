@@ -180,7 +180,7 @@ pub struct SessionInfo {
     pub duration_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ModelInfo {
     pub name: Option<String>,
     pub normalized_name: Option<String>,
@@ -217,6 +217,13 @@ pub struct CostInfo {
     pub pricing_source: Option<String>,
     pub pricing_version: Option<String>,
     pub confidence: Confidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SummaryModelUsage {
+    pub model: ModelInfo,
+    pub usage: UsageCounts,
+    pub cost: CostInfo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -297,6 +304,8 @@ pub struct UsageSummary {
     pub provider_account_id: Option<ProviderAccountId>,
     pub source: EventSource,
     pub model: Option<ModelInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<SummaryModelUsage>,
     pub usage: UsageCounts,
     pub cost: CostInfo,
     pub parse_evidence: Option<ParseEvidence>,
@@ -1045,6 +1054,7 @@ mod tests {
                 duration_seconds: None,
             },
             model: None,
+            models: Vec::new(),
             usage: UsageCounts {
                 input_tokens: Some(tokens / 2),
                 output_tokens: Some(tokens / 2),
@@ -1100,6 +1110,7 @@ mod tests {
                 parse_confidence: Confidence::Medium,
             },
             model: None,
+            models: Vec::new(),
             usage: UsageCounts {
                 input_tokens: Some(tokens),
                 total_tokens: Some(tokens),

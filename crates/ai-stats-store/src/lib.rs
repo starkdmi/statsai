@@ -2,14 +2,14 @@
 
 use ai_stats_core::{
     hash_text, semantic_event_fingerprint, summary_id, Confidence, CostInfo, DailyRollup,
-    EventSource, PrivacyInfo, PrivacyMode, ProviderAccount, SemanticFingerprintInput, SourceId,
-    SourceLocation, Subscription, SummaryId, SummaryMetadata, UsageCounts, UsageEvent,
-    UsageSummary, USAGE_SUMMARY_SCHEMA_VERSION,
+    EventSource, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, SemanticFingerprintInput,
+    SourceId, SourceLocation, Subscription, SummaryId, SummaryMetadata, SummaryModelUsage,
+    UsageCounts, UsageEvent, UsageSummary, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1180,6 +1180,28 @@ impl Store {
         Ok(changed)
     }
 
+    pub fn pending_summaries_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        summaries: &[UsageSummary],
+    ) -> Result<Vec<UsageSummary>> {
+        let mut changed = Vec::new();
+        for summary in summaries {
+            let payload = serde_json::to_string(summary)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                "summary",
+                &summary.summary_id.0,
+                &hash_text(&payload),
+            )? {
+                changed.push(summary.clone());
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn record_sources_synced(
         &self,
         sink: &str,
@@ -1270,6 +1292,42 @@ impl Store {
                     target,
                     "subscription",
                     &subscription.subscription_id.0,
+                    &hash_text(&payload),
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn record_summaries_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        summaries: &[UsageSummary],
+    ) -> Result<()> {
+        if summaries.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            for summary in summaries {
+                let payload = serde_json::to_string(summary)?;
+                self.record_entity_synced(
+                    sink,
+                    target,
+                    "summary",
+                    &summary.summary_id.0,
                     &hash_text(&payload),
                 )?;
             }
@@ -1698,7 +1756,11 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let mut total_tokens = 0u64;
     let mut total_events = 0u64;
     let mut estimated_cost_usd = 0.0f64;
+    let mut provider_reported_usd = 0.0f64;
+    let mut has_provider_reported_usd = false;
     let mut observed_at = first.session.started_at;
+    let mut model_buckets: BTreeMap<String, (ModelInfo, FirestoreRollupModelTotals)> =
+        BTreeMap::new();
 
     for event in events {
         total_input = total_input.saturating_add(event.usage.input_tokens.unwrap_or(0));
@@ -1711,8 +1773,47 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         total_tokens = total_tokens.saturating_add(event.usage.computed_total());
         total_events = total_events.saturating_add(1);
         estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0.0);
+        if let Some(cost) = event.cost.provider_reported_usd {
+            provider_reported_usd += cost;
+            has_provider_reported_usd = true;
+        }
         if event.session.started_at > observed_at {
             observed_at = event.session.started_at;
+        }
+
+        let model = event.model.clone().unwrap_or_default();
+        let entry = model_buckets
+            .entry(firestore_rollup_model_key(&model))
+            .or_insert_with(|| (model.clone(), FirestoreRollupModelTotals::default()));
+        entry.1.input_tokens = entry
+            .1
+            .input_tokens
+            .saturating_add(event.usage.input_tokens.unwrap_or(0));
+        entry.1.output_tokens = entry
+            .1
+            .output_tokens
+            .saturating_add(event.usage.output_tokens.unwrap_or(0));
+        entry.1.cache_creation_tokens = entry
+            .1
+            .cache_creation_tokens
+            .saturating_add(event.usage.cache_creation_tokens.unwrap_or(0));
+        entry.1.cache_read_tokens = entry
+            .1
+            .cache_read_tokens
+            .saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
+        entry.1.reasoning_tokens = entry
+            .1
+            .reasoning_tokens
+            .saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
+        entry.1.total_tokens = entry
+            .1
+            .total_tokens
+            .saturating_add(event.usage.computed_total());
+        entry.1.requests = entry.1.requests.saturating_add(1);
+        entry.1.estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0.0);
+        if let Some(cost) = event.cost.provider_reported_usd {
+            entry.1.provider_reported_usd += cost;
+            entry.1.has_provider_reported_usd = true;
         }
     }
 
@@ -1723,6 +1824,33 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         .unwrap_or(first.session.started_at);
     let period_end = period_start + chrono::Duration::days(1);
     let bucket_key = firestore_rollup_bucket_key(first);
+    let models = model_buckets
+        .into_values()
+        .map(|(model, totals)| SummaryModelUsage {
+            model,
+            usage: UsageCounts {
+                input_tokens: Some(totals.input_tokens),
+                output_tokens: Some(totals.output_tokens),
+                cache_creation_tokens: Some(totals.cache_creation_tokens),
+                cache_read_tokens: Some(totals.cache_read_tokens),
+                reasoning_tokens: Some(totals.reasoning_tokens),
+                total_tokens: Some(totals.total_tokens),
+                requests: Some(totals.requests),
+                local_prompt_eval_tokens: None,
+                local_eval_tokens: None,
+            },
+            cost: CostInfo {
+                currency: "USD".to_string(),
+                estimated_api_equivalent_usd: Some(totals.estimated_cost_usd),
+                provider_reported_usd: totals
+                    .has_provider_reported_usd
+                    .then_some(totals.provider_reported_usd),
+                pricing_source: Some("local_rollup".to_string()),
+                pricing_version: None,
+                confidence: Confidence::Medium,
+            },
+        })
+        .collect();
 
     UsageSummary {
         schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
@@ -1736,6 +1864,7 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             ..first.source.clone()
         },
         model: None,
+        models,
         usage: UsageCounts {
             input_tokens: Some(total_input),
             output_tokens: Some(total_output),
@@ -1750,7 +1879,7 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         cost: CostInfo {
             currency: "USD".to_string(),
             estimated_api_equivalent_usd: Some(estimated_cost_usd),
-            provider_reported_usd: None,
+            provider_reported_usd: has_provider_reported_usd.then_some(provider_reported_usd),
             pricing_source: Some("local_rollup".to_string()),
             pricing_version: None,
             confidence: Confidence::Medium,
@@ -1767,13 +1896,36 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         observed_at,
         metadata: SummaryMetadata {
             summary_format: "daily_rollup.v1".to_string(),
-            summary_version: Some("1".to_string()),
+            summary_version: Some("2".to_string()),
             total_sessions: None,
             total_messages: None,
             last_computed_at: Some(observed_at),
         },
         imported_at: observed_at,
     }
+}
+
+#[derive(Debug, Default)]
+struct FirestoreRollupModelTotals {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    reasoning_tokens: u64,
+    total_tokens: u64,
+    requests: u64,
+    estimated_cost_usd: f64,
+    provider_reported_usd: f64,
+    has_provider_reported_usd: bool,
+}
+
+fn firestore_rollup_model_key(model: &ModelInfo) -> String {
+    format!(
+        "{}|{}|{}",
+        model.normalized_name.as_deref().unwrap_or(""),
+        model.provider_model_id.as_deref().unwrap_or(""),
+        model.name.as_deref().unwrap_or("")
+    )
 }
 
 fn safe_u64_to_i64(value: u64) -> i64 {
@@ -2269,6 +2421,12 @@ mod tests {
         let mut first = test_store_event(&source, day, "record-a");
         first.provider_account_id = Some(account_id.clone());
         first.usage.total_tokens = Some(15);
+        first.model = Some(ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        });
+        first.cost.provider_reported_usd = Some(0.11);
 
         assert!(store.insert_event(&first).expect("insert first"));
         let dirty = store
@@ -2277,6 +2435,7 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].usage.total_tokens, Some(15));
         assert_eq!(dirty[0].metadata.summary_format, "daily_rollup.v1");
+        assert_eq!(dirty[0].metadata.summary_version.as_deref(), Some("2"));
         assert_eq!(
             dirty[0]
                 .period_start
@@ -2285,6 +2444,13 @@ mod tests {
                 .to_string(),
             "2026-05-28"
         );
+        assert_eq!(dirty[0].models.len(), 1);
+        assert_eq!(
+            dirty[0].models[0].model.normalized_name.as_deref(),
+            Some("gpt-5")
+        );
+        assert_eq!(dirty[0].models[0].usage.total_tokens, Some(15));
+        assert_eq!(dirty[0].cost.provider_reported_usd, Some(0.11));
 
         store
             .mark_firestore_rollups_synced(&[dirty[0].summary_id.clone()])
@@ -2297,6 +2463,12 @@ mod tests {
         let mut second = test_store_event(&source, day + chrono::Duration::hours(1), "record-b");
         second.provider_account_id = Some(account_id);
         second.usage.total_tokens = Some(25);
+        second.model = Some(ModelInfo {
+            name: Some("gpt-4.1".to_string()),
+            normalized_name: Some("gpt-4.1".to_string()),
+            provider_model_id: Some("gpt-4.1".to_string()),
+        });
+        second.cost.provider_reported_usd = Some(0.22);
 
         assert!(store.insert_event(&second).expect("insert second"));
         let dirty = store
@@ -2305,6 +2477,10 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].usage.total_tokens, Some(40));
         assert_eq!(dirty[0].usage.requests, Some(2));
+        assert_eq!(dirty[0].cost.provider_reported_usd, Some(0.33));
+        assert_eq!(dirty[0].models.len(), 2);
+        assert_eq!(dirty[0].models[0].usage.total_tokens, Some(25));
+        assert_eq!(dirty[0].models[1].usage.total_tokens, Some(15));
     }
 
     #[test]
@@ -2489,6 +2665,7 @@ mod tests {
                 normalized_name: Some("claude-test".to_string()),
                 provider_model_id: Some("claude-test".to_string()),
             }),
+            models: Vec::new(),
             usage: UsageCounts {
                 input_tokens: Some(total),
                 total_tokens: Some(total),

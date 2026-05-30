@@ -17,7 +17,7 @@ use ai_stats_core::{
 use ai_stats_sdk::{
     build_reported_usage_summary, ReportedUsageSummaryInput, ReportedUsageSummaryRecord,
 };
-use ai_stats_store::{ScanFileStateEntry, Store};
+use ai_stats_store::{ScanFileStateEntry, Store, SyncState};
 use ai_stats_sync::{
     FileSink, FirestoreSendOptions, FirestoreSink, HttpSink, StdoutSink, SyncSink,
 };
@@ -296,6 +296,11 @@ struct SyncCommand {
         help = "Firestore payload mode (stats, full [emulator/debug only])"
     )]
     firestore_mode: String,
+    #[arg(
+        long,
+        help = "Rebuild local Firestore rollups from events and force all rollups dirty before sync"
+    )]
+    rebuild_rollups: bool,
     #[arg(
         long,
         default_value_t = 1000,
@@ -1024,12 +1029,21 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
             .map(sanitize_event_for_sync)
             .collect()
     };
-    let summaries: Vec<_> = store
-        .summaries_after(summary_cursor)?
-        .into_iter()
-        .map(sanitize_summary_for_sync)
-        .filter(|summary| !firestore_stats_mode || !is_daily_rollup_summary(summary))
-        .collect();
+    let summaries: Vec<_> = if firestore_stats_mode {
+        let passthrough_summaries: Vec<_> = store
+            .summaries()?
+            .into_iter()
+            .map(sanitize_summary_for_sync)
+            .filter(|summary| !is_daily_rollup_summary(summary))
+            .collect();
+        store.pending_summaries_for_sync(&command.sink, &target, &passthrough_summaries)?
+    } else {
+        store
+            .summaries_after(summary_cursor)?
+            .into_iter()
+            .map(sanitize_summary_for_sync)
+            .collect()
+    };
     let all_sources: Vec<_> = store
         .list_sources()?
         .into_iter()
@@ -1073,11 +1087,9 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     };
 
     if firestore_stats_mode {
-        let should_bootstrap = !command.dry_run
-            && command.since_last
-            && store.firestore_rollup_count()? == 0
-            && store.event_count()? > 0;
-        if !command.dry_run && !command.since_last {
+        let should_bootstrap =
+            !command.dry_run && store.firestore_rollup_count()? == 0 && store.event_count()? > 0;
+        if !command.dry_run && command.rebuild_rollups {
             let rebuilt = store.rebuild_firestore_rollups()?;
             let marked_dirty = store.mark_all_firestore_rollups_dirty()?;
             eprintln!(
@@ -1092,11 +1104,7 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
             );
         }
 
-        let rollups = if command.since_last {
-            store.dirty_firestore_rollup_summaries()?
-        } else {
-            store.all_firestore_rollup_summaries()?
-        };
+        let rollups = store.dirty_firestore_rollup_summaries()?;
         eprintln!(
             "firestore stats mode: prepared {} local daily summaries for sync",
             rollups.len()
@@ -1330,6 +1338,7 @@ fn sync_firestore(
                     &passthrough_summaries,
                 )?;
                 store.mark_firestore_rollups_synced(&rollup_summary_ids)?;
+                store.record_summaries_synced(&command.sink, &target, &passthrough_summaries)?;
                 store.record_sources_synced(&command.sink, &target, &sub_batch.sources)?;
                 store.record_accounts_synced(&command.sink, &target, &sub_batch.accounts)?;
                 store.record_subscriptions_synced(
@@ -1403,9 +1412,6 @@ fn sync_verify(command: SyncCommand, store: &Store, device_id: &str) -> Result<(
 
     let auth = resolve_firestore_auth_context(&command)?;
     let target = firestore_sync_target(&command.firebase_project, &auth.uid);
-    let all_sources = store.list_sources()?;
-    let all_accounts = store.list_accounts()?;
-    let all_subscriptions = store.list_subscriptions()?;
     let local_state = store.sync_state("firestore", &target)?;
     let report = FirestoreVerifyReport {
         sink: command.sink.clone(),
@@ -1414,24 +1420,7 @@ fn sync_verify(command: SyncCommand, store: &Store, device_id: &str) -> Result<(
         uid: auth.uid.clone(),
         using_emulator: firestore_emulator_host().is_some(),
         device_id: device_id.to_string(),
-        local: FirestoreLocalVerify {
-            sync_state: local_state.as_ref().map(sync_state_report),
-            total_sources: all_sources.len(),
-            enabled_sources: all_sources.iter().filter(|source| source.enabled).count(),
-            pending_sources: store
-                .pending_sources_for_sync("firestore", &target, &all_sources)?
-                .len(),
-            total_accounts: all_accounts.len(),
-            pending_accounts: store
-                .pending_accounts_for_sync("firestore", &target, &all_accounts)?
-                .len(),
-            total_subscriptions: all_subscriptions.len(),
-            pending_subscriptions: store
-                .pending_subscriptions_for_sync("firestore", &target, &all_subscriptions)?
-                .len(),
-            total_rollups: store.firestore_rollup_count()? as usize,
-            dirty_rollups: store.dirty_firestore_rollup_summaries()?.len(),
-        },
+        local: firestore_local_verify(store, &target, local_state.as_ref())?,
         remote: firestore_remote_verify(
             &command.firebase_project,
             &auth.uid,
@@ -1442,6 +1431,60 @@ fn sync_verify(command: SyncCommand, store: &Store, device_id: &str) -> Result<(
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn firestore_local_verify(
+    store: &Store,
+    target: &str,
+    local_state: Option<&SyncState>,
+) -> Result<FirestoreLocalVerify> {
+    let all_sources = store.list_sources()?;
+    let all_accounts = store.list_accounts()?;
+    let all_subscriptions = store.list_subscriptions()?;
+    let firestore_sources: Vec<_> = all_sources
+        .iter()
+        .cloned()
+        .map(sanitize_source_for_sync)
+        .collect();
+    let firestore_accounts: Vec<_> = all_accounts
+        .iter()
+        .cloned()
+        .map(sanitize_account_for_sync)
+        .collect();
+    let firestore_subscriptions: Vec<_> = all_subscriptions
+        .iter()
+        .cloned()
+        .map(sanitize_subscription_for_sync)
+        .collect();
+    let passthrough_summaries: Vec<_> = store
+        .summaries()?
+        .into_iter()
+        .map(sanitize_summary_for_sync)
+        .filter(|summary| !is_daily_rollup_summary(summary))
+        .collect();
+
+    Ok(FirestoreLocalVerify {
+        sync_state: local_state.map(sync_state_report),
+        total_sources: all_sources.len(),
+        enabled_sources: all_sources.iter().filter(|source| source.enabled).count(),
+        pending_sources: store
+            .pending_sources_for_sync("firestore", target, &firestore_sources)?
+            .len(),
+        total_accounts: all_accounts.len(),
+        pending_accounts: store
+            .pending_accounts_for_sync("firestore", target, &firestore_accounts)?
+            .len(),
+        total_subscriptions: all_subscriptions.len(),
+        pending_subscriptions: store
+            .pending_subscriptions_for_sync("firestore", target, &firestore_subscriptions)?
+            .len(),
+        total_passthrough_summaries: passthrough_summaries.len(),
+        pending_passthrough_summaries: store
+            .pending_summaries_for_sync("firestore", target, &passthrough_summaries)?
+            .len(),
+        total_rollups: store.firestore_rollup_count()? as usize,
+        dirty_rollups: store.dirty_firestore_rollup_summaries()?.len(),
+    })
 }
 
 fn sync_target(command: &SyncCommand) -> String {
@@ -1488,6 +1531,8 @@ struct FirestoreLocalVerify {
     pending_accounts: usize,
     total_subscriptions: usize,
     pending_subscriptions: usize,
+    total_passthrough_summaries: usize,
+    pending_passthrough_summaries: usize,
     total_rollups: usize,
     dirty_rollups: usize,
 }
@@ -2818,6 +2863,7 @@ fn build_firestore_stats_summaries(events: &[UsageEvent], device_id: &str) -> Ve
                 ..bucket.source
             },
             model: None,
+            models: Vec::new(),
             usage: UsageCounts {
                 input_tokens: Some(bucket.input_tokens),
                 output_tokens: Some(bucket.output_tokens),
@@ -2849,7 +2895,7 @@ fn build_firestore_stats_summaries(events: &[UsageEvent], device_id: &str) -> Ve
             observed_at: bucket.observed_at,
             metadata: SummaryMetadata {
                 summary_format: "daily_rollup.v1".to_string(),
-                summary_version: Some("1".to_string()),
+                summary_version: Some("2".to_string()),
                 total_sessions: None,
                 total_messages: None,
                 last_computed_at: Some(Utc::now()),
@@ -2881,9 +2927,11 @@ fn sanitize_subscription_for_sync(mut subscription: Subscription) -> Subscriptio
 mod tests {
     use super::*;
     use ai_stats_core::{
-        event_id, summary_id, CostInfo, EventSource, IdentitySource, ModelInfo, ParseEvidence,
-        PrivacyInfo, PrivacyMode, SessionInfo, SourceKind, SummaryMetadata, UsageCounts,
-        UsageSummary, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+        event_id, subscription_id, summary_id, BillingPeriod, CostInfo, EventSource,
+        IdentitySource, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProviderAccount,
+        SessionInfo, SourceKind, Subscription, SubscriptionStatus, SummaryMetadata, UsageCounts,
+        UsageSummary, PROVIDER_ACCOUNT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
+        USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
     };
     use chrono::TimeZone;
     use std::path::Path;
@@ -3373,6 +3421,7 @@ mod tests {
                 firebase_uid: None,
                 firebase_project: "ai-stats-fire".to_string(),
                 firestore_mode: "stats".to_string(),
+                rebuild_rollups: false,
                 firestore_records_per_batch: 1000,
                 firestore_commit_writes: 200,
                 firestore_retries: 4,
@@ -3433,6 +3482,97 @@ mod tests {
             firestore_sync_target("ai-stats-fire", "uid-123"),
             "firestore:ai-stats-fire:uid-123"
         );
+    }
+
+    #[test]
+    fn firestore_verify_pending_counts_match_sanitized_sync_payloads() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-verify-pending"),
+            LocationOrigin::Configured,
+            Some("personal".to_string()),
+        );
+        store.upsert_source(&source).expect("source");
+
+        let account = ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id: provider_account_id("codex", "personal"),
+            provider: "codex".to_string(),
+            identity_source: IdentitySource::ManualHint,
+            provider_user_id_hash: None,
+            email_hash: None,
+            org_id_hash: None,
+            account_label: Some("personal".to_string()),
+            plan_name: Some("Pro".to_string()),
+            confidence: Confidence::High,
+            source_ids: vec![source.source_id.clone()],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.upsert_account(&account).expect("account");
+
+        let subscription = Subscription {
+            schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+            subscription_id: subscription_id("codex", Some(&account.provider_account_id), "pro"),
+            provider: "codex".to_string(),
+            provider_account_id: Some(account.provider_account_id.clone()),
+            source_ids: vec![source.source_id.clone()],
+            plan_name: "Pro".to_string(),
+            price: 20.0,
+            currency: "USD".to_string(),
+            billing_period: BillingPeriod::Monthly,
+            paid_at: None,
+            renewal_day: None,
+            started_at: None,
+            ended_at: None,
+            status: SubscriptionStatus::Active,
+            notes: Some("private note".to_string()),
+        };
+        store
+            .upsert_subscription(&subscription)
+            .expect("subscription");
+        let summary = test_summary("codex", &source, Utc::now(), 42);
+        store.upsert_summary(&summary).expect("summary");
+
+        let target = firestore_sync_target("ai-stats-fire", "uid-test");
+        store
+            .record_sources_synced(
+                "firestore",
+                &target,
+                &[sanitize_source_for_sync(source.clone())],
+            )
+            .expect("record sources");
+        store
+            .record_accounts_synced(
+                "firestore",
+                &target,
+                &[sanitize_account_for_sync(account.clone())],
+            )
+            .expect("record accounts");
+        store
+            .record_subscriptions_synced(
+                "firestore",
+                &target,
+                &[sanitize_subscription_for_sync(subscription.clone())],
+            )
+            .expect("record subscriptions");
+        store
+            .record_summaries_synced(
+                "firestore",
+                &target,
+                &[sanitize_summary_for_sync(summary.clone())],
+            )
+            .expect("record summaries");
+
+        let local = firestore_local_verify(&store, &target, None).expect("local verify");
+        assert_eq!(local.pending_sources, 0);
+        assert_eq!(local.pending_accounts, 0);
+        assert_eq!(local.pending_subscriptions, 0);
+        assert_eq!(local.total_passthrough_summaries, 1);
+        assert_eq!(local.pending_passthrough_summaries, 0);
     }
 
     #[test]
@@ -3846,6 +3986,7 @@ mod tests {
                 normalized_name: Some("claude-test".to_string()),
                 provider_model_id: Some("claude-test".to_string()),
             }),
+            models: Vec::new(),
             usage: UsageCounts {
                 input_tokens: Some(total),
                 total_tokens: Some(total),

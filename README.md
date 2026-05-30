@@ -105,6 +105,9 @@ progress by sub-batch/chunk. In the default `stats` mode, the CLI now maintains
 local daily rollup summaries and syncs only the dirty rollups instead of
 rescanning all raw events on every run. Unchanged source/account/subscription
 metadata is skipped, and an empty sync no longer writes bookkeeping docs.
+Each daily rollup keeps top-level token/cost totals plus a `models` breakdown
+array so the hosted dashboard can answer per-model usage questions without raw
+event sync.
 
 Default Firestore mode is `stats`, which uploads cached daily summary documents
 for production sync. Hosted `--firestore-mode full` is disabled by default as a
@@ -117,8 +120,12 @@ If you already have a populated local store from older builds, run one full
 stats sync once to bootstrap the local rollup cache:
 
 ```sh
-cargo run -p ai-stats-cli -- sync --sink firestore --firestore-mode stats
+cargo run -p ai-stats-cli -- sync --sink firestore --firestore-mode stats --rebuild-rollups
 ```
+
+Normal Firestore `stats` sync only sends dirty local rollups. Use
+`--rebuild-rollups` when you intentionally want to rebuild rollups from local
+events and force a full hosted rewrite after schema or aggregation changes.
 
 Source management helpers:
 

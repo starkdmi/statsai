@@ -146,6 +146,12 @@ recomputing all summaries from raw events on every run. Hosted
 `--firestore-mode full` is gated off by default; use it only with the emulator
 or by explicitly setting `AI_STATS_ENABLE_HOSTED_FIRESTORE_FULL=1` for
 future/debug raw-event experiments.
+Use `--rebuild-rollups` when you intentionally want to rebuild local rollups
+from stored events and force a full hosted rewrite, for example after changing
+the rollup schema.
+These daily rollup summaries keep top-level usage/cost totals and also include
+`models[]` per-model breakdown entries so a frontend can chart model-level
+token usage without depending on remote raw events.
 Large syncs are split into sub-batches (`--firestore-records-per-batch`) and
 each sub-batch uses Firestore commit chunks (`--firestore-commit-writes`).
 Successful sub-batches update local sync state immediately, so `--since-last`

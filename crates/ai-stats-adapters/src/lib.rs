@@ -681,6 +681,7 @@ fn parse_claude_stats_cache(
                 parse_confidence: Confidence::Medium,
             },
             model: Some(model),
+            models: Vec::new(),
             usage,
             cost,
             parse_evidence: Some(ParseEvidence {
