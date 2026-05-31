@@ -12,7 +12,7 @@ Status: early implementation. The public API is not stable yet.
 - a Rust SDK facade for embedding
 - local provider adapters for direct trusted source reads
 - a local SQLite store
-- abstract sync sinks for stdout/file today and Firebase/Supabase/HTTP later
+- abstract sync sinks for stdout/file/HTTP
 - a loopback-only daemon API for local widgets and toolbar integrations
 
 The first adapters target Claude Code JSONL usage roots and Codex session logs. External aggregate reports, manually transcribed screenshots, or provider `/usage` summaries are supported as reported summary imports. They stay separate from trusted raw local events so reports can show direct usage and imported/manual gaps without double-counting.
@@ -22,7 +22,7 @@ The first adapters target Claude Code JSONL usage roots and Codex session logs. 
 - `crates/ai-stats-core`: normalized types, stable IDs, schema models, privacy metadata
 - `crates/ai-stats-adapters`: Claude Code and Codex local adapters
 - `crates/ai-stats-store`: SQLite persistence
-- `crates/ai-stats-sync`: pluggable sync sink trait plus stdout/file sinks
+- `crates/ai-stats-sync`: pluggable sync sink trait plus stdout/file/HTTP sinks
 - `crates/ai-stats-daemon`: localhost API
 - `crates/ai-stats-sdk`: Rust SDK facade
 - `crates/ai-stats-cli`: `ai-stats` binary
@@ -41,18 +41,17 @@ cargo run -p ai-stats-cli -- subscription add --provider claude --account person
 cargo run -p ai-stats-cli -- import summary --path ./reported_usage_summaries.json --dry-run --verbose
 cargo run -p ai-stats-cli -- report weekly
 cargo run -p ai-stats-cli -- sync --sink file --output ./ai-stats-sync-batch.json
-cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:3000/v1/sync/batches
-cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:3000/v1/sync/batches --since-last
+cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
+cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
 cargo run -p ai-stats-cli -- sync --status
 cargo run -p ai-stats-cli -- auth login
 cargo run -p ai-stats-cli -- auth status
-cargo run -p ai-stats-cli -- sync --sink firestore --since-last
-cargo run -p ai-stats-cli -- sync --sink firestore --since-last --firestore-mode stats
-cargo run -p ai-stats-cli -- sync --sink firestore --verify
+cargo run -p ai-stats-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
+cargo run -p ai-stats-cli -- sync --sink http --verify
 cargo run -p ai-stats-cli -- schema sync-batch
 ```
 
-`source add --account ...` uses a user-defined account alias, not a provider-verified identity. Aliases like `personal`, `work`, or `mini` are stable grouping buckets that determine how sources roll up into provider accounts locally and in Firestore.
+`source add --account ...` uses a user-defined account alias, not a provider-verified identity. Aliases like `personal`, `work`, or `mini` are stable grouping buckets that determine how sources roll up into provider accounts locally and in the hosted dashboard.
 
 `scan --preview` reads configured and default local sources without writing to SQLite. It reports normalized usage events, not raw log rows, and shows the token split when the provider logs expose it:
 
@@ -78,62 +77,38 @@ Estimated cost is API-equivalent, not a subscription invoice. It uses known prov
 
 The backend-facing sync contract starts at `sync_batch.v1`. See `docs/sync-contract.md` for the current ingestion boundary, privacy defaults, and a minimal fixture.
 
-## Firebase Backend
+## Hosted Sync
 
-This repository includes Firebase scaffold files for production sync:
+The collector now targets a Cloudflare-hosted backend, but that backend and its
+UI are intentionally out of scope for this public CLI repo. This repo contains
+the collector, local store, sync contract, and device-pairing client behavior.
 
-- `web/login/`: hosted Firebase Auth login page for the CLI loopback flow
-- `firestore.rules`: user-scoped read/write rules for direct CLI sync
-- `functions/`: optional HTTPS ingestion scaffold for a later server-side sync gateway
-- `firebase.json`, `.firebaserc`: Firebase CLI project config
-
-Production login opens the hosted Firebase Auth page in the browser and stores
-Firebase credentials locally in `~/.ai-stats/auth.json`:
+`auth login` opens the web app configured by `AI_STATS_WEB_URL`, asks the
+signed-in user to authorize the local device, and stores a backend-scoped
+device session under `~/.ai-stats/`. If `AI_STATS_API_URL` / `AI_STATS_WEB_URL`
+are unset, the CLI defaults to the local dev pair
+`http://127.0.0.1:8787` + `http://127.0.0.1:3000`. When a hosted deployment
+exists, export those vars before running `auth login` so the hosted session is
+kept separate from the local one:
 
 ```sh
+export AI_STATS_API_URL="https://api.example.com"
+export AI_STATS_WEB_URL="https://app.example.com"
 cargo run -p ai-stats-cli -- auth login
-cargo run -p ai-stats-cli -- auth status
-cargo run -p ai-stats-cli -- sync --sink firestore --since-last
-cargo run -p ai-stats-cli -- sync --sink firestore --verify
 ```
 
-After login, Firestore and HTTP sync automatically use the stored Firebase ID
-token unless `--auth-token` or `AI_STATS_SYNC_TOKEN` is supplied. The
-`--client-id "$GOOGLE_CLIENT_ID"` login path is still available as an escape
-hatch for a custom desktop OAuth client.
-
-When `FIREBASE_AUTH_EMULATOR_HOST` is set, `auth login` switches to Firebase
-Auth emulator mode instead. It prompts for an existing emulator user's
-email/password, signs in through the local emulator, and stores that session in
-a separate file under `~/.ai-stats/` so production and emulator auth do not
-overwrite each other.
-
-Firestore sync sends writes through Firestore Commit API batches and prints
-progress by sub-batch/chunk. In the default `stats` mode, the CLI now maintains
-local daily rollup summaries and syncs only the dirty rollups instead of
-rescanning all raw events on every run. Unchanged source/account/subscription
-metadata is skipped, and an empty sync no longer writes bookkeeping docs.
-Each daily rollup keeps top-level token/cost totals plus a `models` breakdown
-array so the hosted dashboard can answer per-model usage questions without raw
-event sync.
-
-Default Firestore mode is `stats`, which uploads cached daily summary documents
-for production sync. Hosted `--firestore-mode full` is disabled by default as a
-guardrail because direct per-event writes are too expensive for the intended
-production flow. Use `--firestore-mode full` only with the emulator or by
-explicitly setting `AI_STATS_ENABLE_HOSTED_FIRESTORE_FULL=1` for future/debug
-experiments.
-
-If you already have a populated local store from older builds, run one full
-stats sync once to bootstrap the local rollup cache:
+After login:
 
 ```sh
-cargo run -p ai-stats-cli -- sync --sink firestore --firestore-mode stats --rebuild-rollups
+cargo run -p ai-stats-cli -- auth status
+cargo run -p ai-stats-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
 ```
 
-Normal Firestore `stats` sync only sends dirty local rollups. Use
-`--rebuild-rollups` when you intentionally want to rebuild rollups from local
-events and force a full hosted rewrite after schema or aggregation changes.
+HTTP sync automatically uses the stored device access token unless
+`--auth-token` or `AI_STATS_SYNC_TOKEN` is supplied. Access tokens are
+short-lived and refreshed from the stored device refresh token as needed.
+The collector sends sanitized daily rollups plus metadata to the backend. Raw
+events stay local by default.
 
 Source management helpers:
 
@@ -149,26 +124,13 @@ cargo run -p ai-stats-cli -- source remove --source-id src_123 --delete-data
 remove local events, summaries, rollups, and scan-cache entries tied to that
 source from SQLite.
 
-`sync --verify` resolves the active Firebase target, shows local sync state,
-and fetches a small remote snapshot (`devices`, `syncBatches`, `sources`,
-`accounts`, `subscriptions`, `events`, `summaries`) so you can confirm what the
-backend sees without relying on the Firebase console UI.
-Firestore account docs keep user-defined account aliases for display, while
-still stripping local source paths and plan-name details.
+### Local Backend Development
 
-### Local Firebase Tests
-
-Use real Firebase emulator auth + Firestore for local integration tests:
+Run any compatible sync service locally and point the CLI at it:
 
 ```sh
-export FIREBASE_AUTH_EMULATOR_HOST="127.0.0.1:9099"
-export FIRESTORE_EMULATOR_HOST="127.0.0.1:8080"
-firebase emulators:start --only firestore,auth
+export AI_STATS_API_URL="http://127.0.0.1:8787"
+export AI_STATS_WEB_URL="http://127.0.0.1:3000"
 cargo run -p ai-stats-cli -- auth login
-cargo run -p ai-stats-cli -- auth status
-cargo run -p ai-stats-cli -- sync --sink firestore --firestore-mode stats --since-last
-cargo run -p ai-stats-cli -- sync --sink firestore --verify
+cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
 ```
-
-Create the emulator user in the Firebase Emulator UI first, then use that same
-account from both the frontend and the CLI.

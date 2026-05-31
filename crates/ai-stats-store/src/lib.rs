@@ -125,7 +125,7 @@ impl Store {
               PRIMARY KEY (date, device_id)
             );
             CREATE INDEX IF NOT EXISTS daily_rollups_date_idx ON daily_rollups (date);
-            CREATE TABLE IF NOT EXISTS firestore_rollups (
+            CREATE TABLE IF NOT EXISTS sync_rollups (
               summary_id TEXT PRIMARY KEY,
               provider TEXT NOT NULL,
               source_id TEXT NOT NULL,
@@ -137,10 +137,10 @@ impl Store {
               dirty INTEGER NOT NULL DEFAULT 1,
               payload TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS firestore_rollups_dirty_idx
-              ON firestore_rollups (dirty, updated_at, summary_id);
-            CREATE INDEX IF NOT EXISTS firestore_rollups_lookup_idx
-              ON firestore_rollups (provider, source_id, provider_account_id, day_key);
+            CREATE INDEX IF NOT EXISTS sync_rollups_dirty_idx
+              ON sync_rollups (dirty, updated_at, summary_id);
+            CREATE INDEX IF NOT EXISTS sync_rollups_lookup_idx
+              ON sync_rollups (provider, source_id, provider_account_id, day_key);
             CREATE TABLE IF NOT EXISTS scan_file_state (
               source_id TEXT NOT NULL,
               cache_key TEXT NOT NULL,
@@ -409,7 +409,7 @@ impl Store {
             let mut refreshed = event.clone();
             refreshed.event_id.0 = existing_id;
             let dirty_keys = self.update_event_payload(&refreshed)?;
-            self.refresh_firestore_rollups_for_keys(&dirty_keys)?;
+            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
             return Ok(false);
         }
 
@@ -435,11 +435,9 @@ impl Store {
         )?;
         if changed == 0 {
             let dirty_keys = self.update_event_payload(event)?;
-            self.refresh_firestore_rollups_for_keys(&dirty_keys)?;
+            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
         } else {
-            self.refresh_firestore_rollups_for_keys(&BTreeSet::from([
-                firestore_rollup_bucket_key(event),
-            ]))?;
+            self.refresh_sync_rollups_for_keys(&BTreeSet::from([sync_rollup_bucket_key(event)]))?;
         }
         Ok(changed > 0)
     }
@@ -466,7 +464,7 @@ impl Store {
                 }
                 dirty_keys.extend(outcome.dirty_keys);
             }
-            self.refresh_firestore_rollups_for_keys(&dirty_keys)?;
+            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
             Ok(inserted)
         })();
 
@@ -482,13 +480,10 @@ impl Store {
         }
     }
 
-    fn update_event_payload(
-        &self,
-        event: &UsageEvent,
-    ) -> Result<BTreeSet<FirestoreRollupBucketKey>> {
+    fn update_event_payload(&self, event: &UsageEvent) -> Result<BTreeSet<SyncRollupBucketKey>> {
         let existing_bucket = self
             .event_by_id(&event.event_id.0)?
-            .map(|existing| firestore_rollup_bucket_key(&existing));
+            .map(|existing| sync_rollup_bucket_key(&existing));
         let payload = serde_json::to_string(event)?;
         let fingerprint = event_fingerprint(event);
         self.conn.execute(
@@ -518,7 +513,7 @@ impl Store {
         if let Some(existing_bucket) = existing_bucket {
             dirty_keys.insert(existing_bucket);
         }
-        dirty_keys.insert(firestore_rollup_bucket_key(event));
+        dirty_keys.insert(sync_rollup_bucket_key(event));
         Ok(dirty_keys)
     }
 
@@ -564,7 +559,7 @@ impl Store {
         }
         Ok(EventInsertOutcome {
             inserted: true,
-            dirty_keys: BTreeSet::from([firestore_rollup_bucket_key(event)]),
+            dirty_keys: BTreeSet::from([sync_rollup_bucket_key(event)]),
         })
     }
 
@@ -737,7 +732,7 @@ impl Store {
                     params![&source_id.0],
                 )? as u64;
             }
-            self.delete_firestore_rollups_for_sources_in_tx(source_ids)?;
+            self.delete_sync_rollups_for_sources_in_tx(source_ids)?;
             Ok(deleted)
         })();
 
@@ -1035,28 +1030,26 @@ impl Store {
         Ok(count as u64)
     }
 
-    pub fn firestore_rollup_count(&self) -> Result<u64> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM firestore_rollups", [], |row| {
-                    row.get(0)
-                })?;
+    pub fn sync_rollup_count(&self) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sync_rollups", [], |row| row.get(0))?;
         Ok(count as u64)
     }
 
-    pub fn dirty_firestore_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
-        self.firestore_rollup_summaries_by_sql(
-            "SELECT payload FROM firestore_rollups WHERE dirty = 1 ORDER BY updated_at, summary_id",
+    pub fn dirty_sync_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
+        self.sync_rollup_summaries_by_sql(
+            "SELECT payload FROM sync_rollups WHERE dirty = 1 ORDER BY updated_at, summary_id",
         )
     }
 
-    pub fn all_firestore_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
-        self.firestore_rollup_summaries_by_sql(
-            "SELECT payload FROM firestore_rollups ORDER BY updated_at, summary_id",
+    pub fn all_sync_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
+        self.sync_rollup_summaries_by_sql(
+            "SELECT payload FROM sync_rollups ORDER BY updated_at, summary_id",
         )
     }
 
-    pub fn mark_firestore_rollups_synced(&self, summary_ids: &[SummaryId]) -> Result<()> {
+    pub fn mark_sync_rollups_synced(&self, summary_ids: &[SummaryId]) -> Result<()> {
         if summary_ids.is_empty() {
             return Ok(());
         }
@@ -1064,7 +1057,7 @@ impl Store {
         let result = (|| {
             for summary_id in summary_ids {
                 self.conn.execute(
-                    "UPDATE firestore_rollups SET dirty = 0 WHERE summary_id = ?1",
+                    "UPDATE sync_rollups SET dirty = 0 WHERE summary_id = ?1",
                     params![&summary_id.0],
                 )?;
             }
@@ -1083,22 +1076,22 @@ impl Store {
         }
     }
 
-    pub fn mark_all_firestore_rollups_dirty(&self) -> Result<u64> {
+    pub fn mark_all_sync_rollups_dirty(&self) -> Result<u64> {
         let updated = self.conn.execute(
-            "UPDATE firestore_rollups SET dirty = 1, updated_at = ?1",
+            "UPDATE sync_rollups SET dirty = 1, updated_at = ?1",
             params![Utc::now().to_rfc3339()],
         )? as u64;
         Ok(updated)
     }
 
-    pub fn rebuild_firestore_rollups(&self) -> Result<u64> {
+    pub fn rebuild_sync_rollups(&self) -> Result<u64> {
         let events = self.events()?;
-        let keys: BTreeSet<_> = events.iter().map(firestore_rollup_bucket_key).collect();
+        let keys: BTreeSet<_> = events.iter().map(sync_rollup_bucket_key).collect();
 
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
-            self.conn.execute("DELETE FROM firestore_rollups", [])?;
-            self.refresh_firestore_rollups_for_keys(&keys)?;
+            self.conn.execute("DELETE FROM sync_rollups", [])?;
+            self.refresh_sync_rollups_for_keys(&keys)?;
             Ok(keys.len() as u64)
         })();
 
@@ -1498,7 +1491,7 @@ impl Store {
             .transpose()
     }
 
-    fn firestore_rollup_summaries_by_sql(&self, sql: &str) -> Result<Vec<UsageSummary>> {
+    fn sync_rollup_summaries_by_sql(&self, sql: &str) -> Result<Vec<UsageSummary>> {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut summaries = Vec::new();
@@ -1508,33 +1501,30 @@ impl Store {
         Ok(summaries)
     }
 
-    fn refresh_firestore_rollups_for_keys(
-        &self,
-        keys: &BTreeSet<FirestoreRollupBucketKey>,
-    ) -> Result<()> {
+    fn refresh_sync_rollups_for_keys(&self, keys: &BTreeSet<SyncRollupBucketKey>) -> Result<()> {
         for key in keys {
-            self.refresh_firestore_rollup_for_key(key)?;
+            self.refresh_sync_rollup_for_key(key)?;
         }
         Ok(())
     }
 
-    fn refresh_firestore_rollup_for_key(&self, key: &FirestoreRollupBucketKey) -> Result<()> {
-        let events = self.firestore_rollup_events(key)?;
+    fn refresh_sync_rollup_for_key(&self, key: &SyncRollupBucketKey) -> Result<()> {
+        let events = self.sync_rollup_events(key)?;
         if events.is_empty() {
             self.conn.execute(
-                "DELETE FROM firestore_rollups WHERE summary_id = ?1",
-                params![firestore_rollup_summary_id(key).0],
+                "DELETE FROM sync_rollups WHERE summary_id = ?1",
+                params![sync_rollup_summary_id(key).0],
             )?;
             return Ok(());
         }
 
-        let summary = build_firestore_rollup_summary(&events);
+        let summary = build_sync_rollup_summary(&events);
         let payload = serde_json::to_string(&summary)?;
         let payload_hash = hash_text(&payload);
         let existing: Option<(String, i64)> = self
             .conn
             .query_row(
-                "SELECT payload_hash, dirty FROM firestore_rollups WHERE summary_id = ?1",
+                "SELECT payload_hash, dirty FROM sync_rollups WHERE summary_id = ?1",
                 params![&summary.summary_id.0],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -1550,7 +1540,7 @@ impl Store {
         let dirty = existing.as_ref().map_or(1, |(_, dirty)| (*dirty).max(1));
         self.conn.execute(
             r#"
-            INSERT INTO firestore_rollups (
+            INSERT INTO sync_rollups (
               summary_id, provider, source_id, provider_account_id, day_key,
               observed_at, updated_at, payload_hash, dirty, payload
             )
@@ -1582,7 +1572,7 @@ impl Store {
         Ok(())
     }
 
-    fn firestore_rollup_events(&self, key: &FirestoreRollupBucketKey) -> Result<Vec<UsageEvent>> {
+    fn sync_rollup_events(&self, key: &SyncRollupBucketKey) -> Result<Vec<UsageEvent>> {
         let start = format!("{}T00:00:00+00:00", key.day_key);
         let end = {
             let day = NaiveDate::parse_from_str(&key.day_key, "%Y-%m-%d")?;
@@ -1641,11 +1631,11 @@ impl Store {
         Ok(events)
     }
 
-    fn delete_firestore_rollups_for_sources_in_tx(&self, source_ids: &[SourceId]) -> Result<u64> {
+    fn delete_sync_rollups_for_sources_in_tx(&self, source_ids: &[SourceId]) -> Result<u64> {
         let mut deleted = 0u64;
         for source_id in source_ids {
             deleted += self.conn.execute(
-                "DELETE FROM firestore_rollups WHERE source_id = ?1",
+                "DELETE FROM sync_rollups WHERE source_id = ?1",
                 params![&source_id.0],
             )? as u64;
         }
@@ -1712,7 +1702,7 @@ impl Store {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct FirestoreRollupBucketKey {
+struct SyncRollupBucketKey {
     provider: String,
     source_id: String,
     provider_account_id: Option<String>,
@@ -1722,11 +1712,11 @@ struct FirestoreRollupBucketKey {
 #[derive(Debug, Default)]
 struct EventInsertOutcome {
     inserted: bool,
-    dirty_keys: BTreeSet<FirestoreRollupBucketKey>,
+    dirty_keys: BTreeSet<SyncRollupBucketKey>,
 }
 
-fn firestore_rollup_bucket_key(event: &UsageEvent) -> FirestoreRollupBucketKey {
-    FirestoreRollupBucketKey {
+fn sync_rollup_bucket_key(event: &UsageEvent) -> SyncRollupBucketKey {
+    SyncRollupBucketKey {
         provider: event.provider.clone(),
         source_id: event.source_id.0.clone(),
         provider_account_id: event.provider_account_id.as_ref().map(|id| id.0.clone()),
@@ -1734,7 +1724,7 @@ fn firestore_rollup_bucket_key(event: &UsageEvent) -> FirestoreRollupBucketKey {
     }
 }
 
-fn firestore_rollup_summary_id(key: &FirestoreRollupBucketKey) -> SummaryId {
+fn sync_rollup_summary_id(key: &SyncRollupBucketKey) -> SummaryId {
     summary_id(
         &key.provider,
         &SourceId(key.source_id.clone()),
@@ -1746,7 +1736,7 @@ fn firestore_rollup_summary_id(key: &FirestoreRollupBucketKey) -> SummaryId {
     )
 }
 
-fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
+fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let first = events.first().expect("rollup bucket must contain events");
     let mut total_input = 0u64;
     let mut total_output = 0u64;
@@ -1759,8 +1749,7 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let mut provider_reported_usd = 0.0f64;
     let mut has_provider_reported_usd = false;
     let mut observed_at = first.session.started_at;
-    let mut model_buckets: BTreeMap<String, (ModelInfo, FirestoreRollupModelTotals)> =
-        BTreeMap::new();
+    let mut model_buckets: BTreeMap<String, (ModelInfo, SyncRollupModelTotals)> = BTreeMap::new();
 
     for event in events {
         total_input = total_input.saturating_add(event.usage.input_tokens.unwrap_or(0));
@@ -1783,8 +1772,8 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
 
         let model = event.model.clone().unwrap_or_default();
         let entry = model_buckets
-            .entry(firestore_rollup_model_key(&model))
-            .or_insert_with(|| (model.clone(), FirestoreRollupModelTotals::default()));
+            .entry(sync_rollup_model_key(&model))
+            .or_insert_with(|| (model.clone(), SyncRollupModelTotals::default()));
         entry.1.input_tokens = entry
             .1
             .input_tokens
@@ -1823,7 +1812,7 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
         .unwrap_or(first.session.started_at);
     let period_end = period_start + chrono::Duration::days(1);
-    let bucket_key = firestore_rollup_bucket_key(first);
+    let bucket_key = sync_rollup_bucket_key(first);
     let models = model_buckets
         .into_values()
         .map(|(model, totals)| SummaryModelUsage {
@@ -1854,7 +1843,7 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
 
     UsageSummary {
         schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
-        summary_id: firestore_rollup_summary_id(&bucket_key),
+        summary_id: sync_rollup_summary_id(&bucket_key),
         device_id: first.device_id.clone(),
         provider: first.provider.clone(),
         source_id: first.source_id.clone(),
@@ -1906,7 +1895,7 @@ fn build_firestore_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
 }
 
 #[derive(Debug, Default)]
-struct FirestoreRollupModelTotals {
+struct SyncRollupModelTotals {
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_tokens: u64,
@@ -1919,7 +1908,7 @@ struct FirestoreRollupModelTotals {
     has_provider_reported_usd: bool,
 }
 
-fn firestore_rollup_model_key(model: &ModelInfo) -> String {
+fn sync_rollup_model_key(model: &ModelInfo) -> String {
     format!(
         "{}|{}|{}",
         model.normalized_name.as_deref().unwrap_or(""),
@@ -2490,13 +2479,13 @@ mod tests {
     }
 
     #[test]
-    fn firestore_rollups_track_dirty_daily_buckets() {
+    fn sync_rollups_track_dirty_daily_buckets() {
         let store = Store::in_memory().expect("store");
         let source = ai_stats_core::SourceLocation::local_adapter(
             "codex",
             "test",
             "0",
-            Path::new("/tmp/codex-firestore-rollups"),
+            Path::new("/tmp/codex-sync-rollups"),
             LocationOrigin::Configured,
             Some("personal".to_string()),
         );
@@ -2519,7 +2508,7 @@ mod tests {
 
         assert!(store.insert_event(&first).expect("insert first"));
         let dirty = store
-            .dirty_firestore_rollup_summaries()
+            .dirty_sync_rollup_summaries()
             .expect("dirty rollups after first");
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].usage.total_tokens, Some(15));
@@ -2542,10 +2531,10 @@ mod tests {
         assert_eq!(dirty[0].cost.provider_reported_usd, Some(0.11));
 
         store
-            .mark_firestore_rollups_synced(&[dirty[0].summary_id.clone()])
+            .mark_sync_rollups_synced(&[dirty[0].summary_id.clone()])
             .expect("mark clean");
         assert!(store
-            .dirty_firestore_rollup_summaries()
+            .dirty_sync_rollup_summaries()
             .expect("no dirty after clean")
             .is_empty());
 
@@ -2561,7 +2550,7 @@ mod tests {
 
         assert!(store.insert_event(&second).expect("insert second"));
         let dirty = store
-            .dirty_firestore_rollup_summaries()
+            .dirty_sync_rollup_summaries()
             .expect("dirty rollups after second");
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].usage.total_tokens, Some(40));
@@ -2585,22 +2574,38 @@ mod tests {
         );
 
         let changed = store
-            .pending_sources_for_sync("firestore", "firestore:ai-stats-fire", &[source.clone()])
+            .pending_sources_for_sync(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                &[source.clone()],
+            )
             .expect("initial changed");
         assert_eq!(changed.len(), 1);
 
         store
-            .record_sources_synced("firestore", "firestore:ai-stats-fire", &[source.clone()])
+            .record_sources_synced(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                &[source.clone()],
+            )
             .expect("record synced");
         assert!(store
-            .pending_sources_for_sync("firestore", "firestore:ai-stats-fire", &[source.clone()])
+            .pending_sources_for_sync(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                &[source.clone()]
+            )
             .expect("unchanged")
             .is_empty());
 
         source.account_alias = Some("personal".to_string());
         source.updated_at += chrono::Duration::seconds(1);
         let changed = store
-            .pending_sources_for_sync("firestore", "firestore:ai-stats-fire", &[source])
+            .pending_sources_for_sync(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                &[source],
+            )
             .expect("changed after update");
         assert_eq!(changed.len(), 1);
     }

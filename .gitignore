@@ -23,10 +23,12 @@ target
 *.DS_Store
 .agents/
 temp/
+apps/
+ui/
 functions/lib/
 functions/node_modules/
 functions/.runtimeconfig.json
-firebase-debug.log
-firestore-debug.log
+node_modules/
+*-debug.log
 .firebase/
 /functions

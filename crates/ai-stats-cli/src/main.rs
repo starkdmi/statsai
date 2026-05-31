@@ -18,9 +18,7 @@ use ai_stats_sdk::{
     build_reported_usage_summary, ReportedUsageSummaryInput, ReportedUsageSummaryRecord,
 };
 use ai_stats_store::{ScanFileStateEntry, Store, SyncState};
-use ai_stats_sync::{
-    FileSink, FirestoreSendOptions, FirestoreSink, HttpSink, StdoutSink, SyncSink,
-};
+use ai_stats_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use chrono::Duration;
@@ -31,7 +29,6 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration as StdDuration;
 
 mod auth;
 
@@ -76,7 +73,7 @@ enum Command {
     Status,
     #[command(about = "Check environment and source paths")]
     Doctor,
-    #[command(about = "Authenticate with Firebase production backend")]
+    #[command(about = "Authenticate with the hosted sync backend")]
     Auth(AuthCommand),
 }
 
@@ -88,14 +85,11 @@ struct AuthCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuthSubcommand {
-    #[command(about = "Log in to Firebase (hosted or auth emulator, based on env)")]
-    Login {
-        #[arg(long, help = "Optional Google OAuth Client ID")]
-        client_id: Option<String>,
-    },
-    #[command(about = "Check authentication status for the active auth backend")]
+    #[command(about = "Log in to the hosted sync backend")]
+    Login,
+    #[command(about = "Check authentication status for the Better Auth device session")]
     Status,
-    #[command(about = "Log out and clear stored credentials for the active auth backend")]
+    #[command(about = "Log out and clear stored Better Auth device credentials")]
     Logout,
 }
 
@@ -270,64 +264,23 @@ struct SyncCommand {
     #[arg(
         long,
         default_value = "stdout",
-        help = "Sync sink (stdout, file, http, firestore)"
+        help = "Sync sink (stdout, file, http)"
     )]
     sink: String,
     #[arg(long, help = "Output path for file sink")]
     output: Option<PathBuf>,
-    #[arg(long, help = "HTTP endpoint for the http sink")]
-    endpoint: Option<String>,
     #[arg(
         long,
-        help = "Bearer token override for the http sink or Firestore sync"
+        help = "HTTP endpoint for the http sink (defaults to AI_STATS_API_URL/api/sync/batches)"
     )]
+    endpoint: Option<String>,
+    #[arg(long, help = "Bearer token override for the http sink")]
     auth_token: Option<String>,
     #[arg(
         long,
-        help = "Explicit Firebase UID namespace for Firestore sync when using a manual token"
-    )]
-    firebase_uid: Option<String>,
-    #[arg(
-        long,
-        default_value = "ai-stats-fire",
-        help = "Firebase project ID for the firestore sink"
-    )]
-    firebase_project: String,
-    #[arg(
-        long,
-        default_value = "stats",
-        help = "Firestore payload mode (stats, full [emulator/debug only])"
-    )]
-    firestore_mode: String,
-    #[arg(
-        long,
-        help = "Rebuild local Firestore rollups from events and force all rollups dirty before sync"
+        help = "Rebuild local daily rollups from events and force all rollups dirty before sync"
     )]
     rebuild_rollups: bool,
-    #[arg(
-        long,
-        default_value_t = 1000,
-        help = "Max event+summary records per firestore sub-batch"
-    )]
-    firestore_records_per_batch: usize,
-    #[arg(
-        long,
-        default_value_t = 200,
-        help = "Max document writes per Firestore commit request (1..450)"
-    )]
-    firestore_commit_writes: usize,
-    #[arg(
-        long,
-        default_value_t = 4,
-        help = "Retry attempts for retryable Firestore errors"
-    )]
-    firestore_retries: u32,
-    #[arg(
-        long,
-        default_value_t = 800,
-        help = "Initial backoff in milliseconds for Firestore retries"
-    )]
-    firestore_backoff_ms: u64,
     #[arg(
         long,
         help = "Send only records after this sink target's last successful sync"
@@ -337,7 +290,7 @@ struct SyncCommand {
     status: bool,
     #[arg(
         long,
-        help = "Inspect the resolved target and verify remote firestore access"
+        help = "Inspect the resolved Cloudflare sync target and verify remote device access"
     )]
     verify: bool,
     #[arg(long, help = "Build the sync batch without writing")]
@@ -366,6 +319,12 @@ struct DaemonCommand {
     api: String,
     #[arg(long, help = "Enable file watching for automatic rescans")]
     watch: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncPayloadMode {
+    Raw,
+    Rollups,
 }
 
 fn main() -> Result<()> {
@@ -400,7 +359,7 @@ fn main() -> Result<()> {
 
 fn auth(command: AuthCommand) -> Result<()> {
     match command.command {
-        AuthSubcommand::Login { client_id } => auth::login(client_id),
+        AuthSubcommand::Login => auth::login(),
         AuthSubcommand::Status => auth::status(),
         AuthSubcommand::Logout => auth::logout(),
     }
@@ -985,29 +944,93 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
         return sync_status(store);
     }
 
-    if hosted_firestore_full_mode_disabled(&command) {
-        bail!(
-            "hosted Firestore full mode is disabled; use --firestore-mode stats for production sync, the emulator for raw event testing, or set AI_STATS_ENABLE_HOSTED_FIRESTORE_FULL=1 to bypass this guardrail"
+    let target = sync_target(&command)?;
+    let (batch, payload_mode) = build_sync_batch(&command, store, device_id, &target)?;
+
+    if command.dry_run {
+        eprintln!(
+            "dry run: sink={} mode={} sources={} events={} summaries={}",
+            command.sink,
+            sync_payload_mode_name(payload_mode),
+            batch.sources.len(),
+            batch.events.len(),
+            batch.summaries.len()
         );
+        return Ok(());
     }
 
-    let firestore_auth = if command.sink == "firestore" {
-        Some(resolve_firestore_auth_context(&command)?)
-    } else {
-        None
-    };
-    let target = firestore_auth
-        .as_ref()
-        .map(|auth| firestore_sync_target(&command.firebase_project, &auth.uid))
-        .unwrap_or_else(|| sync_target(&command));
-    let firestore_stats_mode =
-        command.sink == "firestore" && command.firestore_mode.eq_ignore_ascii_case("stats");
+    let result = (|| -> Result<()> {
+        match command.sink.as_str() {
+            "stdout" => {
+                StdoutSink.send(&batch)?;
+                store.record_sync_success(
+                    &command.sink,
+                    &target,
+                    &batch.batch_id,
+                    &batch.events,
+                    &batch.summaries,
+                )?;
+                Ok(())
+            }
+            "file" => {
+                let output = command
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("ai-stats-sync-batch.json"));
+                FileSink::new(output).send(&batch)?;
+                store.record_sync_success(
+                    &command.sink,
+                    &target,
+                    &batch.batch_id,
+                    &batch.events,
+                    &batch.summaries,
+                )?;
+                Ok(())
+            }
+            "http" => {
+                let endpoint = http_sync_endpoint(&command)?;
+                let auth_token = resolve_http_auth_token(&command, false)?;
+                let ack = HttpSink::new(&endpoint, auth_token)?.send_with_ack(&batch)?;
+                println!("{}", serde_json::to_string_pretty(&ack)?);
+                if payload_mode == SyncPayloadMode::Rollups {
+                    record_rollup_sync_success(store, &command.sink, &target, &batch)?;
+                } else {
+                    store.record_sync_success(
+                        &command.sink,
+                        &target,
+                        &batch.batch_id,
+                        &batch.events,
+                        &batch.summaries,
+                    )?;
+                }
+                Ok(())
+            }
+            other => bail!("unsupported sync sink {other}"),
+        }
+    })();
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = store.record_sync_failure(&command.sink, &target);
+            Err(error)
+        }
+    }
+}
+
+fn build_sync_batch(
+    command: &SyncCommand,
+    store: &Store,
+    device_id: &str,
+    target: &str,
+) -> Result<(SyncBatch, SyncPayloadMode)> {
+    let payload_mode = sync_payload_mode(command)?;
     let state = if command.since_last {
-        store.sync_state(&command.sink, &target)?
+        store.sync_state(&command.sink, target)?
     } else {
         None
     };
-    let event_cursor = if firestore_stats_mode {
+    let event_cursor = if payload_mode == SyncPayloadMode::Rollups {
         None
     } else {
         state.as_ref().and_then(|state| {
@@ -1023,7 +1046,7 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
             .as_ref()
             .zip(state.last_summary_id.as_deref())
     });
-    let events: Vec<_> = if firestore_stats_mode {
+    let events: Vec<_> = if payload_mode == SyncPayloadMode::Rollups {
         Vec::new()
     } else {
         store
@@ -1032,14 +1055,18 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
             .map(sanitize_event_for_sync)
             .collect()
     };
-    let summaries: Vec<_> = if firestore_stats_mode {
-        let passthrough_summaries: Vec<_> = store
+    let passthrough_summaries: Vec<_> = if payload_mode == SyncPayloadMode::Rollups {
+        store
             .summaries()?
             .into_iter()
             .map(sanitize_summary_for_sync)
             .filter(|summary| !is_daily_rollup_summary(summary))
-            .collect();
-        store.pending_summaries_for_sync(&command.sink, &target, &passthrough_summaries)?
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut summaries: Vec<_> = if payload_mode == SyncPayloadMode::Rollups {
+        store.pending_summaries_for_sync(&command.sink, target, &passthrough_summaries)?
     } else {
         store
             .summaries_after(summary_cursor)?
@@ -1062,317 +1089,107 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
         .into_iter()
         .map(sanitize_subscription_for_sync)
         .collect();
-    let sources = if command.sink == "firestore" {
-        store.pending_sources_for_sync(&command.sink, &target, &all_sources)?
+    let sources = if payload_mode == SyncPayloadMode::Rollups {
+        store.pending_sources_for_sync(&command.sink, target, &all_sources)?
     } else {
         all_sources
     };
-    let accounts = if command.sink == "firestore" {
-        store.pending_accounts_for_sync(&command.sink, &target, &all_accounts)?
+    let accounts = if payload_mode == SyncPayloadMode::Rollups {
+        store.pending_accounts_for_sync(&command.sink, target, &all_accounts)?
     } else {
         all_accounts
     };
-    let subscriptions = if command.sink == "firestore" {
-        store.pending_subscriptions_for_sync(&command.sink, &target, &all_subscriptions)?
+    let subscriptions = if payload_mode == SyncPayloadMode::Rollups {
+        store.pending_subscriptions_for_sync(&command.sink, target, &all_subscriptions)?
     } else {
         all_subscriptions
     };
-    let mut batch = SyncBatch {
-        schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
-        batch_id: format!("batch_{}", Utc::now().timestamp_millis()),
-        device_id: device_id.to_string(),
-        sources,
-        accounts,
-        subscriptions,
-        events,
-        summaries,
-        created_at: Utc::now(),
-    };
 
-    if firestore_stats_mode {
+    if payload_mode == SyncPayloadMode::Rollups {
+        let label = rollup_mode_label(command);
         let should_bootstrap =
-            !command.dry_run && store.firestore_rollup_count()? == 0 && store.event_count()? > 0;
+            !command.dry_run && store.sync_rollup_count()? == 0 && store.event_count()? > 0;
         if !command.dry_run && command.rebuild_rollups {
-            let rebuilt = store.rebuild_firestore_rollups()?;
-            let marked_dirty = store.mark_all_firestore_rollups_dirty()?;
+            let rebuilt = store.rebuild_sync_rollups()?;
+            let marked_dirty = store.mark_all_sync_rollups_dirty()?;
             eprintln!(
-                "firestore stats mode: rebuilt {} local daily summaries and marked {} dirty for full sync",
+                "{label}: rebuilt {} local daily summaries and marked {} dirty for full sync",
                 rebuilt, marked_dirty
             );
         } else if should_bootstrap {
-            let rebuilt = store.rebuild_firestore_rollups()?;
+            let rebuilt = store.rebuild_sync_rollups()?;
             eprintln!(
-                "firestore stats mode: bootstrapped {} local daily summaries from existing events",
+                "{label}: bootstrapped {} local daily summaries from existing events",
                 rebuilt
             );
         }
 
-        let rollups = store.dirty_firestore_rollup_summaries()?;
+        let full_rollup_sync = !command.since_last || state.is_none();
+        let rollups = if full_rollup_sync {
+            store.all_sync_rollup_summaries()?
+        } else {
+            store.dirty_sync_rollup_summaries()?
+        };
         eprintln!(
-            "firestore stats mode: prepared {} local daily summaries for sync",
-            rollups.len()
+            "{label}: prepared {} local daily summaries for {} sync",
+            rollups.len(),
+            if full_rollup_sync {
+                "full-history"
+            } else {
+                "incremental"
+            }
         );
-        batch
-            .summaries
-            .extend(rollups.into_iter().map(sanitize_summary_for_sync));
-    } else if command.sink == "firestore" {
-        let mode = command.firestore_mode.to_ascii_lowercase();
-        match mode.as_str() {
-            "full" => {}
-            other => bail!("unsupported firestore mode {other}; expected stats or full"),
-        }
+        summaries.extend(rollups.into_iter().map(sanitize_summary_for_sync));
     }
 
-    if command.dry_run {
-        eprintln!(
-            "dry run: sink={} sources={} events={} summaries={}",
-            command.sink,
-            batch.sources.len(),
-            batch.events.len(),
-            batch.summaries.len()
-        );
-        return Ok(());
-    }
-
-    if command.sink == "firestore" {
-        let auth = firestore_auth.context("missing Firestore auth context")?;
-        return sync_firestore(command, store, device_id, target, batch, auth);
-    }
-
-    let result = match command.sink.as_str() {
-        "stdout" => StdoutSink.send(&batch).map(|()| None),
-        "file" => {
-            let output = command
-                .output
-                .unwrap_or_else(|| PathBuf::from("ai-stats-sync-batch.json"));
-            FileSink::new(output).send(&batch).map(|()| None)
-        }
-        "http" => {
-            let send_http = || -> Result<_> {
-                let endpoint = command
-                    .endpoint
-                    .as_deref()
-                    .context("--endpoint is required when --sink http")?;
-                let auth_token = command
-                    .auth_token
-                    .or_else(|| std::env::var("AI_STATS_SYNC_TOKEN").ok())
-                    .or_else(|| auth::get_or_refresh_token().ok().flatten());
-                let ack = HttpSink::new(endpoint, auth_token)?.send_with_ack(&batch)?;
-                println!("{}", serde_json::to_string_pretty(&ack)?);
-                Ok(Some(ack))
-            };
-            send_http()
-        }
-        other => bail!("unsupported sync sink {other}"),
-    };
-
-    match result {
-        Ok(_) => {
-            store.record_sync_success(
-                &command.sink,
-                &target,
-                &batch.batch_id,
-                &batch.events,
-                &batch.summaries,
-            )?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = store.record_sync_failure(&command.sink, &target);
-            Err(error)
-        }
-    }
-}
-
-fn sync_firestore(
-    command: SyncCommand,
-    store: &Store,
-    device_id: &str,
-    target: String,
-    batch: SyncBatch,
-    auth: FirestoreAuthContext,
-) -> Result<()> {
-    let sink = FirestoreSink::new(&command.firebase_project, auth.uid, auth.auth_token);
-    let options = FirestoreSendOptions {
-        commit_chunk_size: command.firestore_commit_writes.clamp(1, 450),
-        max_retries: command.firestore_retries,
-        initial_backoff: StdDuration::from_millis(command.firestore_backoff_ms.max(1)),
-        progress: true,
-    };
-
-    if batch.sources.is_empty()
-        && batch.accounts.is_empty()
-        && batch.subscriptions.is_empty()
-        && batch.events.is_empty()
-        && batch.summaries.is_empty()
-    {
-        eprintln!("firestore sync: nothing to send");
-        return Ok(());
-    }
-
-    let records_per_batch = command.firestore_records_per_batch.max(1);
-    let total_records = batch.events.len() + batch.summaries.len();
-    let total_writes =
-        total_records + batch.sources.len() + batch.accounts.len() + batch.subscriptions.len() + 2;
-    let sub_batches = if total_records == 0 {
-        1
-    } else {
-        total_records.div_ceil(records_per_batch)
-    };
-
-    eprintln!(
-        "firestore sync: {} event/summary records, {} estimated writes, {} sub-batches (commit writes <= {})",
-        total_records, total_writes, sub_batches, options.commit_chunk_size
-    );
-
-    let mut sent_events = 0usize;
-    let mut sent_summaries = 0usize;
-    let mut include_metadata = true;
-    let mut aggregate_ack = ai_stats_core::SyncAck {
-        schema_version: ai_stats_core::SYNC_ACK_SCHEMA_VERSION.to_string(),
-        batch_id: batch.batch_id.clone(),
-        accepted: ai_stats_core::SyncEntityCounts {
-            sources: 0,
-            accounts: 0,
-            subscriptions: 0,
-            events: 0,
-            summaries: 0,
-        },
-        duplicates: ai_stats_core::SyncEntityCounts {
-            sources: 0,
-            accounts: 0,
-            subscriptions: 0,
-            events: 0,
-            summaries: 0,
-        },
-        rejected: Vec::new(),
-    };
-
-    for index in 0..sub_batches {
-        let source_count = if include_metadata {
-            batch.sources.len()
-        } else {
-            0
-        };
-        let account_count = if include_metadata {
-            batch.accounts.len()
-        } else {
-            0
-        };
-        let subscription_count = if include_metadata {
-            batch.subscriptions.len()
-        } else {
-            0
-        };
-
-        let event_end = (sent_events + records_per_batch).min(batch.events.len());
-        let event_slice = &batch.events[sent_events..event_end];
-        let remaining = records_per_batch.saturating_sub(event_slice.len());
-        let summary_end = (sent_summaries + remaining).min(batch.summaries.len());
-        let summary_slice = &batch.summaries[sent_summaries..summary_end];
-
-        let sub_batch = SyncBatch {
-            schema_version: batch.schema_version.clone(),
-            batch_id: format!("{}_{}", batch.batch_id, index + 1),
+    Ok((
+        SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: format!("batch_{}", Utc::now().timestamp_millis()),
             device_id: device_id.to_string(),
-            sources: if include_metadata {
-                batch.sources.clone()
-            } else {
-                Vec::new()
-            },
-            accounts: if include_metadata {
-                batch.accounts.clone()
-            } else {
-                Vec::new()
-            },
-            subscriptions: if include_metadata {
-                batch.subscriptions.clone()
-            } else {
-                Vec::new()
-            },
-            events: event_slice.to_vec(),
-            summaries: summary_slice.to_vec(),
-            created_at: batch.created_at,
-        };
-
-        eprintln!(
-            "firestore sync: sending sub-batch {}/{} (sources={}, accounts={}, subscriptions={}, events={}, summaries={})",
-            index + 1,
-            sub_batches,
-            source_count,
-            account_count,
-            subscription_count,
-            sub_batch.events.len(),
-            sub_batch.summaries.len()
-        );
-
-        match sink.send_with_ack_and_options(&sub_batch, &options) {
-            Ok(ack) => {
-                aggregate_ack.accepted.sources += ack.accepted.sources;
-                aggregate_ack.accepted.accounts += ack.accepted.accounts;
-                aggregate_ack.accepted.subscriptions += ack.accepted.subscriptions;
-                aggregate_ack.accepted.events += ack.accepted.events;
-                aggregate_ack.accepted.summaries += ack.accepted.summaries;
-                aggregate_ack.duplicates.sources += ack.duplicates.sources;
-                aggregate_ack.duplicates.accounts += ack.duplicates.accounts;
-                aggregate_ack.duplicates.subscriptions += ack.duplicates.subscriptions;
-                aggregate_ack.duplicates.events += ack.duplicates.events;
-                aggregate_ack.duplicates.summaries += ack.duplicates.summaries;
-                aggregate_ack.rejected.extend(ack.rejected);
-
-                let passthrough_summaries: Vec<_> = sub_batch
-                    .summaries
-                    .iter()
-                    .filter(|summary| !is_daily_rollup_summary(summary))
-                    .cloned()
-                    .collect();
-                let rollup_summary_ids: Vec<_> = sub_batch
-                    .summaries
-                    .iter()
-                    .filter(|summary| is_daily_rollup_summary(summary))
-                    .map(|summary| summary.summary_id.clone())
-                    .collect();
-
-                store.record_sync_success(
-                    &command.sink,
-                    &target,
-                    &sub_batch.batch_id,
-                    &sub_batch.events,
-                    &passthrough_summaries,
-                )?;
-                store.mark_firestore_rollups_synced(&rollup_summary_ids)?;
-                store.record_summaries_synced(&command.sink, &target, &passthrough_summaries)?;
-                store.record_sources_synced(&command.sink, &target, &sub_batch.sources)?;
-                store.record_accounts_synced(&command.sink, &target, &sub_batch.accounts)?;
-                store.record_subscriptions_synced(
-                    &command.sink,
-                    &target,
-                    &sub_batch.subscriptions,
-                )?;
-                sent_events = event_end;
-                sent_summaries = summary_end;
-                include_metadata = false;
-            }
-            Err(error) => {
-                let _ = store.record_sync_failure(&command.sink, &target);
-                return Err(error);
-            }
-        }
-    }
-
-    println!("{}", serde_json::to_string_pretty(&aggregate_ack)?);
-    Ok(())
+            sources,
+            accounts,
+            subscriptions,
+            events,
+            summaries,
+            created_at: Utc::now(),
+        },
+        payload_mode,
+    ))
 }
 
-fn hosted_firestore_full_mode_disabled(command: &SyncCommand) -> bool {
-    command.sink == "firestore"
-        && command.firestore_mode.eq_ignore_ascii_case("full")
-        && std::env::var("FIRESTORE_EMULATOR_HOST")
-            .ok()
-            .is_none_or(|value| value.trim().is_empty())
-        && std::env::var("AI_STATS_ENABLE_HOSTED_FIRESTORE_FULL")
-            .ok()
-            .is_none_or(|value| value.trim() != "1")
+fn record_rollup_sync_success(
+    store: &Store,
+    sink: &str,
+    target: &str,
+    batch: &SyncBatch,
+) -> Result<()> {
+    let passthrough_summaries: Vec<_> = batch
+        .summaries
+        .iter()
+        .filter(|summary| !is_daily_rollup_summary(summary))
+        .cloned()
+        .collect();
+    let rollup_summary_ids: Vec<_> = batch
+        .summaries
+        .iter()
+        .filter(|summary| is_daily_rollup_summary(summary))
+        .map(|summary| summary.summary_id.clone())
+        .collect();
+
+    store.record_sync_success(
+        sink,
+        target,
+        &batch.batch_id,
+        &batch.events,
+        &passthrough_summaries,
+    )?;
+    store.mark_sync_rollups_synced(&rollup_summary_ids)?;
+    store.record_summaries_synced(sink, target, &passthrough_summaries)?;
+    store.record_sources_synced(sink, target, &batch.sources)?;
+    store.record_accounts_synced(sink, target, &batch.accounts)?;
+    store.record_subscriptions_synced(sink, target, &batch.subscriptions)?;
+    Ok(())
 }
 
 fn sync_status(store: &Store) -> Result<()> {
@@ -1409,52 +1226,49 @@ fn sync_status(store: &Store) -> Result<()> {
 }
 
 fn sync_verify(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
-    if command.sink != "firestore" {
-        bail!("--verify is currently supported only with --sink firestore");
+    if command.sink != "http" {
+        bail!("--verify is currently supported only with --sink http");
     }
+    sync_http_verify(command, store, device_id)
+}
 
-    let auth = resolve_firestore_auth_context(&command)?;
-    let target = firestore_sync_target(&command.firebase_project, &auth.uid);
-    let local_state = store.sync_state("firestore", &target)?;
-    let report = FirestoreVerifyReport {
-        sink: command.sink.clone(),
-        target: target.clone(),
-        project: command.firebase_project.clone(),
-        uid: auth.uid.clone(),
-        using_emulator: firestore_emulator_host().is_some(),
+fn sync_http_verify(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
+    let endpoint = http_sync_endpoint(&command)?;
+    let local_state = store.sync_state("http", &endpoint)?;
+    let auth_token = resolve_http_auth_token(&command, true)?
+        .context("device login required; run `ai-stats auth login` first")?;
+    let report = HttpVerifyReport {
+        sink: command.sink,
+        target: endpoint.clone(),
+        endpoint: endpoint.clone(),
         device_id: device_id.to_string(),
-        local: firestore_local_verify(store, &target, local_state.as_ref())?,
-        remote: firestore_remote_verify(
-            &command.firebase_project,
-            &auth.uid,
-            &auth.auth_token,
-            device_id,
-        )?,
+        local: sync_local_verify(store, "http", &endpoint, local_state.as_ref())?,
+        remote: http_remote_verify(&endpoint, &auth_token)?,
     };
-
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
-fn firestore_local_verify(
+fn sync_local_verify(
     store: &Store,
+    sink: &str,
     target: &str,
     local_state: Option<&SyncState>,
-) -> Result<FirestoreLocalVerify> {
+) -> Result<SyncLocalVerify> {
     let all_sources = store.list_sources()?;
     let all_accounts = store.list_accounts()?;
     let all_subscriptions = store.list_subscriptions()?;
-    let firestore_sources: Vec<_> = all_sources
+    let sync_sources: Vec<_> = all_sources
         .iter()
         .cloned()
         .map(sanitize_source_for_sync)
         .collect();
-    let firestore_accounts: Vec<_> = all_accounts
+    let sync_accounts: Vec<_> = all_accounts
         .iter()
         .cloned()
         .map(sanitize_account_for_sync)
         .collect();
-    let firestore_subscriptions: Vec<_> = all_subscriptions
+    let sync_subscriptions: Vec<_> = all_subscriptions
         .iter()
         .cloned()
         .map(sanitize_subscription_for_sync)
@@ -1466,66 +1280,116 @@ fn firestore_local_verify(
         .filter(|summary| !is_daily_rollup_summary(summary))
         .collect();
 
-    Ok(FirestoreLocalVerify {
+    Ok(SyncLocalVerify {
         sync_state: local_state.map(sync_state_report),
         total_sources: all_sources.len(),
         enabled_sources: all_sources.iter().filter(|source| source.enabled).count(),
         pending_sources: store
-            .pending_sources_for_sync("firestore", target, &firestore_sources)?
+            .pending_sources_for_sync(sink, target, &sync_sources)?
             .len(),
         total_accounts: all_accounts.len(),
         pending_accounts: store
-            .pending_accounts_for_sync("firestore", target, &firestore_accounts)?
+            .pending_accounts_for_sync(sink, target, &sync_accounts)?
             .len(),
         total_subscriptions: all_subscriptions.len(),
         pending_subscriptions: store
-            .pending_subscriptions_for_sync("firestore", target, &firestore_subscriptions)?
+            .pending_subscriptions_for_sync(sink, target, &sync_subscriptions)?
             .len(),
         total_passthrough_summaries: passthrough_summaries.len(),
         pending_passthrough_summaries: store
-            .pending_summaries_for_sync("firestore", target, &passthrough_summaries)?
+            .pending_summaries_for_sync(sink, target, &passthrough_summaries)?
             .len(),
-        total_rollups: store.firestore_rollup_count()? as usize,
-        dirty_rollups: store.dirty_firestore_rollup_summaries()?.len(),
+        total_rollups: store.sync_rollup_count()? as usize,
+        dirty_rollups: store.dirty_sync_rollup_summaries()?.len(),
     })
 }
 
-fn sync_target(command: &SyncCommand) -> String {
+fn sync_target(command: &SyncCommand) -> Result<String> {
     match command.sink.as_str() {
-        "http" => command
-            .endpoint
-            .clone()
-            .unwrap_or_else(|| "http".to_string()),
-        "firestore" => format!("firestore:{}", command.firebase_project),
-        "file" => command
+        "http" => http_sync_endpoint(command),
+        "file" => Ok(command
             .output
             .as_ref()
             .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "ai-stats-sync-batch.json".to_string()),
-        other => other.to_string(),
+            .unwrap_or_else(|| "ai-stats-sync-batch.json".to_string())),
+        other => Ok(other.to_string()),
     }
 }
 
-#[derive(Debug, Clone)]
-struct FirestoreAuthContext {
-    auth_token: String,
-    uid: String,
+fn http_sync_endpoint(command: &SyncCommand) -> Result<String> {
+    if let Some(endpoint) = command
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(endpoint.to_string());
+    }
+    Ok(format!(
+        "{}/api/sync/batches",
+        auth::cloudflare_api_url().trim_end_matches('/')
+    ))
+}
+
+fn resolve_http_auth_token(command: &SyncCommand, required: bool) -> Result<Option<String>> {
+    if let Some(token) = command
+        .auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(token.to_string()));
+    }
+
+    if let Some(token) = std::env::var("AI_STATS_SYNC_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(token));
+    }
+
+    let token = auth::get_or_refresh_token()?;
+    if required {
+        Ok(Some(token.context(
+            "device login required; run `ai-stats auth login` first",
+        )?))
+    } else {
+        Ok(token)
+    }
+}
+
+fn sync_payload_mode(command: &SyncCommand) -> Result<SyncPayloadMode> {
+    match command.sink.as_str() {
+        "http" => Ok(SyncPayloadMode::Rollups),
+        _ => Ok(SyncPayloadMode::Raw),
+    }
+}
+
+fn sync_payload_mode_name(mode: SyncPayloadMode) -> &'static str {
+    match mode {
+        SyncPayloadMode::Raw => "raw",
+        SyncPayloadMode::Rollups => "rollups",
+    }
+}
+
+fn rollup_mode_label(command: &SyncCommand) -> &'static str {
+    let _ = command;
+    "http rollup mode"
 }
 
 #[derive(Debug, Serialize)]
-struct FirestoreVerifyReport {
+struct HttpVerifyReport {
     sink: String,
     target: String,
-    project: String,
-    uid: String,
-    using_emulator: bool,
+    endpoint: String,
     device_id: String,
-    local: FirestoreLocalVerify,
-    remote: FirestoreRemoteVerify,
+    local: SyncLocalVerify,
+    remote: Value,
 }
 
 #[derive(Debug, Serialize)]
-struct FirestoreLocalVerify {
+struct SyncLocalVerify {
     sync_state: Option<SyncStateReport>,
     total_sources: usize,
     enabled_sources: usize,
@@ -1549,65 +1413,41 @@ struct SyncStateReport {
     failure_count: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct FirestoreRemoteVerify {
-    device: Option<FirestoreDeviceSnapshot>,
-    recent_batches: Vec<FirestoreBatchSnapshot>,
-    collections: Vec<FirestoreCollectionSnapshot>,
+fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
+    let url = http_verify_status_url(endpoint)?;
+    let request = ureq::get(&url).set("Authorization", &format!("Bearer {auth_token}"));
+    match request.call() {
+        Ok(response) => http_response_json(response, "verify sync status"),
+        Err(error) => Err(http_request_error("verify sync status", error)),
+    }
 }
 
-#[derive(Debug, Serialize)]
-struct FirestoreDeviceSnapshot {
-    document_id: String,
-    last_batch_id: Option<String>,
-    last_synced_at: Option<String>,
+fn http_verify_status_url(endpoint: &str) -> Result<String> {
+    let endpoint = endpoint.trim_end_matches('/');
+    if let Some(prefix) = endpoint.strip_suffix("/api/sync/batches") {
+        return Ok(format!("{prefix}/api/sync/status"));
+    }
+    bail!(
+        "http verify expects a Cloudflare sync endpoint ending in /api/sync/batches; got {}",
+        endpoint
+    )
 }
 
-#[derive(Debug, Serialize)]
-struct FirestoreBatchSnapshot {
-    document_id: String,
-    batch_id: Option<String>,
-    device_id: Option<String>,
-    synced_at: Option<String>,
-    counts: Option<Value>,
+fn http_request_error(action: &str, error: ureq::Error) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(code, response) => {
+            let body = response.into_string().unwrap_or_default();
+            anyhow::anyhow!("HTTP {action} failed (HTTP {code}): {body}")
+        }
+        other => anyhow::anyhow!("HTTP {action} failed: {other}"),
+    }
 }
 
-#[derive(Debug, Serialize)]
-struct FirestoreCollectionSnapshot {
-    collection: String,
-    returned_docs: usize,
-    has_more: bool,
-    sample_doc_ids: Vec<String>,
-}
-
-fn resolve_firestore_auth_context(command: &SyncCommand) -> Result<FirestoreAuthContext> {
-    let manual_auth_token = command
-        .auth_token
-        .clone()
-        .or_else(|| std::env::var("AI_STATS_SYNC_TOKEN").ok());
-    let auth_token = manual_auth_token
-        .clone()
-        .or_else(|| auth::get_or_refresh_token().ok().flatten())
-        .context("Firebase login required; run `ai-stats auth login` first")?;
-    let uid = command
-        .firebase_uid
-        .clone()
-        .or_else(|| auth::user_id_from_token(&auth_token).ok().flatten())
-        .or_else(|| {
-            if manual_auth_token.is_none() {
-                auth::user_id().ok().flatten()
-            } else {
-                None
-            }
-        })
-        .context(
-            "Firebase UID required for Firestore sync; rerun `ai-stats auth login`, provide --firebase-uid, or use a Firebase ID token whose UID can be derived locally",
-        )?;
-    Ok(FirestoreAuthContext { auth_token, uid })
-}
-
-fn firestore_sync_target(project: &str, uid: &str) -> String {
-    format!("firestore:{project}:{uid}")
+fn http_response_json(response: ureq::Response, action: &str) -> Result<Value> {
+    let body = response
+        .into_string()
+        .with_context(|| format!("read HTTP {action} response body"))?;
+    serde_json::from_str(&body).with_context(|| format!("parse HTTP {action} response JSON"))
 }
 
 fn sync_state_report(state: &ai_stats_store::SyncState) -> SyncStateReport {
@@ -1630,233 +1470,6 @@ fn sync_state_report(state: &ai_stats_store::SyncState) -> SyncStateReport {
         ),
         failure_count: state.failure_count,
     }
-}
-
-fn firestore_remote_verify(
-    project: &str,
-    uid: &str,
-    auth_token: &str,
-    device_id: &str,
-) -> Result<FirestoreRemoteVerify> {
-    let device = firestore_get_document(
-        project,
-        &format!(
-            "users/{}/devices/{}",
-            sanitize_firestore_document_id(uid),
-            sanitize_firestore_document_id(device_id)
-        ),
-        auth_token,
-    )?
-    .map(|document| FirestoreDeviceSnapshot {
-        document_id: firestore_document_id(&document),
-        last_batch_id: firestore_string_field(
-            &document,
-            &["fields", "last_batch_id", "stringValue"],
-        ),
-        last_synced_at: firestore_string_field(
-            &document,
-            &["fields", "last_synced_at", "stringValue"],
-        ),
-    });
-
-    let batches = firestore_list_collection(project, uid, "syncBatches", 5, auth_token)?;
-    let mut recent_batches: Vec<_> = batches
-        .documents
-        .iter()
-        .map(|document| FirestoreBatchSnapshot {
-            document_id: firestore_document_id(document),
-            batch_id: firestore_string_field(document, &["fields", "batch_id", "stringValue"]),
-            device_id: firestore_string_field(document, &["fields", "device_id", "stringValue"]),
-            synced_at: firestore_string_field(document, &["fields", "synced_at", "stringValue"]),
-            counts: document.pointer("/fields/counts/mapValue/fields").cloned(),
-        })
-        .collect();
-    recent_batches.sort_by(|left, right| right.synced_at.cmp(&left.synced_at));
-
-    let mut collections = Vec::new();
-    for (name, page_size) in [
-        ("devices", 3usize),
-        ("syncBatches", 5usize),
-        ("sources", 3usize),
-        ("accounts", 3usize),
-        ("subscriptions", 3usize),
-        ("events", 1usize),
-        ("summaries", 3usize),
-    ] {
-        let listing = firestore_list_collection(project, uid, name, page_size, auth_token)?;
-        collections.push(FirestoreCollectionSnapshot {
-            collection: name.to_string(),
-            returned_docs: listing.documents.len(),
-            has_more: listing.next_page_token.is_some(),
-            sample_doc_ids: listing
-                .documents
-                .iter()
-                .map(firestore_document_id)
-                .collect(),
-        });
-    }
-
-    Ok(FirestoreRemoteVerify {
-        device,
-        recent_batches,
-        collections,
-    })
-}
-
-struct FirestoreListResponse {
-    documents: Vec<Value>,
-    next_page_token: Option<String>,
-}
-
-fn firestore_get_document(
-    project: &str,
-    relative_path: &str,
-    auth_token: &str,
-) -> Result<Option<Value>> {
-    let url = firestore_document_get_url(project, relative_path);
-    let request = firestore_request_with_auth(ureq::get(&url), auth_token);
-    match request.call() {
-        Ok(response) => Ok(Some(firestore_response_json(response, "read document")?)),
-        Err(ureq::Error::Status(404, _)) => Ok(None),
-        Err(error) => Err(firestore_request_error("read document", error)),
-    }
-}
-
-fn firestore_list_collection(
-    project: &str,
-    uid: &str,
-    collection: &str,
-    page_size: usize,
-    auth_token: &str,
-) -> Result<FirestoreListResponse> {
-    let url = firestore_collection_list_url(project, uid, collection, page_size);
-    let request = firestore_request_with_auth(ureq::get(&url), auth_token);
-    let value = match request.call() {
-        Ok(response) => {
-            firestore_response_json(response, &format!("list collection {collection}"))?
-        }
-        Err(ureq::Error::Status(404, _)) => Value::Object(Default::default()),
-        Err(error) => {
-            return Err(firestore_request_error(
-                &format!("list collection {collection}"),
-                error,
-            ))
-        }
-    };
-    Ok(FirestoreListResponse {
-        documents: value
-            .get("documents")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-        next_page_token: value
-            .get("nextPageToken")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-    })
-}
-
-fn firestore_request_error(action: &str, error: ureq::Error) -> anyhow::Error {
-    match error {
-        ureq::Error::Status(code, response) => {
-            let body = response.into_string().unwrap_or_default();
-            anyhow::anyhow!("Firestore {action} failed (HTTP {code}): {body}")
-        }
-        other => anyhow::anyhow!("Firestore {action} failed: {other}"),
-    }
-}
-
-fn firestore_response_json(response: ureq::Response, action: &str) -> Result<Value> {
-    let body = response
-        .into_string()
-        .with_context(|| format!("read Firestore {action} response body"))?;
-    serde_json::from_str(&body).with_context(|| format!("parse Firestore {action} response JSON"))
-}
-
-fn firestore_collection_list_url(
-    project: &str,
-    uid: &str,
-    collection: &str,
-    page_size: usize,
-) -> String {
-    let prefix = firestore_document_path_prefix(project, uid);
-    format!("{prefix}/{collection}?pageSize={page_size}")
-}
-
-fn firestore_document_get_url(project: &str, relative_path: &str) -> String {
-    let base = firestore_api_base(project);
-    format!("{base}/{relative_path}")
-}
-
-fn firestore_document_path_prefix(project: &str, uid: &str) -> String {
-    let base = firestore_api_base(project);
-    format!("{base}/users/{}", sanitize_firestore_document_id(uid))
-}
-
-fn firestore_api_base(project: &str) -> String {
-    if let Some(host) = firestore_emulator_host() {
-        return format!("http://{host}/v1/projects/{project}/databases/(default)/documents");
-    }
-    format!("https://firestore.googleapis.com/v1/projects/{project}/databases/(default)/documents")
-}
-
-fn firestore_request_with_auth(request: ureq::Request, auth_token: &str) -> ureq::Request {
-    if firestore_should_attach_auth_header(auth_token) {
-        request.set("Authorization", &format!("Bearer {auth_token}"))
-    } else {
-        request
-    }
-}
-
-fn firestore_should_attach_auth_header(auth_token: &str) -> bool {
-    !auth_token.trim().is_empty()
-}
-
-fn firestore_emulator_host() -> Option<String> {
-    std::env::var("FIRESTORE_EMULATOR_HOST")
-        .ok()
-        .map(|value| {
-            value
-                .trim()
-                .trim_start_matches("http://")
-                .trim_start_matches("https://")
-                .to_string()
-        })
-        .filter(|value| !value.is_empty())
-}
-
-fn sanitize_firestore_document_id(value: &str) -> String {
-    let safe = !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
-    if safe && value != "." && value != ".." && !value.starts_with("__") && !value.ends_with("__") {
-        return value.to_string();
-    }
-
-    let mut output = String::with_capacity(4 + value.len() * 2);
-    output.push_str("hex_");
-    for byte in value.as_bytes() {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
-}
-
-fn firestore_document_id(document: &Value) -> String {
-    document
-        .get("name")
-        .and_then(Value::as_str)
-        .and_then(|name| name.rsplit('/').next())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-fn firestore_string_field(document: &Value, path: &[&str]) -> Option<String> {
-    let mut value = document;
-    for segment in path {
-        value = value.get(*segment)?;
-    }
-    value.as_str().map(ToOwned::to_owned)
 }
 
 fn format_cursor(date: Option<String>, id: Option<&str>) -> String {
@@ -2746,7 +2359,7 @@ fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
-struct FirestoreStatsAccumulator {
+struct SyncRollupStatsAccumulator {
     provider: String,
     source_id: ai_stats_core::SourceId,
     provider_account_id: Option<ai_stats_core::ProviderAccountId>,
@@ -2768,7 +2381,7 @@ struct FirestoreStatsAccumulator {
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct FirestoreStatsBucketKey {
+struct SyncRollupStatsBucketKey {
     provider: String,
     source_id: String,
     account_key: String,
@@ -2776,8 +2389,8 @@ struct FirestoreStatsBucketKey {
 }
 
 #[cfg(test)]
-fn firestore_stats_bucket_key(event: &UsageEvent) -> FirestoreStatsBucketKey {
-    FirestoreStatsBucketKey {
+fn sync_rollup_stats_bucket_key(event: &UsageEvent) -> SyncRollupStatsBucketKey {
+    SyncRollupStatsBucketKey {
         provider: event.provider.clone(),
         source_id: event.source_id.0.clone(),
         account_key: event
@@ -2790,10 +2403,10 @@ fn firestore_stats_bucket_key(event: &UsageEvent) -> FirestoreStatsBucketKey {
 }
 
 #[cfg(test)]
-fn build_firestore_stats_summaries(events: &[UsageEvent], device_id: &str) -> Vec<UsageSummary> {
-    let mut buckets: BTreeMap<String, FirestoreStatsAccumulator> = BTreeMap::new();
+fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> Vec<UsageSummary> {
+    let mut buckets: BTreeMap<String, SyncRollupStatsAccumulator> = BTreeMap::new();
     for event in events {
-        let key = firestore_stats_bucket_key(event);
+        let key = sync_rollup_stats_bucket_key(event);
         let day = event.session.started_at.date_naive();
         let start = day
             .and_hms_opt(0, 0, 0)
@@ -2805,7 +2418,7 @@ fn build_firestore_stats_summaries(events: &[UsageEvent], device_id: &str) -> Ve
                 "{}|{}|{}|{}",
                 key.provider, key.source_id, key.account_key, key.day_key
             ))
-            .or_insert_with(|| FirestoreStatsAccumulator {
+            .or_insert_with(|| SyncRollupStatsAccumulator {
                 provider: event.provider.clone(),
                 source_id: event.source_id.clone(),
                 provider_account_id: event.provider_account_id.clone(),
@@ -3418,22 +3031,9 @@ mod tests {
 
         sync(
             SyncCommand {
-                sink: "file".to_string(),
                 output: Some(output.clone()),
-                endpoint: None,
-                auth_token: None,
-                firebase_uid: None,
-                firebase_project: "ai-stats-fire".to_string(),
-                firestore_mode: "stats".to_string(),
-                rebuild_rollups: false,
-                firestore_records_per_batch: 1000,
-                firestore_commit_writes: 200,
-                firestore_retries: 4,
-                firestore_backoff_ms: 800,
-                since_last: false,
-                status: false,
-                verify: false,
                 dry_run: true,
+                ..test_sync_command("file")
             },
             &store,
             "device",
@@ -3441,6 +3041,132 @@ mod tests {
         .expect("sync dry run");
 
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn http_sync_uses_configured_or_default_api_endpoint() {
+        let previous = std::env::var("AI_STATS_API_URL").ok();
+        std::env::set_var("AI_STATS_API_URL", "https://sync.example.com");
+        let endpoint = http_sync_endpoint(&test_sync_command("http")).expect("http endpoint");
+        if let Some(value) = previous {
+            std::env::set_var("AI_STATS_API_URL", value);
+        } else {
+            std::env::remove_var("AI_STATS_API_URL");
+        }
+
+        assert_eq!(endpoint, "https://sync.example.com/api/sync/batches");
+    }
+
+    #[test]
+    fn http_sync_builds_rollup_batches_without_raw_events() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollups"),
+            LocationOrigin::Configured,
+            Some("personal".to_string()),
+        );
+        store.upsert_source(&source).expect("source");
+
+        let event = test_event(
+            "codex",
+            &source,
+            Utc::now(),
+            Some(provider_account_id("codex", "personal")),
+            TokenParts {
+                input: 10,
+                output: 5,
+                cached_input: 0,
+                reasoning: 0,
+                total: 15,
+                cost: Some(0.10),
+            },
+        );
+        store.insert_event(&event).expect("event");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert!(!batch.summaries.is_empty());
+        assert!(batch.summaries.iter().all(is_daily_rollup_summary));
+    }
+
+    #[test]
+    fn first_http_incremental_sync_sends_full_rollup_history_for_new_target() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-first-sync"),
+            LocationOrigin::Configured,
+            Some("personal".to_string()),
+        );
+        store.upsert_source(&source).expect("source");
+
+        let event = test_event(
+            "codex",
+            &source,
+            Utc::now(),
+            Some(provider_account_id("codex", "personal")),
+            TokenParts {
+                input: 10,
+                output: 5,
+                cached_input: 0,
+                reasoning: 0,
+                total: 15,
+                cost: Some(0.10),
+            },
+        );
+        store.insert_event(&event).expect("event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let existing_rollups = store
+            .all_sync_rollup_summaries()
+            .expect("all rollups for new target");
+        assert_eq!(existing_rollups.len(), 1);
+
+        store
+            .mark_sync_rollups_synced(
+                &existing_rollups
+                    .iter()
+                    .map(|summary| summary.summary_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("clear dirty flags");
+        assert!(store
+            .dirty_sync_rollup_summaries()
+            .expect("dirty rollups")
+            .is_empty());
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            since_last: true,
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert!(is_daily_rollup_summary(&batch.summaries[0]));
+    }
+
+    #[test]
+    fn http_verify_status_url_points_at_worker_status_endpoint() {
+        assert_eq!(
+            http_verify_status_url("https://api.example.com/api/sync/batches").expect("status"),
+            "https://api.example.com/api/sync/status"
+        );
     }
 
     #[test]
@@ -3481,23 +3207,7 @@ mod tests {
     }
 
     #[test]
-    fn firestore_sync_target_is_scoped_to_uid() {
-        assert_eq!(
-            firestore_sync_target("ai-stats-fire", "uid-123"),
-            "firestore:ai-stats-fire:uid-123"
-        );
-    }
-
-    #[test]
-    fn firestore_verify_reads_attach_auth_for_nonempty_tokens() {
-        assert!(firestore_should_attach_auth_header("emulator-id-token"));
-        assert!(firestore_should_attach_auth_header(" user-id-token "));
-        assert!(!firestore_should_attach_auth_header(""));
-        assert!(!firestore_should_attach_auth_header("   "));
-    }
-
-    #[test]
-    fn firestore_verify_pending_counts_match_sanitized_sync_payloads() {
+    fn http_verify_pending_counts_match_sanitized_sync_payloads() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
             "codex",
@@ -3549,37 +3259,33 @@ mod tests {
         let summary = test_summary("codex", &source, Utc::now(), 42);
         store.upsert_summary(&summary).expect("summary");
 
-        let target = firestore_sync_target("ai-stats-fire", "uid-test");
+        let target = "https://api.example.com/api/sync/batches".to_string();
         store
-            .record_sources_synced(
-                "firestore",
-                &target,
-                &[sanitize_source_for_sync(source.clone())],
-            )
+            .record_sources_synced("http", &target, &[sanitize_source_for_sync(source.clone())])
             .expect("record sources");
         store
             .record_accounts_synced(
-                "firestore",
+                "http",
                 &target,
                 &[sanitize_account_for_sync(account.clone())],
             )
             .expect("record accounts");
         store
             .record_subscriptions_synced(
-                "firestore",
+                "http",
                 &target,
                 &[sanitize_subscription_for_sync(subscription.clone())],
             )
             .expect("record subscriptions");
         store
             .record_summaries_synced(
-                "firestore",
+                "http",
                 &target,
                 &[sanitize_summary_for_sync(summary.clone())],
             )
             .expect("record summaries");
 
-        let local = firestore_local_verify(&store, &target, None).expect("local verify");
+        let local = sync_local_verify(&store, "http", &target, None).expect("local verify");
         assert_eq!(local.pending_sources, 0);
         assert_eq!(local.pending_accounts, 0);
         assert_eq!(local.pending_subscriptions, 0);
@@ -3611,12 +3317,12 @@ mod tests {
     }
 
     #[test]
-    fn firestore_stats_summaries_roll_up_events_by_day_and_account() {
+    fn sync_rollup_stats_summaries_roll_up_events_by_day_and_account() {
         let source = SourceLocation::local_adapter(
             "codex",
             "test",
             "0",
-            Path::new("/tmp/codex-firestore-stats"),
+            Path::new("/tmp/codex-sync-rollup-stats"),
             LocationOrigin::Configured,
             Some("personal".to_string()),
         );
@@ -3634,7 +3340,7 @@ mod tests {
             .single()
             .expect("day2");
 
-        let summaries = build_firestore_stats_summaries(
+        let summaries = build_sync_rollup_stats_summaries(
             &[
                 test_event(
                     "codex",
@@ -3691,6 +3397,20 @@ mod tests {
         assert!(summaries
             .iter()
             .all(|summary| summary.metadata.summary_format == "daily_rollup.v1"));
+    }
+
+    fn test_sync_command(sink: &str) -> SyncCommand {
+        SyncCommand {
+            sink: sink.to_string(),
+            output: None,
+            endpoint: None,
+            auth_token: None,
+            rebuild_rollups: false,
+            since_last: false,
+            status: false,
+            verify: false,
+            dry_run: false,
+        }
     }
 
     #[test]

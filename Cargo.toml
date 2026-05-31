@@ -38,7 +38,6 @@ walkdir = "2"
 notify = "7"
 ureq = { version = "2.9", features = ["json"] }
 percent-encoding = "2.3"
-rpassword = "7"
 
 [profile.release]
 lto = "thin"
