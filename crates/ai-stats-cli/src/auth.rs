@@ -16,6 +16,8 @@ pub struct AuthCredentials {
     #[serde(default)]
     pub cloudflare_refresh_token: Option<String>,
     #[serde(default)]
+    pub cloudflare_refresh_expires_at_secs: u64,
+    #[serde(default)]
     pub cloudflare_access_token: Option<String>,
     #[serde(default)]
     pub cloudflare_access_expires_at_secs: u64,
@@ -166,9 +168,16 @@ pub fn get_or_refresh_token() -> Result<Option<String>> {
     let access_expires_at = json["accessExpiresAt"]
         .as_u64()
         .context("Missing accessExpiresAt from token refresh")?;
+    let next_refresh_token = json["refreshToken"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .context("Missing refreshToken from token refresh")?;
+    let refresh_expires_at = json["refreshExpiresAt"].as_u64().unwrap_or(0);
 
     credentials.backend = Some("cloudflare".to_string());
     credentials.api_base_url = Some(api_base_url);
+    credentials.cloudflare_refresh_token = Some(next_refresh_token);
+    credentials.cloudflare_refresh_expires_at_secs = refresh_expires_at;
     credentials.cloudflare_access_token = Some(access_token.clone());
     credentials.cloudflare_access_expires_at_secs = access_expires_at;
     if let Some(device_id) = json["deviceId"].as_str() {
@@ -234,6 +243,7 @@ fn exchange_cloudflare_device_code(
     let access_expires_at = json["accessExpiresAt"]
         .as_u64()
         .context("Missing accessExpiresAt from device exchange")?;
+    let refresh_expires_at = json["refreshExpiresAt"].as_u64().unwrap_or(0);
     let device_id = json["deviceId"]
         .as_str()
         .context("Missing deviceId from device exchange")?
@@ -243,6 +253,7 @@ fn exchange_cloudflare_device_code(
         backend: Some("cloudflare".to_string()),
         api_base_url: Some(api_base_url.to_string()),
         cloudflare_refresh_token: Some(refresh_token),
+        cloudflare_refresh_expires_at_secs: refresh_expires_at,
         cloudflare_access_token: Some(access_token),
         cloudflare_access_expires_at_secs: access_expires_at,
         device_id: Some(device_id),
@@ -492,6 +503,7 @@ mod tests {
             backend: Some("legacy".to_string()),
             api_base_url: None,
             cloudflare_refresh_token: None,
+            cloudflare_refresh_expires_at_secs: 0,
             cloudflare_access_token: None,
             cloudflare_access_expires_at_secs: 0,
             device_id: None,
@@ -500,6 +512,7 @@ mod tests {
             backend: Some("cloudflare".to_string()),
             api_base_url: Some("http://127.0.0.1:8787".to_string()),
             cloudflare_refresh_token: Some("refresh-token".to_string()),
+            cloudflare_refresh_expires_at_secs: 0,
             cloudflare_access_token: None,
             cloudflare_access_expires_at_secs: 0,
             device_id: Some("device-1".to_string()),
@@ -525,6 +538,7 @@ mod tests {
             backend: Some("cloudflare".to_string()),
             api_base_url: Some("http://127.0.0.1:8787".to_string()),
             cloudflare_refresh_token: Some("refresh-token".to_string()),
+            cloudflare_refresh_expires_at_secs: 0,
             cloudflare_access_token: Some("access-token".to_string()),
             cloudflare_access_expires_at_secs: 123,
             device_id: Some("device-1".to_string()),
@@ -553,6 +567,7 @@ mod tests {
             backend: Some("cloudflare".to_string()),
             api_base_url: Some("http://127.0.0.1:8787".to_string()),
             cloudflare_refresh_token: Some("refresh-token".to_string()),
+            cloudflare_refresh_expires_at_secs: 0,
             cloudflare_access_token: Some("access-token".to_string()),
             cloudflare_access_expires_at_secs: 123,
             device_id: Some("device-1".to_string()),
