@@ -1286,6 +1286,32 @@ impl Store {
         }
     }
 
+    pub fn clear_sync_tracking_for_target(&self, sink: &str, target: &str) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            self.conn.execute(
+                "DELETE FROM entity_sync_state WHERE sink = ?1 AND target = ?2",
+                params![sink, target],
+            )?;
+            self.conn.execute(
+                "DELETE FROM sync_state WHERE sink = ?1 AND target = ?2",
+                params![sink, target],
+            )?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
     pub fn record_sync_success(
         &self,
         sink: &str,
@@ -3912,6 +3938,87 @@ mod tests {
         assert_eq!(dirty[0].models.len(), 2);
         assert_eq!(dirty[0].models[0].usage.total_tokens, Some(25));
         assert_eq!(dirty[0].models[1].usage.total_tokens, Some(15));
+    }
+
+    #[test]
+    fn clear_sync_tracking_for_target_only_removes_matching_target() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-clear-sync-target"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        store
+            .record_sources_synced(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                std::slice::from_ref(&source),
+            )
+            .expect("record synced source");
+        store
+            .record_sources_synced(
+                "http",
+                "https://other.example.com/api/sync/batches",
+                std::slice::from_ref(&source),
+            )
+            .expect("record synced source other target");
+        store
+            .record_sync_success(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                "batch_1",
+                &[],
+                &[],
+            )
+            .expect("record success");
+        store
+            .record_sync_success(
+                "http",
+                "https://other.example.com/api/sync/batches",
+                "batch_2",
+                &[],
+                &[],
+            )
+            .expect("record success other target");
+
+        store
+            .clear_sync_tracking_for_target("http", "https://api.example.com/api/sync/batches")
+            .expect("clear target tracking");
+
+        assert!(store
+            .sync_state("http", "https://api.example.com/api/sync/batches")
+            .expect("state")
+            .is_none());
+        assert!(store
+            .sync_state("http", "https://other.example.com/api/sync/batches")
+            .expect("other state")
+            .is_some());
+
+        assert_eq!(
+            store
+                .pending_sources_for_sync(
+                    "http",
+                    "https://api.example.com/api/sync/batches",
+                    std::slice::from_ref(&source),
+                )
+                .expect("pending sources")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .pending_sources_for_sync(
+                    "http",
+                    "https://other.example.com/api/sync/batches",
+                    std::slice::from_ref(&source),
+                )
+                .expect("other pending sources")
+                .len(),
+            0
+        );
     }
 
     #[test]

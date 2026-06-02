@@ -1830,6 +1830,9 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     }
 
     let target = sync_target(&command)?;
+    if command.sink == "http" {
+        maybe_reset_http_sync_tracking_if_remote_changed(&command, store, &target)?;
+    }
     let (batch, payload_mode) = build_sync_batch(&command, store, device_id, &target)?;
 
     if command.dry_run {
@@ -1901,6 +1904,47 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
             Err(error)
         }
     }
+}
+
+fn maybe_reset_http_sync_tracking_if_remote_changed(
+    command: &SyncCommand,
+    store: &Store,
+    target: &str,
+) -> Result<()> {
+    let Some(local_state) = store.sync_state("http", target)? else {
+        return Ok(());
+    };
+    if local_state.last_batch_id.trim().is_empty() {
+        return Ok(());
+    }
+
+    let auth_token = resolve_http_auth_token(command, true)?
+        .context("device login required; run `statsai auth login` first")?;
+    let remote = http_remote_verify(target, &auth_token)?;
+    let local_verify = sync_local_verify(store, "http", target, Some(&local_state))?;
+    let batch_mismatch = !remote_sync_batch_matches_local_state(&remote, &local_state);
+    let metadata_gap = remote_metadata_gap_reason(&remote, &local_verify);
+    if batch_mismatch || metadata_gap.is_some() {
+        let remote_last_batch = remote_last_sync_batch_id(&remote).unwrap_or("none");
+        let mut reasons = Vec::new();
+        if batch_mismatch {
+            reasons.push(format!(
+                "remote last batch ({remote_last_batch}) no longer matches local last batch ({})",
+                local_state.last_batch_id
+            ));
+        }
+        if let Some(gap) = metadata_gap {
+            reasons.push(format!("remote mirror is missing synced metadata ({gap})"));
+        }
+        eprintln!(
+            "http rollup mode: {}; clearing local sync tracking for target {}",
+            reasons.join("; "),
+            target
+        );
+        store.clear_sync_tracking_for_target("http", target)?;
+    }
+
+    Ok(())
 }
 
 fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
@@ -2436,6 +2480,86 @@ fn http_response_json(response: ureq::Response, action: &str) -> Result<Value> {
         .into_string()
         .with_context(|| format!("read HTTP {action} response body"))?;
     serde_json::from_str(&body).with_context(|| format!("parse HTTP {action} response JSON"))
+}
+
+fn remote_sync_batch_matches_local_state(
+    remote: &Value,
+    local_state: &statsai_store::SyncState,
+) -> bool {
+    remote_last_sync_batch_id(remote)
+        .map(|batch_id| batch_id == local_state.last_batch_id)
+        .unwrap_or(false)
+}
+
+fn remote_last_sync_batch_id(remote: &Value) -> Option<&str> {
+    remote
+        .pointer("/device/last_sync_batch_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn remote_metadata_gap_reason(remote: &Value, local: &SyncLocalVerify) -> Option<String> {
+    let mut reasons = Vec::new();
+    push_remote_metadata_gap(
+        &mut reasons,
+        "sources",
+        remote
+            .pointer("/mirrorCounts/sources")
+            .and_then(Value::as_u64),
+        local.total_sources,
+        local.pending_sources,
+    );
+    push_remote_metadata_gap(
+        &mut reasons,
+        "accounts",
+        remote
+            .pointer("/mirrorCounts/accounts")
+            .and_then(Value::as_u64),
+        local.total_accounts,
+        local.pending_accounts,
+    );
+    push_remote_metadata_gap(
+        &mut reasons,
+        "source_account_assignments",
+        remote
+            .pointer("/mirrorCounts/source_account_assignments")
+            .and_then(Value::as_u64),
+        local.total_source_account_assignments,
+        local.pending_source_account_assignments,
+    );
+    push_remote_metadata_gap(
+        &mut reasons,
+        "subscriptions",
+        remote
+            .pointer("/mirrorCounts/subscriptions")
+            .and_then(Value::as_u64),
+        local.total_subscriptions,
+        local.pending_subscriptions,
+    );
+
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join(", "))
+    }
+}
+
+fn push_remote_metadata_gap(
+    reasons: &mut Vec<String>,
+    label: &str,
+    remote_count: Option<u64>,
+    local_total: usize,
+    local_pending: usize,
+) {
+    if local_total == 0 || local_pending > 0 {
+        return;
+    }
+    if let Some(remote_count) = remote_count {
+        if remote_count < local_total as u64 {
+            reasons.push(format!("{label} {remote_count}<{local_total}"));
+        }
+    }
 }
 
 fn sync_state_report(state: &statsai_store::SyncState) -> SyncStateReport {
@@ -6310,6 +6434,197 @@ mod tests {
 
         assert_eq!(mode, SyncPayloadMode::Rollups);
         assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert!(is_daily_rollup_summary(&batch.summaries[0]));
+    }
+
+    #[test]
+    fn remote_sync_batch_match_requires_same_last_batch_id() {
+        let store = Store::in_memory().expect("store");
+        store
+            .record_sync_success(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                "batch_1",
+                &[],
+                &[],
+            )
+            .expect("record sync success");
+        let local_state = store
+            .sync_state("http", "https://api.example.com/api/sync/batches")
+            .expect("state")
+            .expect("present");
+
+        assert!(remote_sync_batch_matches_local_state(
+            &json!({
+                "device": {
+                    "last_sync_batch_id": "batch_1"
+                }
+            }),
+            &local_state
+        ));
+        assert!(!remote_sync_batch_matches_local_state(
+            &json!({
+                "device": {
+                    "last_sync_batch_id": null
+                }
+            }),
+            &local_state
+        ));
+        assert!(!remote_sync_batch_matches_local_state(
+            &json!({
+                "device": {
+                    "last_sync_batch_id": "batch_2"
+                }
+            }),
+            &local_state
+        ));
+    }
+
+    #[test]
+    fn full_http_sync_resends_metadata_after_tracking_is_cleared() {
+        let endpoint = "https://api.example.com/api/sync/batches".to_string();
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-reset-tracking"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("started_at");
+        let verified_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 14, 56)
+            .single()
+            .expect("verified_at");
+        apply_verified_source_state(
+            &store,
+            &source,
+            Some(&VerifiedSourceState {
+                provider_user_id: Some("acct-real".to_string()),
+                email: Some("verified@example.com".to_string()),
+                account_label: None,
+                plan_name: Some("Plus".to_string()),
+                authenticated_at: Some(started_at),
+                verified_at: Some(verified_at),
+                subscription: Some(VerifiedSubscriptionState {
+                    plan_name: "Plus".to_string(),
+                    price: 20.0,
+                    currency: "USD".to_string(),
+                    billing_period: BillingPeriod::Monthly,
+                    paid_at: Some(started_at),
+                    started_at,
+                    ended_at: None,
+                    current_period_ends_at: Some(started_at + Duration::days(30)),
+                    status: SubscriptionStatus::Active,
+                    verified_at: Some(verified_at),
+                }),
+            }),
+        )
+        .expect("verified state");
+
+        let account_id = store.list_accounts().expect("accounts")[0]
+            .provider_account_id
+            .clone();
+        let event = test_event(
+            "codex",
+            &source,
+            started_at + Duration::hours(1),
+            Some(account_id),
+            TokenParts {
+                input: 10,
+                output: 5,
+                cached_input: 0,
+                reasoning: 0,
+                total: 15,
+                cost: Some(0.10),
+            },
+        );
+        store.insert_event(&event).expect("event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let command = SyncCommand {
+            endpoint: Some(endpoint.clone()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+
+        let (initial_batch, initial_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("initial batch");
+        assert_eq!(initial_mode, SyncPayloadMode::Rollups);
+        record_rollup_sync_success(&store, "http", &target, &initial_batch)
+            .expect("record initial sync");
+
+        let all_sources = store.list_sources().expect("sources");
+        let all_accounts = store.list_accounts().expect("accounts");
+
+        let sync_sources: Vec<_> = all_sources
+            .iter()
+            .cloned()
+            .map(sanitize_source_for_sync)
+            .collect();
+        let sync_accounts: Vec<_> = all_accounts
+            .iter()
+            .cloned()
+            .map(sanitize_account_for_sync)
+            .collect();
+        assert_eq!(
+            store
+                .pending_sources_for_sync("http", &target, &sync_sources)
+                .expect("pending sources")
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .pending_accounts_for_sync("http", &target, &sync_accounts)
+                .expect("pending accounts")
+                .len(),
+            0
+        );
+
+        let local_state = store
+            .sync_state("http", &target)
+            .expect("state")
+            .expect("present");
+        let local_verify =
+            sync_local_verify(&store, "http", &target, Some(&local_state)).expect("local verify");
+        assert_eq!(
+            remote_metadata_gap_reason(
+                &json!({
+                    "device": {
+                        "last_sync_batch_id": initial_batch.batch_id
+                    },
+                    "mirrorCounts": {
+                        "sources": 0,
+                        "accounts": 0,
+                        "source_account_assignments": 0,
+                        "subscriptions": 0,
+                        "summaries": 0,
+                        "sync_batches": 1
+                    }
+                }),
+                &local_verify
+            )
+            .as_deref(),
+            Some("sources 0<1, accounts 0<1, source_account_assignments 0<1, subscriptions 0<1")
+        );
+
+        store
+            .clear_sync_tracking_for_target("http", &target)
+            .expect("clear tracking");
+
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert_eq!(batch.sources.len(), 1);
+        assert_eq!(batch.accounts.len(), 1);
+        assert_eq!(batch.source_account_assignments.len(), 1);
+        assert_eq!(batch.subscriptions.len(), 1);
         assert_eq!(batch.summaries.len(), 1);
         assert!(is_daily_rollup_summary(&batch.summaries[0]));
     }
