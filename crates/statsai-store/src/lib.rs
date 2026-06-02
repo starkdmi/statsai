@@ -1,5 +1,9 @@
 //! Local SQLite storage for `statsai`.
 
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
 use statsai_core::{
     hash_text, normalize_email, normalize_provider_user_id, periods_overlap, provider_account_id,
     provider_account_id_from_identity, semantic_event_fingerprint, source_account_assignment_id,
@@ -12,10 +16,6 @@ use statsai_core::{
     PROVIDER_ACCOUNT_SCHEMA_VERSION, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
-use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -3387,12 +3387,12 @@ fn uses_path_independent_codex_dedupe(event: &UsageEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
     use statsai_core::{
         event_id, summary_id, Confidence, CostInfo, EventSource, LocationOrigin, ModelInfo,
         ParseEvidence, PrivacyInfo, PrivacyMode, SessionInfo, SourceKind, SummaryMetadata,
         UsageCounts, UsageSummary, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
     };
-    use chrono::{TimeZone, Utc};
     use std::path::Path;
 
     #[test]

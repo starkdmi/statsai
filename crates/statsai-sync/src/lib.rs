@@ -1,7 +1,7 @@
 //! Sync sink interfaces for `statsai`.
 
-use statsai_core::{SyncAck, SyncBatch, SYNC_ACK_SCHEMA_VERSION};
 use anyhow::{bail, Context, Result};
+use statsai_core::{SyncAck, SyncBatch, SYNC_ACK_SCHEMA_VERSION};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -140,8 +140,8 @@ impl SyncSink for FileSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use statsai_core::SyncBatch;
     use chrono::Utc;
+    use statsai_core::SyncBatch;
     use std::sync::mpsc;
     use tiny_http::{Header, Method, Response, Server};
 

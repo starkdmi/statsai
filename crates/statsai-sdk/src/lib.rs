@@ -8,6 +8,10 @@ pub use statsai_core as core;
 pub use statsai_store as store;
 pub use statsai_sync as sync;
 
+use anyhow::{bail, Result};
+use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use statsai_core::{
     canonical_display, hash_text, normalize_email, normalize_provider_user_id,
     provider_account_id_from_identity, summary_id, Confidence, CostInfo, EventSource,
@@ -15,10 +19,6 @@ use statsai_core::{
     ProviderAccountId, SourceKind, SourceLocation, SummaryMetadata, UsageCounts, UsageSummary,
     REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
-use anyhow::{bail, Result};
-use chrono::{DateTime, Utc};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const REPORTED_USAGE_IMPORT_ADAPTER_ID: &str = "reported-usage-summary";
@@ -250,8 +250,8 @@ fn normalized_report_identity_key(input: &ReportedUsageSummaryInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use statsai_core::REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION;
     use chrono::TimeZone;
+    use statsai_core::REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION;
 
     #[test]
     fn builds_manual_reported_summary_with_stable_ids() {

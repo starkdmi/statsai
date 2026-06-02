@@ -1,3 +1,10 @@
+use anyhow::{bail, Context, Result};
+#[cfg(test)]
+use chrono::Duration;
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
+use serde_json::{json, Value};
 #[cfg(test)]
 use statsai_adapters::VerifiedSubscriptionState;
 use statsai_adapters::{
@@ -32,13 +39,6 @@ use statsai_store::{
     ScanFileStateEntry, Store, SyncState, UpsertProviderAccountInput,
 };
 use statsai_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
-use anyhow::{bail, Context, Result};
-#[cfg(test)]
-use chrono::Duration;
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
-use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -4408,6 +4408,7 @@ fn sanitize_subscription_for_sync(mut subscription: Subscription) -> Subscriptio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use statsai_core::{
         event_id, subscription_id, summary_id, BillingPeriod, CostInfo, EventSource,
         IdentitySource, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProviderAccount,
@@ -4415,7 +4416,6 @@ mod tests {
         UsageSummary, PROVIDER_ACCOUNT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
         USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
     };
-    use chrono::TimeZone;
     use std::path::Path;
 
     #[derive(Clone)]

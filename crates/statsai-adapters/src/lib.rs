@@ -1,5 +1,8 @@
 //! Provider adapters for local AI usage sources.
 
+use anyhow::{Context, Result};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use serde_json::Value;
 use statsai_core::{
     canonical_display, expand_home_path, hash_text, home_dir, semantic_event_id, summary_id,
     BillingPeriod, Confidence, EventSource, IdentitySource, LocationOrigin, ModelInfo,
@@ -8,9 +11,6 @@ use statsai_core::{
     USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{estimate_cost, normalize_model_name};
-use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};

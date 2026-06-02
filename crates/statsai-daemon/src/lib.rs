@@ -1,12 +1,12 @@
 //! Loopback API + file-watching daemon for `statsai`.
 
+use anyhow::{bail, Context, Result};
+use serde_json::json;
 use statsai_core::{
     SyncAck, SyncBatch, SyncEntityCounts, SyncRejectedRecord, SYNC_ACK_SCHEMA_VERSION,
     SYNC_BATCH_SCHEMA_VERSION,
 };
 use statsai_store::Store;
-use anyhow::{bail, Context, Result};
-use serde_json::json;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -154,6 +154,9 @@ fn content_type_json() -> Header {
 
 #[cfg(feature = "watch")]
 mod watch {
+    use anyhow::{Context, Result};
+    use chrono::{DateTime, Utc};
+    use notify::{Event, EventKind, RecursiveMode, Watcher};
     use statsai_adapters::{default_adapters, ProviderAdapter, ScanCandidateFile, ScanOptions};
     use statsai_core::{
         timestamp_in_period, IdentitySource, ProviderAccountId, SourceAccountAssignment,
@@ -163,9 +166,6 @@ mod watch {
         effective_verified_source_state_is_missing, has_active_verified_source_assignment,
         reconcile_verified_source_state, verified_source_state_hash, ScanFileStateEntry, Store,
     };
-    use anyhow::{Context, Result};
-    use chrono::{DateTime, Utc};
-    use notify::{Event, EventKind, RecursiveMode, Watcher};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::mpsc;
@@ -653,11 +653,11 @@ mod watch {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use chrono::TimeZone;
         use statsai_core::{
             BillingPeriod, LocationOrigin, SubscriptionStatus, VerifiedSourceState,
             VerifiedSubscriptionState,
         };
-        use chrono::TimeZone;
         use std::sync::{Arc, Mutex};
 
         struct TestAdapter {
