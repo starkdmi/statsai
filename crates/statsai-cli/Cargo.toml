@@ -26,7 +26,9 @@ serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
 tiny_http.workspace = true
-percent-encoding.workspace = true
+	percent-encoding.workspace = true
+	getrandom.workspace = true
+
 
 [dev-dependencies]
 tempfile.workspace = true

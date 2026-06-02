@@ -4,6 +4,8 @@ use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use getrandom::getrandom;
+
 const DEFAULT_CLOUDFLARE_API_URL: &str = "http://127.0.0.1:8787";
 const DEFAULT_CLOUDFLARE_WEB_URL: &str = "http://127.0.0.1:3000";
 
@@ -50,7 +52,7 @@ pub fn login() -> Result<()> {
         _ => bail!("Expected loopback IP address"),
     };
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-    let state = generate_random_string(32);
+    let state = generate_random_string(32)?;
     let api_base_url = cloudflare_api_url();
     let web_base_url = cloudflare_web_url();
     let auth_url = format!(
@@ -359,30 +361,15 @@ fn write_credentials(path: &Path, credentials: &AuthCredentials) -> Result<()> {
     Ok(())
 }
 
-fn rand_bytes(buf: &mut [u8]) {
-    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = file.read_exact(buf);
-    } else {
-        let ticks = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let mut value = ticks;
-        for byte in buf.iter_mut() {
-            value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *byte = (value >> 32) as u8;
-        }
-    }
-}
-
-fn generate_random_string(len: usize) -> String {
+fn generate_random_string(len: usize) -> Result<String> {
     let mut buf = vec![0u8; len];
-    rand_bytes(&mut buf);
+    getrandom(&mut buf).context("failed to obtain cryptographically secure random bytes for auth state")?;
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-    buf.iter()
+    let s = buf
+        .iter()
         .map(|byte| CHARS[(*byte as usize) % CHARS.len()] as char)
-        .collect()
+        .collect();
+    Ok(s)
 }
 
 fn listen_for_callback(server: &tiny_http::Server, expected_state: &str) -> Result<String> {
