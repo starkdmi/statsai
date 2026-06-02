@@ -1,5 +1,5 @@
 {
-  "name": "ai-stats",
+  "name": "statsai",
   "version": "0.0.1",
   "description": "Local-first AI usage statistics CLI, SDK, daemon, and adapter framework.",
   "type": "module",
@@ -30,10 +30,10 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/starkdmi/ai-stats.git"
+    "url": "git+https://github.com/starkdmi/statsai.git"
   },
   "bugs": {
-    "url": "https://github.com/starkdmi/ai-stats/issues"
+    "url": "https://github.com/starkdmi/statsai/issues"
   },
-  "homepage": "https://github.com/starkdmi/ai-stats#readme"
+  "homepage": "https://github.com/starkdmi/statsai#readme"
 }

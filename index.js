@@ -1,7 +1,7 @@
 export function getPackageStatus() {
   return {
-    name: "ai-stats",
+    name: "statsai",
     status: "early-development",
-    message: "ai-stats is a Rust-first local AI usage stats utility in early development."
+    message: "statsai is a Rust-first local AI usage stats utility in early development."
   };
 }

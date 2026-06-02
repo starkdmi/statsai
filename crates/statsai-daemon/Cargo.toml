@@ -1,0 +1,22 @@
+[package]
+name = "statsai-daemon"
+description = "Loopback daemon API for statsai."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+statsai-adapters = { path = "../statsai-adapters" }
+statsai-core = { path = "../statsai-core" }
+statsai-store = { path = "../statsai-store" }
+anyhow.workspace = true
+chrono.workspace = true
+notify = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tiny_http.workspace = true
+
+[features]
+watch = ["dep:notify"]

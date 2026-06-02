@@ -1,0 +1,32 @@
+[package]
+name = "statsai-cli"
+description = "Command-line interface for statsai."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "statsai"
+path = "src/main.rs"
+
+[dependencies]
+statsai-adapters = { path = "../statsai-adapters" }
+statsai-core = { path = "../statsai-core" }
+statsai-daemon = { path = "../statsai-daemon" }
+statsai-sdk = { path = "../statsai-sdk" }
+statsai-store = { path = "../statsai-store" }
+statsai-sync = { path = "../statsai-sync" }
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+tiny_http.workspace = true
+percent-encoding.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

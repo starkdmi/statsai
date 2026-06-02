@@ -1,4 +1,4 @@
-# ai-stats
+# statsai
 
 Local-first AI usage statistics for Codex, Claude Code, and future local/provider sources.
 
@@ -6,7 +6,7 @@ Status: early implementation. The public API is not stable yet.
 
 ## Scope
 
-`ai-stats` is a Rust-first utility package, not a hosted dashboard. It provides:
+`statsai` is a Rust-first utility package, not a hosted dashboard. It provides:
 
 - a CLI for scanning, reporting, source config, account mapping, subscription mapping, export, sync, and daemon mode
 - a Rust SDK facade for embedding
@@ -19,40 +19,40 @@ The first adapters target Claude Code JSONL usage roots and Codex session logs. 
 
 ## Workspace
 
-- `crates/ai-stats-core`: normalized types, stable IDs, schema models, privacy metadata
-- `crates/ai-stats-adapters`: Claude Code and Codex local adapters
-- `crates/ai-stats-store`: SQLite persistence
-- `crates/ai-stats-sync`: pluggable sync sink trait plus stdout/file/HTTP sinks
-- `crates/ai-stats-daemon`: localhost API
-- `crates/ai-stats-sdk`: Rust SDK facade
-- `crates/ai-stats-cli`: `ai-stats` binary
+- `crates/statsai-core`: normalized types, stable IDs, schema models, privacy metadata
+- `crates/statsai-adapters`: Claude Code and Codex local adapters
+- `crates/statsai-store`: SQLite persistence
+- `crates/statsai-sync`: pluggable sync sink trait plus stdout/file/HTTP sinks
+- `crates/statsai-daemon`: localhost API
+- `crates/statsai-sdk`: Rust SDK facade
+- `crates/statsai-cli`: `statsai` binary
 
 ## CLI Examples
 
 ```sh
-cargo run -p ai-stats-cli -- scan --provider codex --preview
-cargo run -p ai-stats-cli -- source add --provider codex --path "$HOME/.codex-work"
-cargo run -p ai-stats-cli -- source disable --source-id src_123
-cargo run -p ai-stats-cli -- source enable --source-id src_123
-cargo run -p ai-stats-cli -- source remove --source-id src_123
-cargo run -p ai-stats-cli -- source remove --source-id src_123 --delete-data
-cargo run -p ai-stats-cli -- source connect --path "$HOME/.codex-work" --email work@example.com --label work --started-at 2026-05-01
-cargo run -p ai-stats-cli -- source history --path "$HOME/.codex-work"
-cargo run -p ai-stats-cli -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
-cargo run -p ai-stats-cli -- subscription add --provider claude --email personal@example.com --plan Pro --price 20 --started-at 2026-05-15 --paid-at 2026-05-15
-cargo run -p ai-stats-cli -- subscription change --provider codex --email work@example.com --plan Pro --price 200 --started-at 2026-06-01
-cargo run -p ai-stats-cli -- import summary --path ./reported_usage_summaries.json --dry-run --verbose
-cargo run -p ai-stats-cli -- report weekly
-cargo run -p ai-stats-cli -- report monthly --subscriptions
-cargo run -p ai-stats-cli -- sync --sink file --output ./ai-stats-sync-batch.json
-cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
-cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
-cargo run -p ai-stats-cli -- sync --status
-cargo run -p ai-stats-cli -- auth login
-cargo run -p ai-stats-cli -- auth status
-cargo run -p ai-stats-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
-cargo run -p ai-stats-cli -- sync --sink http --verify
-cargo run -p ai-stats-cli -- schema sync-batch
+cargo run -p statsai-cli -- scan --provider codex --preview
+cargo run -p statsai-cli -- source add --provider codex --path "$HOME/.codex-work"
+cargo run -p statsai-cli -- source disable --source-id src_123
+cargo run -p statsai-cli -- source enable --source-id src_123
+cargo run -p statsai-cli -- source remove --source-id src_123
+cargo run -p statsai-cli -- source remove --source-id src_123 --delete-data
+cargo run -p statsai-cli -- source connect --path "$HOME/.codex-work" --email work@example.com --label work --started-at 2026-05-01
+cargo run -p statsai-cli -- source history --path "$HOME/.codex-work"
+cargo run -p statsai-cli -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
+cargo run -p statsai-cli -- subscription add --provider claude --email personal@example.com --plan Pro --price 20 --started-at 2026-05-15 --paid-at 2026-05-15
+cargo run -p statsai-cli -- subscription change --provider codex --email work@example.com --plan Pro --price 200 --started-at 2026-06-01
+cargo run -p statsai-cli -- import summary --path ./reported_usage_summaries.json --dry-run --verbose
+cargo run -p statsai-cli -- report weekly
+cargo run -p statsai-cli -- report monthly --subscriptions
+cargo run -p statsai-cli -- sync --sink file --output ./statsai-sync-batch.json
+cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
+cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
+cargo run -p statsai-cli -- sync --status
+cargo run -p statsai-cli -- auth login
+cargo run -p statsai-cli -- auth status
+cargo run -p statsai-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
+cargo run -p statsai-cli -- sync --sink http --verify
+cargo run -p statsai-cli -- schema sync-batch
 ```
 
 The primary model is:
@@ -100,29 +100,29 @@ The collector now targets a Cloudflare-hosted backend, but that backend and its
 UI are intentionally out of scope for this public CLI repo. This repo contains
 the collector, local store, sync contract, and device-pairing client behavior.
 
-`auth login` opens the web app configured by `AI_STATS_WEB_URL`, asks the
+`auth login` opens the web app configured by `STATSAI_WEB_URL`, asks the
 signed-in user to authorize the local device, and stores a backend-scoped
-device session under `~/.ai-stats/`. If `AI_STATS_API_URL` / `AI_STATS_WEB_URL`
+device session under `~/.statsai/`. If `STATSAI_API_URL` / `STATSAI_WEB_URL`
 are unset, the CLI defaults to the local dev pair
 `http://127.0.0.1:8787` + `http://127.0.0.1:3000`. When a hosted deployment
 exists, export those vars before running `auth login` so the hosted session is
 kept separate from the local one:
 
 ```sh
-export AI_STATS_API_URL="https://api.example.com"
-export AI_STATS_WEB_URL="https://app.example.com"
-cargo run -p ai-stats-cli -- auth login
+export STATSAI_API_URL="https://api.example.com"
+export STATSAI_WEB_URL="https://app.example.com"
+cargo run -p statsai-cli -- auth login
 ```
 
 After login:
 
 ```sh
-cargo run -p ai-stats-cli -- auth status
-cargo run -p ai-stats-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
+cargo run -p statsai-cli -- auth status
+cargo run -p statsai-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
 ```
 
 HTTP sync automatically uses the stored device access token unless
-`--auth-token` or `AI_STATS_SYNC_TOKEN` is supplied. Access tokens are
+`--auth-token` or `STATSAI_SYNC_TOKEN` is supplied. Access tokens are
 short-lived and refreshed from the stored device refresh token as needed.
 The collector sends sanitized daily rollups plus metadata to the backend. Raw
 events stay local by default.
@@ -130,14 +130,14 @@ events stay local by default.
 Source management helpers:
 
 ```sh
-cargo run -p ai-stats-cli -- source list
-cargo run -p ai-stats-cli -- source connect --path "$HOME/.codex-work" --email work@example.com --started-at 2026-05-01
-cargo run -p ai-stats-cli -- source history --path "$HOME/.codex-work"
-cargo run -p ai-stats-cli -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
-cargo run -p ai-stats-cli -- source disable --source-id src_123
-cargo run -p ai-stats-cli -- source enable --source-id src_123
-cargo run -p ai-stats-cli -- source remove --source-id src_123
-cargo run -p ai-stats-cli -- source remove --source-id src_123 --delete-data
+cargo run -p statsai-cli -- source list
+cargo run -p statsai-cli -- source connect --path "$HOME/.codex-work" --email work@example.com --started-at 2026-05-01
+cargo run -p statsai-cli -- source history --path "$HOME/.codex-work"
+cargo run -p statsai-cli -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
+cargo run -p statsai-cli -- source disable --source-id src_123
+cargo run -p statsai-cli -- source enable --source-id src_123
+cargo run -p statsai-cli -- source remove --source-id src_123
+cargo run -p statsai-cli -- source remove --source-id src_123 --delete-data
 ```
 
 `source remove` deletes the source configuration. Add `--delete-data` to also
@@ -149,8 +149,8 @@ source from SQLite.
 Run any compatible sync service locally and point the CLI at it:
 
 ```sh
-export AI_STATS_API_URL="http://127.0.0.1:8787"
-export AI_STATS_WEB_URL="http://127.0.0.1:3000"
-cargo run -p ai-stats-cli -- auth login
-cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
+export STATSAI_API_URL="http://127.0.0.1:8787"
+export STATSAI_WEB_URL="http://127.0.0.1:3000"
+cargo run -p statsai-cli -- auth login
+cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
 ```

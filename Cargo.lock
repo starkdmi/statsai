@@ -21,118 +21,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-stats-adapters"
-version = "0.0.1"
-dependencies = [
- "ai-stats-core",
- "ai-stats-pricing",
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "walkdir",
-]
-
-[[package]]
-name = "ai-stats-cli"
-version = "0.0.1"
-dependencies = [
- "ai-stats-adapters",
- "ai-stats-core",
- "ai-stats-daemon",
- "ai-stats-sdk",
- "ai-stats-store",
- "ai-stats-sync",
- "anyhow",
- "chrono",
- "clap",
- "percent-encoding",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "tiny_http",
- "ureq",
-]
-
-[[package]]
-name = "ai-stats-core"
-version = "0.0.1"
-dependencies = [
- "chrono",
- "hex",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
-]
-
-[[package]]
-name = "ai-stats-daemon"
-version = "0.0.1"
-dependencies = [
- "ai-stats-adapters",
- "ai-stats-core",
- "ai-stats-store",
- "anyhow",
- "chrono",
- "notify",
- "serde",
- "serde_json",
- "tiny_http",
-]
-
-[[package]]
-name = "ai-stats-pricing"
-version = "0.0.1"
-dependencies = [
- "ai-stats-core",
-]
-
-[[package]]
-name = "ai-stats-sdk"
-version = "0.0.1"
-dependencies = [
- "ai-stats-adapters",
- "ai-stats-core",
- "ai-stats-store",
- "ai-stats-sync",
- "anyhow",
- "chrono",
- "schemars",
- "serde",
-]
-
-[[package]]
-name = "ai-stats-store"
-version = "0.0.1"
-dependencies = [
- "ai-stats-core",
- "anyhow",
- "chrono",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "ai-stats-sync"
-version = "0.0.1"
-dependencies = [
- "ai-stats-core",
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "tiny_http",
- "ureq",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1191,6 +1079,118 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "statsai-adapters"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "statsai-core",
+ "statsai-pricing",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
+name = "statsai-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "percent-encoding",
+ "schemars",
+ "serde",
+ "serde_json",
+ "statsai-adapters",
+ "statsai-core",
+ "statsai-daemon",
+ "statsai-sdk",
+ "statsai-store",
+ "statsai-sync",
+ "tempfile",
+ "tiny_http",
+ "ureq",
+]
+
+[[package]]
+name = "statsai-core"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "hex",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "statsai-daemon"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "notify",
+ "serde",
+ "serde_json",
+ "statsai-adapters",
+ "statsai-core",
+ "statsai-store",
+ "tiny_http",
+]
+
+[[package]]
+name = "statsai-pricing"
+version = "0.0.1"
+dependencies = [
+ "statsai-core",
+]
+
+[[package]]
+name = "statsai-sdk"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "schemars",
+ "serde",
+ "statsai-adapters",
+ "statsai-core",
+ "statsai-store",
+ "statsai-sync",
+]
+
+[[package]]
+name = "statsai-store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "statsai-core",
+ "tempfile",
+]
+
+[[package]]
+name = "statsai-sync"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "statsai-core",
+ "tempfile",
+ "tiny_http",
+ "ureq",
+]
 
 [[package]]
 name = "strsim"

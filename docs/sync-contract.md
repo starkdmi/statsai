@@ -1,6 +1,6 @@
 # Sync Contract
 
-`sync_batch.v1` is the first backend-facing contract for `ai-stats`.
+`sync_batch.v1` is the first backend-facing contract for `statsai`.
 The collector owns local scanning, normalization, idempotent local storage, and
 privacy scrubbing. The backend owns authentication, validation, deduplication,
 rollups, and user-facing queries. The production path sends sanitized batches to
@@ -11,16 +11,16 @@ a Cloudflare Worker backed by D1 and Better Auth device tokens.
 The CLI produces a sync batch with:
 
 ```sh
-cargo run -p ai-stats-cli -- sync --sink stdout
-cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
-cargo run -p ai-stats-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
-cargo run -p ai-stats-cli -- sync --sink http --verify
+cargo run -p statsai-cli -- sync --sink stdout
+cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
+cargo run -p statsai-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
+cargo run -p statsai-cli -- sync --sink http --verify
 ```
 
 The JSON Schema is available with:
 
 ```sh
-cargo run -p ai-stats-cli -- schema sync-batch
+cargo run -p statsai-cli -- schema sync-batch
 ```
 
 ## Privacy Defaults
@@ -51,25 +51,25 @@ display, but they are no longer the primary account key.
 ## Local HTTP Endpoint
 
 For local end-to-end development, run any compatible HTTP service and point the
-CLI at it. If `AI_STATS_API_URL` / `AI_STATS_WEB_URL` are unset, the CLI
+CLI at it. If `STATSAI_API_URL` / `STATSAI_WEB_URL` are unset, the CLI
 defaults to these localhost URLs and keeps that device session separate from
 any future hosted deployment:
 
 ```sh
-export AI_STATS_API_URL="http://127.0.0.1:8787"
-export AI_STATS_WEB_URL="http://127.0.0.1:3000"
-cargo run -p ai-stats-cli -- auth login
-cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
-cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
-cargo run -p ai-stats-cli -- sync --sink http --verify
-cargo run -p ai-stats-cli -- sync --status
+export STATSAI_API_URL="http://127.0.0.1:8787"
+export STATSAI_WEB_URL="http://127.0.0.1:3000"
+cargo run -p statsai-cli -- auth login
+cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
+cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
+cargo run -p statsai-cli -- sync --sink http --verify
+cargo run -p statsai-cli -- sync --status
 ```
 
 The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
 `/api/sync/batches` is the production contract. A compatible backend should:
 
 - require an authenticated device access token
-- accept `Authorization: Bearer <device_access_token>` from stored auth, `--auth-token`, or `AI_STATS_SYNC_TOKEN`
+- accept `Authorization: Bearer <device_access_token>` from stored auth, `--auth-token`, or `STATSAI_SYNC_TOKEN`
 - validate the request body against `sync_batch.v1`
 - reject unsupported `schema_version` values
 - deduplicate sources, accounts, source-account assignments, subscriptions, and summaries by their IDs when server-side deduplication is needed
@@ -123,7 +123,7 @@ sinks update state after their local write succeeds.
 ## Cloudflare Production Backend
 
 The production backend uses Better Auth on Cloudflare Workers plus D1. The CLI
-opens the web app configured by `AI_STATS_WEB_URL`, pairs the local device
+opens the web app configured by `STATSAI_WEB_URL`, pairs the local device
 through a loopback callback, stores a device refresh token in a backend-scoped
 local auth file, and sends sync batches to the Worker API:
 
@@ -138,17 +138,17 @@ auth/session/account tables in the same D1 database. That backend lives
 outside this public CLI repo.
 
 ```sh
-export AI_STATS_API_URL="https://api.example.com"
-export AI_STATS_WEB_URL="https://app.example.com"
-cargo run -p ai-stats-cli -- auth login
-cargo run -p ai-stats-cli -- auth status
-cargo run -p ai-stats-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
+export STATSAI_API_URL="https://api.example.com"
+export STATSAI_WEB_URL="https://app.example.com"
+cargo run -p statsai-cli -- auth login
+cargo run -p statsai-cli -- auth status
+cargo run -p statsai-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
 ```
 
 Auth token precedence for sync is:
 
 ```text
---auth-token > AI_STATS_SYNC_TOKEN > stored Cloudflare device access token
+--auth-token > STATSAI_SYNC_TOKEN > stored Cloudflare device access token
 ```
 
 The Worker rejects raw event cloud sync by default and accepts sanitized daily

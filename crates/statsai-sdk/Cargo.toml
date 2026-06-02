@@ -1,0 +1,18 @@
+[package]
+name = "statsai-sdk"
+description = "Public Rust SDK facade for statsai."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+statsai-adapters = { path = "../statsai-adapters" }
+statsai-core = { path = "../statsai-core" }
+statsai-store = { path = "../statsai-store" }
+statsai-sync = { path = "../statsai-sync" }
+anyhow.workspace = true
+chrono.workspace = true
+schemars.workspace = true
+serde.workspace = true

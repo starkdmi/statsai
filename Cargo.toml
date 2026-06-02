@@ -1,13 +1,13 @@
 [workspace]
 members = [
-  "crates/ai-stats-core",
-  "crates/ai-stats-adapters",
-  "crates/ai-stats-store",
-  "crates/ai-stats-sync",
-  "crates/ai-stats-daemon",
-  "crates/ai-stats-sdk",
-  "crates/ai-stats-cli",
-  "crates/ai-stats-pricing",
+  "crates/statsai-core",
+  "crates/statsai-adapters",
+  "crates/statsai-store",
+  "crates/statsai-sync",
+  "crates/statsai-daemon",
+  "crates/statsai-sdk",
+  "crates/statsai-cli",
+  "crates/statsai-pricing",
 ]
 resolver = "2"
 
@@ -15,7 +15,7 @@ resolver = "2"
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/starkdmi/ai-stats"
+repository = "https://github.com/starkdmi/statsai"
 authors = ["Dmitry Starkov"]
 description = "Local-first AI usage statistics CLI/SDK/daemon"
 keywords = ["ai", "cli", "usage", "statistics", "llm", "tokens", "coding"]

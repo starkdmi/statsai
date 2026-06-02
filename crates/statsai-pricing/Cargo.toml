@@ -1,0 +1,11 @@
+[package]
+name = "statsai-pricing"
+description = "Model pricing helpers for statsai."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+statsai-core = { path = "../statsai-core" }
