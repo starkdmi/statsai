@@ -215,6 +215,7 @@ fn exchange_cloudflare_device_code(
     let response = ureq::post(&url).send_json(serde_json::json!({
         "code": code,
         "state": state,
+        "deviceId": super::default_device_id(),
         "deviceName": default_device_name(),
         "platform": std::env::consts::OS,
         "collectorVersion": env!("CARGO_PKG_VERSION")
