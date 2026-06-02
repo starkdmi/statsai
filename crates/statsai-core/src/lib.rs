@@ -1264,26 +1264,12 @@ fn subscription_value_metrics(
         .unwrap_or((None, None))
 }
 
-fn display_account_identity(account: &ProviderAccount) -> String {
+pub fn display_account_identity(account: &ProviderAccount) -> String {
     account
         .account_label
         .as_deref()
         .filter(|label| !label.trim().is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            account
-                .email
-                .as_deref()
-                .filter(|email| !email.trim().is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .or_else(|| {
-            account
-                .provider_user_id
-                .as_deref()
-                .filter(|provider_user_id| !provider_user_id.trim().is_empty())
-                .map(ToOwned::to_owned)
-        })
         .unwrap_or_else(|| account.provider_account_id.0.clone())
 }
 
@@ -1623,7 +1609,7 @@ mod tests {
             schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
             subscription_id: subscription_id("codex", &account_id, "Plus", mk_dt(2026, 4, 30)),
             provider: "codex".to_string(),
-            provider_account_id: account_id,
+            provider_account_id: account_id.clone(),
             plan_name: "Plus".to_string(),
             price: 20.0,
             currency: "USD".to_string(),
@@ -1650,7 +1636,7 @@ mod tests {
         );
 
         assert_eq!(report.subscription_rows.len(), 1);
-        assert_eq!(report.subscription_rows[0].account, "verified@example.com");
+        assert_eq!(report.subscription_rows[0].account, account_id.0);
         assert_eq!(
             report.subscription_rows[0].ended_at,
             Some(mk_dt(2026, 5, 30))

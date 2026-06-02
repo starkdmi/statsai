@@ -12,7 +12,7 @@ use statsai_adapters::{
     ScanOptions, VerifiedSourceState,
 };
 use statsai_core::{
-    build_usage_report, expand_home_path, hash_text, home_dir, normalize_email,
+    build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir, normalize_email,
     normalize_provider_user_id, path_hash, periods_overlap, source_account_assignment_id,
     subscription_id, timestamp_in_period, BillingPeriod, IdentitySource, LocationOrigin,
     ProviderAccount, ProviderAccountId, ReportPeriod, SourceAccountAssignment,
@@ -1350,29 +1350,6 @@ fn account_reference_counts(
         events,
         summaries,
     })
-}
-
-fn display_account_identity(account: &ProviderAccount) -> String {
-    account
-        .account_label
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            account
-                .email
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .or_else(|| {
-            account
-                .provider_user_id
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| account.provider_account_id.0.clone())
 }
 
 fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
