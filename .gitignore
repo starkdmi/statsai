@@ -32,3 +32,5 @@ node_modules/
 *-debug.log
 .firebase/
 /functions
+DEPLOY.md
+PUBLISH.md
