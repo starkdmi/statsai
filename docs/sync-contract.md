@@ -28,7 +28,6 @@ cargo run -p ai-stats-cli -- schema sync-batch
 The current production sync path strips record-level local evidence before sending:
 
 - `SourceLocation.path_label`
-- `SourceLocation.account_alias`
 - `ProviderAccount.plan_name`
 - `UsageEvent.source.source_record_id`
 - `UsageEvent.parse_evidence.source_line_number`
@@ -38,14 +37,16 @@ The current production sync path strips record-level local evidence before sendi
 - `UsageSummary.parse_evidence.source_record_id`
 - `Subscription.notes`
 
-Hashed path, account, source, event, and summary identifiers remain so the
-server can deduplicate records without seeing local file names or provider/user
-identifiers directly.
+Hashed path, source, event, and summary identifiers remain so the server can
+deduplicate records without seeing local file names directly.
 
-For cloud account docs, a user-defined account alias (the local `--account`
-value) is retained in `ProviderAccount.account_label` for display. This alias is
-intended to be a safe logical bucket like `personal` or `work`, not a provider-
-verified identity.
+Canonical provider account identity may now sync through
+`ProviderAccount.provider_user_id` and `ProviderAccount.email`. The backend uses
+that identity to match time-bounded `source_account_assignments` and
+`subscriptions`.
+
+User-defined aliases are still retained in `ProviderAccount.account_label` for
+display, but they are no longer the primary account key.
 
 ## Local HTTP Endpoint
 
@@ -71,7 +72,7 @@ The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
 - accept `Authorization: Bearer <device_access_token>` from stored auth, `--auth-token`, or `AI_STATS_SYNC_TOKEN`
 - validate the request body against `sync_batch.v1`
 - reject unsupported `schema_version` values
-- deduplicate sources, accounts, subscriptions, and summaries by their IDs when server-side deduplication is needed
+- deduplicate sources, accounts, source-account assignments, subscriptions, and summaries by their IDs when server-side deduplication is needed
 - treat collector IDs as stable client-provided IDs, not database primary keys exposed to users
 - compute daily, monthly, and dashboard rollups server-side from accepted summaries
 - return accepted, updated, duplicate, and rejected counts
@@ -85,13 +86,18 @@ The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
   "accepted": {
     "sources": 1,
     "accounts": 1,
+    "source_account_assignments": 1,
     "subscriptions": 0,
     "events": 1,
     "summaries": 0
   },
   "duplicates": {
+    "sources": 0,
+    "accounts": 0,
+    "source_account_assignments": 0,
     "events": 0,
-    "summaries": 0
+    "summaries": 0,
+    "subscriptions": 0
   },
   "rejected": []
 }
@@ -99,7 +105,8 @@ The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
 
 The current loopback daemon returns this shape and reports duplicate events
 when the existing store already has the semantic event. Source, account,
-subscription, and summary upserts are currently reported as accepted writes.
+source-account assignment, subscription, and summary upserts are currently
+reported as accepted writes.
 
 ## Local Sync State
 
@@ -107,7 +114,8 @@ After a successful sync, the collector records local sync state keyed by sink
 and target. The state stores the last successful batch, event cursor, summary
 cursor, and failure count. Passing `--since-last` sends only events and
 summaries after the recorded cursor for that sink target while still including
-the current source, account, and subscription metadata.
+the current source, account, source-account assignment, and subscription
+metadata.
 
 The HTTP sink parses `sync_ack.v1` before updating local state. File and stdout
 sinks update state after their local write succeeds.
@@ -124,9 +132,10 @@ POST /api/sync/batches
 ```
 
 D1 stores app-owned tables for devices, device tokens, sources, provider
-accounts, subscriptions, daily rollups, monthly rollups, dashboard snapshots,
-and sync batch metadata. Better Auth owns its auth/session/account tables in
-the same D1 database. That backend lives outside this public CLI repo.
+accounts, source-account assignments, subscriptions, daily rollups, monthly
+rollups, dashboard snapshots, and sync batch metadata. Better Auth owns its
+auth/session/account tables in the same D1 database. That backend lives
+outside this public CLI repo.
 
 ```sh
 export AI_STATS_API_URL="https://api.example.com"

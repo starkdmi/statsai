@@ -31,15 +31,19 @@ The first adapters target Claude Code JSONL usage roots and Codex session logs. 
 
 ```sh
 cargo run -p ai-stats-cli -- scan --provider codex --preview
-cargo run -p ai-stats-cli -- source add --provider codex --path "$HOME/.codex-work" --account work
+cargo run -p ai-stats-cli -- source add --provider codex --path "$HOME/.codex-work"
 cargo run -p ai-stats-cli -- source disable --source-id src_123
 cargo run -p ai-stats-cli -- source enable --source-id src_123
 cargo run -p ai-stats-cli -- source remove --source-id src_123
 cargo run -p ai-stats-cli -- source remove --source-id src_123 --delete-data
-cargo run -p ai-stats-cli -- account resolve --provider codex
-cargo run -p ai-stats-cli -- subscription add --provider claude --account personal --plan Pro --price 20 --paid-at 2026-05-15
+cargo run -p ai-stats-cli -- source connect --path "$HOME/.codex-work" --email work@example.com --label work --started-at 2026-05-01
+cargo run -p ai-stats-cli -- source history --path "$HOME/.codex-work"
+cargo run -p ai-stats-cli -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
+cargo run -p ai-stats-cli -- subscription add --provider claude --email personal@example.com --plan Pro --price 20 --started-at 2026-05-15 --paid-at 2026-05-15
+cargo run -p ai-stats-cli -- subscription change --provider codex --email work@example.com --plan Pro --price 200 --started-at 2026-06-01
 cargo run -p ai-stats-cli -- import summary --path ./reported_usage_summaries.json --dry-run --verbose
 cargo run -p ai-stats-cli -- report weekly
+cargo run -p ai-stats-cli -- report monthly --subscriptions
 cargo run -p ai-stats-cli -- sync --sink file --output ./ai-stats-sync-batch.json
 cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
 cargo run -p ai-stats-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
@@ -51,7 +55,16 @@ cargo run -p ai-stats-cli -- sync --sink http --verify
 cargo run -p ai-stats-cli -- schema sync-batch
 ```
 
-`source add --account ...` uses a user-defined account alias, not a provider-verified identity. Aliases like `personal`, `work`, or `mini` are stable grouping buckets that determine how sources roll up into provider accounts locally and in the hosted dashboard.
+The primary model is:
+
+- add a source path with `source add --provider ... --path ...`
+- connect that source to a canonical account with `source connect --email ... --started-at ...`
+- register time-bounded subscription periods with `subscription add --started-at ...`
+
+`account list` is read-only. Canonical accounts are created implicitly the first
+time you use `--email`, `--provider-user-id`, or `--provider-account-id` on a
+source connection or subscription command. Labels like `personal` or `work` are
+display metadata only, not account identity.
 
 `scan --preview` reads configured and default local sources without writing to SQLite. It reports normalized usage events, not raw log rows, and shows the token split when the provider logs expose it:
 
@@ -63,7 +76,11 @@ codex account=work path=~/.codex-work usage_events=123 input=1,000,000 cached=80
 Normal scans now keep a lightweight per-source file signature cache in SQLite and skip unchanged JSONL/stat summary files, so repeat scans usually only parse the currently active log files. The diagnostics line includes `cached=` for files skipped as unchanged.
 Use `scan --no-cache` for a one-off forced reread without deleting existing data first, or `scan --replace` for a destructive source rebuild.
 
-`report weekly`, `report monthly`, and `report all-time` group stored usage by provider and account. Text output is human-readable; `--json --verbose` includes source IDs, local path labels, token split totals, and `estimated_cost_usd` for SDKs or scripts.
+`report weekly`, `report monthly`, and `report all-time` group stored usage by
+provider and account. Add `--subscriptions` to include per-subscription-period
+value rows matched by account identity and event date. Text output is human-
+readable; `--json --verbose` includes source IDs, local path labels, token
+split totals, and `estimated_cost_usd` for SDKs or scripts.
 
 `import summary` accepts a single `reported_usage_summary_input.v1` object or an array of them. Use it for user-reported or external aggregate evidence when raw local history is gone or incomplete. Imported summaries are idempotent and are shown under `summary reports (not added to event totals)` with their source paths, summary kind, token split, and the gap versus direct local events.
 
@@ -114,6 +131,9 @@ Source management helpers:
 
 ```sh
 cargo run -p ai-stats-cli -- source list
+cargo run -p ai-stats-cli -- source connect --path "$HOME/.codex-work" --email work@example.com --started-at 2026-05-01
+cargo run -p ai-stats-cli -- source history --path "$HOME/.codex-work"
+cargo run -p ai-stats-cli -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
 cargo run -p ai-stats-cli -- source disable --source-id src_123
 cargo run -p ai-stats-cli -- source enable --source-id src_123
 cargo run -p ai-stats-cli -- source remove --source-id src_123

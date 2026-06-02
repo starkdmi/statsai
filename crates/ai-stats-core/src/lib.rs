@@ -11,6 +11,7 @@ pub const USAGE_SUMMARY_SCHEMA_VERSION: &str = "usage_summary.v1";
 pub const REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION: &str = "reported_usage_summary_input.v1";
 pub const SOURCE_LOCATION_SCHEMA_VERSION: &str = "source_location.v1";
 pub const PROVIDER_ACCOUNT_SCHEMA_VERSION: &str = "provider_account.v1";
+pub const SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION: &str = "source_account_assignment.v1";
 pub const SUBSCRIPTION_SCHEMA_VERSION: &str = "subscription.v1";
 pub const DAILY_ROLLUP_SCHEMA_VERSION: &str = "daily_rollup.v1";
 pub const SYNC_BATCH_SCHEMA_VERSION: &str = "sync_batch.v1";
@@ -27,6 +28,10 @@ pub struct ProviderAccountId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct SubscriptionId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct SourceAccountAssignmentId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
@@ -105,6 +110,15 @@ pub enum PrivacyMode {
     EnrichedSummaries,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationMode {
+    #[default]
+    Auto,
+    ManualOnly,
+    Disabled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceLocation {
     pub schema_version: String,
@@ -116,9 +130,11 @@ pub struct SourceLocation {
     pub adapter_version: Option<String>,
     pub path_hash: Option<String>,
     pub path_label: Option<String>,
-    #[serde(default, alias = "account_hint")]
-    pub account_alias: Option<String>,
     pub enabled: bool,
+    #[serde(default)]
+    pub verification_mode: SourceVerificationMode,
+    #[serde(default)]
+    pub verified_state_hash: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -129,13 +145,31 @@ pub struct ProviderAccount {
     pub provider_account_id: ProviderAccountId,
     pub provider: String,
     pub identity_source: IdentitySource,
+    pub provider_user_id: Option<String>,
+    pub email: Option<String>,
     pub provider_user_id_hash: Option<String>,
     pub email_hash: Option<String>,
     pub org_id_hash: Option<String>,
     pub account_label: Option<String>,
     pub plan_name: Option<String>,
     pub confidence: Confidence,
-    pub source_ids: Vec<SourceId>,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SourceAccountAssignment {
+    pub schema_version: String,
+    pub assignment_id: SourceAccountAssignmentId,
+    pub source_id: SourceId,
+    pub provider: String,
+    pub provider_account_id: ProviderAccountId,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_identity_source_unknown")]
+    pub record_source: IdentitySource,
+    pub verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -145,18 +179,46 @@ pub struct Subscription {
     pub schema_version: String,
     pub subscription_id: SubscriptionId,
     pub provider: String,
-    pub provider_account_id: Option<ProviderAccountId>,
-    pub source_ids: Vec<SourceId>,
+    pub provider_account_id: ProviderAccountId,
     pub plan_name: String,
     pub price: f64,
     pub currency: String,
     pub billing_period: BillingPeriod,
     pub paid_at: Option<DateTime<Utc>>,
     pub renewal_day: Option<u8>,
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+    pub current_period_ends_at: Option<DateTime<Utc>>,
     pub status: SubscriptionStatus,
+    #[serde(default = "default_identity_source_unknown")]
+    pub record_source: IdentitySource,
+    pub verified_at: Option<DateTime<Utc>>,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct VerifiedSourceState {
+    pub provider_user_id: Option<String>,
+    pub email: Option<String>,
+    pub account_label: Option<String>,
+    pub plan_name: Option<String>,
+    pub authenticated_at: Option<DateTime<Utc>>,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub subscription: Option<VerifiedSubscriptionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct VerifiedSubscriptionState {
+    pub plan_name: String,
+    pub price: f64,
+    pub currency: String,
+    pub billing_period: BillingPeriod,
+    pub paid_at: Option<DateTime<Utc>>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub current_period_ends_at: Option<DateTime<Utc>>,
+    pub status: SubscriptionStatus,
+    pub verified_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -323,10 +385,17 @@ pub struct SyncBatch {
     pub schema_version: String,
     pub batch_id: String,
     pub device_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<SourceLocation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accounts: Vec<ProviderAccount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_account_assignments: Vec<SourceAccountAssignment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscriptions: Vec<Subscription>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<UsageEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub summaries: Vec<UsageSummary>,
     pub created_at: DateTime<Utc>,
 }
@@ -335,6 +404,8 @@ pub struct SyncBatch {
 pub struct SyncEntityCounts {
     pub sources: u64,
     pub accounts: u64,
+    #[serde(default)]
+    pub source_account_assignments: u64,
     pub subscriptions: u64,
     pub events: u64,
     pub summaries: u64,
@@ -383,7 +454,6 @@ impl SourceLocation {
         adapter_version: impl Into<String>,
         path: &Path,
         location_origin: LocationOrigin,
-        account_alias: Option<String>,
     ) -> Self {
         let provider = provider.into();
         let adapter_id = adapter_id.into();
@@ -402,8 +472,9 @@ impl SourceLocation {
             adapter_version: Some(adapter_version),
             path_hash: Some(path_hash),
             path_label: Some(canonical_display(path)),
-            account_alias,
             enabled: true,
+            verification_mode: SourceVerificationMode::Auto,
+            verified_state_hash: None,
             created_at: now,
             updated_at: now,
         }
@@ -415,7 +486,6 @@ impl SourceLocation {
         adapter_id: impl Into<String>,
         adapter_version: impl Into<String>,
         path: &Path,
-        account_alias: Option<String>,
     ) -> Self {
         let provider = provider.into();
         let adapter_id = adapter_id.into();
@@ -434,8 +504,9 @@ impl SourceLocation {
             adapter_version: Some(adapter_version),
             path_hash: Some(path_hash),
             path_label: Some(canonical_display(path)),
-            account_alias,
             enabled: true,
+            verification_mode: SourceVerificationMode::Disabled,
+            verified_state_hash: None,
             created_at: now,
             updated_at: now,
         }
@@ -449,7 +520,6 @@ impl SourceLocation {
         adapter_version: impl Into<String>,
         evidence_key: impl AsRef<str>,
         path_label: Option<String>,
-        account_alias: Option<String>,
     ) -> Self {
         let provider = provider.into();
         let adapter_id = adapter_id.into();
@@ -468,8 +538,9 @@ impl SourceLocation {
             adapter_version: Some(adapter_version),
             path_hash: Some(path_hash),
             path_label,
-            account_alias,
             enabled: true,
+            verification_mode: SourceVerificationMode::Disabled,
+            verified_state_hash: None,
             created_at: now,
             updated_at: now,
         }
@@ -521,15 +592,75 @@ pub fn provider_account_id(provider: &str, stable_key: &str) -> ProviderAccountI
 }
 
 #[must_use]
+pub fn normalize_provider_user_id(value: &str) -> String {
+    value.trim().to_string()
+}
+
+#[must_use]
+pub fn normalize_email(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn default_identity_source_unknown() -> IdentitySource {
+    IdentitySource::Unknown
+}
+
+#[must_use]
+pub fn provider_account_stable_key(
+    provider_user_id: Option<&str>,
+    email: Option<&str>,
+) -> Option<String> {
+    provider_user_id
+        .map(normalize_provider_user_id)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("uid:{value}"))
+        .or_else(|| {
+            email
+                .map(normalize_email)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("email:{value}"))
+        })
+}
+
+#[must_use]
+pub fn provider_account_id_from_identity(
+    provider: &str,
+    provider_user_id: Option<&str>,
+    email: Option<&str>,
+) -> Option<ProviderAccountId> {
+    provider_account_stable_key(provider_user_id, email)
+        .map(|stable_key| provider_account_id(provider, &stable_key))
+}
+
+#[must_use]
+pub fn source_account_assignment_id(
+    source_id: &SourceId,
+    account: &ProviderAccountId,
+    started_at: DateTime<Utc>,
+) -> SourceAccountAssignmentId {
+    SourceAccountAssignmentId(format!(
+        "assign_{}",
+        &hash_text(&format!(
+            "{}:{}:{}",
+            source_id.0,
+            account.0,
+            started_at.to_rfc3339()
+        ))[..24]
+    ))
+}
+
+#[must_use]
 pub fn subscription_id(
     provider: &str,
-    account: Option<&ProviderAccountId>,
+    account: &ProviderAccountId,
     plan: &str,
+    started_at: DateTime<Utc>,
 ) -> SubscriptionId {
-    let account_key = account.map(|id| id.0.as_str()).unwrap_or("unlinked");
+    let account_key = account.0.as_str();
+    let started_at_key = started_at.to_rfc3339();
     SubscriptionId(format!(
         "sub_{}",
-        &hash_text(&format!("{provider}:{account_key}:{plan}"))[..24]
+        &hash_text(&format!("{provider}:{account_key}:{plan}:{started_at_key}"))[..24]
     ))
 }
 
@@ -725,12 +856,32 @@ pub struct SummaryReportRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct SubscriptionReportRow {
+    pub subscription_id: SubscriptionId,
+    pub provider: String,
+    pub provider_account_id: ProviderAccountId,
+    pub account: String,
+    pub plan_name: String,
+    pub price: f64,
+    pub currency: String,
+    pub billing_period: BillingPeriod,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub status: SubscriptionStatus,
+    pub events: u64,
+    pub usage: UsageTotals,
+    pub value_minus_price_usd: Option<f64>,
+    pub value_to_price_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct UsageReport {
     pub label: String,
     pub since: Option<DateTime<Utc>>,
     pub until: DateTime<Utc>,
     pub rows: Vec<UsageReportRow>,
     pub summary_rows: Vec<SummaryReportRow>,
+    pub subscription_rows: Vec<SubscriptionReportRow>,
     pub total_events: u64,
     pub total_usage: UsageTotals,
     pub total_summary_usage: UsageTotals,
@@ -742,6 +893,7 @@ pub fn build_usage_report(
     summaries: &[UsageSummary],
     sources: &[SourceLocation],
     accounts: &[ProviderAccount],
+    subscriptions: &[Subscription],
     period: ReportPeriod,
     now: DateTime<Utc>,
 ) -> UsageReport {
@@ -774,7 +926,7 @@ pub fn build_usage_report(
         }
 
         let source = source_by_id.get(event.source_id.0.as_str()).copied();
-        let account = report_account_label(event, source, &account_by_id);
+        let account = report_account_label(event, &account_by_id);
         let key = (event.provider.clone(), account.clone());
         let row = rows.entry(key).or_insert_with(|| UsageReportRow {
             provider: event.provider.clone(),
@@ -801,17 +953,11 @@ pub fn build_usage_report(
 
             let source = source_by_id.get(summary.source_id.0.as_str()).copied();
             let account =
-                report_identity_label(summary.provider_account_id.as_ref(), source, &account_by_id);
+                report_identity_label(summary.provider_account_id.as_ref(), &account_by_id);
             let kind = summary.metadata.summary_format.clone();
             let key = (summary.provider.clone(), account.clone(), kind.clone());
-            let direct_overlap_usage = direct_usage_for_summary(
-                summary,
-                &account,
-                events,
-                &source_by_id,
-                &account_by_id,
-                now,
-            );
+            let direct_overlap_usage =
+                direct_usage_for_summary(summary, &account, events, &account_by_id, now);
             let exact_overlap =
                 summary_usage_matches_direct_overlap(summary, &direct_overlap_usage);
             let row = summary_rows
@@ -872,6 +1018,8 @@ pub fn build_usage_report(
     for row in &summary_rows {
         total_summary_usage.add_totals(&row.usage);
     }
+    let subscription_rows =
+        build_subscription_report_rows(events, subscriptions, &account_by_id, since, now);
 
     UsageReport {
         label,
@@ -879,25 +1027,21 @@ pub fn build_usage_report(
         until: now,
         rows,
         summary_rows,
+        subscription_rows,
         total_events,
         total_usage,
         total_summary_usage,
     }
 }
 
-fn report_account_label(
-    event: &UsageEvent,
-    source: Option<&SourceLocation>,
-    accounts: &BTreeMap<&str, &ProviderAccount>,
-) -> String {
-    report_identity_label(event.provider_account_id.as_ref(), source, accounts)
+fn report_account_label(event: &UsageEvent, accounts: &BTreeMap<&str, &ProviderAccount>) -> String {
+    report_identity_label(event.provider_account_id.as_ref(), accounts)
 }
 
 fn direct_usage_for_summary(
     summary: &UsageSummary,
     summary_account: &str,
     events: &[UsageEvent],
-    sources: &BTreeMap<&str, &SourceLocation>,
     accounts: &BTreeMap<&str, &ProviderAccount>,
     now: DateTime<Utc>,
 ) -> UsageTotals {
@@ -911,8 +1055,7 @@ fn direct_usage_for_summary(
         {
             continue;
         }
-        let source = sources.get(event.source_id.0.as_str()).copied();
-        if report_account_label(event, source, accounts) != summary_account {
+        if report_account_label(event, accounts) != summary_account {
             continue;
         }
         usage.add_event(event);
@@ -939,24 +1082,16 @@ fn summary_usage_matches_direct_overlap(summary: &UsageSummary, direct: &UsageTo
 
 fn report_identity_label(
     provider_account_id: Option<&ProviderAccountId>,
-    source: Option<&SourceLocation>,
     accounts: &BTreeMap<&str, &ProviderAccount>,
 ) -> String {
     if let Some(account_id) = provider_account_id {
         if let Some(account) = accounts.get(account_id.0.as_str()) {
-            if let Some(label) = account.account_label.as_deref() {
-                return label.to_string();
-            }
-        }
-    }
-    if let Some(source) = source {
-        if let Some(label) = source.account_alias.as_deref() {
-            return label.to_string();
+            return display_account_identity(account);
         }
     }
     provider_account_id
         .map(|id| id.0.clone())
-        .unwrap_or_else(|| "unmapped".to_string())
+        .unwrap_or_else(|| "unassigned".to_string())
 }
 
 fn preview_path_label(source: &SourceLocation) -> String {
@@ -968,6 +1103,188 @@ fn preview_path_label(source: &SourceLocation) -> String {
         }
     }
     path.to_string()
+}
+
+#[must_use]
+pub fn timestamp_in_period(
+    timestamp: DateTime<Utc>,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+) -> bool {
+    timestamp >= started_at
+        && ended_at
+            .map(|ended_at| timestamp < ended_at)
+            .unwrap_or(true)
+}
+
+#[must_use]
+pub fn periods_overlap(
+    left_started_at: DateTime<Utc>,
+    left_ended_at: Option<DateTime<Utc>>,
+    right_started_at: DateTime<Utc>,
+    right_ended_at: Option<DateTime<Utc>>,
+) -> bool {
+    let left_end = left_ended_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let right_end = right_ended_at.unwrap_or(DateTime::<Utc>::MAX_UTC);
+    left_started_at < right_end && right_started_at < left_end
+}
+
+fn build_subscription_report_rows(
+    events: &[UsageEvent],
+    subscriptions: &[Subscription],
+    accounts: &BTreeMap<&str, &ProviderAccount>,
+    since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Vec<SubscriptionReportRow> {
+    let mut rows = Vec::new();
+    for subscription in subscriptions {
+        let provider_account_id = &subscription.provider_account_id;
+        let started_at = subscription.started_at;
+        let ended_at = effective_subscription_ended_at(subscription);
+        if !subscription_intersects_report_window(started_at, ended_at, since, now) {
+            continue;
+        }
+        let mut usage = UsageTotals::default();
+        let mut events_count = 0u64;
+        for event in events {
+            if event.provider != subscription.provider {
+                continue;
+            }
+            if event.provider_account_id.as_ref() != Some(provider_account_id) {
+                continue;
+            }
+            if since.is_some_and(|since| event.session.started_at < since)
+                || event.session.started_at > now
+            {
+                continue;
+            }
+            if !timestamp_in_period(event.session.started_at, started_at, ended_at) {
+                continue;
+            }
+            events_count += 1;
+            usage.add_event(event);
+        }
+        let account = accounts
+            .get(provider_account_id.0.as_str())
+            .map(|account| display_account_identity(account))
+            .unwrap_or_else(|| provider_account_id.0.clone());
+        let (value_minus_price_usd, value_to_price_ratio) = subscription_value_metrics(
+            subscription.price,
+            &subscription.currency,
+            usage.estimated_cost_usd,
+        );
+        rows.push(SubscriptionReportRow {
+            subscription_id: subscription.subscription_id.clone(),
+            provider: subscription.provider.clone(),
+            provider_account_id: provider_account_id.clone(),
+            account,
+            plan_name: subscription.plan_name.clone(),
+            price: subscription.price,
+            currency: subscription.currency.clone(),
+            billing_period: subscription.billing_period.clone(),
+            started_at,
+            ended_at,
+            status: subscription.status.clone(),
+            events: events_count,
+            usage,
+            value_minus_price_usd,
+            value_to_price_ratio,
+        });
+    }
+    rows.sort_by(|left, right| {
+        right
+            .usage
+            .total_tokens
+            .cmp(&left.usage.total_tokens)
+            .then_with(|| left.started_at.cmp(&right.started_at))
+            .then_with(|| left.plan_name.cmp(&right.plan_name))
+    });
+    rows
+}
+
+fn effective_subscription_ended_at(subscription: &Subscription) -> Option<DateTime<Utc>> {
+    if is_legacy_open_verified_subscription(subscription) {
+        None
+    } else {
+        subscription.ended_at
+    }
+}
+
+fn is_legacy_open_verified_subscription(subscription: &Subscription) -> bool {
+    subscription.status == SubscriptionStatus::Active
+        && is_verified_subscription_source(&subscription.record_source)
+        && subscription.ended_at.is_some()
+        && subscription.ended_at == subscription.current_period_ends_at
+}
+
+fn is_verified_subscription_source(source: &IdentitySource) -> bool {
+    matches!(
+        source,
+        IdentitySource::LocalAuth
+            | IdentitySource::ProviderAuth
+            | IdentitySource::ProviderApi
+            | IdentitySource::CookieOauth
+            | IdentitySource::CliProbe
+    )
+}
+
+fn subscription_intersects_report_window(
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    if started_at > now {
+        return false;
+    }
+    let window_start = since.unwrap_or(DateTime::<Utc>::MIN_UTC);
+    periods_overlap(
+        started_at,
+        ended_at,
+        window_start,
+        Some(now + Duration::seconds(1)),
+    )
+}
+
+fn subscription_value_metrics(
+    price: f64,
+    currency: &str,
+    estimated_cost_usd: Option<f64>,
+) -> (Option<f64>, Option<f64>) {
+    if !currency.eq_ignore_ascii_case("USD") || price <= 0.0 {
+        return (None, None);
+    }
+    estimated_cost_usd
+        .map(|estimated_cost_usd| {
+            (
+                Some(estimated_cost_usd - price),
+                Some(estimated_cost_usd / price),
+            )
+        })
+        .unwrap_or((None, None))
+}
+
+fn display_account_identity(account: &ProviderAccount) -> String {
+    account
+        .account_label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            account
+                .email
+                .as_deref()
+                .filter(|email| !email.trim().is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            account
+                .provider_user_id
+                .as_deref()
+                .filter(|provider_user_id| !provider_user_id.trim().is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| account.provider_account_id.0.clone())
 }
 
 #[cfg(test)]
@@ -1010,28 +1327,6 @@ mod tests {
         assert!(json.get("title").is_some());
     }
 
-    #[test]
-    fn source_location_deserializes_legacy_account_hint_field() {
-        let value = serde_json::json!({
-            "schema_version": SOURCE_LOCATION_SCHEMA_VERSION,
-            "source_id": "src_test",
-            "provider": "codex",
-            "source_kind": "local_adapter",
-            "location_origin": "configured",
-            "adapter_id": "codex-local-jsonl",
-            "adapter_version": "0.0.1",
-            "path_hash": "hash",
-            "path_label": "/tmp/test",
-            "account_hint": "personal",
-            "enabled": true,
-            "created_at": "2026-05-30T00:00:00Z",
-            "updated_at": "2026-05-30T00:00:00Z"
-        });
-
-        let source: SourceLocation = serde_json::from_value(value).expect("legacy source");
-        assert_eq!(source.account_alias.as_deref(), Some("personal"));
-    }
-
     fn test_source(provider: &str, path: &str) -> SourceLocation {
         SourceLocation::local_adapter(
             provider,
@@ -1039,7 +1334,6 @@ mod tests {
             "0",
             Path::new(path),
             LocationOrigin::Configured,
-            None,
         )
     }
 
@@ -1177,7 +1471,7 @@ mod tests {
     #[test]
     fn report_empty_inputs_returns_zero_totals() {
         let now = mk_dt(2026, 5, 25);
-        let report = build_usage_report(&[], &[], &[], &[], ReportPeriod::AllTime, now);
+        let report = build_usage_report(&[], &[], &[], &[], &[], ReportPeriod::AllTime, now);
         assert_eq!(report.total_events, 0);
         assert_eq!(report.total_usage.total_tokens, 0);
         assert!(report.rows.is_empty());
@@ -1195,6 +1489,7 @@ mod tests {
             &[recent, old],
             &[],
             &[source],
+            &[],
             &[],
             ReportPeriod::LastDays(7),
             now,
@@ -1216,6 +1511,7 @@ mod tests {
             &[],
             &[source],
             &[],
+            &[],
             ReportPeriod::AllTime,
             now,
         );
@@ -1231,7 +1527,8 @@ mod tests {
         let e1 = test_event("codex", &src, now, 100, None);
         let e2 = test_event("codex", &src, now, 200, None);
 
-        let report = build_usage_report(&[e1, e2], &[], &[src], &[], ReportPeriod::AllTime, now);
+        let report =
+            build_usage_report(&[e1, e2], &[], &[src], &[], &[], ReportPeriod::AllTime, now);
 
         assert_eq!(report.rows.len(), 1);
         assert_eq!(report.rows[0].provider, "codex");
@@ -1258,6 +1555,7 @@ mod tests {
             &[summary],
             &[src],
             &[],
+            &[],
             ReportPeriod::AllTime,
             now,
         );
@@ -1282,10 +1580,153 @@ mod tests {
             500,
         );
 
-        let report =
-            build_usage_report(&[], &[summary], &[src], &[], ReportPeriod::LastDays(7), now);
+        let report = build_usage_report(
+            &[],
+            &[summary],
+            &[src],
+            &[],
+            &[],
+            ReportPeriod::LastDays(7),
+            now,
+        );
 
         assert!(report.summary_rows.is_empty());
+    }
+
+    #[test]
+    fn subscription_rows_respect_past_end_time() {
+        let now = mk_dt(2026, 6, 1);
+        let src = test_source("codex", "/tmp/codex");
+        let account_id = provider_account_id("codex", "email:verified@example.com");
+        let account = ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id: account_id.clone(),
+            provider: "codex".to_string(),
+            identity_source: IdentitySource::LocalAuth,
+            provider_user_id: Some("11111111-2222-4333-8444-555555555555".to_string()),
+            provider_user_id_hash: None,
+            email: Some("verified@example.com".to_string()),
+            email_hash: None,
+            org_id_hash: None,
+            account_label: None,
+            plan_name: Some("Plus".to_string()),
+            confidence: Confidence::High,
+            verified_at: Some(mk_dt(2026, 5, 3)),
+            created_at: mk_dt(2026, 5, 3),
+            updated_at: mk_dt(2026, 5, 3),
+        };
+        let mut before_end = test_event("codex", &src, mk_dt(2026, 5, 29), 100, Some(1.0));
+        before_end.provider_account_id = Some(account_id.clone());
+        let mut after_end = test_event("codex", &src, mk_dt(2026, 5, 31), 200, Some(2.0));
+        after_end.provider_account_id = Some(account_id.clone());
+        let subscription = Subscription {
+            schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+            subscription_id: subscription_id("codex", &account_id, "Plus", mk_dt(2026, 4, 30)),
+            provider: "codex".to_string(),
+            provider_account_id: account_id,
+            plan_name: "Plus".to_string(),
+            price: 20.0,
+            currency: "USD".to_string(),
+            billing_period: BillingPeriod::Monthly,
+            paid_at: Some(mk_dt(2026, 4, 30)),
+            renewal_day: Some(30),
+            started_at: mk_dt(2026, 4, 30),
+            ended_at: Some(mk_dt(2026, 5, 30)),
+            current_period_ends_at: Some(mk_dt(2026, 5, 30)),
+            status: SubscriptionStatus::Cancelled,
+            record_source: IdentitySource::LocalAuth,
+            verified_at: Some(mk_dt(2026, 5, 3)),
+            notes: None,
+        };
+
+        let report = build_usage_report(
+            &[before_end, after_end],
+            &[],
+            &[src],
+            &[account],
+            &[subscription],
+            ReportPeriod::LastDays(30),
+            now,
+        );
+
+        assert_eq!(report.subscription_rows.len(), 1);
+        assert_eq!(report.subscription_rows[0].account, "verified@example.com");
+        assert_eq!(
+            report.subscription_rows[0].ended_at,
+            Some(mk_dt(2026, 5, 30))
+        );
+        assert_eq!(report.subscription_rows[0].events, 1);
+        assert_eq!(report.subscription_rows[0].usage.total_tokens, 100);
+        assert_eq!(
+            report.subscription_rows[0].usage.estimated_cost_usd,
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn subscription_rows_keep_legacy_verified_cycle_rows_open() {
+        let now = mk_dt(2026, 6, 1);
+        let src = test_source("codex", "/tmp/codex");
+        let account_id = provider_account_id("codex", "email:verified@example.com");
+        let account = ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id: account_id.clone(),
+            provider: "codex".to_string(),
+            identity_source: IdentitySource::LocalAuth,
+            provider_user_id: None,
+            provider_user_id_hash: None,
+            email: Some("verified@example.com".to_string()),
+            email_hash: None,
+            org_id_hash: None,
+            account_label: None,
+            plan_name: Some("Plus".to_string()),
+            confidence: Confidence::High,
+            verified_at: Some(mk_dt(2026, 5, 3)),
+            created_at: mk_dt(2026, 5, 3),
+            updated_at: mk_dt(2026, 5, 3),
+        };
+        let mut before_cycle_end = test_event("codex", &src, mk_dt(2026, 5, 29), 100, Some(1.0));
+        before_cycle_end.provider_account_id = Some(account_id.clone());
+        let mut after_cycle_end = test_event("codex", &src, mk_dt(2026, 5, 31), 200, Some(2.0));
+        after_cycle_end.provider_account_id = Some(account_id.clone());
+        let subscription = Subscription {
+            schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+            subscription_id: subscription_id("codex", &account_id, "Plus", mk_dt(2026, 4, 30)),
+            provider: "codex".to_string(),
+            provider_account_id: account_id,
+            plan_name: "Plus".to_string(),
+            price: 20.0,
+            currency: "USD".to_string(),
+            billing_period: BillingPeriod::Monthly,
+            paid_at: Some(mk_dt(2026, 4, 30)),
+            renewal_day: Some(30),
+            started_at: mk_dt(2026, 4, 30),
+            ended_at: Some(mk_dt(2026, 5, 30)),
+            current_period_ends_at: Some(mk_dt(2026, 5, 30)),
+            status: SubscriptionStatus::Active,
+            record_source: IdentitySource::LocalAuth,
+            verified_at: Some(mk_dt(2026, 5, 3)),
+            notes: None,
+        };
+
+        let report = build_usage_report(
+            &[before_cycle_end, after_cycle_end],
+            &[],
+            &[src],
+            &[account],
+            &[subscription],
+            ReportPeriod::LastDays(30),
+            now,
+        );
+
+        assert_eq!(report.subscription_rows.len(), 1);
+        assert_eq!(report.subscription_rows[0].ended_at, None);
+        assert_eq!(report.subscription_rows[0].events, 2);
+        assert_eq!(report.subscription_rows[0].usage.total_tokens, 300);
+        assert_eq!(
+            report.subscription_rows[0].usage.estimated_cost_usd,
+            Some(3.0)
+        );
     }
 
     #[test]
@@ -1298,13 +1739,15 @@ mod tests {
             provider_account_id: acct_id.clone(),
             provider: "codex".to_string(),
             identity_source: IdentitySource::UserConfigured,
+            provider_user_id: None,
             provider_user_id_hash: None,
+            email: None,
             email_hash: None,
             org_id_hash: None,
             account_label: Some("work".to_string()),
             plan_name: None,
             confidence: Confidence::Medium,
-            source_ids: vec![src.source_id.clone()],
+            verified_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -1316,6 +1759,7 @@ mod tests {
             &[],
             &[src],
             &[account],
+            &[],
             ReportPeriod::AllTime,
             now,
         );
@@ -1330,7 +1774,8 @@ mod tests {
         let e1 = test_event("codex", &src, now, 100, Some(0.01));
         let e2 = test_event("codex", &src, now, 200, Some(0.02));
 
-        let report = build_usage_report(&[e1, e2], &[], &[src], &[], ReportPeriod::AllTime, now);
+        let report =
+            build_usage_report(&[e1, e2], &[], &[src], &[], &[], ReportPeriod::AllTime, now);
 
         assert_eq!(report.total_usage.estimated_cost_usd, Some(0.03));
     }

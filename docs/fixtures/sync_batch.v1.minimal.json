@@ -4,6 +4,7 @@
   "device_id": "device_fixture",
   "sources": [],
   "accounts": [],
+  "source_account_assignments": [],
   "subscriptions": [],
   "events": [],
   "summaries": [],

@@ -1,14 +1,21 @@
 //! Local SQLite storage for `ai-stats`.
 
 use ai_stats_core::{
-    hash_text, semantic_event_fingerprint, summary_id, Confidence, CostInfo, DailyRollup,
-    EventSource, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, SemanticFingerprintInput,
-    SourceId, SourceLocation, Subscription, SummaryId, SummaryMetadata, SummaryModelUsage,
-    UsageCounts, UsageEvent, UsageSummary, USAGE_SUMMARY_SCHEMA_VERSION,
+    hash_text, normalize_email, normalize_provider_user_id, periods_overlap, provider_account_id,
+    provider_account_id_from_identity, semantic_event_fingerprint, source_account_assignment_id,
+    subscription_id, summary_id, timestamp_in_period, BillingPeriod, Confidence, CostInfo,
+    DailyRollup, EventSource, IdentitySource, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount,
+    ProviderAccountId, SemanticFingerprintInput, SourceAccountAssignment,
+    SourceAccountAssignmentId, SourceId, SourceLocation, SourceVerificationMode, Subscription,
+    SubscriptionId, SubscriptionStatus, SummaryId, SummaryMetadata, SummaryModelUsage, UsageCounts,
+    UsageEvent, UsageSummary, VerifiedSourceState, VerifiedSubscriptionState,
+    PROVIDER_ACCOUNT_SCHEMA_VERSION, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    SUBSCRIPTION_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
-use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, Utc};
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -29,6 +36,94 @@ pub struct SyncState {
 pub struct ScanFileStateEntry {
     pub cache_key: String,
     pub cache_signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscriptionCompat {
+    #[serde(default = "default_subscription_schema_version")]
+    schema_version: String,
+    subscription_id: SubscriptionId,
+    provider: String,
+    provider_account_id: Option<ProviderAccountId>,
+    plan_name: String,
+    price: f64,
+    currency: String,
+    billing_period: BillingPeriod,
+    paid_at: Option<DateTime<Utc>>,
+    renewal_day: Option<u8>,
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+    current_period_ends_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_subscription_status_active")]
+    status: SubscriptionStatus,
+    #[serde(default = "default_identity_source_unknown")]
+    record_source: IdentitySource,
+    verified_at: Option<DateTime<Utc>>,
+    notes: Option<String>,
+}
+
+fn default_subscription_schema_version() -> String {
+    SUBSCRIPTION_SCHEMA_VERSION.to_string()
+}
+
+fn default_subscription_status_active() -> SubscriptionStatus {
+    SubscriptionStatus::Active
+}
+
+fn default_identity_source_unknown() -> IdentitySource {
+    IdentitySource::Unknown
+}
+
+fn deserialize_subscription_payload(
+    payload: &str,
+    provider_account_id_column: Option<&str>,
+) -> Result<Subscription> {
+    if let Ok(subscription) = serde_json::from_str(payload) {
+        return Ok(subscription);
+    }
+
+    let compat: SubscriptionCompat =
+        serde_json::from_str(payload).context("deserialize legacy subscription payload")?;
+    let provider_account_id = compat
+        .provider_account_id
+        .or_else(|| {
+            provider_account_id_column
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| ProviderAccountId(value.to_string()))
+        })
+        .unwrap_or_else(|| {
+            provider_account_id(
+                &compat.provider,
+                &format!("legacy_subscription:{}", compat.subscription_id.0),
+            )
+        });
+    let started_at = compat
+        .started_at
+        .or(compat.paid_at)
+        .or(compat.current_period_ends_at)
+        .or(compat.ended_at)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+
+    Ok(Subscription {
+        schema_version: compat.schema_version,
+        subscription_id: compat.subscription_id,
+        provider: compat.provider,
+        provider_account_id,
+        plan_name: compat.plan_name,
+        price: compat.price,
+        currency: compat.currency,
+        billing_period: compat.billing_period,
+        paid_at: compat.paid_at,
+        renewal_day: compat.renewal_day,
+        started_at,
+        ended_at: compat.ended_at,
+        current_period_ends_at: compat.current_period_ends_at,
+        status: compat.status,
+        record_source: compat.record_source,
+        verified_at: compat.verified_at,
+        notes: compat.notes,
+    })
 }
 
 pub struct Store {
@@ -81,11 +176,28 @@ impl Store {
               payload TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS source_account_assignments (
+              assignment_id TEXT PRIMARY KEY,
+              source_id TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              provider_account_id TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              ended_at TEXT,
+              payload TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS source_account_assignments_lookup_idx
+              ON source_account_assignments (source_id, started_at, ended_at, provider_account_id);
             CREATE TABLE IF NOT EXISTS subscriptions (
               subscription_id TEXT PRIMARY KEY,
               provider TEXT NOT NULL,
               provider_account_id TEXT,
               payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS local_metadata (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS usage_events (
               event_id TEXT PRIMARY KEY,
@@ -328,10 +440,28 @@ impl Store {
     }
 
     pub fn delete_source(&self, source_id: &SourceId) -> Result<bool> {
-        Ok(self.conn.execute(
-            "DELETE FROM sources WHERE source_id = ?1",
-            params![&source_id.0],
-        )? > 0)
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            self.conn.execute(
+                "DELETE FROM source_account_assignments WHERE source_id = ?1",
+                params![&source_id.0],
+            )?;
+            Ok(self.conn.execute(
+                "DELETE FROM sources WHERE source_id = ?1",
+                params![&source_id.0],
+            )? > 0)
+        })();
+
+        match result {
+            Ok(deleted) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
     }
 
     pub fn upsert_account(&self, account: &ProviderAccount) -> Result<()> {
@@ -355,6 +485,22 @@ impl Store {
         Ok(())
     }
 
+    pub fn account(
+        &self,
+        provider_account_id: &ProviderAccountId,
+    ) -> Result<Option<ProviderAccount>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT payload FROM provider_accounts WHERE provider_account_id = ?1",
+                params![&provider_account_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| serde_json::from_str(&payload))
+            .transpose()?)
+    }
+
     pub fn list_accounts(&self) -> Result<Vec<ProviderAccount>> {
         let mut stmt = self.conn.prepare(
             "SELECT payload FROM provider_accounts ORDER BY provider, provider_account_id",
@@ -365,6 +511,110 @@ impl Store {
             accounts.push(serde_json::from_str(&row?)?);
         }
         Ok(accounts)
+    }
+
+    pub fn delete_account(&self, provider_account_id: &ProviderAccountId) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM provider_accounts WHERE provider_account_id = ?1",
+            params![&provider_account_id.0],
+        )? > 0)
+    }
+
+    pub fn upsert_source_account_assignment(
+        &self,
+        assignment: &SourceAccountAssignment,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(assignment)?;
+        self.conn.execute(
+            r#"
+            INSERT INTO source_account_assignments (
+              assignment_id, source_id, provider, provider_account_id,
+              started_at, ended_at, payload, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(assignment_id) DO UPDATE SET
+              source_id = excluded.source_id,
+              provider = excluded.provider,
+              provider_account_id = excluded.provider_account_id,
+              started_at = excluded.started_at,
+              ended_at = excluded.ended_at,
+              payload = excluded.payload,
+              updated_at = excluded.updated_at
+            "#,
+            params![
+                &assignment.assignment_id.0,
+                &assignment.source_id.0,
+                &assignment.provider,
+                &assignment.provider_account_id.0,
+                assignment.started_at.to_rfc3339(),
+                assignment.ended_at.map(|date| date.to_rfc3339()),
+                &payload,
+                assignment.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn source_account_assignment(
+        &self,
+        assignment_id: &SourceAccountAssignmentId,
+    ) -> Result<Option<SourceAccountAssignment>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT payload FROM source_account_assignments WHERE assignment_id = ?1",
+                params![&assignment_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| serde_json::from_str(&payload))
+            .transpose()?)
+    }
+
+    pub fn list_source_account_assignments(&self) -> Result<Vec<SourceAccountAssignment>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT payload
+            FROM source_account_assignments
+            ORDER BY provider, source_id, started_at, assignment_id
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut assignments = Vec::new();
+        for row in rows {
+            assignments.push(serde_json::from_str(&row?)?);
+        }
+        Ok(assignments)
+    }
+
+    pub fn list_source_account_assignments_for_source(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<Vec<SourceAccountAssignment>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT payload
+            FROM source_account_assignments
+            WHERE source_id = ?1
+            ORDER BY started_at, assignment_id
+            "#,
+        )?;
+        let rows = stmt.query_map(params![&source_id.0], |row| row.get::<_, String>(0))?;
+        let mut assignments = Vec::new();
+        for row in rows {
+            assignments.push(serde_json::from_str(&row?)?);
+        }
+        Ok(assignments)
+    }
+
+    pub fn delete_source_account_assignment(
+        &self,
+        assignment_id: &SourceAccountAssignmentId,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM source_account_assignments WHERE assignment_id = ?1",
+            params![&assignment_id.0],
+        )? > 0)
     }
 
     pub fn upsert_subscription(&self, subscription: &Subscription) -> Result<()> {
@@ -381,26 +631,81 @@ impl Store {
             params![
                 &subscription.subscription_id.0,
                 &subscription.provider,
-                subscription
-                    .provider_account_id
-                    .as_ref()
-                    .map(|id| id.0.as_str()),
+                subscription.provider_account_id.0.as_str(),
                 &payload
             ],
         )?;
         Ok(())
     }
 
+    pub fn subscription(&self, subscription_id: &SubscriptionId) -> Result<Option<Subscription>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT payload, provider_account_id FROM subscriptions WHERE subscription_id = ?1",
+                params![&subscription_id.0],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((payload, provider_account_id)) => Ok(Some(deserialize_subscription_payload(
+                &payload,
+                provider_account_id.as_deref(),
+            )?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT payload FROM subscriptions ORDER BY provider, subscription_id")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            .prepare(
+                "SELECT payload, provider_account_id FROM subscriptions ORDER BY provider, subscription_id",
+            )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
         let mut subscriptions = Vec::new();
         for row in rows {
-            subscriptions.push(serde_json::from_str(&row?)?);
+            let (payload, provider_account_id) = row?;
+            subscriptions.push(deserialize_subscription_payload(
+                &payload,
+                provider_account_id.as_deref(),
+            )?);
         }
         Ok(subscriptions)
+    }
+
+    pub fn delete_subscription(&self, subscription_id: &SubscriptionId) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM subscriptions WHERE subscription_id = ?1",
+            params![&subscription_id.0],
+        )? > 0)
+    }
+
+    pub fn metadata_value(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM local_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_metadata_value(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO local_metadata (key, value, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(key) DO UPDATE SET
+              value = excluded.value,
+              updated_at = excluded.updated_at
+            "#,
+            params![key, value, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     pub fn insert_event(&self, event: &UsageEvent) -> Result<bool> {
@@ -694,6 +999,18 @@ impl Store {
         Ok(events)
     }
 
+    pub fn events_for_source(&self, source_id: &SourceId) -> Result<Vec<UsageEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload FROM usage_events WHERE source_id = ?1 ORDER BY started_at, event_id",
+        )?;
+        let rows = stmt.query_map(params![&source_id.0], |row| row.get::<_, String>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(serde_json::from_str(&row?)?);
+        }
+        Ok(events)
+    }
+
     pub fn events_after(&self, cursor: Option<(&DateTime<Utc>, &str)>) -> Result<Vec<UsageEvent>> {
         let sql = if cursor.is_some() {
             r#"
@@ -720,6 +1037,34 @@ impl Store {
             }
         }
         Ok(events)
+    }
+
+    pub fn rewrite_events(&self, events: &[UsageEvent]) -> Result<u64> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut changed = 0u64;
+            let mut dirty_keys = BTreeSet::new();
+            for event in events {
+                dirty_keys.extend(self.update_event_payload(event)?);
+                changed += 1;
+            }
+            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
+            Ok(changed)
+        })();
+
+        match result {
+            Ok(changed) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(changed)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
     }
 
     pub fn delete_events_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
@@ -818,6 +1163,45 @@ impl Store {
         Ok(summaries)
     }
 
+    pub fn summaries_for_source(&self, source_id: &SourceId) -> Result<Vec<UsageSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload FROM usage_summaries WHERE source_id = ?1 ORDER BY observed_at, summary_id",
+        )?;
+        let rows = stmt.query_map(params![&source_id.0], |row| row.get::<_, String>(0))?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(serde_json::from_str(&row?)?);
+        }
+        Ok(summaries)
+    }
+
+    pub fn rewrite_summaries(&self, summaries: &[UsageSummary]) -> Result<u64> {
+        if summaries.is_empty() {
+            return Ok(0);
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut changed = 0u64;
+            for summary in summaries {
+                if self.upsert_summary(summary)? {
+                    changed += 1;
+                }
+            }
+            Ok(changed)
+        })();
+
+        match result {
+            Ok(changed) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(changed)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
     pub fn summaries_after(
         &self,
         cursor: Option<(&DateTime<Utc>, &str)>,
@@ -880,6 +1264,26 @@ impl Store {
             states.push(row?);
         }
         Ok(states)
+    }
+
+    pub fn clear_sync_tracking(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            self.conn.execute("DELETE FROM entity_sync_state", [])?;
+            self.conn.execute("DELETE FROM sync_state", [])?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
     }
 
     pub fn record_sync_success(
@@ -1151,6 +1555,28 @@ impl Store {
         Ok(changed)
     }
 
+    pub fn pending_source_account_assignments_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        assignments: &[SourceAccountAssignment],
+    ) -> Result<Vec<SourceAccountAssignment>> {
+        let mut changed = Vec::new();
+        for assignment in assignments {
+            let payload = serde_json::to_string(assignment)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                "source_account_assignment",
+                &assignment.assignment_id.0,
+                &hash_text(&payload),
+            )? {
+                changed.push(assignment.clone());
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn pending_subscriptions_for_sync(
         &self,
         sink: &str,
@@ -1249,6 +1675,42 @@ impl Store {
                     target,
                     "account",
                     &account.provider_account_id.0,
+                    &hash_text(&payload),
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn record_source_account_assignments_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        assignments: &[SourceAccountAssignment],
+    ) -> Result<()> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            for assignment in assignments {
+                let payload = serde_json::to_string(assignment)?;
+                self.record_entity_synced(
+                    sink,
+                    target,
+                    "source_account_assignment",
+                    &assignment.assignment_id.0,
                     &hash_text(&payload),
                 )?;
             }
@@ -1396,7 +1858,7 @@ impl Store {
                 .provider_account_id
                 .as_ref()
                 .map(|id| id.0.clone())
-                .unwrap_or_else(|| "unmapped".to_string());
+                .unwrap_or_else(|| "unassigned".to_string());
             let account_entry = by_account.entry(account_key).or_insert_with(
                 || serde_json::json!({"tokens": 0, "events": 0, "provider": event.provider}),
             );
@@ -1699,6 +2161,861 @@ impl Store {
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     }
+}
+
+pub fn verified_source_state_hash(
+    verified_state: Option<&VerifiedSourceState>,
+) -> Result<Option<String>> {
+    verified_state
+        .map(|verified_state| serde_json::to_string(verified_state).map(|json| hash_text(&json)))
+        .transpose()
+        .map_err(Into::into)
+}
+
+pub fn find_existing_provider_account(
+    store: &Store,
+    provider: &str,
+    provider_user_id: Option<&str>,
+    email: Option<&str>,
+) -> Result<Option<ProviderAccount>> {
+    let normalized_provider_user_id = provider_user_id
+        .map(normalize_provider_user_id)
+        .filter(|provider_user_id| !provider_user_id.is_empty());
+    let normalized_email = email.map(normalize_email).filter(|email| !email.is_empty());
+    let accounts = store.list_accounts()?;
+    let mut matches: Vec<(&'static str, ProviderAccount)> = Vec::new();
+
+    if let Some(email) = normalized_email.as_deref() {
+        if let Some(account) = accounts.iter().find(|account| {
+            account.provider == provider
+                && account.email.as_deref().map(normalize_email).as_deref() == Some(email)
+        }) {
+            matches.push(("email", account.clone()));
+        }
+    }
+    if let Some(provider_user_id) = normalized_provider_user_id.as_deref() {
+        if let Some(account) = accounts.iter().find(|account| {
+            account.provider == provider
+                && account
+                    .provider_user_id
+                    .as_deref()
+                    .map(normalize_provider_user_id)
+                    .as_deref()
+                    == Some(provider_user_id)
+        }) {
+            matches.push(("provider_user_id", account.clone()));
+        }
+    }
+    if let Some(provider_account_id) = provider_account_id_from_identity(
+        provider,
+        normalized_provider_user_id.as_deref(),
+        normalized_email.as_deref(),
+    ) {
+        if let Some(account) = store.account(&provider_account_id)? {
+            matches.push(("provider_account_id", account));
+        }
+    }
+
+    let mut unique_matches: Vec<(&'static str, ProviderAccount)> = Vec::new();
+    for (match_kind, account) in matches {
+        if !unique_matches
+            .iter()
+            .any(|(_, existing)| existing.provider_account_id == account.provider_account_id)
+        {
+            unique_matches.push((match_kind, account));
+        }
+    }
+
+    if unique_matches.len() > 1 {
+        let details = unique_matches
+            .iter()
+            .map(|(match_kind, account)| {
+                format!("{match_kind} matched {}", account.provider_account_id.0)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("conflicting provider account identifiers for {provider}: {details}");
+    }
+
+    Ok(unique_matches
+        .into_iter()
+        .next()
+        .map(|(_, account)| account))
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertProviderAccountInput<'a> {
+    pub provider: &'a str,
+    pub provider_user_id: Option<&'a str>,
+    pub email: Option<&'a str>,
+    pub label: Option<String>,
+    pub plan_name: Option<String>,
+    pub identity_source: Option<IdentitySource>,
+    pub verified_at: Option<DateTime<Utc>>,
+}
+
+pub fn upsert_provider_account(
+    store: &Store,
+    input: UpsertProviderAccountInput<'_>,
+) -> Result<ProviderAccount> {
+    let UpsertProviderAccountInput {
+        provider,
+        provider_user_id,
+        email,
+        label,
+        plan_name,
+        identity_source,
+        verified_at,
+    } = input;
+    let normalized_provider_user_id = provider_user_id
+        .map(normalize_provider_user_id)
+        .filter(|provider_user_id| !provider_user_id.is_empty());
+    let normalized_email = email.map(normalize_email).filter(|email| !email.is_empty());
+    let existing = find_existing_provider_account(
+        store,
+        provider,
+        normalized_provider_user_id.as_deref(),
+        normalized_email.as_deref(),
+    )?;
+    let provider_account_id = existing
+        .as_ref()
+        .map(|account| account.provider_account_id.clone())
+        .or_else(|| {
+            provider_account_id_from_identity(
+                provider,
+                normalized_provider_user_id.as_deref(),
+                normalized_email.as_deref(),
+            )
+        })
+        .with_context(|| format!("missing canonical account identity for {provider}"))?;
+    let now = Utc::now();
+    let mut account = existing.unwrap_or(ProviderAccount {
+        schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+        provider_account_id: provider_account_id.clone(),
+        provider: provider.to_string(),
+        identity_source: identity_source
+            .clone()
+            .unwrap_or(IdentitySource::UserConfigured),
+        provider_user_id: None,
+        email: None,
+        provider_user_id_hash: None,
+        email_hash: None,
+        org_id_hash: None,
+        account_label: None,
+        plan_name: None,
+        confidence: Confidence::High,
+        verified_at: None,
+        created_at: now,
+        updated_at: now,
+    });
+    if let Some(provider_user_id) = normalized_provider_user_id.as_deref() {
+        account.provider_user_id = Some(provider_user_id.to_string());
+        account.provider_user_id_hash = Some(hash_text(provider_user_id));
+    }
+    if let Some(email) = normalized_email.as_deref() {
+        account.email_hash = Some(hash_text(email));
+        account.email = Some(email.to_string());
+    }
+    if let Some(label) = label {
+        account.account_label = Some(label);
+    }
+    if let Some(plan_name) = plan_name.filter(|plan_name| !plan_name.trim().is_empty()) {
+        account.plan_name = Some(plan_name);
+    }
+    if let Some(identity_source) = identity_source {
+        account.identity_source = merge_identity_source(&account.identity_source, identity_source);
+    }
+    account.verified_at = max_datetime(account.verified_at, verified_at);
+    account.provider = provider.to_string();
+    account.confidence = if account.provider_user_id.is_some() || account.email.is_some() {
+        Confidence::High
+    } else {
+        account.confidence
+    };
+    account.updated_at = now;
+    store.upsert_account(&account)?;
+    Ok(account)
+}
+
+pub fn apply_verified_source_state(
+    store: &Store,
+    source: &SourceLocation,
+    verified_state: Option<&VerifiedSourceState>,
+) -> Result<()> {
+    let Some(verified_state) = verified_state else {
+        return Ok(());
+    };
+    let account = upsert_provider_account(
+        store,
+        UpsertProviderAccountInput {
+            provider: &source.provider,
+            provider_user_id: verified_state.provider_user_id.as_deref(),
+            email: verified_state.email.as_deref(),
+            label: verified_state.account_label.clone(),
+            plan_name: verified_state.plan_name.clone(),
+            identity_source: Some(IdentitySource::LocalAuth),
+            verified_at: verified_state.verified_at,
+        },
+    )?;
+    let assignment_started_at = verified_state.authenticated_at.or_else(|| {
+        verified_state
+            .subscription
+            .as_ref()
+            .map(|subscription| subscription.started_at)
+    });
+    if let Some(started_at) = assignment_started_at {
+        upsert_verified_source_assignment(
+            store,
+            source,
+            &account.provider_account_id,
+            started_at,
+            verified_state.verified_at,
+        )?;
+    }
+    if let Some(subscription) = verified_state.subscription.as_ref() {
+        upsert_verified_subscription(
+            store,
+            &source.provider,
+            &account.provider_account_id,
+            subscription,
+        )?;
+    }
+    Ok(())
+}
+
+pub fn reconcile_verified_source_state(
+    store: &Store,
+    source: &mut SourceLocation,
+    verified_state: Option<&VerifiedSourceState>,
+    next_verified_state_hash: Option<String>,
+) -> Result<()> {
+    if !matches!(source.verification_mode, SourceVerificationMode::Auto) {
+        return Ok(());
+    }
+    let has_legacy_verified_assignment = next_verified_state_hash.is_none()
+        && source.verified_state_hash.is_none()
+        && has_active_verified_source_assignment(store, &source.source_id)?;
+    if source.verified_state_hash == next_verified_state_hash && !has_legacy_verified_assignment {
+        return Ok(());
+    }
+
+    match verified_state {
+        Some(verified_state) => apply_verified_source_state(store, source, Some(verified_state))?,
+        None => close_active_verified_source_linkages(store, &source.source_id, Utc::now())?,
+    }
+    source.verified_state_hash = next_verified_state_hash;
+    source.updated_at = Utc::now();
+    Ok(())
+}
+
+pub fn has_active_verified_source_assignment(store: &Store, source_id: &SourceId) -> Result<bool> {
+    Ok(store
+        .list_source_account_assignments_for_source(source_id)?
+        .into_iter()
+        .any(|assignment| {
+            assignment.ended_at.is_none()
+                && matches!(
+                    assignment.record_source,
+                    IdentitySource::LocalAuth
+                        | IdentitySource::ProviderAuth
+                        | IdentitySource::ProviderApi
+                        | IdentitySource::CookieOauth
+                        | IdentitySource::CliProbe
+                )
+        }))
+}
+
+pub fn effective_verified_source_state_is_missing(
+    verified_state: &Option<VerifiedSourceState>,
+) -> bool {
+    verified_state.is_none()
+}
+
+pub fn apply_source_account_resolution(
+    store: &Store,
+    source: &SourceLocation,
+    events: &mut [UsageEvent],
+    summaries: &mut [UsageSummary],
+) -> Result<()> {
+    let assignments = store.list_source_account_assignments_for_source(&source.source_id)?;
+    for event in events {
+        apply_account_resolution_to_event(&assignments, event);
+    }
+    for summary in summaries {
+        apply_account_resolution_to_summary(&assignments, summary);
+    }
+    Ok(())
+}
+
+fn upsert_verified_source_assignment(
+    store: &Store,
+    source: &SourceLocation,
+    provider_account_id: &ProviderAccountId,
+    started_at: DateTime<Utc>,
+    verified_at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let assignments = store.list_source_account_assignments_for_source(&source.source_id)?;
+    let overlaps: Vec<_> = assignments
+        .iter()
+        .filter(|assignment| {
+            periods_overlap(started_at, None, assignment.started_at, assignment.ended_at)
+        })
+        .cloned()
+        .collect();
+
+    if let Some(existing) = overlaps
+        .iter()
+        .find(|assignment| assignment.provider_account_id == *provider_account_id)
+    {
+        let merged_started_at = existing.started_at.min(started_at);
+        let merged = SourceAccountAssignment {
+            schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+            assignment_id: source_account_assignment_id(
+                &source.source_id,
+                provider_account_id,
+                merged_started_at,
+            ),
+            source_id: source.source_id.clone(),
+            provider: source.provider.clone(),
+            provider_account_id: provider_account_id.clone(),
+            started_at: merged_started_at,
+            ended_at: None,
+            record_source: merge_identity_source(
+                &existing.record_source,
+                IdentitySource::LocalAuth,
+            ),
+            verified_at: max_datetime(existing.verified_at, verified_at),
+            created_at: existing.created_at,
+            updated_at: Utc::now(),
+        };
+        if merged.assignment_id != existing.assignment_id {
+            store.delete_source_account_assignment(&existing.assignment_id)?;
+        }
+        store.upsert_source_account_assignment(&merged)?;
+        reattribute_source_records(store, &source.source_id)?;
+        return Ok(());
+    }
+
+    if overlaps
+        .iter()
+        .any(|assignment| matches!(assignment.record_source, IdentitySource::UserConfigured))
+    {
+        return Ok(());
+    }
+
+    for existing in overlaps
+        .iter()
+        .filter(|assignment| assignment.provider_account_id != *provider_account_id)
+    {
+        if existing.started_at <= started_at {
+            let mut closed = existing.clone();
+            closed.ended_at = Some(started_at);
+            closed.updated_at = Utc::now();
+            store.upsert_source_account_assignment(&closed)?;
+        } else {
+            store.delete_source_account_assignment(&existing.assignment_id)?;
+        }
+    }
+
+    let now = Utc::now();
+    let assignment = SourceAccountAssignment {
+        schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+        assignment_id: source_account_assignment_id(
+            &source.source_id,
+            provider_account_id,
+            started_at,
+        ),
+        source_id: source.source_id.clone(),
+        provider: source.provider.clone(),
+        provider_account_id: provider_account_id.clone(),
+        started_at,
+        ended_at: None,
+        record_source: IdentitySource::LocalAuth,
+        verified_at,
+        created_at: now,
+        updated_at: now,
+    };
+    validate_source_assignment_overlap(
+        store,
+        &source.source_id,
+        provider_account_id,
+        assignment.started_at,
+        assignment.ended_at,
+        None,
+    )?;
+    store.upsert_source_account_assignment(&assignment)?;
+    reattribute_source_records(store, &source.source_id)?;
+    Ok(())
+}
+
+pub fn close_active_verified_source_linkages(
+    store: &Store,
+    source_id: &SourceId,
+    ended_at: DateTime<Utc>,
+) -> Result<()> {
+    let mut changed = false;
+    let mut closed_account_ids = Vec::new();
+    for mut assignment in store.list_source_account_assignments_for_source(source_id)? {
+        if assignment.ended_at.is_some()
+            || !matches!(
+                assignment.record_source,
+                IdentitySource::LocalAuth
+                    | IdentitySource::ProviderAuth
+                    | IdentitySource::ProviderApi
+                    | IdentitySource::CookieOauth
+                    | IdentitySource::CliProbe
+            )
+            || !timestamp_in_period(ended_at, assignment.started_at, assignment.ended_at)
+        {
+            continue;
+        }
+        validate_time_window(assignment.started_at, Some(ended_at), "source connection")?;
+        assignment.ended_at = Some(ended_at);
+        assignment.updated_at = Utc::now();
+        store.upsert_source_account_assignment(&assignment)?;
+        closed_account_ids.push(assignment.provider_account_id.clone());
+        changed = true;
+    }
+    for mut subscription in store.list_subscriptions()? {
+        if !closed_account_ids.contains(&subscription.provider_account_id)
+            || subscription.ended_at.is_some()
+            || !is_verified_subscription_source(&subscription.record_source)
+            || !timestamp_in_period(ended_at, subscription.started_at, subscription.ended_at)
+        {
+            continue;
+        }
+        validate_time_window(subscription.started_at, Some(ended_at), "subscription")?;
+        subscription.ended_at = Some(ended_at);
+        store.upsert_subscription(&subscription)?;
+        changed = true;
+    }
+    if changed {
+        reattribute_source_records(store, source_id)?;
+    }
+    Ok(())
+}
+
+fn upsert_verified_subscription(
+    store: &Store,
+    provider: &str,
+    provider_account_id: &ProviderAccountId,
+    verified: &VerifiedSubscriptionState,
+) -> Result<()> {
+    validate_time_window(verified.started_at, None, "subscription")?;
+    let subscriptions: Vec<_> = store
+        .list_subscriptions()?
+        .into_iter()
+        .filter(|subscription| {
+            subscription.provider == provider
+                && subscription.provider_account_id == *provider_account_id
+        })
+        .collect();
+
+    if let Some(existing) = subscriptions.iter().find(|subscription| {
+        subscription
+            .plan_name
+            .eq_ignore_ascii_case(&verified.plan_name)
+            && periods_overlap(
+                verified.started_at,
+                None,
+                subscription.started_at,
+                subscription.ended_at,
+            )
+    }) {
+        let merged = merge_verified_subscription(existing, verified);
+        store.upsert_subscription(&merged)?;
+        return Ok(());
+    }
+
+    if subscriptions.iter().any(|subscription| {
+        subscription.record_source == IdentitySource::UserConfigured
+            && periods_overlap(
+                verified.started_at,
+                None,
+                subscription.started_at,
+                subscription.ended_at,
+            )
+            && !subscription
+                .plan_name
+                .eq_ignore_ascii_case(&verified.plan_name)
+    }) {
+        return Ok(());
+    }
+
+    for mut subscription in subscriptions
+        .iter()
+        .filter(|subscription| {
+            is_verified_subscription_source(&subscription.record_source)
+                && periods_overlap(
+                    verified.started_at,
+                    None,
+                    subscription.started_at,
+                    subscription.ended_at,
+                )
+                && !subscription
+                    .plan_name
+                    .eq_ignore_ascii_case(&verified.plan_name)
+        })
+        .cloned()
+    {
+        if subscription.started_at < verified.started_at {
+            subscription.ended_at = Some(verified.started_at);
+            store.upsert_subscription(&subscription)?;
+        } else {
+            store.delete_subscription(&subscription.subscription_id)?;
+        }
+    }
+
+    let current_subscriptions: Vec<_> = store
+        .list_subscriptions()?
+        .into_iter()
+        .filter(|subscription| {
+            subscription.provider == provider
+                && subscription.provider_account_id == *provider_account_id
+        })
+        .collect();
+
+    if current_subscriptions.iter().any(|subscription| {
+        periods_overlap(
+            verified.started_at,
+            None,
+            subscription.started_at,
+            subscription.ended_at,
+        )
+    }) {
+        return Ok(());
+    }
+
+    let subscription = Subscription {
+        schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+        subscription_id: subscription_id(
+            provider,
+            provider_account_id,
+            &verified.plan_name,
+            verified.started_at,
+        ),
+        provider: provider.to_string(),
+        provider_account_id: provider_account_id.clone(),
+        plan_name: verified.plan_name.clone(),
+        price: verified.price,
+        currency: verified.currency.clone(),
+        billing_period: verified.billing_period.clone(),
+        paid_at: verified.paid_at.or(Some(verified.started_at)),
+        renewal_day: verified
+            .current_period_ends_at
+            .and_then(subscription_renewal_day),
+        started_at: verified.started_at,
+        ended_at: None,
+        current_period_ends_at: verified.current_period_ends_at,
+        status: verified.status.clone(),
+        record_source: IdentitySource::LocalAuth,
+        verified_at: verified.verified_at,
+        notes: None,
+    };
+    validate_subscription_overlap(
+        store,
+        provider,
+        provider_account_id,
+        subscription.started_at,
+        subscription.ended_at,
+        None,
+    )?;
+    store.upsert_subscription(&subscription)?;
+    Ok(())
+}
+
+fn merge_verified_subscription(
+    existing: &Subscription,
+    verified: &VerifiedSubscriptionState,
+) -> Subscription {
+    let mut merged = existing.clone();
+    if merged.price <= 0.0 {
+        merged.price = verified.price;
+    }
+    if merged.currency.trim().is_empty() {
+        merged.currency = verified.currency.clone();
+    }
+    merged.billing_period = verified.billing_period.clone();
+    merged.paid_at = max_datetime(
+        merged.paid_at,
+        verified.paid_at.or(Some(verified.started_at)),
+    );
+    merged.renewal_day = verified
+        .current_period_ends_at
+        .and_then(subscription_renewal_day)
+        .or(merged.renewal_day);
+    merged.current_period_ends_at = max_datetime(
+        merged.current_period_ends_at,
+        verified.current_period_ends_at,
+    );
+    merged.status = verified.status.clone();
+    merged.record_source = merge_identity_source(&merged.record_source, IdentitySource::LocalAuth);
+    merged.verified_at = max_datetime(merged.verified_at, verified.verified_at);
+    merged
+}
+
+fn merge_identity_source(existing: &IdentitySource, incoming: IdentitySource) -> IdentitySource {
+    if identity_source_rank(&incoming) >= identity_source_rank(existing) {
+        incoming
+    } else {
+        existing.clone()
+    }
+}
+
+fn identity_source_rank(source: &IdentitySource) -> u8 {
+    match source {
+        IdentitySource::UserConfigured => 100,
+        IdentitySource::ProviderApi => 90,
+        IdentitySource::ProviderAuth => 80,
+        IdentitySource::LocalAuth => 70,
+        IdentitySource::CliProbe => 60,
+        IdentitySource::CookieOauth => 50,
+        IdentitySource::SourceConfig => 40,
+        IdentitySource::ManualHint => 30,
+        IdentitySource::Unresolved => 10,
+        IdentitySource::Unknown => 0,
+    }
+}
+
+fn is_verified_subscription_source(source: &IdentitySource) -> bool {
+    matches!(
+        source,
+        IdentitySource::LocalAuth
+            | IdentitySource::ProviderAuth
+            | IdentitySource::ProviderApi
+            | IdentitySource::CookieOauth
+            | IdentitySource::CliProbe
+    )
+}
+
+fn max_datetime(
+    left: Option<DateTime<Utc>>,
+    right: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn subscription_renewal_day(timestamp: DateTime<Utc>) -> Option<u8> {
+    u8::try_from(timestamp.day()).ok()
+}
+
+fn validate_time_window(
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    label: &str,
+) -> Result<()> {
+    if ended_at.is_some_and(|ended_at| ended_at <= started_at) {
+        bail!("{label} ended_at must be after started_at");
+    }
+    Ok(())
+}
+
+fn validate_source_assignment_overlap(
+    store: &Store,
+    source_id: &SourceId,
+    _provider_account_id: &ProviderAccountId,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    ignore_assignment_id: Option<&SourceAccountAssignmentId>,
+) -> Result<()> {
+    for assignment in store.list_source_account_assignments_for_source(source_id)? {
+        if ignore_assignment_id == Some(&assignment.assignment_id) {
+            continue;
+        }
+        if periods_overlap(
+            started_at,
+            ended_at,
+            assignment.started_at,
+            assignment.ended_at,
+        ) {
+            bail!(
+                "source connection overlaps an existing connection for source {}",
+                source_id.0
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_subscription_overlap(
+    store: &Store,
+    provider: &str,
+    provider_account_id: &ProviderAccountId,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    ignore_subscription_id: Option<&SubscriptionId>,
+) -> Result<()> {
+    for subscription in store.list_subscriptions()? {
+        if ignore_subscription_id == Some(&subscription.subscription_id) {
+            continue;
+        }
+        if subscription.provider != provider {
+            continue;
+        }
+        if &subscription.provider_account_id != provider_account_id {
+            continue;
+        }
+        if periods_overlap(
+            started_at,
+            ended_at,
+            subscription.started_at,
+            subscription.ended_at,
+        ) {
+            bail!(
+                "subscription overlaps existing subscription {} for account {}",
+                subscription.subscription_id.0,
+                provider_account_id.0
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reattribute_source_records(store: &Store, source_id: &SourceId) -> Result<()> {
+    if store.source(source_id)?.is_none() {
+        return Ok(());
+    }
+    let assignments = store.list_source_account_assignments_for_source(source_id)?;
+    let mut events = store.events_for_source(source_id)?;
+    let mut summaries = store.summaries_for_source(source_id)?;
+    for event in &mut events {
+        apply_account_resolution_to_event(&assignments, event);
+    }
+    for summary in &mut summaries {
+        apply_account_resolution_to_summary(&assignments, summary);
+    }
+    store.rewrite_events(&events)?;
+    store.rewrite_summaries(&summaries)?;
+    Ok(())
+}
+
+fn apply_account_resolution_to_event(
+    assignments: &[SourceAccountAssignment],
+    event: &mut UsageEvent,
+) {
+    if keep_detected_account_identity(
+        event.provider_account_id.as_ref(),
+        event
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| &evidence.account_identity_source),
+    ) {
+        return;
+    }
+    let assignment = assignment_for_timestamp(assignments, event.session.started_at);
+    if let Some(assignment) = assignment {
+        event.provider_account_id = Some(assignment.provider_account_id.clone());
+        if let Some(evidence) = event.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::SourceConfig;
+        }
+    } else if should_clear_resolved_account(
+        event.provider_account_id.as_ref(),
+        event
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| &evidence.account_identity_source),
+    ) {
+        event.provider_account_id = None;
+        if let Some(evidence) = event.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::Unresolved;
+        }
+    }
+}
+
+fn apply_account_resolution_to_summary(
+    assignments: &[SourceAccountAssignment],
+    summary: &mut UsageSummary,
+) {
+    if keep_detected_account_identity(
+        summary.provider_account_id.as_ref(),
+        summary
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| &evidence.account_identity_source),
+    ) {
+        return;
+    }
+    let timestamp = summary.period_start.unwrap_or(summary.observed_at);
+    let assignment = assignment_for_timestamp(assignments, timestamp);
+    if let Some(assignment) = assignment {
+        summary.provider_account_id = Some(assignment.provider_account_id.clone());
+        if let Some(evidence) = summary.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::SourceConfig;
+        }
+    } else if should_clear_resolved_account(
+        summary.provider_account_id.as_ref(),
+        summary
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| &evidence.account_identity_source),
+    ) {
+        summary.provider_account_id = None;
+        if let Some(evidence) = summary.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::Unresolved;
+        }
+    }
+}
+
+fn keep_detected_account_identity(
+    provider_account_id: Option<&ProviderAccountId>,
+    identity_source: Option<&IdentitySource>,
+) -> bool {
+    let Some(provider_account_id) = provider_account_id else {
+        return false;
+    };
+    if provider_account_id.0.trim().is_empty() {
+        return false;
+    }
+    let Some(identity_source) = identity_source else {
+        return false;
+    };
+    !matches!(
+        identity_source,
+        IdentitySource::SourceConfig
+            | IdentitySource::UserConfigured
+            | IdentitySource::ManualHint
+            | IdentitySource::Unknown
+            | IdentitySource::Unresolved
+    )
+}
+
+fn should_clear_resolved_account(
+    provider_account_id: Option<&ProviderAccountId>,
+    identity_source: Option<&IdentitySource>,
+) -> bool {
+    let Some(provider_account_id) = provider_account_id else {
+        return false;
+    };
+    if provider_account_id.0.trim().is_empty() {
+        return false;
+    }
+    matches!(
+        identity_source,
+        None | Some(
+            IdentitySource::SourceConfig
+                | IdentitySource::UserConfigured
+                | IdentitySource::ManualHint
+                | IdentitySource::Unknown
+                | IdentitySource::Unresolved
+        )
+    )
+}
+
+fn assignment_for_timestamp(
+    assignments: &[SourceAccountAssignment],
+    timestamp: DateTime<Utc>,
+) -> Option<&SourceAccountAssignment> {
+    assignments
+        .iter()
+        .filter(|assignment| {
+            timestamp_in_period(timestamp, assignment.started_at, assignment.ended_at)
+        })
+        .max_by(|left, right| left.started_at.cmp(&right.started_at))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2079,6 +3396,50 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn reads_legacy_subscription_payloads_with_missing_account_and_start() {
+        let store = Store::in_memory().expect("store");
+        let payload = r#"{
+            "schema_version":"subscription.v1",
+            "subscription_id":"sub_legacy",
+            "provider":"codex",
+            "plan_name":"Plus",
+            "price":20.0,
+            "currency":"USD",
+            "billing_period":"monthly",
+            "paid_at":"2026-05-01T00:00:00Z",
+            "status":"active"
+        }"#;
+        store
+            .conn
+            .execute(
+                "INSERT INTO subscriptions (subscription_id, provider, provider_account_id, payload) VALUES (?1, ?2, ?3, ?4)",
+                params!["sub_legacy", "codex", Option::<String>::None, payload],
+            )
+            .expect("insert legacy subscription");
+
+        let subscription = store
+            .subscription(&SubscriptionId("sub_legacy".to_string()))
+            .expect("read legacy subscription")
+            .expect("subscription exists");
+        let subscriptions = store
+            .list_subscriptions()
+            .expect("list legacy subscriptions");
+
+        assert_eq!(subscriptions, vec![subscription.clone()]);
+        assert_eq!(subscription.provider, "codex");
+        assert_eq!(
+            subscription.provider_account_id,
+            provider_account_id("codex", "legacy_subscription:sub_legacy")
+        );
+        assert_eq!(
+            subscription.started_at,
+            Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0)
+                .single()
+                .expect("started_at")
+        );
+    }
+
+    #[test]
     fn inserts_events_idempotently() {
         let store = Store::in_memory().expect("store");
         let source = ai_stats_core::SourceLocation::local_adapter(
@@ -2087,7 +3448,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex"),
             LocationOrigin::Configured,
-            None,
         );
         store.upsert_source(&source).expect("source");
         let now = Utc::now();
@@ -2172,7 +3532,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-semantic"),
             LocationOrigin::Configured,
-            None,
         );
         store.upsert_source(&source).expect("source");
         let now = Utc::now();
@@ -2199,7 +3558,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-token-count"),
             LocationOrigin::Configured,
-            None,
         );
         store.upsert_source(&source).expect("source");
         let now = Utc::now();
@@ -2283,7 +3641,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-normalized"),
             LocationOrigin::Configured,
-            None,
         );
         store.upsert_source(&source).expect("source");
         let now = Utc::now();
@@ -2339,7 +3696,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-batch"),
             LocationOrigin::Configured,
-            None,
         );
         store.upsert_source(&source).expect("source");
         let now = Utc::now();
@@ -2362,7 +3718,6 @@ mod tests {
             "0",
             Path::new("/tmp/claude-summary"),
             LocationOrigin::Configured,
-            None,
         );
         store.upsert_source(&source).expect("source");
         let now = Utc::now();
@@ -2442,7 +3797,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-sync-state"),
             LocationOrigin::Configured,
-            None,
         );
         store.upsert_source(&source).expect("source");
         let now = Utc::now();
@@ -2487,7 +3841,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-sync-rollups"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         store.upsert_source(&source).expect("source");
 
@@ -2570,7 +3923,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-sync-entities"),
             LocationOrigin::Configured,
-            None,
         );
 
         let changed = store
@@ -2598,7 +3950,7 @@ mod tests {
             .expect("unchanged")
             .is_empty());
 
-        source.account_alias = Some("personal".to_string());
+        source.enabled = false;
         source.updated_at += chrono::Duration::seconds(1);
         let changed = store
             .pending_sources_for_sync(
@@ -2619,7 +3971,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-source-lifecycle"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         let source_id = source.source_id.clone();
         store.upsert_source(&source).expect("source");

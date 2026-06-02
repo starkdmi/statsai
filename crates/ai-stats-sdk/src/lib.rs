@@ -9,9 +9,10 @@ pub use ai_stats_store as store;
 pub use ai_stats_sync as sync;
 
 use ai_stats_core::{
-    canonical_display, hash_text, provider_account_id, summary_id, Confidence, CostInfo,
-    EventSource, IdentitySource, LocationOrigin, ModelInfo, ParseEvidence, PrivacyInfo,
-    PrivacyMode, SourceKind, SourceLocation, SummaryMetadata, UsageCounts, UsageSummary,
+    canonical_display, hash_text, normalize_email, normalize_provider_user_id,
+    provider_account_id_from_identity, summary_id, Confidence, CostInfo, EventSource,
+    IdentitySource, LocationOrigin, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode,
+    ProviderAccountId, SourceKind, SourceLocation, SummaryMetadata, UsageCounts, UsageSummary,
     REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use anyhow::{bail, Result};
@@ -26,8 +27,10 @@ pub const REPORTED_USAGE_IMPORT_ADAPTER_ID: &str = "reported-usage-summary";
 pub struct ReportedUsageSummaryInput {
     pub schema_version: String,
     pub provider: String,
-    #[serde(default, alias = "account_hint")]
-    pub account_alias: Option<String>,
+    pub provider_account_id: Option<String>,
+    pub provider_user_id: Option<String>,
+    pub email: Option<String>,
+    pub account_label: Option<String>,
     pub source_kind: SourceKind,
     pub source_name: String,
     pub evidence_id: Option<String>,
@@ -75,12 +78,10 @@ pub fn build_reported_usage_summary(
         .or(input.evidence_id.as_deref())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| {
+            let identity_key = normalized_report_identity_key(&input);
             format!(
                 "{}:{}:{}:{}",
-                input.provider,
-                input.source_name,
-                input.account_alias.as_deref().unwrap_or("unmapped"),
-                input.report_format
+                input.provider, input.source_name, identity_key, input.report_format
             )
         });
     let path_label = input.evidence_path.clone();
@@ -91,8 +92,18 @@ pub fn build_reported_usage_summary(
         env!("CARGO_PKG_VERSION"),
         &evidence_key,
         path_label.clone(),
-        input.account_alias.clone(),
     );
+    let provider_account_id = input
+        .provider_account_id
+        .as_deref()
+        .map(|value| ProviderAccountId(value.to_string()))
+        .or_else(|| {
+            provider_account_id_from_identity(
+                &input.provider,
+                input.provider_user_id.as_deref(),
+                input.email.as_deref(),
+            )
+        });
 
     let period_start_text = input
         .period_start
@@ -154,10 +165,7 @@ pub fn build_reported_usage_summary(
         device_id: device_id.to_string(),
         provider: input.provider.clone(),
         source_id: source.source_id.clone(),
-        provider_account_id: input
-            .account_alias
-            .as_deref()
-            .map(|account| provider_account_id(&input.provider, account)),
+        provider_account_id,
         source: EventSource {
             adapter_id: REPORTED_USAGE_IMPORT_ADAPTER_ID.to_string(),
             adapter_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -184,8 +192,11 @@ pub fn build_reported_usage_summary(
             source_record_id: Some(semantic_key),
             model_inferred: false,
             timestamp_inferred: input.period_start.is_none() || input.period_end.is_none(),
-            account_identity_source: if input.account_alias.is_some() {
-                IdentitySource::ManualHint
+            account_identity_source: if input.provider_account_id.is_some()
+                || input.provider_user_id.is_some()
+                || input.email.is_some()
+            {
+                IdentitySource::UserConfigured
             } else {
                 IdentitySource::Unresolved
             },
@@ -212,6 +223,30 @@ pub fn build_reported_usage_summary(
     Ok(ReportedUsageSummaryRecord { source, summary })
 }
 
+fn normalized_report_identity_key(input: &ReportedUsageSummaryInput) -> String {
+    input
+        .provider_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            input
+                .email
+                .as_deref()
+                .map(normalize_email)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            input
+                .provider_user_id
+                .as_deref()
+                .map(normalize_provider_user_id)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unassigned".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,7 +258,10 @@ mod tests {
         let input = ReportedUsageSummaryInput {
             schema_version: REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION.to_string(),
             provider: "claude_code".to_string(),
-            account_alias: Some("personal".to_string()),
+            provider_account_id: None,
+            provider_user_id: None,
+            email: Some("personal@example.com".to_string()),
+            account_label: Some("personal".to_string()),
             source_kind: SourceKind::Manual,
             source_name: "user_reported_usage".to_string(),
             evidence_id: Some("screenshot:2025-07-11".to_string()),
@@ -262,10 +300,54 @@ mod tests {
         assert_eq!(first.summary.summary_id, second.summary.summary_id);
         assert_eq!(
             first.summary.provider_account_id,
-            Some(provider_account_id("claude_code", "personal"))
+            provider_account_id_from_identity("claude_code", None, Some("personal@example.com"),)
         );
         assert_eq!(first.summary.metadata.summary_format, "manual_daily");
         assert_eq!(first.summary.usage.computed_total(), 100);
+    }
+
+    #[test]
+    fn fallback_report_identity_key_is_normalized() {
+        let base = ReportedUsageSummaryInput {
+            schema_version: REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION.to_string(),
+            provider: "claude_code".to_string(),
+            provider_account_id: None,
+            provider_user_id: None,
+            email: Some(" PERSONAL@example.com ".to_string()),
+            account_label: Some("personal".to_string()),
+            source_kind: SourceKind::Manual,
+            source_name: "user_reported_usage".to_string(),
+            evidence_id: None,
+            evidence_path: None,
+            report_format: "manual_daily".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 23, 59, 59)
+                    .single()
+                    .expect("end"),
+            ),
+            observed_at: None,
+            model: None,
+            usage: UsageCounts {
+                total_tokens: Some(100),
+                ..UsageCounts::default()
+            },
+            cost: None,
+            confidence: Some(Confidence::Medium),
+        };
+        let mut normalized = base.clone();
+        normalized.email = Some("personal@example.com".to_string());
+
+        let first = build_reported_usage_summary(base, "device").expect("first");
+        let second = build_reported_usage_summary(normalized, "device").expect("second");
+
+        assert_eq!(first.source.source_id, second.source.source_id);
+        assert_eq!(first.summary.summary_id, second.summary.summary_id);
     }
 
     #[test]
@@ -273,7 +355,10 @@ mod tests {
         let input = ReportedUsageSummaryInput {
             schema_version: REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION.to_string(),
             provider: "claude_code".to_string(),
-            account_alias: None,
+            provider_account_id: None,
+            provider_user_id: None,
+            email: None,
+            account_label: None,
             source_kind: SourceKind::LocalAdapter,
             source_name: "bad".to_string(),
             evidence_id: None,

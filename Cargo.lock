@@ -28,6 +28,7 @@ dependencies = [
  "ai-stats-pricing",
  "anyhow",
  "chrono",
+ "serde",
  "serde_json",
  "tempfile",
  "walkdir",
@@ -112,6 +113,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]

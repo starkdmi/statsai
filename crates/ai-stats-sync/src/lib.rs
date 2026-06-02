@@ -152,6 +152,7 @@ mod tests {
             device_id: "device".to_string(),
             sources: Vec::new(),
             accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
@@ -237,8 +238,8 @@ mod tests {
             r#"{{
               "schema_version":"sync_ack.v1",
               "batch_id":"{batch_id}",
-              "accepted":{{"sources":0,"accounts":0,"subscriptions":0,"events":0,"summaries":0}},
-              "duplicates":{{"sources":0,"accounts":0,"subscriptions":0,"events":0,"summaries":0}},
+              "accepted":{{"sources":0,"accounts":0,"source_account_assignments":0,"subscriptions":0,"events":0,"summaries":0}},
+              "duplicates":{{"sources":0,"accounts":0,"source_account_assignments":0,"subscriptions":0,"events":0,"summaries":0}},
               "rejected":[]
             }}"#
         )

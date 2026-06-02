@@ -1,10 +1,10 @@
 //! Provider adapters for local AI usage sources.
 
 use ai_stats_core::{
-    canonical_display, expand_home_path, hash_text, home_dir, provider_account_id,
-    semantic_event_id, summary_id, Confidence, EventSource, IdentitySource, LocationOrigin,
-    ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, SessionInfo, SourceKind,
-    SourceLocation, SummaryMetadata, UsageCounts, UsageEvent, UsageSummary,
+    canonical_display, expand_home_path, hash_text, home_dir, semantic_event_id, summary_id,
+    BillingPeriod, Confidence, EventSource, IdentitySource, LocationOrigin, ModelInfo,
+    ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, SessionInfo, SourceKind, SourceLocation,
+    SubscriptionStatus, SummaryMetadata, UsageCounts, UsageEvent, UsageSummary,
     USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use ai_stats_pricing::{estimate_cost, normalize_model_name};
@@ -23,6 +23,8 @@ pub const CODEX_PROVIDER: &str = "codex";
 const SESSION_SCOPED_EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
 const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v2";
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
+
+pub use ai_stats_core::{VerifiedSourceState, VerifiedSubscriptionState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventDeduplication {
@@ -70,6 +72,7 @@ pub struct AdapterScan {
     pub events: Vec<UsageEvent>,
     pub summaries: Vec<UsageSummary>,
     pub diagnostics: ScanDiagnostics,
+    pub verified_source_state: Option<VerifiedSourceState>,
 }
 
 pub trait ProviderAdapter {
@@ -78,6 +81,12 @@ pub trait ProviderAdapter {
     fn provider(&self) -> &'static str;
     fn discover(&self) -> Vec<SourceLocation>;
     fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>>;
+    fn probe_verified_source_state(
+        &self,
+        _source: &SourceLocation,
+    ) -> Result<Option<VerifiedSourceState>> {
+        Ok(None)
+    }
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan>;
 }
 
@@ -177,6 +186,16 @@ impl ProviderAdapter for CodexAdapter {
         codex_scan_candidates(source, self.version())
     }
 
+    fn probe_verified_source_state(
+        &self,
+        source: &SourceLocation,
+    ) -> Result<Option<VerifiedSourceState>> {
+        let Some(root) = source_root_path(source) else {
+            return Ok(None);
+        };
+        Ok(codex_auth_snapshot(&root))
+    }
+
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
         scan_codex_source(self, source, options)
     }
@@ -205,7 +224,6 @@ fn codex_source_for_root(
         adapter.version(),
         root,
         origin,
-        None,
     )
 }
 
@@ -221,8 +239,11 @@ fn claude_source_for_root(
         adapter.version(),
         &root,
         origin,
-        None,
     )
+}
+
+fn source_root_path(source: &SourceLocation) -> Option<PathBuf> {
+    source.path_label.as_deref().map(PathBuf::from)
 }
 
 fn normalize_claude_config_root(root: &Path) -> PathBuf {
@@ -330,17 +351,7 @@ fn scan_codex_source(
             parse_codex_file(&mut ctx, &root, &usage_root, &candidate.path)?;
         }
     }
-    if source.account_alias.is_none() {
-        if let Some(stable_identity) = codex_auth_stable_identity(&root) {
-            let account_id = provider_account_id(CODEX_PROVIDER, &stable_identity);
-            for event in &mut scan.events {
-                event.provider_account_id = Some(account_id.clone());
-                if let Some(evidence) = event.parse_evidence.as_mut() {
-                    evidence.account_identity_source = IdentitySource::LocalAuth;
-                }
-            }
-        }
-    }
+    scan.verified_source_state = codex_auth_snapshot(&root);
     scan.diagnostics.accepted_events = scan.events.len() as u64;
     Ok(scan)
 }
@@ -417,7 +428,7 @@ fn codex_scan_candidates(
 }
 
 fn codex_jsonl_candidates(
-    source: &SourceLocation,
+    _source: &SourceLocation,
     root: &Path,
     cache_namespace: &str,
 ) -> Result<Vec<ScanCandidateFile>> {
@@ -432,10 +443,7 @@ fn codex_jsonl_candidates(
         roots.push(root.to_path_buf());
     }
 
-    let auth_dependency = source
-        .account_alias
-        .is_none()
-        .then(|| file_metadata_signature(&root.join("auth.json")));
+    let auth_dependency = Some(file_metadata_signature(&root.join("auth.json")));
     let dependency = auth_dependency.as_deref();
     let mut candidates = Vec::new();
     for usage_root in roots {
@@ -475,10 +483,9 @@ fn scan_candidate(
 
 fn scan_cache_namespace(source: &SourceLocation, adapter_version: &str) -> String {
     let adapter_id = source.adapter_id.as_deref().unwrap_or("");
-    let account_alias = source.account_alias.as_deref().unwrap_or("");
     let path_hash = source.path_hash.as_deref().unwrap_or("");
     hash_text(&format!(
-        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{adapter_version}:{account_alias}:{path_hash}",
+        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{adapter_version}:{path_hash}",
         source.provider, source.source_kind
     ))
 }
@@ -691,11 +698,7 @@ fn parse_claude_stats_cache(
                 source_record_id: Some(semantic_key),
                 model_inferred: false,
                 timestamp_inferred: period_start.is_none() || period_end.is_none(),
-                account_identity_source: if source.account_alias.is_some() {
-                    IdentitySource::ManualHint
-                } else {
-                    IdentitySource::Unresolved
-                },
+                account_identity_source: IdentitySource::Unresolved,
             }),
             privacy: metadata_only_privacy(),
             period_start,
@@ -969,11 +972,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
             source_record_id: Some(semantic_key),
             model_inferred: parts.model_inferred,
             timestamp_inferred: parts.timestamp_inferred,
-            account_identity_source: if source.account_alias.is_some() {
-                IdentitySource::ManualHint
-            } else {
-                IdentitySource::Unresolved
-            },
+            account_identity_source: IdentitySource::Unresolved,
         }),
         usage: parts.usage,
         project,
@@ -1342,34 +1341,80 @@ fn codex_headless_usage_value(value: &Value) -> Option<&Value> {
     .next()
 }
 
-fn codex_auth_stable_identity(root: &Path) -> Option<String> {
-    let value = std::fs::read_to_string(root.join("auth.json")).ok()?;
+fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
+    let auth_path = root.join("auth.json");
+    let value = std::fs::read_to_string(&auth_path).ok()?;
     let value: Value = serde_json::from_str(&value).ok()?;
-    string_at_any(
+    let payload = string_at_any(
         &value,
-        &[
-            "account_id",
-            "accountId",
-            "chatgpt_account_id",
-            "email",
-            "user_email",
-        ],
+        &["id_token", "idToken", "/tokens/id_token", "/tokens/idToken"],
     )
-    .or_else(|| {
-        string_at_any(&value, &["id_token", "idToken"]).and_then(|token| {
-            jwt_payload_value(&token).and_then(|payload| {
-                string_at_any(
-                    &payload,
-                    &[
-                        "chatgpt_account_id",
-                        "email",
-                        "/https://api.openai.com~1auth/chatgpt_account_id",
-                        "/https://api.openai.com~1profile/email",
-                    ],
-                )
-            })
+    .and_then(|token| jwt_payload_value(&token));
+    let auth = payload
+        .as_ref()
+        .and_then(|payload| payload.pointer("/https:~1~1api.openai.com~1auth"))
+        .or_else(|| value.pointer("/https:~1~1api.openai.com~1auth"));
+
+    let provider_user_id = auth
+        .and_then(|auth| string_at_any(auth, &["chatgpt_account_id", "chatgpt_user_id", "user_id"]))
+        .or_else(|| {
+            string_at_any(
+                &value,
+                &[
+                    "account_id",
+                    "accountId",
+                    "chatgpt_account_id",
+                    "chatgpt_user_id",
+                    "/tokens/account_id",
+                    "/tokens/accountId",
+                ],
+            )
+        });
+    let email = payload
+        .as_ref()
+        .and_then(|payload| {
+            string_at_any(
+                payload,
+                &["email", "/https:~1~1api.openai.com~1profile~1email"],
+            )
         })
+        .or_else(|| string_at_any(&value, &["email", "user_email"]))
+        .map(|email| email.to_ascii_lowercase());
+    if provider_user_id.is_none() && email.is_none() {
+        return None;
+    }
+
+    let plan_type = auth.and_then(|auth| string_at_any(auth, &["chatgpt_plan_type"]));
+    let plan_name = plan_type.as_deref().map(display_codex_plan_name);
+    let authenticated_at = payload
+        .as_ref()
+        .and_then(|payload| timestamp_at_any(payload, &["auth_time", "iat"]))
+        .or_else(|| file_modified_at(&auth_path));
+    let verified_at = auth
+        .and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_last_checked"]))
+        .or(authenticated_at);
+    let paid_at =
+        auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_active_start"]));
+    let current_period_ends_at =
+        auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_active_until"]));
+    let subscription = plan_type.as_deref().and_then(|plan_type| {
+        codex_verified_subscription(plan_type, paid_at, current_period_ends_at, verified_at)
+    });
+
+    Some(VerifiedSourceState {
+        provider_user_id,
+        email,
+        account_label: None,
+        plan_name,
+        authenticated_at,
+        verified_at,
+        subscription,
     })
+}
+
+fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified))
 }
 
 fn string_at_any(value: &Value, keys: &[&str]) -> Option<String> {
@@ -1385,6 +1430,80 @@ fn string_at_any(value: &Value, keys: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn timestamp_at_any(value: &Value, keys: &[&str]) -> Option<DateTime<Utc>> {
+    keys.iter()
+        .filter_map(|key| {
+            if key.starts_with('/') {
+                value.pointer(key)
+            } else {
+                value.get(*key)
+            }
+        })
+        .find_map(parse_timestamp_value)
+}
+
+fn parse_timestamp_value(value: &Value) -> Option<DateTime<Utc>> {
+    match value {
+        Value::String(text) => DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|parsed| parsed.with_timezone(&Utc)),
+        Value::Number(number) => number
+            .as_i64()
+            .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single()),
+        _ => None,
+    }
+}
+
+fn display_codex_plan_name(plan_type: &str) -> String {
+    match plan_type.trim().to_ascii_lowercase().as_str() {
+        "plus" => "Plus".to_string(),
+        "pro" => "Pro".to_string(),
+        "free" => "Free".to_string(),
+        other => other
+            .split(['_', '-', ' '])
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                let Some(first) = chars.next() else {
+                    return String::new();
+                };
+                format!(
+                    "{}{}",
+                    first.to_ascii_uppercase(),
+                    chars.as_str().to_ascii_lowercase()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn codex_verified_subscription(
+    plan_type: &str,
+    paid_at: Option<DateTime<Utc>>,
+    current_period_ends_at: Option<DateTime<Utc>>,
+    verified_at: Option<DateTime<Utc>>,
+) -> Option<VerifiedSubscriptionState> {
+    let started_at = paid_at?;
+    let (plan_name, price) = match plan_type.trim().to_ascii_lowercase().as_str() {
+        "plus" => ("Plus".to_string(), 20.0),
+        "pro" => ("Pro".to_string(), 200.0),
+        _ => return None,
+    };
+    Some(VerifiedSubscriptionState {
+        plan_name,
+        price,
+        currency: "USD".to_string(),
+        billing_period: BillingPeriod::Monthly,
+        paid_at,
+        started_at,
+        ended_at: None,
+        current_period_ends_at,
+        status: SubscriptionStatus::Active,
+        verified_at,
+    })
 }
 
 fn jwt_payload_value(token: &str) -> Option<Value> {
@@ -1537,7 +1656,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
@@ -1583,7 +1701,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
 
         let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
@@ -1632,7 +1749,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
         let selected = [canonical_display(&first)].into_iter().collect();
         let scan = scan_claude_source(
@@ -1678,7 +1794,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
@@ -1709,7 +1824,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let selected = [canonical_display(&second)].into_iter().collect();
@@ -1752,7 +1866,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let first = codex_scan_candidates(&source, "test-adapter").expect("first candidates");
@@ -1771,7 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_scan_candidates_change_when_account_alias_changes() {
+    fn codex_scan_candidates_are_stable_for_same_source() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).expect("sessions");
@@ -1788,7 +1901,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         let remapped = SourceLocation::local_adapter(
             CODEX_PROVIDER,
@@ -1796,7 +1908,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            Some("work".to_string()),
         );
 
         let first = codex_scan_candidates(&hinted, "test-adapter").expect("first candidates");
@@ -1805,7 +1916,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
         assert_eq!(first[0].cache_key, canonical_display(&session_path));
-        assert_ne!(first[0].cache_signature, second[0].cache_signature);
+        assert_eq!(first[0].cache_signature, second[0].cache_signature);
     }
 
     #[test]
@@ -1851,7 +1962,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
@@ -1899,7 +2009,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
@@ -1933,7 +2042,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
@@ -1969,7 +2077,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
@@ -1999,7 +2106,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
@@ -2029,7 +2135,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
@@ -2039,13 +2144,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_auth_json_marks_events_with_local_auth_identity() {
+    fn codex_auth_json_exposes_verified_source_state_without_stamping_events() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).expect("sessions");
         std::fs::write(
             dir.path().join("auth.json"),
-            r#"{"chatgpt_account_id":"acct-real"}"#,
+            serde_json::json!({
+                "email": "existing@example.com",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-real",
+                    "chatgpt_plan_type": "plus",
+                    "chatgpt_subscription_active_start": "2026-05-29T10:12:43+00:00",
+                    "chatgpt_subscription_active_until": "2026-06-29T10:12:43+00:00",
+                    "chatgpt_subscription_last_checked": "2026-05-29T10:14:56.058278+00:00"
+                }
+            })
+            .to_string(),
         )
         .expect("auth");
         let mut file = File::create(sessions.join("session.jsonl")).expect("fixture");
@@ -2060,22 +2175,110 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
 
+        let verified = scan
+            .verified_source_state
+            .as_ref()
+            .expect("verified source state");
+        assert_eq!(verified.provider_user_id.as_deref(), Some("acct-real"));
+        assert_eq!(verified.email.as_deref(), Some("existing@example.com"));
+        assert_eq!(verified.plan_name.as_deref(), Some("Plus"));
+        assert!(verified.authenticated_at.is_some());
         assert_eq!(
-            scan.events[0].provider_account_id,
-            Some(provider_account_id(CODEX_PROVIDER, "acct-real"))
+            verified.verified_at.map(|value| value.to_rfc3339()),
+            Some("2026-05-29T10:14:56.058278+00:00".to_string())
+        );
+        let subscription = verified.subscription.as_ref().expect("subscription");
+        assert_eq!(subscription.plan_name, "Plus");
+        assert_eq!(subscription.price, 20.0);
+        assert_eq!(
+            subscription.started_at.to_rfc3339(),
+            "2026-05-29T10:12:43+00:00"
         );
         assert_eq!(
+            subscription
+                .current_period_ends_at
+                .map(|value| value.to_rfc3339()),
+            Some("2026-06-29T10:12:43+00:00".to_string())
+        );
+        assert_eq!(subscription.ended_at, None);
+        assert_eq!(scan.events[0].provider_account_id, None);
+        assert_ne!(
             scan.events[0]
                 .parse_evidence
                 .as_ref()
                 .map(|evidence| evidence.account_identity_source.clone()),
             Some(IdentitySource::LocalAuth)
         );
+    }
+
+    #[test]
+    fn codex_auth_json_reads_nested_tokens_id_token_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "id_token": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ImV4aXN0aW5nQGV4YW1wbGUuY29tIiwiaWF0IjoxNzQ4NTEzNTYzLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1yZWFsIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIiwiY2hhdGdwdF9zdWJzY3JpcHRpb25fYWN0aXZlX3N0YXJ0IjoiMjAyNi0wNS0yOVQxMDoxMjo0MyswMDowMCIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6IjIwMjYtMDYtMjlUMTA6MTI6NDMrMDA6MDAiLCJjaGF0Z3B0X3N1YnNjcmlwdGlvbl9sYXN0X2NoZWNrZWQiOiIyMDI2LTA1LTI5VDEwOjE0OjU2LjA1ODI3OCswMDowMCJ9fQ.",
+                    "access_token": "unused",
+                    "refresh_token": "unused",
+                    "account_id": "41412a8c-6e19-4d33-9b67-6fb4b4dc0734"
+                },
+                "last_refresh": "2026-05-19T19:56:03.481816Z"
+            })
+            .to_string(),
+        )
+        .expect("auth");
+        let mut file = File::create(sessions.join("session.jsonl")).expect("fixture");
+        writeln!(
+            file,
+            "{{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":2}}}}"
+        )
+        .expect("write");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        let verified = scan
+            .verified_source_state
+            .as_ref()
+            .expect("verified source state");
+        assert_eq!(verified.provider_user_id.as_deref(), Some("acct-real"));
+        assert_eq!(verified.email.as_deref(), Some("existing@example.com"));
+        assert_eq!(verified.plan_name.as_deref(), Some("Plus"));
+        assert!(verified.authenticated_at.is_some());
+        assert_eq!(
+            verified.verified_at.map(|value| value.to_rfc3339()),
+            Some("2026-05-29T10:14:56.058278+00:00".to_string())
+        );
+        let subscription = verified.subscription.as_ref().expect("subscription");
+        assert_eq!(subscription.plan_name, "Plus");
+        assert_eq!(subscription.price, 20.0);
+        assert_eq!(
+            subscription.started_at.to_rfc3339(),
+            "2026-05-29T10:12:43+00:00"
+        );
+        assert_eq!(
+            subscription
+                .current_period_ends_at
+                .map(|value| value.to_rfc3339()),
+            Some("2026-06-29T10:12:43+00:00".to_string())
+        );
+        assert_eq!(subscription.ended_at, None);
+        assert_eq!(scan.events[0].provider_account_id, None);
     }
 
     #[test]
@@ -2130,7 +2333,6 @@ mod tests {
             "0",
             dir.path(),
             LocationOrigin::Configured,
-            None,
         );
 
         let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");

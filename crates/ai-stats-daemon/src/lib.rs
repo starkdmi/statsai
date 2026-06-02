@@ -68,6 +68,9 @@ fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>) -> Result<()>
         }),
         "/sources" => serde_json::to_value(s.list_sources()?)?,
         "/accounts" => serde_json::to_value(s.list_accounts()?)?,
+        "/source-account-assignments" => {
+            serde_json::to_value(s.list_source_account_assignments()?)?
+        }
         "/subscriptions" => serde_json::to_value(s.list_subscriptions()?)?,
         "/reports/weekly" => json!({
             "events": s.event_count()?,
@@ -94,6 +97,9 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     for account in &batch.accounts {
         store.upsert_account(account)?;
     }
+    for assignment in &batch.source_account_assignments {
+        store.upsert_source_account_assignment(assignment)?;
+    }
     for subscription in &batch.subscriptions {
         store.upsert_subscription(subscription)?;
     }
@@ -106,6 +112,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
         accepted: SyncEntityCounts {
             sources: batch.sources.len() as u64,
             accounts: batch.accounts.len() as u64,
+            source_account_assignments: batch.source_account_assignments.len() as u64,
             subscriptions: batch.subscriptions.len() as u64,
             events: inserted_events,
             summaries: written_summaries,
@@ -113,6 +120,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
         duplicates: SyncEntityCounts {
             sources: 0,
             accounts: 0,
+            source_account_assignments: 0,
             subscriptions: 0,
             events: (batch.events.len() as u64).saturating_sub(inserted_events),
             summaries: 0,
@@ -148,10 +156,15 @@ fn content_type_json() -> Header {
 mod watch {
     use ai_stats_adapters::{default_adapters, ProviderAdapter, ScanCandidateFile, ScanOptions};
     use ai_stats_core::{
-        provider_account_id, IdentitySource, SourceKind, SourceLocation, UsageEvent, UsageSummary,
+        timestamp_in_period, IdentitySource, ProviderAccountId, SourceAccountAssignment,
+        SourceKind, SourceLocation, SourceVerificationMode, UsageEvent, UsageSummary,
     };
-    use ai_stats_store::{ScanFileStateEntry, Store};
+    use ai_stats_store::{
+        effective_verified_source_state_is_missing, has_active_verified_source_assignment,
+        reconcile_verified_source_state, verified_source_state_hash, ScanFileStateEntry, Store,
+    };
     use anyhow::{Context, Result};
+    use chrono::{DateTime, Utc};
     use notify::{Event, EventKind, RecursiveMode, Watcher};
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -245,6 +258,15 @@ mod watch {
 
     fn rescan_changed_sources(store: &Store, device_id: &str, changed: &[PathBuf]) {
         let adapters: Vec<Box<dyn ProviderAdapter>> = default_adapters();
+        rescan_changed_sources_with_adapters(store, device_id, changed, &adapters);
+    }
+
+    fn rescan_changed_sources_with_adapters(
+        store: &Store,
+        device_id: &str,
+        changed: &[PathBuf],
+        adapters: &[Box<dyn ProviderAdapter>],
+    ) {
         let configured = match store.list_sources() {
             Ok(sources) => sources,
             Err(e) => {
@@ -253,9 +275,9 @@ mod watch {
             }
         };
 
-        for adapter in &adapters {
+        for adapter in adapters {
             let sources = scan_sources_for_paths(adapter.as_ref(), &configured, changed);
-            for source in sources {
+            for mut source in sources {
                 let cache_candidates = match adapter.scan_candidates(&source) {
                     Ok(candidates) => candidates,
                     Err(e) => {
@@ -278,7 +300,61 @@ mod watch {
                             continue;
                         }
                     };
-                if pending_file_entries.is_empty() {
+                let verification_mode = source.verification_mode.clone();
+                let probed_verified_source_state =
+                    if matches!(verification_mode, SourceVerificationMode::Disabled) {
+                        None
+                    } else {
+                        match adapter.probe_verified_source_state(&source) {
+                            Ok(state) => state,
+                            Err(e) => {
+                                eprintln!(
+                                    "daemon: verified auth probe failed for {}: {e}",
+                                    source.path_label.as_deref().unwrap_or("unknown")
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                let next_verified_state_hash =
+                    if matches!(verification_mode, SourceVerificationMode::Auto) {
+                        match verified_source_state_hash(probed_verified_source_state.as_ref()) {
+                            Ok(hash) => hash,
+                            Err(e) => {
+                                eprintln!(
+                                    "daemon: verified auth hash failed for {}: {e}",
+                                    source.path_label.as_deref().unwrap_or("unknown")
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                let verified_state_changed =
+                    matches!(verification_mode, SourceVerificationMode::Auto)
+                        && source.verified_state_hash != next_verified_state_hash;
+                let legacy_verified_state_needs_reconciliation =
+                    matches!(verification_mode, SourceVerificationMode::Auto)
+                        && source.verified_state_hash.is_none()
+                        && next_verified_state_hash.is_none()
+                        && effective_verified_source_state_is_missing(
+                            &probed_verified_source_state,
+                        )
+                        && match has_active_verified_source_assignment(store, &source.source_id) {
+                            Ok(active) => active,
+                            Err(e) => {
+                                eprintln!(
+                                    "daemon: verified assignment lookup failed for {}: {e}",
+                                    source.path_label.as_deref().unwrap_or("unknown")
+                                );
+                                continue;
+                            }
+                        };
+                if pending_file_entries.is_empty()
+                    && !verified_state_changed
+                    && !legacy_verified_state_needs_reconciliation
+                {
                     continue;
                 }
                 let options = ScanOptions {
@@ -290,11 +366,55 @@ mod watch {
                             .collect::<HashSet<_>>(),
                     ),
                 };
-                match adapter.scan(&source, &options) {
+                let scan_result = if pending_file_entries.is_empty() {
+                    Ok(ai_stats_adapters::AdapterScan::default())
+                } else {
+                    adapter.scan(&source, &options)
+                };
+                match scan_result {
                     Ok(mut scan) => {
-                        apply_source_account_alias(&source, &mut scan.events, &mut scan.summaries);
                         let parsed_events = scan.events.len();
                         let parsed_summaries = scan.summaries.len();
+                        let effective_verified_source_state =
+                            if matches!(verification_mode, SourceVerificationMode::Disabled) {
+                                None
+                            } else if pending_file_entries.is_empty() {
+                                probed_verified_source_state
+                            } else {
+                                scan.verified_source_state
+                                    .take()
+                                    .or(probed_verified_source_state)
+                            };
+                        if let Err(e) = reconcile_verified_source_state(
+                            store,
+                            &mut source,
+                            effective_verified_source_state.as_ref(),
+                            next_verified_state_hash,
+                        ) {
+                            eprintln!("daemon: verified auth reconciliation failed: {e}");
+                            continue;
+                        }
+                        if let Err(e) = store.upsert_source(&source) {
+                            eprintln!("daemon: update source verified auth state failed: {e}");
+                            continue;
+                        }
+                        if pending_file_entries.is_empty() {
+                            eprintln!(
+                                "daemon: reconciled auth state for {} ({})",
+                                source.provider,
+                                source.path_label.as_deref().unwrap_or("unknown")
+                            );
+                            continue;
+                        }
+                        if let Err(e) = apply_source_account_resolution(
+                            store,
+                            &source,
+                            &mut scan.events,
+                            &mut scan.summaries,
+                        ) {
+                            eprintln!("daemon: account resolution failed: {e}");
+                            continue;
+                        }
                         let inserted_events = match store.insert_events(&scan.events) {
                             Ok(count) => count,
                             Err(e) => {
@@ -370,29 +490,6 @@ mod watch {
         sources
     }
 
-    fn apply_source_account_alias(
-        source: &SourceLocation,
-        events: &mut [UsageEvent],
-        summaries: &mut [UsageSummary],
-    ) {
-        let Some(account_alias) = source.account_alias.as_deref() else {
-            return;
-        };
-        let account_id = provider_account_id(&source.provider, account_alias);
-        for event in events {
-            event.provider_account_id = Some(account_id.clone());
-            if let Some(evidence) = event.parse_evidence.as_mut() {
-                evidence.account_identity_source = IdentitySource::ManualHint;
-            }
-        }
-        for summary in summaries {
-            summary.provider_account_id = Some(account_id.clone());
-            if let Some(evidence) = summary.parse_evidence.as_mut() {
-                evidence.account_identity_source = IdentitySource::ManualHint;
-            }
-        }
-    }
-
     fn source_in_changed_paths(source: &SourceLocation, changed: &[PathBuf]) -> bool {
         let Some(label) = source.path_label.as_deref() else {
             return false;
@@ -411,6 +508,284 @@ mod watch {
                 cache_signature: candidate.cache_signature.clone(),
             })
             .collect()
+    }
+
+    fn apply_source_account_resolution(
+        store: &Store,
+        source: &SourceLocation,
+        events: &mut [UsageEvent],
+        summaries: &mut [UsageSummary],
+    ) -> Result<()> {
+        let assignments = store.list_source_account_assignments_for_source(&source.source_id)?;
+        for event in events {
+            apply_account_resolution_to_event(&assignments, event);
+        }
+        for summary in summaries {
+            apply_account_resolution_to_summary(&assignments, summary);
+        }
+        Ok(())
+    }
+
+    fn apply_account_resolution_to_event(
+        assignments: &[SourceAccountAssignment],
+        event: &mut UsageEvent,
+    ) {
+        if keep_detected_account_identity(
+            event.provider_account_id.as_ref(),
+            event
+                .parse_evidence
+                .as_ref()
+                .map(|evidence| &evidence.account_identity_source),
+        ) {
+            return;
+        }
+        let assignment = assignment_for_timestamp(assignments, event.session.started_at);
+        if let Some(assignment) = assignment {
+            event.provider_account_id = Some(assignment.provider_account_id.clone());
+            if let Some(evidence) = event.parse_evidence.as_mut() {
+                evidence.account_identity_source = IdentitySource::SourceConfig;
+            }
+        } else if should_clear_resolved_account(
+            event.provider_account_id.as_ref(),
+            event
+                .parse_evidence
+                .as_ref()
+                .map(|evidence| &evidence.account_identity_source),
+        ) {
+            event.provider_account_id = None;
+            if let Some(evidence) = event.parse_evidence.as_mut() {
+                evidence.account_identity_source = IdentitySource::Unresolved;
+            }
+        }
+    }
+
+    fn apply_account_resolution_to_summary(
+        assignments: &[SourceAccountAssignment],
+        summary: &mut UsageSummary,
+    ) {
+        if keep_detected_account_identity(
+            summary.provider_account_id.as_ref(),
+            summary
+                .parse_evidence
+                .as_ref()
+                .map(|evidence| &evidence.account_identity_source),
+        ) {
+            return;
+        }
+        let timestamp = summary.period_start.unwrap_or(summary.observed_at);
+        let assignment = assignment_for_timestamp(assignments, timestamp);
+        if let Some(assignment) = assignment {
+            summary.provider_account_id = Some(assignment.provider_account_id.clone());
+            if let Some(evidence) = summary.parse_evidence.as_mut() {
+                evidence.account_identity_source = IdentitySource::SourceConfig;
+            }
+        } else if should_clear_resolved_account(
+            summary.provider_account_id.as_ref(),
+            summary
+                .parse_evidence
+                .as_ref()
+                .map(|evidence| &evidence.account_identity_source),
+        ) {
+            summary.provider_account_id = None;
+            if let Some(evidence) = summary.parse_evidence.as_mut() {
+                evidence.account_identity_source = IdentitySource::Unresolved;
+            }
+        }
+    }
+
+    fn keep_detected_account_identity(
+        provider_account_id: Option<&ProviderAccountId>,
+        identity_source: Option<&IdentitySource>,
+    ) -> bool {
+        let Some(provider_account_id) = provider_account_id else {
+            return false;
+        };
+        if provider_account_id.0.trim().is_empty() {
+            return false;
+        }
+        let Some(identity_source) = identity_source else {
+            return false;
+        };
+        !matches!(
+            identity_source,
+            IdentitySource::SourceConfig
+                | IdentitySource::UserConfigured
+                | IdentitySource::ManualHint
+                | IdentitySource::Unknown
+                | IdentitySource::Unresolved
+        )
+    }
+
+    fn should_clear_resolved_account(
+        provider_account_id: Option<&ProviderAccountId>,
+        identity_source: Option<&IdentitySource>,
+    ) -> bool {
+        let Some(provider_account_id) = provider_account_id else {
+            return false;
+        };
+        if provider_account_id.0.trim().is_empty() {
+            return false;
+        }
+        matches!(
+            identity_source,
+            None | Some(
+                IdentitySource::SourceConfig
+                    | IdentitySource::UserConfigured
+                    | IdentitySource::ManualHint
+                    | IdentitySource::Unknown
+                    | IdentitySource::Unresolved
+            )
+        )
+    }
+
+    fn assignment_for_timestamp(
+        assignments: &[SourceAccountAssignment],
+        timestamp: DateTime<Utc>,
+    ) -> Option<&SourceAccountAssignment> {
+        assignments
+            .iter()
+            .filter(|assignment| {
+                timestamp_in_period(timestamp, assignment.started_at, assignment.ended_at)
+            })
+            .max_by(|left, right| left.started_at.cmp(&right.started_at))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ai_stats_core::{
+            BillingPeriod, LocationOrigin, SubscriptionStatus, VerifiedSourceState,
+            VerifiedSubscriptionState,
+        };
+        use chrono::TimeZone;
+        use std::sync::{Arc, Mutex};
+
+        struct TestAdapter {
+            provider: &'static str,
+            verified_state: Option<VerifiedSourceState>,
+            scan_calls: Arc<Mutex<u64>>,
+        }
+
+        impl ProviderAdapter for TestAdapter {
+            fn id(&self) -> &'static str {
+                "test-watch-adapter"
+            }
+
+            fn version(&self) -> &'static str {
+                "0.0.0"
+            }
+
+            fn provider(&self) -> &'static str {
+                self.provider
+            }
+
+            fn discover(&self) -> Vec<SourceLocation> {
+                Vec::new()
+            }
+
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(Vec::new())
+            }
+
+            fn probe_verified_source_state(
+                &self,
+                _source: &SourceLocation,
+            ) -> Result<Option<VerifiedSourceState>> {
+                Ok(self.verified_state.clone())
+            }
+
+            fn scan(
+                &self,
+                _source: &SourceLocation,
+                _options: &ScanOptions,
+            ) -> Result<ai_stats_adapters::AdapterScan> {
+                *self.scan_calls.lock().expect("scan calls") += 1;
+                Ok(ai_stats_adapters::AdapterScan::default())
+            }
+        }
+
+        #[test]
+        fn rescan_changed_sources_reconciles_verified_auth_without_pending_usage_files() {
+            let store = Store::in_memory().expect("store");
+            let root =
+                std::env::temp_dir().join(format!("ai-stats-watch-auth-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("temp source root");
+            let mut source = SourceLocation::local_adapter(
+                "codex",
+                "test",
+                "0",
+                &root,
+                LocationOrigin::Configured,
+            );
+            source.verification_mode = SourceVerificationMode::Auto;
+            store.upsert_source(&source).expect("source");
+
+            let authenticated_at = Utc
+                .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+                .single()
+                .expect("authenticated_at");
+            let verified_at = Utc
+                .with_ymd_and_hms(2026, 5, 29, 10, 14, 56)
+                .single()
+                .expect("verified_at");
+            let current_period_ends_at = Utc
+                .with_ymd_and_hms(2026, 6, 29, 10, 12, 43)
+                .single()
+                .expect("current_period_ends_at");
+            let scan_calls = Arc::new(Mutex::new(0u64));
+            let adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(TestAdapter {
+                provider: "codex",
+                verified_state: Some(VerifiedSourceState {
+                    provider_user_id: Some("acct-watch".to_string()),
+                    email: Some("watch@example.com".to_string()),
+                    account_label: None,
+                    plan_name: Some("Plus".to_string()),
+                    authenticated_at: Some(authenticated_at),
+                    verified_at: Some(verified_at),
+                    subscription: Some(VerifiedSubscriptionState {
+                        plan_name: "Plus".to_string(),
+                        price: 20.0,
+                        currency: "USD".to_string(),
+                        billing_period: BillingPeriod::Monthly,
+                        paid_at: Some(authenticated_at),
+                        started_at: authenticated_at,
+                        ended_at: Some(current_period_ends_at),
+                        current_period_ends_at: Some(current_period_ends_at),
+                        status: SubscriptionStatus::Active,
+                        verified_at: Some(verified_at),
+                    }),
+                }),
+                scan_calls: scan_calls.clone(),
+            })];
+
+            rescan_changed_sources_with_adapters(
+                &store,
+                "device-test",
+                &[
+                    PathBuf::from(source.path_label.as_deref().expect("path label"))
+                        .join("auth.json"),
+                ],
+                &adapters,
+            );
+
+            assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
+            assert_eq!(store.list_accounts().expect("accounts").len(), 1);
+            assert_eq!(store.list_subscriptions().expect("subscriptions").len(), 1);
+            let assignments = store
+                .list_source_account_assignments_for_source(&source.source_id)
+                .expect("assignments");
+            assert_eq!(assignments.len(), 1);
+            assert_eq!(assignments[0].started_at, authenticated_at);
+            assert_eq!(assignments[0].ended_at, None);
+            assert_eq!(assignments[0].record_source, IdentitySource::LocalAuth);
+            let stored_source = store
+                .source(&source.source_id)
+                .expect("source")
+                .expect("stored source");
+            assert!(stored_source.verified_state_hash.is_some());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }
 
@@ -449,6 +824,7 @@ mod tests {
             device_id: "device_test".to_string(),
             sources: Vec::new(),
             accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),

@@ -4,6 +4,7 @@
   "accepted": {
     "sources": 0,
     "accounts": 0,
+    "source_account_assignments": 0,
     "subscriptions": 0,
     "events": 0,
     "summaries": 0
@@ -11,6 +12,7 @@
   "duplicates": {
     "sources": 0,
     "accounts": 0,
+    "source_account_assignments": 0,
     "subscriptions": 0,
     "events": 0,
     "summaries": 0

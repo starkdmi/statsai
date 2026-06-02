@@ -12,6 +12,7 @@ ai-stats-core = { path = "../ai-stats-core" }
 ai-stats-pricing = { path = "../ai-stats-pricing" }
 anyhow.workspace = true
 chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 walkdir.workspace = true
 

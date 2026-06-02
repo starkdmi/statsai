@@ -1,28 +1,41 @@
+#[cfg(test)]
+use ai_stats_adapters::VerifiedSubscriptionState;
 use ai_stats_adapters::{
     adapter_for_provider, default_adapters, ProviderAdapter, ScanCandidateFile, ScanDiagnostics,
-    ScanOptions,
+    ScanOptions, VerifiedSourceState,
 };
 use ai_stats_core::{
-    build_usage_report, hash_text, home_dir, provider_account_id, subscription_id, BillingPeriod,
-    Confidence, IdentitySource, LocationOrigin, ProviderAccount, ReportPeriod, SourceKind,
-    SourceLocation, Subscription, SubscriptionStatus, SyncBatch, UsageEvent, UsageReport,
-    UsageSummary, UsageTotals, PROVIDER_ACCOUNT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
-    SYNC_BATCH_SCHEMA_VERSION,
+    build_usage_report, expand_home_path, hash_text, home_dir, normalize_email,
+    normalize_provider_user_id, path_hash, periods_overlap, source_account_assignment_id,
+    subscription_id, timestamp_in_period, BillingPeriod, IdentitySource, LocationOrigin,
+    ProviderAccount, ProviderAccountId, ReportPeriod, SourceAccountAssignment,
+    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
+    Subscription, SubscriptionId, SubscriptionStatus, SyncBatch, UsageEvent, UsageReport,
+    UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
 use ai_stats_core::{
-    summary_id, CostInfo, EventSource, PrivacyInfo, PrivacyMode, SummaryMetadata, UsageCounts,
+    provider_account_id, provider_account_id_from_identity, summary_id, Confidence, CostInfo,
+    EventSource, PrivacyInfo, PrivacyMode, SummaryMetadata, UsageCounts,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use ai_stats_sdk::{
     build_reported_usage_summary, ReportedUsageSummaryInput, ReportedUsageSummaryRecord,
 };
-use ai_stats_store::{ScanFileStateEntry, Store, SyncState};
+#[cfg(test)]
+use ai_stats_store::apply_verified_source_state;
+use ai_stats_store::{
+    close_active_verified_source_linkages, effective_verified_source_state_is_missing,
+    find_existing_provider_account, has_active_verified_source_assignment,
+    reconcile_verified_source_state, upsert_provider_account, verified_source_state_hash,
+    ScanFileStateEntry, Store, SyncState, UpsertProviderAccountInput,
+};
 use ai_stats_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use chrono::Duration;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -55,9 +68,9 @@ enum Command {
     Report(ReportCommand),
     #[command(about = "Manage configured source paths")]
     Source(SourceCommand),
-    #[command(about = "Resolve provider accounts from sources")]
+    #[command(about = "List canonical provider accounts")]
     Account(AccountCommand),
-    #[command(about = "Manage subscription plans")]
+    #[command(about = "Manage subscription periods")]
     Subscription(SubscriptionCommand),
     #[command(about = "Import external usage summaries")]
     Import(ImportCommand),
@@ -129,6 +142,8 @@ enum ReportSubcommand {
         json: bool,
         #[arg(long, help = "Show source paths and reasoning tokens")]
         verbose: bool,
+        #[arg(long, help = "Include subscription-value rows")]
+        subscriptions: bool,
     },
     #[command(about = "Show usage for the last 30 days")]
     Monthly {
@@ -136,6 +151,8 @@ enum ReportSubcommand {
         json: bool,
         #[arg(long, help = "Show source paths and reasoning tokens")]
         verbose: bool,
+        #[arg(long, help = "Include subscription-value rows")]
+        subscriptions: bool,
     },
     #[command(about = "Show all stored usage")]
     AllTime {
@@ -143,6 +160,8 @@ enum ReportSubcommand {
         json: bool,
         #[arg(long, help = "Show source paths and reasoning tokens")]
         verbose: bool,
+        #[arg(long, help = "Include subscription-value rows")]
+        subscriptions: bool,
     },
 }
 
@@ -160,11 +179,6 @@ enum SourceSubcommand {
         provider: String,
         #[arg(long, help = "Path to the provider's local data directory")]
         path: PathBuf,
-        #[arg(
-            long,
-            help = "User-defined account alias to group this source under (e.g. personal, work)"
-        )]
-        account: Option<String>,
     },
     #[command(about = "Enable a configured source")]
     Enable {
@@ -188,6 +202,75 @@ enum SourceSubcommand {
     },
     #[command(about = "List all configured sources")]
     List,
+    #[command(about = "Connect a source to an account for a time period")]
+    Connect {
+        #[arg(long, help = "Source identifier to attach")]
+        source_id: Option<String>,
+        #[arg(long, help = "Local source path to attach")]
+        path: Option<PathBuf>,
+        #[arg(long, help = "Existing provider account identifier")]
+        provider_account_id: Option<String>,
+        #[arg(long, help = "Canonical provider user/account identifier")]
+        provider_user_id: Option<String>,
+        #[arg(long, help = "Provider email for this account")]
+        email: Option<String>,
+        #[arg(long, help = "Display label for this account")]
+        label: Option<String>,
+        #[arg(long, help = "Assignment start date/time (YYYY-MM-DD or RFC 3339)")]
+        started_at: String,
+        #[arg(long, help = "Assignment end date/time (exclusive)")]
+        ended_at: Option<String>,
+    },
+    #[command(about = "Show source-to-account connection history")]
+    History {
+        #[arg(long, help = "Optional source identifier filter")]
+        source_id: Option<String>,
+        #[arg(long, help = "Optional local source path filter")]
+        path: Option<PathBuf>,
+    },
+    #[command(about = "Set auth verification mode for a source")]
+    Mode {
+        #[arg(long, help = "Source identifier to update")]
+        source_id: Option<String>,
+        #[arg(long, help = "Local source path to update")]
+        path: Option<PathBuf>,
+        #[arg(long, help = "Verification mode (auto, manual_only, disabled)")]
+        mode: String,
+    },
+    #[command(about = "End the active source connection and leave future usage unassigned")]
+    Unassign {
+        #[arg(long, help = "Source identifier to unassign")]
+        source_id: Option<String>,
+        #[arg(long, help = "Local source path to unassign")]
+        path: Option<PathBuf>,
+        #[arg(long, help = "Unassign from this timestamp forward (defaults to now)")]
+        at: Option<String>,
+    },
+    #[command(about = "Explain how a source is currently attributed")]
+    Explain {
+        #[arg(long, help = "Source identifier to inspect")]
+        source_id: Option<String>,
+        #[arg(long, help = "Local source path to inspect")]
+        path: Option<PathBuf>,
+    },
+    #[command(about = "End the active source-to-account connection")]
+    Disconnect {
+        #[arg(long, help = "Source identifier to disconnect")]
+        source_id: Option<String>,
+        #[arg(long, help = "Local source path to disconnect")]
+        path: Option<PathBuf>,
+        #[arg(long, help = "Existing provider account identifier")]
+        provider_account_id: Option<String>,
+        #[arg(long, help = "Canonical provider user/account identifier")]
+        provider_user_id: Option<String>,
+        #[arg(long, help = "Provider email for this account")]
+        email: Option<String>,
+        #[arg(
+            long,
+            help = "End the current connection at this timestamp (exclusive)"
+        )]
+        ended_at: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -198,10 +281,36 @@ struct AccountCommand {
 
 #[derive(Debug, Subcommand)]
 enum AccountSubcommand {
-    #[command(about = "Resolve provider accounts from configured sources")]
-    Resolve {
-        #[arg(long, help = "Provider to resolve accounts for (claude_code, codex)")]
+    #[command(about = "List canonical provider accounts")]
+    List,
+    #[command(about = "Merge a legacy/manual account into an existing canonical account")]
+    Merge {
+        #[arg(long, help = "Provider name (claude_code, codex)")]
         provider: String,
+        #[arg(
+            long,
+            help = "Source account identity (label, email, provider user id, or provider account id)"
+        )]
+        from: String,
+        #[arg(
+            long,
+            help = "Destination account identity (label, email, provider user id, or provider account id)"
+        )]
+        to: String,
+        #[arg(long, help = "Preview the cleanup without writing")]
+        dry_run: bool,
+    },
+    #[command(about = "Remove an unreferenced account row")]
+    Remove {
+        #[arg(long, help = "Provider name (claude_code, codex)")]
+        provider: String,
+        #[arg(
+            long,
+            help = "Account identity to delete (label, email, provider user id, or provider account id)"
+        )]
+        account: String,
+        #[arg(long, help = "Preview the cleanup without writing")]
+        dry_run: bool,
     },
 }
 
@@ -213,20 +322,83 @@ struct SubscriptionCommand {
 
 #[derive(Debug, Subcommand)]
 enum SubscriptionSubcommand {
-    #[command(about = "Register a subscription plan")]
+    #[command(about = "Register a subscription period")]
     Add {
         #[arg(long, help = "Provider name (claude_code, codex)")]
         provider: String,
-        #[arg(long, help = "Account alias to link this subscription to")]
-        account: Option<String>,
+        #[arg(long, help = "Existing provider account identifier")]
+        provider_account_id: Option<String>,
+        #[arg(long, help = "Canonical provider user/account identifier")]
+        provider_user_id: Option<String>,
+        #[arg(long, help = "Provider email for this account")]
+        email: Option<String>,
+        #[arg(long, help = "Display label for this account")]
+        label: Option<String>,
         #[arg(long, help = "Plan name (e.g. Pro, Max, Team)")]
         plan: String,
-        #[arg(long, help = "Monthly price in the given currency")]
+        #[arg(long, help = "Subscription price in the given currency")]
         price: f64,
         #[arg(long, default_value = "USD", help = "Currency code")]
         currency: String,
         #[arg(long, help = "Date the subscription was paid (YYYY-MM-DD or RFC 3339)")]
         paid_at: Option<String>,
+        #[arg(long, help = "Subscription period start (YYYY-MM-DD or RFC 3339)")]
+        started_at: String,
+        #[arg(long, help = "Subscription period end (exclusive)")]
+        ended_at: Option<String>,
+    },
+    #[command(about = "Change to a new subscription period and close the current one")]
+    Change {
+        #[arg(long, help = "Provider name (claude_code, codex)")]
+        provider: String,
+        #[arg(long, help = "Existing provider account identifier")]
+        provider_account_id: Option<String>,
+        #[arg(long, help = "Canonical provider user/account identifier")]
+        provider_user_id: Option<String>,
+        #[arg(long, help = "Provider email for this account")]
+        email: Option<String>,
+        #[arg(long, help = "Display label for this account")]
+        label: Option<String>,
+        #[arg(long, help = "Plan name (e.g. Pro, Max, Team)")]
+        plan: String,
+        #[arg(long, help = "Subscription price in the given currency")]
+        price: f64,
+        #[arg(long, default_value = "USD", help = "Currency code")]
+        currency: String,
+        #[arg(long, help = "Date the subscription was paid (YYYY-MM-DD or RFC 3339)")]
+        paid_at: Option<String>,
+        #[arg(long, help = "New subscription period start (YYYY-MM-DD or RFC 3339)")]
+        started_at: String,
+    },
+    #[command(about = "End the active subscription period")]
+    End {
+        #[arg(long, help = "Provider name (claude_code, codex)")]
+        provider: String,
+        #[arg(long, help = "Existing provider account identifier")]
+        provider_account_id: Option<String>,
+        #[arg(long, help = "Canonical provider user/account identifier")]
+        provider_user_id: Option<String>,
+        #[arg(long, help = "Provider email for this account")]
+        email: Option<String>,
+        #[arg(long, help = "Subscription period end (exclusive, defaults to now)")]
+        ended_at: Option<String>,
+    },
+    #[command(about = "Remove a subscription period")]
+    Remove {
+        #[arg(long, help = "Provider name (claude_code, codex)")]
+        provider: String,
+        #[arg(long, help = "Existing provider account identifier")]
+        provider_account_id: Option<String>,
+        #[arg(long, help = "Canonical provider user/account identifier")]
+        provider_user_id: Option<String>,
+        #[arg(long, help = "Provider email for this account")]
+        email: Option<String>,
+        #[arg(long, help = "Plan name (e.g. Pro, Max, Team)")]
+        plan: Option<String>,
+        #[arg(long, help = "Subscription period start (YYYY-MM-DD or RFC 3339)")]
+        started_at: Option<String>,
+        #[arg(long, help = "Remove the active subscription period")]
+        current: bool,
     },
     #[command(about = "List all registered subscriptions")]
     List,
@@ -293,6 +465,13 @@ struct SyncCommand {
         help = "Inspect the resolved Cloudflare sync target and verify remote device access"
     )]
     verify: bool,
+    #[arg(
+        long,
+        help = "Delete mirrored hosted sync data for the current user and clear local sync tracking (http only)"
+    )]
+    reset_remote: bool,
+    #[arg(long, help = "Confirm destructive sync reset actions")]
+    yes: bool,
     #[arg(long, help = "Build the sync batch without writing")]
     dry_run: bool,
 }
@@ -374,6 +553,15 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
             default_adapters()
         };
 
+    scan_with_adapters(command, store, device_id, adapters)
+}
+
+fn scan_with_adapters(
+    command: ScanCommand,
+    store: &Store,
+    device_id: &str,
+    adapters: Vec<Box<dyn ProviderAdapter>>,
+) -> Result<()> {
     let mut event_count = 0u64;
     let mut summary_count = 0u64;
     let mut inserted_count = 0u64;
@@ -413,9 +601,50 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
                         .collect()
                 }),
             };
-            let mut scan = adapter.scan(&source, &options)?;
-            apply_account_alias_to_events(&source, &mut scan.events);
-            apply_account_alias_to_summaries(&source, &mut scan.summaries);
+            let verification_mode = source_verification_mode(&source);
+            let probed_verified_source_state =
+                if matches!(verification_mode, SourceVerificationMode::Disabled) {
+                    None
+                } else {
+                    adapter.probe_verified_source_state(&source)?
+                };
+            let next_verified_state_hash =
+                if matches!(verification_mode, SourceVerificationMode::Auto) {
+                    verified_source_state_hash(probed_verified_source_state.as_ref())?
+                } else {
+                    None
+                };
+            let verified_state_changed = matches!(verification_mode, SourceVerificationMode::Auto)
+                && source.verified_state_hash != next_verified_state_hash;
+            let legacy_verified_state_needs_reconciliation =
+                matches!(verification_mode, SourceVerificationMode::Auto)
+                    && source.verified_state_hash.is_none()
+                    && next_verified_state_hash.is_none()
+                    && effective_verified_source_state_is_missing(&probed_verified_source_state)
+                    && has_active_verified_source_assignment(store, &source.source_id)?;
+            let should_run_full_scan =
+                command.no_cache || command.replace || !pending_file_entries.is_empty();
+            let mut scan = if should_run_full_scan {
+                adapter.scan(&source, &options)?
+            } else {
+                ai_stats_adapters::AdapterScan {
+                    diagnostics: ScanDiagnostics {
+                        files_skipped_unchanged: file_cache_entries.len() as u64,
+                        ..ScanDiagnostics::default()
+                    },
+                    ..ai_stats_adapters::AdapterScan::default()
+                }
+            };
+            let effective_verified_source_state =
+                if matches!(verification_mode, SourceVerificationMode::Disabled) {
+                    None
+                } else if should_run_full_scan {
+                    scan.verified_source_state
+                        .take()
+                        .or(probed_verified_source_state)
+                } else {
+                    probed_verified_source_state
+                };
             let log_rows = scan.diagnostics.raw_rows;
             let mut source_usage = UsageTotals::default();
             for event in &scan.events {
@@ -432,12 +661,16 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
                 || source_summary_count > 0
                 || scan.diagnostics.files_scanned > 0
                 || scan.diagnostics.files_skipped_unchanged > 0
-                || log_rows > 0;
+                || log_rows > 0
+                || verified_state_changed
+                || legacy_verified_state_needs_reconciliation;
             let suppress_source_processing = !command.verbose
                 && !command.explain
                 && source_event_count == 0
                 && source_summary_count == 0
-                && !touched_files;
+                && !touched_files
+                && !verified_state_changed
+                && !legacy_verified_state_needs_reconciliation;
 
             if !has_scan_activity {
                 continue;
@@ -467,7 +700,14 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
                 );
                 continue;
             }
+            reconcile_verified_source_state(
+                store,
+                &mut source,
+                effective_verified_source_state.as_ref(),
+                next_verified_state_hash,
+            )?;
             persist_source_after_preview(store, &source)?;
+            apply_source_account_resolution(store, &source, &mut scan.events, &mut scan.summaries)?;
             if command.replace {
                 replaced_event_count +=
                     store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
@@ -548,11 +788,7 @@ fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
 
 fn source(command: SourceCommand, store: &Store) -> Result<()> {
     match command.command {
-        SourceSubcommand::Add {
-            provider,
-            path,
-            account,
-        } => {
+        SourceSubcommand::Add { provider, path } => {
             let adapter = adapter_for_provider(&provider)
                 .with_context(|| format!("unsupported provider {provider}"))?;
             let path = normalize_configured_source_path(adapter.provider(), &path)?;
@@ -562,7 +798,6 @@ fn source(command: SourceCommand, store: &Store) -> Result<()> {
                 adapter.version(),
                 &path,
                 LocationOrigin::Configured,
-                account,
             );
             source.path_label = Some(path.to_string_lossy().to_string());
             store.upsert_source(&source)?;
@@ -622,107 +857,739 @@ fn source(command: SourceCommand, store: &Store) -> Result<()> {
         SourceSubcommand::List => {
             println!("{}", serde_json::to_string_pretty(&store.list_sources()?)?);
         }
+        SourceSubcommand::Connect {
+            source_id,
+            path,
+            provider_account_id,
+            provider_user_id,
+            email,
+            label,
+            started_at,
+            ended_at,
+        } => {
+            let source = resolve_source_reference(store, source_id.as_deref(), path.as_deref())?;
+            let assignment = connect_source_to_account(
+                store,
+                ConnectSourceToAccountInput {
+                    source_id: &source.source_id,
+                    provider_account_id_value: provider_account_id.as_deref(),
+                    provider_user_id: provider_user_id.as_deref(),
+                    email: email.as_deref(),
+                    label,
+                    started_at: parse_date(&started_at)?,
+                    ended_at: ended_at.as_deref().map(parse_date).transpose()?,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&assignment)?);
+        }
+        SourceSubcommand::History { source_id, path } => {
+            let assignments = if source_id.is_some() || path.is_some() {
+                let source =
+                    resolve_source_reference(store, source_id.as_deref(), path.as_deref())?;
+                store.list_source_account_assignments_for_source(&source.source_id)?
+            } else {
+                store.list_source_account_assignments()?
+            };
+            println!("{}", serde_json::to_string_pretty(&assignments)?);
+        }
+        SourceSubcommand::Mode {
+            source_id,
+            path,
+            mode,
+        } => {
+            let mut source =
+                resolve_source_reference(store, source_id.as_deref(), path.as_deref())?;
+            source.verification_mode = parse_source_verification_mode(&mode)?;
+            if !matches!(source.verification_mode, SourceVerificationMode::Auto) {
+                source.verified_state_hash = None;
+            }
+            if matches!(source.verification_mode, SourceVerificationMode::Disabled) {
+                close_active_verified_source_linkages(store, &source.source_id, Utc::now())?;
+            }
+            source.updated_at = Utc::now();
+            store.upsert_source(&source)?;
+            println!("{}", serde_json::to_string_pretty(&source)?);
+        }
+        SourceSubcommand::Unassign {
+            source_id,
+            path,
+            at,
+        } => {
+            let source = resolve_source_reference(store, source_id.as_deref(), path.as_deref())?;
+            let ended_at = at
+                .as_deref()
+                .map(parse_date)
+                .transpose()?
+                .unwrap_or_else(Utc::now);
+            let assignment = disconnect_source_from_account(
+                store,
+                &source.source_id,
+                None,
+                None,
+                None,
+                ended_at,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&assignment)?);
+        }
+        SourceSubcommand::Explain { source_id, path } => {
+            let source = resolve_source_reference(store, source_id.as_deref(), path.as_deref())?;
+            let explanation = explain_source(store, &source)?;
+            println!("{}", serde_json::to_string_pretty(&explanation)?);
+        }
+        SourceSubcommand::Disconnect {
+            source_id,
+            path,
+            provider_account_id,
+            provider_user_id,
+            email,
+            ended_at,
+        } => {
+            let source = resolve_source_reference(store, source_id.as_deref(), path.as_deref())?;
+            let assignment = disconnect_source_from_account(
+                store,
+                &source.source_id,
+                provider_account_id.as_deref(),
+                provider_user_id.as_deref(),
+                email.as_deref(),
+                parse_date(&ended_at)?,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&assignment)?);
+        }
     }
     Ok(())
 }
 
 fn account(command: AccountCommand, store: &Store) -> Result<()> {
     match command.command {
-        AccountSubcommand::Resolve { provider } => {
-            let provider = canonical_provider(&provider)?;
-            let sources: Vec<_> = store
-                .list_sources()?
-                .into_iter()
-                .filter(|source| provider_matches(&source.provider, &provider))
-                .collect();
-            if sources.is_empty() {
-                println!("no configured sources for {provider}");
-                return Ok(());
-            }
-            let mut accounts: BTreeMap<String, ProviderAccount> = BTreeMap::new();
-            for source in sources {
-                let stable = source
-                    .account_alias
-                    .as_deref()
-                    .unwrap_or(&source.source_id.0);
-                let id = provider_account_id(&source.provider, stable);
-                if let Some(account) = accounts.get_mut(&id.0) {
-                    account.source_ids.push(source.source_id.clone());
-                    account
-                        .source_ids
-                        .sort_by(|left, right| left.0.cmp(&right.0));
-                    account.source_ids.dedup();
-                    account.updated_at = Utc::now();
-                    continue;
-                }
-                let account = ProviderAccount {
-                    schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
-                    provider_account_id: id.clone(),
-                    provider: source.provider.clone(),
-                    identity_source: if source.account_alias.is_some() {
-                        IdentitySource::UserConfigured
-                    } else {
-                        IdentitySource::Unknown
-                    },
-                    provider_user_id_hash: None,
-                    email_hash: None,
-                    org_id_hash: None,
-                    account_label: source.account_alias.clone(),
-                    plan_name: None,
-                    confidence: if source.account_alias.is_some() {
-                        Confidence::Medium
-                    } else {
-                        Confidence::Low
-                    },
-                    source_ids: vec![source.source_id.clone()],
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                };
-                accounts.insert(id.0, account);
-            }
-            for account in accounts.into_values() {
-                store.upsert_account(&account)?;
-                println!("{}", serde_json::to_string_pretty(&account)?);
-            }
+        AccountSubcommand::List => {
+            println!("{}", serde_json::to_string_pretty(&store.list_accounts()?)?);
+        }
+        AccountSubcommand::Merge {
+            provider,
+            from,
+            to,
+            dry_run,
+        } => {
+            let report = merge_provider_accounts(
+                store,
+                &canonical_provider(&provider)?,
+                &from,
+                &to,
+                dry_run,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        AccountSubcommand::Remove {
+            provider,
+            account,
+            dry_run,
+        } => {
+            let report = remove_orphan_provider_account(
+                store,
+                &canonical_provider(&provider)?,
+                &account,
+                dry_run,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct AccountReferenceCounts {
+    source_account_assignments: usize,
+    subscriptions: usize,
+    events: usize,
+    summaries: usize,
+}
+
+impl AccountReferenceCounts {
+    fn total(&self) -> usize {
+        self.source_account_assignments + self.subscriptions + self.events + self.summaries
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AccountMergeReport {
+    provider: String,
+    from: String,
+    to: String,
+    from_provider_account_id: String,
+    to_provider_account_id: String,
+    moved_source_account_assignments: usize,
+    moved_subscriptions: usize,
+    moved_events: usize,
+    moved_summaries: usize,
+    deleted_source_account: bool,
+    remaining_references: AccountReferenceCounts,
+    reset_local_sync_tracking: bool,
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AccountRemoveReport {
+    provider: String,
+    account: String,
+    provider_account_id: String,
+    deleted: bool,
+    remaining_references: AccountReferenceCounts,
+    reset_local_sync_tracking: bool,
+    dry_run: bool,
+}
+
+fn merge_provider_accounts(
+    store: &Store,
+    provider: &str,
+    from_selector: &str,
+    to_selector: &str,
+    dry_run: bool,
+) -> Result<AccountMergeReport> {
+    let from = resolve_existing_provider_account_selector(store, provider, from_selector)?;
+    let to = resolve_existing_provider_account_selector(store, provider, to_selector)?;
+    if from.provider_account_id == to.provider_account_id {
+        bail!("source and destination accounts are the same");
+    }
+
+    let assignments_to_move: Vec<_> = store
+        .list_source_account_assignments()?
+        .into_iter()
+        .filter(|assignment| assignment.provider == provider)
+        .filter(|assignment| assignment.provider_account_id == from.provider_account_id)
+        .collect();
+    let subscriptions_to_move: Vec<_> = store
+        .list_subscriptions()?
+        .into_iter()
+        .filter(|subscription| subscription.provider == provider)
+        .filter(|subscription| subscription.provider_account_id == from.provider_account_id)
+        .collect();
+    let direct_events_to_move = store
+        .events()?
+        .into_iter()
+        .filter(|event| event.provider == provider)
+        .filter(|event| event.provider_account_id.as_ref() == Some(&from.provider_account_id))
+        .count();
+    let direct_summaries_to_move = store
+        .summaries()?
+        .into_iter()
+        .filter(|summary| summary.provider == provider)
+        .filter(|summary| summary.provider_account_id.as_ref() == Some(&from.provider_account_id))
+        .count();
+
+    if !dry_run {
+        for assignment in &assignments_to_move {
+            connect_source_to_account(
+                store,
+                ConnectSourceToAccountInput {
+                    source_id: &assignment.source_id,
+                    provider_account_id_value: Some(&to.provider_account_id.0),
+                    provider_user_id: None,
+                    email: None,
+                    label: None,
+                    started_at: assignment.started_at,
+                    ended_at: assignment.ended_at,
+                },
+            )?;
+        }
+        for subscription in &subscriptions_to_move {
+            move_subscription_to_account(store, subscription, &to.provider_account_id)?;
+        }
+        move_direct_account_records(
+            store,
+            provider,
+            &from.provider_account_id,
+            &to.provider_account_id,
+        )?;
+    }
+
+    let remaining_references =
+        account_reference_counts(store, &from.provider_account_id, Some(provider))?;
+    let deleted_source_account = if !dry_run && remaining_references.total() == 0 {
+        store.delete_account(&from.provider_account_id)?
+    } else {
+        false
+    };
+    if !dry_run {
+        store.clear_sync_tracking()?;
+    }
+
+    Ok(AccountMergeReport {
+        provider: provider.to_string(),
+        from: display_account_identity(&from),
+        to: display_account_identity(&to),
+        from_provider_account_id: from.provider_account_id.0,
+        to_provider_account_id: to.provider_account_id.0,
+        moved_source_account_assignments: assignments_to_move.len(),
+        moved_subscriptions: subscriptions_to_move.len(),
+        moved_events: direct_events_to_move,
+        moved_summaries: direct_summaries_to_move,
+        deleted_source_account,
+        remaining_references,
+        reset_local_sync_tracking: !dry_run,
+        dry_run,
+    })
+}
+
+fn remove_orphan_provider_account(
+    store: &Store,
+    provider: &str,
+    selector: &str,
+    dry_run: bool,
+) -> Result<AccountRemoveReport> {
+    let account = resolve_existing_provider_account_selector(store, provider, selector)?;
+    let remaining_references =
+        account_reference_counts(store, &account.provider_account_id, Some(provider))?;
+    if remaining_references.total() > 0 {
+        bail!(
+            "account {} still has references: {} source assignments, {} subscriptions, {} events, {} summaries",
+            display_account_identity(&account),
+            remaining_references.source_account_assignments,
+            remaining_references.subscriptions,
+            remaining_references.events,
+            remaining_references.summaries
+        );
+    }
+    let deleted = if dry_run {
+        false
+    } else {
+        store.delete_account(&account.provider_account_id)?
+    };
+    if !dry_run {
+        store.clear_sync_tracking()?;
+    }
+
+    Ok(AccountRemoveReport {
+        provider: provider.to_string(),
+        account: display_account_identity(&account),
+        provider_account_id: account.provider_account_id.0,
+        deleted,
+        remaining_references,
+        reset_local_sync_tracking: !dry_run,
+        dry_run,
+    })
+}
+
+fn resolve_existing_provider_account_selector(
+    store: &Store,
+    provider: &str,
+    selector: &str,
+) -> Result<ProviderAccount> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("account selector cannot be empty");
+    }
+    let normalized_email = normalize_email(selector);
+    let normalized_provider_user_id = normalize_provider_user_id(selector);
+    let normalized_label = selector.to_ascii_lowercase();
+
+    let matches: Vec<_> = store
+        .list_accounts()?
+        .into_iter()
+        .filter(|account| account.provider == provider)
+        .filter(|account| {
+            account.provider_account_id.0 == selector
+                || account.email.as_deref().map(normalize_email).as_deref()
+                    == Some(normalized_email.as_str())
+                || account
+                    .provider_user_id
+                    .as_deref()
+                    .map(normalize_provider_user_id)
+                    .as_deref()
+                    == Some(normalized_provider_user_id.as_str())
+                || account
+                    .account_label
+                    .as_deref()
+                    .map(|label| label.trim().to_ascii_lowercase())
+                    .as_deref()
+                    == Some(normalized_label.as_str())
+        })
+        .collect();
+
+    match matches.len() {
+        0 => bail!("no {provider} account matched '{selector}'"),
+        1 => Ok(matches.into_iter().next().expect("single account")),
+        _ => bail!("multiple {provider} accounts matched '{selector}'"),
+    }
+}
+
+fn move_subscription_to_account(
+    store: &Store,
+    subscription: &Subscription,
+    target_provider_account_id: &ProviderAccountId,
+) -> Result<Subscription> {
+    let moved_subscription_id = subscription_id(
+        &subscription.provider,
+        target_provider_account_id,
+        &subscription.plan_name,
+        subscription.started_at,
+    );
+    if moved_subscription_id != subscription.subscription_id {
+        if let Some(existing) = store.subscription(&moved_subscription_id)? {
+            if existing.provider == subscription.provider
+                && existing.provider_account_id == *target_provider_account_id
+                && existing.plan_name == subscription.plan_name
+                && existing.price == subscription.price
+                && existing.currency == subscription.currency
+                && existing.billing_period == subscription.billing_period
+                && existing.paid_at == subscription.paid_at
+                && existing.renewal_day == subscription.renewal_day
+                && existing.started_at == subscription.started_at
+                && existing.ended_at == subscription.ended_at
+                && existing.current_period_ends_at == subscription.current_period_ends_at
+                && existing.status == subscription.status
+            {
+                store.delete_subscription(&subscription.subscription_id)?;
+                return Ok(existing);
+            }
+            bail!(
+                "subscription {} would collide with existing subscription {} on {}",
+                subscription.subscription_id.0,
+                moved_subscription_id.0,
+                target_provider_account_id.0
+            );
+        }
+    }
+
+    validate_subscription_overlap(
+        store,
+        &subscription.provider,
+        target_provider_account_id,
+        subscription.started_at,
+        subscription.ended_at,
+        Some(&subscription.subscription_id),
+    )?;
+
+    let moved = Subscription {
+        subscription_id: moved_subscription_id,
+        provider_account_id: target_provider_account_id.clone(),
+        ..subscription.clone()
+    };
+    if moved.subscription_id != subscription.subscription_id {
+        store.delete_subscription(&subscription.subscription_id)?;
+    }
+    store.upsert_subscription(&moved)?;
+    Ok(moved)
+}
+
+fn move_direct_account_records(
+    store: &Store,
+    provider: &str,
+    from_provider_account_id: &ProviderAccountId,
+    target_provider_account_id: &ProviderAccountId,
+) -> Result<()> {
+    let mut events_to_move: Vec<_> = store
+        .events()?
+        .into_iter()
+        .filter(|event| event.provider == provider)
+        .filter(|event| event.provider_account_id.as_ref() == Some(from_provider_account_id))
+        .collect();
+    for event in &mut events_to_move {
+        event.provider_account_id = Some(target_provider_account_id.clone());
+        if let Some(evidence) = event.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::UserConfigured;
+        }
+    }
+    if !events_to_move.is_empty() {
+        store.rewrite_events(&events_to_move)?;
+    }
+
+    let mut summaries_to_move: Vec<_> = store
+        .summaries()?
+        .into_iter()
+        .filter(|summary| summary.provider == provider)
+        .filter(|summary| summary.provider_account_id.as_ref() == Some(from_provider_account_id))
+        .collect();
+    for summary in &mut summaries_to_move {
+        summary.provider_account_id = Some(target_provider_account_id.clone());
+        if let Some(evidence) = summary.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::UserConfigured;
+        }
+    }
+    if !summaries_to_move.is_empty() {
+        store.rewrite_summaries(&summaries_to_move)?;
+    }
+
+    Ok(())
+}
+
+fn account_reference_counts(
+    store: &Store,
+    provider_account_id: &ProviderAccountId,
+    provider: Option<&str>,
+) -> Result<AccountReferenceCounts> {
+    let provider_matches =
+        |row_provider: &str| provider.map(|value| value == row_provider).unwrap_or(true);
+    let source_account_assignments = store
+        .list_source_account_assignments()?
+        .into_iter()
+        .filter(|assignment| assignment.provider_account_id == *provider_account_id)
+        .filter(|assignment| provider_matches(&assignment.provider))
+        .count();
+    let subscriptions = store
+        .list_subscriptions()?
+        .into_iter()
+        .filter(|subscription| subscription.provider_account_id == *provider_account_id)
+        .filter(|subscription| provider_matches(&subscription.provider))
+        .count();
+    let events = store
+        .events()?
+        .into_iter()
+        .filter(|event| event.provider_account_id.as_ref() == Some(provider_account_id))
+        .filter(|event| provider_matches(&event.provider))
+        .count();
+    let summaries = store
+        .summaries()?
+        .into_iter()
+        .filter(|summary| summary.provider_account_id.as_ref() == Some(provider_account_id))
+        .filter(|summary| provider_matches(&summary.provider))
+        .count();
+
+    Ok(AccountReferenceCounts {
+        source_account_assignments,
+        subscriptions,
+        events,
+        summaries,
+    })
+}
+
+fn display_account_identity(account: &ProviderAccount) -> String {
+    account
+        .account_label
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            account
+                .email
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            account
+                .provider_user_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| account.provider_account_id.0.clone())
 }
 
 fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
     match command.command {
         SubscriptionSubcommand::Add {
             provider,
-            account,
+            provider_account_id,
+            provider_user_id,
+            email,
+            label,
             plan,
             price,
             currency,
             paid_at,
+            started_at,
+            ended_at,
         } => {
             let provider = canonical_provider(&provider)?;
-            let account_id = account
+            let account = resolve_or_create_provider_account(
+                store,
+                &provider,
+                provider_account_id.as_deref(),
+                provider_user_id.as_deref(),
+                email.as_deref(),
+                label,
+            )?;
+            let started_at = parse_date(&started_at)?;
+            let ended_at = ended_at.as_deref().map(parse_date).transpose()?;
+            validate_time_window(started_at, ended_at, "subscription")?;
+            validate_subscription_overlap(
+                store,
+                &provider,
+                &account.provider_account_id,
+                started_at,
+                ended_at,
+                None,
+            )?;
+            let paid_at = paid_at
                 .as_deref()
-                .map(|label| provider_account_id(&provider, label));
-            let paid_at = paid_at.as_deref().map(parse_date).transpose()?;
+                .map(parse_date)
+                .transpose()?
+                .or(Some(started_at));
             let subscription = Subscription {
                 schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
-                subscription_id: subscription_id(&provider, account_id.as_ref(), &plan),
-                provider,
-                provider_account_id: account_id,
-                source_ids: Vec::new(),
+                subscription_id: subscription_id(
+                    &provider,
+                    &account.provider_account_id,
+                    &plan,
+                    started_at,
+                ),
+                provider: provider.clone(),
+                provider_account_id: account.provider_account_id.clone(),
                 plan_name: plan,
                 price,
                 currency,
                 billing_period: BillingPeriod::Monthly,
                 paid_at,
-                renewal_day: None,
-                started_at: paid_at,
-                ended_at: None,
+                renewal_day: paid_at.and_then(subscription_renewal_day),
+                started_at,
+                ended_at,
+                current_period_ends_at: None,
                 status: SubscriptionStatus::Active,
+                record_source: IdentitySource::UserConfigured,
+                verified_at: None,
                 notes: None,
             };
             store.upsert_subscription(&subscription)?;
             println!("{}", serde_json::to_string_pretty(&subscription)?);
+        }
+        SubscriptionSubcommand::Change {
+            provider,
+            provider_account_id,
+            provider_user_id,
+            email,
+            label,
+            plan,
+            price,
+            currency,
+            paid_at,
+            started_at,
+        } => {
+            let provider = canonical_provider(&provider)?;
+            let account = resolve_existing_provider_account(
+                store,
+                &provider,
+                provider_account_id.as_deref(),
+                provider_user_id.as_deref(),
+                email.as_deref(),
+                label,
+            )?;
+            let started_at = parse_date(&started_at)?;
+            if close_active_subscription(
+                store,
+                &provider,
+                &account.provider_account_id,
+                started_at,
+            )?
+            .is_none()
+            {
+                bail!(
+                    "subscription change requires an active subscription for account {} at {}",
+                    account.provider_account_id.0,
+                    started_at.to_rfc3339()
+                );
+            }
+            let paid_at = paid_at
+                .as_deref()
+                .map(parse_date)
+                .transpose()?
+                .or(Some(started_at));
+            let subscription = Subscription {
+                schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+                subscription_id: subscription_id(
+                    &provider,
+                    &account.provider_account_id,
+                    &plan,
+                    started_at,
+                ),
+                provider: provider.clone(),
+                provider_account_id: account.provider_account_id.clone(),
+                plan_name: plan,
+                price,
+                currency,
+                billing_period: BillingPeriod::Monthly,
+                paid_at,
+                renewal_day: paid_at.and_then(subscription_renewal_day),
+                started_at,
+                ended_at: None,
+                current_period_ends_at: None,
+                status: SubscriptionStatus::Active,
+                record_source: IdentitySource::UserConfigured,
+                verified_at: None,
+                notes: None,
+            };
+            store.upsert_subscription(&subscription)?;
+            println!("{}", serde_json::to_string_pretty(&subscription)?);
+        }
+        SubscriptionSubcommand::End {
+            provider,
+            provider_account_id,
+            provider_user_id,
+            email,
+            ended_at,
+        } => {
+            let provider = canonical_provider(&provider)?;
+            let account = resolve_existing_provider_account(
+                store,
+                &provider,
+                provider_account_id.as_deref(),
+                provider_user_id.as_deref(),
+                email.as_deref(),
+                None,
+            )?;
+            let subscription = end_active_subscription(
+                store,
+                &provider,
+                &account.provider_account_id,
+                ended_at
+                    .as_deref()
+                    .map(parse_date)
+                    .transpose()?
+                    .unwrap_or_else(Utc::now),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&subscription)?);
+        }
+        SubscriptionSubcommand::Remove {
+            provider,
+            provider_account_id,
+            provider_user_id,
+            email,
+            plan,
+            started_at,
+            current,
+        } => {
+            if current == started_at.is_some() {
+                bail!("pass either --started-at or --current");
+            }
+            let provider = canonical_provider(&provider)?;
+            let account = resolve_existing_provider_account(
+                store,
+                &provider,
+                provider_account_id.as_deref(),
+                provider_user_id.as_deref(),
+                email.as_deref(),
+                None,
+            )?;
+            let subscription = if current {
+                active_subscription(
+                    store,
+                    &provider,
+                    &account.provider_account_id,
+                    plan.as_deref(),
+                    Utc::now(),
+                )?
+            } else {
+                let started_at = parse_date(
+                    started_at
+                        .as_deref()
+                        .with_context(|| "missing --started-at")?,
+                )?;
+                subscription_for_period(
+                    store,
+                    &provider,
+                    &account.provider_account_id,
+                    started_at,
+                    plan.as_deref(),
+                )?
+            };
+            let deleted = store.delete_subscription(&subscription.subscription_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "subscription_id": subscription.subscription_id.0,
+                    "deleted": deleted,
+                    "subscription": subscription
+                }))?
+            );
         }
         SubscriptionSubcommand::List => println!(
             "{}",
@@ -902,27 +1769,38 @@ fn stable_reported_record_id(summary: &UsageSummary) -> Option<String> {
 }
 
 fn report(command: ReportCommand, store: &Store) -> Result<()> {
-    let (period, json_output, verbose) = match command.command {
-        ReportSubcommand::Weekly { json, verbose, .. } => {
-            (ReportPeriod::LastDays(7), json, verbose)
-        }
-        ReportSubcommand::Monthly { json, verbose, .. } => {
-            (ReportPeriod::LastDays(30), json, verbose)
-        }
-        ReportSubcommand::AllTime { json, verbose } => (ReportPeriod::AllTime, json, verbose),
+    let (period, json_output, verbose, include_subscriptions) = match command.command {
+        ReportSubcommand::Weekly {
+            json,
+            verbose,
+            subscriptions,
+            ..
+        } => (ReportPeriod::LastDays(7), json, verbose, subscriptions),
+        ReportSubcommand::Monthly {
+            json,
+            verbose,
+            subscriptions,
+            ..
+        } => (ReportPeriod::LastDays(30), json, verbose, subscriptions),
+        ReportSubcommand::AllTime {
+            json,
+            verbose,
+            subscriptions,
+        } => (ReportPeriod::AllTime, json, verbose, subscriptions),
     };
     let report = build_usage_report(
         &store.events()?,
         &store.summaries()?,
         &store.list_sources()?,
         &store.list_accounts()?,
+        &store.list_subscriptions()?,
         period,
         Utc::now(),
     );
     if json_output {
-        print_report_json(&report, verbose)?;
+        print_report_json(&report, verbose, include_subscriptions)?;
     } else {
-        print_report_table(&report, verbose);
+        print_report_table(&report, verbose, include_subscriptions);
     }
     Ok(())
 }
@@ -936,6 +1814,13 @@ fn export(command: ExportCommand, store: &Store) -> Result<()> {
 }
 
 fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
+    if command.reset_remote {
+        if command.status || command.verify {
+            bail!("--reset-remote cannot be combined with --status or --verify");
+        }
+        return sync_remote_reset(command, store);
+    }
+
     if command.verify {
         return sync_verify(command, store, device_id);
     }
@@ -1018,6 +1903,48 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     }
 }
 
+fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
+    if command.sink != "http" {
+        bail!("--reset-remote is currently supported only with --sink http");
+    }
+
+    let endpoint = http_sync_endpoint(&command)?;
+    if command.dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "sink": command.sink,
+                "target": endpoint,
+                "endpoint": endpoint,
+                "would_reset_remote_sync_data": true,
+                "would_clear_local_sync_tracking": true,
+                "dry_run": true,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if !command.yes {
+        bail!("--reset-remote deletes mirrored hosted sync data; rerun with --yes");
+    }
+
+    let auth_token = resolve_http_auth_token(&command, true)?
+        .context("device login required; run `ai-stats auth login` first")?;
+    let remote = http_remote_reset(&endpoint, &auth_token)?;
+    store.clear_sync_tracking()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "sink": command.sink,
+            "target": endpoint,
+            "endpoint": endpoint,
+            "cleared_local_sync_tracking": true,
+            "remote": remote,
+        }))?
+    );
+    Ok(())
+}
+
 fn build_sync_batch(
     command: &SyncCommand,
     store: &Store,
@@ -1084,6 +2011,11 @@ fn build_sync_batch(
         .into_iter()
         .map(sanitize_account_for_sync)
         .collect();
+    let all_source_account_assignments: Vec<_> = store
+        .list_source_account_assignments()?
+        .into_iter()
+        .map(sanitize_source_account_assignment_for_sync)
+        .collect();
     let all_subscriptions: Vec<_> = store
         .list_subscriptions()?
         .into_iter()
@@ -1098,6 +2030,15 @@ fn build_sync_batch(
         store.pending_accounts_for_sync(&command.sink, target, &all_accounts)?
     } else {
         all_accounts
+    };
+    let source_account_assignments = if payload_mode == SyncPayloadMode::Rollups {
+        store.pending_source_account_assignments_for_sync(
+            &command.sink,
+            target,
+            &all_source_account_assignments,
+        )?
+    } else {
+        all_source_account_assignments
     };
     let subscriptions = if payload_mode == SyncPayloadMode::Rollups {
         store.pending_subscriptions_for_sync(&command.sink, target, &all_subscriptions)?
@@ -1149,6 +2090,7 @@ fn build_sync_batch(
             device_id: device_id.to_string(),
             sources,
             accounts,
+            source_account_assignments,
             subscriptions,
             events,
             summaries,
@@ -1188,6 +2130,11 @@ fn record_rollup_sync_success(
     store.record_summaries_synced(sink, target, &passthrough_summaries)?;
     store.record_sources_synced(sink, target, &batch.sources)?;
     store.record_accounts_synced(sink, target, &batch.accounts)?;
+    store.record_source_account_assignments_synced(
+        sink,
+        target,
+        &batch.source_account_assignments,
+    )?;
     store.record_subscriptions_synced(sink, target, &batch.subscriptions)?;
     Ok(())
 }
@@ -1257,6 +2204,7 @@ fn sync_local_verify(
 ) -> Result<SyncLocalVerify> {
     let all_sources = store.list_sources()?;
     let all_accounts = store.list_accounts()?;
+    let all_source_account_assignments = store.list_source_account_assignments()?;
     let all_subscriptions = store.list_subscriptions()?;
     let sync_sources: Vec<_> = all_sources
         .iter()
@@ -1267,6 +2215,11 @@ fn sync_local_verify(
         .iter()
         .cloned()
         .map(sanitize_account_for_sync)
+        .collect();
+    let sync_source_account_assignments: Vec<_> = all_source_account_assignments
+        .iter()
+        .cloned()
+        .map(sanitize_source_account_assignment_for_sync)
         .collect();
     let sync_subscriptions: Vec<_> = all_subscriptions
         .iter()
@@ -1290,6 +2243,14 @@ fn sync_local_verify(
         total_accounts: all_accounts.len(),
         pending_accounts: store
             .pending_accounts_for_sync(sink, target, &sync_accounts)?
+            .len(),
+        total_source_account_assignments: all_source_account_assignments.len(),
+        pending_source_account_assignments: store
+            .pending_source_account_assignments_for_sync(
+                sink,
+                target,
+                &sync_source_account_assignments,
+            )?
             .len(),
         total_subscriptions: all_subscriptions.len(),
         pending_subscriptions: store
@@ -1396,6 +2357,8 @@ struct SyncLocalVerify {
     pending_sources: usize,
     total_accounts: usize,
     pending_accounts: usize,
+    total_source_account_assignments: usize,
+    pending_source_account_assignments: usize,
     total_subscriptions: usize,
     pending_subscriptions: usize,
     total_passthrough_summaries: usize,
@@ -1422,6 +2385,20 @@ fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
     }
 }
 
+fn http_remote_reset(endpoint: &str, auth_token: &str) -> Result<Value> {
+    let url = http_reset_url(endpoint)?;
+    let body = serde_json::to_string(&json!({
+        "confirm": "reset_synced_data",
+    }))?;
+    let request = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {auth_token}"))
+        .set("Content-Type", "application/json");
+    match request.send_string(&body) {
+        Ok(response) => http_response_json(response, "reset remote sync data"),
+        Err(error) => Err(http_request_error("reset remote sync data", error)),
+    }
+}
+
 fn http_verify_status_url(endpoint: &str) -> Result<String> {
     let endpoint = endpoint.trim_end_matches('/');
     if let Some(prefix) = endpoint.strip_suffix("/api/sync/batches") {
@@ -1429,6 +2406,17 @@ fn http_verify_status_url(endpoint: &str) -> Result<String> {
     }
     bail!(
         "http verify expects a Cloudflare sync endpoint ending in /api/sync/batches; got {}",
+        endpoint
+    )
+}
+
+fn http_reset_url(endpoint: &str) -> Result<String> {
+    let endpoint = endpoint.trim_end_matches('/');
+    if let Some(prefix) = endpoint.strip_suffix("/api/sync/batches") {
+        return Ok(format!("{prefix}/api/sync/reset"));
+    }
+    bail!(
+        "http reset expects a Cloudflare sync endpoint ending in /api/sync/batches; got {}",
         endpoint
     )
 }
@@ -1547,9 +2535,8 @@ fn doctor(store_path: &Path) -> Result<()> {
                 .filter(|candidate| !pending_keys.contains(candidate.cache_key.as_str()))
                 .collect();
             println!(
-                "  - {} account={} origin={} files={} pending={} cached={}",
+                "  - {} origin={} files={} pending={} cached={}",
                 preview_path_label(&source),
-                source.account_alias.as_deref().unwrap_or("unmapped"),
                 location_origin_label(&source.location_origin),
                 candidates.len(),
                 pending.len(),
@@ -1603,7 +2590,7 @@ fn read_reported_summary_inputs(path: &Path) -> Result<Vec<ReportedUsageSummaryI
     Ok(inputs)
 }
 
-fn print_report_table(report: &UsageReport, verbose: bool) {
+fn print_report_table(report: &UsageReport, verbose: bool, include_subscriptions: bool) {
     println!("ai-stats report: {}", report.label);
     if let Some(since) = report.since {
         println!(
@@ -1668,6 +2655,10 @@ fn print_report_table(report: &UsageReport, verbose: bool) {
         format_u64(report.total_usage.total_tokens),
         format_cost(report.total_usage.estimated_cost_usd)
     );
+
+    if include_subscriptions {
+        print_subscription_report_table(report, verbose);
+    }
 
     if !report.summary_rows.is_empty() {
         let summary_direct_total: u64 = report
@@ -1760,6 +2751,43 @@ fn print_report_table(report: &UsageReport, verbose: bool) {
     }
 }
 
+fn print_subscription_report_table(report: &UsageReport, verbose: bool) {
+    if report.subscription_rows.is_empty() {
+        println!("subscription value: no matching subscription periods");
+        return;
+    }
+    println!("subscription value:");
+    println!(
+        "{:<14} {:<16} {:<14} {:>10} {:>12} {:>12} {:>12} {:>12}",
+        "provider", "account", "plan", "events", "total", "value_usd", "price", "ratio"
+    );
+    for row in &report.subscription_rows {
+        println!(
+            "{:<14} {:<16} {:<14} {:>10} {:>12} {:>12} {:>12} {:>12}",
+            row.provider,
+            truncate_label(&row.account, 16),
+            truncate_label(&row.plan_name, 14),
+            format_u64(row.events),
+            format_u64(row.usage.total_tokens),
+            format_cost(row.usage.estimated_cost_usd),
+            format_subscription_price(row.price, &row.currency),
+            format_ratio(row.value_to_price_ratio)
+        );
+        if verbose {
+            println!("  subscription_id: {}", row.subscription_id.0);
+            println!("  provider_account_id: {}", row.provider_account_id.0);
+            println!("  started_at: {}", row.started_at.to_rfc3339());
+            if let Some(ended_at) = row.ended_at {
+                println!("  ended_at: {}", ended_at.to_rfc3339());
+            }
+            println!("  status: {}", subscription_status_label(&row.status));
+            if let Some(delta) = row.value_minus_price_usd {
+                println!("  value_minus_price_usd: {:.2}", delta);
+            }
+        }
+    }
+}
+
 fn print_known_usage_table(report: &UsageReport) {
     let mut direct_by_provider: BTreeMap<String, UsageTotals> = BTreeMap::new();
     for row in &report.rows {
@@ -1815,7 +2843,11 @@ fn print_known_usage_table(report: &UsageReport) {
     }
 }
 
-fn print_report_json(report: &UsageReport, verbose: bool) -> Result<()> {
+fn print_report_json(
+    report: &UsageReport,
+    verbose: bool,
+    include_subscriptions: bool,
+) -> Result<()> {
     let rows = report.rows.iter().map(|row| {
         let mut value = json!({
             "provider": row.provider,
@@ -1865,6 +2897,34 @@ fn print_report_json(report: &UsageReport, verbose: bool) -> Result<()> {
         }
         value
     });
+    let subscription_rows = report.subscription_rows.iter().map(|row| {
+        json!({
+            "subscription_id": row.subscription_id.0,
+            "provider": row.provider,
+            "provider_account_id": row.provider_account_id.0,
+            "account": row.account,
+            "plan_name": row.plan_name,
+            "price": row.price,
+            "currency": row.currency,
+            "billing_period": format!("{:?}", row.billing_period).to_ascii_lowercase(),
+            "started_at": row.started_at.to_rfc3339(),
+            "ended_at": row.ended_at.map(|date| date.to_rfc3339()),
+            "status": subscription_status_label(&row.status),
+            "events": row.events,
+            "tokens": {
+                "input": row.usage.input_tokens,
+                "cache_creation": row.usage.cache_creation_tokens,
+                "cache_read": row.usage.cached_input_tokens,
+                "cached_input": row.usage.cached_input_tokens,
+                "output": row.usage.output_tokens,
+                "reasoning": row.usage.reasoning_tokens,
+                "total": row.usage.total_tokens,
+            },
+            "estimated_cost_usd": row.usage.estimated_cost_usd,
+            "value_minus_price_usd": row.value_minus_price_usd,
+            "value_to_price_ratio": row.value_to_price_ratio,
+        })
+    });
     let summary_direct_total: u64 = report
         .summary_rows
         .iter()
@@ -1872,7 +2932,7 @@ fn print_report_json(report: &UsageReport, verbose: bool) -> Result<()> {
         .sum();
     let mut known_usage = report.total_usage.clone();
     known_usage.add_totals(&report.total_summary_usage);
-    let value = json!({
+    let mut value = json!({
         "label": report.label,
         "since": report.since.map(|date| date.to_rfc3339()),
         "until": report.until.to_rfc3339(),
@@ -1918,8 +2978,804 @@ fn print_report_json(report: &UsageReport, verbose: bool) -> Result<()> {
         },
         "rows": rows.collect::<Vec<_>>(),
     });
+    if include_subscriptions {
+        value["subscription_value"] = json!({
+            "rows": subscription_rows.collect::<Vec<_>>(),
+        });
+    }
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+fn resolve_or_create_provider_account(
+    store: &Store,
+    provider: &str,
+    provider_account_id_value: Option<&str>,
+    provider_user_id: Option<&str>,
+    email: Option<&str>,
+    label: Option<String>,
+) -> Result<ProviderAccount> {
+    if let Some(provider_account_id_value) = provider_account_id_value {
+        let provider_account_id = ProviderAccountId(provider_account_id_value.to_string());
+        if let Some(account) = store.account(&provider_account_id)? {
+            ensure_account_matches_provider(&account, provider)?;
+            return Ok(account);
+        }
+        if provider_user_id.is_none() && email.is_none() {
+            bail!("unknown provider account {provider_account_id_value}");
+        }
+    }
+    upsert_provider_account(
+        store,
+        UpsertProviderAccountInput {
+            provider,
+            provider_user_id,
+            email,
+            label,
+            plan_name: None,
+            identity_source: Some(IdentitySource::UserConfigured),
+            verified_at: None,
+        },
+    )
+}
+
+fn resolve_existing_provider_account(
+    store: &Store,
+    provider: &str,
+    provider_account_id_value: Option<&str>,
+    provider_user_id: Option<&str>,
+    email: Option<&str>,
+    label: Option<String>,
+) -> Result<ProviderAccount> {
+    if let Some(provider_account_id_value) = provider_account_id_value {
+        let provider_account_id = ProviderAccountId(provider_account_id_value.to_string());
+        let account = store
+            .account(&provider_account_id)?
+            .with_context(|| format!("unknown provider account {provider_account_id_value}"))?;
+        ensure_account_matches_provider(&account, provider)?;
+        return Ok(account);
+    }
+
+    if let Some(account) = find_existing_provider_account(store, provider, provider_user_id, email)?
+    {
+        return Ok(account);
+    }
+
+    let normalized_label = label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty());
+    if let Some(label) = normalized_label {
+        let mut matches = store.list_accounts()?.into_iter().filter(|account| {
+            account.provider == provider && account.account_label.as_deref() == Some(label)
+        });
+        let Some(account) = matches.next() else {
+            bail!("unknown provider account label {label} for {provider}");
+        };
+        if matches.next().is_some() {
+            bail!("provider account label {label} is ambiguous for {provider}");
+        }
+        return Ok(account);
+    }
+
+    bail!("unknown provider account selector for {provider}")
+}
+
+fn ensure_account_matches_provider(account: &ProviderAccount, provider: &str) -> Result<()> {
+    if account.provider != provider {
+        bail!(
+            "provider account {} belongs to {}, not {}",
+            account.provider_account_id.0,
+            account.provider,
+            provider
+        );
+    }
+    Ok(())
+}
+
+fn is_verified_subscription_source(source: &IdentitySource) -> bool {
+    matches!(
+        source,
+        IdentitySource::LocalAuth
+            | IdentitySource::ProviderAuth
+            | IdentitySource::ProviderApi
+            | IdentitySource::CookieOauth
+            | IdentitySource::CliProbe
+    )
+}
+
+fn parse_source_verification_mode(value: &str) -> Result<SourceVerificationMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(SourceVerificationMode::Auto),
+        "manual_only" | "manual-only" => Ok(SourceVerificationMode::ManualOnly),
+        "disabled" => Ok(SourceVerificationMode::Disabled),
+        _ => bail!("unsupported verification mode {value}; use auto, manual_only, or disabled"),
+    }
+}
+
+fn resolve_source_reference(
+    store: &Store,
+    source_id: Option<&str>,
+    path: Option<&Path>,
+) -> Result<SourceLocation> {
+    match (source_id, path) {
+        (Some(_), Some(_)) => bail!("pass either --source-id or --path, not both"),
+        (Some(source_id), None) => store
+            .source(&SourceId(source_id.to_string()))?
+            .with_context(|| format!("source {source_id} not found")),
+        (None, Some(path)) => {
+            let normalized = expand_home_path(&path.to_string_lossy());
+            let target_hash = path_hash(&normalized);
+            let mut matches = store
+                .list_sources()?
+                .into_iter()
+                .filter(|source| source.path_hash.as_deref() == Some(target_hash.as_str()));
+            let Some(source) = matches.next() else {
+                bail!("no source found for path {}", normalized.display());
+            };
+            if matches.next().is_some() {
+                bail!(
+                    "multiple sources match path {}; use --source-id instead",
+                    normalized.display()
+                );
+            }
+            Ok(source)
+        }
+        (None, None) => bail!("pass either --source-id or --path"),
+    }
+}
+
+fn source_verification_mode(source: &SourceLocation) -> SourceVerificationMode {
+    source.verification_mode.clone()
+}
+
+fn probe_source_verified_state(source: &SourceLocation) -> Result<Option<VerifiedSourceState>> {
+    if matches!(
+        source_verification_mode(source),
+        SourceVerificationMode::Disabled
+    ) {
+        return Ok(None);
+    }
+    let Some(adapter) = adapter_for_provider(&source.provider) else {
+        return Ok(None);
+    };
+    adapter.probe_verified_source_state(source)
+}
+
+fn explain_source(store: &Store, source: &SourceLocation) -> Result<Value> {
+    let assignments = store.list_source_account_assignments_for_source(&source.source_id)?;
+    let detected_auth_state = if matches!(
+        source_verification_mode(source),
+        SourceVerificationMode::Disabled
+    ) {
+        None
+    } else {
+        probe_source_verified_state(source)?
+            .map(serde_json::to_value)
+            .transpose()?
+    };
+    let now = Utc::now();
+    let current_assignment = assignment_for_timestamp(&assignments, now).cloned();
+    let current_subscription = current_assignment
+        .as_ref()
+        .and_then(|assignment| {
+            active_subscription(
+                store,
+                &source.provider,
+                &assignment.provider_account_id,
+                None,
+                now,
+            )
+            .ok()
+        })
+        .map(serde_json::to_value)
+        .transpose()?;
+    Ok(json!({
+        "source": source,
+        "verification_mode": source.verification_mode,
+        "verified_state_hash": source.verified_state_hash,
+        "detected_auth_state": detected_auth_state,
+        "current_assignment": current_assignment,
+        "current_subscription": current_subscription,
+        "history": assignments,
+        "explanation": {
+            "usage_is_primary": true,
+            "subscriptions_are_secondary": true,
+            "unassigned_means": "usage without an active source-to-account connection"
+        }
+    }))
+}
+
+struct ConnectSourceToAccountInput<'a> {
+    source_id: &'a SourceId,
+    provider_account_id_value: Option<&'a str>,
+    provider_user_id: Option<&'a str>,
+    email: Option<&'a str>,
+    label: Option<String>,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+}
+
+fn connect_source_to_account(
+    store: &Store,
+    input: ConnectSourceToAccountInput<'_>,
+) -> Result<SourceAccountAssignment> {
+    let ConnectSourceToAccountInput {
+        source_id,
+        provider_account_id_value,
+        provider_user_id,
+        email,
+        label,
+        started_at,
+        ended_at,
+    } = input;
+    let source = store
+        .source(source_id)?
+        .with_context(|| format!("unknown source {}", source_id.0))?;
+    let account = resolve_or_create_provider_account(
+        store,
+        &source.provider,
+        provider_account_id_value,
+        provider_user_id,
+        email,
+        label,
+    )?;
+    validate_time_window(started_at, ended_at, "source connection")?;
+
+    let overlaps: Vec<_> = store
+        .list_source_account_assignments_for_source(&source.source_id)?
+        .into_iter()
+        .filter(|assignment| {
+            periods_overlap(
+                started_at,
+                ended_at,
+                assignment.started_at,
+                assignment.ended_at,
+            )
+        })
+        .collect();
+
+    if overlaps.len() > 1 {
+        bail!(
+            "source {} has multiple overlapping account connections around {}",
+            source.source_id.0,
+            started_at.to_rfc3339()
+        );
+    }
+
+    if let Some(existing) = overlaps.first() {
+        if existing.provider_account_id == account.provider_account_id {
+            let merged_started_at = existing.started_at.min(started_at);
+            let merged_ended_at = match (existing.ended_at, ended_at) {
+                (None, _) | (_, None) => None,
+                (Some(left), Some(right)) => Some(left.max(right)),
+            };
+
+            if existing.started_at == merged_started_at && existing.ended_at == merged_ended_at {
+                return Ok(existing.clone());
+            }
+
+            let previous_assignment_id = existing.assignment_id.clone();
+            let now = Utc::now();
+            let merged = SourceAccountAssignment {
+                schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                assignment_id: source_account_assignment_id(
+                    &source.source_id,
+                    &account.provider_account_id,
+                    merged_started_at,
+                ),
+                source_id: source.source_id.clone(),
+                provider: source.provider.clone(),
+                provider_account_id: account.provider_account_id.clone(),
+                started_at: merged_started_at,
+                ended_at: merged_ended_at,
+                record_source: IdentitySource::UserConfigured,
+                verified_at: existing.verified_at,
+                created_at: existing.created_at,
+                updated_at: now,
+            };
+            if previous_assignment_id != merged.assignment_id {
+                store.delete_source_account_assignment(&previous_assignment_id)?;
+            }
+            store.upsert_source_account_assignment(&merged)?;
+            reattribute_source_records(store, &source.source_id)?;
+            return Ok(merged);
+        }
+
+        preserve_non_overlapping_source_assignment_segments(
+            store, &source, existing, started_at, ended_at,
+        )?;
+    }
+
+    validate_source_assignment_overlap(
+        store,
+        &source.source_id,
+        &account.provider_account_id,
+        started_at,
+        ended_at,
+        None,
+    )?;
+    let now = Utc::now();
+    let assignment = SourceAccountAssignment {
+        schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+        assignment_id: source_account_assignment_id(
+            &source.source_id,
+            &account.provider_account_id,
+            started_at,
+        ),
+        source_id: source.source_id.clone(),
+        provider: source.provider.clone(),
+        provider_account_id: account.provider_account_id,
+        started_at,
+        ended_at,
+        record_source: IdentitySource::UserConfigured,
+        verified_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    store.upsert_source_account_assignment(&assignment)?;
+    reattribute_source_records(store, &source.source_id)?;
+    Ok(assignment)
+}
+
+fn preserve_non_overlapping_source_assignment_segments(
+    store: &Store,
+    source: &SourceLocation,
+    existing: &SourceAccountAssignment,
+    replacement_started_at: DateTime<Utc>,
+    replacement_ended_at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let now = Utc::now();
+    let preserve_before = existing.started_at < replacement_started_at;
+    let preserve_after = replacement_ended_at
+        .map(|replacement_ended_at| {
+            existing
+                .ended_at
+                .map(|existing_ended_at| existing_ended_at > replacement_ended_at)
+                .unwrap_or(true)
+        })
+        .unwrap_or(false);
+
+    if preserve_before {
+        let mut before = existing.clone();
+        before.ended_at = Some(replacement_started_at);
+        before.updated_at = now;
+        validate_time_window(before.started_at, before.ended_at, "source connection")?;
+        store.upsert_source_account_assignment(&before)?;
+    } else {
+        store.delete_source_account_assignment(&existing.assignment_id)?;
+    }
+
+    if preserve_after {
+        let tail_started_at =
+            replacement_ended_at.expect("preserve_after requires finite replacement end");
+        let tail = SourceAccountAssignment {
+            schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+            assignment_id: source_account_assignment_id(
+                &source.source_id,
+                &existing.provider_account_id,
+                tail_started_at,
+            ),
+            source_id: source.source_id.clone(),
+            provider: source.provider.clone(),
+            provider_account_id: existing.provider_account_id.clone(),
+            started_at: tail_started_at,
+            ended_at: existing.ended_at,
+            record_source: existing.record_source.clone(),
+            verified_at: existing.verified_at,
+            created_at: now,
+            updated_at: now,
+        };
+        validate_time_window(tail.started_at, tail.ended_at, "source connection")?;
+        store.upsert_source_account_assignment(&tail)?;
+    }
+
+    Ok(())
+}
+
+fn active_subscription(
+    store: &Store,
+    provider: &str,
+    provider_account_id: &ProviderAccountId,
+    plan: Option<&str>,
+    timestamp: DateTime<Utc>,
+) -> Result<Subscription> {
+    store
+        .list_subscriptions()?
+        .into_iter()
+        .filter(|subscription| {
+            subscription.provider == provider
+                && subscription.provider_account_id == *provider_account_id
+                && plan
+                    .map(|plan_name| subscription.plan_name.eq_ignore_ascii_case(plan_name))
+                    .unwrap_or(true)
+                && timestamp_in_period(
+                    timestamp,
+                    subscription.started_at,
+                    effective_subscription_ended_at(subscription),
+                )
+        })
+        .max_by(|left, right| left.started_at.cmp(&right.started_at))
+        .with_context(|| {
+            let plan_suffix = plan
+                .map(|plan_name| format!(" plan {}", plan_name))
+                .unwrap_or_default();
+            format!(
+                "no active{} subscription found for account {} at {}",
+                plan_suffix,
+                provider_account_id.0,
+                timestamp.to_rfc3339()
+            )
+        })
+}
+
+fn disconnect_source_from_account(
+    store: &Store,
+    source_id: &SourceId,
+    provider_account_id_value: Option<&str>,
+    provider_user_id: Option<&str>,
+    email: Option<&str>,
+    ended_at: DateTime<Utc>,
+) -> Result<SourceAccountAssignment> {
+    let source = store
+        .source(source_id)?
+        .with_context(|| format!("unknown source {}", source_id.0))?;
+    let account_filter =
+        if provider_account_id_value.is_some() || provider_user_id.is_some() || email.is_some() {
+            Some(
+                resolve_existing_provider_account(
+                    store,
+                    &source.provider,
+                    provider_account_id_value,
+                    provider_user_id,
+                    email,
+                    None,
+                )?
+                .provider_account_id,
+            )
+        } else {
+            None
+        };
+    let mut active: Vec<_> = store
+        .list_source_account_assignments_for_source(&source.source_id)?
+        .into_iter()
+        .filter(|assignment| {
+            timestamp_in_period(ended_at, assignment.started_at, assignment.ended_at)
+        })
+        .filter(|assignment| {
+            account_filter
+                .as_ref()
+                .map(|account_id| &assignment.provider_account_id == account_id)
+                .unwrap_or(true)
+        })
+        .collect();
+    let Some(mut assignment) = active.pop() else {
+        bail!(
+            "no active source connection found for {} at {}",
+            source.source_id.0,
+            ended_at.to_rfc3339()
+        );
+    };
+    validate_time_window(assignment.started_at, Some(ended_at), "source connection")?;
+    assignment.ended_at = Some(ended_at);
+    assignment.updated_at = Utc::now();
+    store.upsert_source_account_assignment(&assignment)?;
+    reattribute_source_records(store, &source.source_id)?;
+    Ok(assignment)
+}
+
+fn subscription_renewal_day(timestamp: DateTime<Utc>) -> Option<u8> {
+    u8::try_from(timestamp.day()).ok()
+}
+
+fn subscription_for_period(
+    store: &Store,
+    provider: &str,
+    provider_account_id: &ProviderAccountId,
+    started_at: DateTime<Utc>,
+    plan: Option<&str>,
+) -> Result<Subscription> {
+    store
+        .list_subscriptions()?
+        .into_iter()
+        .find(|subscription| {
+            subscription.provider == provider
+                && subscription.provider_account_id == *provider_account_id
+                && subscription.started_at == started_at
+                && plan
+                    .map(|plan_name| subscription.plan_name == plan_name)
+                    .unwrap_or(true)
+        })
+        .with_context(|| {
+            format!(
+                "unknown subscription period for account {} starting {}",
+                provider_account_id.0,
+                started_at.to_rfc3339()
+            )
+        })
+}
+
+fn close_active_subscription(
+    store: &Store,
+    provider: &str,
+    provider_account_id: &ProviderAccountId,
+    ended_at: DateTime<Utc>,
+) -> Result<Option<Subscription>> {
+    let active = store
+        .list_subscriptions()?
+        .into_iter()
+        .find(|subscription| {
+            subscription.provider == provider
+                && subscription.provider_account_id == *provider_account_id
+                && timestamp_in_period(
+                    ended_at,
+                    subscription.started_at,
+                    effective_subscription_ended_at(subscription),
+                )
+        });
+    let Some(mut subscription) = active else {
+        return Ok(None);
+    };
+    validate_time_window(subscription.started_at, Some(ended_at), "subscription")?;
+    subscription.ended_at = Some(ended_at);
+    store.upsert_subscription(&subscription)?;
+    Ok(Some(subscription))
+}
+
+fn effective_subscription_ended_at(subscription: &Subscription) -> Option<DateTime<Utc>> {
+    if is_verified_subscription_source(&subscription.record_source)
+        && subscription.status == SubscriptionStatus::Active
+        && subscription.ended_at.is_some()
+        && subscription.ended_at == subscription.current_period_ends_at
+    {
+        return None;
+    }
+    subscription.ended_at
+}
+
+fn end_active_subscription(
+    store: &Store,
+    provider: &str,
+    provider_account_id: &ProviderAccountId,
+    ended_at: DateTime<Utc>,
+) -> Result<Subscription> {
+    close_active_subscription(store, provider, provider_account_id, ended_at)?.with_context(|| {
+        format!(
+            "no active subscription found for account {} at {}",
+            provider_account_id.0,
+            ended_at.to_rfc3339()
+        )
+    })
+}
+
+fn validate_time_window(
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    label: &str,
+) -> Result<()> {
+    if ended_at.is_some_and(|ended_at| ended_at <= started_at) {
+        bail!("{label} ended_at must be after started_at");
+    }
+    Ok(())
+}
+
+fn validate_source_assignment_overlap(
+    store: &Store,
+    source_id: &SourceId,
+    _provider_account_id: &ProviderAccountId,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    ignore_assignment_id: Option<&SourceAccountAssignmentId>,
+) -> Result<()> {
+    for assignment in store.list_source_account_assignments_for_source(source_id)? {
+        if ignore_assignment_id == Some(&assignment.assignment_id) {
+            continue;
+        }
+        if periods_overlap(
+            started_at,
+            ended_at,
+            assignment.started_at,
+            assignment.ended_at,
+        ) {
+            bail!(
+                "source connection overlaps an existing connection for source {}",
+                source_id.0
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_subscription_overlap(
+    store: &Store,
+    provider: &str,
+    provider_account_id: &ProviderAccountId,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    ignore_subscription_id: Option<&SubscriptionId>,
+) -> Result<()> {
+    for subscription in store.list_subscriptions()? {
+        if ignore_subscription_id == Some(&subscription.subscription_id) {
+            continue;
+        }
+        if subscription.provider != provider {
+            continue;
+        }
+        if &subscription.provider_account_id != provider_account_id {
+            continue;
+        }
+        if periods_overlap(
+            started_at,
+            ended_at,
+            subscription.started_at,
+            subscription.ended_at,
+        ) {
+            bail!(
+                "subscription overlaps existing subscription {} for account {}",
+                subscription.subscription_id.0,
+                provider_account_id.0
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reattribute_source_records(store: &Store, source_id: &SourceId) -> Result<()> {
+    if store.source(source_id)?.is_none() {
+        return Ok(());
+    }
+    let assignments = store.list_source_account_assignments_for_source(source_id)?;
+    let mut events = store.events_for_source(source_id)?;
+    let mut summaries = store.summaries_for_source(source_id)?;
+    for event in &mut events {
+        apply_account_resolution_to_event(&assignments, event);
+    }
+    for summary in &mut summaries {
+        apply_account_resolution_to_summary(&assignments, summary);
+    }
+    store.rewrite_events(&events)?;
+    store.rewrite_summaries(&summaries)?;
+    Ok(())
+}
+
+fn apply_source_account_resolution(
+    store: &Store,
+    source: &SourceLocation,
+    events: &mut [UsageEvent],
+    summaries: &mut [UsageSummary],
+) -> Result<()> {
+    let assignments = store.list_source_account_assignments_for_source(&source.source_id)?;
+    for event in events {
+        apply_account_resolution_to_event(&assignments, event);
+    }
+    for summary in summaries {
+        apply_account_resolution_to_summary(&assignments, summary);
+    }
+    Ok(())
+}
+
+fn apply_account_resolution_to_event(
+    assignments: &[SourceAccountAssignment],
+    event: &mut UsageEvent,
+) {
+    if keep_detected_account_identity(
+        event.provider_account_id.as_ref(),
+        event
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| &evidence.account_identity_source),
+    ) {
+        return;
+    }
+    let assignment = assignment_for_timestamp(assignments, event.session.started_at);
+    if let Some(assignment) = assignment {
+        event.provider_account_id = Some(assignment.provider_account_id.clone());
+        if let Some(evidence) = event.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::SourceConfig;
+        }
+    } else if should_clear_resolved_account(
+        event.provider_account_id.as_ref(),
+        event
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| &evidence.account_identity_source),
+    ) {
+        event.provider_account_id = None;
+        if let Some(evidence) = event.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::Unresolved;
+        }
+    }
+}
+
+fn apply_account_resolution_to_summary(
+    assignments: &[SourceAccountAssignment],
+    summary: &mut UsageSummary,
+) {
+    if keep_detected_account_identity(
+        summary.provider_account_id.as_ref(),
+        summary
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| &evidence.account_identity_source),
+    ) {
+        return;
+    }
+    let timestamp = summary.period_start.unwrap_or(summary.observed_at);
+    let assignment = assignment_for_timestamp(assignments, timestamp);
+    if let Some(assignment) = assignment {
+        summary.provider_account_id = Some(assignment.provider_account_id.clone());
+        if let Some(evidence) = summary.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::SourceConfig;
+        }
+    } else if should_clear_resolved_account(
+        summary.provider_account_id.as_ref(),
+        summary
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| &evidence.account_identity_source),
+    ) {
+        summary.provider_account_id = None;
+        if let Some(evidence) = summary.parse_evidence.as_mut() {
+            evidence.account_identity_source = IdentitySource::Unresolved;
+        }
+    }
+}
+
+fn keep_detected_account_identity(
+    provider_account_id: Option<&ProviderAccountId>,
+    identity_source: Option<&IdentitySource>,
+) -> bool {
+    let Some(provider_account_id) = provider_account_id else {
+        return false;
+    };
+    if provider_account_id.0.trim().is_empty() {
+        return false;
+    }
+    let Some(identity_source) = identity_source else {
+        return false;
+    };
+    !matches!(
+        identity_source,
+        IdentitySource::SourceConfig
+            | IdentitySource::UserConfigured
+            | IdentitySource::ManualHint
+            | IdentitySource::Unknown
+            | IdentitySource::Unresolved
+    )
+}
+
+fn should_clear_resolved_account(
+    provider_account_id: Option<&ProviderAccountId>,
+    identity_source: Option<&IdentitySource>,
+) -> bool {
+    let Some(provider_account_id) = provider_account_id else {
+        return false;
+    };
+    if provider_account_id.0.trim().is_empty() {
+        return false;
+    }
+    matches!(
+        identity_source,
+        None | Some(
+            IdentitySource::SourceConfig
+                | IdentitySource::UserConfigured
+                | IdentitySource::ManualHint
+                | IdentitySource::Unknown
+                | IdentitySource::Unresolved
+        )
+    )
+}
+
+fn assignment_for_timestamp(
+    assignments: &[SourceAccountAssignment],
+    timestamp: DateTime<Utc>,
+) -> Option<&SourceAccountAssignment> {
+    assignments
+        .iter()
+        .filter(|assignment| {
+            timestamp_in_period(timestamp, assignment.started_at, assignment.ended_at)
+        })
+        .max_by(|left, right| left.started_at.cmp(&right.started_at))
 }
 
 fn default_store_path() -> PathBuf {
@@ -2065,9 +3921,8 @@ fn print_scan_preview_line(
 ) {
     if verbose {
         println!(
-            "{} account={} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
+            "{} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
             source.provider,
-            source.account_alias.as_deref().unwrap_or("unmapped"),
             preview_path_label(source),
             usage_events,
             summaries,
@@ -2092,9 +3947,8 @@ fn print_scan_preview_line(
         );
     } else {
         println!(
-            "{} account={} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={}",
+            "{} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={}",
             source.provider,
-            source.account_alias.as_deref().unwrap_or("unmapped"),
             preview_path_label(source),
             usage_events,
             summaries,
@@ -2120,30 +3974,6 @@ fn add_diagnostics(target: &mut ScanDiagnostics, source: &ScanDiagnostics) {
     target.invalid_rows += source.invalid_rows;
     target.timestamp_fallbacks += source.timestamp_fallbacks;
     target.model_fallbacks += source.model_fallbacks;
-}
-
-fn apply_account_alias_to_events(source: &SourceLocation, events: &mut [UsageEvent]) {
-    let Some(account_alias) = source.account_alias.as_deref() else {
-        return;
-    };
-    for event in events {
-        event.provider_account_id = Some(provider_account_id(&source.provider, account_alias));
-        if let Some(evidence) = event.parse_evidence.as_mut() {
-            evidence.account_identity_source = IdentitySource::ManualHint;
-        }
-    }
-}
-
-fn apply_account_alias_to_summaries(source: &SourceLocation, summaries: &mut [UsageSummary]) {
-    let Some(account_alias) = source.account_alias.as_deref() else {
-        return;
-    };
-    for summary in summaries {
-        summary.provider_account_id = Some(provider_account_id(&source.provider, account_alias));
-        if let Some(evidence) = summary.parse_evidence.as_mut() {
-            evidence.account_identity_source = IdentitySource::ManualHint;
-        }
-    }
 }
 
 fn print_scan_diagnostics_total(diagnostics: &ScanDiagnostics) {
@@ -2331,21 +4161,56 @@ fn format_cost(cost: Option<f64>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn format_subscription_price(price: f64, currency: &str) -> String {
+    if currency.eq_ignore_ascii_case("USD") {
+        format!("${price:.2}")
+    } else {
+        format!("{price:.2} {currency}")
+    }
+}
+
+fn format_ratio(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}x"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn truncate_label(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
+fn subscription_status_label(status: &SubscriptionStatus) -> &'static str {
+    match status {
+        SubscriptionStatus::Active => "active",
+        SubscriptionStatus::Paused => "paused",
+        SubscriptionStatus::Cancelled => "cancelled",
+    }
+}
+
 fn sanitize_source_for_sync(mut source: SourceLocation) -> SourceLocation {
     source.path_label = None;
-    source.account_alias = None;
     source
 }
 
 fn sanitize_account_for_sync(mut account: ProviderAccount) -> ProviderAccount {
-    if !matches!(
-        account.identity_source,
-        IdentitySource::UserConfigured | IdentitySource::ManualHint
-    ) {
+    if !matches!(account.identity_source, IdentitySource::UserConfigured) {
         account.account_label = None;
     }
     account.plan_name = None;
     account
+}
+
+fn sanitize_source_account_assignment_for_sync(
+    assignment: SourceAccountAssignment,
+) -> SourceAccountAssignment {
+    assignment
 }
 
 fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
@@ -2557,6 +4422,9 @@ mod tests {
     struct TestAdapter {
         provider: &'static str,
         discovered: Vec<SourceLocation>,
+        scan_result: ai_stats_adapters::AdapterScan,
+        probe_result: Option<VerifiedSourceState>,
+        scan_calls: Option<Arc<Mutex<u64>>>,
     }
 
     impl ProviderAdapter for TestAdapter {
@@ -2580,12 +4448,26 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn probe_verified_source_state(
+            &self,
+            _source: &SourceLocation,
+        ) -> Result<Option<VerifiedSourceState>> {
+            Ok(self
+                .probe_result
+                .clone()
+                .or_else(|| self.scan_result.verified_source_state.clone()))
+        }
+
         fn scan(
             &self,
             _source: &SourceLocation,
             _options: &ScanOptions,
         ) -> Result<ai_stats_adapters::AdapterScan> {
-            Ok(ai_stats_adapters::AdapterScan::default())
+            if let Some(scan_calls) = &self.scan_calls {
+                let mut calls = scan_calls.lock().expect("scan call mutex");
+                *calls += 1;
+            }
+            Ok(self.scan_result.clone())
         }
     }
 
@@ -2608,7 +4490,6 @@ mod tests {
             "0",
             Path::new("/tmp/.codex"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         let now = Utc
             .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
@@ -2626,7 +4507,7 @@ mod tests {
             account_identity_source: IdentitySource::ManualHint,
         });
 
-        let mut summary = test_summary("codex", &source, now, 100);
+        let mut summary = test_summary("codex", &source, now, 100, None);
         summary.source.source_record_id = Some("reported_jul11.json:daily:2025-07-11".to_string());
         summary.parse_evidence = event.parse_evidence.clone();
 
@@ -2662,7 +4543,6 @@ mod tests {
             "0",
             "external-report",
             None,
-            Some("personal".to_string()),
         );
         let local_source = SourceLocation::local_adapter(
             "claude_code",
@@ -2670,16 +4550,15 @@ mod tests {
             "0",
             Path::new("/tmp/.claude"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         let now = Utc
             .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
             .single()
             .expect("now");
-        let mut reported = test_summary("claude_code", &source, now, 100);
+        let mut reported = test_summary("claude_code", &source, now, 100, None);
         reported.source.source_kind = SourceKind::ExternalReport;
         reported.metadata.summary_format = "external_daily".to_string();
-        let mut local = test_summary("claude_code", &local_source, now, 200);
+        let mut local = test_summary("claude_code", &local_source, now, 200, None);
         local.source.source_kind = SourceKind::LocalSummary;
         local.metadata.summary_format = "external_daily".to_string();
         store.upsert_summary(&reported).expect("reported summary");
@@ -2709,7 +4588,6 @@ mod tests {
             "0",
             "reported-file-a",
             None,
-            Some("personal".to_string()),
         );
         let other_source = SourceLocation::reported_usage(
             "claude_code",
@@ -2718,20 +4596,19 @@ mod tests {
             "0",
             "reported-file-b",
             None,
-            Some("personal".to_string()),
         );
         let now = Utc
             .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
             .single()
             .expect("now");
 
-        let mut matching = test_summary("claude_code", &source, now, 100);
+        let mut matching = test_summary("claude_code", &source, now, 100, None);
         matching.source.source_kind = SourceKind::ExternalReport;
         matching.metadata.summary_format = "external_daily".to_string();
         matching.period_start = Some(now - Duration::days(1));
         matching.period_end = Some(now);
 
-        let mut same_file_different_day = test_summary("claude_code", &source, now, 200);
+        let mut same_file_different_day = test_summary("claude_code", &source, now, 200, None);
         same_file_different_day.summary_id =
             summary_id("claude_code", &source.source_id, "other-day");
         same_file_different_day.source.source_kind = SourceKind::ExternalReport;
@@ -2739,7 +4616,8 @@ mod tests {
         same_file_different_day.period_start = Some(now - Duration::days(2));
         same_file_different_day.period_end = Some(now - Duration::days(1));
 
-        let mut same_period_different_file = test_summary("claude_code", &other_source, now, 300);
+        let mut same_period_different_file =
+            test_summary("claude_code", &other_source, now, 300, None);
         same_period_different_file.source.source_kind = SourceKind::ExternalReport;
         same_period_different_file.metadata.summary_format = "external_daily".to_string();
         same_period_different_file.period_start = matching.period_start;
@@ -2784,44 +4662,6 @@ mod tests {
     }
 
     #[test]
-    fn account_resolve_merges_sources_with_same_account_alias() {
-        let store = Store::in_memory().expect("store");
-        let source_a = SourceLocation::local_adapter(
-            "claude_code",
-            "test",
-            "0",
-            Path::new("/tmp/claude-a"),
-            LocationOrigin::Configured,
-            Some("personal".to_string()),
-        );
-        let source_b = SourceLocation::local_adapter(
-            "claude_code",
-            "test",
-            "0",
-            Path::new("/tmp/claude-b"),
-            LocationOrigin::Configured,
-            Some("personal".to_string()),
-        );
-        store.upsert_source(&source_a).expect("source a");
-        store.upsert_source(&source_b).expect("source b");
-
-        account(
-            AccountCommand {
-                command: AccountSubcommand::Resolve {
-                    provider: "claude".to_string(),
-                },
-            },
-            &store,
-        )
-        .expect("resolve");
-
-        let accounts = store.list_accounts().expect("accounts");
-        assert_eq!(accounts.len(), 1);
-        assert_eq!(accounts[0].provider, "claude_code");
-        assert_eq!(accounts[0].source_ids.len(), 2);
-    }
-
-    #[test]
     fn subscription_add_uses_canonical_provider_for_account_id() {
         let store = Store::in_memory().expect("store");
 
@@ -2829,11 +4669,16 @@ mod tests {
             SubscriptionCommand {
                 command: SubscriptionSubcommand::Add {
                     provider: "claude".to_string(),
-                    account: Some("personal".to_string()),
+                    provider_account_id: None,
+                    provider_user_id: None,
+                    email: Some("personal@example.com".to_string()),
+                    label: None,
                     plan: "Pro".to_string(),
                     price: 20.0,
                     currency: "USD".to_string(),
                     paid_at: Some("2026-05-15".to_string()),
+                    started_at: "2026-05-15".to_string(),
+                    ended_at: None,
                 },
             },
             &store,
@@ -2845,7 +4690,8 @@ mod tests {
         assert_eq!(subscriptions[0].provider, "claude_code");
         assert_eq!(
             subscriptions[0].provider_account_id,
-            Some(provider_account_id("claude_code", "personal"))
+            provider_account_id_from_identity("claude_code", None, Some("personal@example.com"))
+                .expect("account id")
         );
     }
 
@@ -2858,7 +4704,6 @@ mod tests {
             "0",
             Path::new("/tmp/ai-stats-preview-source"),
             LocationOrigin::Configured,
-            None,
         );
 
         persist_source_after_preview(&store, &source).expect("persist");
@@ -2874,7 +4719,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-merge"),
             LocationOrigin::Default,
-            None,
         );
         let configured = SourceLocation::local_adapter(
             "codex",
@@ -2882,18 +4726,19 @@ mod tests {
             "0",
             Path::new("/tmp/codex-merge"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![discovered],
+            scan_result: ai_stats_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
         };
 
         let sources = scan_sources_for_adapter(&adapter, &[configured]);
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].location_origin, LocationOrigin::Configured);
-        assert_eq!(sources[0].account_alias.as_deref(), Some("personal"));
     }
 
     #[test]
@@ -2904,7 +4749,6 @@ mod tests {
             "0",
             Path::new("/tmp/ai-stats-claude/projects"),
             LocationOrigin::Default,
-            None,
         );
         let configured = SourceLocation::local_adapter(
             "claude_code",
@@ -2912,18 +4756,19 @@ mod tests {
             "0",
             Path::new("/tmp/ai-stats-claude"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         let adapter = TestAdapter {
             provider: "claude_code",
             discovered: vec![discovered],
+            scan_result: ai_stats_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
         };
 
         let sources = scan_sources_for_adapter(&adapter, &[configured]);
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].location_origin, LocationOrigin::Configured);
-        assert_eq!(sources[0].account_alias.as_deref(), Some("personal"));
         assert_eq!(
             sources[0].path_label.as_deref(),
             Some("/tmp/ai-stats-claude")
@@ -2938,7 +4783,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-local"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         let configured_manual = SourceLocation::reported_usage(
             "codex",
@@ -2947,11 +4791,13 @@ mod tests {
             "0",
             "manual-note",
             None,
-            Some("personal".to_string()),
         );
         let adapter = TestAdapter {
             provider: "codex",
             discovered: Vec::new(),
+            scan_result: ai_stats_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
         };
 
         let sources =
@@ -2961,49 +4807,1359 @@ mod tests {
     }
 
     #[test]
-    fn apply_account_alias_attaches_manual_identity() {
-        let adapter = adapter_for_provider("codex").expect("adapter");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sessions = dir.path().join("sessions");
-        std::fs::create_dir_all(&sessions).expect("sessions");
-        std::fs::write(
-            sessions.join("session.jsonl"),
-            "{\"timestamp\":\"2026-05-24T00:00:00Z\",\"session_id\":\"session\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
-        )
-        .expect("fixture");
+    fn connect_source_to_account_closes_existing_open_connection() {
+        let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
             "codex",
             "test",
             "0",
-            dir.path(),
+            Path::new("/tmp/codex-connect"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
+        store.upsert_source(&source).expect("source");
+        let first_start = Utc
+            .with_ymd_and_hms(2026, 5, 1, 0, 0, 0)
+            .single()
+            .expect("first");
+        let second_start = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("second");
 
-        let mut scan = adapter
-            .scan(
+        connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("first@example.com"),
+                label: None,
+                started_at: first_start,
+                ended_at: None,
+            },
+        )
+        .expect("first connect");
+        connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("second@example.com"),
+                label: None,
+                started_at: second_start,
+                ended_at: None,
+            },
+        )
+        .expect("second connect");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].ended_at, Some(second_start));
+        assert_eq!(assignments[1].started_at, second_start);
+    }
+
+    #[test]
+    fn connect_source_to_account_preserves_tail_when_replacing_finite_window() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-connect-tail"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let period_start = Utc
+            .with_ymd_and_hms(2026, 5, 1, 0, 0, 0)
+            .single()
+            .expect("period start");
+        let split_at = Utc
+            .with_ymd_and_hms(2026, 5, 15, 0, 0, 0)
+            .single()
+            .expect("split");
+        let period_end = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("period end");
+        let before_split = Utc
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("before split");
+        let after_split = Utc
+            .with_ymd_and_hms(2026, 5, 20, 12, 0, 0)
+            .single()
+            .expect("after split");
+        store
+            .insert_event(&test_event(
+                "codex",
                 &source,
-                &ScanOptions {
-                    device_id: "device".to_string(),
-                    selected_cache_keys: None,
-                },
-            )
-            .expect("scan");
-        apply_account_alias_to_events(&source, &mut scan.events);
+                before_split,
+                None,
+                TokenParts::total(1),
+            ))
+            .expect("before event");
+        store
+            .insert_event(&test_event(
+                "codex",
+                &source,
+                after_split,
+                None,
+                TokenParts::total(1),
+            ))
+            .expect("after event");
 
-        assert_eq!(scan.events.len(), 1);
+        connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("first@example.com"),
+                label: None,
+                started_at: period_start,
+                ended_at: Some(period_end),
+            },
+        )
+        .expect("first connect");
+        connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("second@example.com"),
+                label: None,
+                started_at: period_start,
+                ended_at: Some(split_at),
+            },
+        )
+        .expect("second connect");
+
+        let first_account =
+            provider_account_id_from_identity("codex", None, Some("first@example.com"))
+                .expect("first account");
+        let second_account =
+            provider_account_id_from_identity("codex", None, Some("second@example.com"))
+                .expect("second account");
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 2);
+        assert!(assignments.iter().any(|assignment| {
+            assignment.provider_account_id == second_account
+                && assignment.started_at == period_start
+                && assignment.ended_at == Some(split_at)
+        }));
+        assert!(assignments.iter().any(|assignment| {
+            assignment.provider_account_id == first_account
+                && assignment.started_at == split_at
+                && assignment.ended_at == Some(period_end)
+        }));
+
+        let events = store
+            .events_for_source(&source.source_id)
+            .expect("source events");
+        assert_eq!(events.len(), 2);
+        let before = events
+            .iter()
+            .find(|event| event.session.started_at == before_split)
+            .expect("before event");
+        let after = events
+            .iter()
+            .find(|event| event.session.started_at == after_split)
+            .expect("after event");
+        assert_eq!(before.provider_account_id, Some(second_account));
+        assert_eq!(after.provider_account_id, Some(first_account));
+    }
+
+    #[test]
+    fn connect_source_to_account_merges_same_account_and_backfills_boundary_events() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-connect-merge"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let original_start = Utc
+            .with_ymd_and_hms(2026, 5, 28, 11, 31, 9)
+            .single()
+            .expect("original start");
+        let extended_start = Utc
+            .with_ymd_and_hms(2026, 5, 28, 0, 0, 0)
+            .single()
+            .expect("extended start");
+        let boundary_event_at = Utc
+            .with_ymd_and_hms(2026, 5, 28, 7, 23, 28)
+            .single()
+            .expect("boundary event");
+
+        let event = test_event(
+            "codex",
+            &source,
+            boundary_event_at,
+            None,
+            TokenParts::total(1),
+        );
+        store.insert_event(&event).expect("event");
+
+        connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("same-account@example.com"),
+                label: None,
+                started_at: original_start,
+                ended_at: None,
+            },
+        )
+        .expect("initial connect");
+
+        connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("same-account@example.com"),
+                label: None,
+                started_at: extended_start,
+                ended_at: None,
+            },
+        )
+        .expect("extended connect");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].started_at, extended_start);
+
+        let events = store
+            .events_for_source(&source.source_id)
+            .expect("source events");
+        assert_eq!(events.len(), 1);
         assert_eq!(
-            scan.events[0].provider_account_id,
-            Some(provider_account_id("codex", "personal"))
+            events[0].provider_account_id,
+            provider_account_id_from_identity("codex", None, Some("same-account@example.com"))
+        );
+    }
+
+    #[test]
+    fn apply_verified_source_state_reuses_existing_email_account() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-verified-state"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let existing = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: None,
+                email: Some("existing@example.com"),
+                label: Some("existing-alias".to_string()),
+                plan_name: None,
+                identity_source: Some(IdentitySource::UserConfigured),
+                verified_at: None,
+            },
+        )
+        .expect("existing account");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("started_at");
+        let verified_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 14, 56)
+            .single()
+            .expect("verified_at");
+        let current_period_ends_at = Utc
+            .with_ymd_and_hms(2026, 6, 29, 10, 12, 43)
+            .single()
+            .expect("current_period_ends_at");
+
+        apply_verified_source_state(
+            &store,
+            &source,
+            Some(&VerifiedSourceState {
+                provider_user_id: Some("chatgpt-account-123".to_string()),
+                email: Some("existing@example.com".to_string()),
+                account_label: None,
+                plan_name: Some("Plus".to_string()),
+                authenticated_at: Some(started_at),
+                verified_at: Some(verified_at),
+                subscription: Some(VerifiedSubscriptionState {
+                    plan_name: "Plus".to_string(),
+                    price: 20.0,
+                    currency: "USD".to_string(),
+                    billing_period: BillingPeriod::Monthly,
+                    paid_at: Some(started_at),
+                    started_at,
+                    ended_at: Some(current_period_ends_at),
+                    current_period_ends_at: Some(current_period_ends_at),
+                    status: SubscriptionStatus::Active,
+                    verified_at: Some(verified_at),
+                }),
+            }),
+        )
+        .expect("apply verified state");
+
+        let accounts = store.list_accounts().expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(
+            accounts[0].provider_account_id,
+            existing.provider_account_id
         );
         assert_eq!(
-            scan.events[0]
-                .parse_evidence
-                .as_ref()
-                .map(|evidence| evidence.account_identity_source.clone()),
-            Some(IdentitySource::ManualHint)
+            accounts[0].provider_user_id.as_deref(),
+            Some("chatgpt-account-123")
         );
-        assert_eq!(scan.events[0].usage.computed_total(), 15);
+        assert_eq!(accounts[0].plan_name.as_deref(), Some("Plus"));
+        assert_eq!(accounts[0].verified_at, Some(verified_at));
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0].provider_account_id,
+            existing.provider_account_id
+        );
+        assert_eq!(assignments[0].record_source, IdentitySource::LocalAuth);
+        assert_eq!(assignments[0].verified_at, Some(verified_at));
+
+        let subscriptions = store.list_subscriptions().expect("subscriptions");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(
+            subscriptions[0].provider_account_id,
+            existing.provider_account_id
+        );
+        assert_eq!(subscriptions[0].record_source, IdentitySource::LocalAuth);
+        assert_eq!(
+            subscriptions[0].current_period_ends_at,
+            Some(current_period_ends_at)
+        );
+        assert_eq!(subscriptions[0].ended_at, None);
+    }
+
+    #[test]
+    fn upsert_provider_account_rejects_conflicting_email_and_provider_user_id() {
+        let store = Store::in_memory().expect("store");
+        let email_account = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: None,
+                email: Some("conflict@example.com"),
+                label: Some("email".to_string()),
+                plan_name: None,
+                identity_source: Some(IdentitySource::UserConfigured),
+                verified_at: None,
+            },
+        )
+        .expect("email account");
+        let user_account = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: Some("acct-conflict"),
+                email: None,
+                label: Some("user".to_string()),
+                plan_name: None,
+                identity_source: Some(IdentitySource::UserConfigured),
+                verified_at: None,
+            },
+        )
+        .expect("user account");
+
+        let error = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: Some("acct-conflict"),
+                email: Some("conflict@example.com"),
+                label: None,
+                plan_name: None,
+                identity_source: Some(IdentitySource::LocalAuth),
+                verified_at: None,
+            },
+        )
+        .expect_err("conflicting identity");
+
+        assert!(error
+            .to_string()
+            .contains("conflicting provider account identifiers"));
+        let accounts = store.list_accounts().expect("accounts");
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.iter().any(|account| {
+            account.provider_account_id == email_account.provider_account_id
+                && account.provider_user_id.is_none()
+                && account.email.as_deref() == Some("conflict@example.com")
+        }));
+        assert!(accounts.iter().any(|account| {
+            account.provider_account_id == user_account.provider_account_id
+                && account.provider_user_id.as_deref() == Some("acct-conflict")
+                && account.email.is_none()
+        }));
+    }
+
+    #[test]
+    fn lookup_provider_account_does_not_create_orphans() {
+        let store = Store::in_memory().expect("store");
+
+        let error = resolve_existing_provider_account(
+            &store,
+            "codex",
+            None,
+            None,
+            Some("typo@example.com"),
+            None,
+        )
+        .expect_err("missing account");
+
+        assert!(error
+            .to_string()
+            .contains("unknown provider account selector"));
+        assert!(store.list_accounts().expect("accounts").is_empty());
+    }
+
+    #[test]
+    fn provider_account_id_lookup_rejects_wrong_provider() {
+        let store = Store::in_memory().expect("store");
+        let account = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "claude_code",
+                provider_user_id: None,
+                email: Some("claude@example.com"),
+                label: None,
+                plan_name: None,
+                identity_source: Some(IdentitySource::UserConfigured),
+                verified_at: None,
+            },
+        )
+        .expect("account");
+
+        let existing_error = resolve_existing_provider_account(
+            &store,
+            "codex",
+            Some(&account.provider_account_id.0),
+            None,
+            None,
+            None,
+        )
+        .expect_err("wrong existing provider");
+        let create_error = resolve_or_create_provider_account(
+            &store,
+            "codex",
+            Some(&account.provider_account_id.0),
+            Some("codex-user"),
+            None,
+            None,
+        )
+        .expect_err("wrong create provider");
+
+        assert!(existing_error
+            .to_string()
+            .contains("belongs to claude_code"));
+        assert!(create_error.to_string().contains("belongs to claude_code"));
+    }
+
+    #[test]
+    fn subscription_change_requires_active_existing_subscription() {
+        let store = Store::in_memory().expect("store");
+        let account = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: None,
+                email: Some("change@example.com"),
+                label: None,
+                plan_name: None,
+                identity_source: Some(IdentitySource::UserConfigured),
+                verified_at: None,
+            },
+        )
+        .expect("account");
+
+        let error = subscription(
+            SubscriptionCommand {
+                command: SubscriptionSubcommand::Change {
+                    provider: "codex".to_string(),
+                    provider_account_id: Some(account.provider_account_id.0.clone()),
+                    provider_user_id: None,
+                    email: None,
+                    label: None,
+                    plan: "Pro".to_string(),
+                    price: 200.0,
+                    currency: "USD".to_string(),
+                    paid_at: None,
+                    started_at: "2026-06-01".to_string(),
+                },
+            },
+            &store,
+        )
+        .expect_err("missing active subscription");
+
+        assert!(error
+            .to_string()
+            .contains("subscription change requires an active subscription"));
+        assert!(store
+            .list_subscriptions()
+            .expect("subscriptions")
+            .is_empty());
+        assert_eq!(store.list_accounts().expect("accounts").len(), 1);
+    }
+
+    #[test]
+    fn scan_applies_verified_source_state_even_when_source_files_are_unchanged() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-work-upgrade"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let legacy_start = Utc
+            .with_ymd_and_hms(2026, 5, 24, 20, 10, 31)
+            .single()
+            .expect("legacy_start");
+        let mut legacy_assignment = connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("work"),
+                label: Some("work".to_string()),
+                started_at: legacy_start,
+                ended_at: None,
+            },
+        )
+        .expect("legacy work assignment");
+        legacy_assignment.record_source = IdentitySource::Unknown;
+        store
+            .upsert_source_account_assignment(&legacy_assignment)
+            .expect("legacy assignment");
+
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 4, 30, 7, 43, 17)
+            .single()
+            .expect("started_at");
+        let verified_at = Utc
+            .with_ymd_and_hms(2026, 5, 30, 7, 43, 18)
+            .single()
+            .expect("verified_at");
+        let current_period_ends_at = Utc
+            .with_ymd_and_hms(2026, 5, 30, 7, 43, 17)
+            .single()
+            .expect("current_period_ends_at");
+
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            scan_result: ai_stats_adapters::AdapterScan {
+                diagnostics: ScanDiagnostics {
+                    files_skipped_unchanged: 1,
+                    ..ScanDiagnostics::default()
+                },
+                verified_source_state: Some(VerifiedSourceState {
+                    provider_user_id: Some("11111111-2222-4333-8444-555555555555".to_string()),
+                    email: Some("verified@example.com".to_string()),
+                    account_label: None,
+                    plan_name: Some("Plus".to_string()),
+                    authenticated_at: Some(started_at),
+                    verified_at: Some(verified_at),
+                    subscription: Some(VerifiedSubscriptionState {
+                        plan_name: "Plus".to_string(),
+                        price: 20.0,
+                        currency: "USD".to_string(),
+                        billing_period: BillingPeriod::Monthly,
+                        paid_at: Some(started_at),
+                        started_at,
+                        ended_at: Some(current_period_ends_at),
+                        current_period_ends_at: Some(current_period_ends_at),
+                        status: SubscriptionStatus::Active,
+                        verified_at: Some(verified_at),
+                    }),
+                }),
+                ..ai_stats_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        let expected_account_id = provider_account_id_from_identity(
+            "codex",
+            Some("11111111-2222-4333-8444-555555555555"),
+            Some("verified@example.com"),
+        )
+        .expect("expected account id");
+
+        let accounts = store.list_accounts().expect("accounts");
+        assert!(accounts.iter().any(|account| {
+            account.provider_account_id == expected_account_id
+                && account.email.as_deref() == Some("verified@example.com")
+                && account.plan_name.as_deref() == Some("Plus")
+        }));
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].started_at, started_at);
+        assert_eq!(assignments[0].ended_at, None);
+        assert_eq!(assignments[0].provider_account_id, expected_account_id);
+        assert_eq!(assignments[0].record_source, IdentitySource::LocalAuth);
+
+        let subscriptions = store.list_subscriptions().expect("subscriptions");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].provider_account_id, expected_account_id);
+        assert_eq!(subscriptions[0].record_source, IdentitySource::LocalAuth);
+        assert_eq!(subscriptions[0].ended_at, None);
+        assert_eq!(
+            subscriptions[0].current_period_ends_at,
+            Some(current_period_ends_at)
+        );
+        let stored_source = store
+            .source(&source.source_id)
+            .expect("source row")
+            .expect("stored source");
+        assert!(stored_source.verified_state_hash.is_some());
+    }
+
+    #[test]
+    fn scan_reopens_existing_verified_assignment_when_auth_is_still_current() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-reopen-verified"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 3, 10, 54, 50)
+            .single()
+            .expect("started_at");
+        let closed_at = Utc
+            .with_ymd_and_hms(2026, 5, 24, 20, 10, 31)
+            .single()
+            .expect("closed_at");
+        let verified_at = Utc
+            .with_ymd_and_hms(2026, 5, 3, 10, 54, 50)
+            .single()
+            .expect("verified_at");
+
+        let account = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: Some("11111111-2222-4333-8444-555555555555"),
+                email: Some("verified@example.com"),
+                label: None,
+                plan_name: Some("Plus".to_string()),
+                identity_source: Some(IdentitySource::LocalAuth),
+                verified_at: Some(verified_at),
+            },
+        )
+        .expect("account");
+        store
+            .upsert_source_account_assignment(&SourceAccountAssignment {
+                schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                assignment_id: source_account_assignment_id(
+                    &source.source_id,
+                    &account.provider_account_id,
+                    started_at,
+                ),
+                source_id: source.source_id.clone(),
+                provider: source.provider.clone(),
+                provider_account_id: account.provider_account_id.clone(),
+                started_at,
+                ended_at: Some(closed_at),
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(verified_at),
+                created_at: started_at,
+                updated_at: closed_at,
+            })
+            .expect("closed assignment");
+
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            scan_result: ai_stats_adapters::AdapterScan {
+                diagnostics: ScanDiagnostics {
+                    files_skipped_unchanged: 1,
+                    ..ScanDiagnostics::default()
+                },
+                verified_source_state: Some(VerifiedSourceState {
+                    provider_user_id: Some("11111111-2222-4333-8444-555555555555".to_string()),
+                    email: Some("verified@example.com".to_string()),
+                    account_label: None,
+                    plan_name: Some("Plus".to_string()),
+                    authenticated_at: Some(started_at),
+                    verified_at: Some(verified_at),
+                    subscription: None,
+                }),
+                ..ai_stats_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0].provider_account_id,
+            account.provider_account_id
+        );
+        assert_eq!(assignments[0].started_at, started_at);
+        assert_eq!(assignments[0].ended_at, None);
+    }
+
+    #[test]
+    fn scan_skips_full_scan_when_usage_and_verified_state_are_unchanged() {
+        let store = Store::in_memory().expect("store");
+        let mut source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-scan-skip"),
+            LocationOrigin::Configured,
+        );
+        let verified_state = VerifiedSourceState {
+            provider_user_id: Some("acct-verified".to_string()),
+            email: Some("verified@example.com".to_string()),
+            account_label: None,
+            plan_name: Some("Plus".to_string()),
+            authenticated_at: Some(
+                Utc.with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+                    .single()
+                    .expect("authenticated_at"),
+            ),
+            verified_at: Some(
+                Utc.with_ymd_and_hms(2026, 5, 29, 10, 14, 56)
+                    .single()
+                    .expect("verified_at"),
+            ),
+            subscription: None,
+        };
+        source.verified_state_hash =
+            verified_source_state_hash(Some(&verified_state)).expect("verified state hash");
+        store.upsert_source(&source).expect("source");
+
+        let scan_calls = Arc::new(Mutex::new(0u64));
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            scan_result: ai_stats_adapters::AdapterScan::default(),
+            probe_result: Some(verified_state),
+            scan_calls: Some(scan_calls.clone()),
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
+    }
+
+    #[test]
+    fn scan_closes_verified_assignment_when_auto_source_loses_auth() {
+        let store = Store::in_memory().expect("store");
+        let mut source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-unassign-on-missing-auth"),
+            LocationOrigin::Configured,
+        );
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("started_at");
+        let verified_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 14, 56)
+            .single()
+            .expect("verified_at");
+        let verified_state = VerifiedSourceState {
+            provider_user_id: Some("acct-verified".to_string()),
+            email: Some("verified@example.com".to_string()),
+            account_label: None,
+            plan_name: Some("Plus".to_string()),
+            authenticated_at: Some(started_at),
+            verified_at: Some(verified_at),
+            subscription: None,
+        };
+        source.verified_state_hash =
+            verified_source_state_hash(Some(&verified_state)).expect("verified state hash");
+        store.upsert_source(&source).expect("source");
+
+        let account = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: verified_state.provider_user_id.as_deref(),
+                email: verified_state.email.as_deref(),
+                label: None,
+                plan_name: verified_state.plan_name.clone(),
+                identity_source: Some(IdentitySource::LocalAuth),
+                verified_at: verified_state.verified_at,
+            },
+        )
+        .expect("account");
+        store
+            .upsert_source_account_assignment(&SourceAccountAssignment {
+                schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                assignment_id: source_account_assignment_id(
+                    &source.source_id,
+                    &account.provider_account_id,
+                    started_at,
+                ),
+                source_id: source.source_id.clone(),
+                provider: source.provider.clone(),
+                provider_account_id: account.provider_account_id.clone(),
+                started_at,
+                ended_at: None,
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(verified_at),
+                created_at: started_at,
+                updated_at: started_at,
+            })
+            .expect("assignment");
+
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            scan_result: ai_stats_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].ended_at.is_some());
+        let stored_source = store
+            .source(&source.source_id)
+            .expect("source row")
+            .expect("stored source");
+        assert_eq!(stored_source.verified_state_hash, None);
+    }
+
+    #[test]
+    fn scan_closes_legacy_verified_assignment_without_state_hash_when_auth_is_missing() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-legacy-unassign-on-missing-auth"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("started_at");
+        let verified_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 14, 56)
+            .single()
+            .expect("verified_at");
+        let account = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: Some("acct-legacy-verified"),
+                email: Some("legacy-verified@example.com"),
+                label: None,
+                plan_name: Some("Plus".to_string()),
+                identity_source: Some(IdentitySource::LocalAuth),
+                verified_at: Some(verified_at),
+            },
+        )
+        .expect("account");
+        store
+            .upsert_source_account_assignment(&SourceAccountAssignment {
+                schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                assignment_id: source_account_assignment_id(
+                    &source.source_id,
+                    &account.provider_account_id,
+                    started_at,
+                ),
+                source_id: source.source_id.clone(),
+                provider: source.provider.clone(),
+                provider_account_id: account.provider_account_id.clone(),
+                started_at,
+                ended_at: None,
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(verified_at),
+                created_at: started_at,
+                updated_at: started_at,
+            })
+            .expect("assignment");
+
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            scan_result: ai_stats_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].ended_at.is_some());
+    }
+
+    #[test]
+    fn manual_only_source_ignores_verified_state_mutations() {
+        let store = Store::in_memory().expect("store");
+        let mut source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-manual-only"),
+            LocationOrigin::Configured,
+        );
+        source.verification_mode = SourceVerificationMode::ManualOnly;
+        store.upsert_source(&source).expect("source");
+
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("started_at");
+        let verified_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 14, 56)
+            .single()
+            .expect("verified_at");
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            scan_result: ai_stats_adapters::AdapterScan::default(),
+            probe_result: Some(VerifiedSourceState {
+                provider_user_id: Some("acct-manual-only".to_string()),
+                email: Some("manual-only@example.com".to_string()),
+                account_label: None,
+                plan_name: Some("Plus".to_string()),
+                authenticated_at: Some(started_at),
+                verified_at: Some(verified_at),
+                subscription: Some(VerifiedSubscriptionState {
+                    plan_name: "Plus".to_string(),
+                    price: 20.0,
+                    currency: "USD".to_string(),
+                    billing_period: BillingPeriod::Monthly,
+                    paid_at: Some(started_at),
+                    started_at,
+                    ended_at: None,
+                    current_period_ends_at: None,
+                    status: SubscriptionStatus::Active,
+                    verified_at: Some(verified_at),
+                }),
+            }),
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        assert!(store.list_accounts().expect("accounts").is_empty());
+        assert!(store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments")
+            .is_empty());
+        assert!(store
+            .list_subscriptions()
+            .expect("subscriptions")
+            .is_empty());
+    }
+
+    #[test]
+    fn disabled_source_mode_closes_verified_linkages() {
+        let store = Store::in_memory().expect("store");
+        let mut source_location = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-disable-verification"),
+            LocationOrigin::Configured,
+        );
+        source_location.verified_state_hash = Some("verified-state".to_string());
+        store.upsert_source(&source_location).expect("source");
+        let started_at = Utc::now() - Duration::days(1);
+        let account = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: Some("acct-disable"),
+                email: Some("disable@example.com"),
+                label: None,
+                plan_name: Some("Plus".to_string()),
+                identity_source: Some(IdentitySource::LocalAuth),
+                verified_at: Some(started_at),
+            },
+        )
+        .expect("account");
+        store
+            .upsert_source_account_assignment(&SourceAccountAssignment {
+                schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                assignment_id: source_account_assignment_id(
+                    &source_location.source_id,
+                    &account.provider_account_id,
+                    started_at,
+                ),
+                source_id: source_location.source_id.clone(),
+                provider: "codex".to_string(),
+                provider_account_id: account.provider_account_id.clone(),
+                started_at,
+                ended_at: None,
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(started_at),
+                created_at: started_at,
+                updated_at: started_at,
+            })
+            .expect("assignment");
+        store
+            .upsert_subscription(&Subscription {
+                schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+                subscription_id: subscription_id(
+                    "codex",
+                    &account.provider_account_id,
+                    "Plus",
+                    started_at,
+                ),
+                provider: "codex".to_string(),
+                provider_account_id: account.provider_account_id.clone(),
+                plan_name: "Plus".to_string(),
+                price: 20.0,
+                currency: "USD".to_string(),
+                billing_period: BillingPeriod::Monthly,
+                paid_at: Some(started_at),
+                renewal_day: None,
+                started_at,
+                ended_at: None,
+                current_period_ends_at: None,
+                status: SubscriptionStatus::Active,
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(started_at),
+                notes: None,
+            })
+            .expect("subscription");
+
+        source(
+            SourceCommand {
+                command: SourceSubcommand::Mode {
+                    source_id: Some(source_location.source_id.0.clone()),
+                    path: None,
+                    mode: "disabled".to_string(),
+                },
+            },
+            &store,
+        )
+        .expect("disable mode");
+
+        let source = store
+            .source(&source_location.source_id)
+            .expect("source lookup")
+            .expect("source exists");
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        let subscriptions = store.list_subscriptions().expect("subscriptions");
+
+        assert_eq!(source.verification_mode, SourceVerificationMode::Disabled);
+        assert_eq!(source.verified_state_hash, None);
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].ended_at.is_some());
+        assert_eq!(subscriptions.len(), 1);
+        assert!(subscriptions[0].ended_at.is_some());
+    }
+
+    #[test]
+    fn apply_verified_source_state_does_not_override_conflicting_manual_connection() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-manual-wins"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("started_at");
+        let manual = connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("manual@example.com"),
+                label: Some("manual".to_string()),
+                started_at,
+                ended_at: None,
+            },
+        )
+        .expect("manual connection");
+
+        apply_verified_source_state(
+            &store,
+            &source,
+            Some(&VerifiedSourceState {
+                provider_user_id: Some("chatgpt-account-999".to_string()),
+                email: Some("verified@example.com".to_string()),
+                account_label: None,
+                plan_name: Some("Plus".to_string()),
+                authenticated_at: Some(started_at),
+                verified_at: Some(started_at),
+                subscription: Some(VerifiedSubscriptionState {
+                    plan_name: "Plus".to_string(),
+                    price: 20.0,
+                    currency: "USD".to_string(),
+                    billing_period: BillingPeriod::Monthly,
+                    paid_at: Some(started_at),
+                    started_at,
+                    ended_at: None,
+                    current_period_ends_at: None,
+                    status: SubscriptionStatus::Active,
+                    verified_at: Some(started_at),
+                }),
+            }),
+        )
+        .expect("apply verified state");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0].provider_account_id,
+            manual.provider_account_id
+        );
+        assert_eq!(assignments[0].record_source, IdentitySource::UserConfigured);
+    }
+
+    #[test]
+    fn subscription_change_closes_existing_period() {
+        let store = Store::in_memory().expect("store");
+
+        subscription(
+            SubscriptionCommand {
+                command: SubscriptionSubcommand::Add {
+                    provider: "codex".to_string(),
+                    provider_account_id: None,
+                    provider_user_id: None,
+                    email: Some("personal@example.com".to_string()),
+                    label: None,
+                    plan: "Plus".to_string(),
+                    price: 20.0,
+                    currency: "USD".to_string(),
+                    paid_at: Some("2026-05-01".to_string()),
+                    started_at: "2026-05-01".to_string(),
+                    ended_at: None,
+                },
+            },
+            &store,
+        )
+        .expect("subscription add");
+
+        subscription(
+            SubscriptionCommand {
+                command: SubscriptionSubcommand::Change {
+                    provider: "codex".to_string(),
+                    provider_account_id: None,
+                    provider_user_id: None,
+                    email: Some("personal@example.com".to_string()),
+                    label: None,
+                    plan: "Pro".to_string(),
+                    price: 200.0,
+                    currency: "USD".to_string(),
+                    paid_at: Some("2026-06-01".to_string()),
+                    started_at: "2026-06-01".to_string(),
+                },
+            },
+            &store,
+        )
+        .expect("subscription change");
+
+        let subscriptions = store.list_subscriptions().expect("subscriptions");
+        assert_eq!(subscriptions.len(), 2);
+        assert!(subscriptions
+            .iter()
+            .any(|subscription| subscription.plan_name == "Plus"
+                && subscription.ended_at
+                    == Some(
+                        Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+                            .single()
+                            .expect("end")
+                    )));
+        assert!(
+            subscriptions
+                .iter()
+                .any(|subscription| subscription.plan_name == "Pro"
+                    && subscription.ended_at.is_none())
+        );
+    }
+
+    #[test]
+    fn active_subscription_treats_legacy_verified_cycle_rows_as_current_periods() {
+        let store = Store::in_memory().expect("store");
+        let account_id = provider_account_id("codex", "verified@example.com");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 4, 30, 7, 43, 17)
+            .single()
+            .expect("started_at");
+        let period_end = Utc
+            .with_ymd_and_hms(2026, 5, 30, 7, 43, 17)
+            .single()
+            .expect("period_end");
+        store
+            .upsert_subscription(&Subscription {
+                schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+                subscription_id: subscription_id("codex", &account_id, "Plus", started_at),
+                provider: "codex".to_string(),
+                provider_account_id: account_id.clone(),
+                plan_name: "Plus".to_string(),
+                price: 20.0,
+                currency: "USD".to_string(),
+                billing_period: BillingPeriod::Monthly,
+                paid_at: Some(started_at),
+                renewal_day: Some(30),
+                started_at,
+                ended_at: Some(period_end),
+                current_period_ends_at: Some(period_end),
+                status: SubscriptionStatus::Active,
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(
+                    Utc.with_ymd_and_hms(2026, 5, 3, 10, 54, 50)
+                        .single()
+                        .expect("verified_at"),
+                ),
+                notes: None,
+            })
+            .expect("legacy subscription");
+
+        let active = active_subscription(
+            &store,
+            "codex",
+            &account_id,
+            Some("Plus"),
+            Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+                .single()
+                .expect("lookup"),
+        )
+        .expect("active subscription");
+
+        assert_eq!(active.provider_account_id, account_id);
+        assert_eq!(active.plan_name, "Plus");
     }
 
     #[test]
@@ -3017,7 +6173,6 @@ mod tests {
             "0",
             &home.join(".codex"),
             LocationOrigin::Default,
-            None,
         );
 
         assert!(preview_path_label(&source).starts_with("~/.codex"));
@@ -3066,7 +6221,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-http-rollups"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         store.upsert_source(&source).expect("source");
 
@@ -3108,7 +6262,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-http-first-sync"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         store.upsert_source(&source).expect("source");
 
@@ -3170,6 +6323,14 @@ mod tests {
     }
 
     #[test]
+    fn http_reset_url_points_at_worker_reset_endpoint() {
+        assert_eq!(
+            http_reset_url("https://api.example.com/api/sync/batches").expect("reset"),
+            "https://api.example.com/api/sync/reset"
+        );
+    }
+
+    #[test]
     fn no_cache_scan_reselects_unchanged_files() {
         let store = Store::in_memory().expect("store");
         let source_id = ai_stats_core::SourceId("src-no-cache".to_string());
@@ -3215,7 +6376,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-verify-pending"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         store.upsert_source(&source).expect("source");
 
@@ -3224,39 +6384,55 @@ mod tests {
             provider_account_id: provider_account_id("codex", "personal"),
             provider: "codex".to_string(),
             identity_source: IdentitySource::ManualHint,
+            provider_user_id: None,
             provider_user_id_hash: None,
+            email: None,
             email_hash: None,
             org_id_hash: None,
             account_label: Some("personal".to_string()),
             plan_name: Some("Pro".to_string()),
             confidence: Confidence::High,
-            source_ids: vec![source.source_id.clone()],
+            verified_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
         store.upsert_account(&account).expect("account");
+        let started_at = Utc::now();
 
         let subscription = Subscription {
             schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
-            subscription_id: subscription_id("codex", Some(&account.provider_account_id), "pro"),
+            subscription_id: subscription_id(
+                "codex",
+                &account.provider_account_id,
+                "pro",
+                started_at,
+            ),
             provider: "codex".to_string(),
-            provider_account_id: Some(account.provider_account_id.clone()),
-            source_ids: vec![source.source_id.clone()],
+            provider_account_id: account.provider_account_id.clone(),
             plan_name: "Pro".to_string(),
             price: 20.0,
             currency: "USD".to_string(),
             billing_period: BillingPeriod::Monthly,
             paid_at: None,
             renewal_day: None,
-            started_at: None,
+            started_at,
             ended_at: None,
+            current_period_ends_at: None,
             status: SubscriptionStatus::Active,
+            record_source: IdentitySource::UserConfigured,
+            verified_at: None,
             notes: Some("private note".to_string()),
         };
         store
             .upsert_subscription(&subscription)
             .expect("subscription");
-        let summary = test_summary("codex", &source, Utc::now(), 42);
+        let summary = test_summary(
+            "codex",
+            &source,
+            Utc::now(),
+            42,
+            Some(account.provider_account_id.clone()),
+        );
         store.upsert_summary(&summary).expect("summary");
 
         let target = "https://api.example.com/api/sync/batches".to_string();
@@ -3288,25 +6464,28 @@ mod tests {
         let local = sync_local_verify(&store, "http", &target, None).expect("local verify");
         assert_eq!(local.pending_sources, 0);
         assert_eq!(local.pending_accounts, 0);
+        assert_eq!(local.pending_source_account_assignments, 0);
         assert_eq!(local.pending_subscriptions, 0);
         assert_eq!(local.total_passthrough_summaries, 1);
         assert_eq!(local.pending_passthrough_summaries, 0);
     }
 
     #[test]
-    fn sanitize_account_for_sync_preserves_user_alias() {
+    fn sanitize_account_for_sync_preserves_user_configured_label() {
         let account = ProviderAccount {
             schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
             provider_account_id: provider_account_id("codex", "personal"),
             provider: "codex".to_string(),
             identity_source: IdentitySource::UserConfigured,
+            provider_user_id: None,
             provider_user_id_hash: None,
+            email: None,
             email_hash: None,
             org_id_hash: None,
             account_label: Some("personal".to_string()),
             plan_name: Some("Pro".to_string()),
             confidence: Confidence::Medium,
-            source_ids: Vec::new(),
+            verified_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -3324,7 +6503,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-sync-rollup-stats"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
         let account = provider_account_id("codex", "personal");
         let day1_a = Utc
@@ -3399,6 +6577,312 @@ mod tests {
             .all(|summary| summary.metadata.summary_format == "daily_rollup.v1"));
     }
 
+    #[test]
+    fn merge_provider_accounts_moves_source_records_and_prunes_alias() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "codex-local-jsonl",
+            "0",
+            Path::new("/tmp/.codex-work"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 0)
+            .single()
+            .expect("now");
+        let alias = test_account("codex", Some("work"), None, None, None, now);
+        let canonical = test_account(
+            "codex",
+            None,
+            Some("verified@example.com"),
+            Some("11111111-2222-4333-8444-555555555555"),
+            Some("Plus"),
+            now,
+        );
+        store.upsert_account(&alias).expect("alias account");
+        store.upsert_account(&canonical).expect("canonical account");
+        let assignment = test_assignment(
+            &source,
+            &alias.provider_account_id,
+            now - Duration::days(40),
+            None,
+            now,
+        );
+        store
+            .upsert_source_account_assignment(&assignment)
+            .expect("assignment");
+
+        let mut event = test_event(
+            "codex",
+            &source,
+            now - Duration::days(2),
+            Some(alias.provider_account_id.clone()),
+            TokenParts::total(120),
+        );
+        event.parse_evidence = Some(ai_stats_core::ParseEvidence {
+            event_key_version: "test".to_string(),
+            source_file_path_hash: source.path_hash.clone(),
+            source_line_number: None,
+            source_record_id: Some("event".to_string()),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: IdentitySource::Unknown,
+        });
+        let mut summary = test_summary(
+            "codex",
+            &source,
+            now,
+            300,
+            Some(alias.provider_account_id.clone()),
+        );
+        summary.parse_evidence = Some(ai_stats_core::ParseEvidence {
+            event_key_version: "test".to_string(),
+            source_file_path_hash: source.path_hash.clone(),
+            source_line_number: None,
+            source_record_id: Some("summary".to_string()),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: IdentitySource::Unknown,
+        });
+        store.insert_event(&event).expect("event");
+        store.upsert_summary(&summary).expect("summary");
+
+        let target = "https://api.example.com/api/sync/batches";
+        store
+            .record_sources_synced("http", target, &[sanitize_source_for_sync(source.clone())])
+            .expect("sync source");
+        store
+            .record_accounts_synced(
+                "http",
+                target,
+                &[
+                    sanitize_account_for_sync(alias.clone()),
+                    sanitize_account_for_sync(canonical.clone()),
+                ],
+            )
+            .expect("sync accounts");
+        store
+            .record_source_account_assignments_synced(
+                "http",
+                target,
+                &[sanitize_source_account_assignment_for_sync(
+                    assignment.clone(),
+                )],
+            )
+            .expect("sync assignments");
+        store
+            .record_sync_success("http", target, "batch_1", &[], &[])
+            .expect("sync success");
+
+        let report =
+            merge_provider_accounts(&store, "codex", "work", "verified@example.com", false)
+                .expect("merge");
+
+        assert_eq!(report.moved_source_account_assignments, 1);
+        assert_eq!(report.moved_subscriptions, 0);
+        assert_eq!(report.moved_events, 1);
+        assert_eq!(report.moved_summaries, 1);
+        assert!(report.deleted_source_account);
+        assert!(report.reset_local_sync_tracking);
+        assert_eq!(report.remaining_references.total(), 0);
+
+        let accounts = store.list_accounts().expect("accounts");
+        assert!(!accounts
+            .iter()
+            .any(|account| account.provider_account_id == alias.provider_account_id));
+        assert!(accounts
+            .iter()
+            .any(|account| account.provider_account_id == canonical.provider_account_id));
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0].provider_account_id,
+            canonical.provider_account_id
+        );
+
+        let events = store.events_for_source(&source.source_id).expect("events");
+        assert_eq!(
+            events[0].provider_account_id,
+            Some(canonical.provider_account_id.clone())
+        );
+        let summaries = store
+            .summaries_for_source(&source.source_id)
+            .expect("summaries");
+        assert_eq!(
+            summaries[0].provider_account_id,
+            Some(canonical.provider_account_id.clone())
+        );
+
+        assert!(store.list_sync_states().expect("sync states").is_empty());
+        let sync_accounts: Vec<_> = store
+            .list_accounts()
+            .expect("accounts after merge")
+            .into_iter()
+            .map(sanitize_account_for_sync)
+            .collect();
+        let pending = store
+            .pending_accounts_for_sync("http", target, &sync_accounts)
+            .expect("pending accounts");
+        assert_eq!(pending.len(), sync_accounts.len());
+    }
+
+    #[test]
+    fn merge_provider_accounts_moves_orphan_summary_rows() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "codex-local-jsonl",
+            "0",
+            Path::new("/tmp/.codex-legacy-alias"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 0)
+            .single()
+            .expect("now");
+        let alias = test_account("codex", Some("legacy-alias"), None, None, None, now);
+        let canonical = test_account(
+            "codex",
+            None,
+            Some("canonical@example.com"),
+            Some("stable-provider-id"),
+            Some("Plus"),
+            now,
+        );
+        store.upsert_account(&alias).expect("alias account");
+        store.upsert_account(&canonical).expect("canonical account");
+
+        let mut summary = test_summary(
+            "codex",
+            &source,
+            now - Duration::days(10),
+            512,
+            Some(alias.provider_account_id.clone()),
+        );
+        summary.parse_evidence = Some(ai_stats_core::ParseEvidence {
+            event_key_version: "test".to_string(),
+            source_file_path_hash: source.path_hash.clone(),
+            source_line_number: None,
+            source_record_id: Some("summary".to_string()),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: IdentitySource::Unknown,
+        });
+        store.upsert_summary(&summary).expect("summary");
+
+        let report = merge_provider_accounts(
+            &store,
+            "codex",
+            "legacy-alias",
+            "canonical@example.com",
+            false,
+        )
+        .expect("merge");
+
+        assert_eq!(report.moved_source_account_assignments, 0);
+        assert_eq!(report.moved_subscriptions, 0);
+        assert_eq!(report.moved_events, 0);
+        assert_eq!(report.moved_summaries, 1);
+        assert!(report.deleted_source_account);
+        assert_eq!(report.remaining_references.total(), 0);
+
+        let summaries = store.summaries().expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].provider_account_id,
+            Some(canonical.provider_account_id.clone())
+        );
+        assert_eq!(
+            summaries[0]
+                .parse_evidence
+                .as_ref()
+                .map(|evidence| evidence.account_identity_source.clone()),
+            Some(IdentitySource::UserConfigured)
+        );
+        assert!(store
+            .list_accounts()
+            .expect("accounts")
+            .into_iter()
+            .all(|account| account.provider_account_id != alias.provider_account_id));
+    }
+
+    #[test]
+    fn remove_orphan_provider_account_rejects_referenced_account() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "codex-local-jsonl",
+            "0",
+            Path::new("/tmp/.codex-existing-alias"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 0)
+            .single()
+            .expect("now");
+        let alias = test_account("codex", Some("existing-alias"), None, None, None, now);
+        store.upsert_account(&alias).expect("alias account");
+        let assignment = test_assignment(
+            &source,
+            &alias.provider_account_id,
+            now - Duration::days(1),
+            None,
+            now,
+        );
+        store
+            .upsert_source_account_assignment(&assignment)
+            .expect("assignment");
+
+        let error = remove_orphan_provider_account(&store, "codex", "existing-alias", false)
+            .expect_err("referenced account should fail");
+        assert!(error.to_string().contains("still has references"));
+    }
+
+    #[test]
+    fn remove_orphan_provider_account_deletes_account_and_clears_sync_tracking() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 0)
+            .single()
+            .expect("now");
+        let alias = test_account("codex", Some("orphan-alias"), None, None, None, now);
+        store.upsert_account(&alias).expect("alias account");
+        store
+            .record_accounts_synced(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                &[sanitize_account_for_sync(alias.clone())],
+            )
+            .expect("sync account");
+        store
+            .record_sync_success(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                "batch_1",
+                &[],
+                &[],
+            )
+            .expect("sync success");
+
+        let report =
+            remove_orphan_provider_account(&store, "codex", "orphan-alias", false).expect("remove");
+        assert!(report.deleted);
+        assert!(report.reset_local_sync_tracking);
+        assert!(store.list_sync_states().expect("sync states").is_empty());
+        assert!(store
+            .list_accounts()
+            .expect("accounts")
+            .into_iter()
+            .all(|account| account.provider_account_id != alias.provider_account_id));
+    }
+
     fn test_sync_command(sink: &str) -> SyncCommand {
         SyncCommand {
             sink: sink.to_string(),
@@ -3409,12 +6893,14 @@ mod tests {
             since_last: false,
             status: false,
             verify: false,
+            reset_remote: false,
+            yes: false,
             dry_run: false,
         }
     }
 
     #[test]
-    fn usage_report_filters_period_and_groups_by_source_account_alias() {
+    fn usage_report_filters_period_and_groups_by_canonical_account() {
         let now = Utc
             .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
             .single()
@@ -3425,13 +6911,30 @@ mod tests {
             "0",
             Path::new("/tmp/codex-report"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
+        let account_id = provider_account_id("codex", "personal@example.com");
+        let account = ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id: account_id.clone(),
+            provider: "codex".to_string(),
+            identity_source: IdentitySource::UserConfigured,
+            provider_user_id: None,
+            provider_user_id_hash: None,
+            email: Some("personal@example.com".to_string()),
+            email_hash: None,
+            org_id_hash: None,
+            account_label: Some("personal".to_string()),
+            plan_name: None,
+            confidence: Confidence::High,
+            verified_at: None,
+            created_at: now,
+            updated_at: now,
+        };
         let recent = test_event(
             "codex",
             &source,
             now - Duration::days(1),
-            Some(provider_account_id("codex", "personal")),
+            Some(account_id.clone()),
             TokenParts {
                 input: 70,
                 cached_input: 20,
@@ -3445,7 +6948,7 @@ mod tests {
             "codex",
             &source,
             now - Duration::days(10),
-            Some(provider_account_id("codex", "personal")),
+            Some(account_id),
             TokenParts {
                 input: 120,
                 cached_input: 30,
@@ -3460,6 +6963,7 @@ mod tests {
             &[recent, old],
             &[],
             &[source],
+            &[account],
             &[],
             ReportPeriod::LastDays(7),
             now,
@@ -3488,7 +6992,6 @@ mod tests {
             "0",
             Path::new("/tmp/codex-report-account"),
             LocationOrigin::Configured,
-            None,
         );
         let account_id = provider_account_id("codex", "stable-provider-id");
         let account = ProviderAccount {
@@ -3496,13 +6999,15 @@ mod tests {
             provider_account_id: account_id.clone(),
             provider: "codex".to_string(),
             identity_source: IdentitySource::UserConfigured,
+            provider_user_id: None,
             provider_user_id_hash: None,
+            email: None,
             email_hash: None,
             org_id_hash: None,
             account_label: Some("work".to_string()),
             plan_name: None,
             confidence: Confidence::Medium,
-            source_ids: vec![source.source_id.clone()],
+            verified_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -3519,6 +7024,7 @@ mod tests {
             &[],
             &[source],
             &[account],
+            &[],
             ReportPeriod::AllTime,
             now,
         );
@@ -3540,21 +7046,39 @@ mod tests {
             "0",
             Path::new("/tmp/claude-report-summary"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
+        let account_id = provider_account_id("claude_code", "personal@example.com");
+        let account = ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id: account_id.clone(),
+            provider: "claude_code".to_string(),
+            identity_source: IdentitySource::UserConfigured,
+            provider_user_id: None,
+            provider_user_id_hash: None,
+            email: Some("personal@example.com".to_string()),
+            email_hash: None,
+            org_id_hash: None,
+            account_label: Some("personal".to_string()),
+            plan_name: None,
+            confidence: Confidence::High,
+            verified_at: None,
+            created_at: now,
+            updated_at: now,
+        };
         let event = test_event(
             "claude_code",
             &source,
             now,
-            Some(provider_account_id("claude_code", "personal")),
+            Some(account_id.clone()),
             TokenParts::total(100),
         );
-        let summary = test_summary("claude_code", &source, now, 500);
+        let summary = test_summary("claude_code", &source, now, 500, Some(account_id.clone()));
 
         let report = build_usage_report(
             &[event],
             &[summary],
             std::slice::from_ref(&source),
+            std::slice::from_ref(&account),
             &[],
             ReportPeriod::AllTime,
             now,
@@ -3568,8 +7092,15 @@ mod tests {
 
         let weekly = build_usage_report(
             &[],
-            &[test_summary("claude_code", &source, now, 500)],
+            &[test_summary(
+                "claude_code",
+                &source,
+                now,
+                500,
+                Some(account_id),
+            )],
             std::slice::from_ref(&source),
+            std::slice::from_ref(&account),
             &[],
             ReportPeriod::LastDays(7),
             now,
@@ -3589,11 +7120,12 @@ mod tests {
             "0",
             Path::new("/tmp/claude-report-summary-kinds"),
             LocationOrigin::Configured,
-            Some("personal".to_string()),
         );
-        let mut stats_cache = test_summary("claude_code", &source, now, 500);
+        let account_id = provider_account_id("claude_code", "personal@example.com");
+        let mut stats_cache =
+            test_summary("claude_code", &source, now, 500, Some(account_id.clone()));
         stats_cache.metadata.summary_format = "claude_stats_cache".to_string();
-        let mut external = test_summary("claude_code", &source, now, 300);
+        let mut external = test_summary("claude_code", &source, now, 300, Some(account_id));
         external.summary_id = summary_id("claude_code", &source.source_id, "external");
         external.metadata.summary_format = "external_daily".to_string();
 
@@ -3601,6 +7133,7 @@ mod tests {
             &[],
             &[stats_cache, external],
             std::slice::from_ref(&source),
+            &[],
             &[],
             ReportPeriod::AllTime,
             now,
@@ -3636,6 +7169,67 @@ mod tests {
                 total,
                 cost: None,
             }
+        }
+    }
+
+    fn test_account(
+        provider: &str,
+        label: Option<&str>,
+        email: Option<&str>,
+        provider_user_id: Option<&str>,
+        plan_name: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> ProviderAccount {
+        let provider_account_id =
+            provider_account_id_from_identity(provider, provider_user_id, email)
+                .unwrap_or_else(|| provider_account_id(provider, label.expect("label")));
+        let normalized_email = email.map(normalize_email);
+        ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id,
+            provider: provider.to_string(),
+            identity_source: IdentitySource::UserConfigured,
+            provider_user_id: provider_user_id.map(ToOwned::to_owned),
+            provider_user_id_hash: provider_user_id.map(hash_text),
+            email_hash: normalized_email.as_deref().map(hash_text),
+            email: normalized_email,
+            org_id_hash: None,
+            account_label: label.map(ToOwned::to_owned),
+            plan_name: plan_name.map(ToOwned::to_owned),
+            confidence: if email.is_some() || provider_user_id.is_some() {
+                Confidence::High
+            } else {
+                Confidence::Medium
+            },
+            verified_at: email.map(|_| now),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_assignment(
+        source: &SourceLocation,
+        provider_account_id: &ai_stats_core::ProviderAccountId,
+        started_at: DateTime<Utc>,
+        ended_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> SourceAccountAssignment {
+        SourceAccountAssignment {
+            schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+            assignment_id: source_account_assignment_id(
+                &source.source_id,
+                provider_account_id,
+                started_at,
+            ),
+            source_id: source.source_id.clone(),
+            provider: source.provider.clone(),
+            provider_account_id: provider_account_id.clone(),
+            started_at,
+            ended_at,
+            record_source: IdentitySource::UserConfigured,
+            verified_at: None,
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -3715,6 +7309,7 @@ mod tests {
         source: &SourceLocation,
         now: DateTime<Utc>,
         total: u64,
+        provider_account_id: Option<ai_stats_core::ProviderAccountId>,
     ) -> UsageSummary {
         UsageSummary {
             schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
@@ -3722,10 +7317,7 @@ mod tests {
             device_id: "device".to_string(),
             provider: provider.to_string(),
             source_id: source.source_id.clone(),
-            provider_account_id: source
-                .account_alias
-                .as_deref()
-                .map(|hint| provider_account_id(provider, hint)),
+            provider_account_id,
             source: EventSource {
                 adapter_id: "test".to_string(),
                 adapter_version: "0".to_string(),
