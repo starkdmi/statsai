@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use keyring::{Entry, Error as KeyringError};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,41 @@ use getrandom::getrandom;
 
 const DEFAULT_CLOUDFLARE_API_URL: &str = "http://127.0.0.1:8787";
 const DEFAULT_CLOUDFLARE_WEB_URL: &str = "http://127.0.0.1:3000";
+
+#[cfg_attr(test, allow(dead_code))]
+fn keyring_username_for_token(api_base_url: &str, kind: &str) -> String {
+    let safe = api_base_url.replace([':', '/', '.', ' '], "_");
+    format!("cf-{}-{}", kind, safe)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn refresh_token_entry(api_base_url: &str) -> Result<Entry> {
+    Entry::new(
+        "statsai-cli",
+        &keyring_username_for_token(api_base_url, "refresh"),
+    )
+    .context("failed to open keyring for refresh token")
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn access_token_entry(api_base_url: &str) -> Result<Entry> {
+    Entry::new(
+        "statsai-cli",
+        &keyring_username_for_token(api_base_url, "access"),
+    )
+    .context("failed to open keyring for access token")
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn load_secret_from_keyring(entry: &Entry, label: &str) -> Result<Option<String>> {
+    match entry.get_secret() {
+        Ok(secret) => String::from_utf8(secret)
+            .with_context(|| format!("{label} stored in OS keyring is not valid UTF-8"))
+            .map(Some),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {label} from OS keyring")),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthCredentials {
@@ -113,10 +149,11 @@ pub fn status() -> Result<()> {
 }
 
 pub fn logout() -> Result<()> {
-    if let Some((path, _credentials)) =
+    if let Some((path, credentials)) =
         auth_record_for_backend(&auth_base_dir(), &cloudflare_api_url())?
     {
         std::fs::remove_file(&path)?;
+        delete_tokens_from_keyring(&credentials);
         println!("Successfully logged out.");
     } else {
         println!("Already logged out.");
@@ -272,7 +309,10 @@ fn default_device_name() -> String {
 
 fn load_credentials(path: &Path) -> Result<AuthCredentials> {
     let file = std::fs::File::open(path)?;
-    serde_json::from_reader(file).context("parse stored auth credentials")
+    let mut credentials: AuthCredentials =
+        serde_json::from_reader(file).context("parse stored auth credentials")?;
+    hydrate_credentials_from_keyring(&mut credentials)?;
+    Ok(credentials)
 }
 
 fn auth_record_for_backend(
@@ -296,6 +336,11 @@ fn auth_record_for_backend(
         && credentials_match_backend(&credentials, &api_base_url)
     {
         write_credentials(&path, &credentials)?;
+        // sanitize legacy file so tokens are no longer plaintext on disk
+        let mut sanitized = credentials.clone();
+        sanitized.cloudflare_refresh_token = None;
+        sanitized.cloudflare_access_token = None;
+        let _ = write_credentials(&legacy_path, &sanitized);
         return Ok(Some((path, credentials)));
     }
 
@@ -331,6 +376,7 @@ fn ensure_cloudflare_session(path: &Path, credentials: &AuthCredentials) -> Resu
     }
 
     let _ = std::fs::remove_file(path);
+    delete_tokens_from_keyring(credentials);
     bail!("Stored credentials use a removed auth flow. Please run `statsai auth login` again.")
 }
 
@@ -355,15 +401,99 @@ fn write_credentials(path: &Path, credentials: &AuthCredentials) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    write_tokens_to_keyring(credentials)?;
+    let data_to_write = if cfg!(test) {
+        credentials.clone()
+    } else {
+        let mut redacted = credentials.clone();
+        redacted.cloudflare_refresh_token = None;
+        redacted.cloudflare_access_token = None;
+        redacted
+    };
     let file = std::fs::File::create(path)?;
-    serde_json::to_writer_pretty(file, credentials)?;
+    serde_json::to_writer_pretty(file, &data_to_write)?;
     restrict_file_permissions(path)?;
     Ok(())
 }
 
+fn hydrate_credentials_from_keyring(credentials: &mut AuthCredentials) -> Result<()> {
+    #[cfg(not(test))]
+    {
+        let api_base = credentials
+            .api_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
+        if credentials.cloudflare_refresh_token.is_none() {
+            if let Some(secret) =
+                load_secret_from_keyring(&refresh_token_entry(api_base)?, "refresh token")?
+            {
+                credentials.cloudflare_refresh_token = Some(secret);
+            }
+        }
+        if credentials.cloudflare_access_token.is_none() {
+            if let Some(secret) =
+                load_secret_from_keyring(&access_token_entry(api_base)?, "access token")?
+            {
+                credentials.cloudflare_access_token = Some(secret);
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = credentials;
+    }
+    Ok(())
+}
+
+fn write_tokens_to_keyring(credentials: &AuthCredentials) -> Result<()> {
+    #[cfg(not(test))]
+    {
+        let api_base = credentials
+            .api_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
+        if let Some(token) = &credentials.cloudflare_refresh_token {
+            refresh_token_entry(api_base)?
+                .set_secret(token.as_bytes())
+                .context("store refresh token in OS keyring")?;
+        }
+        if let Some(token) = &credentials.cloudflare_access_token {
+            access_token_entry(api_base)?
+                .set_secret(token.as_bytes())
+                .context("store access token in OS keyring")?;
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = credentials;
+    }
+    Ok(())
+}
+
+fn delete_tokens_from_keyring(credentials: &AuthCredentials) {
+    #[cfg(not(test))]
+    {
+        let api_base = credentials
+            .api_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
+        if let Ok(entry) = refresh_token_entry(api_base) {
+            let _ = entry.delete_credential();
+        }
+        if let Ok(entry) = access_token_entry(api_base) {
+            let _ = entry.delete_credential();
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = credentials;
+    }
+}
+
 fn generate_random_string(len: usize) -> Result<String> {
     let mut buf = vec![0u8; len];
-    getrandom(&mut buf).context("failed to obtain cryptographically secure random bytes for auth state")?;
+    getrandom(&mut buf)
+        .context("failed to obtain cryptographically secure random bytes for auth state")?;
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
     let s = buf
         .iter()
