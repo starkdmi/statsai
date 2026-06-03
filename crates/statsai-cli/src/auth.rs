@@ -156,8 +156,7 @@ struct HeadlessLoginStart {
 pub fn login(no_open: bool, headless: bool, device_name: Option<String>) -> Result<()> {
     let api_base_url = cloudflare_api_url();
     let device_name = requested_device_name(device_name);
-    let remembered_device_id =
-        remembered_auth_device_id(&api_base_url).unwrap_or_else(super::default_device_id);
+    let remembered_device_id = preferred_auth_device_id(&auth_base_dir(), &api_base_url);
     if headless {
         return headless_login(&api_base_url, &remembered_device_id, &device_name);
     }
@@ -595,15 +594,54 @@ where
     Err(anyhow::anyhow!(exhausted_message.to_string()))
 }
 
-fn remembered_auth_device_id(api_base_url: &str) -> Option<String> {
-    let path = auth_device_id_path_for_api_base_url(&auth_base_dir(), api_base_url);
+fn remembered_auth_device_id_from_base(base: &Path, api_base_url: &str) -> Option<String> {
+    let path = auth_device_id_path_for_api_base_url(base, api_base_url);
     let value = std::fs::read_to_string(path).ok()?;
     let value = value.trim();
     (!value.is_empty()).then_some(value.to_string())
 }
 
+fn preferred_auth_device_id(base: &Path, api_base_url: &str) -> String {
+    preferred_auth_device_id_with_fallback(base, api_base_url, super::default_device_id)
+}
+
+fn preferred_auth_device_id_with_fallback<F>(base: &Path, api_base_url: &str, fallback: F) -> String
+where
+    F: FnOnce() -> String,
+{
+    if let Some(device_id) = remembered_auth_device_id_from_base(base, api_base_url) {
+        return device_id;
+    }
+
+    match auth_record_for_backend(base, api_base_url) {
+        Ok(Some((_path, credentials))) => {
+            if let Some(device_id) = credentials
+                .device_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                remember_auth_device_id_in_base(base, api_base_url, device_id);
+                return device_id.to_string();
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!(
+                "Warning: ignoring unreadable stored auth state while choosing a device ID: {error}"
+            );
+        }
+    }
+
+    fallback()
+}
+
 fn remember_auth_device_id(api_base_url: &str, device_id: &str) {
-    let path = auth_device_id_path_for_api_base_url(&auth_base_dir(), api_base_url);
+    remember_auth_device_id_in_base(&auth_base_dir(), api_base_url, device_id);
+}
+
+fn remember_auth_device_id_in_base(base: &Path, api_base_url: &str, device_id: &str) {
+    let path = auth_device_id_path_for_api_base_url(base, api_base_url);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1053,6 +1091,47 @@ mod tests {
         let record =
             auth_record_for_backend(dir.path(), "https://api.example.com").expect("auth record");
         assert!(record.is_none());
+    }
+
+    #[test]
+    fn preferred_auth_device_id_reuses_stored_backend_device_id_when_sidecar_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_base_url = "https://api.example.com";
+        let auth_path = auth_path_for_api_base_url(dir.path(), api_base_url);
+        let credentials = AuthCredentials {
+            backend: Some("cloudflare".to_string()),
+            api_base_url: Some(api_base_url.to_string()),
+            cloudflare_refresh_token: Some("refresh-token".to_string()),
+            cloudflare_refresh_expires_at_secs: 0,
+            cloudflare_access_token: Some("access-token".to_string()),
+            cloudflare_access_expires_at_secs: 123,
+            device_id: Some("device-1".to_string()),
+        };
+        write_credentials(&auth_path, &credentials).expect("write auth credentials");
+
+        let preferred = preferred_auth_device_id(dir.path(), api_base_url);
+
+        assert_eq!(preferred, "device-1");
+        let sidecar = std::fs::read_to_string(auth_device_id_path_for_api_base_url(
+            dir.path(),
+            api_base_url,
+        ))
+        .expect("sidecar device id");
+        assert_eq!(sidecar.trim(), "device-1");
+    }
+
+    #[test]
+    fn preferred_auth_device_id_falls_back_when_auth_record_is_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_base_url = "https://api.example.com";
+        let auth_path = auth_path_for_api_base_url(dir.path(), api_base_url);
+        std::fs::write(&auth_path, "{not-json").expect("write corrupt auth file");
+
+        let preferred = preferred_auth_device_id_with_fallback(dir.path(), api_base_url, || {
+            "fallback-device".to_string()
+        });
+
+        assert_eq!(preferred, "fallback-device");
     }
 
     #[test]
