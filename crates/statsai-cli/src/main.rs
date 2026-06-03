@@ -45,6 +45,9 @@ use std::sync::{Arc, Mutex};
 
 mod auth;
 
+const HTTP_ROLLUP_SUMMARIES_PER_BATCH: usize = 25;
+const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "statsai",
@@ -1857,19 +1860,15 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
             "http" => {
                 let endpoint = http_sync_endpoint(&command)?;
                 let auth_token = resolve_http_auth_token(&command, false)?;
-                let ack = HttpSink::new(&endpoint, auth_token)?.send_with_ack(&batch)?;
-                println!("{}", serde_json::to_string_pretty(&ack)?);
-                if payload_mode == SyncPayloadMode::Rollups {
-                    record_rollup_sync_success(store, &command.sink, &target, &batch)?;
-                } else {
-                    store.record_sync_success(
-                        &command.sink,
-                        &target,
-                        &batch.batch_id,
-                        &batch.events,
-                        &batch.summaries,
-                    )?;
-                }
+                send_http_sync_batch(
+                    store,
+                    &command.sink,
+                    &target,
+                    &endpoint,
+                    auth_token,
+                    &batch,
+                    payload_mode,
+                )?;
                 Ok(())
             }
             other => bail!("unsupported sync sink {other}"),
@@ -2162,6 +2161,146 @@ fn record_rollup_sync_success(
     Ok(())
 }
 
+fn send_http_sync_batch(
+    store: &Store,
+    sink: &str,
+    target: &str,
+    endpoint: &str,
+    auth_token: Option<String>,
+    batch: &SyncBatch,
+    payload_mode: SyncPayloadMode,
+) -> Result<()> {
+    let http_sink = HttpSink::new(endpoint, auth_token)?;
+    let batches = if payload_mode == SyncPayloadMode::Rollups {
+        split_http_rollup_sync_batches(batch)
+    } else {
+        vec![batch.clone()]
+    };
+
+    if batches.len() > 1 {
+        eprintln!(
+            "http rollup mode: split sync into {} batches of at most {} summaries",
+            batches.len(),
+            HTTP_ROLLUP_SUMMARIES_PER_BATCH
+        );
+    }
+
+    for (index, chunk) in batches.iter().enumerate() {
+        if batches.len() > 1 {
+            eprintln!(
+                "http rollup mode: sending batch {}/{} ({})",
+                index + 1,
+                batches.len(),
+                chunk.batch_id
+            );
+        }
+        let ack = http_sink.send_with_ack(chunk)?;
+        println!("{}", serde_json::to_string_pretty(&ack)?);
+    }
+
+    if payload_mode == SyncPayloadMode::Rollups {
+        record_rollup_sync_success(store, sink, target, batch)?;
+    } else {
+        store.record_sync_success(
+            sink,
+            target,
+            &batch.batch_id,
+            &batch.events,
+            &batch.summaries,
+        )?;
+    }
+    Ok(())
+}
+
+fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch> {
+    let metadata_count = batch.sources.len()
+        + batch.accounts.len()
+        + batch.source_account_assignments.len()
+        + batch.subscriptions.len();
+    if batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
+        && metadata_count <= HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH
+    {
+        return vec![batch.clone()];
+    }
+
+    let total_chunks = batch
+        .summaries
+        .len()
+        .div_ceil(HTTP_ROLLUP_SUMMARIES_PER_BATCH);
+    let metadata_chunks = metadata_count.div_ceil(HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH);
+    let mut chunks = Vec::with_capacity(total_chunks + metadata_chunks);
+
+    for (index, records) in batch
+        .sources
+        .chunks(HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH)
+        .enumerate()
+    {
+        let mut chunk = empty_http_rollup_chunk(batch, &format!("sources_{}", index + 1));
+        chunk.sources = records.to_vec();
+        chunks.push(chunk);
+    }
+    for (index, records) in batch
+        .accounts
+        .chunks(HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH)
+        .enumerate()
+    {
+        let mut chunk = empty_http_rollup_chunk(batch, &format!("accounts_{}", index + 1));
+        chunk.accounts = records.to_vec();
+        chunks.push(chunk);
+    }
+    for (index, records) in batch
+        .source_account_assignments
+        .chunks(HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH)
+        .enumerate()
+    {
+        let mut chunk = empty_http_rollup_chunk(batch, &format!("assignments_{}", index + 1));
+        chunk.source_account_assignments = records.to_vec();
+        chunks.push(chunk);
+    }
+    for (index, records) in batch
+        .subscriptions
+        .chunks(HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH)
+        .enumerate()
+    {
+        let mut chunk = empty_http_rollup_chunk(batch, &format!("subscriptions_{}", index + 1));
+        chunk.subscriptions = records.to_vec();
+        chunks.push(chunk);
+    }
+
+    chunks.extend(
+        batch
+            .summaries
+            .chunks(HTTP_ROLLUP_SUMMARIES_PER_BATCH)
+            .enumerate()
+            .map(|(index, summaries)| {
+                let mut chunk = batch.clone();
+                chunk.batch_id =
+                    format!("{}_part_{}_of_{}", batch.batch_id, index + 1, total_chunks);
+                chunk.sources.clear();
+                chunk.accounts.clear();
+                chunk.source_account_assignments.clear();
+                chunk.subscriptions.clear();
+                chunk.events.clear();
+                chunk.summaries = summaries.to_vec();
+                chunk
+            }),
+    );
+
+    chunks
+}
+
+fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
+    let mut chunk = batch.clone();
+    chunk.batch_id = format!("{}_{}", batch.batch_id, suffix);
+    chunk.sources.clear();
+    chunk.accounts.clear();
+    chunk.source_account_assignments.clear();
+    chunk.subscriptions.clear();
+    chunk.events.clear();
+    chunk.summaries.clear();
+    chunk
+}
+
 fn sync_status(store: &Store) -> Result<()> {
     let states = store.list_sync_states()?;
     if states.is_empty() {
@@ -2169,12 +2308,13 @@ fn sync_status(store: &Store) -> Result<()> {
         return Ok(());
     }
     for state in states {
+        let display_batch_id = logical_http_rollup_batch_id(&state.last_batch_id);
         println!(
             "{} target={} last_success={} batch={} event_cursor={} summary_cursor={} failures={}",
             state.sink,
             state.target,
             state.last_success_at.to_rfc3339(),
-            state.last_batch_id,
+            display_batch_id,
             format_cursor(
                 state
                     .last_event_started_at
@@ -2466,8 +2606,38 @@ fn remote_sync_batch_matches_local_state(
     local_state: &statsai_store::SyncState,
 ) -> bool {
     remote_last_sync_batch_id(remote)
-        .map(|batch_id| batch_id == local_state.last_batch_id)
+        .map(|batch_id| {
+            logical_http_rollup_batch_id(batch_id)
+                == logical_http_rollup_batch_id(&local_state.last_batch_id)
+        })
         .unwrap_or(false)
+}
+
+fn logical_http_rollup_batch_id(batch_id: &str) -> String {
+    if let Some(index) = batch_id.rfind("_part_") {
+        let suffix = &batch_id[(index + "_part_".len())..];
+        if let Some((part, total)) = suffix.split_once("_of_") {
+            if part.parse::<usize>().is_ok() && total.parse::<usize>().is_ok() {
+                return batch_id[..index].to_string();
+            }
+        }
+    }
+
+    for marker in [
+        "_sources_",
+        "_accounts_",
+        "_assignments_",
+        "_subscriptions_",
+    ] {
+        if let Some(index) = batch_id.rfind(marker) {
+            let suffix = &batch_id[(index + marker.len())..];
+            if suffix.parse::<usize>().is_ok() {
+                return batch_id[..index].to_string();
+            }
+        }
+    }
+
+    batch_id.to_string()
 }
 
 fn remote_last_sync_batch_id(remote: &Value) -> Option<&str> {
@@ -2544,7 +2714,7 @@ fn push_remote_metadata_gap(
 fn sync_state_report(state: &statsai_store::SyncState) -> SyncStateReport {
     SyncStateReport {
         last_success_at: state.last_success_at.to_rfc3339(),
-        last_batch_id: state.last_batch_id.clone(),
+        last_batch_id: logical_http_rollup_batch_id(&state.last_batch_id),
         event_cursor: format_cursor(
             state
                 .last_event_started_at
@@ -6453,13 +6623,186 @@ mod tests {
     }
 
     #[test]
+    fn http_rollup_sync_splits_large_summary_batches() {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-chunks"),
+            LocationOrigin::Configured,
+        );
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let summaries: Vec<_> = (0..(HTTP_ROLLUP_SUMMARIES_PER_BATCH * 2 + 4))
+            .map(|index| {
+                let mut summary = test_summary(
+                    "codex",
+                    &source,
+                    now + Duration::days(index as i64),
+                    10,
+                    None,
+                );
+                summary.summary_id = statsai_core::SummaryId(format!("summary-{index}"));
+                summary
+            })
+            .collect();
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_large".to_string(),
+            device_id: "device".to_string(),
+            sources: vec![source.clone()],
+            accounts: vec![],
+            source_account_assignments: vec![],
+            subscriptions: vec![],
+            events: vec![],
+            summaries,
+            created_at: now,
+        };
+
+        let chunks = split_http_rollup_sync_batches(&batch);
+
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0].batch_id, "batch_large_sources_1");
+        assert_eq!(chunks[1].batch_id, "batch_large_part_1_of_3");
+        assert_eq!(chunks[2].batch_id, "batch_large_part_2_of_3");
+        assert_eq!(chunks[3].batch_id, "batch_large_part_3_of_3");
+        assert!(chunks[0].summaries.is_empty());
+        assert_eq!(chunks[1].summaries.len(), HTTP_ROLLUP_SUMMARIES_PER_BATCH);
+        assert_eq!(chunks[2].summaries.len(), HTTP_ROLLUP_SUMMARIES_PER_BATCH);
+        assert_eq!(chunks[3].summaries.len(), 4);
+        assert_eq!(chunks[0].sources.len(), 1);
+        assert!(chunks[1].sources.is_empty());
+        assert!(chunks[2].sources.is_empty());
+        assert!(chunks[3].sources.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk.events.is_empty()));
+    }
+
+    #[test]
+    fn http_rollup_sync_splits_metadata_away_from_summaries() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let sources: Vec<_> = (0..17)
+            .map(|index| {
+                SourceLocation::local_adapter(
+                    "codex",
+                    format!("test-{index}"),
+                    "0",
+                    Path::new("/tmp/codex-http-metadata"),
+                    LocationOrigin::Configured,
+                )
+            })
+            .collect();
+        let accounts: Vec<_> = (0..7)
+            .map(|index| {
+                test_account(
+                    "codex",
+                    Some(&format!("account-{index}")),
+                    None,
+                    None,
+                    Some("Pro"),
+                    now,
+                )
+            })
+            .collect();
+        let assignments: Vec<_> = (0..16)
+            .map(|index| {
+                test_assignment(
+                    &sources[index],
+                    &accounts[index % accounts.len()].provider_account_id,
+                    now + Duration::days(index as i64),
+                    None,
+                    now,
+                )
+            })
+            .collect();
+        let subscriptions: Vec<_> = accounts
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(index, account)| Subscription {
+                schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+                subscription_id: subscription_id(
+                    "codex",
+                    &account.provider_account_id,
+                    &format!("pro-{index}"),
+                    now,
+                ),
+                provider: "codex".to_string(),
+                provider_account_id: account.provider_account_id.clone(),
+                plan_name: "Pro".to_string(),
+                price: 2000,
+                currency: "USD".to_string(),
+                billing_period: BillingPeriod::Monthly,
+                paid_at: None,
+                renewal_day: None,
+                started_at: now,
+                ended_at: None,
+                current_period_ends_at: None,
+                status: SubscriptionStatus::Active,
+                record_source: IdentitySource::UserConfigured,
+                verified_at: None,
+                notes: None,
+            })
+            .collect();
+        let summaries: Vec<_> = (0..HTTP_ROLLUP_SUMMARIES_PER_BATCH)
+            .map(|index| {
+                let mut summary = test_summary(
+                    "codex",
+                    &sources[index % sources.len()],
+                    now + Duration::days(index as i64),
+                    10,
+                    Some(accounts[index % accounts.len()].provider_account_id.clone()),
+                );
+                summary.summary_id = statsai_core::SummaryId(format!("summary-{index}"));
+                summary
+            })
+            .collect();
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_metadata".to_string(),
+            device_id: "device".to_string(),
+            sources,
+            accounts,
+            source_account_assignments: assignments,
+            subscriptions,
+            events: vec![],
+            summaries,
+            created_at: now,
+        };
+
+        let chunks = split_http_rollup_sync_batches(&batch);
+
+        assert_eq!(chunks.len(), 5);
+        assert_eq!(chunks[0].batch_id, "batch_metadata_sources_1");
+        assert_eq!(chunks[1].batch_id, "batch_metadata_accounts_1");
+        assert_eq!(chunks[2].batch_id, "batch_metadata_assignments_1");
+        assert_eq!(chunks[3].batch_id, "batch_metadata_subscriptions_1");
+        assert_eq!(chunks[4].batch_id, "batch_metadata_part_1_of_1");
+        assert_eq!(chunks[0].sources.len(), 17);
+        assert_eq!(chunks[1].accounts.len(), 7);
+        assert_eq!(chunks[2].source_account_assignments.len(), 16);
+        assert_eq!(chunks[3].subscriptions.len(), 3);
+        assert_eq!(chunks[4].summaries.len(), HTTP_ROLLUP_SUMMARIES_PER_BATCH);
+        assert!(chunks[..4].iter().all(|chunk| chunk.summaries.is_empty()));
+        assert!(chunks[4].sources.is_empty());
+        assert!(chunks[4].accounts.is_empty());
+        assert!(chunks[4].source_account_assignments.is_empty());
+        assert!(chunks[4].subscriptions.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk.events.is_empty()));
+    }
+
+    #[test]
     fn remote_sync_batch_match_requires_same_last_batch_id() {
         let store = Store::in_memory().expect("store");
         store
             .record_sync_success(
                 "http",
                 "https://api.example.com/api/sync/batches",
-                "batch_1",
+                "batch_1_part_2_of_2",
                 &[],
                 &[],
             )
@@ -6493,6 +6836,24 @@ mod tests {
             }),
             &local_state
         ));
+    }
+
+    #[test]
+    fn logical_http_rollup_batch_id_strips_known_chunk_suffixes() {
+        assert_eq!(
+            logical_http_rollup_batch_id("batch_1_part_11_of_11"),
+            "batch_1"
+        );
+        assert_eq!(logical_http_rollup_batch_id("batch_1_sources_1"), "batch_1");
+        assert_eq!(
+            logical_http_rollup_batch_id("batch_1_subscriptions_2"),
+            "batch_1"
+        );
+        assert_eq!(logical_http_rollup_batch_id("batch_1"), "batch_1");
+        assert_eq!(
+            logical_http_rollup_batch_id("batch_1_part_final"),
+            "batch_1_part_final"
+        );
     }
 
     #[test]
