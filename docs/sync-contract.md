@@ -13,7 +13,7 @@ The CLI produces a sync batch with:
 ```sh
 cargo run -p statsai-cli -- sync --sink stdout
 cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
-cargo run -p statsai-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
+cargo run -p statsai-cli -- sync --sink http --since-last
 cargo run -p statsai-cli -- sync --sink http --verify
 ```
 
@@ -51,9 +51,9 @@ display, but they are no longer the primary account key.
 ## Local HTTP Endpoint
 
 For local end-to-end development, run any compatible HTTP service and point the
-CLI at it. If `STATSAI_API_URL` / `STATSAI_WEB_URL` are unset, the CLI
-defaults to these localhost URLs and keeps that device session separate from
-any future hosted deployment:
+CLI at it. The CLI now defaults to the hosted production URLs, so export the
+localhost pair explicitly when you want a local session that stays separate from
+hosted sync:
 
 ```sh
 export STATSAI_API_URL="http://127.0.0.1:8787"
@@ -138,11 +138,9 @@ auth/session/account tables in the same D1 database. That backend lives
 outside this public CLI repo.
 
 ```sh
-export STATSAI_API_URL="https://api.example.com"
-export STATSAI_WEB_URL="https://app.example.com"
 cargo run -p statsai-cli -- auth login
 cargo run -p statsai-cli -- auth status
-cargo run -p statsai-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
+cargo run -p statsai-cli -- sync --sink http --since-last
 ```
 
 Auth token precedence for sync is:

@@ -45,12 +45,12 @@ cargo run -p statsai-cli -- import summary --path ./reported_usage_summaries.jso
 cargo run -p statsai-cli -- report weekly
 cargo run -p statsai-cli -- report monthly --subscriptions
 cargo run -p statsai-cli -- sync --sink file --output ./statsai-sync-batch.json
+cargo run -p statsai-cli -- sync --sink http --since-last
 cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
 cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
 cargo run -p statsai-cli -- sync --status
 cargo run -p statsai-cli -- auth login
 cargo run -p statsai-cli -- auth status
-cargo run -p statsai-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
 cargo run -p statsai-cli -- sync --sink http --verify
 cargo run -p statsai-cli -- schema sync-batch
 ```
@@ -102,15 +102,14 @@ the collector, local store, sync contract, and device-pairing client behavior.
 
 `auth login` opens the web app configured by `STATSAI_WEB_URL`, asks the
 signed-in user to authorize the local device, and stores a backend-scoped
-device session under `~/.statsai/`. If `STATSAI_API_URL` / `STATSAI_WEB_URL`
-are unset, the CLI defaults to the local dev pair
-`http://127.0.0.1:8787` + `http://127.0.0.1:3000`. When a hosted deployment
-exists, export those vars before running `auth login` so the hosted session is
-kept separate from the local one:
+device session under `~/.statsai/`. The CLI now defaults to the hosted
+production pair `https://api.statsai.dev` + `https://statsai.dev`. Set
+`STATSAI_API_URL` / `STATSAI_WEB_URL` only when you want to target a different
+backend, such as local development or a self-hosted deployment:
 
 ```sh
-export STATSAI_API_URL="https://api.example.com"
-export STATSAI_WEB_URL="https://app.example.com"
+export STATSAI_API_URL="http://127.0.0.1:8787"
+export STATSAI_WEB_URL="http://127.0.0.1:3000"
 cargo run -p statsai-cli -- auth login
 ```
 
@@ -118,7 +117,7 @@ After login:
 
 ```sh
 cargo run -p statsai-cli -- auth status
-cargo run -p statsai-cli -- sync --sink http --endpoint https://api.example.com/api/sync/batches --since-last
+cargo run -p statsai-cli -- sync --sink http --since-last
 ```
 
 HTTP sync automatically uses the stored device access token unless
@@ -143,6 +142,11 @@ cargo run -p statsai-cli -- source remove --source-id src_123 --delete-data
 `source remove` deletes the source configuration. Add `--delete-data` to also
 remove local events, summaries, rollups, and scan-cache entries tied to that
 source from SQLite.
+
+Maintainer notes:
+
+- release/distribution plan: [docs/release-distribution-plan.md](docs/release-distribution-plan.md)
+- auth UX and headless login research: [docs/auth-login-ux-research.md](docs/auth-login-ux-research.md)
 
 ### Local Backend Development
 

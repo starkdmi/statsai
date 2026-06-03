@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use getrandom::getrandom;
 
-const DEFAULT_CLOUDFLARE_API_URL: &str = "http://127.0.0.1:8787";
-const DEFAULT_CLOUDFLARE_WEB_URL: &str = "http://127.0.0.1:3000";
+const DEFAULT_CLOUDFLARE_API_URL: &str = "https://api.statsai.dev";
+const DEFAULT_CLOUDFLARE_WEB_URL: &str = "https://statsai.dev";
 
 #[cfg_attr(test, allow(dead_code))]
 fn keyring_backend_key(api_base_url: &str) -> String {
