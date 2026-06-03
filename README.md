@@ -113,6 +113,19 @@ export STATSAI_WEB_URL="http://127.0.0.1:3000"
 cargo run -p statsai-cli -- auth login
 ```
 
+For terminals where automatic browser launch is undesirable, use
+`auth login --no-open`. This still expects the approving browser to reach the
+CLI's local `127.0.0.1` callback. For SSH sessions and servers where the
+browser is on a different device, use:
+
+```sh
+cargo run -p statsai-cli -- auth login --headless --device-name "Mini server"
+```
+
+The headless flow prints a short user code and approval URL, then polls until
+the browser-side approval mints the same backend-scoped device session used by
+normal login.
+
 After login:
 
 ```sh

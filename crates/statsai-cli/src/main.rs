@@ -102,7 +102,17 @@ struct AuthCommand {
 #[derive(Debug, Subcommand)]
 enum AuthSubcommand {
     #[command(about = "Log in to the hosted sync backend")]
-    Login,
+    Login {
+        #[arg(long, help = "Print the local-browser URL without opening it")]
+        no_open: bool,
+        #[arg(
+            long,
+            help = "Use cross-device login for SSH, servers, and headless shells"
+        )]
+        headless: bool,
+        #[arg(long, help = "Friendly name to show for this device")]
+        device_name: Option<String>,
+    },
     #[command(about = "Check authentication status for the Better Auth device session")]
     Status,
     #[command(about = "Log out and clear stored Better Auth device credentials")]
@@ -541,7 +551,11 @@ fn main() -> Result<()> {
 
 fn auth(command: AuthCommand) -> Result<()> {
     match command.command {
-        AuthSubcommand::Login => auth::login(),
+        AuthSubcommand::Login {
+            no_open,
+            headless,
+            device_name,
+        } => auth::login(no_open, headless, device_name),
         AuthSubcommand::Status => auth::status(),
         AuthSubcommand::Logout => auth::logout(),
     }

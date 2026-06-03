@@ -4,6 +4,8 @@ use keyring::{Entry, Error as KeyringError};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::thread::sleep;
+use std::time::Duration;
 
 use getrandom::getrandom;
 
@@ -124,7 +126,42 @@ fn auth_path_for_api_base_url(base: &Path, api_base_url: &str) -> PathBuf {
     ))
 }
 
-pub fn login() -> Result<()> {
+fn auth_device_id_path_for_api_base_url(base: &Path, api_base_url: &str) -> PathBuf {
+    base.join(format!(
+        "auth-device-{}",
+        sanitize_backend_key(&normalize_base_url(api_base_url))
+    ))
+}
+
+#[derive(Debug)]
+enum DeviceSessionRequestError {
+    InvalidDeviceId,
+    Fatal(anyhow::Error),
+}
+
+type DeviceSessionRequestResult<T> = std::result::Result<T, DeviceSessionRequestError>;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HeadlessLoginStart {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    expires_at: u64,
+    interval: u64,
+}
+
+pub fn login(no_open: bool, headless: bool, device_name: Option<String>) -> Result<()> {
+    let api_base_url = cloudflare_api_url();
+    let device_name = requested_device_name(device_name);
+    let remembered_device_id =
+        remembered_auth_device_id(&api_base_url).unwrap_or_else(super::default_device_id);
+    if headless {
+        return headless_login(&api_base_url, &remembered_device_id, &device_name);
+    }
+
     let server = tiny_http::Server::http("127.0.0.1:0")
         .map_err(|error| anyhow::anyhow!("Failed to bind loopback server: {}", error))?;
     let port = match server.server_addr() {
@@ -133,7 +170,6 @@ pub fn login() -> Result<()> {
     };
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let state = generate_random_string(32)?;
-    let api_base_url = cloudflare_api_url();
     let web_base_url = cloudflare_web_url();
     let auth_url = format!(
         "{}/connect-device?redirect_uri={}&state={}",
@@ -142,17 +178,56 @@ pub fn login() -> Result<()> {
         state
     );
 
-    println!("Opening your browser to connect this device...");
-    println!("If the browser does not open automatically, please open this link:");
+    if no_open {
+        println!("Open this link in your browser to connect this device:");
+    } else {
+        println!("Opening your browser to connect this device...");
+        println!("If the browser does not open automatically, please open this link:");
+    }
     println!("\n{}\n", auth_url);
-    let _ = open::that(&auth_url);
+    if !no_open {
+        let _ = open::that(&auth_url);
+    }
 
     println!(
         "Waiting for device authorization callback on port {}...",
         port
     );
     let code = listen_for_callback(&server, &state)?;
-    let credentials = exchange_cloudflare_device_code(&api_base_url, &code, &state)?;
+    let credentials = with_device_id_retry(
+        &remembered_device_id,
+        "Cloudflare device exchange failed: the backend rejected both the remembered and fresh device identifiers.",
+        |device_id| {
+            exchange_cloudflare_device_code(
+                api_base_url.as_str(),
+                &code,
+                &state,
+                device_id,
+                &device_name,
+            )
+        },
+    )?;
+    save_credentials(credentials)?;
+    Ok(())
+}
+
+fn headless_login(api_base_url: &str, preferred_device_id: &str, device_name: &str) -> Result<()> {
+    let credentials = with_device_id_retry(
+        preferred_device_id,
+        "Cloudflare headless login failed: the backend rejected both the remembered and fresh device identifiers.",
+        |device_id| {
+            let start = start_headless_device_login(api_base_url, device_id, device_name)?;
+            println!("Open this URL on any trusted browser:");
+            println!("\n{}\n", start.verification_uri);
+            println!("Enter code: {}", start.user_code);
+            if let Some(verification_uri_complete) = start.verification_uri_complete.as_deref() {
+                println!("Direct approval link:");
+                println!("\n{}\n", verification_uri_complete);
+            }
+            println!("Waiting for approval...");
+            poll_headless_device_login(api_base_url, &start)
+        },
+    )?;
     save_credentials(credentials)?;
     Ok(())
 }
@@ -259,13 +334,14 @@ pub fn get_or_refresh_token() -> Result<Option<String>> {
     let refresh_expires_at = json["refreshExpiresAt"].as_u64().unwrap_or(0);
 
     credentials.backend = Some("cloudflare".to_string());
-    credentials.api_base_url = Some(api_base_url);
+    credentials.api_base_url = Some(api_base_url.clone());
     credentials.cloudflare_refresh_token = Some(next_refresh_token);
     credentials.cloudflare_refresh_expires_at_secs = refresh_expires_at;
     credentials.cloudflare_access_token = Some(access_token.clone());
     credentials.cloudflare_access_expires_at_secs = access_expires_at;
     if let Some(device_id) = json["deviceId"].as_str() {
         credentials.device_id = Some(device_id.to_string());
+        remember_auth_device_id(&api_base_url, device_id);
     }
     write_credentials(&path, &credentials)?;
     Ok(Some(access_token))
@@ -291,7 +367,9 @@ fn exchange_cloudflare_device_code(
     api_base_url: &str,
     code: &str,
     state: &str,
-) -> Result<AuthCredentials> {
+    device_id: &str,
+    device_name: &str,
+) -> DeviceSessionRequestResult<AuthCredentials> {
     let url = format!(
         "{}/api/devices/exchange",
         api_base_url.trim_end_matches('/')
@@ -299,8 +377,8 @@ fn exchange_cloudflare_device_code(
     let response = ureq::post(&url).send_json(serde_json::json!({
         "code": code,
         "state": state,
-        "deviceId": super::default_device_id(),
-        "deviceName": default_device_name(),
+        "deviceId": device_id,
+        "deviceName": device_name,
         "platform": std::env::consts::OS,
         "collectorVersion": env!("CARGO_PKG_VERSION")
     }));
@@ -308,31 +386,156 @@ fn exchange_cloudflare_device_code(
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
             let body = response.into_string().unwrap_or_default();
-            bail!(
-                "Cloudflare device exchange failed (HTTP {}): {}",
+            return Err(device_session_request_error(
+                "Cloudflare device exchange failed",
                 code,
-                body
-            );
+                body,
+            ));
         }
-        Err(error) => bail!("Cloudflare device exchange failed: {}", error),
+        Err(error) => {
+            return Err(DeviceSessionRequestError::Fatal(anyhow::anyhow!(
+                "Cloudflare device exchange failed: {}",
+                error
+            )));
+        }
     };
-    let json: serde_json::Value = response.into_json()?;
+    parse_device_session_response(
+        api_base_url,
+        response
+            .into_json()
+            .map_err(|error| DeviceSessionRequestError::Fatal(error.into()))?,
+    )
+}
+
+fn start_headless_device_login(
+    api_base_url: &str,
+    device_id: &str,
+    device_name: &str,
+) -> DeviceSessionRequestResult<HeadlessLoginStart> {
+    let url = format!("{}/api/devices/start", api_base_url.trim_end_matches('/'));
+    let response = ureq::post(&url).send_json(serde_json::json!({
+        "deviceId": device_id,
+        "deviceName": device_name,
+        "platform": std::env::consts::OS,
+        "collectorVersion": env!("CARGO_PKG_VERSION")
+    }));
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            return Err(device_session_request_error(
+                "Cloudflare headless login start failed",
+                code,
+                body,
+            ));
+        }
+        Err(error) => {
+            return Err(DeviceSessionRequestError::Fatal(anyhow::anyhow!(
+                "Cloudflare headless login start failed: {}",
+                error
+            )));
+        }
+    };
+    response
+        .into_json()
+        .context("parse headless login start response")
+        .map_err(DeviceSessionRequestError::Fatal)
+}
+
+fn poll_headless_device_login(
+    api_base_url: &str,
+    start: &HeadlessLoginStart,
+) -> DeviceSessionRequestResult<AuthCredentials> {
+    let url = format!("{}/api/devices/poll", api_base_url.trim_end_matches('/'));
+    let mut interval = start.interval.max(1);
+
+    loop {
+        let now = Utc::now().timestamp() as u64;
+        if now >= start.expires_at {
+            return Err(DeviceSessionRequestError::Fatal(anyhow::anyhow!(
+                "Headless login expired before approval. Please run `statsai auth login --headless` again."
+            )));
+        }
+
+        sleep(Duration::from_secs(interval));
+        let response = ureq::post(&url).send_json(serde_json::json!({
+            "deviceCode": start.device_code
+        }));
+        let response = match response {
+            Ok(response) => response,
+            Err(ureq::Error::Status(code, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let error = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|json| json["error"].as_str().map(ToOwned::to_owned))
+                    .unwrap_or_default();
+                match error.as_str() {
+                    "authorization_pending" => continue,
+                    "slow_down" => {
+                        interval = interval.saturating_add(5).max(1);
+                        continue;
+                    }
+                    "expired_token" => {
+                        return Err(DeviceSessionRequestError::Fatal(anyhow::anyhow!(
+                            "Headless login expired. Please run `statsai auth login --headless` again."
+                        )));
+                    }
+                    "access_denied" => {
+                        return Err(DeviceSessionRequestError::Fatal(anyhow::anyhow!(
+                            "Headless login was denied."
+                        )));
+                    }
+                    _ => {
+                        return Err(device_session_request_error(
+                            "Cloudflare headless login polling failed",
+                            code,
+                            body,
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(DeviceSessionRequestError::Fatal(anyhow::anyhow!(
+                    "Cloudflare headless login polling failed: {}",
+                    error
+                )));
+            }
+        };
+        return parse_device_session_response(
+            api_base_url,
+            response
+                .into_json()
+                .map_err(|error| DeviceSessionRequestError::Fatal(error.into()))?,
+        );
+    }
+}
+
+fn parse_device_session_response(
+    api_base_url: &str,
+    json: serde_json::Value,
+) -> DeviceSessionRequestResult<AuthCredentials> {
     let refresh_token = json["refreshToken"]
         .as_str()
-        .context("Missing refreshToken from device exchange")?
+        .context("Missing refreshToken from device login")
+        .map_err(DeviceSessionRequestError::Fatal)?
         .to_string();
     let access_token = json["accessToken"]
         .as_str()
-        .context("Missing accessToken from device exchange")?
+        .context("Missing accessToken from device login")
+        .map_err(DeviceSessionRequestError::Fatal)?
         .to_string();
     let access_expires_at = json["accessExpiresAt"]
         .as_u64()
-        .context("Missing accessExpiresAt from device exchange")?;
+        .context("Missing accessExpiresAt from device login")
+        .map_err(DeviceSessionRequestError::Fatal)?;
     let refresh_expires_at = json["refreshExpiresAt"].as_u64().unwrap_or(0);
     let device_id = json["deviceId"]
         .as_str()
-        .context("Missing deviceId from device exchange")?
+        .context("Missing deviceId from device login")
+        .map_err(DeviceSessionRequestError::Fatal)?
         .to_string();
+
+    remember_auth_device_id(api_base_url, &device_id);
 
     Ok(AuthCredentials {
         backend: Some("cloudflare".to_string()),
@@ -343,6 +546,91 @@ fn exchange_cloudflare_device_code(
         cloudflare_access_expires_at_secs: access_expires_at,
         device_id: Some(device_id),
     })
+}
+
+fn requested_device_name(device_name: Option<String>) -> String {
+    device_name
+        .and_then(|name| {
+            let name = name.trim().to_string();
+            (!name.is_empty()).then_some(name)
+        })
+        .unwrap_or_else(default_device_name)
+}
+
+fn login_device_id_candidates(preferred_device_id: &str) -> Vec<String> {
+    let mut candidates = vec![preferred_device_id.to_string()];
+    let fresh_device_id = super::generate_device_id();
+    if fresh_device_id != preferred_device_id {
+        candidates.push(fresh_device_id);
+    }
+    candidates
+}
+
+fn with_device_id_retry<T, F>(
+    preferred_device_id: &str,
+    exhausted_message: &str,
+    mut action: F,
+) -> Result<T>
+where
+    F: FnMut(&str) -> DeviceSessionRequestResult<T>,
+{
+    for (index, device_id) in login_device_id_candidates(preferred_device_id)
+        .iter()
+        .enumerate()
+    {
+        match action(device_id) {
+            Ok(value) => return Ok(value),
+            Err(DeviceSessionRequestError::InvalidDeviceId) if index == 0 => {
+                eprintln!(
+                    "The previous device identifier is already linked to another account. Restarting login with a fresh device ID..."
+                );
+            }
+            Err(DeviceSessionRequestError::InvalidDeviceId) => {
+                return Err(anyhow::anyhow!(exhausted_message.to_string()));
+            }
+            Err(DeviceSessionRequestError::Fatal(error)) => return Err(error),
+        }
+    }
+
+    Err(anyhow::anyhow!(exhausted_message.to_string()))
+}
+
+fn remembered_auth_device_id(api_base_url: &str) -> Option<String> {
+    let path = auth_device_id_path_for_api_base_url(&auth_base_dir(), api_base_url);
+    let value = std::fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then_some(value.to_string())
+}
+
+fn remember_auth_device_id(api_base_url: &str, device_id: &str) {
+    let path = auth_device_id_path_for_api_base_url(&auth_base_dir(), api_base_url);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, format!("{device_id}\n"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+fn device_session_request_error(
+    context: &str,
+    code: u16,
+    body: String,
+) -> DeviceSessionRequestError {
+    if code == 409 && response_error_code(&body).as_deref() == Some("invalid_device_id") {
+        DeviceSessionRequestError::InvalidDeviceId
+    } else {
+        DeviceSessionRequestError::Fatal(anyhow::anyhow!("{context} (HTTP {code}): {body}"))
+    }
+}
+
+fn response_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| json["error"].as_str().map(str::to_owned))
 }
 
 fn default_device_name() -> String {
@@ -765,5 +1053,36 @@ mod tests {
         let record =
             auth_record_for_backend(dir.path(), "https://api.example.com").expect("auth record");
         assert!(record.is_none());
+    }
+
+    #[test]
+    fn with_device_id_retry_retries_after_invalid_device_id() {
+        let mut seen_device_ids = Vec::new();
+        let result = with_device_id_retry("remembered-device", "retry exhausted", |device_id| {
+            seen_device_ids.push(device_id.to_string());
+            if seen_device_ids.len() == 1 {
+                Err(DeviceSessionRequestError::InvalidDeviceId)
+            } else {
+                Ok("ok")
+            }
+        })
+        .expect("retry succeeds");
+
+        assert_eq!(result, "ok");
+        assert_eq!(seen_device_ids.len(), 2);
+        assert_eq!(seen_device_ids[0], "remembered-device");
+        assert_ne!(seen_device_ids[1], "remembered-device");
+    }
+
+    #[test]
+    fn with_device_id_retry_propagates_fatal_errors() {
+        let error = with_device_id_retry("remembered-device", "retry exhausted", |_device_id| {
+            Err::<(), _>(DeviceSessionRequestError::Fatal(anyhow::anyhow!(
+                "fatal problem"
+            )))
+        })
+        .expect_err("fatal error should propagate");
+
+        assert!(error.to_string().contains("fatal problem"));
     }
 }
