@@ -2091,7 +2091,8 @@ fn build_sync_batch(
         let rollups = if full_rollup_sync {
             store.all_sync_rollup_summaries()?
         } else {
-            store.dirty_sync_rollup_summaries()?
+            let all_rollups = store.all_sync_rollup_summaries()?;
+            store.pending_summaries_for_sync(&command.sink, target, &all_rollups)?
         };
         eprintln!(
             "{label}: prepared {} local daily summaries for {} sync",
@@ -2149,7 +2150,7 @@ fn record_rollup_sync_success(
         &passthrough_summaries,
     )?;
     store.mark_sync_rollups_synced(&rollup_summary_ids)?;
-    store.record_summaries_synced(sink, target, &passthrough_summaries)?;
+    store.record_summaries_synced(sink, target, &batch.summaries)?;
     store.record_sources_synced(sink, target, &batch.sources)?;
     store.record_accounts_synced(sink, target, &batch.accounts)?;
     store.record_source_account_assignments_synced(
@@ -2395,6 +2396,7 @@ fn sync_local_verify(
         .map(sanitize_summary_for_sync)
         .filter(|summary| !is_daily_rollup_summary(summary))
         .collect();
+    let rollup_summaries = store.all_sync_rollup_summaries()?;
 
     Ok(SyncLocalVerify {
         sync_state: local_state.map(sync_state_report),
@@ -2423,7 +2425,10 @@ fn sync_local_verify(
         pending_passthrough_summaries: store
             .pending_summaries_for_sync(sink, target, &passthrough_summaries)?
             .len(),
-        total_rollups: store.sync_rollup_count()? as usize,
+        total_rollups: rollup_summaries.len(),
+        pending_rollups: store
+            .pending_summaries_for_sync(sink, target, &rollup_summaries)?
+            .len(),
         dirty_rollups: store.dirty_sync_rollup_summaries()?.len(),
     })
 }
@@ -2527,6 +2532,7 @@ struct SyncLocalVerify {
     total_passthrough_summaries: usize,
     pending_passthrough_summaries: usize,
     total_rollups: usize,
+    pending_rollups: usize,
     dirty_rollups: usize,
 }
 
@@ -6620,6 +6626,114 @@ mod tests {
         assert!(batch.events.is_empty());
         assert_eq!(batch.summaries.len(), 1);
         assert!(is_daily_rollup_summary(&batch.summaries[0]));
+    }
+
+    #[test]
+    fn http_incremental_rollups_are_tracked_per_target() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollup-targets"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let account_id = provider_account_id("codex", "personal");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("started_at");
+        let first = test_event(
+            "codex",
+            &source,
+            started_at,
+            Some(account_id.clone()),
+            TokenParts {
+                input: 10,
+                output: 5,
+                cached_input: 0,
+                reasoning: 0,
+                total: 15,
+                cost: Some(10),
+            },
+        );
+        store.insert_event(&first).expect("first event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let local_command = SyncCommand {
+            endpoint: Some("http://127.0.0.1:8787/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let local_target = sync_target(&local_command).expect("local target");
+        let (local_batch, local_mode) =
+            build_sync_batch(&local_command, &store, "device", &local_target)
+                .expect("local initial batch");
+        assert_eq!(local_mode, SyncPayloadMode::Rollups);
+        assert_eq!(local_batch.summaries.len(), 1);
+        record_rollup_sync_success(&store, "http", &local_target, &local_batch)
+            .expect("record local sync");
+
+        let local_incremental_command = SyncCommand {
+            endpoint: Some("http://127.0.0.1:8787/api/sync/batches".to_string()),
+            since_last: true,
+            ..test_sync_command("http")
+        };
+        let (local_incremental_batch, _) =
+            build_sync_batch(&local_incremental_command, &store, "device", &local_target)
+                .expect("local incremental batch");
+        assert!(local_incremental_batch.summaries.is_empty());
+
+        let second = test_event(
+            "codex",
+            &source,
+            started_at + Duration::hours(1),
+            Some(account_id),
+            TokenParts {
+                input: 20,
+                output: 5,
+                cached_input: 0,
+                reasoning: 0,
+                total: 25,
+                cost: Some(20),
+            },
+        );
+        store.insert_event(&second).expect("second event");
+        assert_eq!(
+            store
+                .dirty_sync_rollup_summaries()
+                .expect("dirty after second event")
+                .len(),
+            1
+        );
+
+        let remote_command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let remote_target = sync_target(&remote_command).expect("remote target");
+        let (remote_batch, remote_mode) =
+            build_sync_batch(&remote_command, &store, "device", &remote_target)
+                .expect("remote batch");
+        assert_eq!(remote_mode, SyncPayloadMode::Rollups);
+        assert_eq!(remote_batch.summaries.len(), 1);
+        record_rollup_sync_success(&store, "http", &remote_target, &remote_batch)
+            .expect("record remote sync");
+        assert!(store
+            .dirty_sync_rollup_summaries()
+            .expect("dirty after remote sync")
+            .is_empty());
+
+        let (local_catchup_batch, local_catchup_mode) =
+            build_sync_batch(&local_incremental_command, &store, "device", &local_target)
+                .expect("local catchup batch");
+        assert_eq!(local_catchup_mode, SyncPayloadMode::Rollups);
+        assert_eq!(local_catchup_batch.summaries.len(), 1);
+        assert_eq!(
+            local_catchup_batch.summaries[0].usage.total_tokens,
+            Some(40)
+        );
     }
 
     #[test]
