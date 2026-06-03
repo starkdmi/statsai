@@ -666,7 +666,7 @@ fn parse_claude_stats_cache(
             .and_then(Value::as_f64)
             .filter(|cost| *cost > 0.0)
         {
-            cost.provider_reported_usd = Some(provider_cost);
+            cost.provider_reported_usd = Some((provider_cost * 100.0).round() as i64);
             cost.pricing_source = Some("claude_stats_cache:costUSD".to_string());
             cost.confidence = Confidence::Medium;
         }
@@ -1488,8 +1488,8 @@ fn codex_verified_subscription(
 ) -> Option<VerifiedSubscriptionState> {
     let started_at = paid_at?;
     let (plan_name, price) = match plan_type.trim().to_ascii_lowercase().as_str() {
-        "plus" => ("Plus".to_string(), 20.0),
-        "pro" => ("Pro".to_string(), 200.0),
+        "plus" => ("Plus".to_string(), 2000),
+        "pro" => ("Pro".to_string(), 20000),
         _ => return None,
     };
     Some(VerifiedSubscriptionState {
@@ -1719,7 +1719,7 @@ mod tests {
         assert_eq!(scan.summaries[0].usage.cache_read_tokens, Some(282480618));
         assert_eq!(scan.summaries[0].usage.cache_creation_tokens, Some(10));
         assert_eq!(scan.summaries[0].usage.output_tokens, Some(387));
-        assert_eq!(scan.summaries[0].cost.provider_reported_usd, Some(12.5));
+        assert_eq!(scan.summaries[0].cost.provider_reported_usd, Some(1250));
         assert_eq!(scan.summaries[0].metadata.total_sessions, Some(61));
         assert_eq!(scan.summaries[0].metadata.total_messages, Some(15679));
     }
@@ -2193,7 +2193,7 @@ mod tests {
         );
         let subscription = verified.subscription.as_ref().expect("subscription");
         assert_eq!(subscription.plan_name, "Plus");
-        assert_eq!(subscription.price, 20.0);
+        assert_eq!(subscription.price, 2000);
         assert_eq!(
             subscription.started_at.to_rfc3339(),
             "2026-05-29T10:12:43+00:00"
@@ -2266,7 +2266,7 @@ mod tests {
         );
         let subscription = verified.subscription.as_ref().expect("subscription");
         assert_eq!(subscription.plan_name, "Plus");
-        assert_eq!(subscription.price, 20.0);
+        assert_eq!(subscription.price, 2000);
         assert_eq!(
             subscription.started_at.to_rfc3339(),
             "2026-05-29T10:12:43+00:00"

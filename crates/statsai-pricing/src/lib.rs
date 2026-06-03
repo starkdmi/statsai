@@ -118,10 +118,11 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
         + cached as f64 * pricing.cached_input_per_million
         + (output + reasoning) as f64 * pricing.output_per_million)
         / 1_000_000.0;
+    let cost_cents = (cost * 100.0).round() as i64;
 
     CostInfo {
         currency: "USD".to_string(),
-        estimated_api_equivalent_usd: Some(cost),
+        estimated_api_equivalent_usd: Some(cost_cents),
         provider_reported_usd: None,
         pricing_source: Some(format!("{provider}_api_pricing:{model_name}")),
         pricing_version: Some("static:2026-05".to_string()),
@@ -240,8 +241,8 @@ mod tests {
             ..UsageCounts::default()
         };
         let cost = estimate_cost("codex", Some(&model), &usage);
-        // Uncached input = 200K at $1.25/M, cached input = 800K at $0.125/M.
-        assert!((cost.estimated_api_equivalent_usd.unwrap() - 0.35).abs() < 1e-9);
+        // Uncached input = 200K at $1.25/M, cached input = 800K at $0.125/M -> 35 cents.
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(35));
     }
 
     #[test]
@@ -257,6 +258,6 @@ mod tests {
             ..UsageCounts::default()
         };
         let cost = estimate_cost("codex", Some(&model), &usage);
-        assert!((cost.estimated_api_equivalent_usd.unwrap() - 1.5).abs() < 1e-9);
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(150));
     }
 }

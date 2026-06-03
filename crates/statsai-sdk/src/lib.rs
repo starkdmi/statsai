@@ -52,6 +52,12 @@ pub struct ReportedUsageSummaryRecord {
     pub summary: UsageSummary,
 }
 
+fn reported_summary_cost_key(cost: &CostInfo) -> Option<String> {
+    cost.provider_reported_usd
+        .or(cost.estimated_api_equivalent_usd)
+        .map(|cost_cents| format!("{:.4}", cost_cents as f64 / 100.0))
+}
+
 pub fn build_reported_usage_summary(
     input: ReportedUsageSummaryInput,
     device_id: &str,
@@ -118,11 +124,7 @@ pub fn build_reported_usage_summary(
     let cost_key = input
         .cost
         .as_ref()
-        .and_then(|cost| {
-            cost.provider_reported_usd
-                .or(cost.estimated_api_equivalent_usd)
-        })
-        .map(|cost| format!("{cost:.4}"))
+        .and_then(reported_summary_cost_key)
         .unwrap_or_else(|| "unknown_cost".to_string());
     let semantic_key = format!(
         "reported_summary.v1:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
@@ -348,6 +350,20 @@ mod tests {
 
         assert_eq!(first.source.source_id, second.source.source_id);
         assert_eq!(first.summary.summary_id, second.summary.summary_id);
+    }
+
+    #[test]
+    fn reported_summary_cost_key_keeps_legacy_dollar_semantics() {
+        let cost = CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: Some(35),
+            provider_reported_usd: None,
+            pricing_source: Some("manual".to_string()),
+            pricing_version: None,
+            confidence: Confidence::Low,
+        };
+
+        assert_eq!(reported_summary_cost_key(&cost).as_deref(), Some("0.3500"));
     }
 
     #[test]

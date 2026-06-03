@@ -12,13 +12,13 @@ use statsai_adapters::{
     ScanOptions, VerifiedSourceState,
 };
 use statsai_core::{
-    build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir, normalize_email,
-    normalize_provider_user_id, path_hash, periods_overlap, source_account_assignment_id,
-    subscription_id, timestamp_in_period, BillingPeriod, IdentitySource, LocationOrigin,
-    ProviderAccount, ProviderAccountId, ReportPeriod, SourceAccountAssignment,
-    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
-    Subscription, SubscriptionId, SubscriptionStatus, SyncBatch, UsageEvent, UsageReport,
-    UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
+    normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
+    source_account_assignment_id, subscription_id, timestamp_in_period, BillingPeriod,
+    IdentitySource, LocationOrigin, ProviderAccount, ProviderAccountId, ReportPeriod,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
+    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch,
+    UsageEvent, UsageReport, UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -1392,6 +1392,7 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                 .map(parse_date)
                 .transpose()?
                 .or(Some(started_at));
+            let price_cents = (price * 100.0).round() as i64;
             let subscription = Subscription {
                 schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
                 subscription_id: subscription_id(
@@ -1403,7 +1404,7 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                 provider: provider.clone(),
                 provider_account_id: account.provider_account_id.clone(),
                 plan_name: plan,
-                price,
+                price: price_cents,
                 currency,
                 billing_period: BillingPeriod::Monthly,
                 paid_at,
@@ -1417,7 +1418,7 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                 notes: None,
             };
             store.upsert_subscription(&subscription)?;
-            println!("{}", serde_json::to_string_pretty(&subscription)?);
+            print_subscription_json(&subscription)?;
         }
         SubscriptionSubcommand::Change {
             provider,
@@ -1460,6 +1461,7 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                 .map(parse_date)
                 .transpose()?
                 .or(Some(started_at));
+            let price_cents = (price * 100.0).round() as i64;
             let subscription = Subscription {
                 schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
                 subscription_id: subscription_id(
@@ -1471,7 +1473,7 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                 provider: provider.clone(),
                 provider_account_id: account.provider_account_id.clone(),
                 plan_name: plan,
-                price,
+                price: price_cents,
                 currency,
                 billing_period: BillingPeriod::Monthly,
                 paid_at,
@@ -1485,7 +1487,7 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                 notes: None,
             };
             store.upsert_subscription(&subscription)?;
-            println!("{}", serde_json::to_string_pretty(&subscription)?);
+            print_subscription_json(&subscription)?;
         }
         SubscriptionSubcommand::End {
             provider,
@@ -1513,7 +1515,7 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                     .transpose()?
                     .unwrap_or_else(Utc::now),
             )?;
-            println!("{}", serde_json::to_string_pretty(&subscription)?);
+            print_subscription_json(&subscription)?;
         }
         SubscriptionSubcommand::Remove {
             provider,
@@ -2883,7 +2885,7 @@ fn print_subscription_report_table(report: &UsageReport, verbose: bool) {
             }
             println!("  status: {}", subscription_status_label(&row.status));
             if let Some(delta) = row.value_minus_price_usd {
-                println!("  value_minus_price_usd: {:.2}", delta);
+                println!("  value_minus_price_usd: {}", format_cost(Some(delta)));
             }
         }
     }
@@ -2963,7 +2965,8 @@ fn print_report_json(
                 "reasoning": row.usage.reasoning_tokens,
                 "total": row.usage.total_tokens,
             },
-            "estimated_cost_usd": row.usage.estimated_cost_usd,
+            "estimated_cost_usd": usd_amount_json(row.usage.estimated_cost_usd),
+            "estimated_cost_usd_cents": row.usage.estimated_cost_usd,
         });
         if verbose {
             value["sources"] = json!(row.sources.iter().cloned().collect::<Vec<_>>());
@@ -2990,7 +2993,8 @@ fn print_report_json(
             "uncovered_total_tokens": row.usage.total_tokens.saturating_sub(row.direct_event_usage.total_tokens),
             "exact_overlap_summaries": row.exact_overlap_summaries,
             "observed_at": row.observed_at.map(|date| date.to_rfc3339()),
-            "estimated_or_reported_cost_usd": row.usage.estimated_cost_usd,
+            "estimated_or_reported_cost_usd": usd_amount_json(row.usage.estimated_cost_usd),
+            "estimated_or_reported_cost_usd_cents": row.usage.estimated_cost_usd,
         });
         if verbose {
             value["sources"] = json!(row.sources.iter().cloned().collect::<Vec<_>>());
@@ -3005,7 +3009,8 @@ fn print_report_json(
             "provider_account_id": row.provider_account_id.0,
             "account": row.account,
             "plan_name": row.plan_name,
-            "price": row.price,
+            "price": major_unit_amount(row.price),
+            "price_cents": row.price,
             "currency": row.currency,
             "billing_period": format!("{:?}", row.billing_period).to_ascii_lowercase(),
             "started_at": row.started_at.to_rfc3339(),
@@ -3021,8 +3026,10 @@ fn print_report_json(
                 "reasoning": row.usage.reasoning_tokens,
                 "total": row.usage.total_tokens,
             },
-            "estimated_cost_usd": row.usage.estimated_cost_usd,
-            "value_minus_price_usd": row.value_minus_price_usd,
+            "estimated_cost_usd": usd_amount_json(row.usage.estimated_cost_usd),
+            "estimated_cost_usd_cents": row.usage.estimated_cost_usd,
+            "value_minus_price_usd": usd_amount_json(row.value_minus_price_usd),
+            "value_minus_price_usd_cents": row.value_minus_price_usd,
             "value_to_price_ratio": row.value_to_price_ratio,
         })
     });
@@ -3047,7 +3054,8 @@ fn print_report_json(
             "reasoning": report.total_usage.reasoning_tokens,
             "total": report.total_usage.total_tokens,
         },
-        "total_estimated_cost_usd": report.total_usage.estimated_cost_usd,
+        "total_estimated_cost_usd": usd_amount_json(report.total_usage.estimated_cost_usd),
+        "total_estimated_cost_usd_cents": report.total_usage.estimated_cost_usd,
         "known_gross": {
             "description": "direct events plus reported/manual summaries, without overlap deduction",
             "total_tokens": {
@@ -3059,7 +3067,8 @@ fn print_report_json(
                 "reasoning": known_usage.reasoning_tokens,
                 "total": known_usage.total_tokens,
             },
-            "estimated_or_reported_cost_usd": known_usage.estimated_cost_usd,
+            "estimated_or_reported_cost_usd": usd_amount_json(known_usage.estimated_cost_usd),
+            "estimated_or_reported_cost_usd_cents": known_usage.estimated_cost_usd,
         },
         "summary_reports": {
             "included_in_event_totals": false,
@@ -3073,7 +3082,8 @@ fn print_report_json(
                 "reasoning": report.total_summary_usage.reasoning_tokens,
                 "total": report.total_summary_usage.total_tokens,
             },
-            "estimated_or_reported_cost_usd": report.total_summary_usage.estimated_cost_usd,
+            "estimated_or_reported_cost_usd": usd_amount_json(report.total_summary_usage.estimated_cost_usd),
+            "estimated_or_reported_cost_usd_cents": report.total_summary_usage.estimated_cost_usd,
             "uncovered_total_tokens": report.total_summary_usage.total_tokens.saturating_sub(summary_direct_total),
             "rows": summary_rows.collect::<Vec<_>>(),
         },
@@ -4257,17 +4267,44 @@ fn format_u64(value: u64) -> String {
     out.chars().rev().collect()
 }
 
-fn format_cost(cost: Option<f64>) -> String {
-    cost.map(|cost| format!("${cost:.2}"))
-        .unwrap_or_else(|| "unknown".to_string())
+fn major_unit_amount(cents: i64) -> f64 {
+    cents as f64 / 100.0
 }
 
-fn format_subscription_price(price: f64, currency: &str) -> String {
+fn usd_amount_json(cost: Option<i64>) -> Value {
+    cost.map_or(Value::Null, |cents| json!(major_unit_amount(cents)))
+}
+
+fn format_cost(cost: Option<i64>) -> String {
+    cost.map(|cents| {
+        let dollars = major_unit_amount(cents);
+        format!("${dollars:.2}")
+    })
+    .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_subscription_price(price_cents: i64, currency: &str) -> String {
+    let price = major_unit_amount(price_cents);
     if currency.eq_ignore_ascii_case("USD") {
         format!("${price:.2}")
     } else {
         format!("{price:.2} {currency}")
     }
+}
+
+fn subscription_json_value(subscription: &Subscription) -> Value {
+    let mut value = serde_json::to_value(subscription).expect("serialize subscription");
+    value["price_cents"] = json!(subscription.price);
+    value["price"] = json!(major_unit_amount(subscription.price));
+    value
+}
+
+fn print_subscription_json(subscription: &Subscription) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&subscription_json_value(subscription))?
+    );
+    Ok(())
 }
 
 fn format_ratio(value: Option<f64>) -> String {
@@ -4342,7 +4379,7 @@ struct SyncRollupStatsAccumulator {
     reasoning_tokens: u64,
     total_tokens: u64,
     events: u64,
-    estimated_cost_usd: f64,
+    estimated_cost_usd: i64, // cents USD
 }
 
 #[cfg(test)]
@@ -4401,7 +4438,7 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
                 reasoning_tokens: 0,
                 total_tokens: 0,
                 events: 0,
-                estimated_cost_usd: 0.0,
+                estimated_cost_usd: 0,
             });
         entry.input_tokens = entry
             .input_tokens
@@ -4422,7 +4459,7 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
             .total_tokens
             .saturating_add(event.usage.computed_total());
         entry.events = entry.events.saturating_add(1);
-        entry.estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0.0);
+        entry.estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0);
         if event.session.started_at > entry.observed_at {
             entry.observed_at = event.session.started_at;
         }
@@ -5203,7 +5240,7 @@ mod tests {
                 verified_at: Some(verified_at),
                 subscription: Some(VerifiedSubscriptionState {
                     plan_name: "Plus".to_string(),
-                    price: 20.0,
+                    price: 2000,
                     currency: "USD".to_string(),
                     billing_period: BillingPeriod::Monthly,
                     paid_at: Some(started_at),
@@ -5488,7 +5525,7 @@ mod tests {
                     verified_at: Some(verified_at),
                     subscription: Some(VerifiedSubscriptionState {
                         plan_name: "Plus".to_string(),
-                        price: 20.0,
+                        price: 2000,
                         currency: "USD".to_string(),
                         billing_period: BillingPeriod::Monthly,
                         paid_at: Some(started_at),
@@ -5941,7 +5978,7 @@ mod tests {
                 verified_at: Some(verified_at),
                 subscription: Some(VerifiedSubscriptionState {
                     plan_name: "Plus".to_string(),
-                    price: 20.0,
+                    price: 2000,
                     currency: "USD".to_string(),
                     billing_period: BillingPeriod::Monthly,
                     paid_at: Some(started_at),
@@ -6038,7 +6075,7 @@ mod tests {
                 provider: "codex".to_string(),
                 provider_account_id: account.provider_account_id.clone(),
                 plan_name: "Plus".to_string(),
-                price: 20.0,
+                price: 2000,
                 currency: "USD".to_string(),
                 billing_period: BillingPeriod::Monthly,
                 paid_at: Some(started_at),
@@ -6123,7 +6160,7 @@ mod tests {
                 verified_at: Some(started_at),
                 subscription: Some(VerifiedSubscriptionState {
                     plan_name: "Plus".to_string(),
-                    price: 20.0,
+                    price: 2000,
                     currency: "USD".to_string(),
                     billing_period: BillingPeriod::Monthly,
                     paid_at: Some(started_at),
@@ -6229,7 +6266,7 @@ mod tests {
                 provider: "codex".to_string(),
                 provider_account_id: account_id.clone(),
                 plan_name: "Plus".to_string(),
-                price: 20.0,
+                price: 2000,
                 currency: "USD".to_string(),
                 billing_period: BillingPeriod::Monthly,
                 paid_at: Some(started_at),
@@ -6336,7 +6373,7 @@ mod tests {
                 cached_input: 0,
                 reasoning: 0,
                 total: 15,
-                cost: Some(0.10),
+                cost: Some(10),
             },
         );
         store.insert_event(&event).expect("event");
@@ -6377,7 +6414,7 @@ mod tests {
                 cached_input: 0,
                 reasoning: 0,
                 total: 15,
-                cost: Some(0.10),
+                cost: Some(10),
             },
         );
         store.insert_event(&event).expect("event");
@@ -6491,7 +6528,7 @@ mod tests {
                 verified_at: Some(verified_at),
                 subscription: Some(VerifiedSubscriptionState {
                     plan_name: "Plus".to_string(),
-                    price: 20.0,
+                    price: 2000,
                     currency: "USD".to_string(),
                     billing_period: BillingPeriod::Monthly,
                     paid_at: Some(started_at),
@@ -6519,7 +6556,7 @@ mod tests {
                 cached_input: 0,
                 reasoning: 0,
                 total: 15,
-                cost: Some(0.10),
+                cost: Some(10),
             },
         );
         store.insert_event(&event).expect("event");
@@ -6702,7 +6739,7 @@ mod tests {
             provider: "codex".to_string(),
             provider_account_id: account.provider_account_id.clone(),
             plan_name: "Pro".to_string(),
-            price: 20.0,
+            price: 2000,
             currency: "USD".to_string(),
             billing_period: BillingPeriod::Monthly,
             paid_at: None,
@@ -6823,7 +6860,7 @@ mod tests {
                         cached_input: 0,
                         reasoning: 0,
                         total: 15,
-                        cost: Some(0.10),
+                        cost: Some(10),
                     },
                 ),
                 test_event(
@@ -6837,7 +6874,7 @@ mod tests {
                         cached_input: 0,
                         reasoning: 0,
                         total: 30,
-                        cost: Some(0.30),
+                        cost: Some(30),
                     },
                 ),
                 test_event(
@@ -6851,7 +6888,7 @@ mod tests {
                         cached_input: 0,
                         reasoning: 0,
                         total: 10,
-                        cost: Some(0.05),
+                        cost: Some(5),
                     },
                 ),
             ],
@@ -7233,7 +7270,7 @@ mod tests {
                 output: 25,
                 reasoning: 5,
                 total: 100,
-                cost: Some(0.0004),
+                cost: Some(1),
             },
         );
         let old = test_event(
@@ -7247,7 +7284,7 @@ mod tests {
                 output: 50,
                 reasoning: 0,
                 total: 200,
-                cost: Some(0.0008),
+                cost: Some(1),
             },
         );
 
@@ -7267,7 +7304,7 @@ mod tests {
         assert_eq!(report.total_usage.cached_input_tokens, 20);
         assert_eq!(report.total_usage.output_tokens, 25);
         assert_eq!(report.total_usage.reasoning_tokens, 5);
-        assert_eq!(report.total_usage.estimated_cost_usd, Some(0.0004));
+        assert_eq!(report.total_usage.estimated_cost_usd, Some(1));
         assert_eq!(report.rows.len(), 1);
         assert_eq!(report.rows[0].account, "personal");
     }
@@ -7448,7 +7485,7 @@ mod tests {
         output: u64,
         reasoning: u64,
         total: u64,
-        cost: Option<f64>,
+        cost: Option<i64>, // cents
     }
 
     impl TokenParts {
@@ -7658,5 +7695,48 @@ mod tests {
             },
             imported_at: now,
         }
+    }
+
+    #[test]
+    fn usd_amount_json_uses_major_units() {
+        assert_eq!(usd_amount_json(Some(125)), json!(1.25));
+        assert_eq!(usd_amount_json(None), Value::Null);
+    }
+
+    #[test]
+    fn subscription_json_value_preserves_major_unit_price() {
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let subscription = Subscription {
+            schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+            subscription_id: subscription_id(
+                "codex",
+                &provider_account_id("codex", "acct-test"),
+                "Plus",
+                started_at,
+            ),
+            provider: "codex".to_string(),
+            provider_account_id: provider_account_id("codex", "acct-test"),
+            plan_name: "Plus".to_string(),
+            price: 2000,
+            currency: "USD".to_string(),
+            billing_period: BillingPeriod::Monthly,
+            paid_at: Some(started_at),
+            renewal_day: Some(29),
+            started_at,
+            ended_at: None,
+            current_period_ends_at: None,
+            status: SubscriptionStatus::Active,
+            record_source: IdentitySource::UserConfigured,
+            verified_at: None,
+            notes: None,
+        };
+
+        let value = subscription_json_value(&subscription);
+
+        assert_eq!(value["price"], json!(20.0));
+        assert_eq!(value["price_cents"], json!(2000));
     }
 }

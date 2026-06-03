@@ -111,7 +111,7 @@ fn deserialize_subscription_payload(
         provider: compat.provider,
         provider_account_id,
         plan_name: compat.plan_name,
-        price: compat.price,
+        price: (compat.price * 100.0).round() as i64,
         currency: compat.currency,
         billing_period: compat.billing_period,
         paid_at: compat.paid_at,
@@ -1850,7 +1850,7 @@ impl Store {
         let mut total_tokens = 0u64;
         let mut total_events = 0u64;
         let mut sessions = std::collections::BTreeSet::new();
-        let mut estimated_cost = None::<f64>;
+        let mut estimated_cost = None::<i64>; // cents USD
         let mut by_provider: std::collections::BTreeMap<String, serde_json::Value> =
             std::collections::BTreeMap::new();
         let mut by_account: std::collections::BTreeMap<String, serde_json::Value> =
@@ -1868,7 +1868,7 @@ impl Store {
             sessions.insert(event.session.session_id.clone());
 
             if let Some(cost) = event.cost.estimated_api_equivalent_usd {
-                estimated_cost = Some(estimated_cost.unwrap_or(0.0) + cost);
+                estimated_cost = Some(estimated_cost.unwrap_or(0) + cost);
             }
 
             let provider_entry = by_provider
@@ -2755,7 +2755,7 @@ fn merge_verified_subscription(
     verified: &VerifiedSubscriptionState,
 ) -> Subscription {
     let mut merged = existing.clone();
-    if merged.price <= 0.0 {
+    if merged.price <= 0 {
         merged.price = verified.price;
     }
     if merged.currency.trim().is_empty() {
@@ -3088,8 +3088,8 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let mut total_reasoning = 0u64;
     let mut total_tokens = 0u64;
     let mut total_events = 0u64;
-    let mut estimated_cost_usd = 0.0f64;
-    let mut provider_reported_usd = 0.0f64;
+    let mut estimated_cost_usd = 0i64; // cents
+    let mut provider_reported_usd = 0i64; // cents
     let mut has_provider_reported_usd = false;
     let mut observed_at = first.session.started_at;
     let mut model_buckets: BTreeMap<String, (ModelInfo, SyncRollupModelTotals)> = BTreeMap::new();
@@ -3104,7 +3104,7 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         total_reasoning = total_reasoning.saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
         total_tokens = total_tokens.saturating_add(event.usage.computed_total());
         total_events = total_events.saturating_add(1);
-        estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0.0);
+        estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0);
         if let Some(cost) = event.cost.provider_reported_usd {
             provider_reported_usd += cost;
             has_provider_reported_usd = true;
@@ -3142,7 +3142,7 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             .total_tokens
             .saturating_add(event.usage.computed_total());
         entry.1.requests = entry.1.requests.saturating_add(1);
-        entry.1.estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0.0);
+        entry.1.estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0);
         if let Some(cost) = event.cost.provider_reported_usd {
             entry.1.provider_reported_usd += cost;
             entry.1.has_provider_reported_usd = true;
@@ -3246,8 +3246,8 @@ struct SyncRollupModelTotals {
     reasoning_tokens: u64,
     total_tokens: u64,
     requests: u64,
-    estimated_cost_usd: f64,
-    provider_reported_usd: f64,
+    estimated_cost_usd: i64,    // cents
+    provider_reported_usd: i64, // cents
     has_provider_reported_usd: bool,
 }
 
@@ -3538,7 +3538,7 @@ mod tests {
         event.usage.input_tokens = Some(12);
         event.usage.output_tokens = Some(3);
         event.usage.total_tokens = Some(15);
-        event.cost.estimated_api_equivalent_usd = Some(0.001);
+        event.cost.estimated_api_equivalent_usd = Some(1);
 
         assert!(!store.insert_event(&event).expect("refresh duplicate"));
         assert_eq!(store.event_count().expect("count after refresh"), 1);
@@ -3546,7 +3546,7 @@ mod tests {
 
         let events = store.events().expect("events");
         assert_eq!(events[0].usage.input_tokens, Some(12));
-        assert_eq!(events[0].cost.estimated_api_equivalent_usd, Some(0.001));
+        assert_eq!(events[0].cost.estimated_api_equivalent_usd, Some(1));
     }
 
     #[test]
@@ -3883,7 +3883,7 @@ mod tests {
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
         });
-        first.cost.provider_reported_usd = Some(0.11);
+        first.cost.provider_reported_usd = Some(11);
 
         assert!(store.insert_event(&first).expect("insert first"));
         let dirty = store
@@ -3907,7 +3907,7 @@ mod tests {
             Some("gpt-5")
         );
         assert_eq!(dirty[0].models[0].usage.total_tokens, Some(15));
-        assert_eq!(dirty[0].cost.provider_reported_usd, Some(0.11));
+        assert_eq!(dirty[0].cost.provider_reported_usd, Some(11));
 
         store
             .mark_sync_rollups_synced(&[dirty[0].summary_id.clone()])
@@ -3925,7 +3925,7 @@ mod tests {
             normalized_name: Some("gpt-4.1".to_string()),
             provider_model_id: Some("gpt-4.1".to_string()),
         });
-        second.cost.provider_reported_usd = Some(0.22);
+        second.cost.provider_reported_usd = Some(22);
 
         assert!(store.insert_event(&second).expect("insert second"));
         let dirty = store
@@ -3934,7 +3934,7 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].usage.total_tokens, Some(40));
         assert_eq!(dirty[0].usage.requests, Some(2));
-        assert_eq!(dirty[0].cost.provider_reported_usd, Some(0.33));
+        assert_eq!(dirty[0].cost.provider_reported_usd, Some(33));
         assert_eq!(dirty[0].models.len(), 2);
         assert_eq!(dirty[0].models[0].usage.total_tokens, Some(25));
         assert_eq!(dirty[0].models[1].usage.total_tokens, Some(15));

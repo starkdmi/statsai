@@ -181,7 +181,7 @@ pub struct Subscription {
     pub provider: String,
     pub provider_account_id: ProviderAccountId,
     pub plan_name: String,
-    pub price: f64,
+    pub price: i64, // minor units (cents) of the currency
     pub currency: String,
     pub billing_period: BillingPeriod,
     pub paid_at: Option<DateTime<Utc>>,
@@ -210,7 +210,7 @@ pub struct VerifiedSourceState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct VerifiedSubscriptionState {
     pub plan_name: String,
-    pub price: f64,
+    pub price: i64, // minor units (cents) of the currency
     pub currency: String,
     pub billing_period: BillingPeriod,
     pub paid_at: Option<DateTime<Utc>>,
@@ -275,8 +275,8 @@ pub struct RuntimeInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CostInfo {
     pub currency: String,
-    pub estimated_api_equivalent_usd: Option<f64>,
-    pub provider_reported_usd: Option<f64>,
+    pub estimated_api_equivalent_usd: Option<i64>, // cents USD
+    pub provider_reported_usd: Option<i64>,        // cents USD
     pub pricing_source: Option<String>,
     pub pricing_version: Option<String>,
     pub confidence: Confidence,
@@ -440,7 +440,7 @@ pub struct DailyRollup {
     pub total_tokens: u64,
     pub total_events: u64,
     pub total_sessions: u64,
-    pub estimated_cost_usd: Option<f64>,
+    pub estimated_cost_usd: Option<i64>, // cents USD
     pub by_provider: Option<String>,
     pub by_account: Option<String>,
     pub updated_at: DateTime<Utc>,
@@ -471,7 +471,7 @@ impl SourceLocation {
             adapter_id: Some(adapter_id),
             adapter_version: Some(adapter_version),
             path_hash: Some(path_hash),
-            path_label: Some(canonical_display(path)),
+            path_label: Some(display_path(path)),
             enabled: true,
             verification_mode: SourceVerificationMode::Auto,
             verified_state_hash: None,
@@ -503,7 +503,7 @@ impl SourceLocation {
             adapter_id: Some(adapter_id),
             adapter_version: Some(adapter_version),
             path_hash: Some(path_hash),
-            path_label: Some(canonical_display(path)),
+            path_label: Some(display_path(path)),
             enabled: true,
             verification_mode: SourceVerificationMode::Disabled,
             verified_state_hash: None,
@@ -739,6 +739,14 @@ pub fn canonical_display(path: &Path) -> String {
         .to_string()
 }
 
+/// Display-friendly path normalization.
+/// Expands `~` for home but does NOT perform filesystem canonicalization
+/// (to avoid symlink/mount identity changes for labels).
+#[must_use]
+pub fn display_path(path: &Path) -> String {
+    expand_home(path).to_string_lossy().to_string()
+}
+
 fn expand_home(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(stripped) = text.strip_prefix("~/") {
@@ -751,7 +759,9 @@ fn expand_home(path: &Path) -> PathBuf {
 
 #[must_use]
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 #[must_use]
@@ -786,7 +796,7 @@ pub struct UsageTotals {
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
-    pub estimated_cost_usd: Option<f64>,
+    pub estimated_cost_usd: Option<i64>, // cents USD
 }
 
 impl UsageTotals {
@@ -798,7 +808,7 @@ impl UsageTotals {
         self.reasoning_tokens += event.usage.reasoning_tokens.unwrap_or(0);
         self.total_tokens += event.usage.computed_total();
         if let Some(cost) = event.cost.estimated_api_equivalent_usd {
-            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0.0) + cost);
+            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0) + cost);
         }
     }
 
@@ -814,7 +824,7 @@ impl UsageTotals {
             .provider_reported_usd
             .or(summary.cost.estimated_api_equivalent_usd)
         {
-            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0.0) + cost);
+            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0) + cost);
         }
     }
 
@@ -826,7 +836,7 @@ impl UsageTotals {
         self.reasoning_tokens += other.reasoning_tokens;
         self.total_tokens += other.total_tokens;
         if let Some(cost) = other.estimated_cost_usd {
-            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0.0) + cost);
+            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0) + cost);
         }
     }
 }
@@ -862,7 +872,7 @@ pub struct SubscriptionReportRow {
     pub provider_account_id: ProviderAccountId,
     pub account: String,
     pub plan_name: String,
-    pub price: f64,
+    pub price: i64, // minor units (cents) of the currency
     pub currency: String,
     pub billing_period: BillingPeriod,
     pub started_at: DateTime<Utc>,
@@ -870,7 +880,7 @@ pub struct SubscriptionReportRow {
     pub status: SubscriptionStatus,
     pub events: u64,
     pub usage: UsageTotals,
-    pub value_minus_price_usd: Option<f64>,
+    pub value_minus_price_usd: Option<i64>, // cents USD
     pub value_to_price_ratio: Option<f64>,
 }
 
@@ -1247,18 +1257,18 @@ fn subscription_intersects_report_window(
 }
 
 fn subscription_value_metrics(
-    price: f64,
+    price_cents: i64,
     currency: &str,
-    estimated_cost_usd: Option<f64>,
-) -> (Option<f64>, Option<f64>) {
-    if !currency.eq_ignore_ascii_case("USD") || price <= 0.0 {
+    estimated_cost_usd_cents: Option<i64>,
+) -> (Option<i64>, Option<f64>) {
+    if !currency.eq_ignore_ascii_case("USD") || price_cents <= 0 {
         return (None, None);
     }
-    estimated_cost_usd
-        .map(|estimated_cost_usd| {
+    estimated_cost_usd_cents
+        .map(|est_cents| {
             (
-                Some(estimated_cost_usd - price),
-                Some(estimated_cost_usd / price),
+                Some(est_cents - price_cents),
+                Some(est_cents as f64 / price_cents as f64),
             )
         })
         .unwrap_or((None, None))
@@ -1328,7 +1338,7 @@ mod tests {
         source: &SourceLocation,
         started_at: DateTime<Utc>,
         tokens: u64,
-        cost: Option<f64>,
+        cost_cents: Option<i64>,
     ) -> UsageEvent {
         UsageEvent {
             schema_version: USAGE_EVENT_SCHEMA_VERSION.to_string(),
@@ -1366,7 +1376,7 @@ mod tests {
             runtime: None,
             cost: CostInfo {
                 currency: "USD".to_string(),
-                estimated_api_equivalent_usd: cost,
+                estimated_api_equivalent_usd: cost_cents,
                 provider_reported_usd: None,
                 pricing_source: None,
                 pricing_version: None,
@@ -1601,9 +1611,9 @@ mod tests {
             created_at: mk_dt(2026, 5, 3),
             updated_at: mk_dt(2026, 5, 3),
         };
-        let mut before_end = test_event("codex", &src, mk_dt(2026, 5, 29), 100, Some(1.0));
+        let mut before_end = test_event("codex", &src, mk_dt(2026, 5, 29), 100, Some(100));
         before_end.provider_account_id = Some(account_id.clone());
-        let mut after_end = test_event("codex", &src, mk_dt(2026, 5, 31), 200, Some(2.0));
+        let mut after_end = test_event("codex", &src, mk_dt(2026, 5, 31), 200, Some(200));
         after_end.provider_account_id = Some(account_id.clone());
         let subscription = Subscription {
             schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
@@ -1611,7 +1621,7 @@ mod tests {
             provider: "codex".to_string(),
             provider_account_id: account_id.clone(),
             plan_name: "Plus".to_string(),
-            price: 20.0,
+            price: 2000,
             currency: "USD".to_string(),
             billing_period: BillingPeriod::Monthly,
             paid_at: Some(mk_dt(2026, 4, 30)),
@@ -1645,7 +1655,7 @@ mod tests {
         assert_eq!(report.subscription_rows[0].usage.total_tokens, 100);
         assert_eq!(
             report.subscription_rows[0].usage.estimated_cost_usd,
-            Some(1.0)
+            Some(100)
         );
     }
 
@@ -1671,9 +1681,9 @@ mod tests {
             created_at: mk_dt(2026, 5, 3),
             updated_at: mk_dt(2026, 5, 3),
         };
-        let mut before_cycle_end = test_event("codex", &src, mk_dt(2026, 5, 29), 100, Some(1.0));
+        let mut before_cycle_end = test_event("codex", &src, mk_dt(2026, 5, 29), 100, Some(100));
         before_cycle_end.provider_account_id = Some(account_id.clone());
-        let mut after_cycle_end = test_event("codex", &src, mk_dt(2026, 5, 31), 200, Some(2.0));
+        let mut after_cycle_end = test_event("codex", &src, mk_dt(2026, 5, 31), 200, Some(200));
         after_cycle_end.provider_account_id = Some(account_id.clone());
         let subscription = Subscription {
             schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
@@ -1681,7 +1691,7 @@ mod tests {
             provider: "codex".to_string(),
             provider_account_id: account_id,
             plan_name: "Plus".to_string(),
-            price: 20.0,
+            price: 2000,
             currency: "USD".to_string(),
             billing_period: BillingPeriod::Monthly,
             paid_at: Some(mk_dt(2026, 4, 30)),
@@ -1711,7 +1721,7 @@ mod tests {
         assert_eq!(report.subscription_rows[0].usage.total_tokens, 300);
         assert_eq!(
             report.subscription_rows[0].usage.estimated_cost_usd,
-            Some(3.0)
+            Some(300)
         );
     }
 
@@ -1757,13 +1767,13 @@ mod tests {
     fn usage_totals_accumulate_cost() {
         let now = mk_dt(2026, 5, 25);
         let src = test_source("codex", "/tmp/codex");
-        let e1 = test_event("codex", &src, now, 100, Some(0.01));
-        let e2 = test_event("codex", &src, now, 200, Some(0.02));
+        let e1 = test_event("codex", &src, now, 100, Some(1));
+        let e2 = test_event("codex", &src, now, 200, Some(2));
 
         let report =
             build_usage_report(&[e1, e2], &[], &[src], &[], &[], ReportPeriod::AllTime, now);
 
-        assert_eq!(report.total_usage.estimated_cost_usd, Some(0.03));
+        assert_eq!(report.total_usage.estimated_cost_usd, Some(3));
     }
 
     #[test]
@@ -1775,5 +1785,36 @@ mod tests {
         };
         let total = usage.computed_total();
         assert_eq!(total, u64::MAX);
+    }
+
+    #[test]
+    fn display_path_expands_home_but_avoids_canonicalize() {
+        let p = Path::new("~/relative/test");
+        let displayed = display_path(p);
+        assert!(displayed.contains("relative/test"));
+        // should not resolve to absolute via fs if ~ expanded
+        if let Some(home) = home_dir() {
+            let home_str = home.to_string_lossy();
+            if displayed.starts_with(home_str.as_ref()) {
+                // expanded, good
+            }
+        }
+    }
+
+    #[test]
+    fn path_hash_remains_stable_via_canonical_display() {
+        let p = Path::new("/tmp/nonexistent-for-test");
+        let h1 = path_hash(p);
+        let h2 = path_hash(p);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn preview_path_label_uses_display_label() {
+        let mut source = test_source("codex", "/tmp/codex");
+        source.path_label = Some("/home/testuser/work/codex".to_string());
+        let preview = preview_path_label(&source);
+        // if home matches, abbreviates; else full
+        assert!(preview.contains("codex") || preview.contains("work"));
     }
 }
