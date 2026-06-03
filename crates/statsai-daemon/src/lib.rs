@@ -744,7 +744,7 @@ mod watch {
                     verified_at: Some(verified_at),
                     subscription: Some(VerifiedSubscriptionState {
                         plan_name: "Plus".to_string(),
-                        price: 20.0,
+                        price: 2000,
                         currency: "USD".to_string(),
                         billing_period: BillingPeriod::Monthly,
                         paid_at: Some(authenticated_at),
