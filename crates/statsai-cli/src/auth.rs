@@ -11,27 +11,36 @@ const DEFAULT_CLOUDFLARE_API_URL: &str = "http://127.0.0.1:8787";
 const DEFAULT_CLOUDFLARE_WEB_URL: &str = "http://127.0.0.1:3000";
 
 #[cfg_attr(test, allow(dead_code))]
-fn keyring_username_for_token(api_base_url: &str, kind: &str) -> String {
-    let safe = api_base_url.replace([':', '/', '.', ' '], "_");
-    format!("cf-{}-{}", kind, safe)
+fn keyring_backend_key(api_base_url: &str) -> String {
+    api_base_url.replace([':', '/', '.', ' '], "_")
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn refresh_token_entry(api_base_url: &str) -> Result<Entry> {
+fn session_entry(api_base_url: &str) -> Result<Entry> {
     Entry::new(
         "statsai-cli",
-        &keyring_username_for_token(api_base_url, "refresh"),
+        &format!("cf-session-{}", keyring_backend_key(api_base_url)),
     )
-    .context("failed to open keyring for refresh token")
+    .context("failed to open keyring for auth session")
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn legacy_token_entry(api_base_url: &str, kind: &str) -> Result<Entry> {
+    Entry::new(
+        "statsai-cli",
+        &format!("cf-{}-{}", kind, keyring_backend_key(api_base_url)),
+    )
+    .with_context(|| format!("failed to open legacy keyring for {kind} token"))
 }
 
 #[cfg_attr(test, allow(dead_code))]
 fn access_token_entry(api_base_url: &str) -> Result<Entry> {
-    Entry::new(
-        "statsai-cli",
-        &keyring_username_for_token(api_base_url, "access"),
-    )
-    .context("failed to open keyring for access token")
+    legacy_token_entry(api_base_url, "access").context("failed to open keyring for access token")
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn refresh_token_entry(api_base_url: &str) -> Result<Entry> {
+    legacy_token_entry(api_base_url, "refresh").context("failed to open keyring for refresh token")
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -43,6 +52,41 @@ fn load_secret_from_keyring(entry: &Entry, label: &str) -> Result<Option<String>
         Err(KeyringError::NoEntry) => Ok(None),
         Err(error) => Err(error).with_context(|| format!("read {label} from OS keyring")),
     }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct KeyringSession {
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn load_session_from_keyring(api_base_url: &str) -> Result<Option<KeyringSession>> {
+    let Some(secret) = load_secret_from_keyring(&session_entry(api_base_url)?, "auth session")?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_str::<KeyringSession>(&secret)
+        .context("parse auth session stored in OS keyring")
+        .map(Some)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn load_legacy_session_from_keyring(api_base_url: &str) -> Result<Option<KeyringSession>> {
+    let refresh_token =
+        load_secret_from_keyring(&refresh_token_entry(api_base_url)?, "refresh token")?;
+    let access_token =
+        load_secret_from_keyring(&access_token_entry(api_base_url)?, "access token")?;
+    if refresh_token.is_none() && access_token.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(KeyringSession {
+        refresh_token,
+        access_token,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +237,7 @@ pub fn get_or_refresh_token() -> Result<Option<String>> {
             let body = response.into_string().unwrap_or_default();
             if code == 400 || code == 401 {
                 let _ = std::fs::remove_file(&path);
+                delete_tokens_from_keyring(&credentials);
                 bail!("Cloudflare device session expired. Please run 'statsai auth login' again.");
             }
             bail!("Cloudflare token refresh failed (HTTP {}): {}", code, body);
@@ -423,19 +468,22 @@ fn hydrate_credentials_from_keyring(credentials: &mut AuthCredentials) -> Result
             .api_base_url
             .as_deref()
             .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
-        if credentials.cloudflare_refresh_token.is_none() {
-            if let Some(secret) =
-                load_secret_from_keyring(&refresh_token_entry(api_base)?, "refresh token")?
-            {
-                credentials.cloudflare_refresh_token = Some(secret);
+        if let Some(session) = load_session_from_keyring(api_base)? {
+            if credentials.cloudflare_refresh_token.is_none() {
+                credentials.cloudflare_refresh_token = session.refresh_token;
             }
-        }
-        if credentials.cloudflare_access_token.is_none() {
-            if let Some(secret) =
-                load_secret_from_keyring(&access_token_entry(api_base)?, "access token")?
-            {
-                credentials.cloudflare_access_token = Some(secret);
+            if credentials.cloudflare_access_token.is_none() {
+                credentials.cloudflare_access_token = session.access_token;
             }
+        } else if let Some(session) = load_legacy_session_from_keyring(api_base)? {
+            if credentials.cloudflare_refresh_token.is_none() {
+                credentials.cloudflare_refresh_token = session.refresh_token.clone();
+            }
+            if credentials.cloudflare_access_token.is_none() {
+                credentials.cloudflare_access_token = session.access_token.clone();
+            }
+            let _ = store_session_in_keyring(api_base, &session);
+            delete_legacy_tokens_from_keyring(api_base);
         }
     }
     #[cfg(test)]
@@ -452,15 +500,19 @@ fn write_tokens_to_keyring(credentials: &AuthCredentials) -> Result<()> {
             .api_base_url
             .as_deref()
             .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
-        if let Some(token) = &credentials.cloudflare_refresh_token {
-            refresh_token_entry(api_base)?
-                .set_secret(token.as_bytes())
-                .context("store refresh token in OS keyring")?;
-        }
-        if let Some(token) = &credentials.cloudflare_access_token {
-            access_token_entry(api_base)?
-                .set_secret(token.as_bytes())
-                .context("store access token in OS keyring")?;
+        let session = KeyringSession {
+            refresh_token: credentials
+                .cloudflare_refresh_token
+                .clone()
+                .filter(|token| !token.trim().is_empty()),
+            access_token: credentials
+                .cloudflare_access_token
+                .clone()
+                .filter(|token| !token.trim().is_empty()),
+        };
+        if session.refresh_token.is_some() || session.access_token.is_some() {
+            store_session_in_keyring(api_base, &session)?;
+            delete_legacy_tokens_from_keyring(api_base);
         }
     }
     #[cfg(test)]
@@ -477,17 +529,35 @@ fn delete_tokens_from_keyring(credentials: &AuthCredentials) {
             .api_base_url
             .as_deref()
             .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
-        if let Ok(entry) = refresh_token_entry(api_base) {
+        if let Ok(entry) = session_entry(api_base) {
             let _ = entry.delete_credential();
         }
-        if let Ok(entry) = access_token_entry(api_base) {
-            let _ = entry.delete_credential();
-        }
+        delete_legacy_tokens_from_keyring(api_base);
     }
     #[cfg(test)]
     {
         let _ = credentials;
     }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn delete_legacy_tokens_from_keyring(api_base_url: &str) {
+    if let Ok(entry) = refresh_token_entry(api_base_url) {
+        let _ = entry.delete_credential();
+    }
+    if let Ok(entry) = access_token_entry(api_base_url) {
+        let _ = entry.delete_credential();
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn store_session_in_keyring(api_base_url: &str, session: &KeyringSession) -> Result<()> {
+    let payload =
+        serde_json::to_string(session).context("serialize auth session for OS keyring")?;
+    session_entry(api_base_url)?
+        .set_secret(payload.as_bytes())
+        .context("store auth session in OS keyring")?;
+    Ok(())
 }
 
 fn generate_random_string(len: usize) -> Result<String> {
