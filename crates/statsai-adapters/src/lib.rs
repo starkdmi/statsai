@@ -426,7 +426,9 @@ fn claude_session_index_dependency(root: &Path, path: &Path) -> Option<String> {
         .skip(1)
         .find_map(|ancestor| {
             let session_index = ancestor.join("sessions-index.json");
-            session_index.is_file().then(|| file_metadata_signature(&session_index))
+            session_index
+                .is_file()
+                .then(|| file_metadata_signature(&session_index))
         })
 }
 
@@ -1810,7 +1812,8 @@ fn load_claude_session_projects(
                 .and_then(Value::as_str)
                 .map(expand_home_path)
                 .or_else(|| {
-                    value.get("entries")
+                    value
+                        .get("entries")
                         .and_then(Value::as_array)
                         .and_then(|entries| entries.first())
                         .and_then(|item| item.get("projectPath"))
