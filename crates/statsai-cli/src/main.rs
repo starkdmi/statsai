@@ -2165,6 +2165,7 @@ fn build_sync_batch(
     ))
 }
 
+#[cfg(test)]
 fn record_rollup_sync_success(
     store: &Store,
     sink: &str,
