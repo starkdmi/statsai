@@ -267,9 +267,61 @@ pub struct UsageCounts {
 pub struct RuntimeInfo {
     pub runtime_name: Option<String>,
     pub host_id: Option<String>,
+    /// End-to-end request or turn duration, not time to first token.
     pub latency_ms: Option<u64>,
+    /// Provenance of latency_ms when the adapter can distinguish it.
+    pub latency_source: Option<LatencySource>,
+    /// Time from request start until the first visible token arrives.
+    pub time_to_first_token_ms: Option<u64>,
     pub prompt_eval_duration_ms: Option<u64>,
     pub eval_duration_ms: Option<u64>,
+    pub total_messages: Option<u64>,
+    pub user_messages: Option<u64>,
+    pub assistant_messages: Option<u64>,
+    pub developer_messages: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LatencySource {
+    Explicit,
+    Inferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MetricStats {
+    pub samples: u64,
+    pub avg: Option<f64>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub p50: Option<f64>,
+    pub p95: Option<f64>,
+    pub sum: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SummaryMetrics {
+    pub active_seconds: Option<f64>,
+    pub tracked_requests: Option<u64>,
+    pub tracked_output_tokens: Option<u64>,
+    pub tracked_reasoning_tokens: Option<u64>,
+    /// Aggregated end-to-end request or turn duration, not TTFT.
+    pub latency_ms: Option<MetricStats>,
+    pub time_to_first_token_ms: Option<MetricStats>,
+    /// Per-turn generated throughput distribution across tracked turns.
+    pub generated_tps: Option<MetricStats>,
+    /// Per-turn visible throughput distribution across tracked turns.
+    pub visible_tps: Option<MetricStats>,
+    /// Overall generated throughput across tracked active time.
+    pub overall_generated_tps: Option<f64>,
+    /// Overall visible throughput across tracked active time.
+    pub overall_visible_tps: Option<f64>,
+    pub cache_hit_ratio: Option<MetricStats>,
+    pub reasoning_share: Option<MetricStats>,
+    pub total_messages: Option<u64>,
+    pub user_messages: Option<u64>,
+    pub assistant_messages: Option<u64>,
+    pub developer_messages: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -308,6 +360,42 @@ pub struct ProjectInfo {
     pub repo_label: Option<String>,
     pub branch_hash: Option<String>,
     pub branch_label: Option<String>,
+    pub path_hash: Option<String>,
+    pub path_label: Option<String>,
+}
+
+#[must_use]
+pub fn project_has_stable_identity(project: &ProjectInfo) -> bool {
+    project
+        .repo_remote_hash
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || project
+            .path_hash
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+#[must_use]
+pub fn project_bucket_key(project: Option<&ProjectInfo>) -> String {
+    let Some(project) = project else {
+        return "none".to_string();
+    };
+    if !project_has_stable_identity(project) {
+        return "none".to_string();
+    }
+    if project.path_hash.is_some()
+        || project.repo_remote_hash.is_some()
+        || project.branch_hash.is_some()
+    {
+        return format!(
+            "repo:{}|path:{}|branch:{}",
+            project.repo_remote_hash.as_deref().unwrap_or("none"),
+            project.path_hash.as_deref().unwrap_or("none"),
+            project.branch_hash.as_deref().unwrap_or("none")
+        );
+    }
+    project.project_id.clone()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -372,7 +460,9 @@ pub struct UsageSummary {
     pub usage: UsageCounts,
     pub cost: CostInfo,
     pub parse_evidence: Option<ParseEvidence>,
+    pub project: Option<ProjectInfo>,
     pub privacy: PrivacyInfo,
+    pub metrics: Option<SummaryMetrics>,
     pub period_start: Option<DateTime<Utc>>,
     pub period_end: Option<DateTime<Utc>>,
     pub observed_at: DateTime<Utc>,
@@ -702,11 +792,12 @@ pub fn summary_id(provider: &str, source_id: &SourceId, semantic_key: &str) -> S
 #[must_use]
 pub fn semantic_event_fingerprint(input: &SemanticFingerprintInput<'_>) -> String {
     hash_text(&format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         input.provider,
         input.source_id.0,
         input.started_at.to_rfc3339(),
         input.session_hash.unwrap_or(""),
+        input.project_key.unwrap_or(""),
         input.model_name.unwrap_or("unknown"),
         input.input_tokens.unwrap_or(0),
         input.cache_read_tokens.unwrap_or(0),
@@ -722,6 +813,7 @@ pub struct SemanticFingerprintInput<'a> {
     pub source_id: &'a SourceId,
     pub started_at: DateTime<Utc>,
     pub session_hash: Option<&'a str>,
+    pub project_key: Option<&'a str>,
     pub model_name: Option<&'a str>,
     pub input_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
@@ -1437,12 +1529,14 @@ mod tests {
                 confidence: Confidence::Low,
             },
             parse_evidence: None,
+            project: None,
             privacy: PrivacyInfo {
                 mode: PrivacyMode::MetadataOnly,
                 contains_prompt_text: false,
                 contains_response_text: false,
                 contains_file_paths: false,
             },
+            metrics: None,
             period_start: Some(period_start),
             period_end: Some(period_end),
             observed_at,
@@ -1807,6 +1901,23 @@ mod tests {
         let h1 = path_hash(p);
         let h2 = path_hash(p);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn bare_project_id_is_not_a_stable_project_identity() {
+        let project = ProjectInfo {
+            project_id: "project_bare".to_string(),
+            project_label: Some("Bare".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: None,
+            path_label: None,
+        };
+
+        assert!(!project_has_stable_identity(&project));
+        assert_eq!(project_bucket_key(Some(&project)), "none");
     }
 
     #[test]

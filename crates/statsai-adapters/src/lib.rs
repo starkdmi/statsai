@@ -4,14 +4,15 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde_json::Value;
 use statsai_core::{
-    canonical_display, expand_home_path, hash_text, home_dir, semantic_event_id, summary_id,
-    BillingPeriod, Confidence, EventSource, IdentitySource, LocationOrigin, ModelInfo,
-    ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, SessionInfo, SourceKind, SourceLocation,
+    canonical_display, display_path, expand_home_path, hash_text, home_dir, path_hash,
+    project_bucket_key, semantic_event_id, summary_id, BillingPeriod, Confidence, EventSource,
+    IdentitySource, LatencySource, LocationOrigin, ModelInfo, ParseEvidence, PrivacyInfo,
+    PrivacyMode, ProjectInfo, RuntimeInfo, SessionInfo, SourceKind, SourceLocation,
     SubscriptionStatus, SummaryMetadata, UsageCounts, UsageEvent, UsageSummary,
     USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{estimate_cost, normalize_model_name};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -21,8 +22,12 @@ use walkdir::WalkDir;
 pub const CLAUDE_CODE_PROVIDER: &str = "claude_code";
 pub const CODEX_PROVIDER: &str = "codex";
 const SESSION_SCOPED_EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
-const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v2";
+const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v4";
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
+// Invalidate unchanged-file scan cache entries whenever Codex parsing semantics change,
+// so historical sessions get rescanned for both runtime and project context.
+const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "turn-runtime-project-context.v8";
+const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "project-context.v1";
 
 pub use statsai_core::{VerifiedSourceState, VerifiedSubscriptionState};
 
@@ -284,6 +289,7 @@ fn scan_claude_source(
     }
 
     let projects = root.join("projects");
+    let session_projects = load_claude_session_projects(&projects);
     let cache_namespace = scan_cache_namespace(source, adapter.version());
     let event_files = claude_jsonl_candidates(&projects, &cache_namespace)?;
     let mut seen = HashSet::new();
@@ -301,7 +307,7 @@ fn scan_claude_source(
                 continue;
             }
             ctx.scan.diagnostics.files_scanned += 1;
-            parse_claude_file(&mut ctx, &projects, &candidate.path)?;
+            parse_claude_file(&mut ctx, &projects, &session_projects, &candidate.path)?;
         }
     }
 
@@ -484,10 +490,19 @@ fn scan_candidate(
 fn scan_cache_namespace(source: &SourceLocation, adapter_version: &str) -> String {
     let adapter_id = source.adapter_id.as_deref().unwrap_or("");
     let path_hash = source.path_hash.as_deref().unwrap_or("");
+    let parser_revision = scan_cache_parser_revision(source);
     hash_text(&format!(
-        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{adapter_version}:{path_hash}",
+        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{adapter_version}:{path_hash}:{parser_revision}",
         source.provider, source.source_kind
     ))
+}
+
+fn scan_cache_parser_revision(source: &SourceLocation) -> &'static str {
+    match source.provider.as_str() {
+        CODEX_PROVIDER => CODEX_SCAN_CACHE_PARSER_REVISION,
+        CLAUDE_CODE_PROVIDER => CLAUDE_SCAN_CACHE_PARSER_REVISION,
+        _ => "default",
+    }
 }
 
 fn file_metadata_signature(path: &Path) -> String {
@@ -526,14 +541,69 @@ struct FileParseContext<'a, A: ProviderAdapter + ?Sized> {
     seen: &'a mut HashSet<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ClaudeSessionProjectMetadata {
+    project_path: Option<PathBuf>,
+    git_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectContext {
+    project_label: Option<String>,
+    repo_remote_hash: Option<String>,
+    repo_label: Option<String>,
+    branch_hash: Option<String>,
+    branch_label: Option<String>,
+    path_hash: Option<String>,
+    path_label: Option<String>,
+}
+
+impl ProjectContext {
+    fn into_project_info(self) -> Option<ProjectInfo> {
+        let identity_key = if let Some(path_hash) = self.path_hash.as_deref() {
+            format!(
+                "path:{path_hash}:repo:{}",
+                self.repo_remote_hash.as_deref().unwrap_or("none")
+            )
+        } else if let Some(repo_remote_hash) = self.repo_remote_hash.as_deref() {
+            format!("repo:{repo_remote_hash}")
+        } else {
+            return None;
+        };
+
+        Some(ProjectInfo {
+            project_id: format!("project_{}", &hash_text(&identity_key)[..24]),
+            project_label: self.project_label,
+            repo_remote_hash: self.repo_remote_hash,
+            repo_label: self.repo_label,
+            branch_hash: self.branch_hash,
+            branch_label: self.branch_label,
+            path_hash: self.path_hash,
+            path_label: self.path_label,
+        })
+    }
+}
+
 fn parse_claude_file(
     ctx: &mut FileParseContext<'_, ClaudeCodeAdapter>,
     projects: &Path,
+    session_projects: &HashMap<String, ClaudeSessionProjectMetadata>,
     path: &Path,
 ) -> Result<()> {
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
+    let canonical_path = canonical_display(path);
+    let project = session_projects
+        .get(&canonical_path)
+        .and_then(|metadata| {
+            resolve_project_context(
+                metadata.project_path.clone(),
+                None,
+                metadata.git_branch.clone(),
+            )
+        })
+        .or_else(|| project_context_from_path_fallback(projects, path));
 
     for (index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -574,18 +644,20 @@ fn parse_claude_file(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| fallback_session_id(path));
-        let project_key = project_key_from_path(projects, path);
         let event = usage_event(
             ctx.adapter,
             ctx.source,
             ctx.options,
             ProviderEventParts {
                 timestamp,
+                session_started_at: None,
+                session_ended_at: None,
+                duration_seconds: None,
                 model,
                 usage,
+                runtime: None,
                 session_raw,
-                project_key,
-                project_label: None,
+                project: project.clone(),
                 event_kind: "claude_message_usage",
                 source_file: path,
                 line_number: index + 1,
@@ -700,7 +772,9 @@ fn parse_claude_stats_cache(
                 timestamp_inferred: period_start.is_none() || period_end.is_none(),
                 account_identity_source: IdentitySource::Unresolved,
             }),
+            project: None,
             privacy: metadata_only_privacy(),
+            metrics: None,
             period_start,
             period_end,
             observed_at,
@@ -724,7 +798,9 @@ fn parse_codex_file(
     let mut previous_totals: Option<UsageCounts> = None;
     let mut current_model: Option<String> = None;
     let mut current_model_is_fallback = false;
+    let mut current_project: Option<ProjectInfo> = None;
     let session_raw = codex_session_id(usage_root, path);
+    let mut records = Vec::new();
 
     for (index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -740,17 +816,30 @@ fn parse_codex_file(
             continue;
         };
 
+        if is_codex_session_meta(&value) {
+            current_project = codex_project_context_from_value(&value);
+            continue;
+        }
+
         if is_codex_turn_context(&value) {
-            if let Some(model) = codex_model_from_value(&value, current_model.as_deref())
+            if let Some(model_name) = codex_model_from_value(&value, current_model.as_deref())
                 .and_then(|model| model.normalized_name)
             {
-                current_model = Some(model);
+                current_model = Some(model_name);
                 current_model_is_fallback = false;
+            }
+            if let Some(project) = codex_project_context_from_value(&value) {
+                current_project = Some(project);
             }
             continue;
         }
 
         let is_token_count_event = is_codex_token_count(&value);
+        let is_task_started = is_codex_task_started(&value);
+        let is_task_complete = is_codex_task_complete(&value);
+        let message_role = codex_visible_message_role(&value).map(ToOwned::to_owned);
+        let event_session_raw =
+            session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
         let usage = if is_token_count_event {
             let info = value.pointer("/payload/info");
             let total_usage = info
@@ -772,15 +861,6 @@ fn parse_codex_file(
             codex_headless_usage_value(&value).map(codex_usage_counts_from_value)
         };
 
-        let Some(usage) = usage else {
-            continue;
-        };
-        ctx.scan.diagnostics.candidate_usage_rows += 1;
-        if usage.computed_total() == 0 {
-            ctx.scan.diagnostics.skipped_zero_events += 1;
-            continue;
-        }
-
         let (timestamp, timestamp_inferred) = timestamp_from_nested_value(&value)
             .map(|timestamp| (timestamp, false))
             .unwrap_or((fallback_timestamp, true));
@@ -788,22 +868,30 @@ fn parse_codex_file(
             ctx.scan.diagnostics.timestamp_fallbacks += 1;
         }
 
-        let parsed_model = codex_model_from_value(&value, current_model.as_deref());
-        let mut model_inferred = false;
-        let model = parsed_model.or_else(|| {
-            model_inferred = true;
-            current_model_is_fallback = true;
-            Some(model_info("gpt-5"))
-        });
-        if let Some(model) = model
+        let explicit_model = codex_model_from_value(&value, None);
+        if let Some(model_name) = explicit_model
             .as_ref()
-            .and_then(|model| model.normalized_name.clone())
+            .and_then(|model| {
+                model
+                    .provider_model_id
+                    .as_ref()
+                    .or(model.name.as_ref())
+                    .or(model.normalized_name.as_ref())
+            })
+            .cloned()
         {
-            if !model_inferred {
-                current_model = Some(model);
-                current_model_is_fallback = false;
-            }
+            current_model = Some(model_name);
+            current_model_is_fallback = false;
         }
+        let model_explicit = explicit_model.is_some();
+        let mut model_inferred = false;
+        let model = explicit_model.or_else(|| {
+            current_model.as_deref().map(model_info).or_else(|| {
+                model_inferred = true;
+                current_model_is_fallback = true;
+                Some(model_info("gpt-5"))
+            })
+        });
         if current_model_is_fallback && !model_inferred {
             model_inferred = true;
         }
@@ -811,30 +899,221 @@ fn parse_codex_file(
             ctx.scan.diagnostics.model_fallbacks += 1;
         }
 
-        let project_key = project_key_from_path(root, path);
-        let event_session_raw =
-            session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
+        let usage = usage.and_then(|usage| {
+            ctx.scan.diagnostics.candidate_usage_rows += 1;
+            if usage.computed_total() == 0 {
+                ctx.scan.diagnostics.skipped_zero_events += 1;
+                None
+            } else {
+                Some(usage)
+            }
+        });
+
+        records.push(CodexLineRecord {
+            line_number: index + 1,
+            value,
+            timestamp,
+            timestamp_inferred,
+            session_raw: event_session_raw,
+            model,
+            model_inferred,
+            model_explicit,
+            usage,
+            is_token_count_event,
+            is_task_started,
+            is_task_complete,
+            message_role,
+            project: current_project
+                .clone()
+                .or_else(|| project_context_from_path_fallback(root, path)),
+        });
+    }
+
+    let mut active_turns: Vec<ActiveCodexTurn> = Vec::new();
+    let mut consumed_usage_lines = HashSet::new();
+
+    for record in &records {
+        if record.is_task_started {
+            let started_at = codex_task_timestamp(&record.value, &["/payload/started_at"])
+                .unwrap_or(record.timestamp);
+            active_turns.push(ActiveCodexTurn {
+                started_at,
+                session_raw: record.session_raw.clone(),
+                model: record.model.clone(),
+                model_inferred: record.model_inferred,
+                timestamp_inferred: record.timestamp_inferred,
+                message_counts: CodexMessageCounts::default(),
+                last_usage: record.usage.clone(),
+                accumulated_usage: record.usage.clone(),
+                usage_lines: record
+                    .usage
+                    .as_ref()
+                    .map(|_| vec![record.line_number])
+                    .unwrap_or_default(),
+                project: record.project.clone(),
+            });
+            if record.usage.is_some() {
+                consumed_usage_lines.insert(record.line_number);
+            }
+            continue;
+        }
+
+        if let Some(turn) = active_turns
+            .iter_mut()
+            .rfind(|turn| turn.session_raw == record.session_raw)
+        {
+            if record.model_explicit {
+                turn.model = record.model.clone();
+                turn.model_inferred = record.model_inferred;
+            }
+            turn.timestamp_inferred |= record.timestamp_inferred;
+            if record.project.is_some() {
+                turn.project = record.project.clone();
+            }
+            if let Some(role) = record.message_role.as_deref() {
+                turn.message_counts.total = turn.message_counts.total.saturating_add(1);
+                match role {
+                    "user" => turn.message_counts.user = turn.message_counts.user.saturating_add(1),
+                    "assistant" => {
+                        turn.message_counts.assistant =
+                            turn.message_counts.assistant.saturating_add(1)
+                    }
+                    "developer" => {
+                        turn.message_counts.developer =
+                            turn.message_counts.developer.saturating_add(1)
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(usage) = record.usage.clone() {
+                if !record.is_task_complete {
+                    turn.accumulated_usage = Some(
+                        turn.accumulated_usage
+                            .as_ref()
+                            .map(|accumulated| sum_usage_counts(accumulated, &usage))
+                            .unwrap_or_else(|| usage.clone()),
+                    );
+                    turn.last_usage = Some(usage);
+                    turn.usage_lines.push(record.line_number);
+                }
+            }
+        }
+
+        if record.is_task_complete {
+            let Some(turn_index) = active_turns
+                .iter()
+                .rposition(|turn| turn.session_raw == record.session_raw)
+            else {
+                continue;
+            };
+            let turn = active_turns.remove(turn_index);
+            let completed_at = codex_task_timestamp(&record.value, &["/payload/completed_at"])
+                .unwrap_or(record.timestamp);
+            let usage = record
+                .usage
+                .clone()
+                .or(turn.accumulated_usage.clone())
+                .or(turn.last_usage.clone());
+            let Some(usage) = usage else {
+                continue;
+            };
+            for line_number in turn.usage_lines {
+                consumed_usage_lines.insert(line_number);
+            }
+            if record.usage.is_some() {
+                consumed_usage_lines.insert(record.line_number);
+            }
+            let explicit_duration_ms = codex_task_u64(
+                &record.value,
+                &["/payload/duration_ms", "/payload/durationMs"],
+            );
+            let duration_ms = explicit_duration_ms
+                .or_else(|| codex_duration_from_turn_timestamps(turn.started_at, completed_at));
+            let latency_source = explicit_duration_ms
+                .map(|_| LatencySource::Explicit)
+                .or_else(|| duration_ms.map(|_| LatencySource::Inferred));
+            let time_to_first_token_ms = codex_task_u64(
+                &record.value,
+                &[
+                    "/payload/time_to_first_token_ms",
+                    "/payload/timeToFirstTokenMs",
+                ],
+            );
+            let event = usage_event(
+                ctx.adapter,
+                ctx.source,
+                ctx.options,
+                ProviderEventParts {
+                    timestamp: completed_at,
+                    session_started_at: Some(turn.started_at),
+                    session_ended_at: Some(completed_at),
+                    duration_seconds: duration_ms.map(|value| value / 1000),
+                    model: record.model.clone().or(turn.model.clone()),
+                    usage,
+                    runtime: Some(RuntimeInfo {
+                        runtime_name: None,
+                        host_id: None,
+                        latency_ms: duration_ms,
+                        latency_source,
+                        time_to_first_token_ms,
+                        prompt_eval_duration_ms: None,
+                        eval_duration_ms: None,
+                        total_messages: Some(turn.message_counts.total),
+                        user_messages: Some(turn.message_counts.user),
+                        assistant_messages: Some(turn.message_counts.assistant),
+                        developer_messages: Some(turn.message_counts.developer),
+                    }),
+                    session_raw: turn.session_raw,
+                    project: record
+                        .project
+                        .clone()
+                        .or(turn.project.clone())
+                        .or_else(|| project_context_from_path_fallback(root, path)),
+                    event_kind: "codex_turn_usage",
+                    source_file: path,
+                    line_number: record.line_number,
+                    model_inferred: record.model_inferred || turn.model_inferred,
+                    timestamp_inferred: record.timestamp_inferred || turn.timestamp_inferred,
+                    deduplication: EventDeduplication::PathIndependent,
+                },
+            );
+            push_deduped(ctx.scan, ctx.seen, event);
+        }
+    }
+
+    for record in records {
+        let Some(usage) = record.usage else {
+            continue;
+        };
+        if consumed_usage_lines.contains(&record.line_number) {
+            continue;
+        }
         let event = usage_event(
             ctx.adapter,
             ctx.source,
             ctx.options,
             ProviderEventParts {
-                timestamp,
-                model,
+                timestamp: record.timestamp,
+                session_started_at: None,
+                session_ended_at: None,
+                duration_seconds: None,
+                model: record.model,
                 usage,
-                session_raw: event_session_raw,
-                project_key,
-                project_label: None,
-                event_kind: if is_token_count_event {
+                runtime: None,
+                session_raw: record.session_raw,
+                project: record
+                    .project
+                    .or_else(|| project_context_from_path_fallback(root, path)),
+                event_kind: if record.is_token_count_event {
                     "codex_token_count"
                 } else {
                     "codex_headless_usage"
                 },
                 source_file: path,
-                line_number: index + 1,
-                model_inferred,
-                timestamp_inferred,
-                deduplication: if is_token_count_event {
+                line_number: record.line_number,
+                model_inferred: record.model_inferred,
+                timestamp_inferred: record.timestamp_inferred,
+                deduplication: if record.is_token_count_event {
                     EventDeduplication::PathIndependent
                 } else {
                     EventDeduplication::SessionScoped
@@ -845,6 +1124,46 @@ fn parse_codex_file(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct CodexLineRecord {
+    line_number: usize,
+    value: Value,
+    timestamp: DateTime<Utc>,
+    timestamp_inferred: bool,
+    session_raw: String,
+    model: Option<ModelInfo>,
+    model_inferred: bool,
+    model_explicit: bool,
+    usage: Option<UsageCounts>,
+    is_token_count_event: bool,
+    is_task_started: bool,
+    is_task_complete: bool,
+    message_role: Option<String>,
+    project: Option<ProjectInfo>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexMessageCounts {
+    total: u64,
+    user: u64,
+    assistant: u64,
+    developer: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveCodexTurn {
+    started_at: DateTime<Utc>,
+    session_raw: String,
+    model: Option<ModelInfo>,
+    model_inferred: bool,
+    timestamp_inferred: bool,
+    message_counts: CodexMessageCounts,
+    last_usage: Option<UsageCounts>,
+    accumulated_usage: Option<UsageCounts>,
+    usage_lines: Vec<usize>,
+    project: Option<ProjectInfo>,
 }
 
 fn push_deduped(scan: &mut AdapterScan, seen: &mut HashSet<String>, event: UsageEvent) {
@@ -862,11 +1181,14 @@ fn push_deduped(scan: &mut AdapterScan, seen: &mut HashSet<String>, event: Usage
 
 struct ProviderEventParts<'a> {
     timestamp: DateTime<Utc>,
+    session_started_at: Option<DateTime<Utc>>,
+    session_ended_at: Option<DateTime<Utc>>,
+    duration_seconds: Option<u64>,
     model: Option<ModelInfo>,
     usage: UsageCounts,
+    runtime: Option<RuntimeInfo>,
     session_raw: String,
-    project_key: Option<String>,
-    project_label: Option<String>,
+    project: Option<ProjectInfo>,
     event_kind: &'static str,
     source_file: &'a Path,
     line_number: usize,
@@ -882,6 +1204,9 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
     parts: ProviderEventParts<'_>,
 ) -> UsageEvent {
     let session_hash = hash_text(&parts.session_raw);
+    let session_started_at = parts.session_started_at.unwrap_or(parts.timestamp);
+    let session_ended_at = parts.session_ended_at.unwrap_or(parts.timestamp);
+    let project_key = project_bucket_key(parts.project.as_ref());
     let model_key = parts
         .model
         .as_ref()
@@ -890,46 +1215,70 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
     let (event_key_version, semantic_key) = match parts.deduplication {
         EventDeduplication::SessionScoped => (
             SESSION_SCOPED_EVENT_KEY_VERSION,
-            format!(
-                "{SESSION_SCOPED_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                parts.event_kind,
-                session_hash,
-                parts.timestamp.timestamp_millis(),
-                model_key,
-                parts.usage.input_tokens.unwrap_or(0),
-                parts.usage.cache_read_tokens.unwrap_or(0),
-                parts.usage.output_tokens.unwrap_or(0),
-                parts.usage.reasoning_tokens.unwrap_or(0),
-                parts.usage.computed_total()
-            ),
+            if parts.session_started_at.is_some() || parts.session_ended_at.is_some() {
+                format!(
+                    "{SESSION_SCOPED_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                    parts.event_kind,
+                    session_hash,
+                    session_started_at.timestamp_millis(),
+                    session_ended_at.timestamp_millis(),
+                    model_key,
+                    parts.usage.input_tokens.unwrap_or(0),
+                    parts.usage.cache_read_tokens.unwrap_or(0),
+                    parts.usage.output_tokens.unwrap_or(0),
+                    parts.usage.reasoning_tokens.unwrap_or(0),
+                    parts.usage.computed_total()
+                )
+            } else {
+                format!(
+                    "{SESSION_SCOPED_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                    parts.event_kind,
+                    session_hash,
+                    parts.timestamp.timestamp_millis(),
+                    model_key,
+                    parts.usage.input_tokens.unwrap_or(0),
+                    parts.usage.cache_read_tokens.unwrap_or(0),
+                    parts.usage.output_tokens.unwrap_or(0),
+                    parts.usage.reasoning_tokens.unwrap_or(0),
+                    parts.usage.computed_total()
+                )
+            },
         ),
         EventDeduplication::PathIndependent => (
             PATH_INDEPENDENT_EVENT_KEY_VERSION,
-            format!(
-                "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}",
-                parts.event_kind,
-                parts.timestamp.timestamp_millis(),
-                model_key,
-                parts.usage.input_tokens.unwrap_or(0),
-                parts.usage.cache_read_tokens.unwrap_or(0),
-                parts.usage.output_tokens.unwrap_or(0),
-                parts.usage.reasoning_tokens.unwrap_or(0),
-                parts.usage.computed_total()
-            ),
+            if parts.session_started_at.is_some() || parts.session_ended_at.is_some() {
+                format!(
+                    "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                    parts.event_kind,
+                    &project_key,
+                    session_started_at.timestamp_millis(),
+                    session_ended_at.timestamp_millis(),
+                    model_key,
+                    parts.usage.input_tokens.unwrap_or(0),
+                    parts.usage.cache_read_tokens.unwrap_or(0),
+                    parts.usage.output_tokens.unwrap_or(0),
+                    parts.usage.reasoning_tokens.unwrap_or(0),
+                    parts.usage.computed_total()
+                )
+            } else {
+                format!(
+                    "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                    parts.event_kind,
+                    &project_key,
+                    parts.timestamp.timestamp_millis(),
+                    model_key,
+                    parts.usage.input_tokens.unwrap_or(0),
+                    parts.usage.cache_read_tokens.unwrap_or(0),
+                    parts.usage.output_tokens.unwrap_or(0),
+                    parts.usage.reasoning_tokens.unwrap_or(0),
+                    parts.usage.computed_total()
+                )
+            },
         ),
     };
     let event_id = semantic_event_id(adapter.provider(), &source.source_id, &semantic_key);
     let file_path_hash = hash_text(&canonical_display(parts.source_file));
     let source_record_id = format!("usage_key_{}", &hash_text(&semantic_key)[..32]);
-    let project = parts.project_key.map(|project_key| ProjectInfo {
-        project_id: format!("project_{}", &hash_text(&project_key)[..24]),
-        project_label: parts.project_label,
-        repo_remote_hash: None,
-        repo_label: None,
-        branch_hash: None,
-        branch_label: None,
-    });
-
     let cost = estimate_cost(adapter.provider(), parts.model.as_ref(), &parts.usage);
 
     UsageEvent {
@@ -958,12 +1307,12 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
             session_id: format!("session_{}", &session_hash[..24]),
             local_session_id_hash: Some(session_hash),
             title: None,
-            started_at: parts.timestamp,
-            ended_at: None,
-            duration_seconds: None,
+            started_at: session_started_at,
+            ended_at: parts.session_ended_at,
+            duration_seconds: parts.duration_seconds,
         },
         model: parts.model,
-        runtime: None,
+        runtime: parts.runtime,
         cost,
         parse_evidence: Some(ParseEvidence {
             event_key_version: event_key_version.to_string(),
@@ -975,7 +1324,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
             account_identity_source: IdentitySource::Unresolved,
         }),
         usage: parts.usage,
-        project,
+        project: parts.project,
         git: None,
         privacy: metadata_only_privacy(),
         created_at: parts.timestamp,
@@ -1096,6 +1445,31 @@ fn infer_missing_output(
             + reasoning.unwrap_or(0);
         (total > known).then_some(total - known)
     })
+}
+
+fn sum_usage_counts(left: &UsageCounts, right: &UsageCounts) -> UsageCounts {
+    fn sum_field(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+        if left.is_some() || right.is_some() {
+            Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0)))
+        } else {
+            None
+        }
+    }
+
+    UsageCounts {
+        input_tokens: sum_field(left.input_tokens, right.input_tokens),
+        output_tokens: sum_field(left.output_tokens, right.output_tokens),
+        cache_creation_tokens: sum_field(left.cache_creation_tokens, right.cache_creation_tokens),
+        cache_read_tokens: sum_field(left.cache_read_tokens, right.cache_read_tokens),
+        reasoning_tokens: sum_field(left.reasoning_tokens, right.reasoning_tokens),
+        total_tokens: sum_field(left.total_tokens, right.total_tokens),
+        requests: sum_field(left.requests, right.requests),
+        local_prompt_eval_tokens: sum_field(
+            left.local_prompt_eval_tokens,
+            right.local_prompt_eval_tokens,
+        ),
+        local_eval_tokens: sum_field(left.local_eval_tokens, right.local_eval_tokens),
+    }
 }
 
 // Codex reports cached input and reasoning output as subsets of the top-level
@@ -1297,10 +1671,6 @@ fn model_from_nested_value(value: &Value, fallback: Option<&str>) -> Option<Mode
     Some(model_info(model))
 }
 
-fn codex_model_from_value(value: &Value, fallback: Option<&str>) -> Option<ModelInfo> {
-    model_from_nested_value(value, fallback)
-}
-
 fn model_info(model: &str) -> ModelInfo {
     let normalized = normalize_model_name(model);
     ModelInfo {
@@ -1308,6 +1678,14 @@ fn model_info(model: &str) -> ModelInfo {
         normalized_name: Some(normalized),
         provider_model_id: Some(model.to_string()),
     }
+}
+
+fn is_codex_session_meta(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("session_meta")
+}
+
+fn codex_model_from_value(value: &Value, fallback: Option<&str>) -> Option<ModelInfo> {
+    model_from_nested_value(value, fallback)
 }
 
 fn is_codex_turn_context(value: &Value) -> bool {
@@ -1319,12 +1697,364 @@ fn is_codex_token_count(value: &Value) -> bool {
         && value.pointer("/payload/type").and_then(Value::as_str) == Some("token_count")
 }
 
+fn is_codex_task_started(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && value.pointer("/payload/type").and_then(Value::as_str) == Some("task_started")
+}
+
+fn is_codex_task_complete(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && value.pointer("/payload/type").and_then(Value::as_str) == Some("task_complete")
+}
+
+fn codex_visible_message_role(value: &Value) -> Option<&str> {
+    (value.get("type").and_then(Value::as_str) == Some("response_item")
+        && value.pointer("/payload/type").and_then(Value::as_str) == Some("message"))
+    .then(|| value.pointer("/payload/role").and_then(Value::as_str))
+    .flatten()
+}
+
 fn codex_line_could_have_usage_or_context(line: &str) -> bool {
-    line.contains("\"turn_context\"")
+    line.contains("\"session_meta\"")
+        || line.contains("\"turn_context\"")
         || line.contains("\"token_count\"")
+        || line.contains("\"task_started\"")
+        || line.contains("\"task_complete\"")
+        || line.contains("\"response_item\"")
         || line.contains("\"usage\"")
         || line.contains("\"input_tokens\"")
         || line.contains("\"prompt_tokens\"")
+}
+
+fn codex_task_timestamp(value: &Value, pointers: &[&str]) -> Option<DateTime<Utc>> {
+    pointers
+        .iter()
+        .filter_map(|pointer| value.pointer(pointer))
+        .find_map(timestamp_from_scalar)
+}
+
+fn codex_task_u64(value: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers
+        .iter()
+        .filter_map(|pointer| value.pointer(pointer))
+        .find_map(value_as_u64)
+}
+
+fn codex_duration_from_turn_timestamps(
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Option<u64> {
+    let millis = completed_at
+        .signed_duration_since(started_at)
+        .num_milliseconds();
+    (millis >= 0).then_some(millis as u64)
+}
+
+fn load_claude_session_projects(
+    projects_root: &Path,
+) -> HashMap<String, ClaudeSessionProjectMetadata> {
+    let mut projects = HashMap::new();
+    if !projects_root.exists() {
+        return projects;
+    }
+
+    for entry in WalkDir::new(projects_root).follow_links(false) {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_file() || entry.file_name() != "sessions-index.json" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(entries) = value.get("entries").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in entries {
+            let Some(full_path) = item.get("fullPath").and_then(Value::as_str) else {
+                continue;
+            };
+            let key = canonical_display(Path::new(full_path));
+            projects.insert(
+                key,
+                ClaudeSessionProjectMetadata {
+                    project_path: item
+                        .get("projectPath")
+                        .and_then(Value::as_str)
+                        .map(expand_home_path),
+                    git_branch: item
+                        .get("gitBranch")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                },
+            );
+        }
+    }
+
+    projects
+}
+
+fn codex_project_context_from_value(value: &Value) -> Option<ProjectInfo> {
+    let payload = value.get("payload");
+    let project_path = payload
+        .and_then(|payload| payload.get("cwd"))
+        .and_then(Value::as_str)
+        .map(expand_home_path);
+    let repository_url = payload
+        .and_then(|payload| payload.get("git"))
+        .and_then(|git| git.get("repository_url"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let branch = payload
+        .and_then(|payload| payload.get("git"))
+        .and_then(|git| git.get("branch"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    resolve_project_context(project_path, repository_url, branch)
+}
+
+fn resolve_project_context(
+    project_path: Option<PathBuf>,
+    repository_url: Option<String>,
+    branch: Option<String>,
+) -> Option<ProjectInfo> {
+    let git = project_path
+        .as_deref()
+        .and_then(read_git_repository_metadata);
+    let normalized_remote = repository_url
+        .as_deref()
+        .and_then(normalize_git_remote)
+        .or_else(|| {
+            git.as_ref()
+                .and_then(|metadata| metadata.normalized_remote.clone())
+        });
+    let repo_remote_hash = normalized_remote.as_ref().map(|remote| hash_text(remote));
+    let repo_label = normalized_remote
+        .as_deref()
+        .map(repo_label_from_normalized_remote)
+        .or_else(|| {
+            git.as_ref()
+                .and_then(|metadata| metadata.repo_label.clone())
+        });
+    let branch_label = branch.or_else(|| {
+        git.as_ref()
+            .and_then(|metadata| metadata.branch_label.clone())
+    });
+    let branch_hash = branch_label.as_ref().map(|branch| hash_text(branch));
+    let project_label = project_path
+        .as_deref()
+        .and_then(project_label_from_path)
+        .or_else(|| repo_label.clone());
+    let path_hash_value = project_path.as_deref().map(path_hash);
+    let path_label = project_path.as_deref().map(display_path);
+
+    ProjectContext {
+        project_label,
+        repo_remote_hash,
+        repo_label,
+        branch_hash,
+        branch_label,
+        path_hash: path_hash_value,
+        path_label,
+    }
+    .into_project_info()
+}
+
+fn project_context_from_path_fallback(root: &Path, path: &Path) -> Option<ProjectInfo> {
+    let project_key = project_key_from_path(root, path)?;
+    if matches!(project_key.as_str(), "sessions" | "archived_sessions") {
+        return None;
+    }
+    let project_path = root.join(&project_key);
+    ProjectContext {
+        project_label: Some(project_key),
+        path_hash: Some(path_hash(&project_path)),
+        path_label: Some(display_path(&project_path)),
+        ..ProjectContext::default()
+    }
+    .into_project_info()
+}
+
+#[derive(Debug, Clone, Default)]
+struct GitRepositoryMetadata {
+    normalized_remote: Option<String>,
+    repo_label: Option<String>,
+    branch_label: Option<String>,
+}
+
+fn read_git_repository_metadata(path: &Path) -> Option<GitRepositoryMetadata> {
+    let repo_root = find_git_repo_root(path)?;
+    let git_dir = git_dir_for_repo_root(&repo_root)?;
+    let common_dir = git_common_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
+    let config_path = if git_dir.join("config").is_file() {
+        git_dir.join("config")
+    } else {
+        common_dir.join("config")
+    };
+    let remote = read_git_remote_url(&config_path);
+    let normalized_remote = remote.as_deref().and_then(normalize_git_remote);
+    let repo_label = normalized_remote
+        .as_deref()
+        .map(repo_label_from_normalized_remote)
+        .or_else(|| project_label_from_path(&repo_root));
+
+    Some(GitRepositoryMetadata {
+        normalized_remote,
+        repo_label,
+        branch_label: read_git_head_branch(&git_dir),
+    })
+}
+
+fn find_git_repo_root(path: &Path) -> Option<PathBuf> {
+    let mut current = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    loop {
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn git_dir_for_repo_root(repo_root: &Path) -> Option<PathBuf> {
+    let dot_git = repo_root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(dot_git).ok()?;
+    let gitdir = text.trim().strip_prefix("gitdir:")?.trim();
+    let path = PathBuf::from(gitdir);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(repo_root.join(path))
+    }
+}
+
+fn git_common_dir(git_dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let value = text.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(git_dir.join(path))
+    }
+}
+
+fn read_git_remote_url(config_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let mut current_remote: Option<String> = None;
+    let mut first_remote_url: Option<String> = None;
+    let mut origin_remote_url: Option<String> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[remote \"") && trimmed.ends_with("\"]") {
+            current_remote = trimmed
+                .trim_start_matches("[remote \"")
+                .trim_end_matches("\"]")
+                .split('"')
+                .next()
+                .map(ToOwned::to_owned);
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            current_remote = None;
+            continue;
+        }
+        let Some(remote_name) = current_remote.as_deref() else {
+            continue;
+        };
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "url" {
+            continue;
+        }
+        let url = value.trim().to_string();
+        if first_remote_url.is_none() {
+            first_remote_url = Some(url.clone());
+        }
+        if remote_name == "origin" {
+            origin_remote_url = Some(url);
+        }
+    }
+
+    origin_remote_url.or(first_remote_url)
+}
+
+fn read_git_head_branch(git_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = text.trim();
+    head.strip_prefix("ref: refs/heads/").map(ToOwned::to_owned)
+}
+
+fn normalize_git_remote(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let host_and_path = if let Some(rest) = trimmed.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        format!("{host}/{path}")
+    } else if let Some((_, rest)) = trimmed.split_once("://") {
+        let rest = rest.trim_start_matches('/');
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        format!("{host}/{path}")
+    } else {
+        trimmed.to_string()
+    };
+
+    let mut parts: Vec<String> = host_and_path
+        .split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    if let Some(last) = parts.last_mut() {
+        if let Some(stripped) = last.strip_suffix(".git") {
+            *last = stripped.to_string();
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn repo_label_from_normalized_remote(remote: &str) -> String {
+    let parts: Vec<&str> = remote.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() >= 3 {
+        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        remote.to_string()
+    }
+}
+
+fn project_label_from_path(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let display = display_path(path);
+            (!display.is_empty()).then_some(display)
+        })
 }
 
 fn codex_headless_usage_value(value: &Value) -> Option<&Value> {
@@ -1602,6 +2332,20 @@ mod tests {
         }
     }
 
+    fn write_git_fixture(repo_root: &Path, remote: &str, branch: &str) {
+        let git_dir = repo_root.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        std::fs::write(
+            git_dir.join("config"),
+            format!(
+                "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = {remote}\n"
+            ),
+        )
+        .expect("git config");
+        std::fs::write(git_dir.join("HEAD"), format!("ref: refs/heads/{branch}\n"))
+            .expect("git head");
+    }
+
     #[test]
     fn codex_discovers_one_logical_source_per_home() {
         let adapter = CodexAdapter;
@@ -1626,6 +2370,124 @@ mod tests {
 
         assert_eq!(source.provider, CLAUDE_CODE_PROVIDER);
         assert_eq!(source.path_label.as_deref(), Some("/tmp/claude-home"));
+    }
+
+    #[test]
+    fn git_remote_normalization_merges_ssh_and_https() {
+        assert_eq!(
+            normalize_git_remote("git@github.com:Owner/Repo.git"),
+            normalize_git_remote("https://github.com/Owner/Repo.git")
+        );
+        assert_eq!(
+            normalize_git_remote("ssh://git@github.com/Owner/Repo.git"),
+            Some("github.com/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn project_context_requires_path_or_repo_identity() {
+        let project = ProjectContext {
+            project_label: Some("scratch".to_string()),
+            ..ProjectContext::default()
+        }
+        .into_project_info();
+
+        assert_eq!(project, None);
+    }
+
+    #[test]
+    fn claude_extracts_project_path_and_git_metadata_from_sessions_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let projects = root.join("projects");
+        let project_store = projects.join("video-chapter");
+        let workspace = root.join("workspace").join("VideoChapter");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_git_fixture(
+            &workspace,
+            "https://github.com/Owner/VideoChapter.git",
+            "main",
+        );
+
+        let session_path = project_store.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        )
+        .expect("session");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            format!(
+                "{{\"version\":1,\"entries\":[{{\"sessionId\":\"abc\",\"fullPath\":\"{}\",\"gitBranch\":\"main\",\"projectPath\":\"{}\"}}]}}",
+                session_path.display(),
+                workspace.display()
+            ),
+        )
+        .expect("session index");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let project = scan.events[0].project.as_ref().expect("project");
+        assert_eq!(
+            project.path_label.as_deref(),
+            Some(workspace.to_string_lossy().as_ref())
+        );
+        assert_eq!(project.project_label.as_deref(), Some("VideoChapter"));
+        assert_eq!(project.repo_label.as_deref(), Some("owner/videochapter"));
+        assert_eq!(project.branch_label.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn codex_extracts_cwd_and_git_metadata_from_session_meta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let codex_root = dir.path().join("codex");
+        let sessions = codex_root.join("sessions");
+        let workspace = dir.path().join("workspace").join("ai-stats");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_git_fixture(&workspace, "git@github.com:StarkDmi/StatsAI.git", "main");
+
+        let session_path = sessions.join("session.jsonl");
+        let mut file = File::create(&session_path).expect("session file");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{{"cwd":"{}","git":{{"repository_url":"git@github.com:StarkDmi/StatsAI.git","branch":"main"}}}}}}"#,
+            workspace.display()
+        )
+        .expect("write session meta");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:01:00Z","usage":{{"input_tokens":10,"output_tokens":5}},"model":"gpt-5"}}"#
+        )
+        .expect("write usage");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            &codex_root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let project = scan.events[0].project.as_ref().expect("project");
+        assert_eq!(
+            project.path_label.as_deref(),
+            Some(workspace.to_string_lossy().as_ref())
+        );
+        assert_eq!(project.project_label.as_deref(), Some("ai-stats"));
+        assert_eq!(project.repo_label.as_deref(), Some("starkdmi/statsai"));
+        assert_eq!(project.branch_label.as_deref(), Some("main"));
     }
 
     #[test]
@@ -1920,6 +2782,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_scan_candidates_invalidate_legacy_cache_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let session_path = sessions.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("session");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let legacy_namespace = {
+            let adapter_id = source.adapter_id.as_deref().unwrap_or("");
+            let path_hash = source.path_hash.as_deref().unwrap_or("");
+            hash_text(&format!(
+                "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{}:{path_hash}",
+                source.provider, source.source_kind, "test-adapter"
+            ))
+        };
+        let legacy_candidate = scan_candidate(session_path.clone(), None, &legacy_namespace);
+        let current = codex_scan_candidates(&source, "test-adapter").expect("current candidates");
+
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].cache_key, canonical_display(&session_path));
+        assert_ne!(legacy_candidate.cache_signature, current[0].cache_signature);
+    }
+
+    #[test]
     fn codex_dedupes_copied_branch_history_and_keeps_branch_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
@@ -2087,6 +2985,469 @@ mod tests {
         assert_eq!(scan.events[1].usage.cache_read_tokens, Some(20));
         assert_eq!(scan.events[1].usage.output_tokens, Some(25));
         assert_eq!(scan.events[1].usage.total_tokens, Some(175));
+    }
+
+    #[test]
+    fn codex_rollout_turns_include_runtime_and_message_metrics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let mut file = File::create(sessions.join("rollout.jsonl")).expect("fixture");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:00Z","type":"turn_context","payload":{{"model":"gpt-5"}}}}"#
+        )
+        .expect("write context");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{{"type":"task_started","started_at":"2026-05-01T00:00:01Z"}}}}"#
+        )
+        .expect("write start");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:02Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hello"}}]}}}}"#
+        )
+        .expect("write user");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:05Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}},"total_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}}}}}}}}"#
+        )
+        .expect("write tokens");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:06Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"hi"}}]}}}}"#
+        )
+        .expect("write assistant");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:06Z","type":"event_msg","payload":{{"type":"task_complete","completed_at":"2026-05-01T00:00:06Z","duration_ms":5000,"time_to_first_token_ms":1200}}}}"#
+        )
+        .expect("write complete");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].usage.input_tokens, Some(60));
+        assert_eq!(scan.events[0].usage.cache_read_tokens, Some(20));
+        assert_eq!(scan.events[0].usage.output_tokens, Some(30));
+        assert_eq!(scan.events[0].usage.reasoning_tokens, Some(10));
+        assert_eq!(scan.events[0].usage.total_tokens, Some(120));
+        assert_eq!(
+            scan.events[0].session.started_at.to_rfc3339(),
+            "2026-05-01T00:00:01+00:00"
+        );
+        assert_eq!(
+            scan.events[0]
+                .session
+                .ended_at
+                .expect("ended_at")
+                .to_rfc3339(),
+            "2026-05-01T00:00:06+00:00"
+        );
+        assert_eq!(scan.events[0].session.duration_seconds, Some(5));
+        let runtime = scan.events[0].runtime.as_ref().expect("runtime");
+        assert_eq!(runtime.latency_ms, Some(5000));
+        assert_eq!(runtime.latency_source, Some(LatencySource::Explicit));
+        assert_eq!(runtime.time_to_first_token_ms, Some(1200));
+        assert_eq!(runtime.total_messages, Some(2));
+        assert_eq!(runtime.user_messages, Some(1));
+        assert_eq!(runtime.assistant_messages, Some(1));
+        assert_eq!(runtime.developer_messages, Some(0));
+    }
+
+    #[test]
+    fn codex_task_complete_usage_is_not_emitted_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let mut file = File::create(sessions.join("completion-usage.jsonl")).expect("fixture");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:00Z","type":"event_msg","payload":{{"type":"task_started","started_at":"2026-05-01T00:00:00Z"}}}}"#
+        )
+        .expect("write start");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}},"total_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}}}}}}}}"#
+        )
+        .expect("write token count");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:03Z","type":"event_msg","payload":{{"type":"task_complete","completed_at":"2026-05-01T00:00:03Z","duration_ms":3000}},"usage":{{"input_tokens":90,"cached_input_tokens":30,"output_tokens":45,"reasoning_output_tokens":15,"total_tokens":150}}}}"#
+        )
+        .expect("write completion");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].usage.input_tokens, Some(60));
+        assert_eq!(scan.events[0].usage.cache_read_tokens, Some(30));
+        assert_eq!(scan.events[0].usage.output_tokens, Some(30));
+        assert_eq!(scan.events[0].usage.reasoning_tokens, Some(15));
+        assert_eq!(scan.events[0].usage.total_tokens, Some(150));
+    }
+
+    #[test]
+    fn codex_rollout_turns_match_interleaved_records_by_session_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let mut file = File::create(sessions.join("interleaved.jsonl")).expect("fixture");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:00Z","session_id":"session-a","type":"event_msg","payload":{{"type":"task_started","started_at":"2026-05-01T00:00:00Z"}}}}"#
+        )
+        .expect("write session a start");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:01Z","session_id":"session-b","type":"event_msg","payload":{{"type":"task_started","started_at":"2026-05-01T00:00:01Z"}}}}"#
+        )
+        .expect("write session b start");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:02Z","session_id":"session-a","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":140}},"total_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":140}}}}}}}}"#
+        )
+        .expect("write session a tokens");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:03Z","session_id":"session-a","type":"event_msg","payload":{{"type":"task_complete","completed_at":"2026-05-01T00:00:03Z"}}}}"#
+        )
+        .expect("write session a complete");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:04Z","session_id":"session-b","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":160,"cached_input_tokens":40,"output_tokens":60,"reasoning_output_tokens":20,"total_tokens":280}},"total_token_usage":{{"input_tokens":160,"cached_input_tokens":40,"output_tokens":60,"reasoning_output_tokens":20,"total_tokens":280}}}}}}}}"#
+        )
+        .expect("write session b tokens");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:05Z","session_id":"session-b","type":"event_msg","payload":{{"type":"task_complete","completed_at":"2026-05-01T00:00:05Z"}}}}"#
+        )
+        .expect("write session b complete");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        let mut events = scan.events.iter().collect::<Vec<_>>();
+        events.sort_by_key(|event| event.usage.total_tokens);
+
+        assert_eq!(events[0].usage.total_tokens, Some(140));
+        assert_eq!(
+            events[0]
+                .session
+                .local_session_id_hash
+                .as_deref()
+                .expect("session a hash"),
+            hash_text("session-a")
+        );
+        assert_eq!(
+            events[0].session.started_at.to_rfc3339(),
+            "2026-05-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            events[0]
+                .session
+                .ended_at
+                .expect("session a ended")
+                .to_rfc3339(),
+            "2026-05-01T00:00:03+00:00"
+        );
+        assert_eq!(events[0].session.duration_seconds, Some(3));
+
+        assert_eq!(events[1].usage.total_tokens, Some(280));
+        assert_eq!(
+            events[1]
+                .session
+                .local_session_id_hash
+                .as_deref()
+                .expect("session b hash"),
+            hash_text("session-b")
+        );
+        assert_eq!(
+            events[1].session.started_at.to_rfc3339(),
+            "2026-05-01T00:00:01+00:00"
+        );
+        assert_eq!(
+            events[1]
+                .session
+                .ended_at
+                .expect("session b ended")
+                .to_rfc3339(),
+            "2026-05-01T00:00:05+00:00"
+        );
+        assert_eq!(events[1].session.duration_seconds, Some(4));
+    }
+
+    #[test]
+    fn codex_turn_usage_consumes_all_token_count_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let mut file = File::create(sessions.join("multi-token-count.jsonl")).expect("fixture");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:00Z","type":"event_msg","payload":{{"type":"task_started","started_at":"2026-05-01T00:00:00Z"}}}}"#
+        )
+        .expect("write start");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":40,"cached_input_tokens":10,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":60}},"total_token_usage":{{"input_tokens":40,"cached_input_tokens":10,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":60}}}}}}}}"#
+        )
+        .expect("write first token count");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}},"total_token_usage":{{"input_tokens":120,"cached_input_tokens":30,"output_tokens":60,"reasoning_output_tokens":15,"total_tokens":180}}}}}}}}"#
+        )
+        .expect("write second token count");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:03Z","type":"event_msg","payload":{{"type":"task_complete","completed_at":"2026-05-01T00:00:03Z","duration_ms":3000}}}}"#
+        )
+        .expect("write completion");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].usage.input_tokens, Some(90));
+        assert_eq!(scan.events[0].usage.cache_read_tokens, Some(30));
+        assert_eq!(scan.events[0].usage.output_tokens, Some(45));
+        assert_eq!(scan.events[0].usage.reasoning_tokens, Some(15));
+        assert_eq!(scan.events[0].usage.total_tokens, Some(180));
+        assert_eq!(scan.events[0].usage.requests, Some(2));
+    }
+
+    #[test]
+    fn codex_rollout_derives_runtime_from_turn_timestamps_when_duration_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let mut file = File::create(sessions.join("legacy-rollout.jsonl")).expect("fixture");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-04-11T00:00:00Z","type":"turn_context","payload":{{"model":"gpt-5"}}}}"#
+        )
+        .expect("write context");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-04-11T00:00:01Z","type":"event_msg","payload":{{"type":"task_started"}}}}"#
+        )
+        .expect("write start");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-04-11T00:00:02Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hello"}}]}}}}"#
+        )
+        .expect("write user");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-04-11T00:00:05Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}},"total_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}}}}}}}}"#
+        )
+        .expect("write tokens");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-04-11T00:00:06Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"hi"}}]}}}}"#
+        )
+        .expect("write assistant");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-04-11T00:00:06Z","type":"event_msg","payload":{{"type":"task_complete"}}}}"#
+        )
+        .expect("write complete");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(
+            scan.events[0].session.started_at.to_rfc3339(),
+            "2026-04-11T00:00:01+00:00"
+        );
+        assert_eq!(
+            scan.events[0]
+                .session
+                .ended_at
+                .expect("ended_at")
+                .to_rfc3339(),
+            "2026-04-11T00:00:06+00:00"
+        );
+        assert_eq!(scan.events[0].session.duration_seconds, Some(5));
+        let runtime = scan.events[0].runtime.as_ref().expect("runtime");
+        assert_eq!(runtime.latency_ms, Some(5000));
+        assert_eq!(runtime.latency_source, Some(LatencySource::Inferred));
+        assert_eq!(runtime.time_to_first_token_ms, None);
+        assert_eq!(runtime.total_messages, Some(2));
+        assert_eq!(runtime.user_messages, Some(1));
+        assert_eq!(runtime.assistant_messages, Some(1));
+        assert_eq!(runtime.developer_messages, Some(0));
+    }
+
+    #[test]
+    fn codex_path_independent_turn_dedupe_keeps_distinct_projects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let codex_root = dir.path().join("codex");
+        let sessions = codex_root.join("sessions");
+        let workspace_a = dir.path().join("workspace-a").join("ai-stats");
+        let workspace_b = dir.path().join("workspace-b").join("ai-stats");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(&workspace_a).expect("workspace a");
+        std::fs::create_dir_all(&workspace_b).expect("workspace b");
+        write_git_fixture(&workspace_a, "git@github.com:StarkDmi/StatsAI.git", "main");
+        write_git_fixture(&workspace_b, "git@github.com:StarkDmi/StatsAI.git", "main");
+
+        for (name, workspace) in [("a.jsonl", &workspace_a), ("b.jsonl", &workspace_b)] {
+            let mut file = File::create(sessions.join(name)).expect("fixture");
+            writeln!(
+                file,
+                r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{{"cwd":"{}","git":{{"repository_url":"git@github.com:StarkDmi/StatsAI.git","branch":"main"}}}}}}"#,
+                workspace.display()
+            )
+            .expect("write session meta");
+            writeln!(
+                file,
+                r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"turn_context","payload":{{"model":"gpt-5"}}}}"#
+            )
+            .expect("write context");
+            writeln!(
+                file,
+                r#"{{"timestamp":"2026-06-01T08:00:01Z","type":"event_msg","payload":{{"type":"task_started","started_at":"2026-06-01T08:00:01Z"}}}}"#
+            )
+            .expect("write start");
+            writeln!(
+                file,
+                r#"{{"timestamp":"2026-06-01T08:00:03Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120}},"total_token_usage":{{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120}}}}}}}}"#
+            )
+            .expect("write tokens");
+            writeln!(
+                file,
+                r#"{{"timestamp":"2026-06-01T08:00:04Z","type":"event_msg","payload":{{"type":"task_complete","completed_at":"2026-06-01T08:00:04Z","duration_ms":3000}}}}"#
+            )
+            .expect("write complete");
+        }
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            &codex_root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(scan.diagnostics.duplicate_events, 0);
+
+        let mut project_paths = scan
+            .events
+            .iter()
+            .map(|event| {
+                event
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.path_label.clone())
+                    .expect("project path")
+            })
+            .collect::<Vec<_>>();
+        project_paths.sort();
+
+        assert_eq!(
+            project_paths,
+            vec![
+                workspace_a.to_string_lossy().to_string(),
+                workspace_b.to_string_lossy().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_path_independent_usage_dedupe_keeps_distinct_branches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let codex_root = dir.path().join("codex");
+        let sessions = codex_root.join("sessions");
+        let workspace = dir.path().join("workspace").join("ai-stats");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_git_fixture(&workspace, "git@github.com:StarkDmi/StatsAI.git", "main");
+
+        for (name, branch_name) in [("main.jsonl", "main"), ("feature.jsonl", "feature-x")] {
+            let mut file = File::create(sessions.join(name)).expect("fixture");
+            writeln!(
+                file,
+                r#"{{"timestamp":"2026-06-03T08:00:00Z","type":"session_meta","payload":{{"cwd":"{}","git":{{"repository_url":"git@github.com:StarkDmi/StatsAI.git","branch":"{}"}}}}}}"#,
+                workspace.display(),
+                branch_name
+            )
+            .expect("write session meta");
+            writeln!(
+                file,
+                r#"{{"timestamp":"2026-06-03T08:00:01Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120}},"total_token_usage":{{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120}}}}}}}}"#
+            )
+            .expect("write usage");
+        }
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            &codex_root,
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(scan.diagnostics.duplicate_events, 0);
+
+        let mut branches = scan
+            .events
+            .iter()
+            .map(|event| {
+                event
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.branch_label.clone())
+                    .expect("branch")
+            })
+            .collect::<Vec<_>>();
+        branches.sort();
+
+        assert_eq!(branches, vec!["feature-x".to_string(), "main".to_string()]);
     }
 
     #[test]

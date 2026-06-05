@@ -5,19 +5,23 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use statsai_core::{
-    hash_text, normalize_email, normalize_provider_user_id, periods_overlap, provider_account_id,
-    provider_account_id_from_identity, semantic_event_fingerprint, source_account_assignment_id,
-    subscription_id, summary_id, timestamp_in_period, BillingPeriod, Confidence, CostInfo,
-    DailyRollup, EventSource, IdentitySource, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount,
-    ProviderAccountId, SemanticFingerprintInput, SourceAccountAssignment,
+    hash_text, normalize_email, normalize_provider_user_id, periods_overlap, project_bucket_key,
+    project_has_stable_identity, provider_account_id, provider_account_id_from_identity,
+    semantic_event_fingerprint, source_account_assignment_id, subscription_id, summary_id,
+    timestamp_in_period, BillingPeriod, Confidence, CostInfo, DailyRollup, EventSource,
+    IdentitySource, LatencySource, MetricStats, ModelInfo, PrivacyInfo, PrivacyMode,
+    ProviderAccount, ProviderAccountId, SemanticFingerprintInput, SourceAccountAssignment,
     SourceAccountAssignmentId, SourceId, SourceLocation, SourceVerificationMode, Subscription,
-    SubscriptionId, SubscriptionStatus, SummaryId, SummaryMetadata, SummaryModelUsage, UsageCounts,
-    UsageEvent, UsageSummary, VerifiedSourceState, VerifiedSubscriptionState,
-    PROVIDER_ACCOUNT_SCHEMA_VERSION, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
-    SUBSCRIPTION_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+    SubscriptionId, SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetrics,
+    SummaryModelUsage, UsageCounts, UsageEvent, UsageSummary, VerifiedSourceState,
+    VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
+    USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+
+const SYNC_ROLLUP_SUMMARY_VERSION: &str = "8";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncState {
@@ -709,8 +713,9 @@ impl Store {
     }
 
     pub fn insert_event(&self, event: &UsageEvent) -> Result<bool> {
-        let fingerprint = event_fingerprint(event);
-        if let Some(existing_id) = self.find_semantic_duplicate_event_id(event, &fingerprint)? {
+        let event = event_with_valid_project(event);
+        let fingerprint = event_fingerprint(&event);
+        if let Some(existing_id) = self.find_semantic_duplicate_event_id(&event, &fingerprint)? {
             let mut refreshed = event.clone();
             refreshed.event_id.0 = existing_id;
             let dirty_keys = self.update_event_payload(&refreshed)?;
@@ -718,7 +723,7 @@ impl Store {
             return Ok(false);
         }
 
-        let payload = serde_json::to_string(event)?;
+        let payload = serde_json::to_string(&event)?;
         let changed = self.conn.execute(
             r#"
             INSERT OR IGNORE INTO usage_events (
@@ -739,15 +744,19 @@ impl Store {
             ],
         )?;
         if changed == 0 {
-            let dirty_keys = self.update_event_payload(event)?;
+            let dirty_keys = self.update_event_payload(&event)?;
             self.refresh_sync_rollups_for_keys(&dirty_keys)?;
         } else {
-            self.refresh_sync_rollups_for_keys(&BTreeSet::from([sync_rollup_bucket_key(event)]))?;
+            self.refresh_sync_rollups_for_keys(&BTreeSet::from([sync_rollup_bucket_key(&event)]))?;
         }
         Ok(changed > 0)
     }
 
     pub fn insert_events(&self, events: &[UsageEvent]) -> Result<u64> {
+        let events = events
+            .iter()
+            .map(event_with_valid_project)
+            .collect::<Vec<_>>();
         let fingerprints: Vec<String> = events.iter().map(event_fingerprint).collect();
         let conflict_map = self.batch_load_conflicts(&fingerprints)?;
 
@@ -992,7 +1001,7 @@ impl Store {
             .conn
             .prepare("SELECT payload FROM usage_events ORDER BY started_at, event_id")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut events = Vec::new();
+        let mut events: Vec<UsageEvent> = Vec::new();
         for row in rows {
             events.push(serde_json::from_str(&row?)?);
         }
@@ -1022,7 +1031,7 @@ impl Store {
             "SELECT payload FROM usage_events ORDER BY started_at, event_id"
         };
         let mut stmt = self.conn.prepare(sql)?;
-        let mut events = Vec::new();
+        let mut events: Vec<UsageEvent> = Vec::new();
         if let Some((started_at, event_id)) = cursor {
             let rows = stmt.query_map(params![started_at.to_rfc3339(), event_id], |row| {
                 row.get::<_, String>(0)
@@ -1468,12 +1477,14 @@ impl Store {
     }
 
     pub fn dirty_sync_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
+        self.ensure_current_sync_rollup_versions()?;
         self.sync_rollup_summaries_by_sql(
             "SELECT payload FROM sync_rollups WHERE dirty = 1 ORDER BY updated_at, summary_id",
         )
     }
 
     pub fn all_sync_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
+        self.ensure_current_sync_rollup_versions()?;
         self.sync_rollup_summaries_by_sql(
             "SELECT payload FROM sync_rollups ORDER BY updated_at, summary_id",
         )
@@ -1535,6 +1546,20 @@ impl Store {
                 Err(error)
             }
         }
+    }
+
+    fn ensure_current_sync_rollup_versions(&self) -> Result<()> {
+        let stale_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sync_rollups
+             WHERE json_extract(payload, '$.metadata.summary_format') = 'daily_rollup.v1'
+               AND COALESCE(json_extract(payload, '$.metadata.summary_version'), '') != ?1",
+            params![SYNC_ROLLUP_SUMMARY_VERSION],
+            |row| row.get(0),
+        )?;
+        if stale_count > 0 {
+            self.rebuild_sync_rollups()?;
+        }
+        Ok(())
     }
 
     pub fn pending_sources_for_sync(
@@ -2092,7 +2117,7 @@ impl Store {
         };
 
         let mut stmt = self.conn.prepare(sql)?;
-        let mut events = Vec::new();
+        let mut events: Vec<UsageEvent> = Vec::new();
         if let Some(provider_account_id) = key.provider_account_id.as_deref() {
             let rows = stmt.query_map(
                 params![
@@ -2116,6 +2141,7 @@ impl Store {
                 events.push(serde_json::from_str(&row?)?);
             }
         }
+        events.retain(|event| sync_rollup_project_key(event.project.as_ref()) == key.project_key);
         Ok(events)
     }
 
@@ -3050,6 +3076,7 @@ struct SyncRollupBucketKey {
     source_id: String,
     provider_account_id: Option<String>,
     day_key: String,
+    project_key: String,
 }
 
 #[derive(Debug, Default)]
@@ -3064,6 +3091,7 @@ fn sync_rollup_bucket_key(event: &UsageEvent) -> SyncRollupBucketKey {
         source_id: event.source_id.0.clone(),
         provider_account_id: event.provider_account_id.as_ref().map(|id| id.0.clone()),
         day_key: event.session.started_at.date_naive().to_string(),
+        project_key: sync_rollup_project_key(event.project.as_ref()),
     }
 }
 
@@ -3072,11 +3100,28 @@ fn sync_rollup_summary_id(key: &SyncRollupBucketKey) -> SummaryId {
         &key.provider,
         &SourceId(key.source_id.clone()),
         &format!(
-            "daily_stats:{}:{}",
+            "daily_stats:{}:{}:{}",
             key.day_key,
-            key.provider_account_id.as_deref().unwrap_or("unlinked")
+            key.provider_account_id.as_deref().unwrap_or("unlinked"),
+            hash_text(&key.project_key),
         ),
     )
+}
+
+fn sync_rollup_project_key(project: Option<&statsai_core::ProjectInfo>) -> String {
+    project_bucket_key(project)
+}
+
+fn event_with_valid_project(event: &UsageEvent) -> UsageEvent {
+    let mut event = event.clone();
+    if event
+        .project
+        .as_ref()
+        .is_some_and(|project| !project_has_stable_identity(project))
+    {
+        event.project = None;
+    }
+    event
 }
 
 fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
@@ -3091,8 +3136,23 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let mut estimated_cost_usd = 0i64; // cents
     let mut provider_reported_usd = 0i64; // cents
     let mut has_provider_reported_usd = false;
-    let mut observed_at = first.session.started_at;
+    let mut observed_at = first.created_at;
     let mut model_buckets: BTreeMap<String, (ModelInfo, SyncRollupModelTotals)> = BTreeMap::new();
+    let mut session_ids = BTreeSet::new();
+    let mut active_seconds = 0.0_f64;
+    let mut latency_values = Vec::new();
+    let mut ttft_values = Vec::new();
+    let mut generated_tps_values = Vec::new();
+    let mut visible_tps_values = Vec::new();
+    let mut cache_hit_ratio_values = Vec::new();
+    let mut reasoning_share_values = Vec::new();
+    let mut total_messages = 0u64;
+    let mut user_messages = 0u64;
+    let mut assistant_messages = 0u64;
+    let mut developer_messages = 0u64;
+    let mut tracked_requests = 0u64;
+    let mut tracked_output_tokens = 0u64;
+    let mut tracked_reasoning_tokens = 0u64;
 
     for event in events {
         total_input = total_input.saturating_add(event.usage.input_tokens.unwrap_or(0));
@@ -3109,8 +3169,82 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             provider_reported_usd += cost;
             has_provider_reported_usd = true;
         }
-        if event.session.started_at > observed_at {
-            observed_at = event.session.started_at;
+        if event.created_at > observed_at {
+            observed_at = event.created_at;
+        }
+        session_ids.insert(
+            event
+                .session
+                .local_session_id_hash
+                .clone()
+                .unwrap_or_else(|| event.session.session_id.clone()),
+        );
+        let is_tracked_turn = event
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.latency_ms)
+            .is_some();
+        if let Some(runtime) = event.runtime.as_ref() {
+            let derived_total_messages = runtime.total_messages.or_else(|| {
+                let derived = runtime.user_messages.unwrap_or(0)
+                    + runtime.assistant_messages.unwrap_or(0)
+                    + runtime.developer_messages.unwrap_or(0);
+                (derived > 0).then_some(derived)
+            });
+            total_messages = total_messages.saturating_add(derived_total_messages.unwrap_or(0));
+            user_messages = user_messages.saturating_add(runtime.user_messages.unwrap_or(0));
+            assistant_messages =
+                assistant_messages.saturating_add(runtime.assistant_messages.unwrap_or(0));
+            developer_messages =
+                developer_messages.saturating_add(runtime.developer_messages.unwrap_or(0));
+
+            if let Some(latency_ms) = runtime.latency_ms {
+                let latency_ms_f64 = latency_ms as f64;
+                active_seconds += latency_ms_f64 / 1000.0;
+
+                if runtime_latency_supports_distribution_metrics(runtime) {
+                    latency_values.push(latency_ms_f64);
+                }
+
+                if latency_ms > 0 && runtime_latency_supports_distribution_metrics(runtime) {
+                    let duration_seconds = latency_ms_f64 / 1000.0;
+                    let generated_tokens = event.usage.output_tokens.unwrap_or(0)
+                        + event.usage.reasoning_tokens.unwrap_or(0);
+                    generated_tps_values.push(generated_tokens as f64 / duration_seconds);
+                    visible_tps_values
+                        .push(event.usage.output_tokens.unwrap_or(0) as f64 / duration_seconds);
+                }
+            }
+
+            if let Some(ttft_ms) = runtime.time_to_first_token_ms {
+                ttft_values.push(ttft_ms as f64);
+            }
+        }
+        if is_tracked_turn {
+            tracked_requests = tracked_requests.saturating_add(1);
+            tracked_output_tokens =
+                tracked_output_tokens.saturating_add(event.usage.output_tokens.unwrap_or(0));
+            tracked_reasoning_tokens =
+                tracked_reasoning_tokens.saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
+        }
+
+        let prompt_tokens = event
+            .usage
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
+        if prompt_tokens > 0 {
+            cache_hit_ratio_values
+                .push(event.usage.cache_read_tokens.unwrap_or(0) as f64 / prompt_tokens as f64);
+        }
+        let generated_tokens = event
+            .usage
+            .output_tokens
+            .unwrap_or(0)
+            .saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
+        if generated_tokens > 0 {
+            reasoning_share_values
+                .push(event.usage.reasoning_tokens.unwrap_or(0) as f64 / generated_tokens as f64);
         }
 
         let model = event.model.clone().unwrap_or_default();
@@ -3183,6 +3317,31 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             },
         })
         .collect();
+    let summary_metrics = summary_metrics_or_none(SummaryMetrics {
+        active_seconds: (active_seconds > 0.0).then_some(active_seconds),
+        tracked_requests: (tracked_requests > 0).then_some(tracked_requests),
+        tracked_output_tokens: (tracked_output_tokens > 0).then_some(tracked_output_tokens),
+        tracked_reasoning_tokens: (tracked_reasoning_tokens > 0)
+            .then_some(tracked_reasoning_tokens),
+        latency_ms: finalize_metric_stats(latency_values),
+        time_to_first_token_ms: finalize_metric_stats(ttft_values),
+        generated_tps: finalize_metric_stats(generated_tps_values),
+        visible_tps: finalize_metric_stats(visible_tps_values),
+        overall_generated_tps: (active_seconds > 0.0)
+            .then_some((tracked_output_tokens + tracked_reasoning_tokens) as f64 / active_seconds),
+        overall_visible_tps: (active_seconds > 0.0)
+            .then_some(tracked_output_tokens as f64 / active_seconds),
+        cache_hit_ratio: finalize_metric_stats(cache_hit_ratio_values),
+        reasoning_share: finalize_metric_stats(reasoning_share_values),
+        total_messages: (total_messages > 0).then_some(total_messages),
+        user_messages: (user_messages > 0).then_some(user_messages),
+        assistant_messages: (assistant_messages > 0).then_some(assistant_messages),
+        developer_messages: (developer_messages > 0).then_some(developer_messages),
+    });
+    let total_sessions = (!session_ids.is_empty()).then_some(session_ids.len() as u64);
+    let total_messages_metadata = summary_metrics
+        .as_ref()
+        .and_then(|metrics| metrics.total_messages);
 
     UsageSummary {
         schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
@@ -3217,24 +3376,82 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             confidence: Confidence::Medium,
         },
         parse_evidence: None,
+        project: first
+            .project
+            .as_ref()
+            .filter(|project| project_has_stable_identity(project))
+            .cloned(),
         privacy: PrivacyInfo {
             mode: PrivacyMode::MetadataOnly,
             contains_prompt_text: false,
             contains_response_text: false,
             contains_file_paths: false,
         },
+        metrics: summary_metrics,
         period_start: Some(period_start),
         period_end: Some(period_end),
         observed_at,
         metadata: SummaryMetadata {
             summary_format: "daily_rollup.v1".to_string(),
-            summary_version: Some("2".to_string()),
-            total_sessions: None,
-            total_messages: None,
+            summary_version: Some(SYNC_ROLLUP_SUMMARY_VERSION.to_string()),
+            total_sessions,
+            total_messages: total_messages_metadata,
             last_computed_at: Some(observed_at),
         },
         imported_at: observed_at,
     }
+}
+
+fn finalize_metric_stats(mut values: Vec<f64>) -> Option<MetricStats> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let samples = values.len() as u64;
+    let sum = values.iter().copied().sum::<f64>();
+    Some(MetricStats {
+        samples,
+        avg: Some(sum / samples as f64),
+        min: values.first().copied(),
+        max: values.last().copied(),
+        p50: percentile_nearest_rank(&values, 0.50),
+        p95: percentile_nearest_rank(&values, 0.95),
+        sum: Some(sum),
+    })
+}
+
+fn runtime_latency_supports_distribution_metrics(runtime: &statsai_core::RuntimeInfo) -> bool {
+    !matches!(runtime.latency_source, Some(LatencySource::Inferred))
+}
+
+fn percentile_nearest_rank(values: &[f64], percentile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let rank = ((values.len() as f64) * percentile).ceil() as usize;
+    values
+        .get(rank.saturating_sub(1).min(values.len().saturating_sub(1)))
+        .copied()
+}
+
+fn summary_metrics_or_none(metrics: SummaryMetrics) -> Option<SummaryMetrics> {
+    let has_metrics = metrics.active_seconds.is_some()
+        || metrics.tracked_requests.is_some()
+        || metrics.tracked_output_tokens.is_some()
+        || metrics.tracked_reasoning_tokens.is_some()
+        || metrics.latency_ms.is_some()
+        || metrics.time_to_first_token_ms.is_some()
+        || metrics.generated_tps.is_some()
+        || metrics.visible_tps.is_some()
+        || metrics.overall_generated_tps.is_some()
+        || metrics.overall_visible_tps.is_some()
+        || metrics.cache_hit_ratio.is_some()
+        || metrics.reasoning_share.is_some()
+        || metrics.total_messages.is_some()
+        || metrics.user_messages.is_some()
+        || metrics.assistant_messages.is_some()
+        || metrics.developer_messages.is_some();
+    has_metrics.then_some(metrics)
 }
 
 #[derive(Debug, Default)]
@@ -3315,11 +3532,13 @@ fn parse_rfc3339_for_row(value: &str, index: usize) -> rusqlite::Result<DateTime
 }
 
 fn event_fingerprint(event: &UsageEvent) -> String {
+    let project_key = path_independent_project_key(event);
     semantic_event_fingerprint(&SemanticFingerprintInput {
         provider: &event.provider,
         source_id: &event.source_id,
         started_at: event.session.started_at,
         session_hash: session_hash_for_fingerprint(event),
+        project_key: project_key.as_deref(),
         model_name: event
             .model
             .as_ref()
@@ -3334,19 +3553,56 @@ fn event_fingerprint(event: &UsageEvent) -> String {
 }
 
 fn semantically_same_event(left: &UsageEvent, right: &UsageEvent) -> bool {
-    let session_matches =
-        if uses_path_independent_codex_dedupe(left) && uses_path_independent_codex_dedupe(right) {
-            true
-        } else {
-            left.session.local_session_id_hash == right.session.local_session_id_hash
-        };
+    let uses_path_independent =
+        uses_path_independent_codex_dedupe(left) && uses_path_independent_codex_dedupe(right);
+    let session_matches = if uses_path_independent {
+        true
+    } else {
+        left.session.local_session_id_hash == right.session.local_session_id_hash
+    };
+    let project_matches = if uses_path_independent {
+        path_independent_projects_match(left, right)
+    } else {
+        true
+    };
     left.provider == right.provider
         && left.source_id == right.source_id
         && left.session.started_at == right.session.started_at
         && session_matches
+        && project_matches
         && model_key(left) == model_key(right)
         && usage_counts_equivalent(&left.provider, &left.usage, &right.usage)
         && left.usage.computed_total() == right.usage.computed_total()
+}
+
+fn path_independent_projects_match(left: &UsageEvent, right: &UsageEvent) -> bool {
+    let left_key = path_independent_project_key(left);
+    let right_key = path_independent_project_key(right);
+    left_key == right_key
+        || legacy_opaque_path_independent_project_match(left, right_key.as_deref())
+        || legacy_opaque_path_independent_project_match(right, left_key.as_deref())
+}
+
+fn legacy_opaque_path_independent_project_match(
+    legacy_candidate: &UsageEvent,
+    other_project_key: Option<&str>,
+) -> bool {
+    other_project_key.is_some_and(|project_key| {
+        project_key != "none"
+            && legacy_candidate
+                .parse_evidence
+                .as_ref()
+                .map(|evidence| evidence.event_key_version.as_str())
+                != Some("semantic_usage_event.v4")
+            && match legacy_candidate.project.as_ref() {
+                None => true,
+                Some(project) => {
+                    project.repo_remote_hash.is_none()
+                        && project.path_hash.is_none()
+                        && project.branch_hash.is_none()
+                }
+            }
+    })
 }
 
 fn usage_counts_equivalent(provider: &str, left: &UsageCounts, right: &UsageCounts) -> bool {
@@ -3401,13 +3657,21 @@ fn session_hash_for_fingerprint(event: &UsageEvent) -> Option<&str> {
     }
 }
 
+fn path_independent_project_key(event: &UsageEvent) -> Option<String> {
+    uses_path_independent_codex_dedupe(event)
+        .then(|| sync_rollup_project_key(event.project.as_ref()))
+}
+
 fn uses_path_independent_codex_dedupe(event: &UsageEvent) -> bool {
     event.provider == "codex"
         && event
             .parse_evidence
             .as_ref()
             .and_then(|evidence| evidence.source_record_id.as_deref())
-            .is_some_and(|record_id| record_id.contains(":codex_token_count:"))
+            .is_some_and(|record_id| {
+                record_id.contains(":codex_token_count:")
+                    || record_id.contains(":codex_turn_usage:")
+            })
 }
 
 #[cfg(test)]
@@ -3416,8 +3680,9 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use statsai_core::{
         event_id, summary_id, Confidence, CostInfo, EventSource, LocationOrigin, ModelInfo,
-        ParseEvidence, PrivacyInfo, PrivacyMode, SessionInfo, SourceKind, SummaryMetadata,
-        UsageCounts, UsageSummary, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+        ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, SessionInfo, SourceKind,
+        SummaryMetadata, UsageCounts, UsageSummary, USAGE_EVENT_SCHEMA_VERSION,
+        USAGE_SUMMARY_SCHEMA_VERSION,
     };
     use std::path::Path;
 
@@ -3550,6 +3815,43 @@ mod tests {
     }
 
     #[test]
+    fn store_strips_bare_project_identity_from_events_and_rollups() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-bare-project"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 5, 9, 0, 0)
+            .single()
+            .expect("now");
+        let mut event = test_store_event(&source, now, "bare-project");
+        event.project = Some(ProjectInfo {
+            project_id: "project_bare".to_string(),
+            project_label: Some("Bare".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: None,
+            path_label: None,
+        });
+
+        assert!(store.insert_event(&event).expect("insert"));
+        let events = store.events().expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].project, None);
+
+        let rollups = store.dirty_sync_rollup_summaries().expect("rollups");
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].project, None);
+    }
+
+    #[test]
     fn refreshes_semantic_duplicate_with_new_event_id_without_double_counting() {
         let store = Store::in_memory().expect("store");
         let source = statsai_core::SourceLocation::local_adapter(
@@ -3632,6 +3934,7 @@ mod tests {
             source_id: &old_event.source_id,
             started_at: old_event.session.started_at,
             session_hash: old_event.session.local_session_id_hash.as_deref(),
+            project_key: None,
             model_name: model_key(&old_event),
             input_tokens: old_event.usage.input_tokens,
             cache_read_tokens: old_event.usage.cache_read_tokens,
@@ -3651,6 +3954,550 @@ mod tests {
         assert!(!store
             .insert_event(&new_event)
             .expect("refresh legacy duplicate"));
+        assert_eq!(store.event_count().expect("count"), 1);
+        assert_eq!(
+            store.events().expect("events")[0].event_id,
+            old_event.event_id
+        );
+    }
+
+    #[test]
+    fn refreshes_legacy_projectless_codex_token_count_without_double_counting() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-token-count-project-upgrade"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let project = ProjectInfo {
+            project_id: "project_shared".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("starkdmi/statsai".to_string()),
+            branch_hash: Some("branch-hash".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+        };
+
+        let mut old_event = test_store_event(&source, now, "legacy-projectless-record");
+        old_event.session.session_id = "session-a".to_string();
+        old_event.session.local_session_id_hash = Some("session-a".to_string());
+        old_event.model = Some(ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        });
+        old_event.project = None;
+        old_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v2".to_string(),
+            source_file_path_hash: Some("active-hash".to_string()),
+            source_line_number: Some(12),
+            source_record_id: Some(
+                "semantic_usage_event.v2:codex_token_count:1715510400000:gpt-5:12:0:3:0:15"
+                    .to_string(),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+
+        let mut new_event = old_event.clone();
+        new_event.event_id = event_id(
+            "codex",
+            &source.source_id,
+            "modern-projectful-record",
+            None,
+            now,
+        );
+        new_event.session.session_id = "session-b".to_string();
+        new_event.session.local_session_id_hash = Some("session-b".to_string());
+        new_event.project = Some(project.clone());
+        new_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v4".to_string(),
+            source_file_path_hash: Some("branch-hash".to_string()),
+            source_line_number: Some(48),
+            source_record_id: Some(format!(
+                "semantic_usage_event.v4:codex_token_count:{}:1715510400000:gpt-5:12:0:3:0:15",
+                project_bucket_key(Some(&project))
+            )),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+
+        assert!(store.insert_event(&old_event).expect("insert old"));
+        let legacy_fingerprint = semantic_event_fingerprint(&SemanticFingerprintInput {
+            provider: &old_event.provider,
+            source_id: &old_event.source_id,
+            started_at: old_event.session.started_at,
+            session_hash: old_event.session.local_session_id_hash.as_deref(),
+            project_key: None,
+            model_name: model_key(&old_event),
+            input_tokens: old_event.usage.input_tokens,
+            cache_read_tokens: old_event.usage.cache_read_tokens,
+            cache_creation_tokens: old_event.usage.cache_creation_tokens,
+            output_tokens: old_event.usage.output_tokens,
+            reasoning_tokens: old_event.usage.reasoning_tokens,
+            total_tokens: old_event.usage.computed_total(),
+        });
+        store
+            .conn
+            .execute(
+                "UPDATE usage_events SET semantic_fingerprint = ?1 WHERE event_id = ?2",
+                params![legacy_fingerprint, &old_event.event_id.0],
+            )
+            .expect("downgrade fingerprint");
+
+        assert!(!store
+            .insert_event(&new_event)
+            .expect("refresh legacy projectless duplicate"));
+        assert_eq!(store.event_count().expect("count"), 1);
+        assert_eq!(
+            store.events().expect("events")[0].event_id,
+            old_event.event_id
+        );
+    }
+
+    #[test]
+    fn refreshes_legacy_codex_turn_usage_duplicate_without_double_counting() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-turn-usage"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let project = ProjectInfo {
+            project_id: "project_shared".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("starkdmi/statsai".to_string()),
+            branch_hash: Some("branch-hash".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+        };
+
+        let mut old_event = test_store_event(&source, now, "legacy-record");
+        old_event.session.session_id = "session-a".to_string();
+        old_event.session.local_session_id_hash = Some("session-a".to_string());
+        old_event.project = Some(project.clone());
+        old_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v3".to_string(),
+            source_file_path_hash: Some("active-hash".to_string()),
+            source_line_number: Some(12),
+            source_record_id: Some(
+                format!(
+                    "semantic_usage_event.v3:codex_turn_usage:{}:1715510400000:1715510405000:gpt-5:12:0:3:0:15",
+                    project.project_id
+                ),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+        old_event.model = Some(ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        });
+        old_event.session.ended_at = Some(now + chrono::Duration::seconds(5));
+        old_event.session.duration_seconds = Some(5);
+
+        let mut new_event = old_event.clone();
+        new_event.event_id = event_id("codex", &source.source_id, "modern-record", None, now);
+        new_event.session.session_id = "session-b".to_string();
+        new_event.session.local_session_id_hash = Some("session-b".to_string());
+        new_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v4".to_string(),
+            source_file_path_hash: Some("branch-hash".to_string()),
+            source_line_number: Some(48),
+            source_record_id: Some(
+                format!(
+                    "semantic_usage_event.v4:codex_turn_usage:{}:1715510400000:1715510405000:gpt-5:12:0:3:0:15",
+                    project_bucket_key(Some(&project))
+                ),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+
+        assert!(store.insert_event(&old_event).expect("insert old"));
+        let legacy_fingerprint = semantic_event_fingerprint(&SemanticFingerprintInput {
+            provider: &old_event.provider,
+            source_id: &old_event.source_id,
+            started_at: old_event.session.started_at,
+            session_hash: old_event.session.local_session_id_hash.as_deref(),
+            project_key: Some("repo:repo-hash|path:path-hash"),
+            model_name: model_key(&old_event),
+            input_tokens: old_event.usage.input_tokens,
+            cache_read_tokens: old_event.usage.cache_read_tokens,
+            cache_creation_tokens: old_event.usage.cache_creation_tokens,
+            output_tokens: old_event.usage.output_tokens,
+            reasoning_tokens: old_event.usage.reasoning_tokens,
+            total_tokens: old_event.usage.computed_total(),
+        });
+        store
+            .conn
+            .execute(
+                "UPDATE usage_events SET semantic_fingerprint = ?1 WHERE event_id = ?2",
+                params![legacy_fingerprint, &old_event.event_id.0],
+            )
+            .expect("downgrade fingerprint");
+
+        assert!(!store
+            .insert_event(&new_event)
+            .expect("refresh legacy duplicate"));
+        assert_eq!(store.event_count().expect("count"), 1);
+        assert_eq!(
+            store.events().expect("events")[0].event_id,
+            old_event.event_id
+        );
+    }
+
+    #[test]
+    fn refreshes_legacy_projectless_codex_turn_usage_without_double_counting() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-turn-usage-project-upgrade"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let project = ProjectInfo {
+            project_id: "project_shared".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("starkdmi/statsai".to_string()),
+            branch_hash: Some("branch-hash".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+        };
+
+        let mut old_event = test_store_event(&source, now, "legacy-projectless-turn");
+        old_event.session.session_id = "session-a".to_string();
+        old_event.session.local_session_id_hash = Some("session-a".to_string());
+        old_event.project = None;
+        old_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v3".to_string(),
+            source_file_path_hash: Some("active-hash".to_string()),
+            source_line_number: Some(12),
+            source_record_id: Some(
+                "semantic_usage_event.v3:codex_turn_usage:1715510400000:1715510405000:gpt-5:12:0:3:0:15"
+                    .to_string(),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+        old_event.model = Some(ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        });
+        old_event.session.ended_at = Some(now + chrono::Duration::seconds(5));
+        old_event.session.duration_seconds = Some(5);
+
+        let mut new_event = old_event.clone();
+        new_event.event_id = event_id(
+            "codex",
+            &source.source_id,
+            "modern-projectful-turn",
+            None,
+            now,
+        );
+        new_event.session.session_id = "session-b".to_string();
+        new_event.session.local_session_id_hash = Some("session-b".to_string());
+        new_event.project = Some(project.clone());
+        new_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v4".to_string(),
+            source_file_path_hash: Some("branch-hash".to_string()),
+            source_line_number: Some(48),
+            source_record_id: Some(
+                format!(
+                    "semantic_usage_event.v4:codex_turn_usage:{}:1715510400000:1715510405000:gpt-5:12:0:3:0:15",
+                    project_bucket_key(Some(&project))
+                ),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+
+        assert!(store.insert_event(&old_event).expect("insert old"));
+        let legacy_fingerprint = semantic_event_fingerprint(&SemanticFingerprintInput {
+            provider: &old_event.provider,
+            source_id: &old_event.source_id,
+            started_at: old_event.session.started_at,
+            session_hash: old_event.session.local_session_id_hash.as_deref(),
+            project_key: None,
+            model_name: model_key(&old_event),
+            input_tokens: old_event.usage.input_tokens,
+            cache_read_tokens: old_event.usage.cache_read_tokens,
+            cache_creation_tokens: old_event.usage.cache_creation_tokens,
+            output_tokens: old_event.usage.output_tokens,
+            reasoning_tokens: old_event.usage.reasoning_tokens,
+            total_tokens: old_event.usage.computed_total(),
+        });
+        store
+            .conn
+            .execute(
+                "UPDATE usage_events SET semantic_fingerprint = ?1 WHERE event_id = ?2",
+                params![legacy_fingerprint, &old_event.event_id.0],
+            )
+            .expect("downgrade fingerprint");
+
+        assert!(!store
+            .insert_event(&new_event)
+            .expect("refresh legacy projectless turn duplicate"));
+        assert_eq!(store.event_count().expect("count"), 1);
+        assert_eq!(
+            store.events().expect("events")[0].event_id,
+            old_event.event_id
+        );
+    }
+
+    #[test]
+    fn refreshes_legacy_project_id_only_codex_token_count_without_double_counting() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-token-count-project-id-upgrade"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let legacy_project = ProjectInfo {
+            project_id: "project_shared".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: None,
+            path_label: None,
+        };
+        let project = ProjectInfo {
+            project_id: "project_shared".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("starkdmi/statsai".to_string()),
+            branch_hash: Some("branch-hash".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+        };
+
+        let mut old_event = test_store_event(&source, now, "legacy-project-id-token-count");
+        old_event.session.session_id = "session-a".to_string();
+        old_event.session.local_session_id_hash = Some("session-a".to_string());
+        old_event.model = Some(ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        });
+        old_event.project = Some(legacy_project.clone());
+        old_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v2".to_string(),
+            source_file_path_hash: Some("active-hash".to_string()),
+            source_line_number: Some(12),
+            source_record_id: Some(format!(
+                "semantic_usage_event.v2:codex_token_count:{}:1715510400000:gpt-5:12:0:3:0:15",
+                legacy_project.project_id
+            )),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+
+        let mut new_event = old_event.clone();
+        new_event.event_id = event_id(
+            "codex",
+            &source.source_id,
+            "modern-projectful-token-count",
+            None,
+            now,
+        );
+        new_event.session.session_id = "session-b".to_string();
+        new_event.session.local_session_id_hash = Some("session-b".to_string());
+        new_event.project = Some(project.clone());
+        new_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v4".to_string(),
+            source_file_path_hash: Some("branch-hash".to_string()),
+            source_line_number: Some(48),
+            source_record_id: Some(format!(
+                "semantic_usage_event.v4:codex_token_count:{}:1715510400000:gpt-5:12:0:3:0:15",
+                project_bucket_key(Some(&project))
+            )),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+
+        assert!(store.insert_event(&old_event).expect("insert old"));
+        let legacy_fingerprint = semantic_event_fingerprint(&SemanticFingerprintInput {
+            provider: &old_event.provider,
+            source_id: &old_event.source_id,
+            started_at: old_event.session.started_at,
+            session_hash: old_event.session.local_session_id_hash.as_deref(),
+            project_key: Some(legacy_project.project_id.as_str()),
+            model_name: model_key(&old_event),
+            input_tokens: old_event.usage.input_tokens,
+            cache_read_tokens: old_event.usage.cache_read_tokens,
+            cache_creation_tokens: old_event.usage.cache_creation_tokens,
+            output_tokens: old_event.usage.output_tokens,
+            reasoning_tokens: old_event.usage.reasoning_tokens,
+            total_tokens: old_event.usage.computed_total(),
+        });
+        store
+            .conn
+            .execute(
+                "UPDATE usage_events SET semantic_fingerprint = ?1 WHERE event_id = ?2",
+                params![legacy_fingerprint, &old_event.event_id.0],
+            )
+            .expect("downgrade fingerprint");
+
+        assert!(!store
+            .insert_event(&new_event)
+            .expect("refresh legacy project-id duplicate"));
+        assert_eq!(store.event_count().expect("count"), 1);
+        assert_eq!(
+            store.events().expect("events")[0].event_id,
+            old_event.event_id
+        );
+    }
+
+    #[test]
+    fn refreshes_legacy_project_id_only_codex_turn_usage_without_double_counting() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-turn-usage-project-id-upgrade"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let legacy_project = ProjectInfo {
+            project_id: "project_shared".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: None,
+            path_label: None,
+        };
+        let project = ProjectInfo {
+            project_id: "project_shared".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("starkdmi/statsai".to_string()),
+            branch_hash: Some("branch-hash".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+        };
+
+        let mut old_event = test_store_event(&source, now, "legacy-project-id-turn");
+        old_event.session.session_id = "session-a".to_string();
+        old_event.session.local_session_id_hash = Some("session-a".to_string());
+        old_event.project = Some(legacy_project.clone());
+        old_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v3".to_string(),
+            source_file_path_hash: Some("active-hash".to_string()),
+            source_line_number: Some(12),
+            source_record_id: Some(
+                format!(
+                    "semantic_usage_event.v3:codex_turn_usage:{}:1715510400000:1715510405000:gpt-5:12:0:3:0:15",
+                    legacy_project.project_id
+                ),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+        old_event.model = Some(ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        });
+        old_event.session.ended_at = Some(now + chrono::Duration::seconds(5));
+        old_event.session.duration_seconds = Some(5);
+
+        let mut new_event = old_event.clone();
+        new_event.event_id = event_id(
+            "codex",
+            &source.source_id,
+            "modern-projectful-turn",
+            None,
+            now,
+        );
+        new_event.session.session_id = "session-b".to_string();
+        new_event.session.local_session_id_hash = Some("session-b".to_string());
+        new_event.project = Some(project.clone());
+        new_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v4".to_string(),
+            source_file_path_hash: Some("branch-hash".to_string()),
+            source_line_number: Some(48),
+            source_record_id: Some(
+                format!(
+                    "semantic_usage_event.v4:codex_turn_usage:{}:1715510400000:1715510405000:gpt-5:12:0:3:0:15",
+                    project_bucket_key(Some(&project))
+                ),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+
+        assert!(store.insert_event(&old_event).expect("insert old"));
+        let legacy_fingerprint = semantic_event_fingerprint(&SemanticFingerprintInput {
+            provider: &old_event.provider,
+            source_id: &old_event.source_id,
+            started_at: old_event.session.started_at,
+            session_hash: old_event.session.local_session_id_hash.as_deref(),
+            project_key: Some(legacy_project.project_id.as_str()),
+            model_name: model_key(&old_event),
+            input_tokens: old_event.usage.input_tokens,
+            cache_read_tokens: old_event.usage.cache_read_tokens,
+            cache_creation_tokens: old_event.usage.cache_creation_tokens,
+            output_tokens: old_event.usage.output_tokens,
+            reasoning_tokens: old_event.usage.reasoning_tokens,
+            total_tokens: old_event.usage.computed_total(),
+        });
+        store
+            .conn
+            .execute(
+                "UPDATE usage_events SET semantic_fingerprint = ?1 WHERE event_id = ?2",
+                params![legacy_fingerprint, &old_event.event_id.0],
+            )
+            .expect("downgrade fingerprint");
+
+        assert!(!store
+            .insert_event(&new_event)
+            .expect("refresh legacy project-id duplicate"));
         assert_eq!(store.event_count().expect("count"), 1);
         assert_eq!(
             store.events().expect("events")[0].event_id,
@@ -3892,7 +4739,10 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].usage.total_tokens, Some(15));
         assert_eq!(dirty[0].metadata.summary_format, "daily_rollup.v1");
-        assert_eq!(dirty[0].metadata.summary_version.as_deref(), Some("2"));
+        assert_eq!(
+            dirty[0].metadata.summary_version.as_deref(),
+            Some(SYNC_ROLLUP_SUMMARY_VERSION)
+        );
         assert_eq!(
             dirty[0]
                 .period_start
@@ -3938,6 +4788,509 @@ mod tests {
         assert_eq!(dirty[0].models.len(), 2);
         assert_eq!(dirty[0].models[0].usage.total_tokens, Some(25));
         assert_eq!(dirty[0].models[1].usage.total_tokens, Some(15));
+        assert_eq!(dirty[0].metadata.total_sessions, Some(1));
+    }
+
+    #[test]
+    fn sync_rollups_split_same_day_usage_by_project_location() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-sync-projects"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let day = Utc
+            .with_ymd_and_hms(2026, 6, 1, 9, 0, 0)
+            .single()
+            .expect("day");
+        let account_id = statsai_core::provider_account_id("codex", "personal");
+
+        let mut first = test_store_event(&source, day, "record-project-a");
+        first.provider_account_id = Some(account_id.clone());
+        first.usage.total_tokens = Some(10);
+        first.project = Some(statsai_core::ProjectInfo {
+            project_id: "project-a".to_string(),
+            project_label: Some("Project A".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: Some("branch-main".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-a".to_string()),
+            path_label: Some("/tmp/project-a".to_string()),
+        });
+
+        let mut second = test_store_event(
+            &source,
+            day + chrono::Duration::hours(1),
+            "record-project-b",
+        );
+        second.provider_account_id = Some(account_id);
+        second.usage.total_tokens = Some(20);
+        second.project = Some(statsai_core::ProjectInfo {
+            project_id: "project-b".to_string(),
+            project_label: Some("Project B".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: Some("branch-main".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-b".to_string()),
+            path_label: Some("/tmp/project-b".to_string()),
+        });
+
+        assert!(store.insert_event(&first).expect("insert first"));
+        assert!(store.insert_event(&second).expect("insert second"));
+
+        let dirty = store
+            .dirty_sync_rollup_summaries()
+            .expect("dirty rollups after project split");
+        assert_eq!(dirty.len(), 2);
+        assert_ne!(dirty[0].summary_id, dirty[1].summary_id);
+        assert_ne!(dirty[0].project, dirty[1].project);
+        assert_eq!(
+            dirty
+                .iter()
+                .map(|summary| summary.usage.total_tokens.unwrap_or(0))
+                .sum::<u64>(),
+            30
+        );
+    }
+
+    #[test]
+    fn sync_rollups_split_same_day_usage_by_branch() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-sync-branches"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let day = Utc
+            .with_ymd_and_hms(2026, 6, 1, 9, 0, 0)
+            .single()
+            .expect("day");
+        let account_id = statsai_core::provider_account_id("codex", "personal");
+
+        let mut first = test_store_event(&source, day, "record-branch-main");
+        first.provider_account_id = Some(account_id.clone());
+        first.usage.total_tokens = Some(10);
+        first.project = Some(statsai_core::ProjectInfo {
+            project_id: "project-shared".to_string(),
+            project_label: Some("Project".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: Some("branch-main".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-shared".to_string()),
+            path_label: Some("/tmp/project".to_string()),
+        });
+
+        let mut second = test_store_event(
+            &source,
+            day + chrono::Duration::hours(1),
+            "record-branch-feature",
+        );
+        second.provider_account_id = Some(account_id);
+        second.usage.total_tokens = Some(20);
+        second.project = Some(statsai_core::ProjectInfo {
+            project_id: "project-shared".to_string(),
+            project_label: Some("Project".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: Some("branch-feature".to_string()),
+            branch_label: Some("feature-x".to_string()),
+            path_hash: Some("path-shared".to_string()),
+            path_label: Some("/tmp/project".to_string()),
+        });
+
+        assert!(store.insert_event(&first).expect("insert first"));
+        assert!(store.insert_event(&second).expect("insert second"));
+
+        let dirty = store
+            .dirty_sync_rollup_summaries()
+            .expect("dirty rollups after branch split");
+        assert_eq!(dirty.len(), 2);
+
+        let mut branches = dirty
+            .iter()
+            .map(|summary| {
+                summary
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.branch_label.clone())
+                    .expect("branch")
+            })
+            .collect::<Vec<_>>();
+        branches.sort();
+
+        assert_eq!(branches, vec!["feature-x".to_string(), "main".to_string()]);
+    }
+
+    #[test]
+    fn path_independent_codex_events_keep_distinct_branches() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-branch-dedupe"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut main = test_store_event(&source, now, "branch-main");
+        main.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v4".to_string(),
+            source_file_path_hash: Some("main-hash".to_string()),
+            source_line_number: Some(12),
+            source_record_id: Some(
+                "semantic_usage_event.v4:codex_turn_usage:repo:repo-hash|path:path-shared|branch:branch-main:1715510400000:1715510405000:gpt-5:12:0:3:0:15"
+                    .to_string(),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+        main.model = Some(ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        });
+        main.project = Some(ProjectInfo {
+            project_id: "project-shared".to_string(),
+            project_label: Some("Project".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: Some("branch-main".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-shared".to_string()),
+            path_label: Some("/tmp/project".to_string()),
+        });
+
+        let mut feature = main.clone();
+        feature.event_id = event_id("codex", &source.source_id, "branch-feature", None, now);
+        feature.source.source_record_id = Some("branch-feature".to_string());
+        feature.project = Some(ProjectInfo {
+            project_id: "project-shared".to_string(),
+            project_label: Some("Project".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: Some("branch-feature".to_string()),
+            branch_label: Some("feature-x".to_string()),
+            path_hash: Some("path-shared".to_string()),
+            path_label: Some("/tmp/project".to_string()),
+        });
+        feature.parse_evidence = Some(ParseEvidence {
+            event_key_version: "semantic_usage_event.v4".to_string(),
+            source_file_path_hash: Some("feature-hash".to_string()),
+            source_line_number: Some(18),
+            source_record_id: Some(
+                "semantic_usage_event.v4:codex_turn_usage:repo:repo-hash|path:path-shared|branch:branch-feature:1715510400000:1715510405000:gpt-5:12:0:3:0:15"
+                    .to_string(),
+            ),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+
+        assert!(store.insert_event(&main).expect("insert main"));
+        assert!(store.insert_event(&feature).expect("insert feature"));
+        assert_eq!(store.event_count().expect("count"), 2);
+    }
+
+    #[test]
+    fn sync_rollups_capture_daily_runtime_metrics() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-sync-metrics"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let day = Utc
+            .with_ymd_and_hms(2026, 5, 29, 9, 0, 0)
+            .single()
+            .expect("day");
+        let mut first = test_store_event(&source, day, "metrics-a");
+        first.session.session_id = "session-a".to_string();
+        first.session.local_session_id_hash = Some("session-a".to_string());
+        first.usage = UsageCounts {
+            input_tokens: Some(60),
+            output_tokens: Some(30),
+            cache_read_tokens: Some(20),
+            reasoning_tokens: Some(10),
+            total_tokens: Some(120),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        first.runtime = Some(statsai_core::RuntimeInfo {
+            runtime_name: None,
+            host_id: None,
+            latency_ms: Some(5000),
+            latency_source: Some(LatencySource::Explicit),
+            time_to_first_token_ms: Some(1200),
+            prompt_eval_duration_ms: None,
+            eval_duration_ms: None,
+            total_messages: Some(2),
+            user_messages: Some(1),
+            assistant_messages: Some(1),
+            developer_messages: Some(0),
+        });
+
+        let mut second = test_store_event(&source, day + chrono::Duration::minutes(2), "metrics-b");
+        second.session.session_id = "session-b".to_string();
+        second.session.local_session_id_hash = Some("session-b".to_string());
+        second.usage = UsageCounts {
+            input_tokens: Some(40),
+            output_tokens: Some(20),
+            cache_read_tokens: Some(10),
+            reasoning_tokens: Some(0),
+            total_tokens: Some(70),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        second.runtime = Some(statsai_core::RuntimeInfo {
+            runtime_name: None,
+            host_id: None,
+            latency_ms: Some(3000),
+            latency_source: Some(LatencySource::Explicit),
+            time_to_first_token_ms: Some(800),
+            prompt_eval_duration_ms: None,
+            eval_duration_ms: None,
+            total_messages: Some(3),
+            user_messages: Some(1),
+            assistant_messages: Some(2),
+            developer_messages: Some(0),
+        });
+
+        assert!(store.insert_event(&first).expect("insert first"));
+        assert!(store.insert_event(&second).expect("insert second"));
+
+        let dirty = store
+            .dirty_sync_rollup_summaries()
+            .expect("dirty rollups after metrics");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(
+            dirty[0].metadata.summary_version.as_deref(),
+            Some(SYNC_ROLLUP_SUMMARY_VERSION)
+        );
+        assert_eq!(dirty[0].metadata.total_sessions, Some(2));
+        assert_eq!(dirty[0].metadata.total_messages, Some(5));
+        let metrics = dirty[0].metrics.as_ref().expect("metrics");
+        assert_eq!(metrics.active_seconds, Some(8.0));
+        assert_eq!(metrics.tracked_requests, Some(2));
+        assert_eq!(metrics.tracked_output_tokens, Some(50));
+        assert_eq!(metrics.tracked_reasoning_tokens, Some(10));
+        assert_eq!(metrics.total_messages, Some(5));
+        assert_eq!(metrics.user_messages, Some(2));
+        assert_eq!(metrics.assistant_messages, Some(3));
+        assert_eq!(
+            metrics.latency_ms.as_ref().map(|value| value.samples),
+            Some(2)
+        );
+        assert_eq!(
+            metrics.latency_ms.as_ref().and_then(|value| value.min),
+            Some(3000.0)
+        );
+        assert_eq!(
+            metrics.latency_ms.as_ref().and_then(|value| value.max),
+            Some(5000.0)
+        );
+        assert_eq!(
+            metrics
+                .time_to_first_token_ms
+                .as_ref()
+                .and_then(|value| value.avg),
+            Some(1000.0)
+        );
+        assert_eq!(
+            metrics.generated_tps.as_ref().and_then(|value| value.min),
+            Some(20.0 / 3.0)
+        );
+        assert_eq!(metrics.overall_generated_tps, Some(7.5));
+        assert_eq!(metrics.overall_visible_tps, Some(6.25));
+    }
+
+    #[test]
+    fn dirty_sync_rollups_rebuild_stale_summary_versions() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-stale-rollups"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 4, 10, 0, 0)
+            .single()
+            .expect("now");
+
+        let mut event = test_store_event(&source, now, "stale-a");
+        event.usage = UsageCounts {
+            output_tokens: Some(12),
+            reasoning_tokens: Some(3),
+            total_tokens: Some(15),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        event.runtime = Some(statsai_core::RuntimeInfo {
+            runtime_name: None,
+            host_id: None,
+            latency_ms: Some(2000),
+            latency_source: Some(LatencySource::Explicit),
+            time_to_first_token_ms: Some(500),
+            prompt_eval_duration_ms: None,
+            eval_duration_ms: None,
+            total_messages: Some(2),
+            user_messages: Some(1),
+            assistant_messages: Some(1),
+            developer_messages: Some(0),
+        });
+        assert!(store.insert_event(&event).expect("insert"));
+
+        let initial = store.dirty_sync_rollup_summaries().expect("dirty initial");
+        assert_eq!(
+            initial[0].metadata.summary_version.as_deref(),
+            Some(SYNC_ROLLUP_SUMMARY_VERSION)
+        );
+        store
+            .mark_sync_rollups_synced(&[initial[0].summary_id.clone()])
+            .expect("mark synced");
+        store
+            .conn
+            .execute(
+                "UPDATE sync_rollups SET payload = json_set(payload, '$.metadata.summary_version', '3'), dirty = 0",
+                [],
+            )
+            .expect("downgrade payload version");
+
+        let rebuilt = store
+            .dirty_sync_rollup_summaries()
+            .expect("dirty after rebuild");
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(
+            rebuilt[0].metadata.summary_version.as_deref(),
+            Some(SYNC_ROLLUP_SUMMARY_VERSION)
+        );
+        let metrics = rebuilt[0].metrics.as_ref().expect("metrics");
+        assert_eq!(metrics.tracked_requests, Some(1));
+        assert_eq!(metrics.tracked_output_tokens, Some(12));
+        assert_eq!(metrics.tracked_reasoning_tokens, Some(3));
+        assert_eq!(metrics.overall_generated_tps, Some(7.5));
+        assert_eq!(metrics.overall_visible_tps, Some(6.0));
+    }
+
+    #[test]
+    fn sync_rollups_exclude_inferred_latency_from_per_turn_sample_metrics() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-sync-inferred-latency"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let day = Utc
+            .with_ymd_and_hms(2026, 6, 1, 9, 0, 0)
+            .single()
+            .expect("day");
+
+        let mut explicit = test_store_event(&source, day, "explicit-runtime");
+        explicit.session.session_id = "session-explicit".to_string();
+        explicit.session.local_session_id_hash = Some("session-explicit".to_string());
+        explicit.usage = UsageCounts {
+            output_tokens: Some(30),
+            reasoning_tokens: Some(10),
+            total_tokens: Some(40),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        explicit.runtime = Some(statsai_core::RuntimeInfo {
+            runtime_name: None,
+            host_id: None,
+            latency_ms: Some(5000),
+            latency_source: Some(LatencySource::Explicit),
+            time_to_first_token_ms: Some(1200),
+            prompt_eval_duration_ms: None,
+            eval_duration_ms: None,
+            total_messages: Some(2),
+            user_messages: Some(1),
+            assistant_messages: Some(1),
+            developer_messages: Some(0),
+        });
+
+        let mut inferred = test_store_event(
+            &source,
+            day + chrono::Duration::minutes(5),
+            "inferred-runtime",
+        );
+        inferred.session.session_id = "session-inferred".to_string();
+        inferred.session.local_session_id_hash = Some("session-inferred".to_string());
+        inferred.usage = UsageCounts {
+            output_tokens: Some(700),
+            reasoning_tokens: Some(300),
+            total_tokens: Some(1000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        inferred.runtime = Some(statsai_core::RuntimeInfo {
+            runtime_name: None,
+            host_id: None,
+            latency_ms: Some(100),
+            latency_source: Some(LatencySource::Inferred),
+            time_to_first_token_ms: None,
+            prompt_eval_duration_ms: None,
+            eval_duration_ms: None,
+            total_messages: Some(2),
+            user_messages: Some(1),
+            assistant_messages: Some(1),
+            developer_messages: Some(0),
+        });
+
+        assert!(store.insert_event(&explicit).expect("insert explicit"));
+        assert!(store.insert_event(&inferred).expect("insert inferred"));
+
+        let dirty = store
+            .dirty_sync_rollup_summaries()
+            .expect("dirty rollups after inferred metrics");
+        assert_eq!(dirty.len(), 1);
+        let metrics = dirty[0].metrics.as_ref().expect("metrics");
+        assert_eq!(metrics.active_seconds, Some(5.1));
+        assert_eq!(metrics.tracked_requests, Some(2));
+        assert_eq!(metrics.tracked_output_tokens, Some(730));
+        assert_eq!(metrics.tracked_reasoning_tokens, Some(310));
+        assert_eq!(
+            metrics.latency_ms.as_ref().map(|value| value.samples),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.generated_tps.as_ref().map(|value| value.samples),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.generated_tps.as_ref().and_then(|value| value.avg),
+            Some(8.0)
+        );
+        assert_eq!(
+            metrics.visible_tps.as_ref().and_then(|value| value.avg),
+            Some(6.0)
+        );
+        assert_eq!(metrics.overall_generated_tps, Some(1040.0 / 5.1));
+        assert_eq!(metrics.overall_visible_tps, Some(730.0 / 5.1));
     }
 
     #[test]
@@ -4232,12 +5585,14 @@ mod tests {
                 confidence: Confidence::Low,
             },
             parse_evidence: None,
+            project: None,
             privacy: PrivacyInfo {
                 mode: PrivacyMode::MetadataOnly,
                 contains_prompt_text: false,
                 contains_response_text: false,
                 contains_file_paths: false,
             },
+            metrics: None,
             period_start: Some(now - chrono::Duration::days(1)),
             period_end: Some(now),
             observed_at: now,

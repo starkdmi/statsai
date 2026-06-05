@@ -203,12 +203,14 @@ pub fn build_reported_usage_summary(
                 IdentitySource::Unresolved
             },
         }),
+        project: None,
         privacy: PrivacyInfo {
             mode: PrivacyMode::MetadataOnly,
             contains_prompt_text: false,
             contains_response_text: false,
             contains_file_paths: false,
         },
+        metrics: None,
         period_start: input.period_start,
         period_end: input.period_end,
         observed_at,
