@@ -27,7 +27,7 @@ const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever Codex parsing semantics change,
 // so historical sessions get rescanned for both runtime and project context.
 const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "turn-runtime-project-context.v8";
-const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "project-context.v1";
+const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "project-context.v2";
 
 pub use statsai_core::{VerifiedSourceState, VerifiedSubscriptionState};
 
@@ -407,7 +407,10 @@ fn claude_scan_candidates(
 fn claude_jsonl_candidates(root: &Path, cache_namespace: &str) -> Result<Vec<ScanCandidateFile>> {
     collect_jsonl_files(root)?
         .into_iter()
-        .map(|path| Ok(scan_candidate(path, None, cache_namespace)))
+        .map(|path| {
+            let dependency = claude_session_index_dependency(root, &path);
+            Ok(scan_candidate(path, dependency.as_deref(), cache_namespace))
+        })
         .collect()
 }
 
@@ -415,6 +418,16 @@ fn claude_stats_cache_candidate(root: &Path, cache_namespace: &str) -> Option<Sc
     let path = root.join("stats-cache.json");
     path.is_file()
         .then(|| scan_candidate(path, None, cache_namespace))
+}
+
+fn claude_session_index_dependency(root: &Path, path: &Path) -> Option<String> {
+    path.ancestors()
+        .take_while(|ancestor| ancestor.starts_with(root))
+        .skip(1)
+        .find_map(|ancestor| {
+            let session_index = ancestor.join("sessions-index.json");
+            session_index.is_file().then(|| file_metadata_signature(&session_index))
+        })
 }
 
 fn codex_scan_candidates(
@@ -593,17 +606,7 @@ fn parse_claude_file(
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
-    let canonical_path = canonical_display(path);
-    let project = session_projects
-        .get(&canonical_path)
-        .and_then(|metadata| {
-            resolve_project_context(
-                metadata.project_path.clone(),
-                None,
-                metadata.git_branch.clone(),
-            )
-        })
-        .or_else(|| project_context_from_path_fallback(projects, path));
+    let project = claude_project_context_for_file(session_projects, projects, path);
 
     for (index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -670,6 +673,36 @@ fn parse_claude_file(
     }
 
     Ok(())
+}
+
+fn claude_project_context_for_file(
+    session_projects: &HashMap<String, ClaudeSessionProjectMetadata>,
+    projects_root: &Path,
+    path: &Path,
+) -> Option<ProjectInfo> {
+    claude_session_metadata_for_file(session_projects, path)
+        .and_then(|metadata| {
+            resolve_project_context(
+                metadata.project_path.clone(),
+                None,
+                metadata.git_branch.clone(),
+            )
+        })
+        .or_else(|| project_context_from_path_fallback(projects_root, path))
+}
+
+fn claude_session_metadata_for_file<'a>(
+    session_projects: &'a HashMap<String, ClaudeSessionProjectMetadata>,
+    path: &Path,
+) -> Option<&'a ClaudeSessionProjectMetadata> {
+    let canonical_path = canonical_display(path);
+    if let Some(metadata) = session_projects.get(&canonical_path) {
+        return Some(metadata);
+    }
+
+    path.ancestors()
+        .skip(1)
+        .find_map(|ancestor| session_projects.get(&canonical_display(ancestor)))
 }
 
 fn parse_claude_stats_cache(
@@ -1771,6 +1804,29 @@ fn load_claude_session_projects(
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
+        if let Some(project_store_root) = entry.path().parent() {
+            let original_path = value
+                .get("originalPath")
+                .and_then(Value::as_str)
+                .map(expand_home_path)
+                .or_else(|| {
+                    value.get("entries")
+                        .and_then(Value::as_array)
+                        .and_then(|entries| entries.first())
+                        .and_then(|item| item.get("projectPath"))
+                        .and_then(Value::as_str)
+                        .map(expand_home_path)
+                });
+            if let Some(project_path) = original_path {
+                projects.insert(
+                    canonical_display(project_store_root),
+                    ClaudeSessionProjectMetadata {
+                        project_path: Some(project_path),
+                        git_branch: None,
+                    },
+                );
+            }
+        }
         let Some(entries) = value.get("entries").and_then(Value::as_array) else {
             continue;
         };
@@ -1778,20 +1834,21 @@ fn load_claude_session_projects(
             let Some(full_path) = item.get("fullPath").and_then(Value::as_str) else {
                 continue;
             };
-            let key = canonical_display(Path::new(full_path));
-            projects.insert(
-                key,
-                ClaudeSessionProjectMetadata {
-                    project_path: item
-                        .get("projectPath")
-                        .and_then(Value::as_str)
-                        .map(expand_home_path),
-                    git_branch: item
-                        .get("gitBranch")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                },
-            );
+            let metadata = ClaudeSessionProjectMetadata {
+                project_path: item
+                    .get("projectPath")
+                    .and_then(Value::as_str)
+                    .map(expand_home_path),
+                git_branch: item
+                    .get("gitBranch")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            };
+            let full_path = Path::new(full_path);
+            projects.insert(canonical_display(full_path), metadata.clone());
+            if full_path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                projects.insert(canonical_display(&full_path.with_extension("")), metadata);
+            }
         }
     }
 
@@ -2400,13 +2457,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         let projects = root.join("projects");
-        let project_store = projects.join("video-chapter");
-        let workspace = root.join("workspace").join("VideoChapter");
+        let project_store = projects.join("example-workspace");
+        let workspace = root.join("workspace").join("ExampleWorkspace");
         std::fs::create_dir_all(&project_store).expect("project store");
         std::fs::create_dir_all(&workspace).expect("workspace");
         write_git_fixture(
             &workspace,
-            "https://github.com/Owner/VideoChapter.git",
+            "https://github.com/example-org/example-workspace.git",
             "main",
         );
 
@@ -2441,9 +2498,128 @@ mod tests {
             project.path_label.as_deref(),
             Some(workspace.to_string_lossy().as_ref())
         );
-        assert_eq!(project.project_label.as_deref(), Some("VideoChapter"));
-        assert_eq!(project.repo_label.as_deref(), Some("owner/videochapter"));
+        assert_eq!(project.project_label.as_deref(), Some("ExampleWorkspace"));
+        assert_eq!(
+            project.repo_label.as_deref(),
+            Some("example-org/example-workspace")
+        );
         assert_eq!(project.branch_label.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn claude_subagent_transcripts_inherit_project_path_from_sessions_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let projects = root.join("projects");
+        let project_store = projects.join("example-workspace");
+        let workspace = root.join("workspace").join("ExampleWorkspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_git_fixture(
+            &workspace,
+            "https://github.com/example-org/example-workspace.git",
+            "feature/example-subagent-fix",
+        );
+
+        let session_file = project_store.join("session-123.jsonl");
+        let subagent_dir = project_store.join("session-123").join("subagents");
+        std::fs::create_dir_all(&subagent_dir).expect("subagent dir");
+        let subagent_file = subagent_dir.join("agent-a.jsonl");
+        std::fs::write(
+            &subagent_file,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        )
+        .expect("subagent session");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            format!(
+                "{{\"version\":1,\"entries\":[{{\"sessionId\":\"session-123\",\"fullPath\":\"{}\",\"gitBranch\":\"feature/example-subagent-fix\",\"projectPath\":\"{}\"}}]}}",
+                session_file.display(),
+                workspace.display()
+            ),
+        )
+        .expect("session index");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let project = scan.events[0].project.as_ref().expect("project");
+        assert_eq!(
+            project.path_label.as_deref(),
+            Some(workspace.to_string_lossy().as_ref())
+        );
+        assert_eq!(project.project_label.as_deref(), Some("ExampleWorkspace"));
+        assert_eq!(
+            project.repo_label.as_deref(),
+            Some("example-org/example-workspace")
+        );
+        assert_eq!(
+            project.branch_label.as_deref(),
+            Some("feature/example-subagent-fix")
+        );
+    }
+
+    #[test]
+    fn claude_project_store_root_falls_back_to_original_path_when_session_index_misses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let projects = root.join("projects");
+        let project_store = projects.join("-home-example-src-ExampleWorkspace");
+        let workspace = root.join("workspace").join("ExampleWorkspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_git_fixture(
+            &workspace,
+            "https://github.com/example-org/example-workspace.git",
+            "main",
+        );
+
+        let subagent_dir = project_store.join("unindexed-session").join("subagents");
+        std::fs::create_dir_all(&subagent_dir).expect("subagent dir");
+        let subagent_file = subagent_dir.join("agent-a.jsonl");
+        std::fs::write(
+            &subagent_file,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        )
+        .expect("subagent session");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            format!(
+                "{{\"version\":1,\"originalPath\":\"{}\",\"entries\":[{{\"sessionId\":\"indexed-session\",\"fullPath\":\"{}\",\"gitBranch\":\"main\",\"projectPath\":\"{}\"}}]}}",
+                workspace.display(),
+                project_store.join("indexed-session.jsonl").display(),
+                workspace.display()
+            ),
+        )
+        .expect("session index");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let project = scan.events[0].project.as_ref().expect("project");
+        assert_eq!(
+            project.path_label.as_deref(),
+            Some(workspace.to_string_lossy().as_ref())
+        );
+        assert_eq!(project.project_label.as_deref(), Some("ExampleWorkspace"));
+        assert_eq!(
+            project.repo_label.as_deref(),
+            Some("example-org/example-workspace")
+        );
     }
 
     #[test]
@@ -2811,6 +2987,93 @@ mod tests {
         };
         let legacy_candidate = scan_candidate(session_path.clone(), None, &legacy_namespace);
         let current = codex_scan_candidates(&source, "test-adapter").expect("current candidates");
+
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].cache_key, canonical_display(&session_path));
+        assert_ne!(legacy_candidate.cache_signature, current[0].cache_signature);
+    }
+
+    #[test]
+    fn claude_scan_candidates_change_when_sessions_index_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let projects = dir.path().join("projects");
+        let project_store = projects.join("example-workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        let session_path = project_store.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("session");
+        let sessions_index = project_store.join("sessions-index.json");
+        std::fs::write(
+            &sessions_index,
+            format!(
+                "{{\"version\":1,\"entries\":[{{\"sessionId\":\"session-1\",\"fullPath\":\"{}\",\"projectPath\":\"/tmp/workspace-a\"}}]}}",
+                session_path.display()
+            ),
+        )
+        .expect("session index");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let first = claude_scan_candidates(&source, "test-adapter").expect("first candidates");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            &sessions_index,
+            format!(
+                "{{\"version\":1,\"entries\":[{{\"sessionId\":\"session-1\",\"fullPath\":\"{}\",\"projectPath\":\"/tmp/workspace-b\"}}]}}",
+                session_path.display()
+            ),
+        )
+        .expect("updated session index");
+
+        let second = claude_scan_candidates(&source, "test-adapter").expect("second candidates");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].cache_key, canonical_display(&session_path));
+        assert_eq!(second[0].cache_key, canonical_display(&session_path));
+        assert_ne!(first[0].cache_signature, second[0].cache_signature);
+    }
+
+    #[test]
+    fn claude_scan_candidates_invalidate_legacy_cache_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let projects = dir.path().join("projects");
+        let project_store = projects.join("example-workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        let session_path = project_store.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("session");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let legacy_namespace = {
+            let adapter_id = source.adapter_id.as_deref().unwrap_or("");
+            let path_hash = source.path_hash.as_deref().unwrap_or("");
+            hash_text(&format!(
+                "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{}:{path_hash}:{}",
+                source.provider, source.source_kind, "test-adapter", "project-context.v1"
+            ))
+        };
+        let legacy_candidate = scan_candidate(session_path.clone(), None, &legacy_namespace);
+        let current = claude_scan_candidates(&source, "test-adapter").expect("current candidates");
 
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].cache_key, canonical_display(&session_path));
