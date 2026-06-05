@@ -14,11 +14,12 @@ use statsai_adapters::{
 use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
     normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
-    source_account_assignment_id, subscription_id, timestamp_in_period, BillingPeriod,
-    IdentitySource, LocationOrigin, ProviderAccount, ProviderAccountId, ReportPeriod,
-    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
-    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch,
-    UsageEvent, UsageReport, UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    project_has_remote_identity, source_account_assignment_id, subscription_id,
+    timestamp_in_period, BillingPeriod, IdentitySource, LocationOrigin, ProjectInfo,
+    ProviderAccount, ProviderAccountId, ReportPeriod, SourceAccountAssignment,
+    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
+    Subscription, SubscriptionId, SubscriptionStatus, SyncBatch, UsageEvent, UsageReport,
+    UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -2111,10 +2112,14 @@ fn build_sync_batch(
         }
 
         let full_rollup_sync = !command.since_last || state.is_none();
+        let all_rollups: Vec<_> = store
+            .all_sync_rollup_summaries()?
+            .into_iter()
+            .map(sanitize_summary_for_sync)
+            .collect();
         let rollups = if full_rollup_sync {
-            store.all_sync_rollup_summaries()?
+            all_rollups
         } else {
-            let all_rollups = store.all_sync_rollup_summaries()?;
             store.pending_summaries_for_sync(&command.sink, target, &all_rollups)?
         };
         eprintln!(
@@ -2481,6 +2486,9 @@ fn http_rollup_project_count(batch: &SyncBatch) -> usize {
 
 fn http_rollup_summary_project_key(summary: &UsageSummary) -> Option<String> {
     let project = summary.project.as_ref()?;
+    if !project_has_remote_identity(project) {
+        return None;
+    }
     if let Some(repo_remote_hash) = project.repo_remote_hash.as_deref() {
         return Some(format!("repo:{repo_remote_hash}"));
     }
@@ -2501,6 +2509,9 @@ fn http_rollup_project_location_count(batch: &SyncBatch) -> usize {
 
 fn http_rollup_summary_project_location_key(summary: &UsageSummary) -> Option<String> {
     let project = summary.project.as_ref()?;
+    if !project_has_remote_identity(project) {
+        return None;
+    }
     if let Some(path_hash) = project.path_hash.as_deref() {
         return Some(format!("path:{path_hash}"));
     }
@@ -2711,7 +2722,11 @@ fn sync_local_verify(
         .map(sanitize_summary_for_sync)
         .filter(|summary| !is_daily_rollup_summary(summary))
         .collect();
-    let rollup_summaries = store.all_sync_rollup_summaries()?;
+    let rollup_summaries: Vec<_> = store
+        .all_sync_rollup_summaries()?
+        .into_iter()
+        .map(sanitize_summary_for_sync)
+        .collect();
 
     Ok(SyncLocalVerify {
         sync_state: local_state.map(sync_state_report),
@@ -4868,7 +4883,16 @@ fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
         evidence.source_line_number = None;
         evidence.source_record_id = None;
     }
+    event.project = event.project.and_then(sanitize_project_for_sync);
     event
+}
+
+fn sanitize_project_for_sync(mut project: ProjectInfo) -> Option<ProjectInfo> {
+    if !project_has_remote_identity(&project) {
+        return None;
+    }
+    project.path_label = None;
+    Some(project)
 }
 
 #[cfg(test)]
@@ -5044,6 +5068,7 @@ fn sanitize_summary_for_sync(mut summary: UsageSummary) -> UsageSummary {
         evidence.source_line_number = None;
         evidence.source_record_id = None;
     }
+    summary.project = summary.project.and_then(sanitize_project_for_sync);
     summary
 }
 
@@ -5150,6 +5175,16 @@ mod tests {
             .expect("now");
         let mut event = test_event("codex", &source, now, None, TokenParts::total(100));
         event.source.source_record_id = Some("/tmp/.codex/sessions/log.jsonl:12".to_string());
+        event.project = Some(ProjectInfo {
+            project_id: "project-event-path-only".to_string(),
+            project_label: Some("hi".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("event-path-hash".to_string()),
+            path_label: Some("/Users/example/Documents/Codex/2026-05-29/hi".to_string()),
+        });
         event.parse_evidence = Some(ParseEvidence {
             event_key_version: "test.v1".to_string(),
             source_file_path_hash: Some("hash".to_string()),
@@ -5163,6 +5198,16 @@ mod tests {
         let mut summary = test_summary("codex", &source, now, 100, None);
         summary.source.source_record_id = Some("reported_jul11.json:daily:2025-07-11".to_string());
         summary.parse_evidence = event.parse_evidence.clone();
+        summary.project = Some(ProjectInfo {
+            project_id: "project-repo-backed".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/work/ai-stats".to_string()),
+        });
 
         let event = sanitize_event_for_sync(event);
         let summary = sanitize_summary_for_sync(summary);
@@ -5175,6 +5220,7 @@ mod tests {
             event_evidence.source_file_path_hash.as_deref(),
             Some("hash")
         );
+        assert!(event.project.is_none());
 
         assert!(summary.source.source_record_id.is_none());
         let summary_evidence = summary.parse_evidence.expect("summary evidence");
@@ -5184,6 +5230,11 @@ mod tests {
             summary_evidence.source_file_path_hash.as_deref(),
             Some("hash")
         );
+        let project = summary.project.expect("repo-backed project");
+        assert_eq!(project.repo_remote_hash.as_deref(), Some("repo-hash"));
+        assert_eq!(project.repo_label.as_deref(), Some("owner/repo"));
+        assert_eq!(project.path_hash.as_deref(), Some("path-hash"));
+        assert!(project.path_label.is_none());
     }
 
     #[test]
@@ -7448,8 +7499,8 @@ mod tests {
                 summary.project = Some(ProjectInfo {
                     project_id: format!("project-budget-{index}"),
                     project_label: Some(format!("Project {index}")),
-                    repo_remote_hash: None,
-                    repo_label: None,
+                    repo_remote_hash: Some(format!("repo-hash-{index}")),
+                    repo_label: Some(format!("owner/repo-{index}")),
                     branch_hash: None,
                     branch_label: None,
                     path_hash: Some(format!("path-hash-{index}")),
@@ -7492,6 +7543,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![7, 6, 6, 6]
         );
+    }
+
+    #[test]
+    fn http_rollup_project_counts_ignore_path_only_projects() {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-path-only-project"),
+            LocationOrigin::Configured,
+        );
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let mut summary = test_summary("codex", &source, now, 10, None);
+        summary.project = Some(ProjectInfo {
+            project_id: "project-path-only".to_string(),
+            project_label: Some("hi".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/Documents/Codex/2026-05-29/hi".to_string()),
+        });
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_path_only_project".to_string(),
+            device_id: "device".to_string(),
+            sources: vec![],
+            accounts: vec![],
+            source_account_assignments: vec![],
+            subscriptions: vec![],
+            events: vec![],
+            summaries: vec![summary],
+            created_at: now,
+        };
+
+        assert_eq!(http_rollup_project_count(&batch), 0);
+        assert_eq!(http_rollup_project_location_count(&batch), 0);
     }
 
     #[test]
@@ -7874,6 +7966,59 @@ mod tests {
         assert_eq!(local.pending_subscriptions, 0);
         assert_eq!(local.total_passthrough_summaries, 1);
         assert_eq!(local.pending_passthrough_summaries, 0);
+    }
+
+    #[test]
+    fn sync_local_verify_uses_sanitized_rollup_hashes() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-sanitized-rollups"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let mut event = test_event(
+            "codex",
+            &source,
+            Utc::now(),
+            Some(provider_account_id("codex", "personal")),
+            TokenParts::total(42),
+        );
+        event.project = Some(ProjectInfo {
+            project_id: "project-repo-backed".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/work/ai-stats".to_string()),
+        });
+        store.insert_event(&event).expect("event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let target = "https://api.example.com/api/sync/batches".to_string();
+        let rollups: Vec<_> = store
+            .all_sync_rollup_summaries()
+            .expect("rollups")
+            .into_iter()
+            .map(sanitize_summary_for_sync)
+            .collect();
+        assert_eq!(rollups.len(), 1);
+        assert!(rollups[0]
+            .project
+            .as_ref()
+            .is_some_and(|project| project.path_label.is_none()));
+        store
+            .record_summaries_synced("http", &target, &rollups)
+            .expect("record rollups");
+
+        let local = sync_local_verify(&store, "http", &target, None).expect("local verify");
+        assert_eq!(local.total_rollups, 1);
+        assert_eq!(local.pending_rollups, 0);
     }
 
     #[test]

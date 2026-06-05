@@ -6,15 +6,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use statsai_core::{
     hash_text, normalize_email, normalize_provider_user_id, periods_overlap, project_bucket_key,
-    project_has_stable_identity, provider_account_id, provider_account_id_from_identity,
-    semantic_event_fingerprint, source_account_assignment_id, subscription_id, summary_id,
-    timestamp_in_period, BillingPeriod, Confidence, CostInfo, DailyRollup, EventSource,
-    IdentitySource, LatencySource, MetricStats, ModelInfo, PrivacyInfo, PrivacyMode,
-    ProviderAccount, ProviderAccountId, SemanticFingerprintInput, SourceAccountAssignment,
-    SourceAccountAssignmentId, SourceId, SourceLocation, SourceVerificationMode, Subscription,
-    SubscriptionId, SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetrics,
-    SummaryModelUsage, UsageCounts, UsageEvent, UsageSummary, VerifiedSourceState,
-    VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    project_has_remote_identity, project_has_stable_identity, provider_account_id,
+    provider_account_id_from_identity, semantic_event_fingerprint, source_account_assignment_id,
+    subscription_id, summary_id, timestamp_in_period, BillingPeriod, Confidence, CostInfo,
+    DailyRollup, EventSource, IdentitySource, LatencySource, MetricStats, ModelInfo, PrivacyInfo,
+    PrivacyMode, ProviderAccount, ProviderAccountId, SemanticFingerprintInput,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceLocation,
+    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SummaryId,
+    SummaryMetadata, SummaryMetrics, SummaryModelUsage, UsageCounts, UsageEvent, UsageSummary,
+    VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
     SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
@@ -3379,7 +3379,7 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         project: first
             .project
             .as_ref()
-            .filter(|project| project_has_stable_identity(project))
+            .filter(|project| project_has_remote_identity(project))
             .cloned(),
         privacy: PrivacyInfo {
             mode: PrivacyMode::MetadataOnly,
@@ -3852,6 +3852,70 @@ mod tests {
     }
 
     #[test]
+    fn sync_rollups_keep_path_only_buckets_without_exporting_project_metadata() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-path-only-projects"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let day = Utc
+            .with_ymd_and_hms(2026, 6, 5, 9, 0, 0)
+            .single()
+            .expect("day");
+        let account_id = statsai_core::provider_account_id("codex", "personal");
+
+        let mut first = test_store_event(&source, day, "path-only-project-a");
+        first.provider_account_id = Some(account_id.clone());
+        first.usage.total_tokens = Some(10);
+        first.project = Some(ProjectInfo {
+            project_id: "project-path-a".to_string(),
+            project_label: Some("hi".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-a".to_string()),
+            path_label: Some("/Users/example/Documents/Codex/2026-05-29/hi".to_string()),
+        });
+
+        let mut second = test_store_event(
+            &source,
+            day + chrono::Duration::hours(1),
+            "path-only-project-b",
+        );
+        second.provider_account_id = Some(account_id);
+        second.usage.total_tokens = Some(20);
+        second.project = Some(ProjectInfo {
+            project_id: "project-path-b".to_string(),
+            project_label: Some("hi".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-b".to_string()),
+            path_label: Some("/Users/example/Documents/Codex/2026-05-28/hi".to_string()),
+        });
+
+        assert!(store.insert_event(&first).expect("insert first"));
+        assert!(store.insert_event(&second).expect("insert second"));
+
+        let dirty = store.dirty_sync_rollup_summaries().expect("dirty rollups");
+        assert_eq!(dirty.len(), 2);
+        assert!(dirty.iter().all(|summary| summary.project.is_none()));
+        assert_eq!(
+            dirty
+                .iter()
+                .map(|summary| summary.usage.total_tokens.unwrap_or(0))
+                .sum::<u64>(),
+            30
+        );
+    }
+
+    #[test]
     fn refreshes_semantic_duplicate_with_new_event_id_without_double_counting() {
         let store = Store::in_memory().expect("store");
         let source = statsai_core::SourceLocation::local_adapter(
@@ -3982,7 +4046,7 @@ mod tests {
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
-            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+            path_label: Some("/workspace/ai-stats".to_string()),
         };
 
         let mut old_event = test_store_event(&source, now, "legacy-projectless-record");
@@ -4085,7 +4149,7 @@ mod tests {
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
-            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+            path_label: Some("/workspace/ai-stats".to_string()),
         };
 
         let mut old_event = test_store_event(&source, now, "legacy-record");
@@ -4187,7 +4251,7 @@ mod tests {
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
-            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+            path_label: Some("/workspace/ai-stats".to_string()),
         };
 
         let mut old_event = test_store_event(&source, now, "legacy-projectless-turn");
@@ -4304,7 +4368,7 @@ mod tests {
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
-            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+            path_label: Some("/workspace/ai-stats".to_string()),
         };
 
         let mut old_event = test_store_event(&source, now, "legacy-project-id-token-count");
@@ -4417,7 +4481,7 @@ mod tests {
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
-            path_label: Some("/Users/starkdmi/Code/Languages/Python/AI/ai-stats".to_string()),
+            path_label: Some("/workspace/ai-stats".to_string()),
         };
 
         let mut old_event = test_store_event(&source, now, "legacy-project-id-turn");

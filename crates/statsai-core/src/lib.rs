@@ -377,6 +377,14 @@ pub fn project_has_stable_identity(project: &ProjectInfo) -> bool {
 }
 
 #[must_use]
+pub fn project_has_remote_identity(project: &ProjectInfo) -> bool {
+    project
+        .repo_remote_hash
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+#[must_use]
 pub fn project_bucket_key(project: Option<&ProjectInfo>) -> String {
     let Some(project) = project else {
         return "none".to_string();
