@@ -1998,7 +1998,7 @@ fn build_sync_batch(
     target: &str,
 ) -> Result<(SyncBatch, SyncPayloadMode)> {
     let payload_mode = sync_payload_mode(command)?;
-    let state = if command.since_last {
+    let state = if command.sink == "http" || command.since_last {
         store.sync_state(&command.sink, target)?
     } else {
         None
@@ -2111,7 +2111,21 @@ fn build_sync_batch(
             );
         }
 
-        let full_rollup_sync = !command.since_last || state.is_none();
+        let resume_partial_rollup_sync = !command.since_last
+            && !command.rebuild_rollups
+            && state
+                .as_ref()
+                .and_then(|state| state.pending_resume_batch_id.as_deref())
+                .is_some();
+        let full_rollup_sync = !command.since_last && !resume_partial_rollup_sync;
+        if full_rollup_sync
+            && state
+                .as_ref()
+                .and_then(|state| state.pending_resume_batch_id.as_deref())
+                .is_some()
+        {
+            store.clear_pending_sync_resume(&command.sink, target)?;
+        }
         let all_rollups: Vec<_> = store
             .all_sync_rollup_summaries()?
             .into_iter()
@@ -2157,6 +2171,17 @@ fn record_rollup_sync_success(
     target: &str,
     batch: &SyncBatch,
 ) -> Result<()> {
+    let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
+    record_rollup_sync_chunk_success(store, sink, target, &logical_batch_id, batch)
+}
+
+fn record_rollup_sync_chunk_success(
+    store: &Store,
+    sink: &str,
+    target: &str,
+    logical_batch_id: &str,
+    batch: &SyncBatch,
+) -> Result<()> {
     let passthrough_summaries: Vec<_> = batch
         .summaries
         .iter()
@@ -2173,10 +2198,11 @@ fn record_rollup_sync_success(
     store.record_sync_success(
         sink,
         target,
-        &batch.batch_id,
+        logical_batch_id,
         &batch.events,
         &passthrough_summaries,
     )?;
+    store.mark_pending_sync_resume(sink, target, logical_batch_id)?;
     store.mark_sync_rollups_synced(&rollup_summary_ids)?;
     store.record_summaries_synced(sink, target, &batch.summaries)?;
     store.record_sources_synced(sink, target, &batch.sources)?;
@@ -2205,6 +2231,7 @@ fn send_http_sync_batch(
     } else {
         vec![batch.clone()]
     };
+    let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
 
     if batches.len() > 1 {
         eprintln!(
@@ -2223,27 +2250,46 @@ fn send_http_sync_batch(
                 chunk.batch_id
             );
         }
-        send_http_rollup_chunk_with_retry(&http_sink, chunk)?;
+        if payload_mode == SyncPayloadMode::Rollups {
+            send_http_rollup_chunk_with_retry(&http_sink, chunk, &|synced_chunk| {
+                record_rollup_sync_chunk_success(
+                    store,
+                    sink,
+                    target,
+                    &logical_batch_id,
+                    synced_chunk,
+                )
+            })?;
+        } else {
+            let ack = http_sink.send_with_ack(chunk)?;
+            println!("{}", serde_json::to_string_pretty(&ack)?);
+            store.record_sync_success(
+                sink,
+                target,
+                &batch.batch_id,
+                &batch.events,
+                &batch.summaries,
+            )?;
+        }
     }
-
     if payload_mode == SyncPayloadMode::Rollups {
-        record_rollup_sync_success(store, sink, target, batch)?;
-    } else {
-        store.record_sync_success(
-            sink,
-            target,
-            &batch.batch_id,
-            &batch.events,
-            &batch.summaries,
-        )?;
+        store.clear_pending_sync_resume(sink, target)?;
     }
     Ok(())
 }
 
-fn send_http_rollup_chunk_with_retry(http_sink: &HttpSink, chunk: &SyncBatch) -> Result<()> {
+fn send_http_rollup_chunk_with_retry<F>(
+    http_sink: &HttpSink,
+    chunk: &SyncBatch,
+    on_success: &F,
+) -> Result<()>
+where
+    F: Fn(&SyncBatch) -> Result<()>,
+{
     send_http_rollup_chunk_with_retry_using(chunk, &|chunk| {
         let ack = http_sink.send_with_ack(chunk)?;
         println!("{}", serde_json::to_string_pretty(&ack)?);
+        on_success(chunk)?;
         Ok(())
     })
 }
@@ -2254,13 +2300,14 @@ where
 {
     match send_chunk(chunk) {
         Ok(()) => Ok(()),
-        Err(error) if should_retry_http_rollup_budget_error(chunk, &error) => {
+        Err(error) if should_retry_http_rollup_chunk_after_error(chunk, &error) => {
             let smaller_chunks = split_http_rollup_sync_batch_after_budget_error(chunk);
             if smaller_chunks.len() <= 1 {
                 return Err(error);
             }
             eprintln!(
-                "http rollup mode: D1 budget rejected {}; retrying as {} smaller batches",
+                "http rollup mode: {} rejected {}; retrying as {} smaller batches",
+                http_rollup_retry_error_label(&error),
                 chunk.batch_id,
                 smaller_chunks.len()
             );
@@ -2273,9 +2320,10 @@ where
     }
 }
 
-fn should_retry_http_rollup_budget_error(chunk: &SyncBatch, error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    if !(message.contains("HTTP 413") && message.contains("sync_batch_d1_query_budget_exceeded")) {
+fn should_retry_http_rollup_chunk_after_error(chunk: &SyncBatch, error: &anyhow::Error) -> bool {
+    if !(is_http_sync_error(error, 413, "sync_batch_d1_query_budget_exceeded")
+        || is_http_sync_error(error, 413, "sync_batch_too_large"))
+    {
         return false;
     }
     chunk.summaries.len() > 1
@@ -2284,6 +2332,40 @@ fn should_retry_http_rollup_budget_error(chunk: &SyncBatch, error: &anyhow::Erro
         || chunk.source_account_assignments.len() > 1
         || chunk.subscriptions.len() > 1
         || (http_rollup_metadata_count(chunk) > 0 && !chunk.summaries.is_empty())
+}
+
+fn http_rollup_retry_error_label(error: &anyhow::Error) -> &'static str {
+    if is_http_sync_error(error, 413, "sync_batch_too_large") {
+        "batch size"
+    } else {
+        "D1 budget"
+    }
+}
+
+fn is_http_sync_error(error: &anyhow::Error, status: u16, error_code: &str) -> bool {
+    parse_http_sync_error(error).is_some_and(|parsed| {
+        parsed.status == status
+            && parsed
+                .body
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == error_code)
+    })
+}
+
+#[derive(Debug)]
+struct ParsedHttpSyncError {
+    status: u16,
+    body: Value,
+}
+
+fn parse_http_sync_error(error: &anyhow::Error) -> Option<ParsedHttpSyncError> {
+    let message = error.to_string();
+    let rest = message.strip_prefix("sync endpoint returned HTTP ")?;
+    let (status_text, body_text) = rest.split_once(':')?;
+    let status = status_text.trim().parse().ok()?;
+    let body = serde_json::from_str(body_text.trim()).ok()?;
+    Some(ParsedHttpSyncError { status, body })
 }
 
 fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch> {
@@ -5093,8 +5175,6 @@ mod tests {
         SUBSCRIPTION_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
     };
     use std::path::Path;
-    use std::sync::mpsc;
-    use tiny_http::{Header, Method, Response, Server};
 
     #[derive(Clone)]
     struct TestAdapter {
@@ -7301,43 +7381,8 @@ mod tests {
 
     #[test]
     fn http_rollup_sync_retries_smaller_batches_after_budget_rejection() {
-        let server = Server::http("127.0.0.1:0").expect("server");
-        let endpoint = format!("http://{}/api/sync/batches", server.server_addr());
-        let (tx, rx) = mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            for _ in 0..3 {
-                let mut request = server.recv().expect("request");
-                assert_eq!(request.method(), &Method::Post);
-                assert_eq!(request.url(), "/api/sync/batches");
-                let mut body = String::new();
-                request.as_reader().read_to_string(&mut body).expect("body");
-                let payload: Value = serde_json::from_str(&body).expect("payload json");
-                let batch_id = payload
-                    .get("batch_id")
-                    .and_then(Value::as_str)
-                    .expect("batch id")
-                    .to_string();
-                let summary_count = payload
-                    .get("summaries")
-                    .and_then(Value::as_array)
-                    .map_or(0, Vec::len);
-                tx.send((batch_id.clone(), summary_count))
-                    .expect("observed request");
-
-                let response = if summary_count > 2 {
-                    Response::from_string(
-                        r#"{"error":"sync_batch_d1_query_budget_exceeded","estimatedQueries":53,"maxQueries":45}"#,
-                    )
-                    .with_status_code(413)
-                } else {
-                    Response::from_string(test_sync_ack_json(&batch_id))
-                }
-                .with_header(Header::from_bytes("content-type", "application/json").unwrap());
-                request.respond(response).expect("respond");
-            }
-        });
-
         let store = Store::in_memory().expect("store");
+        let endpoint = "https://api.example.com/api/sync/batches".to_string();
         let source = SourceLocation::local_adapter(
             "codex",
             "test",
@@ -7360,7 +7405,7 @@ mod tests {
                 );
                 summary.summary_id = statsai_core::SummaryId(format!("summary-{index}"));
                 summary.metadata.summary_format = "daily_rollup.v1".to_string();
-                summary
+                sanitize_summary_for_sync(summary)
             })
             .collect();
         let batch = SyncBatch {
@@ -7375,20 +7420,25 @@ mod tests {
             summaries,
             created_at: now,
         };
+        let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_send = Arc::clone(&observed);
 
-        send_http_sync_batch(
-            &store,
-            "http",
-            &endpoint,
-            &endpoint,
-            None,
-            &batch,
-            SyncPayloadMode::Rollups,
-        )
+        send_http_rollup_chunk_with_retry_using(&batch, &|chunk| {
+            observed_for_send
+                .lock()
+                .expect("observed lock")
+                .push((chunk.batch_id.clone(), chunk.summaries.len()));
+            if chunk.summaries.len() > 2 {
+                return Err(anyhow::Error::msg(
+                    r#"sync endpoint returned HTTP 413: {"error":"sync_batch_d1_query_budget_exceeded","estimatedQueries":53,"maxQueries":45}"#,
+                ));
+            }
+            record_rollup_sync_chunk_success(&store, "http", &endpoint, &logical_batch_id, chunk)
+        })
         .expect("send");
 
-        handle.join().expect("server thread");
-        let observed: Vec<_> = rx.try_iter().collect();
+        let observed = observed.lock().expect("observed lock").clone();
         assert_eq!(
             observed,
             vec![
@@ -7402,6 +7452,264 @@ mod tests {
             .expect("sync state")
             .expect("present");
         assert_eq!(state.last_batch_id, "batch_retry");
+        let pending = store
+            .pending_summaries_for_sync(
+                "http",
+                &endpoint,
+                &batch
+                    .summaries
+                    .iter()
+                    .cloned()
+                    .map(sanitize_summary_for_sync)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("pending summaries");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn http_rollup_sync_retries_smaller_batches_after_payload_too_large() {
+        let store = Store::in_memory().expect("store");
+        let endpoint = "https://api.example.com/api/sync/batches".to_string();
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollup-too-large"),
+            LocationOrigin::Configured,
+        );
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let summaries: Vec<_> = (0..4)
+            .map(|index| {
+                let mut summary = test_summary(
+                    "codex",
+                    &source,
+                    now + Duration::days(index as i64),
+                    10,
+                    None,
+                );
+                summary.summary_id = statsai_core::SummaryId(format!("summary-too-large-{index}"));
+                summary.metadata.summary_format = "daily_rollup.v1".to_string();
+                summary
+            })
+            .collect();
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_too_large".to_string(),
+            device_id: "device".to_string(),
+            sources: vec![],
+            accounts: vec![],
+            source_account_assignments: vec![],
+            subscriptions: vec![],
+            events: vec![],
+            summaries,
+            created_at: now,
+        };
+        let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_send = Arc::clone(&observed);
+
+        send_http_rollup_chunk_with_retry_using(&batch, &|chunk| {
+            observed_for_send
+                .lock()
+                .expect("observed lock")
+                .push((chunk.batch_id.clone(), chunk.summaries.len()));
+            if chunk.summaries.len() > 2 {
+                return Err(anyhow::Error::msg(
+                    r#"sync endpoint returned HTTP 413: {"error":"sync_batch_too_large"}"#,
+                ));
+            }
+            record_rollup_sync_chunk_success(&store, "http", &endpoint, &logical_batch_id, chunk)
+        })
+        .expect("send");
+
+        let observed = observed.lock().expect("observed lock").clone();
+        assert_eq!(
+            observed,
+            vec![
+                ("batch_too_large".to_string(), 4),
+                ("batch_too_large_part_1_of_2".to_string(), 2),
+                ("batch_too_large_part_2_of_2".to_string(), 2),
+            ]
+        );
+        let state = store
+            .sync_state("http", &endpoint)
+            .expect("sync state")
+            .expect("present");
+        assert_eq!(state.last_batch_id, batch.batch_id);
+    }
+
+    #[test]
+    fn http_rollup_sync_resumes_remaining_chunks_after_partial_failure() {
+        let store = Store::in_memory().expect("store");
+        let endpoint = "https://api.example.com/api/sync/batches".to_string();
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollup-resume"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let account_id = provider_account_id("codex", "personal");
+        for index in 0..26 {
+            let event = test_event(
+                "codex",
+                &source,
+                now + Duration::days(index as i64),
+                Some(account_id.clone()),
+                TokenParts::total(10),
+            );
+            store.insert_event(&event).expect("event");
+        }
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let command = SyncCommand {
+            endpoint: Some(endpoint.clone()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert_eq!(batch.sources.len(), 1);
+        assert_eq!(batch.summaries.len(), 26);
+        let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_send = Arc::clone(&observed);
+        let mut observed_error = None;
+
+        for (request_index, chunk) in split_http_rollup_sync_batches(&batch).iter().enumerate() {
+            let result = send_http_rollup_chunk_with_retry_using(chunk, &|chunk| {
+                observed_for_send.lock().expect("observed lock").push((
+                    chunk.batch_id.clone(),
+                    chunk.sources.len(),
+                    chunk.summaries.len(),
+                ));
+                if request_index == 2 {
+                    return Err(anyhow::Error::msg(
+                        r#"sync endpoint returned HTTP 429: {"error":"rate_limited","retryAfterSeconds":60}"#,
+                    ));
+                }
+                record_rollup_sync_chunk_success(&store, "http", &target, &logical_batch_id, chunk)
+            });
+            if let Err(send_error) = result {
+                observed_error = Some(send_error);
+                break;
+            }
+        }
+        let error = observed_error.expect("rate limit should stop the third request");
+        assert!(error.to_string().contains("HTTP 429"));
+        store
+            .record_sync_failure("http", &target)
+            .expect("record sync failure");
+
+        let observed = observed.lock().expect("observed lock").clone();
+        assert_eq!(
+            observed,
+            vec![
+                (format!("{}_sources_1", batch.batch_id), 1, 0),
+                (format!("{}_part_1_of_2", batch.batch_id), 0, 25),
+                (format!("{}_part_2_of_2", batch.batch_id), 0, 1),
+            ]
+        );
+
+        let sync_sources: Vec<_> = store
+            .list_sources()
+            .expect("sources")
+            .into_iter()
+            .map(sanitize_source_for_sync)
+            .collect();
+        assert!(store
+            .pending_sources_for_sync("http", &target, &sync_sources)
+            .expect("pending sources")
+            .is_empty());
+
+        let sync_rollups: Vec<_> = store
+            .all_sync_rollup_summaries()
+            .expect("rollups")
+            .into_iter()
+            .map(sanitize_summary_for_sync)
+            .collect();
+        let pending_rollups = store
+            .pending_summaries_for_sync("http", &target, &sync_rollups)
+            .expect("pending rollups");
+        assert_eq!(pending_rollups.len(), 1);
+        let state = store
+            .sync_state("http", &target)
+            .expect("sync state")
+            .expect("present");
+        assert_eq!(state.last_batch_id, batch.batch_id);
+
+        let (resume_batch, resume_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("resume batch");
+        assert_eq!(resume_mode, SyncPayloadMode::Rollups);
+        assert!(resume_batch.sources.is_empty());
+        assert_eq!(resume_batch.summaries.len(), 1);
+    }
+
+    #[test]
+    fn failed_http_sync_without_ack_keeps_next_default_sync_full_history() {
+        let store = Store::in_memory().expect("store");
+        let endpoint = "https://api.example.com/api/sync/batches".to_string();
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-no-partial-resume"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let event = test_event(
+            "codex",
+            &source,
+            now,
+            Some(provider_account_id("codex", "personal")),
+            TokenParts::total(10),
+        );
+        store.insert_event(&event).expect("event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let command = SyncCommand {
+            endpoint: Some(endpoint.clone()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (initial_batch, initial_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("initial batch");
+        assert_eq!(initial_mode, SyncPayloadMode::Rollups);
+        assert_eq!(initial_batch.summaries.len(), 1);
+        record_rollup_sync_success(&store, "http", &target, &initial_batch)
+            .expect("record initial sync");
+        store
+            .clear_pending_sync_resume("http", &target)
+            .expect("clear pending resume");
+
+        store
+            .record_sync_failure("http", &target)
+            .expect("record failed sync");
+
+        let state = store
+            .sync_state("http", &target)
+            .expect("sync state")
+            .expect("present");
+        assert!(state.pending_resume_batch_id.is_none());
+        assert!(state.failure_count > 0);
+
+        let (retry_batch, retry_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("retry batch");
+        assert_eq!(retry_mode, SyncPayloadMode::Rollups);
+        assert_eq!(retry_batch.summaries.len(), 1);
     }
 
     #[test]
@@ -8919,18 +9227,6 @@ mod tests {
             },
             imported_at: now,
         }
-    }
-
-    fn test_sync_ack_json(batch_id: &str) -> String {
-        format!(
-            r#"{{
-              "schema_version":"sync_ack.v1",
-              "batch_id":"{batch_id}",
-              "accepted":{{"sources":0,"accounts":0,"source_account_assignments":0,"subscriptions":0,"events":0,"summaries":0}},
-              "duplicates":{{"sources":0,"accounts":0,"source_account_assignments":0,"subscriptions":0,"events":0,"summaries":0}},
-              "rejected":[]
-            }}"#
-        )
     }
 
     #[test]

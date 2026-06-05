@@ -34,6 +34,7 @@ pub struct SyncState {
     pub last_summary_observed_at: Option<DateTime<Utc>>,
     pub last_summary_id: Option<String>,
     pub failure_count: u64,
+    pub pending_resume_batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +288,14 @@ impl Store {
             );
             "#,
         )?;
+        match self.conn.execute(
+            "ALTER TABLE sync_state ADD COLUMN pending_resume_batch_id TEXT",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("duplicate column name") => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 
@@ -1247,7 +1256,8 @@ impl Store {
             .query_row(
                 r#"
                 SELECT sink, target, last_success_at, last_batch_id, last_event_started_at,
-                       last_event_id, last_summary_observed_at, last_summary_id, failure_count
+                       last_event_id, last_summary_observed_at, last_summary_id, failure_count,
+                       pending_resume_batch_id
                 FROM sync_state
                 WHERE sink = ?1 AND target = ?2
                 "#,
@@ -1262,7 +1272,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT sink, target, last_success_at, last_batch_id, last_event_started_at,
-                   last_event_id, last_summary_observed_at, last_summary_id, failure_count
+                   last_event_id, last_summary_observed_at, last_summary_id, failure_count,
+                   pending_resume_batch_id
             FROM sync_state
             ORDER BY sink, target
             "#,
@@ -1402,12 +1413,37 @@ impl Store {
     pub fn record_sync_failure(&self, sink: &str, target: &str) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT INTO sync_state (sink, target, last_success_at, last_batch_id, failure_count)
-            VALUES (?1, ?2, ?3, '', 1)
+            INSERT INTO sync_state (
+              sink, target, last_success_at, last_batch_id, failure_count, pending_resume_batch_id
+            )
+            VALUES (?1, ?2, ?3, '', 1, NULL)
             ON CONFLICT(sink, target) DO UPDATE SET
               failure_count = failure_count + 1
             "#,
             params![sink, target, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_pending_sync_resume(&self, sink: &str, target: &str, batch_id: &str) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO sync_state (
+              sink, target, last_success_at, last_batch_id, failure_count, pending_resume_batch_id
+            )
+            VALUES (?1, ?2, ?3, '', 0, ?4)
+            ON CONFLICT(sink, target) DO UPDATE SET
+              pending_resume_batch_id = excluded.pending_resume_batch_id
+            "#,
+            params![sink, target, Utc::now().to_rfc3339(), batch_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_pending_sync_resume(&self, sink: &str, target: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sync_state SET pending_resume_batch_id = NULL WHERE sink = ?1 AND target = ?2",
+            params![sink, target],
         )?;
         Ok(())
     }
@@ -3506,6 +3542,7 @@ fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {
         last_summary_observed_at: parse_optional_rfc3339_for_row(last_summary_observed_at, 6)?,
         last_summary_id: row.get(7)?,
         failure_count: failure_count.max(0) as u64,
+        pending_resume_batch_id: row.get(9)?,
     })
 }
 
