@@ -4576,6 +4576,16 @@ fn normalize_configured_source_path(provider: &str, path: &Path) -> Result<PathB
             path = parent.to_path_buf();
         }
     }
+    if provider_matches(provider, "codex")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "sessions" | "archived_sessions"))
+    {
+        if let Some(parent) = path.parent() {
+            path = parent.to_path_buf();
+        }
+    }
     Ok(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
@@ -4791,6 +4801,9 @@ fn dedupe_overlapping_sources(sources: Vec<SourceLocation>) -> Vec<SourceLocatio
                 let Some(other_path) = comparable_source_path(other) else {
                     return false;
                 };
+                if !provider_shadowing_covers_nested_source(source, &source_path, &other_path) {
+                    return false;
+                }
                 other_path != source_path
                     && source_path.starts_with(&other_path)
                     && source_preference_rank(other) >= source_preference_rank(source)
@@ -4803,6 +4816,31 @@ fn dedupe_overlapping_sources(sources: Vec<SourceLocation>) -> Vec<SourceLocatio
 fn comparable_source_path(source: &SourceLocation) -> Option<PathBuf> {
     let path = PathBuf::from(source.path_label.as_deref()?);
     Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+fn provider_shadowing_covers_nested_source(
+    source: &SourceLocation,
+    source_path: &Path,
+    other_path: &Path,
+) -> bool {
+    match canonical_provider_name(&source.provider) {
+        Some("claude_code") => true,
+        Some("codex") => codex_source_path_is_covered_by_parent(other_path, source_path),
+        _ => false,
+    }
+}
+
+fn codex_source_path_is_covered_by_parent(parent_path: &Path, child_path: &Path) -> bool {
+    if parent_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "sessions" | "archived_sessions"))
+    {
+        return child_path.starts_with(parent_path);
+    }
+
+    child_path.starts_with(parent_path.join("sessions"))
+        || child_path.starts_with(parent_path.join("archived_sessions"))
 }
 
 fn source_preference_rank(source: &SourceLocation) -> u8 {
@@ -5447,6 +5485,21 @@ mod tests {
     }
 
     #[test]
+    fn configured_codex_sessions_path_normalizes_to_codex_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+
+        let normalized =
+            normalize_configured_source_path("codex", &sessions).expect("normalized path");
+
+        assert_eq!(
+            normalized,
+            dir.path().canonicalize().expect("canonical dir")
+        );
+    }
+
+    #[test]
     fn subscription_add_uses_canonical_provider_for_account_id() {
         let store = Store::in_memory().expect("store");
 
@@ -5557,6 +5610,141 @@ mod tests {
         assert_eq!(
             sources[0].path_label.as_deref(),
             Some("/tmp/statsai-claude")
+        );
+    }
+
+    #[test]
+    fn codex_nested_source_is_not_shadowed_by_parent_source() {
+        let discovered_parent = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/statsai-codex"),
+            LocationOrigin::Env,
+        );
+        let configured_child = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/statsai-codex/.codex"),
+            LocationOrigin::Configured,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![discovered_parent.clone()],
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        let mut sources = scan_sources_for_adapter(&adapter, &[configured_child.clone()]);
+        sources.sort_by(|left, right| left.path_label.cmp(&right.path_label));
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].path_label.as_deref(), Some("/tmp/statsai-codex"));
+        assert_eq!(
+            sources[1].path_label.as_deref(),
+            Some("/tmp/statsai-codex/.codex")
+        );
+    }
+
+    #[test]
+    fn codex_nested_sessions_source_is_shadowed_by_parent_source() {
+        let discovered_parent = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/statsai-codex"),
+            LocationOrigin::Env,
+        );
+        let configured_child = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/statsai-codex/sessions"),
+            LocationOrigin::Configured,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![discovered_parent.clone()],
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        let sources = scan_sources_for_adapter(&adapter, &[configured_child]);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].path_label.as_deref(), Some("/tmp/statsai-codex"));
+    }
+
+    #[test]
+    fn codex_source_under_nested_codex_root_is_not_shadowed_by_parent_source() {
+        let discovered_parent = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/statsai-codex"),
+            LocationOrigin::Env,
+        );
+        let configured_child = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/statsai-codex/.codex/sessions"),
+            LocationOrigin::Configured,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![discovered_parent.clone()],
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        let mut sources = scan_sources_for_adapter(&adapter, &[configured_child]);
+        sources.sort_by(|left, right| left.path_label.cmp(&right.path_label));
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].path_label.as_deref(), Some("/tmp/statsai-codex"));
+        assert_eq!(
+            sources[1].path_label.as_deref(),
+            Some("/tmp/statsai-codex/.codex/sessions")
+        );
+    }
+
+    #[test]
+    fn codex_custom_named_nested_root_is_not_shadowed_by_parent_source() {
+        let discovered_parent = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/statsai-codex"),
+            LocationOrigin::Env,
+        );
+        let configured_child = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/statsai-codex/project-codex-home"),
+            LocationOrigin::Configured,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![discovered_parent.clone()],
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        let mut sources = scan_sources_for_adapter(&adapter, &[configured_child]);
+        sources.sort_by(|left, right| left.path_label.cmp(&right.path_label));
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].path_label.as_deref(), Some("/tmp/statsai-codex"));
+        assert_eq!(
+            sources[1].path_label.as_deref(),
+            Some("/tmp/statsai-codex/project-codex-home")
         );
     }
 

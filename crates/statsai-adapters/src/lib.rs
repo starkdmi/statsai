@@ -198,6 +198,7 @@ impl ProviderAdapter for CodexAdapter {
         let Some(root) = source_root_path(source) else {
             return Ok(None);
         };
+        let root = codex_source_root(&root);
         Ok(codex_auth_snapshot(&root))
     }
 
@@ -336,7 +337,8 @@ fn scan_codex_source(
     else {
         return Ok(scan);
     };
-    let root = PathBuf::from(path_label);
+    let source_path = PathBuf::from(path_label);
+    let root = codex_source_root(&source_path);
     let cache_namespace = scan_cache_namespace(source, adapter.version());
     let mut seen = HashSet::new();
     {
@@ -347,7 +349,7 @@ fn scan_codex_source(
             scan: &mut scan,
             seen: &mut seen,
         };
-        for candidate in codex_jsonl_candidates(source, &root, &cache_namespace)? {
+        for candidate in codex_jsonl_candidates(source, &source_path, &cache_namespace)? {
             if !options.should_scan(&candidate.cache_key) {
                 ctx.scan.diagnostics.files_skipped_unchanged += 1;
                 continue;
@@ -378,6 +380,39 @@ fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort_by_cached_key(|path| path.to_string_lossy().into_owned());
     Ok(files)
+}
+
+fn codex_source_root(path: &Path) -> PathBuf {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "sessions" | "archived_sessions"))
+    {
+        return path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf());
+    }
+    path.to_path_buf()
+}
+
+fn codex_usage_roots(path: &Path) -> Vec<PathBuf> {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "sessions" | "archived_sessions"))
+    {
+        return path
+            .is_dir()
+            .then(|| vec![path.to_path_buf()])
+            .unwrap_or_default();
+    }
+
+    ["sessions", "archived_sessions"]
+        .into_iter()
+        .map(|child| path.join(child))
+        .filter(|candidate| candidate.is_dir())
+        .collect()
 }
 
 fn claude_scan_candidates(
@@ -443,33 +478,24 @@ fn codex_scan_candidates(
     else {
         return Ok(Vec::new());
     };
-    let root = PathBuf::from(path_label);
+    let source_path = PathBuf::from(path_label);
     let cache_namespace = scan_cache_namespace(source, adapter_version);
-    codex_jsonl_candidates(source, &root, &cache_namespace)
+    codex_jsonl_candidates(source, &source_path, &cache_namespace)
 }
 
 fn codex_jsonl_candidates(
     _source: &SourceLocation,
-    root: &Path,
+    path: &Path,
     cache_namespace: &str,
 ) -> Result<Vec<ScanCandidateFile>> {
-    let mut roots = Vec::new();
-    for child in ["sessions", "archived_sessions"] {
-        let path = root.join(child);
-        if path.is_dir() {
-            roots.push(path);
-        }
-    }
-    if roots.is_empty() && root.is_dir() {
-        roots.push(root.to_path_buf());
-    }
-
+    let root = codex_source_root(path);
+    let roots = codex_usage_roots(path);
     let auth_dependency = Some(file_metadata_signature(&root.join("auth.json")));
     let dependency = auth_dependency.as_deref();
     let mut candidates = Vec::new();
     for usage_root in roots {
-        for path in collect_jsonl_files(&usage_root)? {
-            candidates.push(scan_candidate(path, dependency, cache_namespace));
+        for candidate_path in collect_jsonl_files(&usage_root)? {
+            candidates.push(scan_candidate(candidate_path, dependency, cache_namespace));
         }
     }
     Ok(candidates)
@@ -2997,6 +3023,74 @@ mod tests {
     }
 
     #[test]
+    fn codex_source_path_pointing_at_sessions_uses_parent_auth_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join(".codex");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::write(
+            root.join("auth.json"),
+            "{\"chatgpt_account_id\":\"acct-real\"}\n",
+        )
+        .expect("auth");
+        std::fs::write(
+            sessions.join("session.jsonl"),
+            "{\"timestamp\":\"2026-05-01T00:01:00Z\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}\n",
+        )
+        .expect("session");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            &sessions,
+            LocationOrigin::Configured,
+        );
+
+        let candidates = codex_scan_candidates(&source, "test-adapter").expect("candidates");
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].cache_key,
+            canonical_display(&sessions.join("session.jsonl"))
+        );
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(
+            scan.verified_source_state
+                .as_ref()
+                .and_then(|state| state.provider_user_id.as_deref()),
+            Some("acct-real")
+        );
+    }
+
+    #[test]
+    fn codex_root_without_usage_directories_has_no_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("not-a-codex-home");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(
+            root.join("history.jsonl"),
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("history");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            &root,
+            LocationOrigin::Configured,
+        );
+
+        let candidates = codex_scan_candidates(&source, "test-adapter").expect("candidates");
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert!(candidates.is_empty());
+        assert!(scan.events.is_empty());
+    }
+
+    #[test]
     fn claude_scan_candidates_change_when_sessions_index_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let projects = dir.path().join("projects");
@@ -3906,6 +4000,45 @@ mod tests {
         );
         assert_eq!(subscription.ended_at, None);
         assert_eq!(scan.events[0].provider_account_id, None);
+    }
+
+    #[test]
+    fn codex_probe_verified_source_state_uses_parent_auth_for_sessions_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            serde_json::json!({
+                "email": "existing@example.com",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-real",
+                    "chatgpt_plan_type": "plus",
+                    "chatgpt_subscription_active_start": "2026-05-29T10:12:43+00:00",
+                    "chatgpt_subscription_active_until": "2026-06-29T10:12:43+00:00",
+                    "chatgpt_subscription_last_checked": "2026-05-29T10:14:56.058278+00:00"
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            &sessions,
+            LocationOrigin::Configured,
+        );
+
+        let verified = CodexAdapter
+            .probe_verified_source_state(&source)
+            .expect("probe")
+            .expect("verified source state");
+
+        assert_eq!(verified.provider_user_id.as_deref(), Some("acct-real"));
+        assert_eq!(verified.email.as_deref(), Some("existing@example.com"));
+        assert_eq!(verified.plan_name.as_deref(), Some("Plus"));
     }
 
     #[test]
