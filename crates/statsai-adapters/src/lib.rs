@@ -402,10 +402,11 @@ fn codex_usage_roots(path: &Path) -> Vec<PathBuf> {
         .and_then(|name| name.to_str())
         .is_some_and(|name| matches!(name, "sessions" | "archived_sessions"))
     {
-        return path
-            .is_dir()
-            .then(|| vec![path.to_path_buf()])
-            .unwrap_or_default();
+        return if path.is_dir() {
+            vec![path.to_path_buf()]
+        } else {
+            Vec::new()
+        };
     }
 
     ["sessions", "archived_sessions"]

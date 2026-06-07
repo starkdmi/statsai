@@ -5637,7 +5637,8 @@ mod tests {
             scan_calls: None,
         };
 
-        let mut sources = scan_sources_for_adapter(&adapter, &[configured_child.clone()]);
+        let mut sources =
+            scan_sources_for_adapter(&adapter, std::slice::from_ref(&configured_child));
         sources.sort_by(|left, right| left.path_label.cmp(&right.path_label));
 
         assert_eq!(sources.len(), 2);
