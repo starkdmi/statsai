@@ -1,0 +1,53 @@
+[package]
+name = "statsai"
+description = "Local-first AI usage statistics CLI for macOS."
+homepage = "https://statsai.dev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.dist]
+dist = true
+formula = "statsai"
+display-name = "statsai"
+
+# Used by `cargo binstall --git … statsai` today; plain `cargo binstall statsai`
+# needs a crates.io publish with versioned path deps first.
+[package.metadata.binstall]
+pkg-url = "https://github.com/starkdmi/statsai/releases/download/v{version}/statsai-{target}.tar.xz"
+pkg-fmt = "txz"
+bin-dir = "statsai-{target}/"
+
+[lib]
+name = "statsai"
+path = "src/lib.rs"
+
+[[bin]]
+name = "statsai"
+path = "src/main.rs"
+
+[dependencies]
+statsai-adapters.workspace = true
+statsai-core.workspace = true
+statsai-daemon = { workspace = true, features = ["watch"] }
+statsai-sdk.workspace = true
+statsai-store.workspace = true
+statsai-sync.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+tiny_http.workspace = true
+percent-encoding.workspace = true
+getrandom.workspace = true
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
+[dev-dependencies]
+tempfile.workspace = true

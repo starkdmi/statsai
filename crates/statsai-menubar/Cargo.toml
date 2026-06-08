@@ -1,0 +1,39 @@
+[package]
+name = "statsai-menubar"
+description = "macOS menu bar controller for StatsAI."
+homepage = "https://statsai.dev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+# Avoid colliding with the `statsai` CLI binary on case-insensitive macOS volumes.
+name = "statsai-menubar"
+path = "src/main.rs"
+
+[package.metadata.bundle]
+name = "StatsAI"
+identifier = "dev.statsai.app"
+icon = ["assets/icon.png"]
+copyright = "Copyright (c) Dmitry Starkov"
+category = "Utility"
+short_description = "Private AI usage dashboard"
+long_description = "Menu bar companion for the StatsAI CLI."
+
+[package.metadata.bundle.macos]
+hardened_runtime = false
+info_plist_exts = { LSUIElement = true, NSHighResolutionCapable = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+statsai = { path = "../statsai" }
+statsai-store = { path = "../statsai-store" }
+tray-icon = "0.21"
+tao = { version = "0.34", default-features = false, features = ["rwh_06"] }
+objc2-core-foundation = "0.3"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = "0.17"

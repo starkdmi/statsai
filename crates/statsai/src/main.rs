@@ -12,7 +12,7 @@ use statsai_adapters::{
     ScanOptions, VerifiedSourceState,
 };
 use statsai_core::{
-    build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
+    build_usage_report, display_account_identity, expand_home_path, home_dir,
     normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
     project_has_remote_identity, source_account_assignment_id, subscription_id,
     timestamp_in_period, BillingPeriod, IdentitySource, LocationOrigin, ProjectInfo,
@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-mod auth;
+use statsai::{auth, default_device_id, default_store_path, service, snapshot};
 
 const HTTP_ROLLUP_SUMMARIES_PER_BATCH: usize = 25;
 const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
@@ -95,6 +95,26 @@ enum Command {
     Doctor,
     #[command(about = "Authenticate with the hosted sync backend")]
     Auth(AuthCommand),
+    #[command(about = "Install or manage the background daemon service")]
+    Service(ServiceCommand),
+    #[command(about = "Show link, sync, and background collection status")]
+    Snapshot(snapshot::SnapshotCommand),
+}
+
+#[derive(Debug, Args)]
+struct ServiceCommand {
+    #[command(subcommand)]
+    command: ServiceSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceSubcommand {
+    #[command(about = "Install a LaunchAgent that runs statsai daemon --watch")]
+    Install,
+    #[command(about = "Remove the background daemon LaunchAgent")]
+    Uninstall,
+    #[command(about = "Show LaunchAgent install and run state")]
+    Status,
 }
 
 #[derive(Debug, Args)]
@@ -532,6 +552,8 @@ fn main() -> Result<()> {
         Command::Schema(command) => schema(command),
         Command::Doctor => doctor(&store_path),
         Command::Auth(command) => auth(command),
+        Command::Service(command) => service(command),
+        Command::Snapshot(command) => snapshot::run(command, &store_path),
         command => {
             let store = Store::open(&store_path)?;
             match command {
@@ -545,11 +567,25 @@ fn main() -> Result<()> {
                 Command::Sync(command) => sync(command, &store, &device_id),
                 Command::Daemon(command) => daemon(command, store, &device_id),
                 Command::Status => status(&store),
-                Command::Schema(_) | Command::Doctor | Command::Auth(_) => {
+                Command::Schema(_)
+                | Command::Doctor
+                | Command::Auth(_)
+                | Command::Service(_)
+                | Command::Snapshot(_) => {
                     unreachable!("handled before store open")
                 }
             }
         }
+    }
+}
+
+fn service(command: ServiceCommand) -> Result<()> {
+    use service::ServiceAction;
+
+    match command.command {
+        ServiceSubcommand::Install => service::service(ServiceAction::Install),
+        ServiceSubcommand::Uninstall => service::service(ServiceAction::Uninstall),
+        ServiceSubcommand::Status => service::service(ServiceAction::Status),
     }
 }
 
@@ -2205,6 +2241,7 @@ fn record_rollup_sync_chunk_success(
     )?;
     store.mark_pending_sync_resume(sink, target, logical_batch_id)?;
     store.mark_sync_rollups_synced(&rollup_summary_ids)?;
+    store.reconcile_sync_rollup_dirty_flags(sink, target)?;
     store.record_summaries_synced(sink, target, &batch.summaries)?;
     store.record_sources_synced(sink, target, &batch.sources)?;
     store.record_accounts_synced(sink, target, &batch.accounts)?;
@@ -2214,6 +2251,7 @@ fn record_rollup_sync_chunk_success(
         &batch.source_account_assignments,
     )?;
     store.record_subscriptions_synced(sink, target, &batch.subscriptions)?;
+    snapshot::invalidate_dashboard_cache();
     Ok(())
 }
 
@@ -4489,84 +4527,6 @@ fn assignment_for_timestamp(
         .max_by(|left, right| left.started_at.cmp(&right.started_at))
 }
 
-fn default_store_path() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".statsai")
-        .join("statsai.sqlite")
-}
-
-fn default_device_id() -> String {
-    if let Ok(value) = std::env::var("STATSAI_DEVICE_ID") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return value.to_string();
-        }
-    }
-
-    let path = device_id_path();
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim();
-        if !existing.is_empty() {
-            return existing.to_string();
-        }
-    }
-
-    // Persist a stable opaque ID instead of leaking hostnames to the backend.
-    let device_id = generate_device_id();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, format!("{device_id}\n"));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    device_id
-}
-
-fn device_id_path() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".statsai")
-        .join("device-id")
-}
-
-fn generate_device_id() -> String {
-    let host = std::env::var("HOSTNAME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(read_hostname)
-        .unwrap_or_else(|| "unknown-host".to_string());
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown-user".to_string());
-    let home = home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .to_string_lossy()
-        .to_string();
-    let seed = format!(
-        "{}:{}:{}:{}:{}",
-        host,
-        user,
-        home,
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    format!("dev_{}", &hash_text(&seed)[..16])
-}
-
-fn read_hostname() -> Option<String> {
-    let output = std::process::Command::new("hostname").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let host = String::from_utf8(output.stdout).ok()?;
-    let host = host.trim();
-    (!host.is_empty()).then(|| host.to_string())
-}
-
 fn normalize_configured_source_path(provider: &str, path: &Path) -> Result<PathBuf> {
     let mut path = expand_cli_path(path)?;
     if provider_matches(provider, "claude_code")
@@ -5008,12 +4968,8 @@ fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
     event
 }
 
-fn sanitize_project_for_sync(mut project: ProjectInfo) -> Option<ProjectInfo> {
-    if !project_has_remote_identity(&project) {
-        return None;
-    }
-    project.path_label = None;
-    Some(project)
+fn sanitize_project_for_sync(project: ProjectInfo) -> Option<ProjectInfo> {
+    statsai_core::sanitize_project_for_sync(project)
 }
 
 #[cfg(test)]
@@ -5183,14 +5139,8 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
         .collect()
 }
 
-fn sanitize_summary_for_sync(mut summary: UsageSummary) -> UsageSummary {
-    summary.source.source_record_id = None;
-    if let Some(evidence) = summary.parse_evidence.as_mut() {
-        evidence.source_line_number = None;
-        evidence.source_record_id = None;
-    }
-    summary.project = summary.project.and_then(sanitize_project_for_sync);
-    summary
+fn sanitize_summary_for_sync(summary: UsageSummary) -> UsageSummary {
+    statsai_core::sanitize_summary_for_sync(summary)
 }
 
 fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
@@ -5207,7 +5157,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use statsai_core::{
-        event_id, subscription_id, summary_id, BillingPeriod, CostInfo, EventSource,
+        event_id, hash_text, subscription_id, summary_id, BillingPeriod, CostInfo, EventSource,
         IdentitySource, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo,
         ProviderAccount, SessionInfo, SourceKind, Subscription, SubscriptionStatus,
         SummaryMetadata, UsageCounts, UsageSummary, PROVIDER_ACCOUNT_SCHEMA_VERSION,

@@ -11,16 +11,16 @@ a Cloudflare Worker backed by D1 and Better Auth device tokens.
 The CLI produces a sync batch with:
 
 ```sh
-cargo run -p statsai-cli -- sync --sink stdout
-cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
-cargo run -p statsai-cli -- sync --sink http --since-last
-cargo run -p statsai-cli -- sync --sink http --verify
+cargo run -p statsai -- sync --sink stdout
+cargo run -p statsai -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
+cargo run -p statsai -- sync --sink http --since-last
+cargo run -p statsai -- sync --sink http --verify
 ```
 
 The JSON Schema is available with:
 
 ```sh
-cargo run -p statsai-cli -- schema sync-batch
+cargo run -p statsai -- schema sync-batch
 ```
 
 ## Privacy Defaults
@@ -58,11 +58,11 @@ hosted sync:
 ```sh
 export STATSAI_API_URL="http://127.0.0.1:8787"
 export STATSAI_WEB_URL="http://127.0.0.1:3000"
-cargo run -p statsai-cli -- auth login
-cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
-cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
-cargo run -p statsai-cli -- sync --sink http --verify
-cargo run -p statsai-cli -- sync --status
+cargo run -p statsai -- auth login
+cargo run -p statsai -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
+cargo run -p statsai -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
+cargo run -p statsai -- sync --sink http --verify
+cargo run -p statsai -- sync --status
 ```
 
 The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
@@ -138,9 +138,9 @@ auth/session/account tables in the same D1 database. That backend lives
 outside this public CLI repo.
 
 ```sh
-cargo run -p statsai-cli -- auth login
-cargo run -p statsai-cli -- auth status
-cargo run -p statsai-cli -- sync --sink http --since-last
+cargo run -p statsai -- auth login
+cargo run -p statsai -- auth status
+cargo run -p statsai -- sync --sink http --since-last
 ```
 
 Auth token precedence for sync is:

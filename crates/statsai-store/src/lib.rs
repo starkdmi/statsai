@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use statsai_core::{
     hash_text, normalize_email, normalize_provider_user_id, periods_overlap, project_bucket_key,
+    sanitize_summary_for_sync,
     project_has_remote_identity, project_has_stable_identity, provider_account_id,
     provider_account_id_from_identity, semantic_event_fingerprint, source_account_assignment_id,
     subscription_id, summary_id, timestamp_in_period, BillingPeriod, Confidence, CostInfo,
@@ -22,6 +23,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const SYNC_ROLLUP_SUMMARY_VERSION: &str = "8";
+
+fn summary_sync_payload_hash(summary: &UsageSummary) -> Result<String> {
+    let payload = serde_json::to_string(&sanitize_summary_for_sync(summary.clone()))?;
+    Ok(hash_text(&payload))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsagePeriodStats {
+    pub events: u64,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollupPeriodStats {
+    pub tokens: u64,
+    pub requests: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotRollupView {
+    pub pending_count: u64,
+    pub pending_days: u64,
+    pub today: RollupPeriodStats,
+    pub week: RollupPeriodStats,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncState {
@@ -1005,6 +1031,42 @@ impl Store {
         Ok(count.unwrap_or(0) as u64)
     }
 
+    pub fn usage_period_stats(&self, since: DateTime<Utc>) -> Result<UsagePeriodStats> {
+        let since = since.to_rfc3339();
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(total_tokens), 0) FROM usage_events WHERE started_at >= ?1",
+                params![since],
+                |row| {
+                    Ok(UsagePeriodStats {
+                        events: row.get::<_, i64>(0)? as u64,
+                        tokens: row.get::<_, i64>(1)? as u64,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn unsynced_event_count(
+        &self,
+        cursor: Option<(&DateTime<Utc>, &str)>,
+    ) -> Result<u64> {
+        let count: i64 = if let Some((started_at, event_id)) = cursor {
+            self.conn.query_row(
+                r#"
+                SELECT COUNT(*) FROM usage_events
+                WHERE started_at > ?1 OR (started_at = ?1 AND event_id > ?2)
+                "#,
+                params![started_at.to_rfc3339(), event_id],
+                |row| row.get(0),
+            )?
+        } else {
+            self.conn
+                .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))?
+        };
+        Ok(count as u64)
+    }
+
     pub fn events(&self) -> Result<Vec<UsageEvent>> {
         let mut stmt = self
             .conn
@@ -1694,18 +1756,192 @@ impl Store {
     ) -> Result<Vec<UsageSummary>> {
         let mut changed = Vec::new();
         for summary in summaries {
-            let payload = serde_json::to_string(summary)?;
+            let payload_hash = summary_sync_payload_hash(summary)?;
             if self.entity_requires_sync(
                 sink,
                 target,
                 "summary",
                 &summary.summary_id.0,
-                &hash_text(&payload),
+                &payload_hash,
             )? {
                 changed.push(summary.clone());
             }
         }
         Ok(changed)
+    }
+
+    pub fn pending_http_sync_rollup_summaries(&self, target: &str) -> Result<Vec<UsageSummary>> {
+        let rollups = self.all_sync_rollup_summaries()?;
+        self.pending_summaries_for_sync("http", target, &rollups)
+    }
+
+    pub fn sync_rollup_period_stats(&self, cutoff_day: NaiveDate) -> Result<RollupPeriodStats> {
+        let mut tokens = 0u64;
+        let mut requests = 0u64;
+        for summary in self.all_sync_rollup_summaries()? {
+            let day = summary
+                .period_start
+                .map(|start| start.date_naive())
+                .unwrap_or_else(|| summary.observed_at.date_naive());
+            if day < cutoff_day {
+                continue;
+            }
+            tokens = tokens.saturating_add(summary.usage.computed_total());
+            requests = requests.saturating_add(summary.usage.requests.unwrap_or(0));
+        }
+        Ok(RollupPeriodStats { tokens, requests })
+    }
+
+    pub fn snapshot_rollup_view(
+        &self,
+        sink: &str,
+        target: &str,
+        week_cutoff: NaiveDate,
+        today_cutoff: NaiveDate,
+    ) -> Result<SnapshotRollupView> {
+        let week_cutoff = week_cutoff.format("%Y-%m-%d").to_string();
+        let today_cutoff = today_cutoff.format("%Y-%m-%d").to_string();
+        let week = self.sync_rollup_stats_since_day(&week_cutoff)?;
+        let today = self.sync_rollup_stats_since_day(&today_cutoff)?;
+        let (pending_count, pending_days) =
+            self.pending_sync_rollup_counts(sink, target)?;
+        Ok(SnapshotRollupView {
+            pending_count,
+            pending_days,
+            today,
+            week,
+        })
+    }
+
+    fn sync_rollup_stats_since_day(&self, cutoff_day: &str) -> Result<RollupPeriodStats> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT
+                  COALESCE(SUM(CAST(json_extract(payload, '$.usage.total_tokens') AS INTEGER)), 0),
+                  COALESCE(SUM(CAST(json_extract(payload, '$.usage.requests') AS INTEGER)), 0)
+                FROM sync_rollups
+                WHERE day_key >= ?1
+                "#,
+                params![cutoff_day],
+                |row| {
+                    Ok(RollupPeriodStats {
+                        tokens: row.get::<_, i64>(0)? as u64,
+                        requests: row.get::<_, i64>(1)? as u64,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    const SYNC_ROLLUP_HASH_RECONCILE_KEY: &str = "sync_rollup_sync_hashes_reconciled_v1";
+
+    pub fn reconcile_sync_rollup_sync_hashes_if_needed(&self) -> Result<u64> {
+        if self
+            .metadata_value(Self::SYNC_ROLLUP_HASH_RECONCILE_KEY)?
+            .as_deref()
+            == Some("1")
+        {
+            return Ok(0);
+        }
+        let updated = self.reconcile_sync_rollup_sync_hashes()?;
+        self.set_metadata_value(Self::SYNC_ROLLUP_HASH_RECONCILE_KEY, "1")?;
+        Ok(updated)
+    }
+
+    pub fn reconcile_sync_rollup_sync_hashes(&self) -> Result<u64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT summary_id, payload FROM sync_rollups")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut updated = 0u64;
+            for (summary_id, payload) in rows {
+                let summary: UsageSummary = serde_json::from_str(&payload)?;
+                let payload_hash = summary_sync_payload_hash(&summary)?;
+                updated += self.conn.execute(
+                    "UPDATE sync_rollups SET payload_hash = ?1 WHERE summary_id = ?2 AND payload_hash != ?1",
+                    params![payload_hash, summary_id],
+                )? as u64;
+            }
+            Ok(updated)
+        })();
+
+        match result {
+            Ok(updated) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(updated)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    fn pending_sync_rollup_counts(&self, sink: &str, target: &str) -> Result<(u64, u64)> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT
+                  COUNT(*),
+                  COUNT(DISTINCT day_key)
+                FROM sync_rollups sr
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM entity_sync_state es
+                  WHERE es.sink = ?1
+                    AND es.target = ?2
+                    AND es.entity_kind = 'summary'
+                    AND es.entity_id = sr.summary_id
+                    AND es.payload_hash = sr.payload_hash
+                )
+                "#,
+                params![sink, target],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn reconcile_sync_rollup_dirty_flags(&self, sink: &str, target: &str) -> Result<u64> {
+        self.ensure_current_sync_rollup_versions()?;
+        let summaries = self.all_sync_rollup_summaries()?;
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut cleared = 0u64;
+            for summary in summaries {
+                let payload_hash = summary_sync_payload_hash(&summary)?;
+                if self.entity_requires_sync(
+                    sink,
+                    target,
+                    "summary",
+                    &summary.summary_id.0,
+                    &payload_hash,
+                )? {
+                    continue;
+                }
+                cleared += self.conn.execute(
+                    "UPDATE sync_rollups SET dirty = 0 WHERE summary_id = ?1 AND dirty = 1",
+                    params![&summary.summary_id.0],
+                )? as u64;
+            }
+            Ok(cleared)
+        })();
+
+        match result {
+            Ok(cleared) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(cleared)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
     }
 
     pub fn record_sources_synced(
@@ -2069,7 +2305,7 @@ impl Store {
 
         let summary = build_sync_rollup_summary(&events);
         let payload = serde_json::to_string(&summary)?;
-        let payload_hash = hash_text(&payload);
+        let payload_hash = summary_sync_payload_hash(&summary)?;
         let existing: Option<(String, i64)> = self
             .conn
             .query_row(

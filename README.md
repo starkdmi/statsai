@@ -25,34 +25,51 @@ The first adapters target Claude Code JSONL usage roots and Codex session logs. 
 - `crates/statsai-sync`: pluggable sync sink trait plus stdout/file/HTTP sinks
 - `crates/statsai-daemon`: localhost API
 - `crates/statsai-sdk`: Rust SDK facade
-- `crates/statsai-cli`: `statsai` binary
+- `crates/statsai`: `statsai` binary
+- `crates/statsai-menubar`: macOS menu bar app (`StatsAI.app`)
+
+## Install (macOS)
+
+```sh
+brew install starkdmi/tap/statsai
+```
+
+Or use the release installer script (no crates.io publish required):
+
+```sh
+curl -LsSf https://github.com/starkdmi/statsai/releases/latest/download/statsai-installer.sh | sh
+```
+
+GitHub Releases also ship `statsai-universal-apple-darwin.tar.xz` and `StatsAI.app.zip`.
+`cargo binstall statsai` will work after the workspace is published to crates.io.
+See `docs/release-distribution-plan.md` and `packaging/homebrew-tap/README.md`.
 
 ## CLI Examples
 
 ```sh
-cargo run -p statsai-cli -- scan --provider codex --preview
-cargo run -p statsai-cli -- source add --provider codex --path "$HOME/.codex-work"
-cargo run -p statsai-cli -- source disable --source-id src_123
-cargo run -p statsai-cli -- source enable --source-id src_123
-cargo run -p statsai-cli -- source remove --source-id src_123
-cargo run -p statsai-cli -- source remove --source-id src_123 --delete-data
-cargo run -p statsai-cli -- source connect --path "$HOME/.codex-work" --email work@example.com --label work --started-at 2026-05-01
-cargo run -p statsai-cli -- source history --path "$HOME/.codex-work"
-cargo run -p statsai-cli -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
-cargo run -p statsai-cli -- subscription add --provider claude --email personal@example.com --plan Pro --price 20 --started-at 2026-05-15 --paid-at 2026-05-15
-cargo run -p statsai-cli -- subscription change --provider codex --email work@example.com --plan Pro --price 200 --started-at 2026-06-01
-cargo run -p statsai-cli -- import summary --path ./reported_usage_summaries.json --dry-run --verbose
-cargo run -p statsai-cli -- report weekly
-cargo run -p statsai-cli -- report monthly --subscriptions
-cargo run -p statsai-cli -- sync --sink file --output ./statsai-sync-batch.json
-cargo run -p statsai-cli -- sync --sink http --since-last
-cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
-cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
-cargo run -p statsai-cli -- sync --status
-cargo run -p statsai-cli -- auth login
-cargo run -p statsai-cli -- auth status
-cargo run -p statsai-cli -- sync --sink http --verify
-cargo run -p statsai-cli -- schema sync-batch
+cargo run -p statsai -- scan --provider codex --preview
+cargo run -p statsai -- source add --provider codex --path "$HOME/.codex-work"
+cargo run -p statsai -- source disable --source-id src_123
+cargo run -p statsai -- source enable --source-id src_123
+cargo run -p statsai -- source remove --source-id src_123
+cargo run -p statsai -- source remove --source-id src_123 --delete-data
+cargo run -p statsai -- source connect --path "$HOME/.codex-work" --email work@example.com --label work --started-at 2026-05-01
+cargo run -p statsai -- source history --path "$HOME/.codex-work"
+cargo run -p statsai -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
+cargo run -p statsai -- subscription add --provider claude --email personal@example.com --plan Pro --price 20 --started-at 2026-05-15 --paid-at 2026-05-15
+cargo run -p statsai -- subscription change --provider codex --email work@example.com --plan Pro --price 200 --started-at 2026-06-01
+cargo run -p statsai -- import summary --path ./reported_usage_summaries.json --dry-run --verbose
+cargo run -p statsai -- report weekly
+cargo run -p statsai -- report monthly --subscriptions
+cargo run -p statsai -- sync --sink file --output ./statsai-sync-batch.json
+cargo run -p statsai -- sync --sink http --since-last
+cargo run -p statsai -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
+cargo run -p statsai -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches --since-last
+cargo run -p statsai -- sync --status
+cargo run -p statsai -- auth login
+cargo run -p statsai -- auth status
+cargo run -p statsai -- sync --sink http --verify
+cargo run -p statsai -- schema sync-batch
 ```
 
 The primary model is:
@@ -110,7 +127,7 @@ backend, such as local development or a self-hosted deployment:
 ```sh
 export STATSAI_API_URL="http://127.0.0.1:8787"
 export STATSAI_WEB_URL="http://127.0.0.1:3000"
-cargo run -p statsai-cli -- auth login
+cargo run -p statsai -- auth login
 ```
 
 For terminals where automatic browser launch is undesirable, use
@@ -119,7 +136,7 @@ CLI's local `127.0.0.1` callback. For SSH sessions and servers where the
 browser is on a different device, use:
 
 ```sh
-cargo run -p statsai-cli -- auth login --headless --device-name "Mini server"
+cargo run -p statsai -- auth login --headless --device-name "Mini server"
 ```
 
 The headless flow prints a short user code and approval URL, then polls until
@@ -129,8 +146,8 @@ normal login.
 After login:
 
 ```sh
-cargo run -p statsai-cli -- auth status
-cargo run -p statsai-cli -- sync --sink http --since-last
+cargo run -p statsai -- auth status
+cargo run -p statsai -- sync --sink http --since-last
 ```
 
 HTTP sync automatically uses the stored device access token unless
@@ -142,14 +159,14 @@ events stay local by default.
 Source management helpers:
 
 ```sh
-cargo run -p statsai-cli -- source list
-cargo run -p statsai-cli -- source connect --path "$HOME/.codex-work" --email work@example.com --started-at 2026-05-01
-cargo run -p statsai-cli -- source history --path "$HOME/.codex-work"
-cargo run -p statsai-cli -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
-cargo run -p statsai-cli -- source disable --source-id src_123
-cargo run -p statsai-cli -- source enable --source-id src_123
-cargo run -p statsai-cli -- source remove --source-id src_123
-cargo run -p statsai-cli -- source remove --source-id src_123 --delete-data
+cargo run -p statsai -- source list
+cargo run -p statsai -- source connect --path "$HOME/.codex-work" --email work@example.com --started-at 2026-05-01
+cargo run -p statsai -- source history --path "$HOME/.codex-work"
+cargo run -p statsai -- source disconnect --path "$HOME/.codex-work" --email work@example.com --ended-at 2026-06-01
+cargo run -p statsai -- source disable --source-id src_123
+cargo run -p statsai -- source enable --source-id src_123
+cargo run -p statsai -- source remove --source-id src_123
+cargo run -p statsai -- source remove --source-id src_123 --delete-data
 ```
 
 `source remove` deletes the source configuration. Add `--delete-data` to also
@@ -168,6 +185,6 @@ Run any compatible sync service locally and point the CLI at it:
 ```sh
 export STATSAI_API_URL="http://127.0.0.1:8787"
 export STATSAI_WEB_URL="http://127.0.0.1:3000"
-cargo run -p statsai-cli -- auth login
-cargo run -p statsai-cli -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
+cargo run -p statsai -- auth login
+cargo run -p statsai -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
 ```

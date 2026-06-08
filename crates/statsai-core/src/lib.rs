@@ -668,6 +668,26 @@ pub fn hash_text(value: &str) -> String {
 }
 
 #[must_use]
+pub fn sanitize_project_for_sync(mut project: ProjectInfo) -> Option<ProjectInfo> {
+    if !project_has_remote_identity(&project) {
+        return None;
+    }
+    project.path_label = None;
+    Some(project)
+}
+
+#[must_use]
+pub fn sanitize_summary_for_sync(mut summary: UsageSummary) -> UsageSummary {
+    summary.source.source_record_id = None;
+    if let Some(evidence) = summary.parse_evidence.as_mut() {
+        evidence.source_line_number = None;
+        evidence.source_record_id = None;
+    }
+    summary.project = summary.project.and_then(sanitize_project_for_sync);
+    summary
+}
+
+#[must_use]
 pub fn path_hash(path: &Path) -> String {
     let canonical = canonical_display(path);
     hash_text(&canonical)

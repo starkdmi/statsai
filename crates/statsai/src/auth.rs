@@ -20,7 +20,7 @@ fn keyring_backend_key(api_base_url: &str) -> String {
 #[cfg_attr(test, allow(dead_code))]
 fn session_entry(api_base_url: &str) -> Result<Entry> {
     Entry::new(
-        "statsai-cli",
+        "statsai",
         &format!("cf-session-{}", keyring_backend_key(api_base_url)),
     )
     .context("failed to open keyring for auth session")
@@ -29,7 +29,7 @@ fn session_entry(api_base_url: &str) -> Result<Entry> {
 #[cfg_attr(test, allow(dead_code))]
 fn legacy_token_entry(api_base_url: &str, kind: &str) -> Result<Entry> {
     Entry::new(
-        "statsai-cli",
+        "statsai",
         &format!("cf-{}-{}", kind, keyring_backend_key(api_base_url)),
     )
     .with_context(|| format!("failed to open legacy keyring for {kind} token"))
@@ -231,6 +231,33 @@ fn headless_login(api_base_url: &str, preferred_device_id: &str, device_name: &s
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginSnapshot {
+    pub logged_in: bool,
+    pub device_id: Option<String>,
+}
+
+pub fn login_snapshot() -> Result<LoginSnapshot> {
+    let api_base_url = cloudflare_api_url();
+    let Some((_path, credentials)) = auth_record_from_file(&auth_base_dir(), &api_base_url)?
+    else {
+        return Ok(LoginSnapshot {
+            logged_in: false,
+            device_id: None,
+        });
+    };
+    if !is_device_linked(&credentials) {
+        return Ok(LoginSnapshot {
+            logged_in: false,
+            device_id: None,
+        });
+    }
+    Ok(LoginSnapshot {
+        logged_in: true,
+        device_id: credentials.device_id.clone(),
+    })
+}
+
 pub fn status() -> Result<()> {
     let api_base_url = cloudflare_api_url();
     let Some((_path, credentials)) = auth_record_for_backend(&auth_base_dir(), &api_base_url)?
@@ -354,12 +381,17 @@ pub fn cloudflare_api_url() -> String {
     )
 }
 
-fn cloudflare_web_url() -> String {
+pub fn cloudflare_web_url() -> String {
     normalize_url(
         &std::env::var("STATSAI_WEB_URL")
             .unwrap_or_else(|_| DEFAULT_CLOUDFLARE_WEB_URL.to_string()),
         DEFAULT_CLOUDFLARE_WEB_URL,
     )
+}
+
+pub fn is_local_backend() -> bool {
+    let api = cloudflare_api_url();
+    api.contains("127.0.0.1") || api.contains("localhost")
 }
 
 fn exchange_cloudflare_device_code(
@@ -558,7 +590,7 @@ fn requested_device_name(device_name: Option<String>) -> String {
 
 fn login_device_id_candidates(preferred_device_id: &str) -> Vec<String> {
     let mut candidates = vec![preferred_device_id.to_string()];
-    let fresh_device_id = super::generate_device_id();
+    let fresh_device_id = crate::generate_device_id();
     if fresh_device_id != preferred_device_id {
         candidates.push(fresh_device_id);
     }
@@ -602,7 +634,7 @@ fn remembered_auth_device_id_from_base(base: &Path, api_base_url: &str) -> Optio
 }
 
 fn preferred_auth_device_id(base: &Path, api_base_url: &str) -> String {
-    preferred_auth_device_id_with_fallback(base, api_base_url, super::default_device_id)
+    preferred_auth_device_id_with_fallback(base, api_base_url, crate::default_device_id)
 }
 
 fn preferred_auth_device_id_with_fallback<F>(base: &Path, api_base_url: &str, fallback: F) -> String
@@ -678,10 +710,50 @@ fn default_device_name() -> String {
     format!("{} ({})", host, std::env::consts::OS)
 }
 
-fn load_credentials(path: &Path) -> Result<AuthCredentials> {
+fn load_credentials_from_file(path: &Path) -> Result<AuthCredentials> {
     let file = std::fs::File::open(path)?;
-    let mut credentials: AuthCredentials =
-        serde_json::from_reader(file).context("parse stored auth credentials")?;
+    serde_json::from_reader(file).context("parse stored auth credentials")
+}
+
+fn auth_record_from_file(
+    base: &Path,
+    api_base_url: &str,
+) -> Result<Option<(PathBuf, AuthCredentials)>> {
+    let api_base_url = normalize_url(api_base_url, DEFAULT_CLOUDFLARE_API_URL);
+    let path = auth_path_for_api_base_url(base, &api_base_url);
+    if path.exists() {
+        let credentials = load_credentials_from_file(&path)?;
+        return Ok(Some((path, credentials)));
+    }
+
+    let legacy_path = legacy_auth_path(base);
+    if !legacy_path.exists() || legacy_path == path {
+        return Ok(None);
+    }
+
+    let credentials = load_credentials(&legacy_path)?;
+    if has_cloudflare_session(&credentials)
+        && credentials_match_backend(&credentials, &api_base_url)
+    {
+        write_credentials(&path, &credentials)?;
+        let mut sanitized = credentials.clone();
+        sanitized.cloudflare_refresh_token = None;
+        sanitized.cloudflare_access_token = None;
+        let _ = write_credentials(&legacy_path, &sanitized);
+        return Ok(Some((path, credentials)));
+    }
+
+    if !has_cloudflare_session(&credentials)
+        && api_base_url == normalize_url(DEFAULT_CLOUDFLARE_API_URL, DEFAULT_CLOUDFLARE_API_URL)
+    {
+        return Ok(Some((legacy_path, credentials)));
+    }
+
+    Ok(None)
+}
+
+fn load_credentials(path: &Path) -> Result<AuthCredentials> {
+    let mut credentials = load_credentials_from_file(path)?;
     hydrate_credentials_from_keyring(&mut credentials)?;
     Ok(credentials)
 }
@@ -707,7 +779,6 @@ fn auth_record_for_backend(
         && credentials_match_backend(&credentials, &api_base_url)
     {
         write_credentials(&path, &credentials)?;
-        // sanitize legacy file so tokens are no longer plaintext on disk
         let mut sanitized = credentials.clone();
         sanitized.cloudflare_refresh_token = None;
         sanitized.cloudflare_access_token = None;
@@ -729,6 +800,13 @@ fn has_cloudflare_session(credentials: &AuthCredentials) -> bool {
         .cloudflare_refresh_token
         .as_deref()
         .is_some_and(|token| !token.trim().is_empty())
+}
+
+fn is_device_linked(credentials: &AuthCredentials) -> bool {
+    credentials
+        .device_id
+        .as_deref()
+        .is_some_and(|device_id| !device_id.trim().is_empty())
 }
 
 fn credentials_match_backend(credentials: &AuthCredentials, api_base_url: &str) -> bool {

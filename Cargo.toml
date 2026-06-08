@@ -6,7 +6,8 @@ members = [
   "crates/statsai-sync",
   "crates/statsai-daemon",
   "crates/statsai-sdk",
-  "crates/statsai-cli",
+  "crates/statsai",
+  "crates/statsai-menubar",
   "crates/statsai-pricing",
 ]
 resolver = "2"
@@ -22,6 +23,12 @@ keywords = ["ai", "cli", "usage", "statistics", "llm", "tokens", "coding"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
+statsai-adapters = { path = "crates/statsai-adapters", version = "0.0.1" }
+statsai-core = { path = "crates/statsai-core", version = "0.0.1" }
+statsai-daemon = { path = "crates/statsai-daemon", version = "0.0.1" }
+statsai-sdk = { path = "crates/statsai-sdk", version = "0.0.1" }
+statsai-store = { path = "crates/statsai-store", version = "0.0.1" }
+statsai-sync = { path = "crates/statsai-sync", version = "0.0.1" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -44,3 +51,8 @@ ureq = { version = "2.9", features = ["json"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
