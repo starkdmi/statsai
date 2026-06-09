@@ -117,8 +117,8 @@ pub fn collect(store: &Store) -> Result<AppSnapshot> {
     let sessions_week = week.requests;
     let cost_week_cents = week.cost_cents;
 
-    let ui = build_ui(
-        login.logged_in,
+    let ui = build_ui(SnapshotUiInput {
+        logged_in: login.logged_in,
         has_synced,
         sync_failures,
         pending_upload,
@@ -126,8 +126,7 @@ pub fn collect(store: &Store) -> Result<AppSnapshot> {
         week,
         today,
         last_sync_at,
-        using_local_dev,
-    );
+    });
 
     Ok(AppSnapshot {
         logged_in: login.logged_in,
@@ -160,6 +159,17 @@ struct PeriodStats {
     tokens: u64,
     requests: u64,
     cost_cents: Option<i64>,
+}
+
+struct SnapshotUiInput {
+    logged_in: bool,
+    has_synced: bool,
+    sync_failures: u64,
+    pending_upload: bool,
+    pending_days: u64,
+    week: PeriodStats,
+    today: PeriodStats,
+    last_sync_at: Option<DateTime<Utc>>,
 }
 
 struct UiCopy {
@@ -384,17 +394,18 @@ fn fetch_dashboard_period_stats() -> Result<(PeriodStats, PeriodStats)> {
     ))
 }
 
-fn build_ui(
-    logged_in: bool,
-    has_synced: bool,
-    sync_failures: u64,
-    pending_upload: bool,
-    pending_days: u64,
-    week: PeriodStats,
-    today: PeriodStats,
-    last_sync_at: Option<DateTime<Utc>>,
-    _using_local_dev: bool,
-) -> UiCopy {
+fn build_ui(input: SnapshotUiInput) -> UiCopy {
+    let SnapshotUiInput {
+        logged_in,
+        has_synced,
+        sync_failures,
+        pending_upload,
+        pending_days,
+        week,
+        today,
+        last_sync_at,
+    } = input;
+
     let menu_stat_1 = format_week_line(&week);
     let menu_stat_2 = format_today_line(&today);
 

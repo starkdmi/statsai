@@ -39,7 +39,7 @@ mod macos {
         Menu(tray_icon::menu::MenuEvent),
         Refresh,
         SetIdle,
-        SnapshotReady(Result<AppSnapshot, String>),
+        SnapshotReady(Box<Result<AppSnapshot, String>>),
     }
 
     struct MenuActions {
@@ -104,7 +104,7 @@ mod macos {
                 .set_enabled(!snapshot.status_error);
 
             #[cfg(debug_assertions)]
-            self.dev_info.set_text(&dev_info_line(snapshot));
+            self.dev_info.set_text(dev_info_line(snapshot));
         }
 
         fn build_menu(&self, snapshot: &AppSnapshot, activity: Activity) -> Menu {
@@ -186,7 +186,7 @@ mod macos {
         }
 
         if let Some(icon) = icon {
-            let _ = icon.set_menu(Some(Box::new(menu_ui.build_menu(snapshot, activity))));
+            icon.set_menu(Some(Box::new(menu_ui.build_menu(snapshot, activity))));
         }
         *menu_shell.borrow_mut() = shell;
         pending_shell.borrow_mut().take();
@@ -212,7 +212,7 @@ mod macos {
         };
         let include_primary = menu_shell_includes_primary(&shell);
         if let Some(icon) = icon {
-            let _ = icon.set_menu(Some(Box::new(menu_ui.build_menu(&snapshot, activity))));
+            icon.set_menu(Some(Box::new(menu_ui.build_menu(&snapshot, activity))));
         }
         *menu_shell.borrow_mut() = shell;
         menu_ui.apply_snapshot(&snapshot, activity, include_primary);
@@ -297,6 +297,7 @@ mod macos {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .open(&path)
                 .map_err(|err| format!("open {}: {err}", path.display()))?;
             let fd = file.as_raw_fd();
@@ -435,12 +436,12 @@ mod macos {
                     let proxy = init_refresh_proxy.clone();
                     std::thread::spawn(move || {
                         let snapshot = fetch_snapshot();
-                        let _ = proxy.send_event(UserEvent::SnapshotReady(snapshot));
+                        let _ = proxy.send_event(UserEvent::SnapshotReady(Box::new(snapshot)));
                     });
                 }
                 Event::UserEvent(UserEvent::SnapshotReady(result)) => {
                     refresh_in_flight.set(false);
-                    let snapshot = match result {
+                    let snapshot = match *result {
                         Ok(snapshot) => {
                             *last_snapshot.borrow_mut() = Some(snapshot.clone());
                             snapshot
