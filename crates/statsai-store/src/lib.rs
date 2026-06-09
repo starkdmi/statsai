@@ -156,6 +156,24 @@ fn deserialize_subscription_payload(
     })
 }
 
+fn restrict_dir_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn restrict_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -170,8 +188,10 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
+            restrict_dir_permissions(parent)?;
         }
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        restrict_file_permissions(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self { conn };
         store.migrate()?;
@@ -3953,6 +3973,28 @@ mod tests {
         USAGE_SUMMARY_SCHEMA_VERSION,
     };
     use std::path::Path;
+
+    #[test]
+    #[cfg(unix)]
+    fn open_restricts_store_directory_and_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let store_dir = dir.path().join(".statsai");
+        let db_path = store_dir.join("statsai.sqlite");
+
+        let store = Store::open(&db_path).expect("open store");
+        drop(store);
+
+        let dir_mode =
+            std::fs::metadata(&store_dir).expect("dir metadata").permissions().mode() & 0o777;
+        let file_mode =
+            std::fs::metadata(&db_path).expect("file metadata").permissions().mode() & 0o777;
+
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+    }
 
     #[test]
     fn reads_legacy_subscription_payloads_with_missing_account_and_start() {
