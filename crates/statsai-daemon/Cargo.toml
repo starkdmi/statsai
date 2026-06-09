@@ -8,9 +8,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-statsai-adapters = { path = "../statsai-adapters" }
-statsai-core = { path = "../statsai-core" }
-statsai-store = { path = "../statsai-store" }
+statsai-adapters.workspace = true
+statsai-core.workspace = true
+statsai-store.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 notify = { workspace = true, optional = true }

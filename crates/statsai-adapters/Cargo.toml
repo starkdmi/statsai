@@ -8,8 +8,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-statsai-core = { path = "../statsai-core" }
-statsai-pricing = { path = "../statsai-pricing" }
+statsai-core.workspace = true
+statsai-pricing.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true

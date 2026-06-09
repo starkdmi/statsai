@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-statsai-core = { path = "../statsai-core" }
+statsai-core.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
