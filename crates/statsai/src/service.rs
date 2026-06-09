@@ -1,10 +1,18 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::Serialize;
+
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+#[cfg(target_os = "macos")]
 use statsai_core::home_dir;
+#[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
 const LAUNCH_AGENT_LABEL: &str = "dev.statsai.daemon";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,36 +28,34 @@ pub struct BackgroundServiceState {
     pub launch_agent_loaded: bool,
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn background_service_state() -> Result<BackgroundServiceState> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Ok(BackgroundServiceState {
-            plist_installed: false,
-            launch_agent_loaded: false,
-        });
-    }
+    Ok(BackgroundServiceState {
+        plist_installed: false,
+        launch_agent_loaded: false,
+    })
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        let plist_path = launch_agent_path()?;
-        let plist_installed = plist_path.exists();
-        let launch_agent_loaded = if plist_installed {
-            Command::new("launchctl")
-                .args([
-                    "print",
-                    &format!("{}/{}", gui_domain()?, LAUNCH_AGENT_LABEL),
-                ])
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        Ok(BackgroundServiceState {
-            plist_installed,
-            launch_agent_loaded,
-        })
-    }
+#[cfg(target_os = "macos")]
+pub fn background_service_state() -> Result<BackgroundServiceState> {
+    let plist_path = launch_agent_path()?;
+    let plist_installed = plist_path.exists();
+    let launch_agent_loaded = if plist_installed {
+        Command::new("launchctl")
+            .args([
+                "print",
+                &format!("{}/{}", gui_domain()?, LAUNCH_AGENT_LABEL),
+            ])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    Ok(BackgroundServiceState {
+        plist_installed,
+        launch_agent_loaded,
+    })
 }
 
 pub fn service(action: ServiceAction) -> Result<()> {
