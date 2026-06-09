@@ -3860,10 +3860,16 @@ mod tests {
         let store = Store::open(&db_path).expect("open store");
         drop(store);
 
-        let dir_mode =
-            std::fs::metadata(&store_dir).expect("dir metadata").permissions().mode() & 0o777;
-        let file_mode =
-            std::fs::metadata(&db_path).expect("file metadata").permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(&store_dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&db_path)
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
 
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);

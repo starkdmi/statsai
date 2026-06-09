@@ -52,11 +52,10 @@ fn record_migration(conn: &Connection, version: i64) -> Result<()> {
 }
 
 fn stamp_legacy_database(conn: &Connection) -> Result<()> {
-    let migration_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM schema_migrations",
-        [],
-        |row| row.get(0),
-    )?;
+    let migration_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })?;
     if migration_count > 0 {
         return Ok(());
     }
@@ -250,7 +249,10 @@ mod tests {
     fn fresh_database_applies_all_schema_migrations() {
         let conn = Connection::open_in_memory().expect("open in-memory database");
         migrate(&conn).expect("migrate fresh database");
-        assert_eq!(schema_version(&conn).expect("read version"), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            schema_version(&conn).expect("read version"),
+            CURRENT_SCHEMA_VERSION
+        );
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
     }
 
@@ -260,7 +262,10 @@ mod tests {
         apply_migration_001(&conn).expect("apply legacy baseline schema");
 
         migrate(&conn).expect("migrate legacy database");
-        assert_eq!(schema_version(&conn).expect("read version"), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            schema_version(&conn).expect("read version"),
+            CURRENT_SCHEMA_VERSION
+        );
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
     }
 }
