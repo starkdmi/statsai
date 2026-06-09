@@ -504,7 +504,7 @@ struct SyncCommand {
     verify: bool,
     #[arg(
         long,
-        help = "Delete mirrored hosted sync data for the current user and clear local sync tracking (http only)"
+        help = "Delete mirrored hosted sync data for the entire account (all paired devices) and clear local sync tracking (http only)"
     )]
     reset_remote: bool,
     #[arg(long, help = "Confirm destructive sync reset actions")]
@@ -2007,8 +2007,14 @@ fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
     }
 
     if !command.yes {
-        bail!("--reset-remote deletes mirrored hosted sync data; rerun with --yes");
+        bail!(
+            "--reset-remote deletes mirrored hosted sync data for your entire account, affecting every paired device; rerun with --yes"
+        );
     }
+
+    eprintln!(
+        "warning: --reset-remote deletes mirrored hosted sync data for your entire account, affecting every paired device."
+    );
 
     let auth_token = resolve_http_auth_token(&command, true)?
         .context("device login required; run `statsai auth login` first")?;
