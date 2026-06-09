@@ -37,8 +37,9 @@ The current production sync path strips record-level local evidence before sendi
 - `UsageSummary.parse_evidence.source_record_id`
 - `Subscription.notes`
 
-Hashed path, source, event, and summary identifiers remain so the server can
-deduplicate records without seeing local file names directly.
+`ProjectInfo.path_label` is retained for owner-facing project location displays
+and manual project linking. Hashed path, source, event, and summary identifiers
+remain so the server can deduplicate records and keep stable location identity.
 
 Canonical provider account identity may now sync through
 `ProviderAccount.provider_user_id` and `ProviderAccount.email`. The backend uses

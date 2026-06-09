@@ -385,6 +385,13 @@ pub fn project_has_remote_identity(project: &ProjectInfo) -> bool {
 }
 
 #[must_use]
+pub fn project_contains_file_paths(project: Option<&ProjectInfo>) -> bool {
+    project
+        .and_then(|project| project.path_label.as_deref())
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+#[must_use]
 pub fn project_bucket_key(project: Option<&ProjectInfo>) -> String {
     let Some(project) = project else {
         return "none".to_string();
@@ -668,11 +675,10 @@ pub fn hash_text(value: &str) -> String {
 }
 
 #[must_use]
-pub fn sanitize_project_for_sync(mut project: ProjectInfo) -> Option<ProjectInfo> {
-    if !project_has_remote_identity(&project) {
+pub fn sanitize_project_for_sync(project: ProjectInfo) -> Option<ProjectInfo> {
+    if !project_has_stable_identity(&project) {
         return None;
     }
-    project.path_label = None;
     Some(project)
 }
 
@@ -684,6 +690,9 @@ pub fn sanitize_summary_for_sync(mut summary: UsageSummary) -> UsageSummary {
         evidence.source_record_id = None;
     }
     summary.project = summary.project.and_then(sanitize_project_for_sync);
+    if project_contains_file_paths(summary.project.as_ref()) {
+        summary.privacy.contains_file_paths = true;
+    }
     summary
 }
 
@@ -1946,6 +1955,74 @@ mod tests {
 
         assert!(!project_has_stable_identity(&project));
         assert_eq!(project_bucket_key(Some(&project)), "none");
+    }
+
+    #[test]
+    fn sanitize_project_for_sync_preserves_path_only_project_labels() {
+        let project = ProjectInfo {
+            project_id: "project_path_only".to_string(),
+            project_label: Some("Scratch".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/Scratch".to_string()),
+        };
+
+        let sanitized = sanitize_project_for_sync(project).expect("stable path identity");
+
+        assert_eq!(sanitized.repo_remote_hash, None);
+        assert_eq!(sanitized.path_hash.as_deref(), Some("path-hash"));
+        assert_eq!(
+            sanitized.path_label.as_deref(),
+            Some("/Users/example/Scratch")
+        );
+        assert!(project_contains_file_paths(Some(&sanitized)));
+    }
+
+    #[test]
+    fn sanitize_project_for_sync_drops_bare_project_ids() {
+        let project = ProjectInfo {
+            project_id: "project_bare".to_string(),
+            project_label: Some("Bare".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: None,
+            path_label: Some("/Users/example/Bare".to_string()),
+        };
+
+        assert!(sanitize_project_for_sync(project).is_none());
+    }
+
+    #[test]
+    fn sanitize_summary_for_sync_marks_project_path_labels_as_file_paths() {
+        let now = mk_dt(2026, 5, 25);
+        let source = test_source("codex", "/tmp/codex");
+        let mut summary = test_summary("codex", &source, now, now, now, 100);
+        summary.project = Some(ProjectInfo {
+            project_id: "project_path_only".to_string(),
+            project_label: Some("Scratch".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/Scratch".to_string()),
+        });
+
+        let sanitized = sanitize_summary_for_sync(summary);
+
+        assert_eq!(
+            sanitized
+                .project
+                .as_ref()
+                .and_then(|project| project.path_label.as_deref()),
+            Some("/Users/example/Scratch")
+        );
+        assert!(sanitized.privacy.contains_file_paths);
     }
 
     #[test]

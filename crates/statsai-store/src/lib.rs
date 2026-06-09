@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use statsai_core::{
     hash_text, normalize_email, normalize_provider_user_id, periods_overlap, project_bucket_key,
-    project_has_remote_identity, project_has_stable_identity, provider_account_id,
+    project_contains_file_paths, project_has_stable_identity, provider_account_id,
     provider_account_id_from_identity, sanitize_summary_for_sync, semantic_event_fingerprint,
     source_account_assignment_id, subscription_id, summary_id, timestamp_in_period, BillingPeriod,
     Confidence, CostInfo, DailyRollup, EventSource, IdentitySource, LatencySource, MetricStats,
@@ -21,7 +21,7 @@ use statsai_core::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-const SYNC_ROLLUP_SUMMARY_VERSION: &str = "8";
+const SYNC_ROLLUP_SUMMARY_VERSION: &str = "9";
 
 fn summary_sync_payload_hash(summary: &UsageSummary) -> Result<String> {
     let payload = serde_json::to_string(&sanitize_summary_for_sync(summary.clone()))?;
@@ -3646,13 +3646,13 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         project: first
             .project
             .as_ref()
-            .filter(|project| project_has_remote_identity(project))
+            .filter(|project| project_has_stable_identity(project))
             .cloned(),
         privacy: PrivacyInfo {
             mode: PrivacyMode::MetadataOnly,
             contains_prompt_text: false,
             contains_response_text: false,
-            contains_file_paths: false,
+            contains_file_paths: project_contains_file_paths(first.project.as_ref()),
         },
         metrics: summary_metrics,
         period_start: Some(period_start),
@@ -4120,7 +4120,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_rollups_keep_path_only_buckets_without_exporting_project_metadata() {
+    fn sync_rollups_export_path_only_project_metadata() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
             "codex",
@@ -4173,7 +4173,23 @@ mod tests {
 
         let dirty = store.dirty_sync_rollup_summaries().expect("dirty rollups");
         assert_eq!(dirty.len(), 2);
-        assert!(dirty.iter().all(|summary| summary.project.is_none()));
+        let projects = dirty
+            .iter()
+            .map(|summary| summary.project.as_ref().expect("project metadata"))
+            .collect::<Vec<_>>();
+        assert!(projects
+            .iter()
+            .all(|project| project.repo_remote_hash.is_none()));
+        assert_eq!(
+            projects
+                .iter()
+                .filter_map(|project| project.path_label.as_deref())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "/Users/example/Documents/Codex/2026-05-28/hi",
+                "/Users/example/Documents/Codex/2026-05-29/hi",
+            ])
+        );
         assert_eq!(
             dirty
                 .iter()

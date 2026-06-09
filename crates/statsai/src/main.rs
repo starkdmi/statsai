@@ -13,12 +13,13 @@ use statsai_adapters::{
 };
 use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, home_dir, normalize_email,
-    normalize_provider_user_id, path_hash, periods_overlap, project_has_remote_identity,
-    source_account_assignment_id, subscription_id, timestamp_in_period, BillingPeriod,
-    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
-    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
-    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch,
-    UsageEvent, UsageReport, UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    normalize_provider_user_id, path_hash, periods_overlap, project_contains_file_paths,
+    project_has_stable_identity, source_account_assignment_id, subscription_id,
+    timestamp_in_period, BillingPeriod, IdentitySource, LocationOrigin, ProjectInfo,
+    ProviderAccount, ProviderAccountId, ReportPeriod, SourceAccountAssignment,
+    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
+    Subscription, SubscriptionId, SubscriptionStatus, SyncBatch, UsageEvent, UsageReport,
+    UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -2606,7 +2607,7 @@ fn http_rollup_project_count(batch: &SyncBatch) -> usize {
 
 fn http_rollup_summary_project_key(summary: &UsageSummary) -> Option<String> {
     let project = summary.project.as_ref()?;
-    if !project_has_remote_identity(project) {
+    if !project_has_stable_identity(project) {
         return None;
     }
     if let Some(repo_remote_hash) = project.repo_remote_hash.as_deref() {
@@ -2629,7 +2630,7 @@ fn http_rollup_project_location_count(batch: &SyncBatch) -> usize {
 
 fn http_rollup_summary_project_location_key(summary: &UsageSummary) -> Option<String> {
     let project = summary.project.as_ref()?;
-    if !project_has_remote_identity(project) {
+    if !project_has_stable_identity(project) {
         return None;
     }
     if let Some(path_hash) = project.path_hash.as_deref() {
@@ -4964,6 +4965,9 @@ fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
         evidence.source_record_id = None;
     }
     event.project = event.project.and_then(sanitize_project_for_sync);
+    if project_contains_file_paths(event.project.as_ref()) {
+        event.privacy.contains_file_paths = true;
+    }
     event
 }
 
@@ -5288,7 +5292,12 @@ mod tests {
             event_evidence.source_file_path_hash.as_deref(),
             Some("hash")
         );
-        assert!(event.project.is_none());
+        let event_project = event.project.expect("path-only event project");
+        assert_eq!(
+            event_project.path_label.as_deref(),
+            Some("/Users/example/Documents/Codex/2026-05-29/hi")
+        );
+        assert!(event.privacy.contains_file_paths);
 
         assert!(summary.source.source_record_id.is_none());
         let summary_evidence = summary.parse_evidence.expect("summary evidence");
@@ -5302,7 +5311,11 @@ mod tests {
         assert_eq!(project.repo_remote_hash.as_deref(), Some("repo-hash"));
         assert_eq!(project.repo_label.as_deref(), Some("owner/repo"));
         assert_eq!(project.path_hash.as_deref(), Some("path-hash"));
-        assert!(project.path_label.is_none());
+        assert_eq!(
+            project.path_label.as_deref(),
+            Some("/Users/example/work/ai-stats")
+        );
+        assert!(summary.privacy.contains_file_paths);
     }
 
     #[test]
@@ -7993,7 +8006,7 @@ mod tests {
     }
 
     #[test]
-    fn http_rollup_project_counts_ignore_path_only_projects() {
+    fn http_rollup_project_counts_include_path_only_projects() {
         let source = SourceLocation::local_adapter(
             "codex",
             "test",
@@ -8029,8 +8042,8 @@ mod tests {
             created_at: now,
         };
 
-        assert_eq!(http_rollup_project_count(&batch), 0);
-        assert_eq!(http_rollup_project_location_count(&batch), 0);
+        assert_eq!(http_rollup_project_count(&batch), 1);
+        assert_eq!(http_rollup_project_location_count(&batch), 1);
     }
 
     #[test]
@@ -8455,10 +8468,14 @@ mod tests {
             .map(sanitize_summary_for_sync)
             .collect();
         assert_eq!(rollups.len(), 1);
-        assert!(rollups[0]
-            .project
-            .as_ref()
-            .is_some_and(|project| project.path_label.is_none()));
+        assert_eq!(
+            rollups[0]
+                .project
+                .as_ref()
+                .and_then(|project| project.path_label.as_deref()),
+            Some("/Users/example/work/ai-stats")
+        );
+        assert!(rollups[0].privacy.contains_file_paths);
         store
             .record_summaries_synced("http", &target, &rollups)
             .expect("record rollups");

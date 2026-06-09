@@ -105,7 +105,7 @@ split totals, and `estimated_cost_usd` for SDKs or scripts.
 
 Trusted direct reads use `source_kind = local_adapter`. Default, configured, env, and discovered paths are distinguished by `location_origin`, not by trust tier.
 
-Local paths are hashed in source identity fields. `path_label` exists for local configuration and scanning ergonomics; exported privacy policy will tighten before the API is declared stable.
+Local paths are hashed in source identity fields. Source and parse-evidence path labels are stripped from sync payloads, while project location path labels are retained for owner-facing dashboard display and manual project linking.
 
 Estimated cost is API-equivalent, not a subscription invoice. It uses known provider pricing for recognized models and remains `unknown` when a local log does not prove the billable model.
 
