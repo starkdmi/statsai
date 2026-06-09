@@ -7,8 +7,13 @@ Homebrew tap for StatsAI. Formulae are published automatically by the
 ## One-time setup
 
 1. Create `https://github.com/starkdmi/homebrew-tap` (initialize with a README).
-2. Create a GitHub personal access token with `repo` scope.
+2. Create a GitHub personal access token that can **write** to `starkdmi/homebrew-tap`:
+   - Fine-grained: repository access = `starkdmi/homebrew-tap`, **Contents: Read and write**
+   - Classic: `repo` scope
 3. Add the token as `HOMEBREW_TAP_TOKEN` in `starkdmi/statsai` repository secrets.
+
+If `publish-homebrew-formula` fails with `Permission to starkdmi/homebrew-tap.git denied`,
+the secret is missing, expired, or scoped to the wrong repository.
 
 ## Install
 
