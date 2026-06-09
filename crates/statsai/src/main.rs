@@ -12,14 +12,13 @@ use statsai_adapters::{
     ScanOptions, VerifiedSourceState,
 };
 use statsai_core::{
-    build_usage_report, display_account_identity, expand_home_path, home_dir,
-    normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
-    project_has_remote_identity, source_account_assignment_id, subscription_id,
-    timestamp_in_period, BillingPeriod, IdentitySource, LocationOrigin, ProjectInfo,
-    ProviderAccount, ProviderAccountId, ReportPeriod, SourceAccountAssignment,
-    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
-    Subscription, SubscriptionId, SubscriptionStatus, SyncBatch, UsageEvent, UsageReport,
-    UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    build_usage_report, display_account_identity, expand_home_path, home_dir, normalize_email,
+    normalize_provider_user_id, path_hash, periods_overlap, project_has_remote_identity,
+    source_account_assignment_id, subscription_id, timestamp_in_period, BillingPeriod,
+    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
+    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch,
+    UsageEvent, UsageReport, UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]

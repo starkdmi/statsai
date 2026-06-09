@@ -239,8 +239,7 @@ pub struct LoginSnapshot {
 
 pub fn login_snapshot() -> Result<LoginSnapshot> {
     let api_base_url = cloudflare_api_url();
-    let Some((_path, credentials)) = auth_record_from_file(&auth_base_dir(), &api_base_url)?
-    else {
+    let Some((_path, credentials)) = auth_record_from_file(&auth_base_dir(), &api_base_url)? else {
         return Ok(LoginSnapshot {
             logged_in: false,
             device_id: None,

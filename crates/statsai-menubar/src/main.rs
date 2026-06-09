@@ -8,6 +8,9 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use statsai::snapshot::{AppSnapshot, PrimaryAction};
+    use statsai::{default_store_path, snapshot};
+    use statsai_store::Store;
     use std::cell::{Cell, RefCell};
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
@@ -17,9 +20,6 @@ mod macos {
     use std::sync::OnceLock;
     use std::thread;
     use std::time::{Duration, Instant};
-    use statsai::snapshot::{AppSnapshot, PrimaryAction};
-    use statsai::{default_store_path, snapshot};
-    use statsai_store::Store;
     use tao::event::Event;
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -92,13 +92,16 @@ mod macos {
             self.stat_3.set_text(&snapshot.menu_stat_3);
 
             if include_primary {
-                self.actions
-                    .primary
-                    .set_text(primary_label(snapshot.primary_action, snapshot.pending_upload));
+                self.actions.primary.set_text(primary_label(
+                    snapshot.primary_action,
+                    snapshot.pending_upload,
+                ));
                 self.actions.primary.set_enabled(true);
             }
 
-            self.actions.open_dashboard.set_enabled(!snapshot.status_error);
+            self.actions
+                .open_dashboard
+                .set_enabled(!snapshot.status_error);
 
             #[cfg(debug_assertions)]
             self.dev_info.set_text(&dev_info_line(snapshot));
@@ -111,12 +114,7 @@ mod macos {
             #[cfg(debug_assertions)]
             let sep_dev = PredefinedMenuItem::separator();
 
-            let _ = menu.append_items(&[
-                &self.summary,
-                &self.stat_1,
-                &self.stat_2,
-                &self.stat_3,
-            ]);
+            let _ = menu.append_items(&[&self.summary, &self.stat_1, &self.stat_2, &self.stat_3]);
 
             if snapshot.status_error {
                 let _ = menu.append(&sep_quit);
@@ -124,8 +122,8 @@ mod macos {
                 return menu;
             }
 
-            let show_primary = activity == Activity::Idle
-                && snapshot.primary_action != PrimaryAction::None;
+            let show_primary =
+                activity == Activity::Idle && snapshot.primary_action != PrimaryAction::None;
             if show_primary {
                 let _ = menu.append(&sep_actions);
                 let _ = menu.append(&self.actions.primary);
@@ -395,37 +393,33 @@ mod macos {
                             let _ = init_refresh_proxy.send_event(UserEvent::Refresh);
                         }
                         Err(err) => {
-                            eprintln!(
-                                "StatsAI could not create the menu bar icon: {err}"
-                            );
+                            eprintln!("StatsAI could not create the menu bar icon: {err}");
                             std::process::exit(1);
                         }
                     }
                 }
                 Event::NewEvents(_) => {}
-                Event::UserEvent(UserEvent::TrayIcon(event)) => {
-                    match event {
-                        TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Down,
-                            ..
-                        } => {
-                            menu_open.set(true);
-                        }
-                        TrayIconEvent::Leave { .. } => {
-                            menu_open.set(false);
-                            flush_pending_menu_shell(
-                                &menu_ui,
-                                tray_icon.as_ref(),
-                                last_snapshot.borrow().clone(),
-                                activity.get(),
-                                &menu_shell,
-                                &pending_shell,
-                            );
-                        }
-                        _ => {}
+                Event::UserEvent(UserEvent::TrayIcon(event)) => match event {
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Down,
+                        ..
+                    } => {
+                        menu_open.set(true);
                     }
-                }
+                    TrayIconEvent::Leave { .. } => {
+                        menu_open.set(false);
+                        flush_pending_menu_shell(
+                            &menu_ui,
+                            tray_icon.as_ref(),
+                            last_snapshot.borrow().clone(),
+                            activity.get(),
+                            &menu_shell,
+                            &pending_shell,
+                        );
+                    }
+                    _ => {}
+                },
                 Event::UserEvent(UserEvent::SetIdle) => {
                     activity.set(Activity::Idle);
                     let _ = init_refresh_proxy.send_event(UserEvent::Refresh);
@@ -492,12 +486,12 @@ mod macos {
                                     let _ = proxy.send_event(UserEvent::SetIdle);
                                 };
                                 match run_statsai_capture(&["scan"]) {
-                                Ok(_) => match run_statsai_capture(&[
-                                    "sync",
-                                    "--sink",
-                                    "http",
-                                    "--since-last",
-                                ]) {
+                                    Ok(_) => match run_statsai_capture(&[
+                                        "sync",
+                                        "--sink",
+                                        "http",
+                                        "--since-last",
+                                    ]) {
                                         Ok(_) => {
                                             finish();
                                         }
@@ -550,16 +544,14 @@ mod macos {
         refresh_proxy: tao::event_loop::EventLoopProxy<UserEvent>,
         idle_proxy: tao::event_loop::EventLoopProxy<UserEvent>,
     ) {
-        spawn_menu_action(move || {
-            match run_statsai_capture(&["scan"]) {
-                Ok(_) => {
-                    let _ = idle_proxy.send_event(UserEvent::SetIdle);
-                    let _ = refresh_proxy.send_event(UserEvent::Refresh);
-                }
-                Err(message) => {
-                    eprintln!("statsai menubar startup scan failed: {message}");
-                    let _ = idle_proxy.send_event(UserEvent::SetIdle);
-                }
+        spawn_menu_action(move || match run_statsai_capture(&["scan"]) {
+            Ok(_) => {
+                let _ = idle_proxy.send_event(UserEvent::SetIdle);
+                let _ = refresh_proxy.send_event(UserEvent::Refresh);
+            }
+            Err(message) => {
+                eprintln!("statsai menubar startup scan failed: {message}");
+                let _ = idle_proxy.send_event(UserEvent::SetIdle);
             }
         });
     }
@@ -584,11 +576,10 @@ mod macos {
     }
 
     fn tray_icon_image() -> tray_icon::Icon {
-        load_tray_icon_from_png(include_bytes!("../assets/icon.png"))
-            .unwrap_or_else(|err| {
-                eprintln!("statsai menubar: could not load bundled icon: {err}");
-                fallback_tray_icon()
-            })
+        load_tray_icon_from_png(include_bytes!("../assets/icon.png")).unwrap_or_else(|err| {
+            eprintln!("statsai menubar: could not load bundled icon: {err}");
+            fallback_tray_icon()
+        })
     }
 
     fn load_tray_icon_from_png(bytes: &[u8]) -> Result<tray_icon::Icon, String> {
@@ -630,8 +621,8 @@ mod macos {
     }
 
     fn dashboard_url() -> String {
-        let base = std::env::var("STATSAI_WEB_URL")
-            .unwrap_or_else(|_| "https://statsai.dev".to_string());
+        let base =
+            std::env::var("STATSAI_WEB_URL").unwrap_or_else(|_| "https://statsai.dev".to_string());
         format!("{}/dashboard/", base.trim_end_matches('/'))
     }
 
@@ -675,12 +666,14 @@ mod macos {
             .spawn()
             .map_err(|err| format!("failed to run {}: {err}", binary.display()))?;
 
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            "failed to capture statsai stdout".to_string()
-        })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
-            "failed to capture statsai stderr".to_string()
-        })?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to capture statsai stdout".to_string())?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to capture statsai stderr".to_string())?;
 
         let stdout_handle = thread::spawn(move || {
             let mut buf = Vec::new();
@@ -769,9 +762,7 @@ mod macos {
 
     fn statsai_binary() -> Result<PathBuf, String> {
         static BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-        BINARY
-            .get_or_init(resolve_statsai_binary)
-            .clone()
+        BINARY.get_or_init(resolve_statsai_binary).clone()
     }
 
     fn resolve_statsai_binary() -> Result<PathBuf, String> {

@@ -87,12 +87,8 @@ pub fn collect(store: &Store) -> Result<AppSnapshot> {
         .map(|state| state.failure_count)
         .unwrap_or(0);
 
-    let rollup_view = store.snapshot_rollup_view(
-        "http",
-        &http_target,
-        calendar_cutoff(7),
-        calendar_cutoff(1),
-    )?;
+    let rollup_view =
+        store.snapshot_rollup_view("http", &http_target, calendar_cutoff(7), calendar_cutoff(1))?;
     let has_pending_rollups = rollup_view.pending_count > 0;
     let pending_days = pending_upload_days(last_sync_at, has_pending_rollups);
     let mut today = period_stats_from_rollup(rollup_view.today);
@@ -273,7 +269,10 @@ fn dashboard_cache_path() -> PathBuf {
         .join("dashboard-overview-cache.json")
 }
 
-fn load_dashboard_cache(api_base_url: &str, now: DateTime<Utc>) -> Option<(PeriodStats, PeriodStats)> {
+fn load_dashboard_cache(
+    api_base_url: &str,
+    now: DateTime<Utc>,
+) -> Option<(PeriodStats, PeriodStats)> {
     load_dashboard_cache_from_path(&dashboard_cache_path(), api_base_url, now)
 }
 
@@ -287,7 +286,8 @@ fn load_dashboard_cache_from_path(
     if cache.api_base_url != api_base_url {
         return None;
     }
-    if now.signed_duration_since(cache.fetched_at).num_seconds() >= DASHBOARD_OVERVIEW_CACHE_TTL_SECS
+    if now.signed_duration_since(cache.fetched_at).num_seconds()
+        >= DASHBOARD_OVERVIEW_CACHE_TTL_SECS
     {
         return None;
     }
@@ -357,9 +357,8 @@ fn fetch_dashboard_period_stats() -> Result<(PeriodStats, PeriodStats)> {
         .set("Authorization", &format!("Bearer {token}"))
         .call()
         .with_context(|| format!("fetch dashboard overview from {url}"))?;
-    let overview: DashboardOverviewResponse = response
-        .into_json()
-        .context("decode dashboard overview")?;
+    let overview: DashboardOverviewResponse =
+        response.into_json().context("decode dashboard overview")?;
     let today_key = Utc::now().format("%Y-%m-%d").to_string();
     let today = overview
         .day_series
@@ -602,13 +601,11 @@ mod tests {
 
         assert!(load_dashboard_cache_from_path(&path, api, now).is_some());
         assert!(load_dashboard_cache_from_path(&path, "https://api.statsai.dev", now).is_none());
-        assert!(
-            load_dashboard_cache_from_path(
-                &path,
-                api,
-                now + Duration::seconds(DASHBOARD_OVERVIEW_CACHE_TTL_SECS)
-            )
-            .is_none()
-        );
+        assert!(load_dashboard_cache_from_path(
+            &path,
+            api,
+            now + Duration::seconds(DASHBOARD_OVERVIEW_CACHE_TTL_SECS)
+        )
+        .is_none());
     }
 }

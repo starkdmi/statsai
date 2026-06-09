@@ -6,16 +6,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use statsai_core::{
     hash_text, normalize_email, normalize_provider_user_id, periods_overlap, project_bucket_key,
-    sanitize_summary_for_sync,
     project_has_remote_identity, project_has_stable_identity, provider_account_id,
-    provider_account_id_from_identity, semantic_event_fingerprint, source_account_assignment_id,
-    subscription_id, summary_id, timestamp_in_period, BillingPeriod, Confidence, CostInfo,
-    DailyRollup, EventSource, IdentitySource, LatencySource, MetricStats, ModelInfo, PrivacyInfo,
-    PrivacyMode, ProviderAccount, ProviderAccountId, SemanticFingerprintInput,
-    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceLocation,
-    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SummaryId,
-    SummaryMetadata, SummaryMetrics, SummaryModelUsage, UsageCounts, UsageEvent, UsageSummary,
-    VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    provider_account_id_from_identity, sanitize_summary_for_sync, semantic_event_fingerprint,
+    source_account_assignment_id, subscription_id, summary_id, timestamp_in_period, BillingPeriod,
+    Confidence, CostInfo, DailyRollup, EventSource, IdentitySource, LatencySource, MetricStats,
+    ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
+    SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
+    SourceLocation, SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
+    SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage, UsageCounts, UsageEvent,
+    UsageSummary, VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
     SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
@@ -1047,10 +1046,7 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn unsynced_event_count(
-        &self,
-        cursor: Option<(&DateTime<Utc>, &str)>,
-    ) -> Result<u64> {
+    pub fn unsynced_event_count(&self, cursor: Option<(&DateTime<Utc>, &str)>) -> Result<u64> {
         let count: i64 = if let Some((started_at, event_id)) = cursor {
             self.conn.query_row(
                 r#"
@@ -1803,8 +1799,7 @@ impl Store {
         let today_cutoff = today_cutoff.format("%Y-%m-%d").to_string();
         let week = self.sync_rollup_stats_since_day(&week_cutoff)?;
         let today = self.sync_rollup_stats_since_day(&today_cutoff)?;
-        let (pending_count, pending_days) =
-            self.pending_sync_rollup_counts(sink, target)?;
+        let (pending_count, pending_days) = self.pending_sync_rollup_counts(sink, target)?;
         Ok(SnapshotRollupView {
             pending_count,
             pending_days,
