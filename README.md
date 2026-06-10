@@ -42,7 +42,6 @@ curl -LsSf https://github.com/starkdmi/statsai/releases/latest/download/statsai-
 
 GitHub Releases also ship `statsai-universal-apple-darwin.tar.xz` and `StatsAI.app.zip`.
 `cargo binstall statsai` will work after the workspace is published to crates.io.
-See `docs/release-distribution-plan.md` and `packaging/homebrew-tap/README.md`.
 
 ## CLI Examples
 
@@ -172,11 +171,6 @@ cargo run -p statsai -- source remove --source-id src_123 --delete-data
 `source remove` deletes the source configuration. Add `--delete-data` to also
 remove local events, summaries, rollups, and scan-cache entries tied to that
 source from SQLite.
-
-Maintainer notes:
-
-- release/distribution plan: [docs/release-distribution-plan.md](docs/release-distribution-plan.md)
-- auth UX and headless login research: [docs/auth-login-ux-research.md](docs/auth-login-ux-research.md)
 
 ### Local Backend Development
 
