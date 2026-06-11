@@ -623,13 +623,15 @@ fn scan_opencode_source(
     if !ambiguous_session_ids.is_empty() {
         let reconstructed_usage = emit_opencode_message_events(
             &connection,
-            &db_path,
-            &ambiguous_session_ids,
-            adapter,
-            source,
-            options,
-            &mut scan,
-            &mut seen,
+            &mut OpenCodeMessageEventContext {
+                db_path: &db_path,
+                ambiguous_session_ids: &ambiguous_session_ids,
+                adapter,
+                source,
+                options,
+                scan: &mut scan,
+                seen: &mut seen,
+            },
         )?;
         for (session_id, aggregate) in ambiguous_session_rows {
             let reconstructed = reconstructed_usage.get(&session_id);
@@ -785,6 +787,16 @@ struct OpenCodeSessionAggregate {
     directory: Option<String>,
 }
 
+struct OpenCodeMessageEventContext<'a> {
+    db_path: &'a Path,
+    ambiguous_session_ids: &'a HashSet<String>,
+    adapter: &'a OpenCodeAdapter,
+    source: &'a SourceLocation,
+    options: &'a ScanOptions,
+    scan: &'a mut AdapterScan,
+    seen: &'a mut HashSet<String>,
+}
+
 fn opencode_usage_fully_reconstructed(
     aggregate: &UsageCounts,
     reconstructed: Option<&UsageCounts>,
@@ -801,13 +813,7 @@ fn opencode_usage_fully_reconstructed(
 
 fn emit_opencode_message_events(
     connection: &Connection,
-    db_path: &Path,
-    ambiguous_session_ids: &HashSet<String>,
-    adapter: &OpenCodeAdapter,
-    source: &SourceLocation,
-    options: &ScanOptions,
-    scan: &mut AdapterScan,
-    seen: &mut HashSet<String>,
+    ctx: &mut OpenCodeMessageEventContext<'_>,
 ) -> Result<HashMap<String, OpenCodeReconstructedUsage>> {
     let mut statement = connection.prepare(
         "SELECT m.id, m.session_id, m.time_created, m.time_updated, m.data, s.title, s.directory \
@@ -818,10 +824,10 @@ fn emit_opencode_message_events(
     let mut reconstructed_usage = HashMap::<String, OpenCodeReconstructedUsage>::new();
     while let Some(row) = rows.next()? {
         let session_id: String = row.get(1)?;
-        if !ambiguous_session_ids.contains(&session_id) {
+        if !ctx.ambiguous_session_ids.contains(&session_id) {
             continue;
         }
-        scan.diagnostics.raw_rows += 1;
+        ctx.scan.diagnostics.raw_rows += 1;
         let message_id: String = row.get(0)?;
         let created_at_raw: i64 = row.get(2)?;
         let updated_at_raw: i64 = row.get(3)?;
@@ -831,21 +837,21 @@ fn emit_opencode_message_events(
         let value: Value = match serde_json::from_str(&data_text) {
             Ok(value) => value,
             Err(_) => {
-                scan.diagnostics.invalid_rows += 1;
+                ctx.scan.diagnostics.invalid_rows += 1;
                 continue;
             }
         };
         let model = opencode_message_model_info(&value);
         if model.is_none() {
-            scan.diagnostics.model_fallbacks += 1;
+            ctx.scan.diagnostics.model_fallbacks += 1;
             continue;
         }
         let usage = opencode_message_usage_counts(&value);
         if usage.computed_total() == 0 {
-            scan.diagnostics.skipped_zero_events += 1;
+            ctx.scan.diagnostics.skipped_zero_events += 1;
             continue;
         }
-        scan.diagnostics.candidate_usage_rows += 1;
+        ctx.scan.diagnostics.candidate_usage_rows += 1;
         let started_at = value
             .pointer("/time/created")
             .and_then(value_as_u64)
@@ -868,9 +874,9 @@ fn emit_opencode_message_events(
             .map(PathBuf::from)
             .and_then(|path| resolve_project_context(Some(path), None, None));
         let mut event = usage_event(
-            adapter,
-            source,
-            options,
+            ctx.adapter,
+            ctx.source,
+            ctx.options,
             ProviderEventParts {
                 timestamp: ended_at,
                 session_started_at: Some(started_at),
@@ -882,7 +888,7 @@ fn emit_opencode_message_events(
                 session_raw: session_id.clone(),
                 project,
                 event_kind: "opencode_message_usage",
-                source_file: db_path,
+                source_file: ctx.db_path,
                 source_line_number: None,
                 source_type: "sqlite:message",
                 model_inferred: false,
@@ -911,7 +917,7 @@ fn emit_opencode_message_events(
                 usage: event.usage.clone(),
                 provider_reported_usd: event.cost.provider_reported_usd.unwrap_or(0),
             });
-        push_deduped(scan, seen, event);
+        push_deduped(ctx.scan, ctx.seen, event);
     }
     Ok(reconstructed_usage)
 }
@@ -2106,24 +2112,28 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
     }
 }
 
-fn metadata_summary<A: ProviderAdapter + ?Sized>(
-    adapter: &A,
-    source: &SourceLocation,
-    options: &ScanOptions,
-    source_file: &Path,
-    summary_format: &str,
-    semantic_key: &str,
+struct MetadataSummaryParts<'a> {
+    source_file: &'a Path,
+    summary_format: &'a str,
+    semantic_key: &'a str,
     observed_at: DateTime<Utc>,
     metadata: SummaryMetadata,
     model: Option<ModelInfo>,
     runtime: Option<RuntimeInfo>,
     project: Option<ProjectInfo>,
+}
+
+fn metadata_summary<A: ProviderAdapter + ?Sized>(
+    adapter: &A,
+    source: &SourceLocation,
+    options: &ScanOptions,
+    parts: MetadataSummaryParts<'_>,
 ) -> UsageSummary {
-    let file_path_hash = hash_text(&canonical_display(source_file));
+    let file_path_hash = hash_text(&canonical_display(parts.source_file));
     let usage = UsageCounts::default();
     UsageSummary {
         schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
-        summary_id: summary_id(adapter.provider(), &source.source_id, semantic_key),
+        summary_id: summary_id(adapter.provider(), &source.source_id, parts.semantic_key),
         device_id: options.device_id.clone(),
         provider: adapter.provider().to_string(),
         source_id: source.source_id.clone(),
@@ -2133,31 +2143,34 @@ fn metadata_summary<A: ProviderAdapter + ?Sized>(
             adapter_version: adapter.version().to_string(),
             source_kind: source.source_kind.clone(),
             location_origin: Some(source.location_origin.clone()),
-            source_type: summary_format.to_string(),
+            source_type: parts.summary_format.to_string(),
             source_path_hash: source.path_hash.clone(),
-            source_record_id: Some(format!("summary_key_{}", &hash_text(semantic_key)[..32])),
+            source_record_id: Some(format!(
+                "summary_key_{}",
+                &hash_text(parts.semantic_key)[..32]
+            )),
             parse_confidence: Confidence::Medium,
         },
-        model: model.clone(),
+        model: parts.model.clone(),
         models: Vec::new(),
         usage: usage.clone(),
-        cost: estimate_cost(adapter.provider(), model.as_ref(), &usage),
+        cost: estimate_cost(adapter.provider(), parts.model.as_ref(), &usage),
         parse_evidence: Some(ParseEvidence {
             event_key_version: "metadata_summary.v1".to_string(),
             source_file_path_hash: Some(file_path_hash),
             source_line_number: None,
-            source_record_id: Some(semantic_key.to_string()),
-            model_inferred: model.is_none(),
+            source_record_id: Some(parts.semantic_key.to_string()),
+            model_inferred: parts.model.is_none(),
             timestamp_inferred: false,
             account_identity_source: IdentitySource::Unresolved,
         }),
-        project,
+        project: parts.project,
         privacy: metadata_only_privacy(),
-        metrics: runtime.map(runtime_to_summary_metrics),
+        metrics: parts.runtime.map(runtime_to_summary_metrics),
         period_start: None,
         period_end: None,
-        observed_at,
-        metadata,
+        observed_at: parts.observed_at,
+        metadata: parts.metadata,
         imported_at: Utc::now(),
     }
 }
@@ -2675,20 +2688,22 @@ fn parse_grok_summary(
         adapter,
         source,
         options,
-        summary_path,
-        "grok_build_session_summary",
-        &format!("grok_build_session_summary.v1:{session_id}"),
-        observed_at,
-        SummaryMetadata {
-            summary_format: "grok_build_session_summary".to_string(),
-            summary_version,
-            total_sessions: Some(1),
-            total_messages,
-            last_computed_at: Some(observed_at),
+        MetadataSummaryParts {
+            source_file: summary_path,
+            summary_format: "grok_build_session_summary",
+            semantic_key: &format!("grok_build_session_summary.v1:{session_id}"),
+            observed_at,
+            metadata: SummaryMetadata {
+                summary_format: "grok_build_session_summary".to_string(),
+                summary_version,
+                total_sessions: Some(1),
+                total_messages,
+                last_computed_at: Some(observed_at),
+            },
+            model,
+            runtime,
+            project,
         },
-        model,
-        runtime,
-        project,
     );
     summary.usage = usage;
     summary.cost = estimate_cost(adapter.provider(), summary.model.as_ref(), &summary.usage);
