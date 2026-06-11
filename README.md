@@ -1,6 +1,7 @@
 # statsai
 
-Local-first AI usage statistics for Codex, Claude Code, and future local/provider sources.
+Local-first AI usage statistics for Codex, Claude Code, OpenCode, and Grok
+Build, with room for future local/provider sources.
 
 Status: early implementation. The public API is not stable yet.
 
@@ -15,12 +16,18 @@ Status: early implementation. The public API is not stable yet.
 - abstract sync sinks for stdout/file/HTTP
 - a loopback-only daemon API for local widgets and toolbar integrations
 
-The first adapters target Claude Code JSONL usage roots and Codex session logs. External aggregate reports, manually transcribed screenshots, or provider `/usage` summaries are supported as reported summary imports. They stay separate from trusted raw local events so reports can show direct usage and imported/manual gaps without double-counting.
+The first adapters target Claude Code JSONL usage roots, Codex session logs,
+OpenCode's local SQLite database, and Grok Build local session summaries.
+External aggregate reports, manually transcribed screenshots, or provider
+`/usage` summaries are supported as reported summary imports. They stay separate
+from trusted raw local events so reports can show direct usage and
+imported/manual gaps without double-counting.
 
 ## Workspace
 
 - `crates/statsai-core`: normalized types, stable IDs, schema models, privacy metadata
-- `crates/statsai-adapters`: Claude Code and Codex local adapters
+- `crates/statsai-adapters`: local adapters for Claude Code, Codex, OpenCode,
+  and Grok Build
 - `crates/statsai-store`: SQLite persistence
 - `crates/statsai-sync`: pluggable sync sink trait plus stdout/file/HTTP sinks
 - `crates/statsai-daemon`: localhost API
@@ -47,6 +54,8 @@ GitHub Releases also ship `statsai-universal-apple-darwin.tar.xz` and `StatsAI.a
 
 ```sh
 cargo run -p statsai -- scan --provider codex --preview
+cargo run -p statsai -- scan --provider opencode --preview
+cargo run -p statsai -- scan --provider grok-build --preview
 cargo run -p statsai -- source add --provider codex --path "$HOME/.codex-work"
 cargo run -p statsai -- source disable --source-id src_123
 cargo run -p statsai -- source enable --source-id src_123
@@ -91,6 +100,17 @@ codex account=work path=~/.codex-work usage_events=123 input=1,000,000 cached=80
 `scan` persists normalized events idempotently. Re-running it refreshes existing rows when adapter metadata improves, so new token split or estimated cost fields can be backfilled without duplicating events.
 Normal scans now keep a lightweight per-source file signature cache in SQLite and skip unchanged JSONL/stat summary files, so repeat scans usually only parse the currently active log files. The diagnostics line includes `cached=` for files skipped as unchanged.
 Use `scan --no-cache` for a one-off forced reread without deleting existing data first, or `scan --replace` for a destructive source rebuild.
+
+Default local discovery currently checks:
+
+- Claude Code: `~/.config/claude` and `~/.claude`
+- Codex: `~/.codex`
+- OpenCode: `~/.local/share/opencode`
+- Grok Build: `~/.grok`
+
+Use `source add --provider ... --path ...` for custom roots. OpenCode and Grok
+Build also support environment overrides for automation: `OPENCODE_DATA_DIRS`
+and `GROK_DATA_DIRS` / `GROK_HOME`.
 
 `report weekly`, `report monthly`, and `report all-time` group stored usage by
 provider and account. Add `--subscriptions` to include per-subscription-period

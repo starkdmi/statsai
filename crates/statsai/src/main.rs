@@ -145,7 +145,7 @@ enum AuthSubcommand {
 
 #[derive(Debug, Args)]
 struct ScanCommand {
-    #[arg(long, help = "Scan only this provider (claude, codex)")]
+    #[arg(long, help = "Scan only this provider")]
     provider: Option<String>,
     #[arg(long, help = "Preview without persisting to the store")]
     preview: bool,
@@ -212,7 +212,7 @@ struct SourceCommand {
 enum SourceSubcommand {
     #[command(about = "Register a manual source path for a provider")]
     Add {
-        #[arg(long, help = "Provider name (claude_code, codex)")]
+        #[arg(long, help = "Provider name")]
         provider: String,
         #[arg(long, help = "Path to the provider's local data directory")]
         path: PathBuf,
@@ -791,7 +791,7 @@ fn scan_with_adapters(
     if command.preview {
         if command.verbose {
             println!(
-                "preview total: sources={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} log_rows={} written=0",
+                "preview total: sources={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={} written=0",
                 format_u64(total_sources),
                 format_u64(event_count),
                 format_u64(summary_count),
@@ -802,12 +802,13 @@ fn scan_with_adapters(
                 format_u64(total_usage.total_tokens),
                 format_cost(total_usage.estimated_cost_usd),
                 format_u64(total_summary_usage.total_tokens),
+                format_cost(total_summary_usage.estimated_cost_usd),
                 format_u64(total_log_rows)
             );
             print_scan_diagnostics_total(&total_diagnostics);
         } else {
             println!(
-                "preview total: sources={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} written=0",
+                "preview total: sources={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} written=0",
                 format_u64(total_sources),
                 format_u64(event_count),
                 format_u64(summary_count),
@@ -817,12 +818,13 @@ fn scan_with_adapters(
                 format_u64(total_usage.output_tokens),
                 format_u64(total_usage.total_tokens),
                 format_cost(total_usage.estimated_cost_usd),
-                format_u64(total_summary_usage.total_tokens)
+                format_u64(total_summary_usage.total_tokens),
+                format_cost(total_summary_usage.estimated_cost_usd)
             );
         }
     } else {
         println!(
-            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} log_rows={}",
+            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={}",
             format_u64(total_sources),
             format_u64(event_count),
             format_u64(inserted_count),
@@ -835,6 +837,7 @@ fn scan_with_adapters(
             format_u64(total_usage.total_tokens),
             format_cost(total_usage.estimated_cost_usd),
             format_u64(total_summary_usage.total_tokens),
+            format_cost(total_summary_usage.estimated_cost_usd),
             format_u64(total_log_rows)
         );
         if command.replace || replaced_event_count > 0 || replaced_summary_count > 0 {
@@ -4552,6 +4555,20 @@ fn normalize_configured_source_path(provider: &str, path: &Path) -> Result<PathB
             path = parent.to_path_buf();
         }
     }
+    if provider_matches(provider, "opencode")
+        && path.file_name().is_some_and(|name| name == "opencode.db")
+    {
+        if let Some(parent) = path.parent() {
+            path = parent.to_path_buf();
+        }
+    }
+    if provider_matches(provider, "grok_build")
+        && path.file_name().is_some_and(|name| name == "sessions")
+    {
+        if let Some(parent) = path.parent() {
+            path = parent.to_path_buf();
+        }
+    }
     Ok(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
@@ -4608,7 +4625,7 @@ fn print_scan_preview_line(
 ) {
     if verbose {
         println!(
-            "{} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
+            "{} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
             source.provider,
             preview_path_label(source),
             usage_events,
@@ -4620,6 +4637,7 @@ fn print_scan_preview_line(
             format_u64(usage.total_tokens),
             format_cost(usage.estimated_cost_usd),
             format_u64(summary_usage.total_tokens),
+            format_cost(summary_usage.estimated_cost_usd),
             format_u64(diagnostics.raw_rows),
             format_u64(diagnostics.candidate_usage_rows),
             format_u64(diagnostics.duplicate_events),
@@ -4634,7 +4652,7 @@ fn print_scan_preview_line(
         );
     } else {
         println!(
-            "{} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={}",
+            "{} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={}",
             source.provider,
             preview_path_label(source),
             usage_events,
@@ -4645,7 +4663,8 @@ fn print_scan_preview_line(
             format_u64(usage.output_tokens),
             format_u64(usage.total_tokens),
             format_cost(usage.estimated_cost_usd),
-            format_u64(summary_usage.total_tokens)
+            format_u64(summary_usage.total_tokens),
+            format_cost(summary_usage.estimated_cost_usd)
         );
     }
 }
@@ -5460,6 +5479,36 @@ mod tests {
 
         let normalized =
             normalize_configured_source_path("codex", &sessions).expect("normalized path");
+
+        assert_eq!(
+            normalized,
+            dir.path().canonicalize().expect("canonical dir")
+        );
+    }
+
+    #[test]
+    fn configured_opencode_db_path_normalizes_to_data_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("opencode.db");
+        std::fs::write(&db, "").expect("db");
+
+        let normalized =
+            normalize_configured_source_path("opencode", &db).expect("normalized path");
+
+        assert_eq!(
+            normalized,
+            dir.path().canonicalize().expect("canonical dir")
+        );
+    }
+
+    #[test]
+    fn configured_grok_sessions_path_normalizes_to_home_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+
+        let normalized =
+            normalize_configured_source_path("grok-build", &sessions).expect("normalized path");
 
         assert_eq!(
             normalized,
