@@ -2,13 +2,14 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use statsai_core::{
     canonical_display, display_path, expand_home_path, hash_text, home_dir, path_hash,
     project_bucket_key, semantic_event_id, summary_id, BillingPeriod, Confidence, EventSource,
-    IdentitySource, LatencySource, LocationOrigin, ModelInfo, ParseEvidence, PrivacyInfo,
-    PrivacyMode, ProjectInfo, RuntimeInfo, SessionInfo, SourceKind, SourceLocation,
-    SubscriptionStatus, SummaryMetadata, UsageCounts, UsageEvent, UsageSummary,
+    IdentitySource, LatencySource, LocationOrigin, MetricStats, ModelInfo, ParseEvidence,
+    PrivacyInfo, PrivacyMode, ProjectInfo, RuntimeInfo, SessionInfo, SourceKind, SourceLocation,
+    SubscriptionStatus, SummaryMetadata, SummaryMetrics, UsageCounts, UsageEvent, UsageSummary,
     USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{estimate_cost, normalize_model_name};
@@ -21,6 +22,8 @@ use walkdir::WalkDir;
 
 pub const CLAUDE_CODE_PROVIDER: &str = "claude_code";
 pub const CODEX_PROVIDER: &str = "codex";
+pub const OPENCODE_PROVIDER: &str = "opencode";
+pub const GROK_BUILD_PROVIDER: &str = "grok_build";
 const SESSION_SCOPED_EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
 const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v4";
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
@@ -28,6 +31,8 @@ const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // so historical sessions get rescanned for both runtime and project context.
 const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "turn-runtime-project-context.v8";
 const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "project-context.v2";
+const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "sqlite-session-aggregate.v1";
+const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "session-inference-usage.v5";
 
 pub use statsai_core::{VerifiedSourceState, VerifiedSubscriptionState};
 
@@ -207,16 +212,91 @@ impl ProviderAdapter for CodexAdapter {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct OpenCodeAdapter;
+
+impl ProviderAdapter for OpenCodeAdapter {
+    fn id(&self) -> &'static str {
+        "opencode-local-sqlite"
+    }
+
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn provider(&self) -> &'static str {
+        OPENCODE_PROVIDER
+    }
+
+    fn discover(&self) -> Vec<SourceLocation> {
+        discover_sources_from_env_or_defaults(
+            self,
+            &["OPENCODE_DATA_DIRS", "OPENCODE_DATA_DIR"],
+            &[".local/share/opencode"],
+            opencode_root_is_source,
+        )
+    }
+
+    fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+        opencode_scan_candidates(source, self.version())
+    }
+
+    fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
+        scan_opencode_source(self, source, options)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct GrokBuildAdapter;
+
+impl ProviderAdapter for GrokBuildAdapter {
+    fn id(&self) -> &'static str {
+        "grok-build-local-sessions"
+    }
+
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn provider(&self) -> &'static str {
+        GROK_BUILD_PROVIDER
+    }
+
+    fn discover(&self) -> Vec<SourceLocation> {
+        discover_sources_from_env_or_defaults(
+            self,
+            &["GROK_DATA_DIRS", "GROK_HOME"],
+            &[".grok"],
+            grok_build_root_is_source,
+        )
+    }
+
+    fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+        grok_build_scan_candidates(source, self.version())
+    }
+
+    fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
+        scan_grok_build_source(self, source, options)
+    }
+}
+
 pub fn adapter_for_provider(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
     match provider {
         CLAUDE_CODE_PROVIDER | "claude" | "claude-code" => Some(Box::new(ClaudeCodeAdapter)),
         CODEX_PROVIDER => Some(Box::new(CodexAdapter)),
+        OPENCODE_PROVIDER | "open-code" | "open_code" => Some(Box::new(OpenCodeAdapter)),
+        GROK_BUILD_PROVIDER | "grok-build" | "grok" => Some(Box::new(GrokBuildAdapter)),
         _ => None,
     }
 }
 
 pub fn default_adapters() -> Vec<Box<dyn ProviderAdapter>> {
-    vec![Box::new(ClaudeCodeAdapter), Box::new(CodexAdapter)]
+    vec![
+        Box::new(ClaudeCodeAdapter),
+        Box::new(CodexAdapter),
+        Box::new(OpenCodeAdapter),
+        Box::new(GrokBuildAdapter),
+    ]
 }
 
 fn codex_source_for_root(
@@ -246,6 +326,65 @@ fn claude_source_for_root(
         &root,
         origin,
     )
+}
+
+fn local_source_for_adapter<A: ProviderAdapter>(
+    adapter: &A,
+    root: &Path,
+    origin: LocationOrigin,
+) -> SourceLocation {
+    SourceLocation::local_adapter(
+        adapter.provider(),
+        adapter.id(),
+        adapter.version(),
+        root,
+        origin,
+    )
+}
+
+fn discover_sources_from_env_or_defaults<A, F>(
+    adapter: &A,
+    env_keys: &[&str],
+    default_suffixes: &[&str],
+    is_source: F,
+) -> Vec<SourceLocation>
+where
+    A: ProviderAdapter,
+    F: Fn(&Path) -> bool,
+{
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    for key in env_keys {
+        if let Ok(value) = std::env::var(key) {
+            for root in split_paths(&value) {
+                if is_source(&root) && seen.insert(canonical_display(&root)) {
+                    sources.push(local_source_for_adapter(
+                        adapter,
+                        &root,
+                        LocationOrigin::Env,
+                    ));
+                }
+            }
+            if !sources.is_empty() {
+                return sources;
+            }
+        }
+    }
+
+    let Some(home) = home_dir() else {
+        return sources;
+    };
+    for suffix in default_suffixes {
+        let root = home.join(suffix);
+        if is_source(&root) && seen.insert(canonical_display(&root)) {
+            sources.push(local_source_for_adapter(
+                adapter,
+                &root,
+                LocationOrigin::Default,
+            ));
+        }
+    }
+    sources
 }
 
 fn source_root_path(source: &SourceLocation) -> Option<PathBuf> {
@@ -361,6 +500,466 @@ fn scan_codex_source(
     }
     scan.verified_source_state = codex_auth_snapshot(&root);
     scan.diagnostics.accepted_events = scan.events.len() as u64;
+    Ok(scan)
+}
+
+fn scan_opencode_source(
+    adapter: &OpenCodeAdapter,
+    source: &SourceLocation,
+    options: &ScanOptions,
+) -> Result<AdapterScan> {
+    let mut scan = AdapterScan::default();
+    let Some(root) = source_root_path(source) else {
+        return Ok(scan);
+    };
+    let db_path = root.join("opencode.db");
+    if !db_path.is_file() {
+        return Ok(scan);
+    }
+
+    let connection = open_sqlite_readonly(&db_path)?;
+    let recovered_session_models = load_opencode_session_models(&connection)?;
+    let ambiguous_session_ids = recovered_session_models
+        .iter()
+        .filter_map(|(session_id, model)| model.is_none().then_some(session_id.clone()))
+        .collect::<HashSet<_>>();
+    let mut ambiguous_session_rows = HashMap::<String, OpenCodeSessionAggregate>::new();
+    let mut statement = connection.prepare(
+        "SELECT id, title, model, cost, tokens_input, tokens_output, tokens_reasoning, \
+         tokens_cache_read, tokens_cache_write, time_created, time_updated, directory \
+         FROM session",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut seen = HashSet::new();
+    while let Some(row) = rows.next()? {
+        scan.diagnostics.raw_rows += 1;
+        let session_id: String = row.get(0)?;
+        let title: Option<String> = row.get(1).ok();
+        let model_text: Option<String> = row.get(2).ok();
+        let provider_cost: f64 = row.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
+        let usage = UsageCounts {
+            input_tokens: sqlite_nonzero_u64(row.get::<_, i64>(4)?),
+            output_tokens: sqlite_nonzero_u64(row.get::<_, i64>(5)?),
+            reasoning_tokens: sqlite_nonzero_u64(row.get::<_, i64>(6)?),
+            cache_read_tokens: sqlite_nonzero_u64(row.get::<_, i64>(7)?),
+            cache_creation_tokens: sqlite_nonzero_u64(row.get::<_, i64>(8)?),
+            total_tokens: None,
+            requests: Some(1),
+            local_prompt_eval_tokens: None,
+            local_eval_tokens: None,
+        };
+        let started_at = timestamp_from_millis(row.get::<_, i64>(9)?).unwrap_or_else(Utc::now);
+        let ended_at = timestamp_from_millis(row.get::<_, i64>(10)?).unwrap_or(started_at);
+        let duration_seconds = ended_at
+            .signed_duration_since(started_at)
+            .num_seconds()
+            .try_into()
+            .ok();
+        let directory: Option<String> = row.get::<_, Option<String>>(11).ok().flatten();
+        if ambiguous_session_ids.contains(&session_id) {
+            ambiguous_session_rows.insert(
+                session_id.clone(),
+                OpenCodeSessionAggregate {
+                    title,
+                    provider_cost,
+                    usage,
+                    started_at,
+                    ended_at,
+                    duration_seconds,
+                    directory,
+                },
+            );
+            continue;
+        }
+        if usage.computed_total() == 0 {
+            scan.diagnostics.skipped_zero_events += 1;
+            continue;
+        }
+        scan.diagnostics.candidate_usage_rows += 1;
+        let project = directory
+            .as_deref()
+            .map(PathBuf::from)
+            .and_then(|path| resolve_project_context(Some(path), None, None));
+        let model = model_text
+            .as_deref()
+            .and_then(opencode_model_info)
+            .or_else(|| recovered_session_models.get(&session_id).cloned().flatten());
+        let model_inferred = model.is_none();
+        if model_inferred {
+            scan.diagnostics.model_fallbacks += 1;
+        }
+        let mut event = usage_event(
+            adapter,
+            source,
+            options,
+            ProviderEventParts {
+                timestamp: ended_at,
+                session_started_at: Some(started_at),
+                session_ended_at: Some(ended_at),
+                duration_seconds,
+                model,
+                usage,
+                runtime: None,
+                session_raw: session_id,
+                project,
+                event_kind: "opencode_session_usage",
+                source_file: &db_path,
+                source_line_number: None,
+                source_type: "sqlite:session",
+                model_inferred,
+                timestamp_inferred: false,
+                deduplication: EventDeduplication::PathIndependent,
+                dedupe_salt: None,
+            },
+        );
+        event.session.title = title.filter(|title| !title.trim().is_empty());
+        if provider_cost > 0.0 {
+            event.cost.provider_reported_usd = Some((provider_cost * 100.0).round() as i64);
+            event.cost.pricing_source = Some("opencode.session.cost".to_string());
+            event.cost.confidence = Confidence::High;
+        }
+        push_deduped(&mut scan, &mut seen, event);
+    }
+    if !ambiguous_session_ids.is_empty() {
+        let reconstructed_usage = emit_opencode_message_events(
+            &connection,
+            &mut OpenCodeMessageEventContext {
+                db_path: &db_path,
+                ambiguous_session_ids: &ambiguous_session_ids,
+                adapter,
+                source,
+                options,
+                scan: &mut scan,
+                seen: &mut seen,
+            },
+        )?;
+        for (session_id, aggregate) in ambiguous_session_rows {
+            let reconstructed = reconstructed_usage.get(&session_id);
+            if opencode_usage_fully_reconstructed(
+                &aggregate.usage,
+                reconstructed.map(|value| &value.usage),
+            ) {
+                continue;
+            }
+            let residual_usage =
+                subtract_usage_counts(&aggregate.usage, reconstructed.map(|value| &value.usage));
+            if residual_usage.computed_total() == 0 {
+                continue;
+            }
+            scan.diagnostics.candidate_usage_rows += 1;
+            scan.diagnostics.model_fallbacks += 1;
+            let project = aggregate
+                .directory
+                .as_deref()
+                .map(PathBuf::from)
+                .and_then(|path| resolve_project_context(Some(path), None, None));
+            let mut event = usage_event(
+                adapter,
+                source,
+                options,
+                ProviderEventParts {
+                    timestamp: aggregate.ended_at,
+                    session_started_at: Some(aggregate.started_at),
+                    session_ended_at: Some(aggregate.ended_at),
+                    duration_seconds: aggregate.duration_seconds,
+                    model: None,
+                    usage: residual_usage,
+                    runtime: None,
+                    session_raw: session_id,
+                    project,
+                    event_kind: "opencode_session_usage",
+                    source_file: &db_path,
+                    source_line_number: None,
+                    source_type: "sqlite:session",
+                    model_inferred: true,
+                    timestamp_inferred: false,
+                    deduplication: EventDeduplication::PathIndependent,
+                    dedupe_salt: None,
+                },
+            );
+            event.session.title = aggregate.title.filter(|title| !title.trim().is_empty());
+            let aggregate_provider_cost_usd = (aggregate.provider_cost * 100.0).round() as i64;
+            let residual_provider_cost_usd = aggregate_provider_cost_usd.saturating_sub(
+                reconstructed
+                    .map(|value| value.provider_reported_usd)
+                    .unwrap_or(0),
+            );
+            if residual_provider_cost_usd > 0 {
+                event.cost.provider_reported_usd = Some(residual_provider_cost_usd);
+                event.cost.pricing_source = Some("opencode.session.cost".to_string());
+                event.cost.confidence = Confidence::High;
+            }
+            push_deduped(&mut scan, &mut seen, event);
+        }
+    }
+    scan.diagnostics.files_scanned = 1;
+    scan.diagnostics.accepted_events = scan.events.len() as u64;
+    Ok(scan)
+}
+
+fn load_opencode_session_models(
+    connection: &Connection,
+) -> Result<HashMap<String, Option<ModelInfo>>> {
+    let mut statement = match connection.prepare(
+        "SELECT session_id, \
+                coalesce(json_extract(data, '$.providerID'), json_extract(data, '$.provider_id')), \
+                coalesce(json_extract(data, '$.modelID'), json_extract(data, '$.id'), json_extract(data, '$.model')), \
+                coalesce(json_extract(data, '$.tokens.input'), 0), \
+                coalesce(json_extract(data, '$.tokens.output'), 0), \
+                coalesce(json_extract(data, '$.tokens.reasoning'), 0), \
+                coalesce(json_extract(data, '$.tokens.cache.read'), 0), \
+                coalesce(json_extract(data, '$.tokens.cache.write'), 0) \
+         FROM message \
+         WHERE json_extract(data, '$.providerID') IS NOT NULL \
+            OR json_extract(data, '$.provider_id') IS NOT NULL \
+            OR json_extract(data, '$.modelID') IS NOT NULL \
+            OR json_extract(data, '$.id') IS NOT NULL \
+            OR json_extract(data, '$.model') IS NOT NULL \
+            OR coalesce(json_extract(data, '$.tokens.input'), 0) > 0 \
+            OR coalesce(json_extract(data, '$.tokens.output'), 0) > 0 \
+            OR coalesce(json_extract(data, '$.tokens.reasoning'), 0) > 0 \
+            OR coalesce(json_extract(data, '$.tokens.cache.read'), 0) > 0 \
+            OR coalesce(json_extract(data, '$.tokens.cache.write'), 0) > 0",
+    ) {
+        Ok(statement) => statement,
+        Err(error) if error.to_string().contains("no such table: message") => {
+            return Ok(HashMap::new());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut rows = statement.query([])?;
+    let mut models = HashMap::<String, Option<ModelInfo>>::new();
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(0)?;
+        let provider_id: Option<String> = row.get(1)?;
+        let model_id: Option<String> = row.get(2)?;
+        let usage = UsageCounts {
+            input_tokens: sqlite_nonzero_u64(row.get::<_, i64>(3)?),
+            output_tokens: sqlite_nonzero_u64(row.get::<_, i64>(4)?),
+            reasoning_tokens: sqlite_nonzero_u64(row.get::<_, i64>(5)?),
+            cache_read_tokens: sqlite_nonzero_u64(row.get::<_, i64>(6)?),
+            cache_creation_tokens: sqlite_nonzero_u64(row.get::<_, i64>(7)?),
+            total_tokens: None,
+            requests: None,
+            local_prompt_eval_tokens: None,
+            local_eval_tokens: None,
+        };
+        if usage.computed_total() > 0 && (provider_id.is_none() || model_id.is_none()) {
+            models.insert(session_id, None);
+            continue;
+        }
+        let (Some(provider_id), Some(model_id)) = (provider_id, model_id) else {
+            continue;
+        };
+        let Some(model) = opencode_model_info(&format!("{provider_id}/{model_id}")) else {
+            continue;
+        };
+        match models.entry(session_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(model));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                if current.is_none() {
+                    continue;
+                }
+                let same_model = current
+                    .as_ref()
+                    .and_then(|current| current.provider_model_id.as_deref())
+                    == model.provider_model_id.as_deref();
+                if !same_model {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    Ok(models)
+}
+
+#[derive(Debug, Clone)]
+struct OpenCodeSessionAggregate {
+    title: Option<String>,
+    provider_cost: f64,
+    usage: UsageCounts,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    duration_seconds: Option<u64>,
+    directory: Option<String>,
+}
+
+struct OpenCodeMessageEventContext<'a> {
+    db_path: &'a Path,
+    ambiguous_session_ids: &'a HashSet<String>,
+    adapter: &'a OpenCodeAdapter,
+    source: &'a SourceLocation,
+    options: &'a ScanOptions,
+    scan: &'a mut AdapterScan,
+    seen: &'a mut HashSet<String>,
+}
+
+fn opencode_usage_fully_reconstructed(
+    aggregate: &UsageCounts,
+    reconstructed: Option<&UsageCounts>,
+) -> bool {
+    let Some(reconstructed) = reconstructed else {
+        return false;
+    };
+    aggregate.input_tokens == reconstructed.input_tokens
+        && aggregate.output_tokens == reconstructed.output_tokens
+        && aggregate.reasoning_tokens == reconstructed.reasoning_tokens
+        && aggregate.cache_read_tokens == reconstructed.cache_read_tokens
+        && aggregate.cache_creation_tokens == reconstructed.cache_creation_tokens
+}
+
+fn emit_opencode_message_events(
+    connection: &Connection,
+    ctx: &mut OpenCodeMessageEventContext<'_>,
+) -> Result<HashMap<String, OpenCodeReconstructedUsage>> {
+    let mut statement = connection.prepare(
+        "SELECT m.id, m.session_id, m.time_created, m.time_updated, m.data, s.title, s.directory \
+         FROM message m \
+         JOIN session s ON s.id = m.session_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut reconstructed_usage = HashMap::<String, OpenCodeReconstructedUsage>::new();
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(1)?;
+        if !ctx.ambiguous_session_ids.contains(&session_id) {
+            continue;
+        }
+        ctx.scan.diagnostics.raw_rows += 1;
+        let message_id: String = row.get(0)?;
+        let created_at_raw: i64 = row.get(2)?;
+        let updated_at_raw: i64 = row.get(3)?;
+        let data_text: String = row.get(4)?;
+        let title: Option<String> = row.get(5).ok();
+        let directory: Option<String> = row.get(6).ok();
+        let value: Value = match serde_json::from_str(&data_text) {
+            Ok(value) => value,
+            Err(_) => {
+                ctx.scan.diagnostics.invalid_rows += 1;
+                continue;
+            }
+        };
+        let model = opencode_message_model_info(&value);
+        if model.is_none() {
+            ctx.scan.diagnostics.model_fallbacks += 1;
+            continue;
+        }
+        let usage = opencode_message_usage_counts(&value);
+        if usage.computed_total() == 0 {
+            ctx.scan.diagnostics.skipped_zero_events += 1;
+            continue;
+        }
+        ctx.scan.diagnostics.candidate_usage_rows += 1;
+        let started_at = value
+            .pointer("/time/created")
+            .and_then(value_as_u64)
+            .and_then(|value| timestamp_from_millis(value as i64))
+            .or_else(|| timestamp_from_millis(created_at_raw))
+            .unwrap_or_else(Utc::now);
+        let ended_at = value
+            .pointer("/time/completed")
+            .and_then(value_as_u64)
+            .and_then(|value| timestamp_from_millis(value as i64))
+            .or_else(|| timestamp_from_millis(updated_at_raw))
+            .unwrap_or(started_at);
+        let duration_seconds = ended_at
+            .signed_duration_since(started_at)
+            .num_seconds()
+            .try_into()
+            .ok();
+        let project = directory
+            .as_deref()
+            .map(PathBuf::from)
+            .and_then(|path| resolve_project_context(Some(path), None, None));
+        let mut event = usage_event(
+            ctx.adapter,
+            ctx.source,
+            ctx.options,
+            ProviderEventParts {
+                timestamp: ended_at,
+                session_started_at: Some(started_at),
+                session_ended_at: Some(ended_at),
+                duration_seconds,
+                model,
+                usage,
+                runtime: None,
+                session_raw: session_id.clone(),
+                project,
+                event_kind: "opencode_message_usage",
+                source_file: ctx.db_path,
+                source_line_number: None,
+                source_type: "sqlite:message",
+                model_inferred: false,
+                timestamp_inferred: false,
+                deduplication: EventDeduplication::SessionScoped,
+                dedupe_salt: Some(message_id),
+            },
+        );
+        event.session.title = title.filter(|title| !title.trim().is_empty());
+        if let Some(provider_cost) = value
+            .get("cost")
+            .and_then(Value::as_f64)
+            .filter(|cost| *cost > 0.0)
+        {
+            event.cost.provider_reported_usd = Some((provider_cost * 100.0).round() as i64);
+            event.cost.pricing_source = Some("opencode.message.cost".to_string());
+            event.cost.confidence = Confidence::High;
+        }
+        reconstructed_usage
+            .entry(session_id)
+            .and_modify(|current| {
+                current.usage = sum_usage_counts(&current.usage, &event.usage);
+                current.provider_reported_usd += event.cost.provider_reported_usd.unwrap_or(0);
+            })
+            .or_insert_with(|| OpenCodeReconstructedUsage {
+                usage: event.usage.clone(),
+                provider_reported_usd: event.cost.provider_reported_usd.unwrap_or(0),
+            });
+        push_deduped(ctx.scan, ctx.seen, event);
+    }
+    Ok(reconstructed_usage)
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpenCodeReconstructedUsage {
+    usage: UsageCounts,
+    provider_reported_usd: i64,
+}
+
+fn scan_grok_build_source(
+    adapter: &GrokBuildAdapter,
+    source: &SourceLocation,
+    options: &ScanOptions,
+) -> Result<AdapterScan> {
+    let mut scan = AdapterScan::default();
+    let Some(root) = source_root_path(source) else {
+        return Ok(scan);
+    };
+    let sessions_root = grok_sessions_root(&root);
+    if !sessions_root.is_dir() {
+        return Ok(scan);
+    }
+
+    let (unified_log_index, invalid_unified_rows) =
+        parse_grok_unified_log_with_invalid_rows(&root)?;
+    scan.diagnostics.invalid_rows += invalid_unified_rows;
+    for candidate in grok_build_scan_candidates(source, adapter.version())? {
+        if !options.should_scan(&candidate.cache_key) {
+            scan.diagnostics.files_skipped_unchanged += 1;
+            continue;
+        }
+        scan.diagnostics.files_scanned += 1;
+        parse_grok_summary(
+            adapter,
+            source,
+            options,
+            &candidate.path,
+            &unified_log_index.session_stats,
+            &mut scan,
+        )?;
+    }
     Ok(scan)
 }
 
@@ -502,6 +1101,110 @@ fn codex_jsonl_candidates(
     Ok(candidates)
 }
 
+fn opencode_scan_candidates(
+    source: &SourceLocation,
+    adapter_version: &str,
+) -> Result<Vec<ScanCandidateFile>> {
+    let Some(root) = source_root_path(source) else {
+        return Ok(Vec::new());
+    };
+    let db_path = root.join("opencode.db");
+    if !db_path.is_file() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![scan_candidate(
+        db_path,
+        opencode_sqlite_dependency_signature(&root.join("opencode.db")).as_deref(),
+        &scan_cache_namespace(source, adapter_version),
+    )])
+}
+
+fn grok_build_scan_candidates(
+    source: &SourceLocation,
+    adapter_version: &str,
+) -> Result<Vec<ScanCandidateFile>> {
+    let Some(root) = source_root_path(source) else {
+        return Ok(Vec::new());
+    };
+    let sessions_root = grok_sessions_root(&root);
+    if !sessions_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let cache_namespace = scan_cache_namespace(source, adapter_version);
+    let unified_log_index = parse_grok_unified_log(&root)?;
+    let mut candidates = Vec::new();
+    for entry in WalkDir::new(sessions_root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.file_name() == "summary.json" {
+            let dependency = grok_summary_dependency_signature(
+                entry.path(),
+                grok_session_id_from_summary_path(entry.path())
+                    .as_deref()
+                    .and_then(|session_id| unified_log_index.session_signatures.get(session_id))
+                    .map(String::as_str),
+            );
+            candidates.push(scan_candidate(
+                entry.path().to_path_buf(),
+                dependency.as_deref(),
+                &cache_namespace,
+            ));
+        }
+    }
+    candidates.sort_by_cached_key(|candidate| candidate.path.to_string_lossy().into_owned());
+    Ok(candidates)
+}
+
+fn grok_summary_dependency_signature(
+    summary_path: &Path,
+    unified_log_signature: Option<&str>,
+) -> Option<String> {
+    let session_dir = summary_path.parent()?;
+    let mut signatures = [
+        "signals.json",
+        "chat_history.jsonl",
+        "updates.jsonl",
+        "events.jsonl",
+    ]
+    .into_iter()
+    .map(|name| file_metadata_signature(&session_dir.join(name)))
+    .collect::<Vec<_>>();
+    signatures.push(unified_log_signature.unwrap_or("missing").to_string());
+    let signatures = signatures.join(":");
+    Some(hash_text(&signatures))
+}
+
+fn opencode_sqlite_dependency_signature(db_path: &Path) -> Option<String> {
+    let db_path = db_path.to_string_lossy();
+    let signatures = ["-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(|suffix| file_metadata_signature(Path::new(&format!("{db_path}{suffix}"))))
+        .collect::<Vec<_>>();
+    Some(hash_text(&signatures.join(":")))
+}
+
+fn opencode_root_is_source(path: &Path) -> bool {
+    path.join("opencode.db").is_file()
+}
+
+fn grok_build_root_is_source(path: &Path) -> bool {
+    grok_sessions_root(path).is_dir()
+}
+
+fn grok_sessions_root(root: &Path) -> PathBuf {
+    if root.file_name().is_some_and(|name| name == "sessions") {
+        root.to_path_buf()
+    } else {
+        root.join("sessions")
+    }
+}
+
+fn grok_unified_log_path(root: &Path) -> PathBuf {
+    root.join("logs/unified.jsonl")
+}
+
 fn codex_usage_root_for_file(root: &Path, path: &Path) -> PathBuf {
     for child in ["sessions", "archived_sessions"] {
         let usage_root = root.join(child);
@@ -543,6 +1246,8 @@ fn scan_cache_parser_revision(source: &SourceLocation) -> &'static str {
     match source.provider.as_str() {
         CODEX_PROVIDER => CODEX_SCAN_CACHE_PARSER_REVISION,
         CLAUDE_CODE_PROVIDER => CLAUDE_SCAN_CACHE_PARSER_REVISION,
+        OPENCODE_PROVIDER => OPENCODE_SCAN_CACHE_PARSER_REVISION,
+        GROK_BUILD_PROVIDER => GROK_BUILD_SCAN_CACHE_PARSER_REVISION,
         _ => "default",
     }
 }
@@ -692,10 +1397,12 @@ fn parse_claude_file(
                 project: project.clone(),
                 event_kind: "claude_message_usage",
                 source_file: path,
-                line_number: index + 1,
+                source_line_number: Some(index + 1),
+                source_type: "jsonl",
                 model_inferred,
                 timestamp_inferred,
                 deduplication: EventDeduplication::SessionScoped,
+                dedupe_salt: None,
             },
         );
         push_deduped(ctx.scan, ctx.seen, event);
@@ -1133,10 +1840,12 @@ fn parse_codex_file(
                         .or_else(|| project_context_from_path_fallback(root, path)),
                     event_kind: "codex_turn_usage",
                     source_file: path,
-                    line_number: record.line_number,
+                    source_line_number: Some(record.line_number),
+                    source_type: "jsonl",
                     model_inferred: record.model_inferred || turn.model_inferred,
                     timestamp_inferred: record.timestamp_inferred || turn.timestamp_inferred,
                     deduplication: EventDeduplication::PathIndependent,
+                    dedupe_salt: None,
                 },
             );
             push_deduped(ctx.scan, ctx.seen, event);
@@ -1172,7 +1881,8 @@ fn parse_codex_file(
                     "codex_headless_usage"
                 },
                 source_file: path,
-                line_number: record.line_number,
+                source_line_number: Some(record.line_number),
+                source_type: "jsonl",
                 model_inferred: record.model_inferred,
                 timestamp_inferred: record.timestamp_inferred,
                 deduplication: if record.is_token_count_event {
@@ -1180,6 +1890,7 @@ fn parse_codex_file(
                 } else {
                     EventDeduplication::SessionScoped
                 },
+                dedupe_salt: None,
             },
         );
         push_deduped(ctx.scan, ctx.seen, event);
@@ -1253,10 +1964,12 @@ struct ProviderEventParts<'a> {
     project: Option<ProjectInfo>,
     event_kind: &'static str,
     source_file: &'a Path,
-    line_number: usize,
+    source_line_number: Option<usize>,
+    source_type: &'static str,
     model_inferred: bool,
     timestamp_inferred: bool,
     deduplication: EventDeduplication,
+    dedupe_salt: Option<String>,
 }
 
 fn usage_event<A: ProviderAdapter + ?Sized>(
@@ -1274,13 +1987,18 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
         .as_ref()
         .and_then(|model| model.normalized_name.as_deref().or(model.name.as_deref()))
         .unwrap_or("unknown");
+    let event_kind_key = parts
+        .dedupe_salt
+        .as_deref()
+        .map(|salt| format!("{}:{salt}", parts.event_kind))
+        .unwrap_or_else(|| parts.event_kind.to_string());
     let (event_key_version, semantic_key) = match parts.deduplication {
         EventDeduplication::SessionScoped => (
             SESSION_SCOPED_EVENT_KEY_VERSION,
             if parts.session_started_at.is_some() || parts.session_ended_at.is_some() {
                 format!(
                     "{SESSION_SCOPED_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    parts.event_kind,
+                    event_kind_key,
                     session_hash,
                     session_started_at.timestamp_millis(),
                     session_ended_at.timestamp_millis(),
@@ -1294,7 +2012,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
             } else {
                 format!(
                     "{SESSION_SCOPED_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    parts.event_kind,
+                    event_kind_key,
                     session_hash,
                     parts.timestamp.timestamp_millis(),
                     model_key,
@@ -1311,7 +2029,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
             if parts.session_started_at.is_some() || parts.session_ended_at.is_some() {
                 format!(
                     "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    parts.event_kind,
+                    event_kind_key,
                     &project_key,
                     session_started_at.timestamp_millis(),
                     session_ended_at.timestamp_millis(),
@@ -1325,7 +2043,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
             } else {
                 format!(
                     "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    parts.event_kind,
+                    event_kind_key,
                     &project_key,
                     parts.timestamp.timestamp_millis(),
                     model_key,
@@ -1356,7 +2074,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
             adapter_version: adapter.version().to_string(),
             source_kind: source.source_kind.clone(),
             location_origin: Some(source.location_origin.clone()),
-            source_type: "jsonl".to_string(),
+            source_type: parts.source_type.to_string(),
             source_path_hash: source.path_hash.clone(),
             source_record_id: Some(source_record_id.clone()),
             parse_confidence: if parts.model_inferred || parts.timestamp_inferred {
@@ -1379,7 +2097,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
         parse_evidence: Some(ParseEvidence {
             event_key_version: event_key_version.to_string(),
             source_file_path_hash: Some(file_path_hash),
-            source_line_number: Some(parts.line_number as u64),
+            source_line_number: parts.source_line_number.map(|value| value as u64),
             source_record_id: Some(semantic_key),
             model_inferred: parts.model_inferred,
             timestamp_inferred: parts.timestamp_inferred,
@@ -1392,6 +2110,682 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
         created_at: parts.timestamp,
         imported_at: Utc::now(),
     }
+}
+
+struct MetadataSummaryParts<'a> {
+    source_file: &'a Path,
+    summary_format: &'a str,
+    semantic_key: &'a str,
+    observed_at: DateTime<Utc>,
+    metadata: SummaryMetadata,
+    model: Option<ModelInfo>,
+    runtime: Option<RuntimeInfo>,
+    project: Option<ProjectInfo>,
+}
+
+fn metadata_summary<A: ProviderAdapter + ?Sized>(
+    adapter: &A,
+    source: &SourceLocation,
+    options: &ScanOptions,
+    parts: MetadataSummaryParts<'_>,
+) -> UsageSummary {
+    let file_path_hash = hash_text(&canonical_display(parts.source_file));
+    let usage = UsageCounts::default();
+    UsageSummary {
+        schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
+        summary_id: summary_id(adapter.provider(), &source.source_id, parts.semantic_key),
+        device_id: options.device_id.clone(),
+        provider: adapter.provider().to_string(),
+        source_id: source.source_id.clone(),
+        provider_account_id: None,
+        source: EventSource {
+            adapter_id: adapter.id().to_string(),
+            adapter_version: adapter.version().to_string(),
+            source_kind: source.source_kind.clone(),
+            location_origin: Some(source.location_origin.clone()),
+            source_type: parts.summary_format.to_string(),
+            source_path_hash: source.path_hash.clone(),
+            source_record_id: Some(format!(
+                "summary_key_{}",
+                &hash_text(parts.semantic_key)[..32]
+            )),
+            parse_confidence: Confidence::Medium,
+        },
+        model: parts.model.clone(),
+        models: Vec::new(),
+        usage: usage.clone(),
+        cost: estimate_cost(adapter.provider(), parts.model.as_ref(), &usage),
+        parse_evidence: Some(ParseEvidence {
+            event_key_version: "metadata_summary.v1".to_string(),
+            source_file_path_hash: Some(file_path_hash),
+            source_line_number: None,
+            source_record_id: Some(parts.semantic_key.to_string()),
+            model_inferred: parts.model.is_none(),
+            timestamp_inferred: false,
+            account_identity_source: IdentitySource::Unresolved,
+        }),
+        project: parts.project,
+        privacy: metadata_only_privacy(),
+        metrics: parts.runtime.map(runtime_to_summary_metrics),
+        period_start: None,
+        period_end: None,
+        observed_at: parts.observed_at,
+        metadata: parts.metadata,
+        imported_at: Utc::now(),
+    }
+}
+
+fn runtime_to_summary_metrics(runtime: RuntimeInfo) -> SummaryMetrics {
+    SummaryMetrics {
+        active_seconds: runtime.latency_ms.map(|value| value as f64 / 1000.0),
+        tracked_requests: runtime.total_messages,
+        tracked_output_tokens: None,
+        tracked_reasoning_tokens: None,
+        latency_ms: runtime.latency_ms.map(metric_single_sample),
+        time_to_first_token_ms: runtime.time_to_first_token_ms.map(metric_single_sample),
+        generated_tps: None,
+        visible_tps: None,
+        overall_generated_tps: None,
+        overall_visible_tps: None,
+        cache_hit_ratio: None,
+        reasoning_share: None,
+        total_messages: runtime.total_messages,
+        user_messages: runtime.user_messages,
+        assistant_messages: runtime.assistant_messages,
+        developer_messages: runtime.developer_messages,
+    }
+}
+
+fn metric_single_sample(value: u64) -> MetricStats {
+    let value = value as f64;
+    MetricStats {
+        samples: 1,
+        avg: Some(value),
+        min: Some(value),
+        max: Some(value),
+        p50: Some(value),
+        p95: Some(value),
+        sum: Some(value),
+    }
+}
+
+fn metric_from_samples(samples: &[u64]) -> Option<MetricStats> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples
+        .iter()
+        .map(|value| *value as f64)
+        .collect::<Vec<_>>();
+    sorted.sort_by(f64::total_cmp);
+    let sum = sorted.iter().sum::<f64>();
+    let percentile = |percent: f64| -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percent).round() as usize;
+        sorted[index]
+    };
+    Some(MetricStats {
+        samples: sorted.len() as u64,
+        avg: Some(sum / sorted.len() as f64),
+        min: sorted.first().copied(),
+        max: sorted.last().copied(),
+        p50: Some(percentile(0.50)),
+        p95: Some(percentile(0.95)),
+        sum: Some(sum),
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct GrokSessionStats {
+    chat_rows: u64,
+    user_messages: u64,
+    assistant_messages: u64,
+    reasoning_messages: u64,
+    tool_result_messages: u64,
+    system_messages: u64,
+    events_rows: u64,
+    update_rows: u64,
+    prompt_count: u64,
+    prompt_context_tokens: Option<u64>,
+    max_total_tokens: Option<u64>,
+    max_tokens_used: Option<u64>,
+    max_tokens_after: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GrokInferenceStats {
+    rows: u64,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+    model_elapsed_ms: Vec<u64>,
+    time_to_first_token_ms: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GrokUnifiedLogIndex {
+    session_stats: HashMap<String, GrokInferenceStats>,
+    session_signatures: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GrokJsonlParseStats {
+    rows: u64,
+    invalid_rows: u64,
+}
+
+impl GrokInferenceStats {
+    fn has_usage(&self) -> bool {
+        self.rows > 0
+            && self
+                .input_tokens
+                .saturating_add(self.cache_read_tokens)
+                .saturating_add(self.output_tokens)
+                .saturating_add(self.reasoning_tokens)
+                > 0
+    }
+
+    fn usage_counts(&self) -> UsageCounts {
+        UsageCounts {
+            input_tokens: nonzero_u64(self.input_tokens),
+            output_tokens: nonzero_u64(self.output_tokens),
+            cache_creation_tokens: None,
+            cache_read_tokens: nonzero_u64(self.cache_read_tokens),
+            reasoning_tokens: nonzero_u64(self.reasoning_tokens),
+            total_tokens: None,
+            requests: nonzero_u64(self.rows),
+            local_prompt_eval_tokens: None,
+            local_eval_tokens: None,
+        }
+    }
+}
+
+impl GrokSessionStats {
+    fn total_chat_messages(&self) -> u64 {
+        self.user_messages
+            .saturating_add(self.assistant_messages)
+            .saturating_add(self.reasoning_messages)
+            .saturating_add(self.tool_result_messages)
+            .saturating_add(self.system_messages)
+    }
+
+    fn token_footprint(&self, signals: Option<&Value>) -> Option<u64> {
+        [
+            signals
+                .and_then(|signals| signals.get("contextTokensUsed"))
+                .and_then(value_as_u64),
+            signals
+                .and_then(|signals| signals.get("totalTokensBeforeCompaction"))
+                .and_then(value_as_u64),
+            self.max_total_tokens,
+            self.max_tokens_used,
+            self.max_tokens_after,
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .filter(|value| *value > 0)
+    }
+
+    fn usage_context_tokens(&self, signals: Option<&Value>) -> Option<u64> {
+        self.prompt_context_tokens
+            .filter(|value| *value > 0)
+            .or_else(|| self.token_footprint(signals))
+    }
+}
+
+fn nonzero_u64(value: u64) -> Option<u64> {
+    (value > 0).then_some(value)
+}
+
+fn grok_session_stats(session_dir: &Path, invalid_rows: &mut u64) -> Result<GrokSessionStats> {
+    let mut stats = GrokSessionStats::default();
+    parse_grok_chat_history(
+        &session_dir.join("chat_history.jsonl"),
+        &mut stats,
+        invalid_rows,
+    )?;
+    parse_grok_updates(&session_dir.join("updates.jsonl"), &mut stats, invalid_rows)?;
+    stats.events_rows = count_jsonl_records(&session_dir.join("events.jsonl"), invalid_rows)?;
+    Ok(stats)
+}
+
+fn parse_grok_unified_log(root: &Path) -> Result<GrokUnifiedLogIndex> {
+    Ok(parse_grok_unified_log_with_invalid_rows(root)?.0)
+}
+
+fn parse_grok_unified_log_with_invalid_rows(root: &Path) -> Result<(GrokUnifiedLogIndex, u64)> {
+    let mut index = GrokUnifiedLogIndex::default();
+    let parse_stats = for_grok_jsonl_record(&grok_unified_log_path(root), |line, value| {
+        if value.get("msg").and_then(Value::as_str) != Some("shell.turn.inference_done") {
+            return Ok(());
+        }
+        let Some(session_id) = value.get("sid").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(ctx) = value.get("ctx") else {
+            return Ok(());
+        };
+        let prompt_tokens = ctx.get("prompt_tokens").and_then(value_as_u64).unwrap_or(0);
+        let cached_prompt_tokens = ctx
+            .get("cached_prompt_tokens")
+            .and_then(value_as_u64)
+            .unwrap_or(0)
+            .min(prompt_tokens);
+        let completion_tokens = ctx
+            .get("completion_tokens")
+            .and_then(value_as_u64)
+            .unwrap_or(0);
+        let reasoning_tokens = ctx
+            .get("reasoning_tokens")
+            .and_then(value_as_u64)
+            .unwrap_or(0);
+        if prompt_tokens == 0 && completion_tokens == 0 && reasoning_tokens == 0 {
+            return Ok(());
+        }
+        let stats = index
+            .session_stats
+            .entry(session_id.to_string())
+            .or_default();
+        stats.rows += 1;
+        stats.input_tokens = stats
+            .input_tokens
+            .saturating_add(prompt_tokens.saturating_sub(cached_prompt_tokens));
+        stats.cache_read_tokens = stats.cache_read_tokens.saturating_add(cached_prompt_tokens);
+        stats.output_tokens = stats.output_tokens.saturating_add(completion_tokens);
+        stats.reasoning_tokens = stats.reasoning_tokens.saturating_add(reasoning_tokens);
+        if let Some(value) = ctx.get("model_elapsed_ms").and_then(value_as_u64) {
+            stats.model_elapsed_ms.push(value);
+        }
+        if let Some(value) = ctx.get("ttft_ms").and_then(value_as_u64) {
+            stats.time_to_first_token_ms.push(value);
+        }
+        let row_signature = hash_text(line);
+        index
+            .session_signatures
+            .entry(session_id.to_string())
+            .and_modify(|signature| *signature = hash_text(&format!("{signature}:{row_signature}")))
+            .or_insert(row_signature);
+        Ok(())
+    })?;
+    Ok((index, parse_stats.invalid_rows))
+}
+
+fn parse_grok_chat_history(
+    path: &Path,
+    stats: &mut GrokSessionStats,
+    invalid_rows: &mut u64,
+) -> Result<()> {
+    *invalid_rows += for_grok_jsonl_value(path, |value| {
+        stats.chat_rows += 1;
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") => stats.user_messages += 1,
+            Some("assistant") => stats.assistant_messages += 1,
+            Some("reasoning") => stats.reasoning_messages += 1,
+            Some("tool_result") => stats.tool_result_messages += 1,
+            Some("system") => stats.system_messages += 1,
+            _ => {}
+        }
+        Ok(())
+    })?
+    .invalid_rows;
+    Ok(())
+}
+
+fn parse_grok_updates(
+    path: &Path,
+    stats: &mut GrokSessionStats,
+    invalid_rows: &mut u64,
+) -> Result<()> {
+    let mut prompt_context_tokens = HashMap::<String, u64>::new();
+    *invalid_rows += for_grok_jsonl_value(path, |value| {
+        stats.update_rows += 1;
+        update_max(
+            &mut stats.max_total_tokens,
+            value.pointer("/params/_meta/totalTokens"),
+        );
+        if let (Some(prompt_id), Some(tokens)) = (
+            value
+                .pointer("/params/_meta/promptId")
+                .and_then(Value::as_str),
+            value
+                .pointer("/params/_meta/totalTokens")
+                .and_then(value_as_u64),
+        ) {
+            prompt_context_tokens
+                .entry(prompt_id.to_string())
+                .and_modify(|current| *current = (*current).max(tokens))
+                .or_insert(tokens);
+        }
+        update_max(
+            &mut stats.max_tokens_used,
+            value.pointer("/params/update/tokens_used"),
+        );
+        update_max(
+            &mut stats.max_tokens_after,
+            value.pointer("/params/update/tokens_after"),
+        );
+        Ok(())
+    })?
+    .invalid_rows;
+    stats.prompt_count = prompt_context_tokens.len() as u64;
+    stats.prompt_context_tokens = prompt_context_tokens
+        .values()
+        .copied()
+        .reduce(u64::saturating_add);
+    Ok(())
+}
+
+fn count_jsonl_records(path: &Path, invalid_rows: &mut u64) -> Result<u64> {
+    let parse_stats = for_grok_jsonl_value(path, |_| Ok(()))?;
+    *invalid_rows += parse_stats.invalid_rows;
+    Ok(parse_stats.rows)
+}
+
+fn for_grok_jsonl_record(
+    path: &Path,
+    mut visit: impl FnMut(&str, &Value) -> Result<()>,
+) -> Result<GrokJsonlParseStats> {
+    if !path.is_file() {
+        return Ok(GrokJsonlParseStats::default());
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut parse_stats = GrokJsonlParseStats::default();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("read {} line {}", path.display(), index + 1))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(_) => {
+                parse_stats.invalid_rows += 1;
+                continue;
+            }
+        };
+        parse_stats.rows += 1;
+        visit(trimmed, &value)?;
+    }
+    Ok(parse_stats)
+}
+
+fn for_grok_jsonl_value(
+    path: &Path,
+    mut visit: impl FnMut(&Value) -> Result<()>,
+) -> Result<GrokJsonlParseStats> {
+    for_grok_jsonl_record(path, |_line, value| visit(value))
+}
+
+fn grok_session_id_from_summary_path(summary_path: &Path) -> Option<String> {
+    read_json_file(summary_path)
+        .as_ref()
+        .and_then(|value| grok_session_id_from_summary_value(value, summary_path))
+        .or_else(|| {
+            summary_path
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn grok_session_id_from_summary_value(value: &Value, summary_path: &Path) -> Option<String> {
+    value
+        .pointer("/info/id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            summary_path
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn update_max(target: &mut Option<u64>, value: Option<&Value>) {
+    if let Some(value) = value.and_then(value_as_u64) {
+        *target = Some(target.unwrap_or(0).max(value));
+    }
+}
+
+fn parse_grok_summary(
+    adapter: &GrokBuildAdapter,
+    source: &SourceLocation,
+    options: &ScanOptions,
+    summary_path: &Path,
+    unified_session_stats: &HashMap<String, GrokInferenceStats>,
+    scan: &mut AdapterScan,
+) -> Result<()> {
+    let text = std::fs::read_to_string(summary_path)
+        .with_context(|| format!("read {}", summary_path.display()))?;
+    let value: Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", summary_path.display()))?;
+    scan.diagnostics.raw_rows += 1;
+    let session_id = grok_session_id_from_summary_value(&value, summary_path)
+        .unwrap_or_else(|| "unknown".to_string());
+    let observed_at = value
+        .get("updated_at")
+        .and_then(timestamp_from_scalar)
+        .or_else(|| file_modified_timestamp(summary_path))
+        .unwrap_or_else(Utc::now);
+    let model = string_at_any(&value, &["current_model_id"]).map(|model| model_info(&model));
+    let session_dir = summary_path.parent();
+    let signals = session_dir
+        .map(|parent| parent.join("signals.json"))
+        .and_then(|path| read_json_file(&path).map(|value| (path, value)));
+    let stats = session_dir
+        .map(|path| grok_session_stats(path, &mut scan.diagnostics.invalid_rows))
+        .transpose()?
+        .unwrap_or_default();
+    let inference_stats = unified_session_stats
+        .get(session_id.as_str())
+        .cloned()
+        .unwrap_or_default();
+    let signal_value = signals.as_ref().map(|(_, signals)| signals);
+    let total_messages = value
+        .get("num_messages")
+        .and_then(value_as_u64)
+        .or_else(|| {
+            let total = stats.total_chat_messages();
+            (total > 0).then_some(total)
+        });
+    let user_messages = signal_value
+        .and_then(|signals| signals.get("userMessageCount"))
+        .and_then(value_as_u64)
+        .or_else(|| (stats.user_messages > 0).then_some(stats.user_messages));
+    let assistant_messages = signal_value
+        .and_then(|signals| signals.get("assistantMessageCount"))
+        .and_then(value_as_u64)
+        .or_else(|| (stats.assistant_messages > 0).then_some(stats.assistant_messages));
+    let usage = if inference_stats.has_usage() {
+        inference_stats.usage_counts()
+    } else {
+        UsageCounts {
+            input_tokens: stats.usage_context_tokens(signal_value),
+            output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            reasoning_tokens: None,
+            total_tokens: stats.usage_context_tokens(signal_value),
+            requests: signal_value
+                .and_then(|signals| signals.get("turnCount"))
+                .and_then(value_as_u64)
+                .or_else(|| (stats.prompt_count > 0).then_some(stats.prompt_count)),
+            local_prompt_eval_tokens: None,
+            local_eval_tokens: None,
+        }
+    };
+    let runtime = signals.as_ref().map(|(_, signals)| RuntimeInfo {
+        runtime_name: Some("grok-build".to_string()),
+        host_id: None,
+        latency_ms: signals
+            .get("sessionDurationSeconds")
+            .and_then(value_as_u64)
+            .map(|seconds| seconds * 1000),
+        latency_source: signals
+            .get("sessionDurationSeconds")
+            .and_then(value_as_u64)
+            .map(|_| LatencySource::Explicit),
+        time_to_first_token_ms: signals.get("avgTimeToFirstTokenMs").and_then(value_as_u64),
+        prompt_eval_duration_ms: None,
+        eval_duration_ms: None,
+        total_messages,
+        user_messages,
+        assistant_messages,
+        developer_messages: None,
+    });
+    let project = value
+        .pointer("/info/cwd")
+        .and_then(Value::as_str)
+        .map(expand_home_path)
+        .and_then(|path| {
+            resolve_project_context(
+                Some(path),
+                value
+                    .get("git_remotes")
+                    .and_then(Value::as_array)
+                    .and_then(|remotes| remotes.first())
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                value
+                    .get("head_branch")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            )
+        });
+    let summary_version = value
+        .get("chat_format_version")
+        .and_then(value_as_u64)
+        .map(|value| {
+            format!(
+                "{value};chat_rows={};updates={};events={};reasoning={};tool_results={};system={};token_footprint={}",
+                stats.chat_rows,
+                stats.update_rows,
+                stats.events_rows,
+                stats.reasoning_messages,
+                stats.tool_result_messages,
+                stats.system_messages,
+                stats.token_footprint(signal_value).unwrap_or(0)
+            )
+        });
+    let summary_version = summary_version.map(|version| {
+        format!(
+            "{version};prompts={};prompt_context_tokens={};inference_rows={};usage_source={}",
+            stats.prompt_count,
+            stats.prompt_context_tokens.unwrap_or(0),
+            inference_stats.rows,
+            if inference_stats.has_usage() {
+                "unified_log"
+            } else {
+                "session_context"
+            }
+        )
+    });
+    let mut summary = metadata_summary(
+        adapter,
+        source,
+        options,
+        MetadataSummaryParts {
+            source_file: summary_path,
+            summary_format: "grok_build_session_summary",
+            semantic_key: &format!("grok_build_session_summary.v1:{session_id}"),
+            observed_at,
+            metadata: SummaryMetadata {
+                summary_format: "grok_build_session_summary".to_string(),
+                summary_version,
+                total_sessions: Some(1),
+                total_messages,
+                last_computed_at: Some(observed_at),
+            },
+            model,
+            runtime,
+            project,
+        },
+    );
+    summary.usage = usage;
+    summary.cost = estimate_cost(adapter.provider(), summary.model.as_ref(), &summary.usage);
+    if summary.cost.estimated_api_equivalent_usd.is_some() {
+        if inference_stats.has_usage() {
+            summary.cost.confidence = Confidence::Medium;
+            summary.cost.pricing_source = summary
+                .cost
+                .pricing_source
+                .map(|source| format!("{source}:unified_log_inference_usage"));
+        } else {
+            summary.cost.confidence = Confidence::Low;
+            summary.cost.pricing_source = summary
+                .cost
+                .pricing_source
+                .map(|source| format!("{source}:prompt_context_token_footprint"));
+        }
+    }
+    if let Some(metrics) = summary.metrics.as_mut() {
+        metrics.tracked_requests = metrics.tracked_requests.or(summary.usage.requests);
+        metrics.total_messages = metrics.total_messages.or(total_messages);
+        metrics.user_messages = metrics.user_messages.or(user_messages);
+        metrics.assistant_messages = metrics.assistant_messages.or(assistant_messages);
+        metrics.tracked_output_tokens = metrics
+            .tracked_output_tokens
+            .or(summary.usage.output_tokens);
+        metrics.tracked_reasoning_tokens = metrics
+            .tracked_reasoning_tokens
+            .or(summary.usage.reasoning_tokens);
+        if inference_stats.has_usage() {
+            metrics.latency_ms = metric_from_samples(&inference_stats.model_elapsed_ms);
+            metrics.time_to_first_token_ms =
+                metric_from_samples(&inference_stats.time_to_first_token_ms);
+        }
+        if metrics.latency_ms.is_none() {
+            metrics.latency_ms = signal_value
+                .and_then(|signals| signals.get("avgResponseTimeMs"))
+                .and_then(value_as_u64)
+                .map(metric_single_sample);
+        }
+    } else {
+        summary.metrics = Some(SummaryMetrics {
+            active_seconds: signal_value
+                .and_then(|signals| signals.get("sessionDurationSeconds"))
+                .and_then(value_as_u64)
+                .map(|value| value as f64),
+            tracked_requests: summary.usage.requests,
+            tracked_output_tokens: summary.usage.output_tokens,
+            tracked_reasoning_tokens: summary.usage.reasoning_tokens,
+            latency_ms: metric_from_samples(&inference_stats.model_elapsed_ms).or_else(|| {
+                signal_value
+                    .and_then(|signals| signals.get("avgResponseTimeMs"))
+                    .and_then(value_as_u64)
+                    .map(metric_single_sample)
+            }),
+            time_to_first_token_ms: metric_from_samples(&inference_stats.time_to_first_token_ms)
+                .or_else(|| {
+                    signal_value
+                        .and_then(|signals| signals.get("avgTimeToFirstTokenMs"))
+                        .and_then(value_as_u64)
+                        .map(metric_single_sample)
+                }),
+            generated_tps: None,
+            visible_tps: None,
+            overall_generated_tps: None,
+            overall_visible_tps: None,
+            cache_hit_ratio: None,
+            reasoning_share: None,
+            total_messages,
+            user_messages,
+            assistant_messages,
+            developer_messages: None,
+        });
+    }
+    scan.diagnostics.raw_rows += stats
+        .chat_rows
+        .saturating_add(stats.update_rows)
+        .saturating_add(stats.events_rows)
+        .saturating_add(inference_stats.rows);
+    scan.diagnostics.candidate_usage_rows += summary.usage.requests.unwrap_or(0);
+    scan.summaries.push(summary);
+    Ok(())
 }
 
 fn claude_usage_counts_from_value(value: &Value) -> UsageCounts {
@@ -1695,11 +3089,34 @@ fn timestamp_from_number(value: i64) -> Option<DateTime<Utc>> {
     }
 }
 
+fn timestamp_from_millis(value: i64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_millis_opt(value).single()
+}
+
 fn file_modified_timestamp(path: &Path) -> Option<DateTime<Utc>> {
     path.metadata()
         .ok()
         .and_then(|metadata| metadata.modified().ok())
         .map(DateTime::<Utc>::from)
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn open_sqlite_readonly(path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open sqlite {}", path.display()))
+}
+
+fn sqlite_nonzero_u64(value: i64) -> Option<u64> {
+    (value > 0).then_some(value as u64)
 }
 
 fn model_from_nested_value(value: &Value, fallback: Option<&str>) -> Option<ModelInfo> {
@@ -1739,6 +3156,66 @@ fn model_info(model: &str) -> ModelInfo {
         name: Some(model.to_string()),
         normalized_name: Some(normalized),
         provider_model_id: Some(model.to_string()),
+    }
+}
+
+fn opencode_model_info(value: &str) -> Option<ModelInfo> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
+        let label = opencode_model_label_from_value(&json).unwrap_or_else(|| trimmed.to_string());
+        return Some(ModelInfo {
+            name: Some(label.clone()),
+            normalized_name: Some(label.to_ascii_lowercase()),
+            provider_model_id: Some(label),
+        });
+    }
+    Some(ModelInfo {
+        name: Some(trimmed.to_string()),
+        normalized_name: Some(if trimmed.contains('/') {
+            trimmed.to_ascii_lowercase()
+        } else {
+            normalize_model_name(trimmed)
+        }),
+        provider_model_id: Some(trimmed.to_string()),
+    })
+}
+
+fn opencode_model_label_from_value(value: &Value) -> Option<String> {
+    let provider = value
+        .get("providerID")
+        .or_else(|| value.get("provider_id"))
+        .and_then(Value::as_str);
+    let model = value
+        .get("modelID")
+        .or_else(|| value.get("id"))
+        .or_else(|| value.get("model"))
+        .and_then(Value::as_str)?;
+    Some(
+        provider
+            .map(|provider| format!("{provider}/{model}"))
+            .unwrap_or_else(|| model.to_string()),
+    )
+}
+
+fn opencode_message_model_info(value: &Value) -> Option<ModelInfo> {
+    let label = opencode_model_label_from_value(value)?;
+    opencode_model_info(&label)
+}
+
+fn opencode_message_usage_counts(value: &Value) -> UsageCounts {
+    UsageCounts {
+        input_tokens: value.pointer("/tokens/input").and_then(value_as_u64),
+        output_tokens: value.pointer("/tokens/output").and_then(value_as_u64),
+        reasoning_tokens: value.pointer("/tokens/reasoning").and_then(value_as_u64),
+        cache_read_tokens: value.pointer("/tokens/cache/read").and_then(value_as_u64),
+        cache_creation_tokens: value.pointer("/tokens/cache/write").and_then(value_as_u64),
+        total_tokens: None,
+        requests: Some(1),
+        local_prompt_eval_tokens: None,
+        local_eval_tokens: None,
     }
 }
 
@@ -2753,7 +4230,7 @@ mod tests {
                   "cacheCreationInputTokens": 10,
                   "costUSD": 12.5
                 }},
-                "google/antigravity-empty": {{
+                "unknown/zero-usage-empty": {{
                   "inputTokens": 0,
                   "outputTokens": 0,
                   "cacheReadInputTokens": 0,
@@ -4100,5 +5577,1243 @@ mod tests {
 
         assert_eq!(scan.events[0].usage.input_tokens, Some(0));
         assert_eq!(scan.events[0].usage.cache_read_tokens, Some(10));
+    }
+
+    #[test]
+    fn new_provider_aliases_resolve_to_adapters() {
+        assert_eq!(
+            adapter_for_provider("opencode")
+                .expect("opencode")
+                .provider(),
+            OPENCODE_PROVIDER
+        );
+        assert_eq!(
+            adapter_for_provider("grok-build").expect("grok").provider(),
+            GROK_BUILD_PROVIDER
+        );
+    }
+
+    #[test]
+    fn opencode_sqlite_sessions_become_usage_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_test",
+                    "Test session",
+                    r#"{"id":"grok-build-0.1","providerID":"xai"}"#,
+                    1.23_f64,
+                    100_i64,
+                    20_i64,
+                    5_i64,
+                    30_i64,
+                    7_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert");
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let event = &scan.events[0];
+        assert_eq!(event.provider, OPENCODE_PROVIDER);
+        assert_eq!(event.session.title.as_deref(), Some("Test session"));
+        assert_eq!(event.usage.input_tokens, Some(100));
+        assert_eq!(event.usage.cache_creation_tokens, Some(7));
+        assert_eq!(event.usage.computed_total(), 162);
+        assert_eq!(event.cost.provider_reported_usd, Some(123));
+        assert_eq!(
+            event.model.as_ref().and_then(|model| model.name.as_deref()),
+            Some("xai/grok-build-0.1")
+        );
+        assert_eq!(
+            event
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("xai/grok-build-0.1")
+        );
+    }
+
+    #[test]
+    fn opencode_recovers_missing_session_model_from_messages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_test",
+                    "Recovered session",
+                    Option::<String>::None,
+                    0.0_f64,
+                    1_000_000_i64,
+                    1_000_000_i64,
+                    0_i64,
+                    1_000_000_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "msg_test",
+                    "ses_test",
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    serde_json::json!({
+                        "providerID": "google",
+                        "modelID": "antigravity-claude-opus-4-5-thinking"
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert message");
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let event = &scan.events[0];
+        assert_eq!(
+            event.model.as_ref().and_then(|model| model.name.as_deref()),
+            Some("google/antigravity-claude-opus-4-5-thinking")
+        );
+        assert_eq!(event.cost.estimated_api_equivalent_usd, Some(3050));
+        assert_eq!(scan.diagnostics.model_fallbacks, 0);
+    }
+
+    #[test]
+    fn opencode_recovers_missing_session_model_from_alternative_message_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_test",
+                    "Recovered alt session",
+                    Option::<String>::None,
+                    0.0_f64,
+                    1_000_000_i64,
+                    1_000_000_i64,
+                    0_i64,
+                    1_000_000_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "msg_test",
+                    "ses_test",
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    serde_json::json!({
+                        "provider_id": "openai",
+                        "id": "gpt-5.2-codex"
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert message");
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let event = &scan.events[0];
+        assert_eq!(
+            event.model.as_ref().and_then(|model| model.name.as_deref()),
+            Some("openai/gpt-5.2-codex")
+        );
+        assert_eq!(event.cost.estimated_api_equivalent_usd, Some(1593));
+        assert_eq!(scan.diagnostics.model_fallbacks, 0);
+    }
+
+    #[test]
+    fn opencode_does_not_recover_single_model_when_usage_bearing_messages_lack_model_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_test",
+                    "Mixed metadata session",
+                    Option::<String>::None,
+                    0.0_f64,
+                    100_i64,
+                    20_i64,
+                    0_i64,
+                    30_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "msg_a",
+                    "ses_test",
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    serde_json::json!({
+                        "providerID": "google",
+                        "modelID": "antigravity-claude-opus-4-5-thinking",
+                        "tokens": {
+                            "input": 60,
+                            "output": 0,
+                            "reasoning": 0,
+                            "cache": { "read": 10, "write": 0 }
+                        }
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert message a");
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "msg_b",
+                    "ses_test",
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    serde_json::json!({
+                        "tokens": {
+                            "input": 40,
+                            "output": 20,
+                            "reasoning": 0,
+                            "cache": { "read": 20, "write": 0 }
+                        }
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert message b");
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        assert!(scan.events.iter().any(|event| event.model.is_some()));
+        assert!(scan.events.iter().any(|event| event.model.is_none()));
+    }
+
+    #[test]
+    fn opencode_splits_multi_model_sessions_into_message_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_test",
+                    "Ambiguous session",
+                    Option::<String>::None,
+                    0.0_f64,
+                    100_i64,
+                    20_i64,
+                    0_i64,
+                    30_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        for (id, provider, model) in [
+            ("msg_a", "google", "antigravity-claude-opus-4-5-thinking"),
+            ("msg_b", "openai", "gpt-5.2-codex"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        "ses_test",
+                        1_767_225_600_000_i64,
+                        1_767_225_660_000_i64,
+                        serde_json::json!({
+                            "providerID": provider,
+                            "modelID": model,
+                            "tokens": {
+                                "input": if provider == "google" { 100 } else { 0 },
+                                "output": if provider == "openai" { 20 } else { 0 },
+                                "reasoning": 0,
+                                "cache": {
+                                    "read": if provider == "google" { 30 } else { 0 },
+                                    "write": 0
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ],
+                )
+                .expect("insert message");
+        }
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(scan.diagnostics.model_fallbacks, 0);
+        assert_eq!(scan.diagnostics.candidate_usage_rows, 2);
+        assert!(scan.events.iter().any(|event| event
+            .model
+            .as_ref()
+            .and_then(|model| model.name.as_deref())
+            == Some("google/antigravity-claude-opus-4-5-thinking")));
+        assert!(scan.events.iter().any(|event| event
+            .model
+            .as_ref()
+            .and_then(|model| model.name.as_deref())
+            == Some("openai/gpt-5.2-codex")));
+    }
+
+    #[test]
+    fn opencode_partial_multi_model_reconstruction_keeps_residual_aggregate_usage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_test",
+                    "Partial session",
+                    Option::<String>::None,
+                    0.0_f64,
+                    100_i64,
+                    20_i64,
+                    0_i64,
+                    30_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        for (id, provider, model, input, output, cache_read) in [
+            (
+                "msg_a",
+                "google",
+                "antigravity-claude-opus-4-5-thinking",
+                60,
+                0,
+                10,
+            ),
+            ("msg_b", "openai", "gpt-5.2-codex", 0, 0, 0),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        "ses_test",
+                        1_767_225_600_000_i64,
+                        1_767_225_660_000_i64,
+                        serde_json::json!({
+                            "providerID": provider,
+                            "modelID": model,
+                            "tokens": {
+                                "input": input,
+                                "output": output,
+                                "reasoning": 0,
+                                "cache": {
+                                    "read": cache_read,
+                                    "write": 0
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ],
+                )
+                .expect("insert message");
+        }
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        let known = scan
+            .events
+            .iter()
+            .find(|event| event.model.is_some())
+            .expect("known event");
+        let residual = scan
+            .events
+            .iter()
+            .find(|event| event.model.is_none())
+            .expect("residual event");
+        assert_eq!(known.usage.input_tokens, Some(60));
+        assert_eq!(known.usage.cache_read_tokens, Some(10));
+        assert_eq!(residual.usage.input_tokens, Some(40));
+        assert_eq!(residual.usage.output_tokens, Some(20));
+        assert_eq!(residual.usage.cache_read_tokens, Some(20));
+    }
+
+    #[test]
+    fn opencode_partial_multi_model_reconstruction_preserves_residual_provider_cost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_test",
+                    "Residual cost session",
+                    Option::<String>::None,
+                    3.0_f64,
+                    100_i64,
+                    20_i64,
+                    0_i64,
+                    30_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "msg_a",
+                    "ses_test",
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    serde_json::json!({
+                        "providerID": "google",
+                        "modelID": "antigravity-claude-opus-4-5-thinking",
+                        "cost": 1.25,
+                        "tokens": {
+                            "input": 60,
+                            "output": 0,
+                            "reasoning": 0,
+                            "cache": { "read": 10, "write": 0 }
+                        }
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert message a");
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "msg_b",
+                    "ses_test",
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    serde_json::json!({
+                        "providerID": "openai",
+                        "modelID": "gpt-5.2-codex",
+                        "tokens": {
+                            "input": 0,
+                            "output": 0,
+                            "reasoning": 0,
+                            "cache": { "read": 0, "write": 0 }
+                        }
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert message b");
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        let residual = scan
+            .events
+            .iter()
+            .find(|event| event.model.is_none())
+            .expect("residual event");
+        assert_eq!(residual.cost.provider_reported_usd, Some(175));
+    }
+
+    #[test]
+    fn opencode_model_info_preserves_provider_qualified_identity() {
+        let foo = opencode_model_info(r#"{"id":"model-x","providerID":"foo"}"#).expect("foo");
+        let bar = opencode_model_info(r#"{"id":"model-x","providerID":"bar"}"#).expect("bar");
+
+        assert_eq!(foo.normalized_name.as_deref(), Some("foo/model-x"));
+        assert_eq!(bar.normalized_name.as_deref(), Some("bar/model-x"));
+        assert_ne!(foo.normalized_name, bar.normalized_name);
+    }
+
+    #[test]
+    fn opencode_scan_candidates_change_when_wal_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("opencode.db"), "db").expect("db");
+        std::fs::write(dir.path().join("opencode.db-wal"), "").expect("wal");
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let before = opencode_scan_candidates(&source, "0").expect("before");
+        std::fs::write(dir.path().join("opencode.db-wal"), "wal-data").expect("updated wal");
+        let after = opencode_scan_candidates(&source, "0").expect("after");
+
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_ne!(before[0].cache_signature, after[0].cache_signature);
+    }
+
+    #[test]
+    fn grok_build_session_summary_records_local_session_stats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-1");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-1", "cwd": dir.path()},
+                "updated_at": "2026-06-09T13:53:52Z",
+                "num_messages": 12,
+                "current_model_id": "grok-build",
+                "chat_format_version": 1,
+                "git_remotes": ["https://github.com/example/repo.git"],
+                "head_branch": "main"
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "sessionDurationSeconds": 60,
+                "avgTimeToFirstTokenMs": 1200,
+                "avgResponseTimeMs": 2400,
+                "turnCount": 3,
+                "userMessageCount": 3,
+                "assistantMessageCount": 9,
+                "contextTokensUsed": 42_000,
+                "contextWindowTokens": 256_000
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        std::fs::write(
+            session.join("chat_history.jsonl"),
+            [
+                serde_json::json!({"type": "system", "content": "system"}).to_string(),
+                serde_json::json!({"type": "user", "content": [{"type": "text", "text": "hello"}]})
+                    .to_string(),
+                serde_json::json!({"type": "assistant", "content": "hi"}).to_string(),
+                serde_json::json!({"type": "reasoning", "summary": "thinking"}).to_string(),
+                serde_json::json!({"type": "tool_result", "content": "ok"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("chat history");
+        std::fs::write(
+            session.join("updates.jsonl"),
+            [
+                serde_json::json!({"params": {"_meta": {"promptId": "p1", "totalTokens": 41_000}}})
+                    .to_string(),
+                serde_json::json!({"params": {"_meta": {"promptId": "p1", "totalTokens": 45_000}}})
+                    .to_string(),
+                serde_json::json!({"params": {"_meta": {"promptId": "p2", "totalTokens": 7_000}}})
+                    .to_string(),
+                serde_json::json!({"params": {"update": {"tokens_used": 40_000}}}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("updates");
+        std::fs::write(
+            session.join("events.jsonl"),
+            serde_json::json!({"type": "turn", "phase": "done"}).to_string(),
+        )
+        .expect("events");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 0);
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(summary.provider, GROK_BUILD_PROVIDER);
+        assert_eq!(summary.metadata.total_sessions, Some(1));
+        assert_eq!(summary.metadata.total_messages, Some(12));
+        assert_eq!(summary.usage.input_tokens, Some(52_000));
+        assert_eq!(summary.usage.total_tokens, Some(52_000));
+        assert_eq!(summary.usage.requests, Some(3));
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(5));
+        assert_eq!(summary.cost.confidence, Confidence::Low);
+        assert_eq!(
+            summary
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.user_messages),
+            Some(3)
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .summary_version
+                .as_deref()
+                .map(|value| value.contains("reasoning=1")),
+            Some(true)
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .summary_version
+                .as_deref()
+                .map(|value| value.contains("chat_rows=5")),
+            Some(true)
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .summary_version
+                .as_deref()
+                .map(|value| value.contains("prompts=2;prompt_context_tokens=52000")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn grok_build_prefers_unified_log_inference_usage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-usage");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-usage", "cwd": dir.path()},
+                "updated_at": "2026-06-09T13:53:52Z",
+                "current_model_id": "grok-composer-2.5-fast",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("updates.jsonl"),
+            serde_json::json!({"params": {"_meta": {"promptId": "p1", "totalTokens": 999_999}}})
+                .to_string(),
+        )
+        .expect("updates");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-06-09T14:22:45.131Z",
+                    "sid": "session-usage",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 1_000_000,
+                        "cached_prompt_tokens": 400_000,
+                        "completion_tokens": 100_000,
+                        "reasoning_tokens": 50_000,
+                        "model_elapsed_ms": 3_000,
+                        "ttft_ms": 1_000
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-06-09T14:22:48.525Z",
+                    "sid": "other-session",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 9_000_000,
+                        "cached_prompt_tokens": 0,
+                        "completion_tokens": 9_000_000
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(summary.usage.input_tokens, Some(600_000));
+        assert_eq!(summary.usage.cache_read_tokens, Some(400_000));
+        assert_eq!(summary.usage.cache_creation_tokens, None);
+        assert_eq!(summary.usage.output_tokens, Some(100_000));
+        assert_eq!(summary.usage.reasoning_tokens, Some(50_000));
+        assert_eq!(summary.usage.requests, Some(1));
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(425));
+        assert_eq!(summary.cost.confidence, Confidence::Medium);
+        assert_eq!(
+            summary
+                .cost
+                .pricing_source
+                .as_deref()
+                .map(|value| value.contains("cursor_model_pricing:composer-2.5-fast")),
+            Some(true)
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .summary_version
+                .as_deref()
+                .map(|value| value.contains("inference_rows=1;usage_source=unified_log")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn grok_build_scan_tolerates_malformed_jsonl_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-malformed");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-malformed", "cwd": dir.path()},
+                "updated_at": "2026-06-09T13:53:52Z",
+                "current_model_id": "grok-build"
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "turnCount": 1,
+                "contextTokensUsed": 999
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        std::fs::write(
+            session.join("chat_history.jsonl"),
+            [
+                serde_json::json!({"type": "user", "content": "hello"}).to_string(),
+                "{\"type\":\"assistant\"".to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("chat");
+        std::fs::write(
+            session.join("updates.jsonl"),
+            [
+                serde_json::json!({"params": {"_meta": {"promptId": "p1", "totalTokens": 123}}})
+                    .to_string(),
+                "{\"params\":".to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("updates");
+        std::fs::write(
+            session.join("events.jsonl"),
+            [
+                serde_json::json!({"type": "turn"}).to_string(),
+                "{".to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("events");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                "{".to_string(),
+                serde_json::json!({
+                    "sid": "session-malformed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 100,
+                        "cached_prompt_tokens": 10,
+                        "completion_tokens": 20
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.diagnostics.invalid_rows, 4);
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(summary.usage.input_tokens, Some(90));
+        assert_eq!(summary.usage.cache_read_tokens, Some(10));
+        assert_eq!(summary.usage.output_tokens, Some(20));
+        assert_eq!(summary.usage.total_tokens, None);
+        assert_eq!(summary.usage.requests, Some(1));
+    }
+
+    #[test]
+    fn grok_summary_candidate_changes_when_session_siblings_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-1");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-1"},
+                "updated_at": "2026-06-09T13:53:52Z"
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(session.join("signals.json"), "{}").expect("signals");
+        std::fs::write(session.join("chat_history.jsonl"), "").expect("chat");
+        std::fs::write(session.join("updates.jsonl"), "").expect("updates");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let before = grok_build_scan_candidates(&source, "0").expect("before");
+        std::fs::write(
+            session.join("chat_history.jsonl"),
+            serde_json::json!({"type": "user", "content": "hello"}).to_string(),
+        )
+        .expect("updated chat");
+        let after = grok_build_scan_candidates(&source, "0").expect("after");
+
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            before[0].path.file_name().and_then(|name| name.to_str()),
+            Some("summary.json")
+        );
+        assert_ne!(before[0].cache_signature, after[0].cache_signature);
+    }
+
+    #[test]
+    fn grok_candidates_tolerate_malformed_unified_log_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-1");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-1"},
+                "updated_at": "2026-06-09T13:53:52Z"
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(session.join("signals.json"), "{}").expect("signals");
+        std::fs::write(session.join("chat_history.jsonl"), "").expect("chat");
+        std::fs::write(session.join("updates.jsonl"), "").expect("updates");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                "{".to_string(),
+                serde_json::json!({
+                    "sid": "session-1",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 100,
+                        "cached_prompt_tokens": 10,
+                        "completion_tokens": 20
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let candidates = grok_build_scan_candidates(&source, "0").expect("candidates");
+
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn grok_summary_candidate_changes_only_for_matching_unified_log_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_a = dir.path().join("sessions/%2Fworkspace/session-a");
+        let session_b = dir.path().join("sessions/%2Fworkspace/session-b");
+        std::fs::create_dir_all(&session_a).expect("session a");
+        std::fs::create_dir_all(&session_b).expect("session b");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs");
+        for (session_dir, session_id) in [(&session_a, "session-a"), (&session_b, "session-b")] {
+            std::fs::write(
+                session_dir.join("summary.json"),
+                serde_json::json!({
+                    "info": {"id": session_id},
+                    "updated_at": "2026-06-09T13:53:52Z"
+                })
+                .to_string(),
+            )
+            .expect("summary");
+            std::fs::write(session_dir.join("signals.json"), "{}").expect("signals");
+            std::fs::write(session_dir.join("chat_history.jsonl"), "").expect("chat");
+            std::fs::write(session_dir.join("updates.jsonl"), "").expect("updates");
+        }
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            serde_json::json!({
+                "ts": "2026-06-09T14:22:45.131Z",
+                "sid": "session-a",
+                "msg": "shell.turn.inference_done",
+                "ctx": {
+                    "prompt_tokens": 100,
+                    "cached_prompt_tokens": 10,
+                    "completion_tokens": 20
+                }
+            })
+            .to_string(),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let before = grok_build_scan_candidates(&source, "0").expect("before");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-06-09T14:22:45.131Z",
+                    "sid": "session-a",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 100,
+                        "cached_prompt_tokens": 10,
+                        "completion_tokens": 20
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-06-09T14:25:45.131Z",
+                    "sid": "session-b",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 200,
+                        "cached_prompt_tokens": 20,
+                        "completion_tokens": 30
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("updated unified log");
+        let after = grok_build_scan_candidates(&source, "0").expect("after");
+
+        let before_a = before
+            .iter()
+            .find(|candidate| candidate.path.starts_with(&session_a))
+            .expect("candidate a");
+        let before_b = before
+            .iter()
+            .find(|candidate| candidate.path.starts_with(&session_b))
+            .expect("candidate b");
+        let after_a = after
+            .iter()
+            .find(|candidate| candidate.path.starts_with(&session_a))
+            .expect("candidate a after");
+        let after_b = after
+            .iter()
+            .find(|candidate| candidate.path.starts_with(&session_b))
+            .expect("candidate b after");
+
+        assert_eq!(before_a.cache_signature, after_a.cache_signature);
+        assert_ne!(before_b.cache_signature, after_b.cache_signature);
     }
 }

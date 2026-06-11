@@ -5,6 +5,82 @@
 
 use statsai_core::{Confidence, CostInfo, ModelInfo, UsageCounts};
 
+fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
+    if lower.contains("claude-opus-4-5") || lower.contains("claude-opus-4.5") {
+        return Some("claude-opus-4-5");
+    }
+    if lower.contains("claude-sonnet-4-5") || lower.contains("claude-sonnet-4.5") {
+        return Some("claude-sonnet-4-5");
+    }
+    if lower.contains("claude-sonnet-4") {
+        return Some("claude-sonnet-4");
+    }
+    if lower.contains("claude-opus-4") {
+        return Some("claude-opus-4");
+    }
+    if lower.contains("claude-sonnet-3-7") || lower.contains("claude-3-7-sonnet") {
+        return Some("claude-sonnet-3-7");
+    }
+    if lower.contains("claude-sonnet-3-5") || lower.contains("claude-3-5-sonnet-20241022") {
+        return Some("claude-sonnet-3-5");
+    }
+    if lower.contains("claude-haiku-3-5") || lower.contains("claude-haiku-3.5") {
+        return Some("claude-haiku-3-5");
+    }
+    if lower.contains("gpt-5.5") {
+        return Some("gpt-5.5");
+    }
+    if lower.contains("gpt-5.4-mini") {
+        return Some("gpt-5.4-mini");
+    }
+    if lower.contains("gpt-5.4") {
+        return Some("gpt-5.4");
+    }
+    if lower.contains("gpt-5.1-codex-mini") {
+        return Some("gpt-5-mini");
+    }
+    if lower.contains("gpt-5.1-codex-max") {
+        return Some("gpt-5.1-codex-max");
+    }
+    if lower.contains("gpt-5.3-codex") {
+        return Some("gpt-5.3-codex");
+    }
+    if lower.contains("gpt-5.2-codex")
+        || lower.contains("gpt-5.2-chat-latest")
+        || lower.contains("gpt-5.2")
+    {
+        return Some("gpt-5.2");
+    }
+    if lower.contains("gpt-5.1-codex") {
+        return Some("gpt-5-codex");
+    }
+    if lower.contains("gpt-5.1-chat-latest") || lower.contains("gpt-5.1") {
+        return Some("gpt-5.1");
+    }
+    if lower.contains("gpt-5-mini") {
+        return Some("gpt-5-mini");
+    }
+    if lower.contains("gpt-5-nano") {
+        return Some("gpt-5-nano");
+    }
+    if lower.contains("gpt-5-chat-latest") || lower.contains("gpt-5") {
+        return Some("gpt-5");
+    }
+    if lower.contains("grok-composer-2.5-fast") || lower.contains("composer-2.5-fast") {
+        return Some("composer-2.5-fast");
+    }
+    if lower.contains("grok-composer-2.5") || lower.contains("composer-2.5") {
+        return Some("composer-2.5");
+    }
+    if lower.contains("grok-build-0.1") || lower.contains("grok-build") {
+        return Some("grok-build-0.1");
+    }
+    if lower.contains("grok-4.3-latest") || lower.contains("grok-4.3") {
+        return Some("grok-4.3");
+    }
+    None
+}
+
 #[must_use]
 pub fn normalize_model_name(name: &str) -> String {
     let name = name.trim();
@@ -37,42 +113,64 @@ pub fn normalize_model_name(name: &str) -> String {
         "gpt-5.5" => "gpt-5.5".to_string(),
         "gpt-5-mini" => "gpt-5-mini".to_string(),
         "gpt-5-nano" => "gpt-5-nano".to_string(),
-        _ => name.to_ascii_lowercase(),
+        "composer-2.5" | "grok-composer-2.5" => "composer-2.5".to_string(),
+        "composer-2.5-fast" | "grok-composer-2.5-fast" => "composer-2.5-fast".to_string(),
+        "grok-build" | "grok-build-0.1" => "grok-build-0.1".to_string(),
+        "grok-4.3" | "grok-4.3-latest" => "grok-4.3".to_string(),
+        _ => normalize_proxy_wrapped_model_name(&lower)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| name.to_ascii_lowercase()),
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
     pub input_per_million: f64,
+    pub cache_creation_per_million: f64,
     pub cached_input_per_million: f64,
     pub output_per_million: f64,
+}
+
+fn pricing(
+    input_per_million: f64,
+    cached_input_per_million: f64,
+    output_per_million: f64,
+) -> ModelPricing {
+    ModelPricing {
+        input_per_million,
+        cache_creation_per_million: input_per_million,
+        cached_input_per_million,
+        output_per_million,
+    }
+}
+
+fn pricing_with_cache_creation(
+    input_per_million: f64,
+    cache_creation_per_million: f64,
+    cached_input_per_million: f64,
+    output_per_million: f64,
+) -> ModelPricing {
+    ModelPricing {
+        input_per_million,
+        cache_creation_per_million,
+        cached_input_per_million,
+        output_per_million,
+    }
 }
 
 #[must_use]
 pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
     let normalized = model_name.to_ascii_lowercase();
     match normalized.as_str() {
-        "gpt-5.5" => Some(ModelPricing {
-            input_per_million: 5.0,
-            cached_input_per_million: 0.5,
-            output_per_million: 30.0,
-        }),
-        "gpt-5.4" => Some(ModelPricing {
-            input_per_million: 2.5,
-            cached_input_per_million: 0.25,
-            output_per_million: 15.0,
-        }),
-        "gpt-5.4-mini" => Some(ModelPricing {
-            input_per_million: 0.75,
-            cached_input_per_million: 0.075,
-            output_per_million: 4.5,
-        }),
+        "claude-opus-4-5" => Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 25.0)),
+        "claude-sonnet-4-5" | "claude-sonnet-4" => {
+            Some(pricing_with_cache_creation(3.0, 3.75, 0.3, 15.0))
+        }
+        "gpt-5.5" => Some(pricing(5.0, 0.5, 30.0)),
+        "gpt-5.4" => Some(pricing(2.5, 0.25, 15.0)),
+        "gpt-5.4-mini" => Some(pricing(0.75, 0.075, 4.5)),
         "gpt-5.3-codex" | "gpt-5.2" | "gpt-5.2-chat-latest" | "gpt-5.2-codex" => {
-            Some(ModelPricing {
-                input_per_million: 1.75,
-                cached_input_per_million: 0.175,
-                output_per_million: 14.0,
-            })
+            Some(pricing(1.75, 0.175, 14.0))
         }
         "gpt-5-codex"
         | "gpt-5.1-codex"
@@ -80,52 +178,73 @@ pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
         | "gpt-5"
         | "gpt-5.1"
         | "gpt-5-chat-latest"
-        | "gpt-5.1-chat-latest" => Some(ModelPricing {
-            input_per_million: 1.25,
-            cached_input_per_million: 0.125,
-            output_per_million: 10.0,
-        }),
-        "gpt-5-mini" | "gpt-5.1-codex-mini" => Some(ModelPricing {
-            input_per_million: 0.25,
-            cached_input_per_million: 0.025,
-            output_per_million: 2.0,
-        }),
-        "gpt-5-nano" => Some(ModelPricing {
-            input_per_million: 0.05,
-            cached_input_per_million: 0.005,
-            output_per_million: 0.4,
-        }),
+        | "gpt-5.1-chat-latest" => Some(pricing(1.25, 0.125, 10.0)),
+        "gpt-5-mini" | "gpt-5.1-codex-mini" => Some(pricing(0.25, 0.025, 2.0)),
+        "gpt-5-nano" => Some(pricing(0.05, 0.005, 0.4)),
+        "composer-2.5" => Some(pricing(0.5, 0.2, 2.5)),
+        "composer-2.5-fast" => Some(pricing(3.0, 0.5, 15.0)),
+        "grok-build-0.1" => Some(pricing(1.0, 1.0, 2.0)),
+        "grok-4.3" => Some(pricing(1.25, 1.25, 2.5)),
         _ => None,
     }
 }
 
+fn priced_model_name(model: &ModelInfo) -> Option<String> {
+    let candidates = [
+        model.normalized_name.as_deref(),
+        model.name.as_deref(),
+        model.provider_model_id.as_deref(),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        let normalized = normalize_model_name(candidate);
+        if pricing_for_model(&normalized).is_some() {
+            return Some(normalized);
+        }
+        if let Some((_, suffix)) = normalized.rsplit_once('/') {
+            let suffix = normalize_model_name(suffix);
+            if pricing_for_model(&suffix).is_some() {
+                return Some(suffix);
+            }
+        }
+    }
+
+    None
+}
+
 #[must_use]
 pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCounts) -> CostInfo {
-    let Some(model_name) =
-        model.and_then(|model| model.normalized_name.as_deref().or(model.name.as_deref()))
-    else {
+    let Some(model_name) = model.and_then(priced_model_name) else {
         return unknown_cost();
     };
-    let Some(pricing) = pricing_for_model(model_name) else {
+    let Some(pricing) = pricing_for_model(&model_name) else {
         return unknown_cost();
     };
 
     let input = usage.input_tokens.unwrap_or(0);
+    let cache_creation = usage.cache_creation_tokens.unwrap_or(0);
     let cached = usage.cache_read_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
     let reasoning = usage.reasoning_tokens.unwrap_or(0);
     let cost = (input as f64 * pricing.input_per_million
+        + cache_creation as f64 * pricing.cache_creation_per_million
         + cached as f64 * pricing.cached_input_per_million
         + (output + reasoning) as f64 * pricing.output_per_million)
         / 1_000_000.0;
     let cost_cents = (cost * 100.0).round() as i64;
 
+    let pricing_source = match model_name.as_str() {
+        "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{model_name}"),
+        "grok-build-0.1" | "grok-4.3" => format!("xai_api_pricing:{model_name}"),
+        _ => format!("{provider}_api_pricing:{model_name}"),
+    };
+
     CostInfo {
         currency: "USD".to_string(),
         estimated_api_equivalent_usd: Some(cost_cents),
         provider_reported_usd: None,
-        pricing_source: Some(format!("{provider}_api_pricing:{model_name}")),
-        pricing_version: Some("static:2026-05".to_string()),
+        pricing_source: Some(pricing_source),
+        pricing_version: Some("static:2026-06".to_string()),
         confidence: Confidence::Medium,
     }
 }
@@ -171,8 +290,54 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_proxy_wrapped_model_names() {
+        assert_eq!(
+            normalize_model_name("google/antigravity-claude-opus-4-5-thinking"),
+            "claude-opus-4-5"
+        );
+        assert_eq!(
+            normalize_model_name("google/antigravity-claude-sonnet-4-5-thinking"),
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(
+            normalize_model_name("relay/openai-gpt-5.2-codex"),
+            "gpt-5.2"
+        );
+        assert_eq!(
+            normalize_model_name("relay/openai-gpt-5-mini"),
+            "gpt-5-mini"
+        );
+        assert_eq!(
+            normalize_model_name("relay/openai-gpt-5-nano"),
+            "gpt-5-nano"
+        );
+    }
+
+    #[test]
     fn normalizes_unknown_model_to_lowercase() {
         assert_eq!(normalize_model_name("SomeNewModel"), "somenewmodel");
+    }
+
+    #[test]
+    fn normalizes_grok_build_aliases() {
+        assert_eq!(normalize_model_name("grok-build"), "grok-build-0.1");
+    }
+
+    #[test]
+    fn normalizes_cursor_composer_aliases() {
+        assert_eq!(
+            normalize_model_name("grok-composer-2.5-fast"),
+            "composer-2.5-fast"
+        );
+        assert_eq!(normalize_model_name("grok-composer-2.5"), "composer-2.5");
+        assert_eq!(
+            pricing_for_model("composer-2.5-fast").map(|pricing| (
+                pricing.input_per_million,
+                pricing.cached_input_per_million,
+                pricing.output_per_million
+            )),
+            Some((3.0, 0.5, 15.0))
+        );
     }
 
     #[test]
@@ -199,6 +364,51 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("codex_api_pricing"));
+    }
+
+    #[test]
+    fn estimates_cost_for_provider_prefixed_model() {
+        let model = statsai_core::ModelInfo {
+            name: Some("xai/grok-build-0.1".to_string()),
+            normalized_name: Some("xai/grok-build-0.1".to_string()),
+            provider_model_id: Some("xai/grok-build-0.1".to_string()),
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(500_000),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("opencode", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(200));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-build-0.1")
+        );
+    }
+
+    #[test]
+    fn estimates_cost_for_proxy_wrapped_claude_model() {
+        let model = statsai_core::ModelInfo {
+            name: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
+            normalized_name: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
+            provider_model_id: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("opencode", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(3050));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("opencode_api_pricing:claude-opus-4-5")
+        );
     }
 
     #[test]
@@ -259,5 +469,27 @@ mod tests {
         };
         let cost = estimate_cost("codex", Some(&model), &usage);
         assert_eq!(cost.estimated_api_equivalent_usd, Some(150));
+    }
+
+    #[test]
+    fn cache_creation_tokens_are_billed_separately() {
+        let model = statsai_core::ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_creation_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+        let cost = estimate_cost("codex", Some(&model), &usage);
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(1263));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("codex_api_pricing:gpt-5")
+        );
     }
 }
