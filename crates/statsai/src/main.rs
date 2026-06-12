@@ -1,7 +1,5 @@
 use anyhow::{bail, Context, Result};
-#[cfg(test)]
-use chrono::Duration;
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -12,14 +10,14 @@ use statsai_adapters::{
     ScanOptions, VerifiedSourceState,
 };
 use statsai_core::{
-    build_usage_report, display_account_identity, expand_home_path, home_dir, normalize_email,
-    normalize_provider_user_id, path_hash, periods_overlap, project_contains_file_paths,
-    project_has_stable_identity, source_account_assignment_id, subscription_id,
-    timestamp_in_period, BillingPeriod, IdentitySource, LocationOrigin, ProjectInfo,
-    ProviderAccount, ProviderAccountId, ReportPeriod, SourceAccountAssignment,
-    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
-    Subscription, SubscriptionId, SubscriptionStatus, SyncBatch, UsageEvent, UsageReport,
-    UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
+    normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
+    project_contains_file_paths, project_has_stable_identity, source_account_assignment_id,
+    source_id as statsai_source_id, subscription_id, timestamp_in_period, BillingPeriod,
+    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
+    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch,
+    UsageEvent, UsageReport, UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -30,6 +28,7 @@ use statsai_core::{
 };
 use statsai_sdk::{
     build_reported_usage_summary, ReportedUsageSummaryInput, ReportedUsageSummaryRecord,
+    REPORTED_USAGE_IMPORT_ADAPTER_ID,
 };
 #[cfg(test)]
 use statsai_store::apply_verified_source_state;
@@ -1655,7 +1654,7 @@ fn import(command: ImportCommand, store: &Store, device_id: &str) -> Result<()> 
             let inputs = read_reported_summary_inputs(&path)?;
             let records = inputs
                 .into_iter()
-                .map(|input| build_reported_usage_summary(input, device_id))
+                .map(|input| build_reported_import_record(input, device_id))
                 .collect::<Result<Vec<_>>>()?;
             import_reported_summary_records(
                 store,
@@ -1684,7 +1683,7 @@ fn import_reported_summary_records(
     let mut total_usage = UsageTotals::default();
     for report in reports {
         for record in &report.records {
-            total_usage.add_summary(&record.summary);
+            total_usage.add_summary(&record.record.summary);
         }
     }
 
@@ -1732,9 +1731,15 @@ fn import_reported_summary_records(
     let mut written = 0u64;
     for report in reports {
         for record in &report.records {
-            store.upsert_source(&record.source)?;
-            written += store.upsert_summaries(std::slice::from_ref(&record.summary))?;
+            store.upsert_source(&record.record.source)?;
+            written += store.upsert_summaries(std::slice::from_ref(&record.record.summary))?;
         }
+    }
+    migrate_legacy_reported_source_assignments(store, reports)?;
+    if replace {
+        delete_orphaned_legacy_reported_sources(store, reports)?;
+    } else {
+        delete_legacy_reported_alias_summaries(store, reports)?;
     }
     println!(
         "import complete: sources={} summaries={} replaced={} summaries_written={} input={} cache_create={} cache_read={} output={} total={} cost={}",
@@ -1759,9 +1764,44 @@ fn matching_reported_summary_ids(
     let incoming_keys: BTreeSet<_> = reports
         .iter()
         .flat_map(|report| report.records.iter())
-        .map(reported_replace_key)
+        .flat_map(reported_replace_keys)
         .collect();
+    matching_reported_summary_ids_for_keys(store, &incoming_keys)
+}
 
+fn matching_legacy_reported_summary_ids(
+    store: &Store,
+    reports: &[ReportedImportReport],
+) -> Result<Vec<statsai_core::SummaryId>> {
+    let incoming_keys: BTreeSet<_> = reports
+        .iter()
+        .flat_map(|report| report.records.iter())
+        .flat_map(reported_replace_keys)
+        .collect();
+    let summary_ids = store
+        .summaries()?
+        .into_iter()
+        .filter(|summary| is_legacy_reported_summary_format(&summary.metadata.summary_format))
+        .filter(|summary| {
+            matches!(
+                summary.source.source_kind,
+                SourceKind::ExternalReport | SourceKind::Manual
+            )
+        })
+        .filter(|summary| {
+            reported_replace_keys_from_summary(summary)
+                .iter()
+                .any(|key| incoming_keys.contains(key))
+        })
+        .map(|summary| summary.summary_id)
+        .collect();
+    Ok(summary_ids)
+}
+
+fn matching_reported_summary_ids_for_keys(
+    store: &Store,
+    incoming_keys: &BTreeSet<ReportedReplaceKey>,
+) -> Result<Vec<statsai_core::SummaryId>> {
     let summary_ids = store
         .summaries()?
         .into_iter()
@@ -1771,10 +1811,116 @@ fn matching_reported_summary_ids(
                 SourceKind::ExternalReport | SourceKind::Manual
             )
         })
-        .filter(|summary| incoming_keys.contains(&reported_replace_key_from_summary(summary)))
+        .filter(|summary| {
+            reported_replace_keys_from_summary(summary)
+                .iter()
+                .any(|key| incoming_keys.contains(key))
+        })
         .map(|summary| summary.summary_id)
         .collect();
     Ok(summary_ids)
+}
+
+fn delete_legacy_reported_alias_summaries(
+    store: &Store,
+    reports: &[ReportedImportReport],
+) -> Result<u64> {
+    let summary_ids = matching_legacy_reported_summary_ids(store, reports)?;
+    let deleted = store.delete_summaries(&summary_ids)?;
+    delete_orphaned_legacy_reported_sources(store, reports)?;
+    Ok(deleted)
+}
+
+fn migrate_legacy_reported_source_assignments(
+    store: &Store,
+    reports: &[ReportedImportReport],
+) -> Result<u64> {
+    let mut migrated = 0;
+    let now = Utc::now();
+    for record in reports.iter().flat_map(|report| report.records.iter()) {
+        let canonical_source = &record.record.source;
+        for legacy_source_id in &record.legacy_replacement_source_ids {
+            let Some(legacy_source) = store.source(legacy_source_id)? else {
+                continue;
+            };
+            if !is_reported_usage_source(&legacy_source) {
+                continue;
+            }
+            for assignment in store.list_source_account_assignments_for_source(legacy_source_id)? {
+                let migrated_assignment = SourceAccountAssignment {
+                    schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                    assignment_id: source_account_assignment_id(
+                        &canonical_source.source_id,
+                        &assignment.provider_account_id,
+                        assignment.started_at,
+                    ),
+                    source_id: canonical_source.source_id.clone(),
+                    provider: canonical_source.provider.clone(),
+                    provider_account_id: assignment.provider_account_id.clone(),
+                    started_at: assignment.started_at,
+                    ended_at: assignment.ended_at,
+                    record_source: assignment.record_source.clone(),
+                    verified_at: assignment.verified_at,
+                    created_at: assignment.created_at,
+                    updated_at: now,
+                };
+                let already_exists = store
+                    .source_account_assignment(&migrated_assignment.assignment_id)?
+                    .is_some();
+                if already_exists {
+                    continue;
+                }
+                store.upsert_source_account_assignment(&migrated_assignment)?;
+                migrated += 1;
+            }
+        }
+    }
+    Ok(migrated)
+}
+
+fn delete_orphaned_legacy_reported_sources(
+    store: &Store,
+    reports: &[ReportedImportReport],
+) -> Result<u64> {
+    let mut deleted = 0;
+    for source_id in legacy_reported_source_ids(reports) {
+        let Some(source) = store.source(&source_id)? else {
+            continue;
+        };
+        if !is_reported_usage_source(&source) {
+            continue;
+        }
+        if !store.events_for_source(&source_id)?.is_empty()
+            || !store.summaries_for_source(&source_id)?.is_empty()
+        {
+            continue;
+        }
+        if store.delete_source(&source_id)? {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+fn is_reported_usage_source(source: &SourceLocation) -> bool {
+    matches!(
+        source.source_kind,
+        SourceKind::ExternalReport | SourceKind::Manual
+    ) && source.adapter_id.as_deref() == Some(REPORTED_USAGE_IMPORT_ADAPTER_ID)
+}
+
+fn legacy_reported_source_ids(reports: &[ReportedImportReport]) -> Vec<SourceId> {
+    let source_ids: BTreeSet<_> = reports
+        .iter()
+        .flat_map(|report| report.records.iter())
+        .flat_map(|record| {
+            record
+                .legacy_replacement_source_ids
+                .iter()
+                .map(|source_id| source_id.0.clone())
+        })
+        .collect();
+    source_ids.into_iter().map(SourceId).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1788,15 +1934,38 @@ struct ReportedReplaceKey {
     source_record_id: Option<String>,
 }
 
-fn reported_replace_key(record: &ReportedUsageSummaryRecord) -> ReportedReplaceKey {
-    reported_replace_key_from_summary(&record.summary)
+fn reported_replace_keys(record: &ReportedImportRecord) -> Vec<ReportedReplaceKey> {
+    let mut keys = vec![reported_replace_key_from_summary(&record.record.summary)];
+    for source_id in &record.legacy_replacement_source_ids {
+        let mut key = keys[0].clone();
+        key.source_id = source_id.0.clone();
+        keys.push(key);
+    }
+    keys
+}
+
+fn canonical_reported_summary_format(value: &str) -> &str {
+    match value {
+        "ccusage_daily" | "custom_daily" => "manual_daily",
+        "custom_period_summary" => "manual_period_summary",
+        _ => value,
+    }
+}
+
+fn is_legacy_reported_summary_format(value: &str) -> bool {
+    canonical_reported_summary_format(value) != value
+}
+
+fn reported_replace_keys_from_summary(summary: &UsageSummary) -> [ReportedReplaceKey; 1] {
+    [reported_replace_key_from_summary(summary)]
 }
 
 fn reported_replace_key_from_summary(summary: &UsageSummary) -> ReportedReplaceKey {
+    let summary_format = canonical_reported_summary_format(&summary.metadata.summary_format);
     ReportedReplaceKey {
         provider: summary.provider.clone(),
         provider_account_id: summary.provider_account_id.as_ref().map(|id| id.0.clone()),
-        summary_format: summary.metadata.summary_format.clone(),
+        summary_format: summary_format.to_string(),
         source_id: summary.source_id.0.clone(),
         period_start: summary.period_start,
         period_end: summary.period_end,
@@ -1811,6 +1980,74 @@ fn stable_reported_record_id(summary: &UsageSummary) -> Option<String> {
         .as_deref()
         .filter(|record_id| !record_id.starts_with("summary_key_"))
         .map(ToOwned::to_owned)
+}
+
+fn build_reported_import_record(
+    input: ReportedUsageSummaryInput,
+    device_id: &str,
+) -> Result<ReportedImportRecord> {
+    let legacy_replacement_source_ids = legacy_alias_replacement_source_ids(&input);
+    let record = build_reported_usage_summary(input, device_id)?;
+    Ok(ReportedImportRecord {
+        record,
+        legacy_replacement_source_ids,
+    })
+}
+
+fn legacy_alias_replacement_source_ids(input: &ReportedUsageSummaryInput) -> Vec<SourceId> {
+    if input.evidence_path.is_some() || input.evidence_id.is_some() {
+        return Vec::new();
+    }
+    let canonical_format = canonical_reported_summary_format(&input.report_format);
+    let legacy_formats: &[&str] = match canonical_format {
+        "manual_daily" => &["ccusage_daily", "custom_daily"],
+        "manual_period_summary" => &["custom_period_summary"],
+        _ => &[],
+    };
+    if legacy_formats.is_empty() {
+        return Vec::new();
+    }
+
+    let identity_key = reported_summary_identity_key(input);
+    legacy_formats
+        .iter()
+        .map(|format| {
+            let evidence_key = format!(
+                "{}:{}:{}:{}",
+                input.provider, input.source_name, identity_key, format
+            );
+            let source_path_hash = hash_text(&evidence_key);
+            statsai_source_id(
+                &input.provider,
+                input.source_kind.clone(),
+                &source_path_hash,
+            )
+        })
+        .collect()
+}
+
+fn reported_summary_identity_key(input: &ReportedUsageSummaryInput) -> String {
+    input
+        .provider_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            input
+                .email
+                .as_deref()
+                .map(normalize_email)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            input
+                .provider_user_id
+                .as_deref()
+                .map(normalize_provider_user_id)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unassigned".to_string())
 }
 
 fn report(command: ReportCommand, store: &Store) -> Result<()> {
@@ -2078,7 +2315,7 @@ fn build_sync_batch(
             .summaries()?
             .into_iter()
             .map(sanitize_summary_for_sync)
-            .filter(|summary| !is_daily_rollup_summary(summary))
+            .filter(is_http_rollup_passthrough_summary)
             .collect()
     } else {
         Vec::new()
@@ -2850,7 +3087,7 @@ fn sync_local_verify(
         .summaries()?
         .into_iter()
         .map(sanitize_summary_for_sync)
-        .filter(|summary| !is_daily_rollup_summary(summary))
+        .filter(is_http_rollup_passthrough_summary)
         .collect();
     let rollup_summaries: Vec<_> = store
         .all_sync_rollup_summaries()?
@@ -3323,10 +3560,16 @@ fn parse_date(value: &str) -> Result<DateTime<Utc>> {
     Ok(datetime.and_utc())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+struct ReportedImportRecord {
+    record: ReportedUsageSummaryRecord,
+    legacy_replacement_source_ids: Vec<SourceId>,
+}
+
+#[derive(Debug, Clone)]
 struct ReportedImportReport {
     path: PathBuf,
-    records: Vec<ReportedUsageSummaryRecord>,
+    records: Vec<ReportedImportRecord>,
     warnings: Vec<String>,
 }
 
@@ -5175,6 +5418,69 @@ fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
     summary.metadata.summary_format == "daily_rollup.v1"
 }
 
+fn summary_spans_single_day(summary: &UsageSummary) -> bool {
+    let start = summary
+        .period_start
+        .as_ref()
+        .or(summary.period_end.as_ref())
+        .unwrap_or(&summary.observed_at);
+    let end = summary
+        .period_end
+        .as_ref()
+        .or(summary.period_start.as_ref())
+        .unwrap_or(&summary.observed_at);
+    start.date_naive() == end.date_naive()
+}
+
+fn summary_fits_single_daily_report_day(summary: &UsageSummary) -> bool {
+    let start = summary
+        .period_start
+        .as_ref()
+        .or(summary.period_end.as_ref())
+        .unwrap_or(&summary.observed_at);
+    let end = summary
+        .period_end
+        .as_ref()
+        .or(summary.period_start.as_ref())
+        .unwrap_or(&summary.observed_at);
+    if start.date_naive() == end.date_naive() {
+        return true;
+    }
+    let duration = *end - *start;
+    duration >= Duration::zero() && duration <= Duration::hours(25)
+}
+
+fn is_exact_daily_passthrough_summary(summary: &UsageSummary) -> bool {
+    matches!(
+        summary.metadata.summary_format.as_str(),
+        "external_daily" | "manual_daily" | "custom_daily" | "ccusage_daily"
+    )
+}
+
+fn is_exact_period_passthrough_summary(summary: &UsageSummary) -> bool {
+    matches!(
+        summary.metadata.summary_format.as_str(),
+        "manual_period_summary" | "custom_period_summary"
+    )
+}
+
+fn is_http_rollup_passthrough_summary(summary: &UsageSummary) -> bool {
+    if is_daily_rollup_summary(summary) {
+        return false;
+    }
+    if summary.metadata.summary_format == "claude_stats_cache" {
+        return false;
+    }
+    if summary.source.source_kind == SourceKind::LocalSummary {
+        return false;
+    }
+    if summary.source.source_kind == SourceKind::LocalAdapter {
+        return true;
+    }
+    (is_exact_daily_passthrough_summary(summary) && summary_fits_single_daily_report_day(summary))
+        || (is_exact_period_passthrough_summary(summary) && !summary_spans_single_day(summary))
+}
+
 fn sanitize_subscription_for_sync(mut subscription: Subscription) -> Subscription {
     subscription.notes = None;
     subscription
@@ -5380,7 +5686,10 @@ mod tests {
         };
         let report = ReportedImportReport {
             path: PathBuf::from("reported_usage_summaries.json"),
-            records: vec![record],
+            records: vec![ReportedImportRecord {
+                record,
+                legacy_replacement_source_ids: Vec::new(),
+            }],
             warnings: Vec::new(),
         };
 
@@ -5447,13 +5756,395 @@ mod tests {
         };
         let report = ReportedImportReport {
             path: PathBuf::from("reported-file-a.json"),
-            records: vec![incoming],
+            records: vec![ReportedImportRecord {
+                record: incoming,
+                legacy_replacement_source_ids: Vec::new(),
+            }],
             warnings: Vec::new(),
         };
 
         let matches = matching_reported_summary_ids(&store, &[report]).expect("matches");
 
         assert_eq!(matches, vec![matching.summary_id]);
+    }
+
+    #[test]
+    fn replace_matching_summaries_matches_legacy_alias_formats_after_canonicalization() {
+        let store = Store::in_memory().expect("store");
+        let input = ReportedUsageSummaryInput {
+            schema_version: "reported_usage_summary_input.v1".to_string(),
+            provider: "claude_code".to_string(),
+            provider_account_id: Some("acct-personal".to_string()),
+            provider_user_id: None,
+            email: None,
+            account_label: Some("personal".to_string()),
+            source_kind: SourceKind::Manual,
+            source_name: "user_reported_usage".to_string(),
+            evidence_id: Some("screenshot:2025-07-11".to_string()),
+            evidence_path: Some("/tmp/user-report.png".to_string()),
+            report_format: "ccusage_daily".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 23, 59, 59)
+                    .single()
+                    .expect("end"),
+            ),
+            observed_at: None,
+            model: None,
+            usage: UsageCounts {
+                total_tokens: Some(100),
+                ..UsageCounts::default()
+            },
+            cost: None,
+            confidence: Some(Confidence::Medium),
+        };
+
+        let incoming = build_reported_import_record(input, "device").expect("incoming");
+        let mut legacy = incoming.record.summary.clone();
+        legacy.metadata.summary_format = "ccusage_daily".to_string();
+        legacy.source.source_type = "ccusage_daily".to_string();
+        store
+            .upsert_source(&incoming.record.source)
+            .expect("source");
+        store.upsert_summary(&legacy).expect("legacy summary");
+
+        let report = ReportedImportReport {
+            path: PathBuf::from("reported-file-a.json"),
+            records: vec![incoming.clone()],
+            warnings: Vec::new(),
+        };
+
+        let matches = matching_reported_summary_ids(&store, &[report]).expect("matches");
+
+        assert_eq!(matches, vec![legacy.summary_id]);
+    }
+
+    #[test]
+    fn replace_matching_summaries_matches_legacy_alias_formats_without_evidence() {
+        let store = Store::in_memory().expect("store");
+        let input = ReportedUsageSummaryInput {
+            schema_version: "reported_usage_summary_input.v1".to_string(),
+            provider: "claude_code".to_string(),
+            provider_account_id: Some("acct-personal".to_string()),
+            provider_user_id: None,
+            email: None,
+            account_label: Some("personal".to_string()),
+            source_kind: SourceKind::Manual,
+            source_name: "user_reported_usage".to_string(),
+            evidence_id: None,
+            evidence_path: None,
+            report_format: "ccusage_daily".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 23, 59, 59)
+                    .single()
+                    .expect("end"),
+            ),
+            observed_at: None,
+            model: None,
+            usage: UsageCounts {
+                total_tokens: Some(100),
+                ..UsageCounts::default()
+            },
+            cost: None,
+            confidence: Some(Confidence::Medium),
+        };
+
+        let incoming = build_reported_import_record(input, "device").expect("incoming");
+        let mut legacy = incoming.record.summary.clone();
+        let legacy_source = SourceLocation::reported_usage(
+            "claude_code",
+            SourceKind::Manual,
+            "reported-usage-summary",
+            "0",
+            "claude_code:user_reported_usage:acct-personal:ccusage_daily",
+            None,
+        );
+        assert_ne!(legacy_source.source_id, incoming.record.source.source_id);
+        legacy.source_id = legacy_source.source_id.clone();
+        legacy.metadata.summary_format = "ccusage_daily".to_string();
+        legacy.source.source_type = "ccusage_daily".to_string();
+        legacy.source.source_path_hash = legacy_source.path_hash.clone();
+        store.upsert_source(&legacy_source).expect("legacy source");
+        store.upsert_summary(&legacy).expect("legacy summary");
+
+        let other_legacy_source = SourceLocation::reported_usage(
+            "claude_code",
+            SourceKind::Manual,
+            "reported-usage-summary",
+            "0",
+            "claude_code:other_report:acct-personal:ccusage_daily",
+            None,
+        );
+        let mut other_legacy = legacy.clone();
+        other_legacy.summary_id = summary_id(
+            "claude_code",
+            &other_legacy_source.source_id,
+            "other-source-same-period",
+        );
+        other_legacy.source_id = other_legacy_source.source_id.clone();
+        other_legacy.source.source_path_hash = other_legacy_source.path_hash.clone();
+        store
+            .upsert_source(&other_legacy_source)
+            .expect("other legacy source");
+        store
+            .upsert_summary(&other_legacy)
+            .expect("other legacy summary");
+
+        let report = ReportedImportReport {
+            path: PathBuf::from("reported-file-a.json"),
+            records: vec![incoming.clone()],
+            warnings: Vec::new(),
+        };
+
+        let matches = matching_reported_summary_ids(&store, &[report]).expect("matches");
+
+        assert_eq!(matches, vec![legacy.summary_id]);
+        store
+            .delete_summaries(&matches)
+            .expect("delete legacy summary");
+        assert_eq!(
+            delete_orphaned_legacy_reported_sources(
+                &store,
+                &[ReportedImportReport {
+                    path: PathBuf::from("reported-file-a.json"),
+                    records: vec![incoming],
+                    warnings: Vec::new(),
+                }]
+            )
+            .expect("delete legacy source"),
+            1
+        );
+        assert!(store
+            .source(&legacy_source.source_id)
+            .expect("legacy source")
+            .is_none());
+        assert!(store
+            .source(&other_legacy_source.source_id)
+            .expect("other legacy source")
+            .is_some());
+    }
+
+    #[test]
+    fn import_migrates_legacy_alias_summary_without_replace() {
+        let store = Store::in_memory().expect("store");
+        let input = ReportedUsageSummaryInput {
+            schema_version: "reported_usage_summary_input.v1".to_string(),
+            provider: "claude_code".to_string(),
+            provider_account_id: Some("acct-personal".to_string()),
+            provider_user_id: None,
+            email: None,
+            account_label: Some("personal".to_string()),
+            source_kind: SourceKind::Manual,
+            source_name: "user_reported_usage".to_string(),
+            evidence_id: None,
+            evidence_path: None,
+            report_format: "manual_daily".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 23, 59, 59)
+                    .single()
+                    .expect("end"),
+            ),
+            observed_at: None,
+            model: None,
+            usage: UsageCounts {
+                total_tokens: Some(100),
+                ..UsageCounts::default()
+            },
+            cost: None,
+            confidence: Some(Confidence::Medium),
+        };
+
+        let incoming = build_reported_import_record(input, "device").expect("incoming");
+        let canonical_source = incoming.record.source.clone();
+        let canonical_source_id = incoming.record.source.source_id.clone();
+        let canonical_summary_id = incoming.record.summary.summary_id.clone();
+        let legacy_source = SourceLocation::reported_usage(
+            "claude_code",
+            SourceKind::Manual,
+            "reported-usage-summary",
+            "0",
+            "claude_code:user_reported_usage:acct-personal:ccusage_daily",
+            None,
+        );
+        let mut legacy = incoming.record.summary.clone();
+        legacy.summary_id = summary_id("claude_code", &legacy_source.source_id, "legacy-alias");
+        legacy.source_id = legacy_source.source_id.clone();
+        legacy.metadata.summary_format = "ccusage_daily".to_string();
+        legacy.source.source_type = "ccusage_daily".to_string();
+        legacy.source.source_path_hash = legacy_source.path_hash.clone();
+        let provider_account_id = ProviderAccountId("acct-personal".to_string());
+        let legacy_assignment = test_assignment(
+            &legacy_source,
+            &provider_account_id,
+            Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0)
+                .single()
+                .expect("assignment start"),
+            None,
+            Utc.with_ymd_and_hms(2025, 7, 12, 0, 0, 0)
+                .single()
+                .expect("assignment updated"),
+        );
+        let mut existing_canonical_assignment = test_assignment(
+            &canonical_source,
+            &provider_account_id,
+            legacy_assignment.started_at,
+            Some(
+                Utc.with_ymd_and_hms(2025, 8, 1, 0, 0, 0)
+                    .single()
+                    .expect("canonical assignment end"),
+            ),
+            Utc.with_ymd_and_hms(2025, 7, 20, 0, 0, 0)
+                .single()
+                .expect("canonical assignment updated"),
+        );
+        existing_canonical_assignment.record_source = IdentitySource::SourceConfig;
+        existing_canonical_assignment.verified_at = Some(
+            Utc.with_ymd_and_hms(2025, 7, 20, 0, 0, 0)
+                .single()
+                .expect("canonical assignment verified"),
+        );
+        store
+            .upsert_source(&canonical_source)
+            .expect("canonical source");
+        store
+            .upsert_source_account_assignment(&existing_canonical_assignment)
+            .expect("canonical assignment");
+        store.upsert_source(&legacy_source).expect("legacy source");
+        store.upsert_summary(&legacy).expect("legacy summary");
+        store
+            .upsert_source_account_assignment(&legacy_assignment)
+            .expect("legacy assignment");
+
+        let report = ReportedImportReport {
+            path: PathBuf::from("reported-file-a.json"),
+            records: vec![incoming],
+            warnings: Vec::new(),
+        };
+
+        import_reported_summary_records(&store, &[report], false, false, false).expect("import");
+
+        let summaries = store.summaries().expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].summary_id, canonical_summary_id);
+        assert_eq!(summaries[0].source_id, canonical_source_id);
+        assert!(store
+            .source(&legacy_source.source_id)
+            .expect("legacy source")
+            .is_none());
+        assert!(store
+            .source(&canonical_source.source_id)
+            .expect("canonical source")
+            .is_some());
+        assert!(store
+            .list_source_account_assignments_for_source(&legacy_source.source_id)
+            .expect("legacy assignments")
+            .is_empty());
+        let canonical_assignments = store
+            .list_source_account_assignments_for_source(&canonical_source.source_id)
+            .expect("canonical assignments");
+        assert_eq!(canonical_assignments.len(), 1);
+        assert_eq!(
+            canonical_assignments[0].provider_account_id,
+            provider_account_id
+        );
+        assert_eq!(
+            canonical_assignments[0].started_at,
+            legacy_assignment.started_at
+        );
+        assert_eq!(
+            canonical_assignments[0].ended_at,
+            existing_canonical_assignment.ended_at
+        );
+        assert_eq!(
+            canonical_assignments[0].record_source,
+            existing_canonical_assignment.record_source
+        );
+        assert_eq!(
+            canonical_assignments[0].verified_at,
+            existing_canonical_assignment.verified_at
+        );
+    }
+
+    #[test]
+    fn import_migrates_evidence_backed_legacy_alias_summary_without_replace() {
+        let store = Store::in_memory().expect("store");
+        let input = ReportedUsageSummaryInput {
+            schema_version: "reported_usage_summary_input.v1".to_string(),
+            provider: "claude_code".to_string(),
+            provider_account_id: Some("acct-personal".to_string()),
+            provider_user_id: None,
+            email: None,
+            account_label: Some("personal".to_string()),
+            source_kind: SourceKind::Manual,
+            source_name: "user_reported_usage".to_string(),
+            evidence_id: Some("screenshot:2025-07-11".to_string()),
+            evidence_path: Some("/tmp/user-report.png".to_string()),
+            report_format: "ccusage_daily".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 23, 59, 59)
+                    .single()
+                    .expect("end"),
+            ),
+            observed_at: None,
+            model: None,
+            usage: UsageCounts {
+                total_tokens: Some(100),
+                ..UsageCounts::default()
+            },
+            cost: None,
+            confidence: Some(Confidence::Medium),
+        };
+
+        let incoming = build_reported_import_record(input, "device").expect("incoming");
+        let canonical_summary_id = incoming.record.summary.summary_id.clone();
+        let mut legacy = incoming.record.summary.clone();
+        legacy.summary_id = summary_id(
+            "claude_code",
+            &incoming.record.source.source_id,
+            "legacy-evidence-alias",
+        );
+        legacy.metadata.summary_format = "ccusage_daily".to_string();
+        legacy.source.source_type = "ccusage_daily".to_string();
+        store
+            .upsert_source(&incoming.record.source)
+            .expect("source");
+        store.upsert_summary(&legacy).expect("legacy summary");
+
+        let report = ReportedImportReport {
+            path: PathBuf::from("reported-file-a.json"),
+            records: vec![incoming],
+            warnings: Vec::new(),
+        };
+
+        import_reported_summary_records(&store, &[report], false, false, false).expect("import");
+
+        let summaries = store.summaries().expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].summary_id, canonical_summary_id);
+        assert_eq!(summaries[0].metadata.summary_format, "manual_daily");
     }
 
     #[test]
@@ -7245,6 +7936,513 @@ mod tests {
     }
 
     #[test]
+    fn http_sync_excludes_non_daily_stats_cache_summaries_from_rollup_batches() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-stats-cache"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 13, 23, 59, 59)
+            .single()
+            .expect("now");
+        let start = Utc
+            .with_ymd_and_hms(2026, 5, 13, 0, 0, 0)
+            .single()
+            .expect("start");
+        let mut summary = test_summary("claude_code", &source, now, 500, None);
+        summary.metadata.summary_format = "claude_stats_cache".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(now);
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert!(batch.summaries.is_empty());
+    }
+
+    #[test]
+    fn http_sync_keeps_grok_build_summary_only_sessions_in_rollup_batches() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "grok_build",
+            "test",
+            "0",
+            Path::new("/tmp/grok-build-http-rollup"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 13, 23, 59, 59)
+            .single()
+            .expect("now");
+        let start = Utc
+            .with_ymd_and_hms(2026, 5, 13, 8, 0, 0)
+            .single()
+            .expect("start");
+        let mut summary = test_summary("grok_build", &source, now, 500, None);
+        summary.source.source_kind = SourceKind::LocalAdapter;
+        summary.source.source_type = "build-session.json".to_string();
+        summary.metadata.summary_format = "grok_build_session_summary".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(now);
+        summary.summary_id = summary_id("grok_build", &source.source_id, "session-summary");
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(
+            batch.summaries[0].metadata.summary_format,
+            "grok_build_session_summary"
+        );
+    }
+
+    #[test]
+    fn http_sync_excludes_multi_day_external_daily_summaries_from_rollup_batches() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-external-multi-day"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 5, 13, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Utc
+            .with_ymd_and_hms(2026, 5, 14, 23, 59, 59)
+            .single()
+            .expect("end");
+        let mut summary = test_summary("claude_code", &source, end, 500, None);
+        summary.source.source_kind = SourceKind::ExternalReport;
+        summary.metadata.summary_format = "external_daily".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(end);
+        summary.summary_id = summary_id("claude_code", &source.source_id, "external-multi-day");
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert!(batch.summaries.is_empty());
+    }
+
+    #[test]
+    fn http_sync_keeps_one_day_external_daily_summaries_in_rollup_batches() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-external-daily"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 13, 23, 59, 59)
+            .single()
+            .expect("now");
+        let start = Utc
+            .with_ymd_and_hms(2026, 5, 13, 0, 0, 0)
+            .single()
+            .expect("start");
+        let mut summary = test_summary("claude_code", &source, now, 500, None);
+        summary.source.source_kind = SourceKind::ExternalReport;
+        summary.metadata.summary_format = "external_daily".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(now);
+        summary.summary_id = summary_id("claude_code", &source.source_id, "external-daily");
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(batch.summaries[0].metadata.summary_format, "external_daily");
+    }
+
+    #[test]
+    fn http_sync_keeps_offset_local_day_external_daily_summaries_in_rollup_batches() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-external-offset-daily"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 5, 13, 7, 0, 0)
+            .single()
+            .expect("start");
+        let end = Utc
+            .with_ymd_and_hms(2026, 5, 14, 6, 59, 59)
+            .single()
+            .expect("end");
+        let mut summary = test_summary("claude_code", &source, end, 500, None);
+        summary.source.source_kind = SourceKind::ExternalReport;
+        summary.metadata.summary_format = "external_daily".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(end);
+        summary.summary_id = summary_id("claude_code", &source.source_id, "external-offset-daily");
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(batch.summaries[0].metadata.summary_format, "external_daily");
+    }
+
+    #[test]
+    fn http_sync_keeps_dst_fallback_external_daily_summaries_in_rollup_batches() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-external-dst-fallback-daily"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 11, 1, 7, 0, 0)
+            .single()
+            .expect("start");
+        let end = Utc
+            .with_ymd_and_hms(2026, 11, 2, 7, 59, 59)
+            .single()
+            .expect("end");
+        let mut summary = test_summary("claude_code", &source, end, 500, None);
+        summary.source.source_kind = SourceKind::ExternalReport;
+        summary.metadata.summary_format = "external_daily".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(end);
+        summary.summary_id = summary_id(
+            "claude_code",
+            &source.source_id,
+            "external-dst-fallback-daily",
+        );
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(batch.summaries[0].metadata.summary_format, "external_daily");
+    }
+
+    #[test]
+    fn http_sync_keeps_one_day_manual_daily_summaries_in_rollup_batches() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-manual-daily"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 13, 23, 59, 59)
+            .single()
+            .expect("now");
+        let start = Utc
+            .with_ymd_and_hms(2026, 5, 13, 0, 0, 0)
+            .single()
+            .expect("start");
+        let mut summary = test_summary("claude_code", &source, now, 500, None);
+        summary.source.source_kind = SourceKind::Manual;
+        summary.metadata.summary_format = "manual_daily".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(now);
+        summary.summary_id = summary_id("claude_code", &source.source_id, "manual-daily");
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(batch.summaries[0].metadata.summary_format, "manual_daily");
+    }
+
+    #[test]
+    fn http_sync_keeps_one_day_manual_daily_summaries_without_period_end() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-manual-daily-missing-end"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 5, 13, 0, 0, 0)
+            .single()
+            .expect("start");
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 5, 16, 12, 0, 0)
+            .single()
+            .expect("observed_at");
+        let mut summary = test_summary("claude_code", &source, observed_at, 500, None);
+        summary.source.source_kind = SourceKind::Manual;
+        summary.metadata.summary_format = "manual_daily".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = None;
+        summary.observed_at = observed_at;
+        summary.summary_id =
+            summary_id("claude_code", &source.source_id, "manual-daily-missing-end");
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(batch.summaries[0].metadata.summary_format, "manual_daily");
+    }
+
+    #[test]
+    fn http_sync_keeps_one_day_manual_daily_summaries_without_period_start() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-manual-daily-missing-start"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let period_end = Utc
+            .with_ymd_and_hms(2026, 5, 13, 23, 59, 59)
+            .single()
+            .expect("period_end");
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 5, 16, 12, 0, 0)
+            .single()
+            .expect("observed_at");
+        let mut summary = test_summary("claude_code", &source, observed_at, 500, None);
+        summary.source.source_kind = SourceKind::Manual;
+        summary.metadata.summary_format = "manual_daily".to_string();
+        summary.period_start = None;
+        summary.period_end = Some(period_end);
+        summary.observed_at = observed_at;
+        summary.summary_id = summary_id(
+            "claude_code",
+            &source.source_id,
+            "manual-daily-missing-start",
+        );
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(batch.summaries[0].metadata.summary_format, "manual_daily");
+    }
+
+    #[test]
+    fn http_sync_keeps_one_day_manual_daily_summaries_without_period_bounds() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-manual-daily-missing-bounds"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 5, 13, 12, 0, 0)
+            .single()
+            .expect("observed_at");
+        let mut summary = test_summary("claude_code", &source, observed_at, 500, None);
+        summary.source.source_kind = SourceKind::Manual;
+        summary.metadata.summary_format = "manual_daily".to_string();
+        summary.period_start = None;
+        summary.period_end = None;
+        summary.observed_at = observed_at;
+        summary.summary_id = summary_id(
+            "claude_code",
+            &source.source_id,
+            "manual-daily-missing-bounds",
+        );
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(batch.summaries[0].metadata.summary_format, "manual_daily");
+    }
+
+    #[test]
+    fn http_sync_keeps_legacy_ccusage_daily_summaries_in_rollup_batches() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-ccusage-daily"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 13, 23, 59, 59)
+            .single()
+            .expect("now");
+        let start = Utc
+            .with_ymd_and_hms(2026, 5, 13, 0, 0, 0)
+            .single()
+            .expect("start");
+        let mut summary = test_summary("claude_code", &source, now, 500, None);
+        summary.source.source_kind = SourceKind::Manual;
+        summary.metadata.summary_format = "ccusage_daily".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(now);
+        summary.summary_id = summary_id("claude_code", &source.source_id, "ccusage-daily");
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(batch.summaries[0].metadata.summary_format, "ccusage_daily");
+    }
+
+    #[test]
+    fn http_sync_keeps_exact_manual_period_summaries_in_rollup_batches() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-rollup-manual-period"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let start = Utc
+            .with_ymd_and_hms(2025, 9, 4, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Utc
+            .with_ymd_and_hms(2025, 9, 9, 23, 59, 59)
+            .single()
+            .expect("end");
+        let mut summary = test_summary("claude_code", &source, end, 500, None);
+        summary.source.source_kind = SourceKind::Manual;
+        summary.metadata.summary_format = "manual_period_summary".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(end);
+        summary.summary_id = summary_id("claude_code", &source.source_id, "manual-period");
+        store.upsert_summary(&summary).expect("summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, mode) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+        assert_eq!(mode, SyncPayloadMode::Rollups);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.summaries.len(), 1);
+        assert_eq!(
+            batch.summaries[0].metadata.summary_format,
+            "manual_period_summary"
+        );
+    }
+
+    #[test]
     fn first_http_incremental_sync_sends_full_rollup_history_for_new_target() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
@@ -8479,7 +9677,7 @@ mod tests {
         assert_eq!(local.pending_accounts, 0);
         assert_eq!(local.pending_source_account_assignments, 0);
         assert_eq!(local.pending_subscriptions, 0);
-        assert_eq!(local.total_passthrough_summaries, 1);
+        assert_eq!(local.total_passthrough_summaries, 0);
         assert_eq!(local.pending_passthrough_summaries, 0);
     }
 

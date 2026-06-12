@@ -6,11 +6,29 @@
 use statsai_core::{Confidence, CostInfo, ModelInfo, UsageCounts};
 
 fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
+    if lower.contains("claude-opus-4-8") || lower.contains("claude-opus-4.8") {
+        return Some("claude-opus-4-8");
+    }
+    if lower.contains("claude-opus-4-7") || lower.contains("claude-opus-4.7") {
+        return Some("claude-opus-4-7");
+    }
+    if lower.contains("claude-opus-4-6") || lower.contains("claude-opus-4.6") {
+        return Some("claude-opus-4-6");
+    }
     if lower.contains("claude-opus-4-5") || lower.contains("claude-opus-4.5") {
         return Some("claude-opus-4-5");
     }
+    if lower.contains("claude-opus-4-1") || lower.contains("claude-opus-4.1") {
+        return Some("claude-opus-4-1");
+    }
+    if lower.contains("claude-sonnet-4-6") || lower.contains("claude-sonnet-4.6") {
+        return Some("claude-sonnet-4-6");
+    }
     if lower.contains("claude-sonnet-4-5") || lower.contains("claude-sonnet-4.5") {
         return Some("claude-sonnet-4-5");
+    }
+    if lower.contains("claude-haiku-4-5") || lower.contains("claude-haiku-4.5") {
+        return Some("claude-haiku-4-5");
     }
     if lower.contains("claude-sonnet-4") {
         return Some("claude-sonnet-4");
@@ -95,11 +113,25 @@ pub fn normalize_model_name(name: &str) -> String {
         "claude-3-5-sonnet-20241022" | "claude-sonnet-3-5" => "claude-sonnet-3-5".to_string(),
         "claude-3-7-sonnet" | "claude-sonnet-3-7" => "claude-sonnet-3-7".to_string(),
         "claude-opus-4" => "claude-opus-4".to_string(),
+        "claude-opus-4-1" | "claude-opus-4.1" => "claude-opus-4-1".to_string(),
         "claude-opus-4-5" | "claude-opus-4-5-thinking" | "claude-opus-4.5" => {
             "claude-opus-4-5".to_string()
         }
+        "claude-opus-4-6" | "claude-opus-4-6-thinking" | "claude-opus-4.6" => {
+            "claude-opus-4-6".to_string()
+        }
+        "claude-opus-4-7" | "claude-opus-4-7-thinking" | "claude-opus-4.7" => {
+            "claude-opus-4-7".to_string()
+        }
+        "claude-opus-4-8" | "claude-opus-4-8-thinking" | "claude-opus-4.8" => {
+            "claude-opus-4-8".to_string()
+        }
         "claude-sonnet-4" => "claude-sonnet-4".to_string(),
         "claude-sonnet-4-5" | "claude-sonnet-4.5" => "claude-sonnet-4-5".to_string(),
+        "claude-sonnet-4-6" | "claude-sonnet-4-6-thinking" | "claude-sonnet-4.6" => {
+            "claude-sonnet-4-6".to_string()
+        }
+        "claude-haiku-4-5" | "claude-haiku-4.5" => "claude-haiku-4-5".to_string(),
         "claude-haiku-3-5" | "claude-haiku-3.5" => "claude-haiku-3-5".to_string(),
         "gpt-5" | "gpt-5-chat-latest" => "gpt-5".to_string(),
         "gpt-5.1" | "gpt-5.1-chat-latest" => "gpt-5.1".to_string(),
@@ -162,10 +194,16 @@ fn pricing_with_cache_creation(
 pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
     let normalized = model_name.to_ascii_lowercase();
     match normalized.as_str() {
-        "claude-opus-4-5" => Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 25.0)),
-        "claude-sonnet-4-5" | "claude-sonnet-4" => {
+        "claude-opus-4" | "claude-opus-4-1" => {
+            Some(pricing_with_cache_creation(15.0, 18.75, 1.5, 75.0))
+        }
+        "claude-opus-4-5" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" => {
+            Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 25.0))
+        }
+        "claude-sonnet-4" | "claude-sonnet-4-5" | "claude-sonnet-4-6" => {
             Some(pricing_with_cache_creation(3.0, 3.75, 0.3, 15.0))
         }
+        "claude-haiku-4-5" => Some(pricing_with_cache_creation(1.0, 1.25, 0.1, 5.0)),
         "gpt-5.5" => Some(pricing(5.0, 0.5, 30.0)),
         "gpt-5.4" => Some(pricing(2.5, 0.25, 15.0)),
         "gpt-5.4-mini" => Some(pricing(0.75, 0.075, 4.5)),
@@ -272,6 +310,14 @@ mod tests {
             normalize_model_name("claude-opus-4-5-thinking"),
             "claude-opus-4-5"
         );
+        assert_eq!(
+            normalize_model_name("claude-opus-4-6-thinking"),
+            "claude-opus-4-6"
+        );
+        assert_eq!(
+            normalize_model_name("claude-sonnet-4-6-thinking"),
+            "claude-sonnet-4-6"
+        );
     }
 
     #[test]
@@ -287,6 +333,8 @@ mod tests {
             "claude-sonnet-4-5"
         );
         assert_eq!(normalize_model_name("openai/gpt-5"), "gpt-5");
+        assert_eq!(normalize_model_name("openai/gpt-5.2-codex"), "gpt-5.2");
+        assert_eq!(normalize_model_name("openai/gpt-5.4"), "gpt-5.4");
     }
 
     #[test]
@@ -294,6 +342,18 @@ mod tests {
         assert_eq!(
             normalize_model_name("google/antigravity-claude-opus-4-5-thinking"),
             "claude-opus-4-5"
+        );
+        assert_eq!(
+            normalize_model_name("openrouter/claude-opus-4-6-thinking"),
+            "claude-opus-4-6"
+        );
+        assert_eq!(
+            normalize_model_name("openrouter/claude-opus-4-8-thinking"),
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            normalize_model_name("openrouter/claude-sonnet-4-6-thinking"),
+            "claude-sonnet-4-6"
         );
         assert_eq!(
             normalize_model_name("google/antigravity-claude-sonnet-4-5-thinking"),
@@ -408,6 +468,87 @@ mod tests {
         assert_eq!(
             cost.pricing_source.as_deref(),
             Some("opencode_api_pricing:claude-opus-4-5")
+        );
+    }
+
+    #[test]
+    fn estimates_cost_for_claude_family_alias() {
+        let model = statsai_core::ModelInfo {
+            name: Some("claude-opus-4-6-thinking".to_string()),
+            normalized_name: Some("claude-opus-4-6".to_string()),
+            provider_model_id: Some("claude-opus-4-6-thinking".to_string()),
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("claude_code", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(3050));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("claude_code_api_pricing:claude-opus-4-6")
+        );
+    }
+
+    #[test]
+    fn estimates_cost_for_legacy_claude_opus_4() {
+        let model = statsai_core::ModelInfo {
+            name: Some("claude-opus-4".to_string()),
+            normalized_name: Some("claude-opus-4".to_string()),
+            provider_model_id: Some("claude-opus-4".to_string()),
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("claude_code", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(9150));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("claude_code_api_pricing:claude-opus-4")
+        );
+    }
+
+    #[test]
+    fn estimates_cost_for_provider_prefixed_openai_models() {
+        let model = statsai_core::ModelInfo {
+            name: Some("openai/gpt-5.2-codex".to_string()),
+            normalized_name: Some("openai/gpt-5.2-codex".to_string()),
+            provider_model_id: Some("openai/gpt-5.2-codex".to_string()),
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(500_000),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("opencode", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(875));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("opencode_api_pricing:gpt-5.2")
+        );
+
+        let model = statsai_core::ModelInfo {
+            name: Some("openai/gpt-5.4".to_string()),
+            normalized_name: Some("openai/gpt-5.4".to_string()),
+            provider_model_id: Some("openai/gpt-5.4".to_string()),
+        };
+        let cost = estimate_cost("opencode", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(1000));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("opencode_api_pricing:gpt-5.4")
         );
     }
 

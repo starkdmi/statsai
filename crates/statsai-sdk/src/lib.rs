@@ -58,6 +58,14 @@ fn reported_summary_cost_key(cost: &CostInfo) -> Option<String> {
         .map(|cost_cents| format!("{:.4}", cost_cents as f64 / 100.0))
 }
 
+fn canonical_report_format(value: &str) -> &str {
+    match value {
+        "ccusage_daily" | "custom_daily" => "manual_daily",
+        "custom_period_summary" => "manual_period_summary",
+        _ => value,
+    }
+}
+
 pub fn build_reported_usage_summary(
     input: ReportedUsageSummaryInput,
     device_id: &str,
@@ -77,6 +85,7 @@ pub fn build_reported_usage_summary(
     if input.usage.computed_total() == 0 {
         bail!("reported usage summary has zero total tokens");
     }
+    let report_format = canonical_report_format(&input.report_format).to_string();
 
     let evidence_key = input
         .evidence_path
@@ -87,7 +96,7 @@ pub fn build_reported_usage_summary(
             let identity_key = normalized_report_identity_key(&input);
             format!(
                 "{}:{}:{}:{}",
-                input.provider, input.source_name, identity_key, input.report_format
+                input.provider, input.source_name, identity_key, report_format
             )
         });
     let path_label = input.evidence_path.clone();
@@ -129,7 +138,7 @@ pub fn build_reported_usage_summary(
     let semantic_key = format!(
         "reported_summary.v1:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         source.source_id.0,
-        input.report_format,
+        report_format,
         period_start_text,
         period_end_text,
         input.usage.input_tokens.unwrap_or(0),
@@ -173,7 +182,7 @@ pub fn build_reported_usage_summary(
             adapter_version: env!("CARGO_PKG_VERSION").to_string(),
             source_kind: input.source_kind.clone(),
             location_origin: Some(LocationOrigin::Configured),
-            source_type: input.report_format.clone(),
+            source_type: report_format.clone(),
             source_path_hash: source.path_hash.clone(),
             source_record_id: Some(
                 input
@@ -215,7 +224,7 @@ pub fn build_reported_usage_summary(
         period_end: input.period_end,
         observed_at,
         metadata: SummaryMetadata {
-            summary_format: input.report_format,
+            summary_format: report_format,
             summary_version: input.report_version,
             total_sessions: None,
             total_messages: None,
@@ -352,6 +361,96 @@ mod tests {
 
         assert_eq!(first.source.source_id, second.source.source_id);
         assert_eq!(first.summary.summary_id, second.summary.summary_id);
+    }
+
+    #[test]
+    fn legacy_custom_daily_aliases_canonicalize_to_manual_daily() {
+        let input = ReportedUsageSummaryInput {
+            schema_version: REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION.to_string(),
+            provider: "claude_code".to_string(),
+            provider_account_id: None,
+            provider_user_id: None,
+            email: Some("personal@example.com".to_string()),
+            account_label: Some("personal".to_string()),
+            source_kind: SourceKind::Manual,
+            source_name: "user_reported_usage".to_string(),
+            evidence_id: Some("screenshot:2025-07-11".to_string()),
+            evidence_path: Some("/tmp/user-report.png".to_string()),
+            report_format: "ccusage_daily".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 23, 59, 59)
+                    .single()
+                    .expect("end"),
+            ),
+            observed_at: None,
+            model: None,
+            usage: UsageCounts {
+                total_tokens: Some(100),
+                ..UsageCounts::default()
+            },
+            cost: None,
+            confidence: Some(Confidence::Medium),
+        };
+
+        let record = build_reported_usage_summary(input, "device").expect("record");
+
+        assert_eq!(record.summary.metadata.summary_format, "manual_daily");
+        assert_eq!(record.summary.source.source_type, "manual_daily");
+    }
+
+    #[test]
+    fn legacy_aliases_without_evidence_share_canonical_source_identity() {
+        let alias = ReportedUsageSummaryInput {
+            schema_version: REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION.to_string(),
+            provider: "claude_code".to_string(),
+            provider_account_id: None,
+            provider_user_id: None,
+            email: Some("personal@example.com".to_string()),
+            account_label: Some("personal".to_string()),
+            source_kind: SourceKind::Manual,
+            source_name: "user_reported_usage".to_string(),
+            evidence_id: None,
+            evidence_path: None,
+            report_format: "ccusage_daily".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 23, 59, 59)
+                    .single()
+                    .expect("end"),
+            ),
+            observed_at: None,
+            model: None,
+            usage: UsageCounts {
+                total_tokens: Some(100),
+                ..UsageCounts::default()
+            },
+            cost: None,
+            confidence: Some(Confidence::Medium),
+        };
+        let mut canonical = alias.clone();
+        canonical.report_format = "manual_daily".to_string();
+
+        let alias_record = build_reported_usage_summary(alias, "device").expect("alias");
+        let canonical_record =
+            build_reported_usage_summary(canonical, "device").expect("canonical");
+
+        assert_eq!(alias_record.summary.metadata.summary_format, "manual_daily");
+        assert_eq!(alias_record.summary.source.source_type, "manual_daily");
+        assert_eq!(
+            alias_record.source.source_id,
+            canonical_record.source.source_id
+        );
     }
 
     #[test]

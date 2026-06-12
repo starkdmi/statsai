@@ -1178,7 +1178,8 @@ fn grok_summary_dependency_signature(
 
 fn opencode_sqlite_dependency_signature(db_path: &Path) -> Option<String> {
     let db_path = db_path.to_string_lossy();
-    let signatures = ["-wal", "-shm", "-journal"]
+    // The shared-memory sidecar reflects SQLite coordination state, not durable content.
+    let signatures = ["-wal", "-journal"]
         .into_iter()
         .map(|suffix| file_metadata_signature(Path::new(&format!("{db_path}{suffix}"))))
         .collect::<Vec<_>>();
@@ -4270,6 +4271,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_stats_cache_zero_cost_family_alias_still_estimates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("projects")).expect("projects");
+        let mut file = File::create(dir.path().join("stats-cache.json")).expect("stats cache");
+        writeln!(
+            file,
+            r#"{{
+              "version": 2,
+              "lastComputedDate": "2026-05-13",
+              "firstSessionDate": "2026-01-21T17:21:43.119Z",
+              "totalSessions": 1,
+              "totalMessages": 10,
+              "modelUsage": {{
+                "claude-opus-4-6-thinking": {{
+                  "inputTokens": 1000000,
+                  "outputTokens": 1000000,
+                  "cacheReadInputTokens": 1000000,
+                  "cacheCreationInputTokens": 0,
+                  "costUSD": 0
+                }}
+              }}
+            }}"#
+        )
+        .expect("write");
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert!(scan.events.is_empty());
+        assert_eq!(scan.summaries.len(), 1);
+        assert_eq!(
+            scan.summaries[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("claude-opus-4-6")
+        );
+        assert_eq!(scan.summaries[0].cost.provider_reported_usd, None);
+        assert_eq!(
+            scan.summaries[0].cost.estimated_api_equivalent_usd,
+            Some(3050)
+        );
+    }
+
+    #[test]
     fn claude_scan_respects_selected_cache_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
         let projects = dir.path().join("projects");
@@ -5653,6 +5705,15 @@ mod tests {
         assert_eq!(event.usage.cache_creation_tokens, Some(7));
         assert_eq!(event.usage.computed_total(), 162);
         assert_eq!(event.cost.provider_reported_usd, Some(123));
+        let project = event.project.as_ref().expect("project");
+        assert_eq!(
+            project.path_label.as_deref(),
+            Some(display_path(dir.path()).as_str())
+        );
+        assert_eq!(
+            project.path_hash.as_deref(),
+            Some(path_hash(dir.path()).as_str())
+        );
         assert_eq!(
             event.model.as_ref().and_then(|model| model.name.as_deref()),
             Some("xai/grok-build-0.1")
@@ -6305,6 +6366,28 @@ mod tests {
     }
 
     #[test]
+    fn opencode_scan_candidates_ignore_shm_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("opencode.db"), "db").expect("db");
+        std::fs::write(dir.path().join("opencode.db-shm"), "").expect("shm");
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let before = opencode_scan_candidates(&source, "0").expect("before");
+        std::fs::write(dir.path().join("opencode.db-shm"), "shm-data").expect("updated shm");
+        let after = opencode_scan_candidates(&source, "0").expect("after");
+
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_eq!(before[0].cache_signature, after[0].cache_signature);
+    }
+
+    #[test]
     fn grok_build_session_summary_records_local_session_stats() {
         let dir = tempfile::tempdir().expect("tempdir");
         let session = dir
@@ -6395,6 +6478,17 @@ mod tests {
         assert_eq!(summary.usage.requests, Some(3));
         assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(5));
         assert_eq!(summary.cost.confidence, Confidence::Low);
+        let project = summary.project.as_ref().expect("project");
+        assert_eq!(
+            project.path_label.as_deref(),
+            Some(display_path(dir.path()).as_str())
+        );
+        assert_eq!(
+            project.path_hash.as_deref(),
+            Some(path_hash(dir.path()).as_str())
+        );
+        assert_eq!(project.repo_label.as_deref(), Some("example/repo"));
+        assert_eq!(project.branch_label.as_deref(), Some("main"));
         assert_eq!(
             summary
                 .metrics
