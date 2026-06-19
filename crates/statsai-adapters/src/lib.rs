@@ -31,7 +31,7 @@ const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // so historical sessions get rescanned for both runtime and project context.
 const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "turn-runtime-project-context.v8";
 const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "project-context.v2";
-const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "sqlite-session-aggregate.v1";
+const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "sqlite-session-aggregate.v2";
 const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "session-inference-usage.v5";
 
 pub use statsai_core::{VerifiedSourceState, VerifiedSubscriptionState};
@@ -3169,19 +3169,22 @@ fn opencode_model_info(value: &str) -> Option<ModelInfo> {
         let label = opencode_model_label_from_value(&json).unwrap_or_else(|| trimmed.to_string());
         return Some(ModelInfo {
             name: Some(label.clone()),
-            normalized_name: Some(label.to_ascii_lowercase()),
+            normalized_name: Some(normalize_provider_qualified_model_name(&label)),
             provider_model_id: Some(label),
         });
     }
     Some(ModelInfo {
         name: Some(trimmed.to_string()),
-        normalized_name: Some(if trimmed.contains('/') {
-            trimmed.to_ascii_lowercase()
-        } else {
-            normalize_model_name(trimmed)
-        }),
+        normalized_name: Some(normalize_provider_qualified_model_name(trimmed)),
         provider_model_id: Some(trimmed.to_string()),
     })
+}
+
+fn normalize_provider_qualified_model_name(label: &str) -> String {
+    label
+        .rsplit_once('/')
+        .map(|(_, model)| normalize_model_name(model))
+        .unwrap_or_else(|| normalize_model_name(label))
 }
 
 fn opencode_model_label_from_value(value: &Value) -> Option<String> {
@@ -5723,6 +5726,13 @@ mod tests {
                 .model
                 .as_ref()
                 .and_then(|model| model.normalized_name.as_deref()),
+            Some("grok-build-0.1")
+        );
+        assert_eq!(
+            event
+                .model
+                .as_ref()
+                .and_then(|model| model.provider_model_id.as_deref()),
             Some("xai/grok-build-0.1")
         );
     }
@@ -6334,13 +6344,35 @@ mod tests {
     }
 
     #[test]
-    fn opencode_model_info_preserves_provider_qualified_identity() {
+    fn opencode_model_info_uses_model_name_for_stats_and_preserves_provider_identity() {
         let foo = opencode_model_info(r#"{"id":"model-x","providerID":"foo"}"#).expect("foo");
         let bar = opencode_model_info(r#"{"id":"model-x","providerID":"bar"}"#).expect("bar");
 
-        assert_eq!(foo.normalized_name.as_deref(), Some("foo/model-x"));
-        assert_eq!(bar.normalized_name.as_deref(), Some("bar/model-x"));
-        assert_ne!(foo.normalized_name, bar.normalized_name);
+        assert_eq!(foo.name.as_deref(), Some("foo/model-x"));
+        assert_eq!(bar.name.as_deref(), Some("bar/model-x"));
+        assert_eq!(foo.provider_model_id.as_deref(), Some("foo/model-x"));
+        assert_eq!(bar.provider_model_id.as_deref(), Some("bar/model-x"));
+        assert_eq!(foo.normalized_name.as_deref(), Some("model-x"));
+        assert_eq!(bar.normalized_name.as_deref(), Some("model-x"));
+    }
+
+    #[test]
+    fn opencode_model_info_normalizes_provider_qualified_known_aliases() {
+        let deepseek = opencode_model_info("opencode-go/deepseek-v4-pro").expect("deepseek");
+        let grok = opencode_model_info(r#"{"id":"grok-build","providerID":"xai"}"#).expect("grok");
+
+        assert_eq!(deepseek.name.as_deref(), Some("opencode-go/deepseek-v4-pro"));
+        assert_eq!(
+            deepseek.provider_model_id.as_deref(),
+            Some("opencode-go/deepseek-v4-pro")
+        );
+        assert_eq!(
+            deepseek.normalized_name.as_deref(),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(grok.name.as_deref(), Some("xai/grok-build"));
+        assert_eq!(grok.provider_model_id.as_deref(), Some("xai/grok-build"));
+        assert_eq!(grok.normalized_name.as_deref(), Some("grok-build-0.1"));
     }
 
     #[test]
