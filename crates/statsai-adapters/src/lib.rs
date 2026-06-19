@@ -6361,15 +6361,15 @@ mod tests {
         let deepseek = opencode_model_info("opencode-go/deepseek-v4-pro").expect("deepseek");
         let grok = opencode_model_info(r#"{"id":"grok-build","providerID":"xai"}"#).expect("grok");
 
-        assert_eq!(deepseek.name.as_deref(), Some("opencode-go/deepseek-v4-pro"));
+        assert_eq!(
+            deepseek.name.as_deref(),
+            Some("opencode-go/deepseek-v4-pro")
+        );
         assert_eq!(
             deepseek.provider_model_id.as_deref(),
             Some("opencode-go/deepseek-v4-pro")
         );
-        assert_eq!(
-            deepseek.normalized_name.as_deref(),
-            Some("deepseek-v4-pro")
-        );
+        assert_eq!(deepseek.normalized_name.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(grok.name.as_deref(), Some("xai/grok-build"));
         assert_eq!(grok.provider_model_id.as_deref(), Some("xai/grok-build"));
         assert_eq!(grok.normalized_name.as_deref(), Some("grok-build-0.1"));
