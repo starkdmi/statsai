@@ -2405,11 +2405,10 @@ fn build_sync_batch(
         let failed_without_resume = state.as_ref().is_some_and(|state| {
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()
         });
-        let force_full_rollup_sync =
-            command.full
-                || command.rebuild_rollups
-                || state.is_none()
-                || (!command.since_last && failed_without_resume);
+        let force_full_rollup_sync = command.full
+            || command.rebuild_rollups
+            || state.is_none()
+            || (!command.since_last && failed_without_resume);
         let resume_partial_rollup_sync = !force_full_rollup_sync
             && !command.since_last
             && !command.rebuild_rollups
@@ -9237,8 +9236,7 @@ mod tests {
             .expect("sync state")
             .expect("present");
         assert_eq!(
-            state_after.pending_resume_batch_id,
-            state.pending_resume_batch_id,
+            state_after.pending_resume_batch_id, state.pending_resume_batch_id,
             "dry-run must not mutate pending resume state"
         );
     }
