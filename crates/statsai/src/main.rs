@@ -2406,7 +2406,10 @@ fn build_sync_batch(
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()
         });
         let force_full_rollup_sync =
-            command.full || command.rebuild_rollups || state.is_none() || failed_without_resume;
+            command.full
+                || command.rebuild_rollups
+                || state.is_none()
+                || (!command.since_last && failed_without_resume);
         let resume_partial_rollup_sync = !force_full_rollup_sync
             && !command.since_last
             && !command.rebuild_rollups
@@ -2415,7 +2418,8 @@ fn build_sync_batch(
                 .and_then(|state| state.pending_resume_batch_id.as_deref())
                 .is_some();
         let full_rollup_sync = force_full_rollup_sync && !resume_partial_rollup_sync;
-        if full_rollup_sync
+        if !command.dry_run
+            && full_rollup_sync
             && state
                 .as_ref()
                 .and_then(|state| state.pending_resume_batch_id.as_deref())
@@ -9154,6 +9158,89 @@ mod tests {
             build_sync_batch(&command, &store, "device", &target).expect("retry batch");
         assert_eq!(retry_mode, SyncPayloadMode::Rollups);
         assert_eq!(retry_batch.summaries.len(), 1);
+
+        let since_last_command = SyncCommand {
+            endpoint: Some(endpoint),
+            since_last: true,
+            ..test_sync_command("http")
+        };
+        let (since_last_batch, since_last_mode) =
+            build_sync_batch(&since_last_command, &store, "device", &target)
+                .expect("since-last retry batch");
+        assert_eq!(since_last_mode, SyncPayloadMode::Rollups);
+        assert!(
+            since_last_batch.summaries.is_empty(),
+            "explicit --since-last should not force full history after an unacknowledged failure"
+        );
+    }
+
+    #[test]
+    fn full_dry_run_does_not_clear_pending_http_resume_state() {
+        let store = Store::in_memory().expect("store");
+        let endpoint = "https://api.example.com/api/sync/batches".to_string();
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-full-dry-run-resume"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let event = test_event(
+            "codex",
+            &source,
+            now,
+            Some(provider_account_id("codex", "personal")),
+            TokenParts::total(10),
+        );
+        store.insert_event(&event).expect("event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let initial_command = SyncCommand {
+            endpoint: Some(endpoint.clone()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&initial_command).expect("target");
+        let (initial_batch, _) =
+            build_sync_batch(&initial_command, &store, "device", &target).expect("initial batch");
+        record_rollup_sync_success(&store, "http", &target, &initial_batch)
+            .expect("record partial sync state");
+        let expected_logical_batch_id = logical_http_rollup_batch_id(&initial_batch.batch_id);
+
+        let state = store
+            .sync_state("http", &target)
+            .expect("sync state")
+            .expect("present");
+        assert_eq!(
+            state.pending_resume_batch_id.as_deref(),
+            Some(expected_logical_batch_id.as_str())
+        );
+
+        let full_dry_run_command = SyncCommand {
+            endpoint: Some(endpoint),
+            full: true,
+            dry_run: true,
+            ..test_sync_command("http")
+        };
+        let (dry_run_batch, dry_run_mode) =
+            build_sync_batch(&full_dry_run_command, &store, "device", &target)
+                .expect("full dry-run batch");
+        assert_eq!(dry_run_mode, SyncPayloadMode::Rollups);
+        assert_eq!(dry_run_batch.summaries.len(), 1);
+
+        let state_after = store
+            .sync_state("http", &target)
+            .expect("sync state")
+            .expect("present");
+        assert_eq!(
+            state_after.pending_resume_batch_id,
+            state.pending_resume_batch_id,
+            "dry-run must not mutate pending resume state"
+        );
     }
 
     #[test]
