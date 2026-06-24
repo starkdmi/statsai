@@ -491,6 +491,11 @@ struct SyncCommand {
     rebuild_rollups: bool,
     #[arg(
         long,
+        help = "Force a full HTTP rollup sync even when this target was synced before"
+    )]
+    full: bool,
+    #[arg(
+        long,
         help = "Send only records after this sink target's last successful sync"
     )]
     since_last: bool,
@@ -2096,6 +2101,10 @@ fn export(command: ExportCommand, store: &Store) -> Result<()> {
 }
 
 fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
+    if command.since_last && (command.full || command.rebuild_rollups) {
+        bail!("--since-last cannot be combined with --full or --rebuild-rollups");
+    }
+
     if command.reset_remote {
         if command.status || command.verify {
             bail!("--reset-remote cannot be combined with --status or --verify");
@@ -2393,13 +2402,19 @@ fn build_sync_batch(
             );
         }
 
-        let resume_partial_rollup_sync = !command.since_last
+        let failed_without_resume = state.as_ref().is_some_and(|state| {
+            state.failure_count > 0 && state.pending_resume_batch_id.is_none()
+        });
+        let force_full_rollup_sync =
+            command.full || command.rebuild_rollups || state.is_none() || failed_without_resume;
+        let resume_partial_rollup_sync = !force_full_rollup_sync
+            && !command.since_last
             && !command.rebuild_rollups
             && state
                 .as_ref()
                 .and_then(|state| state.pending_resume_batch_id.as_deref())
                 .is_some();
-        let full_rollup_sync = !command.since_last && !resume_partial_rollup_sync;
+        let full_rollup_sync = force_full_rollup_sync && !resume_partial_rollup_sync;
         if full_rollup_sync
             && state
                 .as_ref()
@@ -8550,6 +8565,30 @@ mod tests {
         record_rollup_sync_success(&store, "http", &local_target, &local_batch)
             .expect("record local sync");
 
+        let (local_repeat_batch, local_repeat_mode) =
+            build_sync_batch(&local_command, &store, "device", &local_target)
+                .expect("local repeat batch");
+        assert_eq!(local_repeat_mode, SyncPayloadMode::Rollups);
+        assert!(
+            local_repeat_batch.summaries.is_empty(),
+            "plain HTTP sync should be incremental after a target was synced"
+        );
+
+        let local_full_command = SyncCommand {
+            endpoint: Some("http://127.0.0.1:8787/api/sync/batches".to_string()),
+            full: true,
+            ..test_sync_command("http")
+        };
+        let (local_full_batch, local_full_mode) =
+            build_sync_batch(&local_full_command, &store, "device", &local_target)
+                .expect("local full batch");
+        assert_eq!(local_full_mode, SyncPayloadMode::Rollups);
+        assert_eq!(
+            local_full_batch.summaries.len(),
+            1,
+            "--full should deliberately resend synced rollups"
+        );
+
         let local_incremental_command = SyncCommand {
             endpoint: Some("http://127.0.0.1:8787/api/sync/batches".to_string()),
             since_last: true,
@@ -10158,6 +10197,7 @@ mod tests {
             endpoint: None,
             auth_token: None,
             rebuild_rollups: false,
+            full: false,
             since_last: false,
             status: false,
             verify: false,
