@@ -2207,7 +2207,7 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
 
     let auth_token = resolve_http_auth_token(command, true)?
         .context("device login required; run `statsai auth login` first")?;
-    let remote = http_remote_verify(target, &auth_token)?;
+    let remote = http_remote_preflight_status(target, &auth_token)?;
     let local_verify = sync_local_verify(store, "http", target, Some(&local_state))?;
     let batch_mismatch = !remote_sync_batch_matches_local_state(&remote, &local_state);
     let metadata_gap = remote_metadata_gap_reason(&remote, &local_verify);
@@ -3269,6 +3269,15 @@ fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
     }
 }
 
+fn http_remote_preflight_status(endpoint: &str, auth_token: &str) -> Result<Value> {
+    let url = http_preflight_status_url(endpoint)?;
+    let request = ureq::get(&url).set("Authorization", &format!("Bearer {auth_token}"));
+    match request.call() {
+        Ok(response) => http_response_json(response, "load sync preflight status"),
+        Err(error) => Err(http_request_error("load sync preflight status", error)),
+    }
+}
+
 fn http_remote_reset(endpoint: &str, auth_token: &str) -> Result<Value> {
     let url = http_reset_url(endpoint)?;
     let body = serde_json::to_string(&json!({
@@ -3290,6 +3299,17 @@ fn http_verify_status_url(endpoint: &str) -> Result<String> {
     }
     bail!(
         "http verify expects a Cloudflare sync endpoint ending in /api/sync/batches; got {}",
+        endpoint
+    )
+}
+
+fn http_preflight_status_url(endpoint: &str) -> Result<String> {
+    let endpoint = endpoint.trim_end_matches('/');
+    if let Some(prefix) = endpoint.strip_suffix("/api/sync/batches") {
+        return Ok(format!("{prefix}/api/sync/status?view=preflight"));
+    }
+    bail!(
+        "http preflight expects a Cloudflare sync endpoint ending in /api/sync/batches; got {}",
         endpoint
     )
 }
@@ -9645,6 +9665,14 @@ mod tests {
         assert_eq!(
             http_verify_status_url("https://api.example.com/api/sync/batches").expect("status"),
             "https://api.example.com/api/sync/status"
+        );
+    }
+
+    #[test]
+    fn http_preflight_status_url_points_at_lightweight_worker_status_endpoint() {
+        assert_eq!(
+            http_preflight_status_url("https://api.example.com/api/sync/batches").expect("status"),
+            "https://api.example.com/api/sync/status?view=preflight"
         );
     }
 
