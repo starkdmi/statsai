@@ -50,6 +50,23 @@ curl -LsSf https://github.com/starkdmi/statsai/releases/latest/download/statsai-
 GitHub Releases also ship `statsai-universal-apple-darwin.tar.xz` and `StatsAI.app.zip`.
 `cargo binstall statsai` will work after the workspace is published to crates.io.
 
+## Local Checks
+
+Use the same Rust checks locally that GitHub runs in CI:
+
+```sh
+./scripts/rust-ci.sh full
+```
+
+To install repo-local git hooks that run `fmt` + `clippy` before commit and the
+full Rust CI suite before push:
+
+```sh
+./scripts/install-git-hooks.sh
+```
+
+For an exceptional bypass, set `STATSAI_SKIP_LOCAL_CI=1` for that one command.
+
 ## CLI Examples
 
 ```sh

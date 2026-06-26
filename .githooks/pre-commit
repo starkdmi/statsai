@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${STATSAI_SKIP_LOCAL_CI:-0}" == "1" ]]; then
+  exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
+
+if ! printf '%s\n' "$staged_files" | grep -Eq '(^Cargo\.(toml|lock)$|\.rs$|^crates/.*/Cargo\.toml$|^scripts/rust-ci\.sh$|^\.github/workflows/ci\.yml$|^rust-toolchain\.toml$)'; then
+  exit 0
+fi
+
+./scripts/rust-ci.sh fast

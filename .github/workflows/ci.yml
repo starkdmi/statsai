@@ -19,10 +19,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo test -p statsai-daemon --features watch
+      - run: ./scripts/rust-ci.sh fmt
+      - run: ./scripts/rust-ci.sh clippy
+      - run: ./scripts/rust-ci.sh test
 
   test-linux:
     name: Test (Linux)
@@ -35,10 +34,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo test -p statsai-daemon --features watch
+      - run: ./scripts/rust-ci.sh fmt
+      - run: ./scripts/rust-ci.sh clippy
+      - run: ./scripts/rust-ci.sh test
 
   dependency-review:
     name: Dependency Review

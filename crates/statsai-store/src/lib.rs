@@ -3933,9 +3933,9 @@ fn exact_or_semantic_conflict<'a>(
         .iter()
         .find(|candidate| candidate.event_id == event.event_id.0)
         .or_else(|| {
-            candidates.iter().find_map(|candidate| {
-                semantically_same_event(&candidate.event, event).then_some(candidate)
-            })
+            candidates
+                .iter()
+                .find(|candidate| semantically_same_event(&candidate.event, event))
         })
 }
 
