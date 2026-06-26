@@ -8,9 +8,9 @@ use statsai_core::{
     canonical_display, display_path, expand_home_path, hash_text, home_dir, path_hash,
     project_bucket_key, semantic_event_id, summary_id, BillingPeriod, Confidence, EventSource,
     IdentitySource, LatencySource, LocationOrigin, MetricStats, ModelInfo, ParseEvidence,
-    PrivacyInfo, PrivacyMode, ProjectInfo, RuntimeInfo, SessionInfo, SourceKind, SourceLocation,
-    SubscriptionStatus, SummaryMetadata, SummaryMetrics, UsageCounts, UsageEvent, UsageSummary,
-    USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+    PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo, SessionInfo, SourceKind,
+    SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics, UsageCounts, UsageEvent,
+    UsageSummary, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{estimate_cost, normalize_model_name};
 use std::collections::{HashMap, HashSet};
@@ -29,9 +29,9 @@ const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v4";
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever Codex parsing semantics change,
 // so historical sessions get rescanned for both runtime and project context.
-const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "turn-runtime-project-context.v8";
-const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "project-context.v2";
-const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "sqlite-session-aggregate.v2";
+const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "turn-runtime-project-context.v9";
+const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "project-context.v3";
+const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "sqlite-session-aggregate.v3";
 const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "session-inference-usage.v5";
 
 pub use statsai_core::{VerifiedSourceState, VerifiedSubscriptionState};
@@ -519,11 +519,13 @@ fn scan_opencode_source(
 
     let connection = open_sqlite_readonly(&db_path)?;
     let recovered_session_models = load_opencode_session_models(&connection)?;
-    let ambiguous_session_ids = recovered_session_models
+    let reconstructed_session_ids = recovered_session_models
         .iter()
-        .filter_map(|(session_id, model)| model.is_none().then_some(session_id.clone()))
+        .filter_map(|(session_id, summary)| {
+            (summary.ambiguous || summary.has_variant).then_some(session_id.clone())
+        })
         .collect::<HashSet<_>>();
-    let mut ambiguous_session_rows = HashMap::<String, OpenCodeSessionAggregate>::new();
+    let mut reconstructed_session_rows = HashMap::<String, OpenCodeSessionAggregate>::new();
     let mut statement = connection.prepare(
         "SELECT id, title, model, cost, tokens_input, tokens_output, tokens_reasoning, \
          tokens_cache_read, tokens_cache_write, time_created, time_updated, directory \
@@ -556,11 +558,12 @@ fn scan_opencode_source(
             .try_into()
             .ok();
         let directory: Option<String> = row.get::<_, Option<String>>(11).ok().flatten();
-        if ambiguous_session_ids.contains(&session_id) {
-            ambiguous_session_rows.insert(
+        if reconstructed_session_ids.contains(&session_id) {
+            reconstructed_session_rows.insert(
                 session_id.clone(),
                 OpenCodeSessionAggregate {
                     title,
+                    model_text,
                     provider_cost,
                     usage,
                     started_at,
@@ -583,7 +586,11 @@ fn scan_opencode_source(
         let model = model_text
             .as_deref()
             .and_then(opencode_model_info)
-            .or_else(|| recovered_session_models.get(&session_id).cloned().flatten());
+            .or_else(|| {
+                recovered_session_models
+                    .get(&session_id)
+                    .and_then(|summary| summary.model.clone())
+            });
         let model_inferred = model.is_none();
         if model_inferred {
             scan.diagnostics.model_fallbacks += 1;
@@ -620,12 +627,12 @@ fn scan_opencode_source(
         }
         push_deduped(&mut scan, &mut seen, event);
     }
-    if !ambiguous_session_ids.is_empty() {
+    if !reconstructed_session_ids.is_empty() {
         let reconstructed_usage = emit_opencode_message_events(
             &connection,
             &mut OpenCodeMessageEventContext {
                 db_path: &db_path,
-                ambiguous_session_ids: &ambiguous_session_ids,
+                reconstructed_session_ids: &reconstructed_session_ids,
                 adapter,
                 source,
                 options,
@@ -633,7 +640,7 @@ fn scan_opencode_source(
                 seen: &mut seen,
             },
         )?;
-        for (session_id, aggregate) in ambiguous_session_rows {
+        for (session_id, aggregate) in reconstructed_session_rows {
             let reconstructed = reconstructed_usage.get(&session_id);
             if opencode_usage_fully_reconstructed(
                 &aggregate.usage,
@@ -647,12 +654,40 @@ fn scan_opencode_source(
                 continue;
             }
             scan.diagnostics.candidate_usage_rows += 1;
-            scan.diagnostics.model_fallbacks += 1;
             let project = aggregate
                 .directory
                 .as_deref()
                 .map(PathBuf::from)
                 .and_then(|path| resolve_project_context(Some(path), None, None));
+            let model = recovered_session_models
+                .get(&session_id)
+                .and_then(|summary| {
+                    if summary.model_conflict {
+                        return None;
+                    }
+                    let session_model = aggregate
+                        .model_text
+                        .as_deref()
+                        .and_then(opencode_model_info);
+                    match (session_model, summary.model.clone()) {
+                        (Some(mut session_model), Some(recovered))
+                            if same_model_identity(Some(&session_model), &recovered) =>
+                        {
+                            apply_reasoning_state(
+                                &mut session_model,
+                                &reasoning_state_from_model(&recovered),
+                            );
+                            Some(session_model)
+                        }
+                        (Some(session_model), _) => Some(session_model),
+                        (None, Some(recovered)) => Some(recovered),
+                        (None, None) => None,
+                    }
+                });
+            let model_inferred = model.is_none();
+            if model_inferred {
+                scan.diagnostics.model_fallbacks += 1;
+            }
             let mut event = usage_event(
                 adapter,
                 source,
@@ -662,7 +697,7 @@ fn scan_opencode_source(
                     session_started_at: Some(aggregate.started_at),
                     session_ended_at: Some(aggregate.ended_at),
                     duration_seconds: aggregate.duration_seconds,
-                    model: None,
+                    model,
                     usage: residual_usage,
                     runtime: None,
                     session_raw: session_id,
@@ -671,7 +706,7 @@ fn scan_opencode_source(
                     source_file: &db_path,
                     source_line_number: None,
                     source_type: "sqlite:session",
-                    model_inferred: true,
+                    model_inferred,
                     timestamp_inferred: false,
                     deduplication: EventDeduplication::PathIndependent,
                     dedupe_salt: None,
@@ -699,11 +734,9 @@ fn scan_opencode_source(
 
 fn load_opencode_session_models(
     connection: &Connection,
-) -> Result<HashMap<String, Option<ModelInfo>>> {
+) -> Result<HashMap<String, OpenCodeSessionModelSummary>> {
     let mut statement = match connection.prepare(
-        "SELECT session_id, \
-                coalesce(json_extract(data, '$.providerID'), json_extract(data, '$.provider_id')), \
-                coalesce(json_extract(data, '$.modelID'), json_extract(data, '$.id'), json_extract(data, '$.model')), \
+        "SELECT session_id, data, \
                 coalesce(json_extract(data, '$.tokens.input'), 0), \
                 coalesce(json_extract(data, '$.tokens.output'), 0), \
                 coalesce(json_extract(data, '$.tokens.reasoning'), 0), \
@@ -715,6 +748,8 @@ fn load_opencode_session_models(
             OR json_extract(data, '$.modelID') IS NOT NULL \
             OR json_extract(data, '$.id') IS NOT NULL \
             OR json_extract(data, '$.model') IS NOT NULL \
+            OR json_extract(data, '$.variant') IS NOT NULL \
+            OR json_extract(data, '$.model.variant') IS NOT NULL \
             OR coalesce(json_extract(data, '$.tokens.input'), 0) > 0 \
             OR coalesce(json_extract(data, '$.tokens.output'), 0) > 0 \
             OR coalesce(json_extract(data, '$.tokens.reasoning'), 0) > 0 \
@@ -728,57 +763,81 @@ fn load_opencode_session_models(
         Err(error) => return Err(error.into()),
     };
     let mut rows = statement.query([])?;
-    let mut models = HashMap::<String, Option<ModelInfo>>::new();
+    let mut models = HashMap::<String, OpenCodeSessionModelSummary>::new();
     while let Some(row) = rows.next()? {
         let session_id: String = row.get(0)?;
-        let provider_id: Option<String> = row.get(1)?;
-        let model_id: Option<String> = row.get(2)?;
+        let data_text: String = row.get(1)?;
+        let value = match serde_json::from_str::<Value>(&data_text) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
         let usage = UsageCounts {
-            input_tokens: sqlite_nonzero_u64(row.get::<_, i64>(3)?),
-            output_tokens: sqlite_nonzero_u64(row.get::<_, i64>(4)?),
-            reasoning_tokens: sqlite_nonzero_u64(row.get::<_, i64>(5)?),
-            cache_read_tokens: sqlite_nonzero_u64(row.get::<_, i64>(6)?),
-            cache_creation_tokens: sqlite_nonzero_u64(row.get::<_, i64>(7)?),
+            input_tokens: sqlite_nonzero_u64(row.get::<_, i64>(2)?),
+            output_tokens: sqlite_nonzero_u64(row.get::<_, i64>(3)?),
+            reasoning_tokens: sqlite_nonzero_u64(row.get::<_, i64>(4)?),
+            cache_read_tokens: sqlite_nonzero_u64(row.get::<_, i64>(5)?),
+            cache_creation_tokens: sqlite_nonzero_u64(row.get::<_, i64>(6)?),
             total_tokens: None,
             requests: None,
             local_prompt_eval_tokens: None,
             local_eval_tokens: None,
         };
-        if usage.computed_total() > 0 && (provider_id.is_none() || model_id.is_none()) {
-            models.insert(session_id, None);
+        let model = opencode_message_model_info(&value);
+        let entry = models.entry(session_id).or_default();
+        entry.has_variant |= opencode_message_has_variant(&value);
+        if usage.computed_total() > 0 && model.is_none() {
+            entry.ambiguous = true;
             continue;
         }
-        let (Some(provider_id), Some(model_id)) = (provider_id, model_id) else {
+        let Some(model) = model else {
             continue;
         };
-        let Some(model) = opencode_model_info(&format!("{provider_id}/{model_id}")) else {
-            continue;
-        };
-        match models.entry(session_id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Some(model));
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let current = entry.get();
-                if current.is_none() {
+        // Ambiguous usage rows can still be followed by explicit model context that
+        // reveals whether residual aggregate usage is safe to label or must stay model-less.
+        match entry.model.as_ref() {
+            None => entry.model = Some(model),
+            Some(existing) if same_model_identity(Some(existing), &model) => {
+                let existing_reasoning = reasoning_state_from_model(existing);
+                let model_reasoning = reasoning_state_from_model(&model);
+                let existing_has_reasoning =
+                    existing_reasoning.level.is_some() || existing_reasoning.raw.is_some();
+                let model_has_reasoning =
+                    model_reasoning.level.is_some() || model_reasoning.raw.is_some();
+                if !existing_has_reasoning && model_has_reasoning {
+                    entry.model = Some(model);
                     continue;
                 }
-                let same_model = current
-                    .as_ref()
-                    .and_then(|current| current.provider_model_id.as_deref())
-                    == model.provider_model_id.as_deref();
-                if !same_model {
-                    entry.insert(None);
+                if existing_has_reasoning
+                    && model_has_reasoning
+                    && existing_reasoning != model_reasoning
+                {
+                    entry.model = None;
+                    entry.ambiguous = true;
+                    entry.model_conflict = true;
                 }
+            }
+            Some(_) => {
+                entry.model = None;
+                entry.ambiguous = true;
+                entry.model_conflict = true;
             }
         }
     }
     Ok(models)
 }
 
+#[derive(Debug, Clone, Default)]
+struct OpenCodeSessionModelSummary {
+    model: Option<ModelInfo>,
+    ambiguous: bool,
+    has_variant: bool,
+    model_conflict: bool,
+}
+
 #[derive(Debug, Clone)]
 struct OpenCodeSessionAggregate {
     title: Option<String>,
+    model_text: Option<String>,
     provider_cost: f64,
     usage: UsageCounts,
     started_at: DateTime<Utc>,
@@ -789,7 +848,7 @@ struct OpenCodeSessionAggregate {
 
 struct OpenCodeMessageEventContext<'a> {
     db_path: &'a Path,
-    ambiguous_session_ids: &'a HashSet<String>,
+    reconstructed_session_ids: &'a HashSet<String>,
     adapter: &'a OpenCodeAdapter,
     source: &'a SourceLocation,
     options: &'a ScanOptions,
@@ -818,13 +877,15 @@ fn emit_opencode_message_events(
     let mut statement = connection.prepare(
         "SELECT m.id, m.session_id, m.time_created, m.time_updated, m.data, s.title, s.directory \
          FROM message m \
-         JOIN session s ON s.id = m.session_id",
+         JOIN session s ON s.id = m.session_id \
+         ORDER BY m.session_id, m.time_created, m.id",
     )?;
     let mut rows = statement.query([])?;
     let mut reconstructed_usage = HashMap::<String, OpenCodeReconstructedUsage>::new();
+    let mut session_models = HashMap::<String, ModelInfo>::new();
     while let Some(row) = rows.next()? {
         let session_id: String = row.get(1)?;
-        if !ctx.ambiguous_session_ids.contains(&session_id) {
+        if !ctx.reconstructed_session_ids.contains(&session_id) {
             continue;
         }
         ctx.scan.diagnostics.raw_rows += 1;
@@ -841,10 +902,8 @@ fn emit_opencode_message_events(
                 continue;
             }
         };
-        let model = opencode_message_model_info(&value);
-        if model.is_none() {
-            ctx.scan.diagnostics.model_fallbacks += 1;
-            continue;
+        if let Some(model) = opencode_message_model_info(&value) {
+            session_models.insert(session_id.clone(), model);
         }
         let usage = opencode_message_usage_counts(&value);
         if usage.computed_total() == 0 {
@@ -852,6 +911,10 @@ fn emit_opencode_message_events(
             continue;
         }
         ctx.scan.diagnostics.candidate_usage_rows += 1;
+        let Some(model) = session_models.get(&session_id).cloned() else {
+            ctx.scan.diagnostics.model_fallbacks += 1;
+            continue;
+        };
         let started_at = value
             .pointer("/time/created")
             .and_then(value_as_u64)
@@ -882,7 +945,7 @@ fn emit_opencode_message_events(
                 session_started_at: Some(started_at),
                 session_ended_at: Some(ended_at),
                 duration_seconds,
-                model,
+                model: Some(model),
                 usage,
                 runtime: None,
                 session_raw: session_id.clone(),
@@ -1342,6 +1405,7 @@ fn parse_claude_file(
     let reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
     let project = claude_project_context_for_file(session_projects, projects, path);
+    let mut current_reasoning = ModelReasoningState::default();
 
     for (index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -1353,6 +1417,10 @@ fn parse_claude_file(
             ctx.scan.diagnostics.invalid_rows += 1;
             continue;
         };
+        let reasoning = claude_reasoning_state_from_value(&value);
+        if reasoning.raw.is_some() {
+            current_reasoning = reasoning;
+        }
         let Some(usage_value) = value
             .pointer("/message/usage")
             .or_else(|| value.get("usage"))
@@ -1371,7 +1439,7 @@ fn parse_claude_file(
         if timestamp_inferred {
             ctx.scan.diagnostics.timestamp_fallbacks += 1;
         }
-        let model = model_from_nested_value(&value, None);
+        let model = with_reasoning_state(model_from_nested_value(&value, None), &current_reasoning);
         let model_inferred = model.is_none();
         if model_inferred {
             ctx.scan.diagnostics.model_fallbacks += 1;
@@ -1567,6 +1635,7 @@ fn parse_codex_file(
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
     let mut previous_totals: Option<UsageCounts> = None;
     let mut current_model: Option<String> = None;
+    let mut current_reasoning = ModelReasoningState::default();
     let mut current_model_is_fallback = false;
     let mut current_project: Option<ProjectInfo> = None;
     let session_raw = codex_session_id(usage_root, path);
@@ -1592,6 +1661,7 @@ fn parse_codex_file(
         }
 
         if is_codex_turn_context(&value) {
+            current_reasoning = codex_reasoning_state_from_value(&value);
             if let Some(model_name) = codex_model_from_value(&value, current_model.as_deref())
                 .and_then(|model| model.normalized_name)
             {
@@ -1638,7 +1708,8 @@ fn parse_codex_file(
             ctx.scan.diagnostics.timestamp_fallbacks += 1;
         }
 
-        let explicit_model = codex_model_from_value(&value, None);
+        let explicit_model =
+            with_reasoning_state(codex_model_from_value(&value, None), &current_reasoning);
         if let Some(model_name) = explicit_model
             .as_ref()
             .and_then(|model| {
@@ -1656,11 +1727,14 @@ fn parse_codex_file(
         let model_explicit = explicit_model.is_some();
         let mut model_inferred = false;
         let model = explicit_model.or_else(|| {
-            current_model.as_deref().map(model_info).or_else(|| {
-                model_inferred = true;
-                current_model_is_fallback = true;
-                Some(model_info("gpt-5"))
-            })
+            current_model
+                .as_deref()
+                .map(|model| model_info_with_reasoning(model, &current_reasoning))
+                .or_else(|| {
+                    model_inferred = true;
+                    current_model_is_fallback = true;
+                    Some(model_info_with_reasoning("gpt-5", &current_reasoning))
+                })
         });
         if current_model_is_fallback && !model_inferred {
             model_inferred = true;
@@ -3151,12 +3225,88 @@ fn model_from_nested_value(value: &Value, fallback: Option<&str>) -> Option<Mode
     Some(model_info(model))
 }
 
+fn claude_reasoning_state_from_value(value: &Value) -> ModelReasoningState {
+    let max_thinking_tokens = [
+        value.pointer("/thinkingMetadata/maxThinkingTokens"),
+        value.pointer("/thinking_metadata/maxThinkingTokens"),
+        value.pointer("/thinking_metadata/max_thinking_tokens"),
+        value.pointer("/message/thinkingMetadata/maxThinkingTokens"),
+        value.pointer("/message/thinking_metadata/maxThinkingTokens"),
+        value.pointer("/message/thinking_metadata/max_thinking_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(value_as_u64);
+
+    ModelReasoningState {
+        level: None,
+        raw: max_thinking_tokens.map(|value| value.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ModelReasoningState {
+    level: Option<ReasoningLevel>,
+    raw: Option<String>,
+}
+
+impl ModelReasoningState {
+    fn from_raw(value: Option<&str>) -> Self {
+        let raw = value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        Self {
+            level: raw.as_deref().and_then(ReasoningLevel::parse),
+            raw,
+        }
+    }
+}
+
+fn apply_reasoning_state(model: &mut ModelInfo, reasoning: &ModelReasoningState) {
+    if model.reasoning_level.is_none() {
+        model.reasoning_level = reasoning.level;
+    }
+    if model.reasoning_level_raw.is_none() {
+        model.reasoning_level_raw = reasoning.raw.clone();
+    }
+}
+
+fn model_info_with_reasoning(model: &str, reasoning: &ModelReasoningState) -> ModelInfo {
+    let mut info = model_info(model);
+    apply_reasoning_state(&mut info, reasoning);
+    info
+}
+
+fn with_reasoning_state(
+    model: Option<ModelInfo>,
+    reasoning: &ModelReasoningState,
+) -> Option<ModelInfo> {
+    model.map(|mut model| {
+        apply_reasoning_state(&mut model, reasoning);
+        model
+    })
+}
+
+fn reasoning_state_from_model(model: &ModelInfo) -> ModelReasoningState {
+    ModelReasoningState {
+        level: model.reasoning_level,
+        raw: model.reasoning_level_raw.clone(),
+    }
+}
+
+fn same_model_identity(left: Option<&ModelInfo>, right: &ModelInfo) -> bool {
+    left.and_then(|model| model.provider_model_id.as_deref()) == right.provider_model_id.as_deref()
+}
+
 fn model_info(model: &str) -> ModelInfo {
     let normalized = normalize_model_name(model);
     ModelInfo {
         name: Some(model.to_string()),
         normalized_name: Some(normalized),
         provider_model_id: Some(model.to_string()),
+        reasoning_level: None,
+        reasoning_level_raw: None,
     }
 }
 
@@ -3166,18 +3316,17 @@ fn opencode_model_info(value: &str) -> Option<ModelInfo> {
         return None;
     }
     if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
-        let label = opencode_model_label_from_value(&json).unwrap_or_else(|| trimmed.to_string());
-        return Some(ModelInfo {
-            name: Some(label.clone()),
-            normalized_name: Some(normalize_provider_qualified_model_name(&label)),
-            provider_model_id: Some(label),
+        return opencode_model_info_from_value(&json).or_else(|| {
+            Some(opencode_named_model_info(
+                trimmed,
+                &ModelReasoningState::default(),
+            ))
         });
     }
-    Some(ModelInfo {
-        name: Some(trimmed.to_string()),
-        normalized_name: Some(normalize_provider_qualified_model_name(trimmed)),
-        provider_model_id: Some(trimmed.to_string()),
-    })
+    Some(opencode_named_model_info(
+        trimmed,
+        &ModelReasoningState::default(),
+    ))
 }
 
 fn normalize_provider_qualified_model_name(label: &str) -> String {
@@ -3187,26 +3336,99 @@ fn normalize_provider_qualified_model_name(label: &str) -> String {
         .unwrap_or_else(|| normalize_model_name(label))
 }
 
+fn opencode_model_info_from_value(value: &Value) -> Option<ModelInfo> {
+    let label = opencode_model_label_from_value(value)?;
+    let reasoning = opencode_reasoning_state_from_value(value);
+    Some(opencode_named_model_info(&label, &reasoning))
+}
+
+fn opencode_named_model_info(label: &str, reasoning: &ModelReasoningState) -> ModelInfo {
+    ModelInfo {
+        name: Some(label.to_string()),
+        normalized_name: Some(normalize_provider_qualified_model_name(label)),
+        provider_model_id: Some(label.to_string()),
+        reasoning_level: reasoning.level,
+        reasoning_level_raw: reasoning.raw.clone(),
+    }
+}
+
 fn opencode_model_label_from_value(value: &Value) -> Option<String> {
-    let provider = value
-        .get("providerID")
-        .or_else(|| value.get("provider_id"))
-        .and_then(Value::as_str);
-    let model = value
-        .get("modelID")
-        .or_else(|| value.get("id"))
-        .or_else(|| value.get("model"))
-        .and_then(Value::as_str)?;
+    let provider = opencode_provider_id_from_value(value);
+    let model = opencode_model_id_from_value(value)?;
     Some(
         provider
             .map(|provider| format!("{provider}/{model}"))
-            .unwrap_or_else(|| model.to_string()),
+            .unwrap_or(model),
     )
 }
 
 fn opencode_message_model_info(value: &Value) -> Option<ModelInfo> {
-    let label = opencode_model_label_from_value(value)?;
-    opencode_model_info(&label)
+    opencode_model_info_from_value(value)
+}
+
+fn opencode_provider_id_from_value(value: &Value) -> Option<&str> {
+    value
+        .get("providerID")
+        .or_else(|| value.get("provider_id"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value.get("model").and_then(|model| {
+                model
+                    .get("providerID")
+                    .or_else(|| model.get("provider_id"))
+                    .and_then(Value::as_str)
+            })
+        })
+}
+
+fn opencode_model_id_from_value(value: &Value) -> Option<String> {
+    value
+        .get("modelID")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            value
+                .get("model")
+                .and_then(opencode_model_id_from_model_value)
+        })
+        .or_else(|| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn opencode_model_id_from_model_value(value: &Value) -> Option<String> {
+    value
+        .get("modelID")
+        .or_else(|| value.get("id"))
+        .or_else(|| value.get("model"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn opencode_reasoning_state_from_value(value: &Value) -> ModelReasoningState {
+    ModelReasoningState::from_raw(value.get("variant").and_then(Value::as_str).or_else(|| {
+        value
+            .get("model")
+            .and_then(|model| model.get("variant"))
+            .and_then(Value::as_str)
+    }))
+}
+
+fn opencode_message_has_variant(value: &Value) -> bool {
+    opencode_reasoning_state_from_value(value).raw.is_some()
+}
+
+fn codex_reasoning_state_from_value(value: &Value) -> ModelReasoningState {
+    ModelReasoningState::from_raw(
+        value
+            .pointer("/payload/collaboration_mode/settings/reasoning_effort")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/payload/effort").and_then(Value::as_str)),
+    )
 }
 
 fn opencode_message_usage_counts(value: &Value) -> UsageCounts {
@@ -5908,7 +6130,168 @@ mod tests {
     }
 
     #[test]
-    fn opencode_does_not_recover_single_model_when_usage_bearing_messages_lack_model_ids() {
+    fn codex_turn_context_reasoning_effort_propagates_with_precedence_and_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let mut file = File::create(sessions.join("reasoning.jsonl")).expect("fixture");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:00Z","type":"turn_context","payload":{{"model":"gpt-5","collaboration_mode":{{"settings":{{"reasoning_effort":"high"}}}},"effort":"low"}}}}"#
+        )
+        .expect("write first context");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}},"total_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}}}}}}}}"#
+        )
+        .expect("write first usage");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:02Z","type":"turn_context","payload":{{"model":"gpt-5.4","effort":"xhigh"}}}}"#
+        )
+        .expect("write second context");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-01T00:00:03Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":60,"cached_input_tokens":10,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":95}},"total_token_usage":{{"input_tokens":140,"cached_input_tokens":30,"output_tokens":60,"reasoning_output_tokens":15,"total_tokens":215}}}}}}}}"#
+        )
+        .expect("write second usage");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(
+            scan.events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            Some(ReasoningLevel::High)
+        );
+        assert_eq!(
+            scan.events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level_raw.as_deref()),
+            Some("high")
+        );
+        assert_eq!(
+            scan.events[1]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            Some(ReasoningLevel::Xhigh)
+        );
+        assert_eq!(
+            scan.events[1]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level_raw.as_deref()),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn claude_adapter_does_not_infer_reasoning_level_from_thinking_model_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let projects = dir.path().join("projects/workspace");
+        std::fs::create_dir_all(&projects).expect("projects");
+        std::fs::write(
+            projects.join("session.jsonl"),
+            serde_json::json!({
+                "timestamp": "2026-05-01T00:00:00Z",
+                "sessionId": "session-thinking",
+                "model": "claude-opus-4-5-thinking",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20
+                }
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write session");
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let model = scan.events[0].model.as_ref().expect("model");
+        assert_eq!(model.name.as_deref(), Some("claude-opus-4-5-thinking"));
+        assert_eq!(model.reasoning_level, None);
+        assert_eq!(model.reasoning_level_raw, None);
+    }
+
+    #[test]
+    fn claude_carries_max_thinking_tokens_forward_as_raw_reasoning_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let projects = dir.path().join("projects/workspace");
+        std::fs::create_dir_all(&projects).expect("projects");
+        std::fs::write(
+            projects.join("session.jsonl"),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-01T00:00:00Z",
+                    "sessionId": "session-thinking-budget",
+                    "type": "user",
+                    "thinkingMetadata": {
+                        "maxThinkingTokens": 31999
+                    },
+                    "message": {
+                        "role": "user",
+                        "content": "hello"
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp": "2026-05-01T00:00:02Z",
+                    "sessionId": "session-thinking-budget",
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-opus-4-5-thinking",
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 20
+                        }
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .expect("write session");
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let model = scan.events[0].model.as_ref().expect("model");
+        assert_eq!(model.name.as_deref(), Some("claude-opus-4-5-thinking"));
+        assert_eq!(model.reasoning_level, None);
+        assert_eq!(model.reasoning_level_raw.as_deref(), Some("31999"));
+    }
+
+    #[test]
+    fn opencode_recovers_single_model_from_prior_message_context() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("opencode.db");
         let connection = Connection::open(&db_path).expect("db");
@@ -6009,8 +6392,13 @@ mod tests {
         let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
 
         assert_eq!(scan.events.len(), 2);
-        assert!(scan.events.iter().any(|event| event.model.is_some()));
-        assert!(scan.events.iter().any(|event| event.model.is_none()));
+        assert!(scan.events.iter().all(|event| {
+            event
+                .model
+                .as_ref()
+                .and_then(|model| model.provider_model_id.as_deref())
+                == Some("google/antigravity-claude-opus-4-5-thinking")
+        }));
     }
 
     #[test]
@@ -6344,6 +6732,1032 @@ mod tests {
     }
 
     #[test]
+    fn opencode_variant_only_residual_keeps_recovered_session_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_variant_only",
+                    "Variant aggregate only",
+                    Option::<String>::None,
+                    0.0_f64,
+                    90_i64,
+                    20_i64,
+                    5_i64,
+                    10_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        for (id, data) in [
+            (
+                "msg_user_a",
+                serde_json::json!({
+                    "role": "user",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.5",
+                        "variant": "high"
+                    }
+                }),
+            ),
+            (
+                "msg_assistant_a",
+                serde_json::json!({
+                    "role": "assistant",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.5"
+                    }
+                }),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        "ses_variant_only",
+                        1_767_225_600_000_i64,
+                        1_767_225_660_000_i64,
+                        data.to_string(),
+                    ],
+                )
+                .expect("insert message");
+        }
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let event = &scan.events[0];
+        let model = event.model.as_ref().expect("model");
+        assert_eq!(model.provider_model_id.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(model.reasoning_level, Some(ReasoningLevel::High));
+        assert_eq!(model.reasoning_level_raw.as_deref(), Some("high"));
+        assert!(
+            !event
+                .parse_evidence
+                .as_ref()
+                .expect("evidence")
+                .model_inferred
+        );
+    }
+
+    #[test]
+    fn opencode_variant_only_residual_falls_back_to_session_row_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_variant_session_model",
+                    "Variant session row model",
+                    "openai/gpt-5.5",
+                    0.0_f64,
+                    90_i64,
+                    20_i64,
+                    5_i64,
+                    10_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "msg_user_a",
+                    "ses_variant_session_model",
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    serde_json::json!({
+                        "role": "user",
+                        "variant": "high"
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert message");
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let event = &scan.events[0];
+        let model = event.model.as_ref().expect("model");
+        assert_eq!(model.provider_model_id.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(model.reasoning_level, None);
+        assert_eq!(model.reasoning_level_raw, None);
+        assert!(
+            !event
+                .parse_evidence
+                .as_ref()
+                .expect("evidence")
+                .model_inferred
+        );
+    }
+
+    #[test]
+    fn opencode_variant_residual_with_missing_message_model_uses_session_row_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_variant_missing_model",
+                    "Variant missing message model",
+                    "openai/gpt-5.5",
+                    0.0_f64,
+                    90_i64,
+                    20_i64,
+                    5_i64,
+                    10_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        for (id, data) in [
+            (
+                "msg_user_a",
+                serde_json::json!({
+                    "role": "user",
+                    "variant": "high"
+                }),
+            ),
+            (
+                "msg_assistant_a",
+                serde_json::json!({
+                    "role": "assistant",
+                    "tokens": {
+                        "input": 60,
+                        "output": 10,
+                        "reasoning": 5,
+                        "cache": { "read": 0, "write": 0 }
+                    }
+                }),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        "ses_variant_missing_model",
+                        1_767_225_600_000_i64,
+                        1_767_225_660_000_i64,
+                        data.to_string(),
+                    ],
+                )
+                .expect("insert message");
+        }
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let event = &scan.events[0];
+        let model = event.model.as_ref().expect("model");
+        assert_eq!(model.provider_model_id.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(model.reasoning_level, None);
+        assert_eq!(model.reasoning_level_raw, None);
+        assert!(
+            !event
+                .parse_evidence
+                .as_ref()
+                .expect("evidence")
+                .model_inferred
+        );
+    }
+
+    #[test]
+    fn opencode_ambiguous_usage_still_detects_late_variant_conflict_for_residuals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_variant_ambiguous_conflict",
+                    "Variant ambiguous conflict",
+                    Option::<String>::None,
+                    0.0_f64,
+                    100_i64,
+                    20_i64,
+                    5_i64,
+                    10_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        for (id, created_at, data) in [
+            (
+                "msg_user_low",
+                1_767_225_600_000_i64,
+                serde_json::json!({
+                    "role": "user",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.5",
+                        "variant": "low"
+                    }
+                }),
+            ),
+            (
+                "msg_assistant_usage",
+                1_767_225_601_000_i64,
+                serde_json::json!({
+                    "role": "assistant",
+                    "tokens": {
+                        "input": 60,
+                        "output": 10,
+                        "reasoning": 5,
+                        "cache": { "read": 0, "write": 0 }
+                    }
+                }),
+            ),
+            (
+                "msg_user_high",
+                1_767_225_602_000_i64,
+                serde_json::json!({
+                    "role": "user",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.5",
+                        "variant": "high"
+                    }
+                }),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        "ses_variant_ambiguous_conflict",
+                        created_at,
+                        created_at,
+                        data.to_string(),
+                    ],
+                )
+                .expect("insert message");
+        }
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        let reconstructed = scan
+            .events
+            .iter()
+            .find(|event| event.usage.input_tokens == Some(60))
+            .expect("reconstructed event");
+        let reconstructed_model = reconstructed.model.as_ref().expect("reconstructed model");
+        assert_eq!(
+            reconstructed_model.provider_model_id.as_deref(),
+            Some("openai/gpt-5.5")
+        );
+        assert_eq!(
+            reconstructed_model.reasoning_level,
+            Some(ReasoningLevel::Low)
+        );
+        assert_eq!(
+            reconstructed_model.reasoning_level_raw.as_deref(),
+            Some("low")
+        );
+
+        let residual = scan
+            .events
+            .iter()
+            .find(|event| event.usage.input_tokens == Some(40))
+            .expect("residual event");
+        assert!(residual.model.is_none());
+        assert!(
+            residual
+                .parse_evidence
+                .as_ref()
+                .expect("evidence")
+                .model_inferred
+        );
+    }
+
+    #[test]
+    fn opencode_variant_only_residual_stays_model_less_when_variants_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_variant_conflict",
+                    "Variant conflict aggregate only",
+                    Option::<String>::None,
+                    0.0_f64,
+                    90_i64,
+                    20_i64,
+                    5_i64,
+                    10_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        for (id, data) in [
+            (
+                "msg_user_a",
+                serde_json::json!({
+                    "role": "user",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.5",
+                        "variant": "low"
+                    }
+                }),
+            ),
+            (
+                "msg_user_b",
+                serde_json::json!({
+                    "role": "user",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.5",
+                        "variant": "high"
+                    }
+                }),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        "ses_variant_conflict",
+                        1_767_225_600_000_i64,
+                        1_767_225_660_000_i64,
+                        data.to_string(),
+                    ],
+                )
+                .expect("insert message");
+        }
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let event = &scan.events[0];
+        assert!(event.model.is_none());
+        assert!(
+            event
+                .parse_evidence
+                .as_ref()
+                .expect("evidence")
+                .model_inferred
+        );
+    }
+
+    #[test]
+    fn opencode_variant_sessions_reconstruct_usage_from_nested_model_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_variant",
+                    "Variant session",
+                    Option::<String>::None,
+                    0.0_f64,
+                    90_i64,
+                    20_i64,
+                    9_i64,
+                    0_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        for (id, created_at, data) in [
+            (
+                "msg_user_a",
+                1_767_225_600_000_i64,
+                serde_json::json!({
+                    "role": "user",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.4-mini",
+                        "variant": "low"
+                    }
+                }),
+            ),
+            (
+                "msg_assistant_a",
+                1_767_225_601_000_i64,
+                serde_json::json!({
+                    "role": "assistant",
+                    "tokens": {
+                        "input": 60,
+                        "output": 10,
+                        "reasoning": 4,
+                        "cache": { "read": 0, "write": 0 }
+                    }
+                }),
+            ),
+            (
+                "msg_user_b",
+                1_767_225_602_000_i64,
+                serde_json::json!({
+                    "role": "user",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.5",
+                        "variant": "high"
+                    }
+                }),
+            ),
+            (
+                "msg_assistant_b",
+                1_767_225_603_000_i64,
+                serde_json::json!({
+                    "role": "assistant",
+                    "tokens": {
+                        "input": 30,
+                        "output": 10,
+                        "reasoning": 5,
+                        "cache": { "read": 0, "write": 0 }
+                    }
+                }),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![id, "ses_variant", created_at, created_at, data.to_string(),],
+                )
+                .expect("insert message");
+        }
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        assert!(scan.events.iter().all(|event| event.model.is_some()));
+        assert!(scan.events.iter().any(|event| {
+            event
+                .model
+                .as_ref()
+                .and_then(|model| model.provider_model_id.as_deref())
+                == Some("openai/gpt-5.4-mini")
+                && event.model.as_ref().and_then(|model| model.reasoning_level)
+                    == Some(ReasoningLevel::Low)
+        }));
+        assert!(scan.events.iter().any(|event| {
+            event
+                .model
+                .as_ref()
+                .and_then(|model| model.provider_model_id.as_deref())
+                == Some("openai/gpt-5.5")
+                && event.model.as_ref().and_then(|model| model.reasoning_level)
+                    == Some(ReasoningLevel::High)
+        }));
+    }
+
+    #[test]
+    fn opencode_model_switch_without_variant_clears_inherited_reasoning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_switch",
+                    "Switch session",
+                    Option::<String>::None,
+                    0.0_f64,
+                    100_i64,
+                    20_i64,
+                    5_i64,
+                    0_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        for (id, created_at, data) in [
+            (
+                "msg_user_variant",
+                1_767_225_600_000_i64,
+                serde_json::json!({
+                    "role": "user",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.4-mini",
+                        "variant": "low"
+                    }
+                }),
+            ),
+            (
+                "msg_assistant_same",
+                1_767_225_601_000_i64,
+                serde_json::json!({
+                    "role": "assistant",
+                    "tokens": {
+                        "input": 60,
+                        "output": 10,
+                        "reasoning": 5,
+                        "cache": { "read": 0, "write": 0 }
+                    }
+                }),
+            ),
+            (
+                "msg_assistant_switch",
+                1_767_225_602_000_i64,
+                serde_json::json!({
+                    "role": "assistant",
+                    "providerID": "openai",
+                    "modelID": "gpt-5.5",
+                    "tokens": {
+                        "input": 40,
+                        "output": 10,
+                        "reasoning": 0,
+                        "cache": { "read": 0, "write": 0 }
+                    }
+                }),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![id, "ses_switch", created_at, created_at, data.to_string(),],
+                )
+                .expect("insert message");
+        }
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        let retained = scan
+            .events
+            .iter()
+            .find(|event| {
+                event
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.provider_model_id.as_deref())
+                    == Some("openai/gpt-5.4-mini")
+            })
+            .expect("retained event");
+        assert_eq!(
+            retained
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            Some(ReasoningLevel::Low)
+        );
+        let cleared = scan
+            .events
+            .iter()
+            .find(|event| {
+                event
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.provider_model_id.as_deref())
+                    == Some("openai/gpt-5.5")
+            })
+            .expect("cleared event");
+        assert_eq!(
+            cleared
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            None
+        );
+        assert_eq!(
+            cleared
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level_raw.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_same_model_without_variant_clears_inherited_reasoning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("opencode.db");
+        let connection = Connection::open(&db_path).expect("db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT,
+                    cost REAL,
+                    tokens_input INTEGER NOT NULL,
+                    tokens_output INTEGER NOT NULL,
+                    tokens_reasoning INTEGER NOT NULL,
+                    tokens_cache_read INTEGER NOT NULL,
+                    tokens_cache_write INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    directory TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    "ses_same_model",
+                    "Same model session",
+                    Option::<String>::None,
+                    0.0_f64,
+                    120_i64,
+                    25_i64,
+                    5_i64,
+                    0_i64,
+                    0_i64,
+                    1_767_225_600_000_i64,
+                    1_767_225_660_000_i64,
+                    dir.path().to_string_lossy().to_string(),
+                ],
+            )
+            .expect("insert session");
+        for (id, created_at, data) in [
+            (
+                "msg_user_variant",
+                1_767_225_600_000_i64,
+                serde_json::json!({
+                    "role": "user",
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.5",
+                        "variant": "high"
+                    }
+                }),
+            ),
+            (
+                "msg_assistant_inherit",
+                1_767_225_601_000_i64,
+                serde_json::json!({
+                    "role": "assistant",
+                    "tokens": {
+                        "input": 50,
+                        "output": 10,
+                        "reasoning": 5,
+                        "cache": { "read": 0, "write": 0 }
+                    }
+                }),
+            ),
+            (
+                "msg_assistant_clear",
+                1_767_225_602_000_i64,
+                serde_json::json!({
+                    "role": "assistant",
+                    "providerID": "openai",
+                    "modelID": "gpt-5.5",
+                    "tokens": {
+                        "input": 70,
+                        "output": 15,
+                        "reasoning": 0,
+                        "cache": { "read": 0, "write": 0 }
+                    }
+                }),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        "ses_same_model",
+                        created_at,
+                        created_at,
+                        data.to_string(),
+                    ],
+                )
+                .expect("insert message");
+        }
+        let source = SourceLocation::local_adapter(
+            OPENCODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        let inherited = scan
+            .events
+            .iter()
+            .find(|event| event.usage.input_tokens == Some(50))
+            .expect("inherited event");
+        assert_eq!(
+            inherited
+                .model
+                .as_ref()
+                .and_then(|model| model.provider_model_id.as_deref()),
+            Some("openai/gpt-5.5")
+        );
+        assert_eq!(
+            inherited
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            Some(ReasoningLevel::High)
+        );
+        assert_eq!(
+            inherited
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level_raw.as_deref()),
+            Some("high")
+        );
+
+        let cleared = scan
+            .events
+            .iter()
+            .find(|event| event.usage.input_tokens == Some(70))
+            .expect("cleared event");
+        assert_eq!(
+            cleared
+                .model
+                .as_ref()
+                .and_then(|model| model.provider_model_id.as_deref()),
+            Some("openai/gpt-5.5")
+        );
+        assert_eq!(
+            cleared
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            None
+        );
+        assert_eq!(
+            cleared
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level_raw.as_deref()),
+            None
+        );
+    }
+
+    #[test]
     fn opencode_model_info_uses_model_name_for_stats_and_preserves_provider_identity() {
         let foo = opencode_model_info(r#"{"id":"model-x","providerID":"foo"}"#).expect("foo");
         let bar = opencode_model_info(r#"{"id":"model-x","providerID":"bar"}"#).expect("bar");
@@ -6354,6 +7768,19 @@ mod tests {
         assert_eq!(bar.provider_model_id.as_deref(), Some("bar/model-x"));
         assert_eq!(foo.normalized_name.as_deref(), Some("model-x"));
         assert_eq!(bar.normalized_name.as_deref(), Some("model-x"));
+        assert_eq!(foo.reasoning_level, None);
+        assert_eq!(bar.reasoning_level_raw, None);
+    }
+
+    #[test]
+    fn opencode_model_info_maps_variant_to_reasoning_fields() {
+        let model =
+            opencode_model_info(r#"{"providerID":"openai","modelID":"gpt-5.5","variant":"xhigh"}"#)
+                .expect("model");
+
+        assert_eq!(model.provider_model_id.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(model.reasoning_level, Some(ReasoningLevel::Xhigh));
+        assert_eq!(model.reasoning_level_raw.as_deref(), Some("xhigh"));
     }
 
     #[test]

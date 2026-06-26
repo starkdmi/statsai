@@ -411,6 +411,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             input_tokens: Some(1_000_000),
@@ -432,6 +434,8 @@ mod tests {
             name: Some("xai/grok-build-0.1".to_string()),
             normalized_name: Some("xai/grok-build-0.1".to_string()),
             provider_model_id: Some("xai/grok-build-0.1".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             input_tokens: Some(1_000_000),
@@ -454,6 +458,8 @@ mod tests {
             name: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
             normalized_name: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
             provider_model_id: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             input_tokens: Some(1_000_000),
@@ -477,6 +483,8 @@ mod tests {
             name: Some("claude-opus-4-6-thinking".to_string()),
             normalized_name: Some("claude-opus-4-6".to_string()),
             provider_model_id: Some("claude-opus-4-6-thinking".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             input_tokens: Some(1_000_000),
@@ -500,6 +508,8 @@ mod tests {
             name: Some("claude-opus-4".to_string()),
             normalized_name: Some("claude-opus-4".to_string()),
             provider_model_id: Some("claude-opus-4".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             input_tokens: Some(1_000_000),
@@ -523,6 +533,8 @@ mod tests {
             name: Some("openai/gpt-5.2-codex".to_string()),
             normalized_name: Some("openai/gpt-5.2-codex".to_string()),
             provider_model_id: Some("openai/gpt-5.2-codex".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             input_tokens: Some(1_000_000),
@@ -542,6 +554,8 @@ mod tests {
             name: Some("openai/gpt-5.4".to_string()),
             normalized_name: Some("openai/gpt-5.4".to_string()),
             provider_model_id: Some("openai/gpt-5.4".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let cost = estimate_cost("opencode", Some(&model), &usage);
 
@@ -558,6 +572,8 @@ mod tests {
             name: Some("unknown-model".to_string()),
             normalized_name: Some("unknown-model".to_string()),
             provider_model_id: Some("unknown-model".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             total_tokens: Some(100),
@@ -584,6 +600,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             input_tokens: Some(200_000),
@@ -602,6 +620,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             output_tokens: Some(100_000),
@@ -618,6 +638,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         };
         let usage = UsageCounts {
             input_tokens: Some(1_000_000),

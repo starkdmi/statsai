@@ -23,7 +23,7 @@ use statsai_core::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-const SYNC_ROLLUP_SUMMARY_VERSION: &str = "9";
+const SYNC_ROLLUP_SUMMARY_VERSION: &str = "10";
 
 fn summary_sync_payload_hash(summary: &UsageSummary) -> Result<String> {
     let payload = serde_json::to_string(&sanitize_summary_for_sync(summary.clone()))?;
@@ -643,8 +643,9 @@ impl Store {
         let event = event_with_valid_project(event);
         let fingerprint = event_fingerprint(&event);
         if let Some(existing_id) = self.find_semantic_duplicate_event_id(&event, &fingerprint)? {
-            let mut refreshed = event.clone();
-            refreshed.event_id.0 = existing_id;
+            let existing = self.event_by_id(&existing_id)?;
+            let refreshed =
+                refreshed_duplicate_event(existing.as_ref(), &event, existing_id.as_str());
             let dirty_keys = self.update_event_payload(&refreshed)?;
             self.refresh_sync_rollups_for_keys(&dirty_keys)?;
             return Ok(false);
@@ -671,7 +672,10 @@ impl Store {
             ],
         )?;
         if changed == 0 {
-            let dirty_keys = self.update_event_payload(&event)?;
+            let existing = self.event_by_id(&event.event_id.0)?;
+            let refreshed =
+                refreshed_duplicate_event(existing.as_ref(), &event, event.event_id.0.as_str());
+            let dirty_keys = self.update_event_payload(&refreshed)?;
             self.refresh_sync_rollups_for_keys(&dirty_keys)?;
         } else {
             self.refresh_sync_rollups_for_keys(&BTreeSet::from([sync_rollup_bucket_key(&event)]))?;
@@ -685,20 +689,51 @@ impl Store {
             .map(event_with_valid_project)
             .collect::<Vec<_>>();
         let fingerprints: Vec<String> = events.iter().map(event_fingerprint).collect();
-        let conflict_map = self.batch_load_conflicts(&fingerprints)?;
+        let conflict_keys: Vec<ConflictLookupKey> = events
+            .iter()
+            .zip(fingerprints.iter())
+            .map(|(event, fingerprint)| conflict_lookup_key(event, fingerprint))
+            .collect();
+        let mut conflict_map = self.batch_load_conflicts(&conflict_keys)?;
 
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             let mut inserted = 0u64;
             let mut dirty_keys = BTreeSet::new();
             for (index, event) in events.iter().enumerate() {
-                let fingerprint = &fingerprints[index];
-                if let Some(existing_id) = conflict_map.get(fingerprint) {
-                    let mut refreshed = event.clone();
-                    refreshed.event_id.0 = existing_id.clone();
+                let matched_event_id =
+                    conflict_map
+                        .get(&conflict_keys[index])
+                        .and_then(|candidates| {
+                            exact_or_semantic_conflict(Some(candidates.as_slice()), event)
+                                .map(|candidate| candidate.event_id.clone())
+                        });
+                if let Some(existing_id) = matched_event_id {
+                    let existing = conflict_map
+                        .get(&conflict_keys[index])
+                        .and_then(|candidates| {
+                            candidates
+                                .iter()
+                                .find(|candidate| candidate.event_id == existing_id)
+                        })
+                        .expect("matched conflict candidate");
+                    let refreshed = refreshed_duplicate_event(
+                        Some(&existing.event),
+                        event,
+                        existing_id.as_str(),
+                    );
                     dirty_keys.extend(self.update_event_payload(&refreshed)?);
+                    if let Some(candidates) = conflict_map.get_mut(&conflict_keys[index]) {
+                        if let Some(candidate) = candidates
+                            .iter_mut()
+                            .find(|candidate| candidate.event_id == existing_id)
+                        {
+                            candidate.event = refreshed;
+                        }
+                    }
                     continue;
                 }
+                let fingerprint = &fingerprints[index];
                 let outcome = self.insert_event_in_batch(event, fingerprint)?;
                 if outcome.inserted {
                     inserted += 1;
@@ -764,8 +799,9 @@ impl Store {
         fingerprint: &str,
     ) -> Result<EventInsertOutcome> {
         if let Some(existing_id) = self.find_semantic_duplicate_event_id(event, fingerprint)? {
-            let mut refreshed = event.clone();
-            refreshed.event_id.0 = existing_id;
+            let existing = self.event_by_id(&existing_id)?;
+            let refreshed =
+                refreshed_duplicate_event(existing.as_ref(), event, existing_id.as_str());
             return Ok(EventInsertOutcome {
                 inserted: false,
                 dirty_keys: self.update_event_payload(&refreshed)?,
@@ -793,9 +829,12 @@ impl Store {
             ],
         )?;
         if changed == 0 {
+            let existing = self.event_by_id(&event.event_id.0)?;
+            let refreshed =
+                refreshed_duplicate_event(existing.as_ref(), event, event.event_id.0.as_str());
             return Ok(EventInsertOutcome {
                 inserted: false,
-                dirty_keys: self.update_event_payload(event)?,
+                dirty_keys: self.update_event_payload(&refreshed)?,
             });
         }
         Ok(EventInsertOutcome {
@@ -806,38 +845,68 @@ impl Store {
 
     fn batch_load_conflicts(
         &self,
-        fingerprints: &[String],
-    ) -> Result<std::collections::HashMap<String, String>> {
+        keys: &[ConflictLookupKey],
+    ) -> Result<std::collections::HashMap<ConflictLookupKey, Vec<ConflictCandidate>>> {
         let mut conflicts = std::collections::HashMap::new();
-        if fingerprints.is_empty() {
+        if keys.is_empty() {
             return Ok(conflicts);
         }
 
-        const CHUNK_SIZE: usize = 500;
-        for chunk in fingerprints.chunks(CHUNK_SIZE) {
+        // Keep the query within SQLite's common 999-parameter limit:
+        // each lookup uses provider, source_id, and semantic_fingerprint.
+        const CHUNK_SIZE: usize = 300;
+        for chunk in keys.chunks(CHUNK_SIZE) {
             let placeholders: Vec<String> = chunk
                 .iter()
                 .enumerate()
-                .map(|(i, _)| format!("?{}", i + 1))
+                .map(|(i, _)| {
+                    let base = (i * 3) + 1;
+                    format!(
+                        "(provider = ?{base} AND source_id = ?{} AND semantic_fingerprint = ?{})",
+                        base + 1,
+                        base + 2
+                    )
+                })
                 .collect();
             let sql = format!(
-                "SELECT event_id, semantic_fingerprint FROM usage_events WHERE semantic_fingerprint IN ({})",
-                placeholders.join(",")
+                "SELECT provider, source_id, event_id, semantic_fingerprint, payload \
+                 FROM usage_events WHERE {}",
+                placeholders.join(" OR ")
             );
 
             let mut stmt = self.conn.prepare(&sql)?;
             let params: Vec<&dyn rusqlite::types::ToSql> = chunk
                 .iter()
-                .map(|fp| fp as &dyn rusqlite::types::ToSql)
+                .flat_map(|key| {
+                    [
+                        &key.provider as &dyn rusqlite::types::ToSql,
+                        &key.source_id as &dyn rusqlite::types::ToSql,
+                        &key.fingerprint as &dyn rusqlite::types::ToSql,
+                    ]
+                })
                 .collect();
 
             let rows = stmt.query_map(params.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
             })?;
 
             for row in rows {
-                let (event_id, fingerprint) = row?;
-                conflicts.insert(fingerprint, event_id);
+                let (provider, source_id, event_id, fingerprint, payload) = row?;
+                let event: UsageEvent = serde_json::from_str(&payload)?;
+                conflicts
+                    .entry(ConflictLookupKey {
+                        provider,
+                        source_id,
+                        fingerprint,
+                    })
+                    .or_insert_with(Vec::new)
+                    .push(ConflictCandidate { event_id, event });
             }
         }
         Ok(conflicts)
@@ -3630,10 +3699,16 @@ struct SyncRollupModelTotals {
 
 fn sync_rollup_model_key(model: &ModelInfo) -> String {
     format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         model.normalized_name.as_deref().unwrap_or(""),
         model.provider_model_id.as_deref().unwrap_or(""),
-        model.name.as_deref().unwrap_or("")
+        model.name.as_deref().unwrap_or(""),
+        model
+            .reasoning_level
+            .as_ref()
+            .map(|level| level.as_str())
+            .unwrap_or(""),
+        model.reasoning_level_raw.as_deref().unwrap_or("")
     )
 }
 
@@ -3732,8 +3807,26 @@ fn semantically_same_event(left: &UsageEvent, right: &UsageEvent) -> bool {
         && session_matches
         && project_matches
         && model_key(left) == model_key(right)
+        && reasoning_matches_for_dedupe(left.model.as_ref(), right.model.as_ref())
         && usage_counts_equivalent(&left.provider, &left.usage, &right.usage)
         && left.usage.computed_total() == right.usage.computed_total()
+}
+
+fn reasoning_matches_for_dedupe(left: Option<&ModelInfo>, right: Option<&ModelInfo>) -> bool {
+    optional_value_matches(
+        left.and_then(|model| model.reasoning_level),
+        right.and_then(|model| model.reasoning_level),
+    ) && optional_value_matches(
+        left.and_then(|model| model.reasoning_level_raw.as_deref()),
+        right.and_then(|model| model.reasoning_level_raw.as_deref()),
+    )
+}
+
+fn optional_value_matches<T: PartialEq>(left: Option<T>, right: Option<T>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 fn path_independent_projects_match(left: &UsageEvent, right: &UsageEvent) -> bool {
@@ -3810,6 +3903,67 @@ fn model_key(event: &UsageEvent) -> Option<&str> {
         .and_then(|model| model.normalized_name.as_deref().or(model.name.as_deref()))
 }
 
+#[derive(Debug)]
+struct ConflictCandidate {
+    event_id: String,
+    event: UsageEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConflictLookupKey {
+    provider: String,
+    source_id: String,
+    fingerprint: String,
+}
+
+fn conflict_lookup_key(event: &UsageEvent, fingerprint: &str) -> ConflictLookupKey {
+    ConflictLookupKey {
+        provider: event.provider.clone(),
+        source_id: event.source_id.0.clone(),
+        fingerprint: fingerprint.to_string(),
+    }
+}
+
+fn exact_or_semantic_conflict<'a>(
+    candidates: Option<&'a [ConflictCandidate]>,
+    event: &UsageEvent,
+) -> Option<&'a ConflictCandidate> {
+    let candidates = candidates?;
+    candidates
+        .iter()
+        .find(|candidate| candidate.event_id == event.event_id.0)
+        .or_else(|| {
+            candidates.iter().find_map(|candidate| {
+                semantically_same_event(&candidate.event, event).then_some(candidate)
+            })
+        })
+}
+
+fn refreshed_duplicate_event(
+    existing: Option<&UsageEvent>,
+    incoming: &UsageEvent,
+    existing_id: &str,
+) -> UsageEvent {
+    let mut refreshed = incoming.clone();
+    refreshed.event_id.0 = existing_id.to_string();
+
+    let Some(existing_model) = existing.and_then(|event| event.model.as_ref()) else {
+        return refreshed;
+    };
+    let Some(refreshed_model) = refreshed.model.as_mut() else {
+        return refreshed;
+    };
+
+    if refreshed_model.reasoning_level.is_none() {
+        refreshed_model.reasoning_level = existing_model.reasoning_level;
+    }
+    if refreshed_model.reasoning_level_raw.is_none() {
+        refreshed_model.reasoning_level_raw = existing_model.reasoning_level_raw.clone();
+    }
+
+    refreshed
+}
+
 fn session_hash_for_fingerprint(event: &UsageEvent) -> Option<&str> {
     if uses_path_independent_codex_dedupe(event) {
         None
@@ -3841,8 +3995,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use statsai_core::{
         event_id, summary_id, Confidence, CostInfo, EventSource, LocationOrigin, ModelInfo,
-        ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, SessionInfo, SourceKind,
-        SummaryMetadata, UsageCounts, UsageSummary, USAGE_EVENT_SCHEMA_VERSION,
+        ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, SessionInfo,
+        SourceKind, SummaryMetadata, UsageCounts, UsageSummary, USAGE_EVENT_SCHEMA_VERSION,
         USAGE_SUMMARY_SCHEMA_VERSION,
     };
     use std::path::Path;
@@ -4147,6 +4301,385 @@ mod tests {
     }
 
     #[test]
+    fn refreshes_legacy_reasoning_level_upgrade_without_double_counting() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-reasoning-upgrade"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut old_event = test_store_event(&source, now, "legacy-record");
+        old_event.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        });
+
+        let mut new_event = old_event.clone();
+        new_event.event_id = event_id("codex", &source.source_id, "reasoning-record", None, now);
+        new_event.source.source_record_id = Some("usage_key_reasoning".to_string());
+        new_event.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::Low),
+            reasoning_level_raw: Some("low".to_string()),
+        });
+
+        assert!(store.insert_event(&old_event).expect("insert old"));
+        assert!(!store
+            .insert_event(&new_event)
+            .expect("refresh reasoning upgrade"));
+
+        let events = store.events().expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, old_event.event_id);
+        assert_eq!(
+            events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            Some(ReasoningLevel::Low)
+        );
+        assert_eq!(
+            events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level_raw.as_deref()),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn refresh_duplicate_without_reasoning_does_not_erase_enriched_reasoning() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-reasoning-preserve"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut enriched = test_store_event(&source, now, "enriched-record");
+        enriched.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::Low),
+            reasoning_level_raw: Some("low".to_string()),
+        });
+
+        let mut less_enriched = enriched.clone();
+        less_enriched.event_id = event_id("codex", &source.source_id, "less-enriched", None, now);
+        less_enriched.source.source_record_id = Some("usage_key_less_enriched".to_string());
+        less_enriched.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        });
+
+        assert!(store.insert_event(&enriched).expect("insert enriched"));
+        assert!(!store
+            .insert_event(&less_enriched)
+            .expect("refresh less-enriched duplicate"));
+
+        let events = store.events().expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            Some(ReasoningLevel::Low)
+        );
+        assert_eq!(
+            events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level_raw.as_deref()),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn exact_event_id_refresh_without_reasoning_does_not_erase_enriched_reasoning() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-reasoning-exact-id-preserve"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut enriched = test_store_event(&source, now, "same-record");
+        enriched.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::Medium),
+            reasoning_level_raw: Some("medium".to_string()),
+        });
+
+        let mut less_enriched = enriched.clone();
+        less_enriched.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        });
+
+        assert!(store.insert_event(&enriched).expect("insert enriched"));
+        assert!(!store
+            .insert_event(&less_enriched)
+            .expect("refresh exact-id duplicate"));
+
+        let events = store.events().expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            Some(ReasoningLevel::Medium)
+        );
+        assert_eq!(
+            events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level_raw.as_deref()),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn keeps_explicit_reasoning_levels_as_distinct_events() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-reasoning-distinct"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut low = test_store_event(&source, now, "low-record");
+        low.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::Low),
+            reasoning_level_raw: Some("low".to_string()),
+        });
+
+        let mut high = low.clone();
+        high.event_id = event_id("codex", &source.source_id, "high-record", None, now);
+        high.source.source_record_id = Some("high-record".to_string());
+        high.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::High),
+            reasoning_level_raw: Some("high".to_string()),
+        });
+
+        assert!(store.insert_event(&low).expect("insert low"));
+        assert!(store.insert_event(&high).expect("insert high"));
+
+        let events = store.events().expect("events");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| {
+            event.model.as_ref().and_then(|model| model.reasoning_level)
+                == Some(ReasoningLevel::Low)
+        }));
+        assert!(events.iter().any(|event| {
+            event.model.as_ref().and_then(|model| model.reasoning_level)
+                == Some(ReasoningLevel::High)
+        }));
+    }
+
+    #[test]
+    fn insert_events_keeps_existing_reasoning_variants_distinct() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-reasoning-batch"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut low = test_store_event(&source, now, "low-record");
+        low.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::Low),
+            reasoning_level_raw: Some("low".to_string()),
+        });
+        assert!(store.insert_event(&low).expect("insert low"));
+
+        let mut high = low.clone();
+        high.event_id = event_id("codex", &source.source_id, "high-record", None, now);
+        high.source.source_record_id = Some("high-record".to_string());
+        high.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::High),
+            reasoning_level_raw: Some("high".to_string()),
+        });
+
+        assert_eq!(
+            store.insert_events(&[high]).expect("insert batched high"),
+            1
+        );
+        assert_eq!(store.event_count().expect("count"), 2);
+    }
+
+    #[test]
+    fn insert_events_preserves_existing_reasoning_on_less_enriched_duplicate() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-reasoning-batch-preserve"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut enriched = test_store_event(&source, now, "enriched-record");
+        enriched.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::High),
+            reasoning_level_raw: Some("high".to_string()),
+        });
+        assert!(store.insert_event(&enriched).expect("insert enriched"));
+
+        let mut less_enriched = enriched.clone();
+        less_enriched.event_id = event_id("codex", &source.source_id, "less-enriched", None, now);
+        less_enriched.source.source_record_id = Some("less-enriched".to_string());
+        less_enriched.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        });
+
+        assert_eq!(
+            store
+                .insert_events(&[less_enriched])
+                .expect("insert batched less-enriched duplicate"),
+            0
+        );
+
+        let events = store.events().expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level),
+            Some(ReasoningLevel::High)
+        );
+        assert_eq!(
+            events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.reasoning_level_raw.as_deref()),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn insert_events_refreshes_preloaded_conflicts_before_matching_new_reasoning_variant() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-reasoning-batch-refresh"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut legacy = test_store_event(&source, now, "legacy-record");
+        legacy.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        });
+        assert!(store.insert_event(&legacy).expect("insert legacy"));
+
+        let mut low = legacy.clone();
+        low.event_id = event_id("codex", &source.source_id, "low-record", None, now);
+        low.source.source_record_id = Some("low-record".to_string());
+        low.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::Low),
+            reasoning_level_raw: Some("low".to_string()),
+        });
+
+        let mut high = low.clone();
+        high.event_id = event_id("codex", &source.source_id, "high-record", None, now);
+        high.source.source_record_id = Some("high-record".to_string());
+        high.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::High),
+            reasoning_level_raw: Some("high".to_string()),
+        });
+
+        assert_eq!(
+            store
+                .insert_events(&[low, high])
+                .expect("insert batched variants"),
+            1
+        );
+
+        let events = store.events().expect("events");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| {
+            event.model.as_ref().and_then(|model| model.reasoning_level)
+                == Some(ReasoningLevel::Low)
+        }));
+        assert!(events.iter().any(|event| {
+            event.model.as_ref().and_then(|model| model.reasoning_level)
+                == Some(ReasoningLevel::High)
+        }));
+    }
+
+    #[test]
     fn refreshes_legacy_codex_token_count_duplicate_without_double_counting() {
         let store = Store::in_memory().expect("store");
         let source = statsai_core::SourceLocation::local_adapter(
@@ -4166,6 +4699,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         old_event.parse_evidence = Some(ParseEvidence {
             event_key_version: "semantic_usage_event.v1".to_string(),
@@ -4261,6 +4796,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         old_event.project = None;
         old_event.parse_evidence = Some(ParseEvidence {
@@ -4379,6 +4916,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         old_event.session.ended_at = Some(now + chrono::Duration::seconds(5));
         old_event.session.duration_seconds = Some(5);
@@ -4479,6 +5018,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         old_event.session.ended_at = Some(now + chrono::Duration::seconds(5));
         old_event.session.duration_seconds = Some(5);
@@ -4583,6 +5124,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         old_event.project = Some(legacy_project.clone());
         old_event.parse_evidence = Some(ParseEvidence {
@@ -4711,6 +5254,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         old_event.session.ended_at = Some(now + chrono::Duration::seconds(5));
         old_event.session.duration_seconds = Some(5);
@@ -4792,6 +5337,8 @@ mod tests {
             name: Some("gpt-5-codex".to_string()),
             normalized_name: Some("gpt-5-codex".to_string()),
             provider_model_id: Some("gpt-5-codex".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         old_event.usage = UsageCounts {
             input_tokens: Some(100),
@@ -4998,6 +5545,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         first.cost.provider_reported_usd = Some(11);
 
@@ -5043,6 +5592,8 @@ mod tests {
             name: Some("gpt-4.1".to_string()),
             normalized_name: Some("gpt-4.1".to_string()),
             provider_model_id: Some("gpt-4.1".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         second.cost.provider_reported_usd = Some(22);
 
@@ -5058,6 +5609,58 @@ mod tests {
         assert_eq!(dirty[0].models[0].usage.total_tokens, Some(25));
         assert_eq!(dirty[0].models[1].usage.total_tokens, Some(15));
         assert_eq!(dirty[0].metadata.total_sessions, Some(1));
+    }
+
+    #[test]
+    fn sync_rollups_split_same_model_by_reasoning_level() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-sync-rollups-reasoning"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let day = Utc
+            .with_ymd_and_hms(2026, 5, 29, 9, 0, 0)
+            .single()
+            .expect("day");
+        let mut low = test_store_event(&source, day, "record-low");
+        low.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::Low),
+            reasoning_level_raw: Some("low".to_string()),
+        });
+        low.usage.total_tokens = Some(15);
+
+        let mut high = test_store_event(&source, day + chrono::Duration::hours(1), "record-high");
+        high.model = Some(ModelInfo {
+            name: Some("gpt-5.5".to_string()),
+            normalized_name: Some("gpt-5.5".to_string()),
+            provider_model_id: Some("gpt-5.5".to_string()),
+            reasoning_level: Some(ReasoningLevel::High),
+            reasoning_level_raw: Some("high".to_string()),
+        });
+        high.usage.total_tokens = Some(25);
+
+        assert!(store.insert_event(&low).expect("insert low"));
+        assert!(store.insert_event(&high).expect("insert high"));
+
+        let dirty = store.dirty_sync_rollup_summaries().expect("dirty rollups");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].models.len(), 2);
+        assert!(dirty[0].models.iter().any(|entry| {
+            entry.model.reasoning_level == Some(ReasoningLevel::Low)
+                && entry.usage.total_tokens == Some(15)
+        }));
+        assert!(dirty[0].models.iter().any(|entry| {
+            entry.model.reasoning_level == Some(ReasoningLevel::High)
+                && entry.usage.total_tokens == Some(25)
+        }));
     }
 
     #[test]
@@ -5231,6 +5834,8 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
         });
         main.project = Some(ProjectInfo {
             project_id: "project-shared".to_string(),
@@ -5838,6 +6443,8 @@ mod tests {
                 name: Some("claude-test".to_string()),
                 normalized_name: Some("claude-test".to_string()),
                 provider_model_id: Some("claude-test".to_string()),
+                reasoning_level: None,
+                reasoning_level_raw: None,
             }),
             models: Vec::new(),
             usage: UsageCounts {
