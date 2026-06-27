@@ -627,8 +627,8 @@ fn scan_with_adapters(
     let mut summary_count = 0u64;
     let mut inserted_count = 0u64;
     let mut summary_written_count = 0u64;
-    let mut replaced_event_count = 0u64;
-    let mut replaced_summary_count = 0u64;
+    let mut removed_event_count = 0u64;
+    let mut removed_summary_count = 0u64;
     let mut total_sources = 0u64;
     let mut total_log_rows = 0u64;
     let mut total_diagnostics = ScanDiagnostics::default();
@@ -646,21 +646,47 @@ fn scan_with_adapters(
             }
             let cache_candidates = adapter.scan_candidates(&source)?;
             let file_cache_entries = scan_file_state_entries(&cache_candidates);
-            let pending_file_entries = select_scan_file_entries(
+            let file_reconciliation = select_scan_file_reconciliation(
                 store,
                 &source.source_id,
                 &file_cache_entries,
                 command.replace,
                 command.no_cache,
             )?;
+            let pending_file_entries = file_reconciliation.pending_entries;
+            let removed_file_entries = file_reconciliation.removed_entries;
+            let touched_files =
+                !pending_file_entries.is_empty() || !removed_file_entries.is_empty();
+            let scan_all_current_files = !file_cache_entries.is_empty()
+                && pending_file_entries.len() == file_cache_entries.len();
+            let needs_legacy_full_reconcile = !command.replace
+                && !command.no_cache
+                && touched_files
+                && !scan_all_current_files
+                && store.source_records_missing_scan_file_hashes(&source.source_id)?;
+            let replace_source_records = should_replace_source_records_for_scan(
+                command.replace,
+                command.no_cache,
+                file_cache_entries.len(),
+                pending_file_entries.len(),
+                needs_legacy_full_reconcile,
+            );
+            let should_run_adapter_scan = if replace_source_records {
+                !file_cache_entries.is_empty()
+            } else {
+                !pending_file_entries.is_empty()
+            };
             let options = ScanOptions {
                 device_id: device_id.to_string(),
-                selected_cache_keys: (!command.no_cache).then(|| {
-                    pending_file_entries
-                        .iter()
-                        .map(|entry| entry.cache_key.clone())
-                        .collect()
-                }),
+                selected_cache_keys: (should_run_adapter_scan
+                    && !replace_source_records
+                    && !command.no_cache)
+                    .then(|| {
+                        pending_file_entries
+                            .iter()
+                            .map(|entry| entry.cache_key.clone())
+                            .collect()
+                    }),
             };
             let verification_mode = source_verification_mode(&source);
             let probed_verified_source_state =
@@ -683,14 +709,15 @@ fn scan_with_adapters(
                     && next_verified_state_hash.is_none()
                     && effective_verified_source_state_is_missing(&probed_verified_source_state)
                     && has_active_verified_source_assignment(store, &source.source_id)?;
-            let should_run_full_scan =
-                command.no_cache || command.replace || !pending_file_entries.is_empty();
-            let mut scan = if should_run_full_scan {
+            let mut scan = if should_run_adapter_scan {
                 adapter.scan(&source, &options)?
             } else {
                 statsai_adapters::AdapterScan {
                     diagnostics: ScanDiagnostics {
-                        files_skipped_unchanged: file_cache_entries.len() as u64,
+                        files_skipped_unchanged: (file_cache_entries
+                            .len()
+                            .saturating_sub(pending_file_entries.len()))
+                            as u64,
                         ..ScanDiagnostics::default()
                     },
                     ..statsai_adapters::AdapterScan::default()
@@ -699,7 +726,7 @@ fn scan_with_adapters(
             let effective_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
                     None
-                } else if should_run_full_scan {
+                } else if should_run_adapter_scan {
                     scan.verified_source_state
                         .take()
                         .or(probed_verified_source_state)
@@ -717,8 +744,8 @@ fn scan_with_adapters(
             }
             let source_event_count = scan.events.len() as u64;
             let source_summary_count = scan.summaries.len() as u64;
-            let touched_files = !pending_file_entries.is_empty();
-            let has_scan_activity = source_event_count > 0
+            let has_scan_activity = touched_files
+                || source_event_count > 0
                 || source_summary_count > 0
                 || scan.diagnostics.files_scanned > 0
                 || scan.diagnostics.files_skipped_unchanged > 0
@@ -769,17 +796,24 @@ fn scan_with_adapters(
             )?;
             persist_source_after_preview(store, &source)?;
             apply_source_account_resolution(store, &source, &mut scan.events, &mut scan.summaries)?;
-            let replace_source_records = should_replace_source_records_for_scan(
-                command.replace,
-                should_run_full_scan,
-                file_cache_entries.len(),
-                pending_file_entries.len(),
-            );
             if replace_source_records {
-                replaced_event_count +=
+                removed_event_count +=
                     store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
-                replaced_summary_count +=
+                removed_summary_count +=
                     store.delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
+            } else if touched_files {
+                let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
+                    &pending_file_entries,
+                    &removed_file_entries,
+                );
+                removed_event_count += store.delete_events_for_source_file_hashes(
+                    &source.source_id,
+                    &reconciled_file_hashes,
+                )?;
+                removed_summary_count += store.delete_summaries_for_source_file_hashes(
+                    &source.source_id,
+                    &reconciled_file_hashes,
+                )?;
             }
             inserted_count += store.insert_events(&scan.events)?;
             summary_written_count += store.upsert_summaries(&scan.summaries)?;
@@ -789,6 +823,8 @@ fn scan_with_adapters(
                 &pending_file_entries
             };
             store.record_scan_file_entries(&source.source_id, cache_entries_to_record)?;
+            let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
+            store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
         }
     }
 
@@ -844,11 +880,11 @@ fn scan_with_adapters(
             format_cost(total_summary_usage.estimated_cost_usd),
             format_u64(total_log_rows)
         );
-        if command.replace || replaced_event_count > 0 || replaced_summary_count > 0 {
+        if command.replace || removed_event_count > 0 || removed_summary_count > 0 {
             println!(
-                "replace removed: events={} summaries={}",
-                format_u64(replaced_event_count),
-                format_u64(replaced_summary_count)
+                "scan removed stale records: events={} summaries={}",
+                format_u64(removed_event_count),
+                format_u64(removed_summary_count)
             );
         }
         print_scan_diagnostics_total(&total_diagnostics);
@@ -4988,6 +5024,36 @@ fn scan_file_state_entries(candidates: &[ScanCandidateFile]) -> Vec<ScanFileStat
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanFileReconciliation {
+    pending_entries: Vec<ScanFileStateEntry>,
+    removed_entries: Vec<ScanFileStateEntry>,
+}
+
+fn select_scan_file_reconciliation(
+    store: &Store,
+    source_id: &statsai_core::SourceId,
+    file_cache_entries: &[ScanFileStateEntry],
+    replace: bool,
+    no_cache: bool,
+) -> Result<ScanFileReconciliation> {
+    let pending_entries =
+        select_scan_file_entries(store, source_id, file_cache_entries, replace, no_cache)?;
+    let tracked_entries = store.scan_file_entries(source_id)?;
+    let current_cache_keys: BTreeSet<_> = file_cache_entries
+        .iter()
+        .map(|entry| entry.cache_key.as_str())
+        .collect();
+    let removed_entries = tracked_entries
+        .into_iter()
+        .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
+        .collect();
+    Ok(ScanFileReconciliation {
+        pending_entries,
+        removed_entries,
+    })
+}
+
 fn select_scan_file_entries(
     store: &Store,
     source_id: &statsai_core::SourceId,
@@ -5003,11 +5069,35 @@ fn select_scan_file_entries(
 
 fn should_replace_source_records_for_scan(
     explicit_replace: bool,
-    ran_scan: bool,
+    no_cache: bool,
     candidate_count: usize,
     pending_count: usize,
+    legacy_full_reconcile: bool,
 ) -> bool {
-    explicit_replace || (ran_scan && candidate_count > 0 && pending_count == candidate_count)
+    explicit_replace
+        || no_cache
+        || legacy_full_reconcile
+        || (candidate_count > 0 && pending_count == candidate_count)
+}
+
+fn scan_file_hashes_for_reconciliation(
+    pending_entries: &[ScanFileStateEntry],
+    removed_entries: &[ScanFileStateEntry],
+) -> Vec<String> {
+    pending_entries
+        .iter()
+        .chain(removed_entries.iter())
+        .map(|entry| hash_text(&entry.cache_key))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn scan_file_cache_keys(entries: &[ScanFileStateEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.cache_key.clone())
+        .collect()
 }
 
 fn format_cache_key_sample<'a>(keys: impl IntoIterator<Item = &'a str>) -> String {
@@ -5541,6 +5631,7 @@ mod tests {
     struct TestAdapter {
         provider: &'static str,
         discovered: Vec<SourceLocation>,
+        candidates: Vec<ScanCandidateFile>,
         scan_result: statsai_adapters::AdapterScan,
         probe_result: Option<VerifiedSourceState>,
         scan_calls: Option<Arc<Mutex<u64>>>,
@@ -5564,7 +5655,7 @@ mod tests {
         }
 
         fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
-            Ok(Vec::new())
+            Ok(self.candidates.clone())
         }
 
         fn probe_verified_source_state(
@@ -6314,6 +6405,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![discovered],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: None,
             scan_calls: None,
@@ -6344,6 +6436,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "claude_code",
             discovered: vec![discovered],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: None,
             scan_calls: None,
@@ -6378,6 +6471,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![discovered_parent.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: None,
             scan_calls: None,
@@ -6414,6 +6508,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![discovered_parent.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: None,
             scan_calls: None,
@@ -6444,6 +6539,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![discovered_parent.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: None,
             scan_calls: None,
@@ -6479,6 +6575,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![discovered_parent.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: None,
             scan_calls: None,
@@ -6515,6 +6612,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: Vec::new(),
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: None,
             scan_calls: None,
@@ -7093,6 +7191,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![source.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan {
                 diagnostics: ScanDiagnostics {
                     files_skipped_unchanged: 1,
@@ -7239,6 +7338,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![source.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan {
                 diagnostics: ScanDiagnostics {
                     files_skipped_unchanged: 1,
@@ -7321,6 +7421,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![source.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: Some(verified_state),
             scan_calls: Some(scan_calls.clone()),
@@ -7411,6 +7512,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![source.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: None,
             scan_calls: None,
@@ -7499,6 +7601,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![source.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: None,
             scan_calls: None,
@@ -7550,6 +7653,7 @@ mod tests {
         let adapter = TestAdapter {
             provider: "codex",
             discovered: vec![source.clone()],
+            candidates: Vec::new(),
             scan_result: statsai_adapters::AdapterScan::default(),
             probe_result: Some(VerifiedSourceState {
                 provider_user_id: Some("acct-manual-only".to_string()),
@@ -9723,11 +9827,289 @@ mod tests {
 
     #[test]
     fn full_source_rescan_replaces_existing_source_records() {
-        assert!(should_replace_source_records_for_scan(false, true, 2, 2));
-        assert!(should_replace_source_records_for_scan(true, false, 0, 0));
-        assert!(!should_replace_source_records_for_scan(false, true, 2, 1));
-        assert!(!should_replace_source_records_for_scan(false, true, 0, 0));
-        assert!(!should_replace_source_records_for_scan(false, false, 2, 2));
+        assert!(should_replace_source_records_for_scan(
+            true, false, 0, 0, false
+        ));
+        assert!(should_replace_source_records_for_scan(
+            false, true, 0, 0, false
+        ));
+        assert!(should_replace_source_records_for_scan(
+            false, false, 2, 2, false
+        ));
+        assert!(should_replace_source_records_for_scan(
+            false, false, 0, 0, true
+        ));
+        assert!(!should_replace_source_records_for_scan(
+            false, false, 2, 1, false
+        ));
+        assert!(!should_replace_source_records_for_scan(
+            false, false, 0, 0, false
+        ));
+    }
+
+    #[test]
+    fn scan_file_reconciliation_tracks_removed_candidates() {
+        let store = Store::in_memory().expect("store");
+        let source_id = statsai_core::SourceId("src-removed-cache".to_string());
+        let tracked = vec![
+            ScanFileStateEntry {
+                cache_key: "/tmp/a.jsonl".to_string(),
+                cache_signature: "sig-a-1".to_string(),
+            },
+            ScanFileStateEntry {
+                cache_key: "/tmp/b.jsonl".to_string(),
+                cache_signature: "sig-b-1".to_string(),
+            },
+        ];
+        store
+            .record_scan_file_entries(&source_id, &tracked)
+            .expect("record tracked cache state");
+
+        let reconciliation = select_scan_file_reconciliation(
+            &store,
+            &source_id,
+            &[ScanFileStateEntry {
+                cache_key: "/tmp/b.jsonl".to_string(),
+                cache_signature: "sig-b-1".to_string(),
+            }],
+            false,
+            false,
+        )
+        .expect("reconciliation");
+
+        assert!(reconciliation.pending_entries.is_empty());
+        assert_eq!(
+            reconciliation.removed_entries,
+            vec![ScanFileStateEntry {
+                cache_key: "/tmp/a.jsonl".to_string(),
+                cache_signature: "sig-a-1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn partial_scan_removes_rows_that_disappear_from_changed_file() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-partial-rescan"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_a = "/tmp/codex-partial-rescan/a.jsonl";
+        let file_b = "/tmp/codex-partial-rescan/b.jsonl";
+        let initial_candidates = vec![
+            test_scan_candidate(file_a, "sig-a-1"),
+            test_scan_candidate(file_b, "sig-b-1"),
+        ];
+        let next_candidates = vec![
+            test_scan_candidate(file_a, "sig-a-2"),
+            test_scan_candidate(file_b, "sig-b-1"),
+        ];
+        let a_started_at = Utc
+            .with_ymd_and_hms(2026, 5, 1, 10, 0, 0)
+            .single()
+            .expect("a_started_at");
+        let b_started_at = Utc
+            .with_ymd_and_hms(2026, 5, 2, 10, 0, 0)
+            .single()
+            .expect("b_started_at");
+        let initial_adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: initial_candidates,
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![
+                    test_scan_event(&source, file_a, a_started_at, "event-a", 100),
+                    test_scan_event(&source, file_b, b_started_at, "event-b", 200),
+                ],
+                summaries: vec![
+                    test_scan_summary(&source, file_a, a_started_at, "summary-a", 100),
+                    test_scan_summary(&source, file_b, b_started_at, "summary-b", 200),
+                ],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(initial_adapter)],
+        )
+        .expect("initial scan");
+
+        assert_eq!(store.event_count().expect("event count"), 2);
+        assert_eq!(store.summary_count().expect("summary count"), 2);
+        assert_eq!(store.sync_rollup_count().expect("rollup count"), 2);
+
+        let changed_only_adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: next_candidates,
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(changed_only_adapter)],
+        )
+        .expect("partial scan");
+
+        let events = store.events_for_source(&source.source_id).expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .parse_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.source_record_id.as_deref()),
+            Some("event-b")
+        );
+        let summaries = store
+            .summaries_for_source(&source.source_id)
+            .expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].summary_id,
+            summary_id("codex", &source.source_id, "summary-b")
+        );
+        assert_eq!(store.sync_rollup_count().expect("rollup count"), 1);
+    }
+
+    #[test]
+    fn partial_scan_with_legacy_rows_falls_back_to_full_source_reconcile() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-partial-legacy"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_a = "/tmp/codex-partial-legacy/a.jsonl";
+        let file_b = "/tmp/codex-partial-legacy/b.jsonl";
+        let tracked_entries = vec![
+            ScanFileStateEntry {
+                cache_key: file_a.to_string(),
+                cache_signature: "sig-a-1".to_string(),
+            },
+            ScanFileStateEntry {
+                cache_key: file_b.to_string(),
+                cache_signature: "sig-b-1".to_string(),
+            },
+        ];
+        store
+            .record_scan_file_entries(&source.source_id, &tracked_entries)
+            .expect("record initial cache");
+
+        let a_started_at = Utc
+            .with_ymd_and_hms(2026, 5, 3, 10, 0, 0)
+            .single()
+            .expect("a_started_at");
+        let b_started_at = Utc
+            .with_ymd_and_hms(2026, 5, 4, 10, 0, 0)
+            .single()
+            .expect("b_started_at");
+        let legacy_event_a =
+            test_event("codex", &source, a_started_at, None, TokenParts::total(50));
+        let legacy_event_b =
+            test_event("codex", &source, b_started_at, None, TokenParts::total(75));
+        let mut legacy_summary_a = test_summary("codex", &source, a_started_at, 50, None);
+        legacy_summary_a.summary_id = summary_id("codex", &source.source_id, "legacy-summary-a");
+        let mut legacy_summary_b = test_summary("codex", &source, b_started_at, 75, None);
+        legacy_summary_b.summary_id = summary_id("codex", &source.source_id, "legacy-summary-b");
+        store
+            .insert_events(&[legacy_event_a, legacy_event_b])
+            .expect("seed legacy events");
+        store
+            .upsert_summaries(&[legacy_summary_a, legacy_summary_b])
+            .expect("seed legacy summaries");
+
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![
+                test_scan_candidate(file_a, "sig-a-2"),
+                test_scan_candidate(file_b, "sig-b-1"),
+            ],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![test_scan_event(
+                    &source,
+                    file_b,
+                    b_started_at,
+                    "event-b",
+                    125,
+                )],
+                summaries: vec![test_scan_summary(
+                    &source,
+                    file_b,
+                    b_started_at,
+                    "summary-b",
+                    125,
+                )],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("reconcile scan");
+
+        let events = store.events_for_source(&source.source_id).expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .parse_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.source_record_id.as_deref()),
+            Some("event-b")
+        );
+        let summaries = store
+            .summaries_for_source(&source.source_id)
+            .expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].summary_id,
+            summary_id("codex", &source.source_id, "summary-b")
+        );
     }
 
     #[test]
@@ -10791,6 +11173,65 @@ mod tests {
             },
             imported_at: now,
         }
+    }
+
+    fn test_scan_candidate(path: &str, cache_signature: &str) -> ScanCandidateFile {
+        ScanCandidateFile {
+            path: PathBuf::from(path),
+            cache_key: path.to_string(),
+            cache_signature: cache_signature.to_string(),
+        }
+    }
+
+    fn test_scan_event(
+        source: &SourceLocation,
+        file_path: &str,
+        started_at: DateTime<Utc>,
+        record_id: &str,
+        total_tokens: u64,
+    ) -> UsageEvent {
+        let mut event = test_event(
+            "codex",
+            source,
+            started_at,
+            None,
+            TokenParts::total(total_tokens),
+        );
+        event.source.source_record_id = Some(record_id.to_string());
+        event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "test-scan.v1".to_string(),
+            source_file_path_hash: Some(hash_text(file_path)),
+            source_line_number: Some(1),
+            source_record_id: Some(record_id.to_string()),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: IdentitySource::Unresolved,
+        });
+        event
+    }
+
+    fn test_scan_summary(
+        source: &SourceLocation,
+        file_path: &str,
+        observed_at: DateTime<Utc>,
+        record_id: &str,
+        total_tokens: u64,
+    ) -> UsageSummary {
+        let mut summary = test_summary("codex", source, observed_at, total_tokens, None);
+        summary.summary_id = summary_id("codex", &source.source_id, record_id);
+        summary.source.source_kind = SourceKind::LocalAdapter;
+        summary.source.source_type = "jsonl".to_string();
+        summary.source.source_record_id = Some(record_id.to_string());
+        summary.parse_evidence = Some(ParseEvidence {
+            event_key_version: "test-scan-summary.v1".to_string(),
+            source_file_path_hash: Some(hash_text(file_path)),
+            source_line_number: None,
+            source_record_id: Some(record_id.to_string()),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: IdentitySource::Unresolved,
+        });
+        summary
     }
 
     #[test]

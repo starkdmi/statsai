@@ -282,6 +282,54 @@ impl Store {
         }
     }
 
+    pub fn scan_file_entries(&self, source_id: &SourceId) -> Result<Vec<ScanFileStateEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cache_key, cache_signature
+             FROM scan_file_state
+             WHERE source_id = ?1
+             ORDER BY cache_key",
+        )?;
+        let rows = stmt.query_map(params![&source_id.0], |row| {
+            Ok(ScanFileStateEntry {
+                cache_key: row.get(0)?,
+                cache_signature: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    pub fn delete_scan_file_entries(
+        &self,
+        source_id: &SourceId,
+        cache_keys: &[String],
+    ) -> Result<u64> {
+        if cache_keys.is_empty() {
+            return Ok(0);
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut deleted = 0u64;
+            let mut stmt = self
+                .conn
+                .prepare("DELETE FROM scan_file_state WHERE source_id = ?1 AND cache_key = ?2")?;
+            for cache_key in cache_keys {
+                deleted += stmt.execute(params![&source_id.0, cache_key])? as u64;
+            }
+            Ok(deleted)
+        })();
+
+        match result {
+            Ok(deleted) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
     pub fn delete_scan_file_entries_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
@@ -305,6 +353,34 @@ impl Store {
                 Err(error)
             }
         }
+    }
+
+    pub fn source_records_missing_scan_file_hashes(&self, source_id: &SourceId) -> Result<bool> {
+        let event_missing: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM usage_events
+            WHERE source_id = ?1
+              AND COALESCE(json_extract(payload, '$.parse_evidence.source_file_path_hash'), '') = ''
+            "#,
+            params![&source_id.0],
+            |row| row.get(0),
+        )?;
+        if event_missing > 0 {
+            return Ok(true);
+        }
+
+        let summary_missing: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM usage_summaries
+            WHERE source_id = ?1
+              AND COALESCE(json_extract(payload, '$.parse_evidence.source_file_path_hash'), '') = ''
+            "#,
+            params![&source_id.0],
+            |row| row.get(0),
+        )?;
+        Ok(summary_missing > 0)
     }
 
     pub fn upsert_source(&self, source: &SourceLocation) -> Result<()> {
@@ -1131,6 +1207,67 @@ impl Store {
         }
     }
 
+    pub fn delete_events_for_source_file_hashes(
+        &self,
+        source_id: &SourceId,
+        file_hashes: &[String],
+    ) -> Result<u64> {
+        if file_hashes.is_empty() {
+            return Ok(0);
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut deleted = 0u64;
+            let mut dirty_keys = BTreeSet::new();
+
+            for file_hash in file_hashes {
+                let payloads: Vec<String>;
+                {
+                    let mut stmt = self.conn.prepare(
+                        r#"
+                        SELECT payload
+                        FROM usage_events
+                        WHERE source_id = ?1
+                          AND json_extract(payload, '$.parse_evidence.source_file_path_hash') = ?2
+                        "#,
+                    )?;
+                    let rows =
+                        stmt.query_map(params![&source_id.0, file_hash], |row| row.get(0))?;
+                    payloads = rows.collect::<Result<Vec<_>, _>>()?;
+                }
+
+                for payload in payloads {
+                    let event: UsageEvent = serde_json::from_str(&payload)?;
+                    dirty_keys.insert(sync_rollup_bucket_key(&event));
+                }
+
+                deleted += self.conn.execute(
+                    r#"
+                    DELETE FROM usage_events
+                    WHERE source_id = ?1
+                      AND json_extract(payload, '$.parse_evidence.source_file_path_hash') = ?2
+                    "#,
+                    params![&source_id.0, file_hash],
+                )? as u64;
+            }
+
+            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
+            Ok(deleted)
+        })();
+
+        match result {
+            Ok(deleted) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
     pub fn upsert_summary(&self, summary: &UsageSummary) -> Result<bool> {
         let payload = serde_json::to_string(summary)?;
         let changed = self.conn.execute(
@@ -1181,6 +1318,43 @@ impl Store {
             Ok(changed) => {
                 self.conn.execute_batch("COMMIT")?;
                 Ok(changed)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn delete_summaries_for_source_file_hashes(
+        &self,
+        source_id: &SourceId,
+        file_hashes: &[String],
+    ) -> Result<u64> {
+        if file_hashes.is_empty() {
+            return Ok(0);
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut deleted = 0u64;
+            for file_hash in file_hashes {
+                deleted += self.conn.execute(
+                    r#"
+                    DELETE FROM usage_summaries
+                    WHERE source_id = ?1
+                      AND json_extract(payload, '$.parse_evidence.source_file_path_hash') = ?2
+                    "#,
+                    params![&source_id.0, file_hash],
+                )? as u64;
+            }
+            Ok(deleted)
+        })();
+
+        match result {
+            Ok(deleted) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(deleted)
             }
             Err(error) => {
                 rollback(&self.conn);
