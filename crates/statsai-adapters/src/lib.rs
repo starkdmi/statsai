@@ -5,12 +5,15 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use statsai_core::{
-    canonical_display, display_path, expand_home_path, hash_text, home_dir, path_hash,
-    project_bucket_key, semantic_event_id, summary_id, BillingPeriod, Confidence, EventSource,
-    IdentitySource, LatencySource, LocationOrigin, MetricStats, ModelInfo, ParseEvidence,
-    PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo, SessionInfo, SourceKind,
-    SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics, UsageCounts, UsageEvent,
-    UsageSummary, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+    branch_family, canonical_display, display_path, expand_home_path, extract_issue_keys,
+    hash_text, home_dir, normalize_task_title, path_hash, project_bucket_key, semantic_event_id,
+    summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
+    task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal, BillingPeriod,
+    Confidence, EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats,
+    ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo,
+    SessionInfo, SourceKind, SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics,
+    TaskSpan, UsageCounts, UsageEvent, UsageSummary, TASK_SPAN_SCHEMA_VERSION,
+    USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{estimate_cost, normalize_model_name};
 use std::collections::{HashMap, HashSet};
@@ -29,10 +32,10 @@ const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v4";
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever Codex parsing semantics change,
 // so historical sessions get rescanned for both runtime and project context.
-const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "turn-runtime-project-context.v9";
-const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "project-context.v3";
-const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "sqlite-session-aggregate.v3";
-const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "session-inference-usage.v5";
+const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v20";
+const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
+const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v14";
+const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v16";
 
 pub use statsai_core::{VerifiedSourceState, VerifiedSubscriptionState};
 
@@ -81,6 +84,7 @@ pub struct ScanDiagnostics {
 pub struct AdapterScan {
     pub events: Vec<UsageEvent>,
     pub summaries: Vec<UsageSummary>,
+    pub task_spans: Vec<TaskSpan>,
     pub diagnostics: ScanDiagnostics,
     pub verified_source_state: Option<VerifiedSourceState>,
 }
@@ -432,6 +436,7 @@ fn scan_claude_source(
     let session_projects = load_claude_session_projects(&projects);
     let cache_namespace = scan_cache_namespace(source, adapter.version());
     let event_files = claude_jsonl_candidates(&projects, &cache_namespace)?;
+    let mut scanned_event_cache_keys = HashSet::new();
     let mut seen = HashSet::new();
     {
         let mut ctx = FileParseContext {
@@ -447,6 +452,7 @@ fn scan_claude_source(
                 continue;
             }
             ctx.scan.diagnostics.files_scanned += 1;
+            scanned_event_cache_keys.insert(candidate.cache_key.clone());
             parse_claude_file(&mut ctx, &projects, &session_projects, &candidate.path)?;
         }
     }
@@ -459,8 +465,165 @@ fn scan_claude_source(
             scan.diagnostics.files_skipped_unchanged += 1;
         }
     }
+    let event_rollups = session_event_rollups(&scan.events);
+    for entry in load_claude_task_entries(&projects) {
+        let event_rollup = event_rollups.get(&hash_text(&entry.session_id));
+        if !should_emit_claude_task_entry(options, &scanned_event_cache_keys, &entry, event_rollup)
+        {
+            continue;
+        }
+        let title = entry
+            .title
+            .clone()
+            .unwrap_or_else(|| "Claude session".to_string());
+        let issue_keys = extract_issue_keys(&[
+            title.as_str(),
+            entry.summary_preview.as_deref().unwrap_or(""),
+            entry
+                .project
+                .as_ref()
+                .and_then(|project| project.branch_label.as_deref())
+                .unwrap_or(""),
+        ]);
+        scan.task_spans.push(TaskSpan {
+            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+            span_id: task_span_id(
+                adapter.provider(),
+                &source.source_id,
+                &format!(
+                    "claude_task_span.v1:{}:{}",
+                    entry.session_id,
+                    entry.ended_at.to_rfc3339()
+                ),
+            ),
+            provider: adapter.provider().to_string(),
+            source_id: source.source_id.clone(),
+            span_kind: "claude_session".to_string(),
+            source_record_id: Some(entry.session_id.clone()),
+            source_file_path_hash: entry
+                .source_path
+                .as_deref()
+                .map(claude_task_entry_source_file_path_hash),
+            summary_id: None,
+            session_id: Some(entry.session_id.clone()),
+            thread_id: None,
+            title: title.clone(),
+            normalized_title: normalize_task_title(&title),
+            title_source: Some(entry.title_source.to_string()),
+            summary_preview: entry.summary_preview.clone(),
+            todo_excerpt: None,
+            issue_keys,
+            branch_family: branch_family(
+                entry
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.branch_label.as_deref()),
+            ),
+            project_bucket: project_bucket_key(entry.project.as_ref()),
+            project: entry.project.clone(),
+            git: None,
+            usage: event_rollup
+                .map(|rollup| rollup.usage.clone())
+                .unwrap_or_default(),
+            estimated_cost_usd: event_rollup.and_then(|rollup| rollup.estimated_cost_usd),
+            linked_event_ids: event_rollup
+                .map(|rollup| rollup.event_ids.clone())
+                .unwrap_or_default(),
+            confidence: if entry.title_source == "summary"
+                && !task_title_is_generic(Some(title.as_str()))
+            {
+                Confidence::High
+            } else if entry.summary_preview.is_some() {
+                Confidence::Medium
+            } else {
+                Confidence::Low
+            },
+            is_meta: task_title_is_generic(Some(title.as_str())),
+            started_at: entry.started_at,
+            ended_at: Some(entry.ended_at),
+            duration_seconds: entry
+                .ended_at
+                .signed_duration_since(entry.started_at)
+                .num_seconds()
+                .try_into()
+                .ok(),
+        });
+    }
     scan.diagnostics.accepted_events = scan.events.len() as u64;
     Ok(scan)
+}
+
+fn should_emit_claude_task_entry(
+    options: &ScanOptions,
+    scanned_event_cache_keys: &HashSet<String>,
+    entry: &ClaudeTaskEntry,
+    event_rollup: Option<&SessionEventRollup>,
+) -> bool {
+    if options.selected_cache_keys.is_none() {
+        return true;
+    }
+
+    if event_rollup.is_some() {
+        return true;
+    }
+
+    entry
+        .source_path
+        .as_deref()
+        .is_some_and(|path| claude_task_entry_matches_scanned_file(path, scanned_event_cache_keys))
+}
+
+fn claude_task_entry_matches_scanned_file(
+    path: &Path,
+    scanned_event_cache_keys: &HashSet<String>,
+) -> bool {
+    let canonical_path = claude_task_entry_source_cache_key(path);
+    if scanned_event_cache_keys.contains(&canonical_path) {
+        return true;
+    }
+
+    let canonical_path = Path::new(&canonical_path);
+    match canonical_path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonl") => scanned_event_cache_keys
+            .contains(&canonical_display(&canonical_path.with_extension(""))),
+        None => scanned_event_cache_keys
+            .contains(&canonical_display(&canonical_path.with_extension("jsonl"))),
+        Some(_) => false,
+    }
+}
+
+fn claude_task_entry_source_file_path_hash(path: &Path) -> String {
+    hash_text(&claude_task_entry_source_cache_key(path))
+}
+
+fn claude_task_entry_source_cache_key(path: &Path) -> String {
+    canonical_display(&claude_task_entry_source_path(path))
+}
+
+fn claude_task_entry_source_path(path: &Path) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonl") => {
+            if path.is_file() {
+                path.to_path_buf()
+            } else {
+                let without_extension = path.with_extension("");
+                if without_extension.is_file() {
+                    without_extension
+                } else {
+                    path.to_path_buf()
+                }
+            }
+        }
+        None => {
+            let jsonl_path = path.with_extension("jsonl");
+            if jsonl_path.is_file() {
+                jsonl_path
+            } else {
+                path.to_path_buf()
+            }
+        }
+        Some(_) => path.to_path_buf(),
+    }
 }
 
 fn scan_codex_source(
@@ -479,6 +642,7 @@ fn scan_codex_source(
     let source_path = PathBuf::from(path_label);
     let root = codex_source_root(&source_path);
     let cache_namespace = scan_cache_namespace(source, adapter.version());
+    let thread_titles = load_codex_thread_titles(&root);
     let mut seen = HashSet::new();
     {
         let mut ctx = FileParseContext {
@@ -495,7 +659,13 @@ fn scan_codex_source(
             }
             let usage_root = codex_usage_root_for_file(&root, &candidate.path);
             ctx.scan.diagnostics.files_scanned += 1;
-            parse_codex_file(&mut ctx, &root, &usage_root, &candidate.path)?;
+            parse_codex_file(
+                &mut ctx,
+                &root,
+                &usage_root,
+                &thread_titles,
+                &candidate.path,
+            )?;
         }
     }
     scan.verified_source_state = codex_auth_snapshot(&root);
@@ -518,6 +688,7 @@ fn scan_opencode_source(
     }
 
     let connection = open_sqlite_readonly(&db_path)?;
+    let todos_by_session = load_opencode_todos(&connection)?;
     let recovered_session_models = load_opencode_session_models(&connection)?;
     let reconstructed_session_ids = recovered_session_models
         .iter()
@@ -526,11 +697,18 @@ fn scan_opencode_source(
         })
         .collect::<HashSet<_>>();
     let mut reconstructed_session_rows = HashMap::<String, OpenCodeSessionAggregate>::new();
-    let mut statement = connection.prepare(
+    let summary_diffs_sql = if sqlite_column_exists(&connection, "session", "summary_diffs")? {
+        "summary_diffs"
+    } else {
+        "NULL AS summary_diffs"
+    };
+    let mut task_seeds = Vec::<OpenCodeTaskSeed>::new();
+    let mut statement = connection.prepare(&format!(
         "SELECT id, title, model, cost, tokens_input, tokens_output, tokens_reasoning, \
-         tokens_cache_read, tokens_cache_write, time_created, time_updated, directory \
-         FROM session",
-    )?;
+         tokens_cache_read, tokens_cache_write, time_created, time_updated, directory, \
+         {summary_diffs_sql} \
+         FROM session"
+    ))?;
     let mut rows = statement.query([])?;
     let mut seen = HashSet::new();
     while let Some(row) = rows.next()? {
@@ -558,6 +736,65 @@ fn scan_opencode_source(
             .try_into()
             .ok();
         let directory: Option<String> = row.get::<_, Option<String>>(11).ok().flatten();
+        let summary_diffs = row
+            .get::<_, Option<String>>(12)
+            .ok()
+            .flatten()
+            .and_then(|value| summarize_task_text(Some(&value), 220));
+        let todos = todos_by_session
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        let todo_excerpt = summarize_task_text(
+            Some(
+                &todos
+                    .iter()
+                    .take(3)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            ),
+            220,
+        );
+        let project = directory
+            .as_deref()
+            .map(PathBuf::from)
+            .and_then(|path| resolve_project_context(Some(path), None, None));
+        let session_title = title
+            .clone()
+            .and_then(|value| summarize_task_text(Some(&value), 90));
+        let preferred_session_title = session_title.clone().filter(|value| {
+            !task_title_is_generic(Some(value.as_str()))
+                && !task_title_is_weak_signal(Some(value.as_str()))
+        });
+        let has_preferred_session_title = preferred_session_title.is_some();
+        let inferred_title = preferred_session_title
+            .or_else(|| task_title_from_prompt(summary_diffs.as_deref()))
+            .or_else(|| task_title_from_prompt(todo_excerpt.as_deref()));
+        task_seeds.push(OpenCodeTaskSeed {
+            session_id: session_id.clone(),
+            title: inferred_title.or(session_title.clone()),
+            title_source: if has_preferred_session_title {
+                "session_title"
+            } else if summary_diffs.is_some() {
+                "summary_diffs"
+            } else if todo_excerpt.is_some() {
+                "todo_excerpt"
+            } else if session_title.is_some() {
+                "session_title_weak"
+            } else {
+                "default"
+            },
+            summary_preview: summary_diffs.clone().or_else(|| todo_excerpt.clone()),
+            todo_excerpt,
+            project: project.clone(),
+            started_at,
+            ended_at,
+            duration_seconds,
+            usage: usage.clone(),
+            estimated_cost_usd: (provider_cost > 0.0)
+                .then_some((provider_cost * 100.0).round() as i64),
+        });
         if reconstructed_session_ids.contains(&session_id) {
             reconstructed_session_rows.insert(
                 session_id.clone(),
@@ -579,10 +816,6 @@ fn scan_opencode_source(
             continue;
         }
         scan.diagnostics.candidate_usage_rows += 1;
-        let project = directory
-            .as_deref()
-            .map(PathBuf::from)
-            .and_then(|path| resolve_project_context(Some(path), None, None));
         let model = model_text
             .as_deref()
             .and_then(opencode_model_info)
@@ -727,6 +960,81 @@ fn scan_opencode_source(
             push_deduped(&mut scan, &mut seen, event);
         }
     }
+    let event_rollups = session_event_rollups(&scan.events);
+    for seed in task_seeds {
+        let session_hash = hash_text(&seed.session_id);
+        let event_rollup = event_rollups.get(&session_hash);
+        let title = seed
+            .title
+            .clone()
+            .unwrap_or_else(|| "OpenCode session".to_string());
+        let issue_keys = extract_issue_keys(&[
+            title.as_str(),
+            seed.summary_preview.as_deref().unwrap_or(""),
+            seed.todo_excerpt.as_deref().unwrap_or(""),
+            seed.project
+                .as_ref()
+                .and_then(|project| project.branch_label.as_deref())
+                .unwrap_or(""),
+        ]);
+        scan.task_spans.push(TaskSpan {
+            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+            span_id: task_span_id(
+                adapter.provider(),
+                &source.source_id,
+                &format!(
+                    "opencode_task_span.v1:{}:{}",
+                    seed.session_id,
+                    seed.ended_at.to_rfc3339()
+                ),
+            ),
+            provider: adapter.provider().to_string(),
+            source_id: source.source_id.clone(),
+            span_kind: "opencode_session".to_string(),
+            source_record_id: Some(seed.session_id.clone()),
+            source_file_path_hash: Some(hash_text(&canonical_display(&db_path))),
+            summary_id: None,
+            session_id: Some(seed.session_id.clone()),
+            thread_id: None,
+            title: title.clone(),
+            normalized_title: normalize_task_title(&title),
+            title_source: Some(seed.title_source.to_string()),
+            summary_preview: seed.summary_preview.clone(),
+            todo_excerpt: seed.todo_excerpt.clone(),
+            issue_keys,
+            branch_family: branch_family(
+                seed.project
+                    .as_ref()
+                    .and_then(|project| project.branch_label.as_deref()),
+            ),
+            project_bucket: project_bucket_key(seed.project.as_ref()),
+            project: seed.project.clone(),
+            git: None,
+            usage: event_rollup
+                .map(|rollup| rollup.usage.clone())
+                .filter(|usage| usage.computed_total() > 0)
+                .unwrap_or_else(|| seed.usage.clone()),
+            estimated_cost_usd: event_rollup
+                .and_then(|rollup| rollup.estimated_cost_usd)
+                .or(seed.estimated_cost_usd),
+            linked_event_ids: event_rollup
+                .map(|rollup| rollup.event_ids.clone())
+                .unwrap_or_default(),
+            confidence: if seed.title_source == "session_title"
+                && !task_title_is_generic(Some(title.as_str()))
+            {
+                Confidence::High
+            } else if seed.summary_preview.is_some() || seed.todo_excerpt.is_some() {
+                Confidence::Medium
+            } else {
+                Confidence::Low
+            },
+            is_meta: task_title_is_generic(Some(title.as_str())),
+            started_at: seed.started_at,
+            ended_at: Some(seed.ended_at),
+            duration_seconds: seed.duration_seconds,
+        });
+    }
     scan.diagnostics.files_scanned = 1;
     scan.diagnostics.accepted_events = scan.events.len() as u64;
     Ok(scan)
@@ -826,6 +1134,32 @@ fn load_opencode_session_models(
     Ok(models)
 }
 
+fn load_opencode_todos(connection: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    let mut statement = match connection
+        .prepare("SELECT session_id, content FROM todo ORDER BY session_id, position")
+    {
+        Ok(statement) => statement,
+        Err(error) if error.to_string().contains("no such table: todo") => {
+            return Ok(HashMap::new());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut rows = statement.query([])?;
+    let mut todos = HashMap::<String, Vec<String>>::new();
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(0)?;
+        let content: Option<String> = row.get(1).ok();
+        let Some(content) = content
+            .as_deref()
+            .and_then(|value| summarize_task_text(Some(value), 220))
+        else {
+            continue;
+        };
+        todos.entry(session_id).or_default().push(content);
+    }
+    Ok(todos)
+}
+
 #[derive(Debug, Clone, Default)]
 struct OpenCodeSessionModelSummary {
     model: Option<ModelInfo>,
@@ -844,6 +1178,21 @@ struct OpenCodeSessionAggregate {
     ended_at: DateTime<Utc>,
     duration_seconds: Option<u64>,
     directory: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OpenCodeTaskSeed {
+    session_id: String,
+    title: Option<String>,
+    title_source: &'static str,
+    summary_preview: Option<String>,
+    todo_excerpt: Option<String>,
+    project: Option<ProjectInfo>,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    duration_seconds: Option<u64>,
+    usage: UsageCounts,
+    estimated_cost_usd: Option<i64>,
 }
 
 struct OpenCodeMessageEventContext<'a> {
@@ -989,6 +1338,34 @@ fn emit_opencode_message_events(
 struct OpenCodeReconstructedUsage {
     usage: UsageCounts,
     provider_reported_usd: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionEventRollup {
+    event_ids: Vec<EventId>,
+    usage: UsageCounts,
+    estimated_cost_usd: Option<i64>,
+}
+
+fn session_event_rollups(events: &[UsageEvent]) -> HashMap<String, SessionEventRollup> {
+    let mut rollups = HashMap::<String, SessionEventRollup>::new();
+    for event in events {
+        let Some(session_hash) = event.session.local_session_id_hash.as_ref() else {
+            continue;
+        };
+        let rollup = rollups.entry(session_hash.clone()).or_default();
+        rollup.event_ids.push(event.event_id.clone());
+        rollup.usage = sum_usage_counts(&rollup.usage, &event.usage);
+        rollup.estimated_cost_usd = match (
+            rollup.estimated_cost_usd,
+            event.cost.estimated_api_equivalent_usd,
+        ) {
+            (Some(left), Some(right)) => Some(left.saturating_add(right)),
+            (Some(left), None) => Some(left),
+            (None, right) => right,
+        };
+    }
+    rollups
 }
 
 fn scan_grok_build_source(
@@ -1358,6 +1735,18 @@ struct ClaudeSessionProjectMetadata {
     git_branch: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeTaskEntry {
+    session_id: String,
+    title: Option<String>,
+    title_source: &'static str,
+    summary_preview: Option<String>,
+    project: Option<ProjectInfo>,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    source_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProjectContext {
     project_label: Option<String>,
@@ -1628,6 +2017,7 @@ fn parse_codex_file(
     ctx: &mut FileParseContext<'_, CodexAdapter>,
     root: &Path,
     usage_root: &Path,
+    thread_titles: &HashMap<String, String>,
     path: &Path,
 ) -> Result<()> {
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
@@ -1638,6 +2028,8 @@ fn parse_codex_file(
     let mut current_reasoning = ModelReasoningState::default();
     let mut current_model_is_fallback = false;
     let mut current_project: Option<ProjectInfo> = None;
+    let mut current_title: Option<String> = None;
+    let mut current_thread_id: Option<String> = None;
     let session_raw = codex_session_id(usage_root, path);
     let mut records = Vec::new();
 
@@ -1656,6 +2048,24 @@ fn parse_codex_file(
         };
 
         if is_codex_session_meta(&value) {
+            current_thread_id = value
+                .pointer("/payload/id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let session_id = current_thread_id
+                .clone()
+                .or_else(|| Some(session_raw.clone()));
+            current_title = value
+                .pointer("/payload/thread_name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    session_id
+                        .as_ref()
+                        .and_then(|session_id| thread_titles.get(session_id))
+                        .cloned()
+                })
+                .or_else(|| thread_titles.get(&session_raw).cloned());
             current_project = codex_project_context_from_value(&value);
             continue;
         }
@@ -1678,6 +2088,7 @@ fn parse_codex_file(
         let is_task_started = is_codex_task_started(&value);
         let is_task_complete = is_codex_task_complete(&value);
         let message_role = codex_visible_message_role(&value).map(ToOwned::to_owned);
+        let user_message_preview = codex_user_message_preview(&value);
         let event_session_raw =
             session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
         let usage = if is_token_count_event {
@@ -1767,6 +2178,9 @@ fn parse_codex_file(
             is_task_started,
             is_task_complete,
             message_role,
+            user_message_preview,
+            session_title: current_title.clone(),
+            thread_id: current_thread_id.clone(),
             project: current_project
                 .clone()
                 .or_else(|| project_context_from_path_fallback(root, path)),
@@ -1783,12 +2197,16 @@ fn parse_codex_file(
             active_turns.push(ActiveCodexTurn {
                 started_at,
                 session_raw: record.session_raw.clone(),
+                title: record.session_title.clone(),
+                thread_id: record.thread_id.clone(),
                 model: record.model.clone(),
                 model_inferred: record.model_inferred,
                 timestamp_inferred: record.timestamp_inferred,
                 message_counts: CodexMessageCounts::default(),
                 last_usage: record.usage.clone(),
                 accumulated_usage: record.usage.clone(),
+                prompt_previews: Vec::new(),
+                last_activity_at: record.timestamp,
                 usage_lines: record
                     .usage
                     .as_ref()
@@ -1811,8 +2229,12 @@ fn parse_codex_file(
                 turn.model_inferred = record.model_inferred;
             }
             turn.timestamp_inferred |= record.timestamp_inferred;
+            turn.last_activity_at = record.timestamp;
             if record.project.is_some() {
                 turn.project = record.project.clone();
+            }
+            if turn.title.is_none() && record.session_title.is_some() {
+                turn.title = record.session_title.clone();
             }
             if let Some(role) = record.message_role.as_deref() {
                 turn.message_counts.total = turn.message_counts.total.saturating_add(1);
@@ -1827,6 +2249,16 @@ fn parse_codex_file(
                             turn.message_counts.developer.saturating_add(1)
                     }
                     _ => {}
+                }
+            }
+            if let Some(prompt_preview) = record.user_message_preview.as_ref() {
+                if turn.prompt_previews.len() < 3
+                    && !turn
+                        .prompt_previews
+                        .iter()
+                        .any(|existing| existing == prompt_preview)
+                {
+                    turn.prompt_previews.push(prompt_preview.clone());
                 }
             }
             if let Some(usage) = record.usage.clone() {
@@ -1923,8 +2355,155 @@ fn parse_codex_file(
                     dedupe_salt: None,
                 },
             );
+            let event_id = event.event_id.clone();
+            let event_cost = event.cost.estimated_api_equivalent_usd;
+            let prompt_preview = choose_best_task_preview(&turn.prompt_previews);
+            let has_prompt_preview = prompt_preview.is_some();
+            let (title, title_source, is_meta) =
+                codex_task_title(turn.title.as_deref(), prompt_preview.as_deref());
+            let normalized_title = normalize_task_title(&title);
+            let project = record
+                .project
+                .clone()
+                .or(turn.project.clone())
+                .or_else(|| project_context_from_path_fallback(root, path));
+            let issue_keys = extract_issue_keys(&[
+                title.as_str(),
+                prompt_preview.as_deref().unwrap_or(""),
+                project
+                    .as_ref()
+                    .and_then(|project| project.branch_label.as_deref())
+                    .unwrap_or(""),
+            ]);
+            let branch_family = branch_family(
+                project
+                    .as_ref()
+                    .and_then(|project| project.branch_label.as_deref()),
+            );
+            let project_bucket = project_bucket_key(project.as_ref());
+            let usage_snapshot = event.usage.clone();
             push_deduped(ctx.scan, ctx.seen, event);
+            ctx.scan.task_spans.push(TaskSpan {
+                schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                span_id: task_span_id(
+                    ctx.adapter.provider(),
+                    &ctx.source.source_id,
+                    &format!(
+                        "codex_task_span.v1:{}:{}:{}:{}",
+                        record.session_raw,
+                        turn.started_at.to_rfc3339(),
+                        completed_at.to_rfc3339(),
+                        record.line_number
+                    ),
+                ),
+                provider: ctx.adapter.provider().to_string(),
+                source_id: ctx.source.source_id.clone(),
+                span_kind: "codex_task".to_string(),
+                source_record_id: Some(format!(
+                    "codex_task_span.v1:{}:{}",
+                    record.session_raw, record.line_number
+                )),
+                source_file_path_hash: Some(hash_text(&canonical_display(path))),
+                summary_id: None,
+                session_id: Some(record.session_raw.clone()),
+                thread_id: record.thread_id.clone().or(turn.thread_id.clone()),
+                title,
+                normalized_title,
+                title_source: Some(title_source.to_string()),
+                summary_preview: prompt_preview,
+                todo_excerpt: None,
+                issue_keys,
+                branch_family,
+                project_bucket,
+                project,
+                git: None,
+                usage: usage_snapshot,
+                estimated_cost_usd: event_cost,
+                linked_event_ids: vec![event_id],
+                confidence: if turn.title.is_some() {
+                    Confidence::High
+                } else if has_prompt_preview {
+                    Confidence::Medium
+                } else {
+                    Confidence::Low
+                },
+                is_meta,
+                started_at: turn.started_at,
+                ended_at: Some(completed_at),
+                duration_seconds: duration_ms.map(|value| value / 1000),
+            });
         }
+    }
+
+    for turn in active_turns {
+        let prompt_preview = choose_best_task_preview(&turn.prompt_previews);
+        let (title, title_source, is_meta) =
+            codex_task_title(turn.title.as_deref(), prompt_preview.as_deref());
+        let normalized_title = normalize_task_title(&title);
+        let project = turn
+            .project
+            .clone()
+            .or_else(|| project_context_from_path_fallback(root, path));
+        let issue_keys = extract_issue_keys(&[
+            title.as_str(),
+            prompt_preview.as_deref().unwrap_or(""),
+            project
+                .as_ref()
+                .and_then(|project| project.branch_label.as_deref())
+                .unwrap_or(""),
+        ]);
+        ctx.scan.task_spans.push(TaskSpan {
+            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+            span_id: task_span_id(
+                ctx.adapter.provider(),
+                &ctx.source.source_id,
+                &format!(
+                    "codex_task_span.v1:{}:{}:open",
+                    turn.session_raw,
+                    turn.started_at.to_rfc3339()
+                ),
+            ),
+            provider: ctx.adapter.provider().to_string(),
+            source_id: ctx.source.source_id.clone(),
+            span_kind: "codex_task".to_string(),
+            source_record_id: Some(format!(
+                "codex_task_span.v1:{}:{}:open",
+                turn.session_raw,
+                turn.started_at.to_rfc3339()
+            )),
+            source_file_path_hash: Some(hash_text(&canonical_display(path))),
+            summary_id: None,
+            session_id: Some(turn.session_raw.clone()),
+            thread_id: turn.thread_id.clone(),
+            title,
+            normalized_title,
+            title_source: Some(title_source.to_string()),
+            summary_preview: prompt_preview,
+            todo_excerpt: None,
+            issue_keys,
+            branch_family: branch_family(
+                project
+                    .as_ref()
+                    .and_then(|project| project.branch_label.as_deref()),
+            ),
+            project_bucket: project_bucket_key(project.as_ref()),
+            project,
+            git: None,
+            usage: turn.accumulated_usage.unwrap_or_default(),
+            estimated_cost_usd: None,
+            linked_event_ids: Vec::new(),
+            confidence: if turn.title.is_some() {
+                Confidence::Medium
+            } else if turn.prompt_previews.is_empty() {
+                Confidence::Low
+            } else {
+                Confidence::Medium
+            },
+            is_meta,
+            started_at: turn.started_at,
+            ended_at: None,
+            duration_seconds: None,
+        });
     }
 
     for record in records {
@@ -1989,6 +2568,9 @@ struct CodexLineRecord {
     is_task_started: bool,
     is_task_complete: bool,
     message_role: Option<String>,
+    user_message_preview: Option<String>,
+    session_title: Option<String>,
+    thread_id: Option<String>,
     project: Option<ProjectInfo>,
 }
 
@@ -2004,12 +2586,16 @@ struct CodexMessageCounts {
 struct ActiveCodexTurn {
     started_at: DateTime<Utc>,
     session_raw: String,
+    title: Option<String>,
+    thread_id: Option<String>,
     model: Option<ModelInfo>,
     model_inferred: bool,
     timestamp_inferred: bool,
     message_counts: CodexMessageCounts,
     last_usage: Option<UsageCounts>,
     accumulated_usage: Option<UsageCounts>,
+    prompt_previews: Vec<String>,
+    last_activity_at: DateTime<Utc>,
     usage_lines: Vec<usize>,
     project: Option<ProjectInfo>,
 }
@@ -2859,6 +3445,91 @@ fn parse_grok_summary(
         .saturating_add(stats.events_rows)
         .saturating_add(inference_stats.rows);
     scan.diagnostics.candidate_usage_rows += summary.usage.requests.unwrap_or(0);
+    let generated_title = value
+        .get("generated_title")
+        .and_then(Value::as_str)
+        .and_then(|value| summarize_task_text(Some(value), 90));
+    let session_summary = value
+        .get("session_summary")
+        .and_then(Value::as_str)
+        .and_then(|value| summarize_task_text(Some(value), 220));
+    let title = generated_title
+        .clone()
+        .or_else(|| task_title_from_prompt(session_summary.as_deref()))
+        .unwrap_or_else(|| format!("Grok session {session_id}"));
+    let issue_keys = extract_issue_keys(&[
+        title.as_str(),
+        session_summary.as_deref().unwrap_or(""),
+        summary
+            .project
+            .as_ref()
+            .and_then(|project| project.branch_label.as_deref())
+            .unwrap_or(""),
+    ]);
+    scan.task_spans.push(TaskSpan {
+        schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+        span_id: task_span_id(
+            adapter.provider(),
+            &source.source_id,
+            &format!(
+                "grok_task_span.v1:{session_id}:{}",
+                observed_at.to_rfc3339()
+            ),
+        ),
+        provider: adapter.provider().to_string(),
+        source_id: source.source_id.clone(),
+        span_kind: "grok_session_summary".to_string(),
+        source_record_id: Some(session_id.clone()),
+        source_file_path_hash: Some(hash_text(&canonical_display(summary_path))),
+        summary_id: Some(summary.summary_id.clone()),
+        session_id: Some(session_id.clone()),
+        thread_id: None,
+        title: title.clone(),
+        normalized_title: normalize_task_title(&title),
+        title_source: Some(
+            if generated_title.is_some() {
+                "generated_title"
+            } else if session_summary.is_some() {
+                "session_summary"
+            } else {
+                "default"
+            }
+            .to_string(),
+        ),
+        summary_preview: session_summary.clone(),
+        todo_excerpt: None,
+        issue_keys,
+        branch_family: branch_family(
+            summary
+                .project
+                .as_ref()
+                .and_then(|project| project.branch_label.as_deref()),
+        ),
+        project_bucket: project_bucket_key(summary.project.as_ref()),
+        project: summary.project.clone(),
+        git: None,
+        usage: summary.usage.clone(),
+        estimated_cost_usd: summary.cost.estimated_api_equivalent_usd,
+        linked_event_ids: Vec::new(),
+        confidence: if generated_title.is_some() {
+            Confidence::High
+        } else if session_summary.is_some() {
+            Confidence::Medium
+        } else {
+            Confidence::Low
+        },
+        is_meta: task_title_is_generic(Some(title.as_str())),
+        started_at: value
+            .get("created_at")
+            .and_then(timestamp_from_scalar)
+            .unwrap_or(observed_at),
+        ended_at: Some(observed_at),
+        duration_seconds: summary
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.active_seconds)
+            .map(|seconds| seconds as u64),
+    });
     scan.summaries.push(summary);
     Ok(())
 }
@@ -3190,6 +3861,18 @@ fn open_sqlite_readonly(path: &Path) -> Result<Connection> {
     .with_context(|| format!("open sqlite {}", path.display()))
 }
 
+fn sqlite_column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn sqlite_nonzero_u64(value: i64) -> Option<u64> {
     (value > 0).then_some(value as u64)
 }
@@ -3491,6 +4174,118 @@ fn codex_line_could_have_usage_or_context(line: &str) -> bool {
         || line.contains("\"prompt_tokens\"")
 }
 
+fn load_codex_thread_titles(root: &Path) -> HashMap<String, String> {
+    let index_path = root.join("session_index.jsonl");
+    let Ok(file) = File::open(&index_path) else {
+        return HashMap::new();
+    };
+    let reader = BufReader::new(file);
+    let mut titles = HashMap::new();
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(session_id) = value.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(title) = value.get("thread_name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(title) = summarize_task_text(Some(title), 90) {
+            titles.insert(session_id.to_string(), title);
+        }
+    }
+    titles
+}
+
+fn choose_best_task_preview(previews: &[String]) -> Option<String> {
+    previews
+        .iter()
+        .find(|preview| {
+            !task_title_is_generic(Some(preview.as_str()))
+                && !task_title_is_weak_signal(Some(preview.as_str()))
+        })
+        .cloned()
+        .or_else(|| {
+            previews
+                .iter()
+                .find(|preview| !task_title_is_generic(Some(preview.as_str())))
+                .cloned()
+        })
+        .or_else(|| previews.first().cloned())
+}
+
+fn codex_task_title(
+    session_title: Option<&str>,
+    prompt_preview: Option<&str>,
+) -> (String, &'static str, bool) {
+    if let Some(title) = summarize_task_text(session_title, 90) {
+        let is_meta = task_title_is_generic(Some(title.as_str()));
+        if !is_meta {
+            return (title, "thread_name", false);
+        }
+        if prompt_preview.is_none() {
+            return (title, "thread_name", true);
+        }
+    }
+    if let Some(prompt_title) = task_title_from_prompt(prompt_preview) {
+        let is_meta = task_title_is_generic(Some(prompt_title.as_str()));
+        return (prompt_title, "user_prompt", is_meta);
+    }
+    (
+        "Codex task".to_string(),
+        "default",
+        task_title_is_generic(Some("Codex task")),
+    )
+}
+
+fn codex_user_message_preview(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) == Some("response_item")
+        && value.pointer("/payload/type").and_then(Value::as_str) == Some("message")
+        && value.pointer("/payload/role").and_then(Value::as_str) == Some("user")
+    {
+        return task_preview_from_prompt(
+            codex_message_content_text(value.pointer("/payload/content")).as_deref(),
+            220,
+        );
+    }
+
+    if value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && value.pointer("/payload/type").and_then(Value::as_str) == Some("user_message")
+    {
+        return task_preview_from_prompt(
+            value
+                .pointer("/payload/message")
+                .and_then(Value::as_str)
+                .or_else(|| value.pointer("/payload/text").and_then(Value::as_str)),
+            220,
+        );
+    }
+
+    None
+}
+
+fn codex_message_content_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    let array = value.as_array()?;
+    let parts = array
+        .iter()
+        .filter_map(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .or_else(|| item.pointer("/content/text").and_then(Value::as_str))
+                .or_else(|| item.pointer("/input/text").and_then(Value::as_str))
+        })
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 fn codex_task_timestamp(value: &Value, pointers: &[&str]) -> Option<DateTime<Utc>> {
     pointers
         .iter()
@@ -3586,6 +4381,116 @@ fn load_claude_session_projects(
     }
 
     projects
+}
+
+fn load_claude_task_entries(projects_root: &Path) -> Vec<ClaudeTaskEntry> {
+    let mut entries_out = Vec::new();
+    if !projects_root.exists() {
+        return entries_out;
+    }
+
+    for entry in WalkDir::new(projects_root).follow_links(false) {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_file() || entry.file_name() != "sessions-index.json" {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let original_path = value
+            .get("originalPath")
+            .and_then(Value::as_str)
+            .map(expand_home_path);
+        let Some(entries) = value.get("entries").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in entries {
+            let Some(session_id) = item.get("sessionId").and_then(Value::as_str) else {
+                continue;
+            };
+            let summary = item
+                .get("summary")
+                .and_then(Value::as_str)
+                .and_then(|value| summarize_task_text(Some(value), 220));
+            let first_prompt = item
+                .get("firstPrompt")
+                .and_then(Value::as_str)
+                .and_then(|value| summarize_task_text(Some(value), 220));
+            let title = if summary
+                .as_deref()
+                .is_some_and(|value| !task_title_is_generic(Some(value)))
+            {
+                summary
+                    .as_deref()
+                    .and_then(|value| summarize_task_text(Some(value), 90))
+            } else {
+                task_title_from_prompt(first_prompt.as_deref()).or_else(|| {
+                    summary
+                        .as_deref()
+                        .and_then(|value| summarize_task_text(Some(value), 90))
+                })
+            };
+            let title_source = if summary
+                .as_deref()
+                .is_some_and(|value| !task_title_is_generic(Some(value)))
+            {
+                "summary"
+            } else if first_prompt.is_some() {
+                "first_prompt"
+            } else {
+                "summary"
+            };
+            let project = item
+                .get("projectPath")
+                .and_then(Value::as_str)
+                .map(expand_home_path)
+                .or_else(|| original_path.clone())
+                .and_then(|project_path| {
+                    resolve_project_context(
+                        Some(project_path),
+                        None,
+                        item.get("gitBranch")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                    )
+                });
+            let started_at = item
+                .get("created")
+                .and_then(timestamp_from_scalar)
+                .or_else(|| file_modified_timestamp(entry.path()))
+                .unwrap_or_else(Utc::now);
+            let ended_at = item
+                .get("modified")
+                .and_then(timestamp_from_scalar)
+                .or_else(|| item.get("created").and_then(timestamp_from_scalar))
+                .or_else(|| file_modified_timestamp(entry.path()))
+                .unwrap_or(started_at);
+            let summary_preview = first_prompt
+                .clone()
+                .filter(|prompt| title.as_deref() != Some(prompt.as_str()))
+                .or(summary.clone());
+            entries_out.push(ClaudeTaskEntry {
+                session_id: session_id.to_string(),
+                title,
+                title_source,
+                summary_preview,
+                project,
+                started_at,
+                ended_at,
+                source_path: item
+                    .get("fullPath")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from),
+            });
+        }
+    }
+
+    entries_out
 }
 
 fn codex_project_context_from_value(value: &Value) -> Option<ProjectInfo> {
@@ -4363,13 +5268,17 @@ mod tests {
         let workspace = dir.path().join("workspace").join("ai-stats");
         std::fs::create_dir_all(&sessions).expect("sessions");
         std::fs::create_dir_all(&workspace).expect("workspace");
-        write_git_fixture(&workspace, "git@github.com:StarkDmi/StatsAI.git", "main");
+        write_git_fixture(
+            &workspace,
+            "git@github.com:example-org/example-workspace.git",
+            "main",
+        );
 
         let session_path = sessions.join("session.jsonl");
         let mut file = File::create(&session_path).expect("session file");
         writeln!(
             file,
-            r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{{"cwd":"{}","git":{{"repository_url":"git@github.com:StarkDmi/StatsAI.git","branch":"main"}}}}}}"#,
+            r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{{"cwd":"{}","git":{{"repository_url":"git@github.com:example-org/example-workspace.git","branch":"main"}}}}}}"#,
             workspace.display()
         )
         .expect("write session meta");
@@ -4395,8 +5304,134 @@ mod tests {
             Some(workspace.to_string_lossy().as_ref())
         );
         assert_eq!(project.project_label.as_deref(), Some("ai-stats"));
-        assert_eq!(project.repo_label.as_deref(), Some("starkdmi/statsai"));
+        assert_eq!(
+            project.repo_label.as_deref(),
+            Some("example-org/example-workspace")
+        );
         assert_eq!(project.branch_label.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn codex_task_title_extracts_user_request_from_transcript_delta_prompt() {
+        let (title, title_source, is_meta) = codex_task_title(
+            None,
+            Some(
+                ">>> TRANSCRIPT DELTA START [167] user: Code review Found one actionable issue: \
+                 ::code-comment{title=\"[P2] Concurrent filter changes can overwrite each \
+                 other\" body=\"Each update derives from the last rendered searchParams\"}",
+            ),
+        );
+
+        assert_eq!(title, "Code review");
+        assert_eq!(title_source, "user_prompt");
+        assert!(!is_meta);
+    }
+
+    #[test]
+    fn codex_task_title_rejects_tool_result_transcript_delta_prompt() {
+        let (title, title_source, is_meta) = codex_task_title(
+            None,
+            Some(
+                ">>> TRANSCRIPT DELTA START [288] tool exec_command result: Chunk ID: 84e62e \
+                 Wall time: 1.0006 seconds Process running with session ID 32988 Original \
+                 token count: 30 Output:",
+            ),
+        );
+
+        assert_eq!(title, "Codex task");
+        assert_eq!(title_source, "default");
+        assert!(is_meta);
+    }
+
+    #[test]
+    fn codex_task_title_rejects_metric_report_prompt_without_intent() {
+        let (title, title_source, is_meta) = codex_task_title(
+            None,
+            Some("Qwen3.5 8bit ckpt2400: F1_overlap=49.19 Avg_TIoU=74.88 MAE=1.85 TitleF1=39.34"),
+        );
+
+        assert_eq!(title, "Codex task");
+        assert_eq!(title_source, "default");
+        assert!(is_meta);
+    }
+
+    #[test]
+    fn codex_task_title_skips_instructional_preamble_and_keeps_request() {
+        let (title, title_source, is_meta) = codex_task_title(
+            None,
+            Some(
+                "This is NOT the Next.js you know. This version may differ from your training \
+                 data. Read the relevant guide before writing code. I need device renaming on \
+                 web and api.",
+            ),
+        );
+
+        assert_eq!(title, "I need device renaming on web and api");
+        assert_eq!(title_source, "user_prompt");
+        assert!(!is_meta);
+    }
+
+    #[test]
+    fn codex_task_spans_capture_thread_id_from_session_meta() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let codex_root = dir.path().join("codex");
+        let sessions = codex_root.join("sessions");
+        let workspace = dir.path().join("workspace").join("ai-stats");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_git_fixture(
+            &workspace,
+            "git@github.com:example-org/example-workspace.git",
+            "main",
+        );
+
+        let session_path = sessions.join("session.jsonl");
+        let mut file = File::create(&session_path).expect("session file");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{{"id":"thread-123","thread_name":"Fix parser bug","cwd":"{}","git":{{"repository_url":"git@github.com:example-org/example-workspace.git","branch":"main"}}}}}}"#,
+            workspace.display()
+        )
+        .expect("write session meta");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"turn_context","payload":{{"model":"gpt-5"}}}}"#
+        )
+        .expect("write context");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:00:01Z","type":"event_msg","payload":{{"type":"task_started","started_at":"2026-06-01T08:00:01Z"}}}}"#
+        )
+        .expect("write start");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:00:02Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Fix parser bug in statsai scan"}}]}}}}"#
+        )
+        .expect("write user message");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:00:03Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120}},"total_token_usage":{{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120}}}}}}}}"#
+        )
+        .expect("write tokens");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:00:04Z","type":"event_msg","payload":{{"type":"task_complete","completed_at":"2026-06-01T08:00:04Z","duration_ms":3000}}}}"#
+        )
+        .expect("write complete");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            &codex_root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.task_spans.len(), 1);
+        assert_eq!(scan.task_spans[0].thread_id.as_deref(), Some("thread-123"));
+        assert_eq!(scan.task_spans[0].session_id.as_deref(), Some("session"));
+        assert_eq!(scan.task_spans[0].title, "Fix parser bug");
     }
 
     #[test]
@@ -4587,6 +5622,185 @@ mod tests {
         assert_eq!(scan.diagnostics.files_scanned, 1);
         assert_eq!(scan.diagnostics.files_skipped_unchanged, 1);
         assert_eq!(scan.events[0].usage.computed_total(), 3);
+    }
+
+    #[test]
+    fn claude_partial_jsonl_scan_only_emits_selected_task_spans() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_store = root.join("projects").join("example-workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+
+        let first = project_store.join("first.jsonl");
+        let second = project_store.join("second.jsonl");
+        std::fs::write(
+            &first,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"sessionId\":\"session-a\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        )
+        .expect("first");
+        std::fs::write(
+            &second,
+            "{\"timestamp\":\"2026-05-01T00:01:00Z\",\"sessionId\":\"session-b\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n",
+        )
+        .expect("second");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            format!(
+                concat!(
+                    "{{\"version\":1,\"entries\":[",
+                    "{{\"sessionId\":\"session-a\",\"fullPath\":\"{}\",\"summary\":\"Fix parser bug\"}},",
+                    "{{\"sessionId\":\"session-b\",\"fullPath\":\"{}\",\"summary\":\"Review release notes\"}}",
+                    "]}}"
+                ),
+                first.display(),
+                second.display()
+            ),
+        )
+        .expect("session index");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            root,
+            LocationOrigin::Configured,
+        );
+        let selected = [canonical_display(&first)].into_iter().collect();
+        let scan = scan_claude_source(
+            &ClaudeCodeAdapter,
+            &source,
+            &ScanOptions {
+                device_id: "device".to_string(),
+                selected_cache_keys: Some(selected),
+            },
+        )
+        .expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.task_spans.len(), 1);
+        assert_eq!(scan.task_spans[0].session_id.as_deref(), Some("session-a"));
+        assert_eq!(scan.task_spans[0].title, "Fix parser bug");
+        assert_eq!(scan.task_spans[0].usage.computed_total(), 3);
+        assert_eq!(scan.task_spans[0].linked_event_ids.len(), 1);
+    }
+
+    #[test]
+    fn claude_partial_stats_cache_scan_does_not_emit_unscanned_task_spans() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_store = root.join("projects").join("example-workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+
+        let session = project_store.join("session.jsonl");
+        std::fs::write(
+            &session,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"sessionId\":\"session-a\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        )
+        .expect("session");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            format!(
+                "{{\"version\":1,\"entries\":[{{\"sessionId\":\"session-a\",\"fullPath\":\"{}\",\"summary\":\"Investigate cache issue\"}}]}}",
+                session.display()
+            ),
+        )
+        .expect("session index");
+        std::fs::write(
+            root.join("stats-cache.json"),
+            r#"{
+              "version": 2,
+              "lastComputedDate": "2026-05-13",
+              "firstSessionDate": "2026-05-01T00:00:00Z",
+              "totalSessions": 1,
+              "totalMessages": 2,
+              "modelUsage": {
+                "claude-opus-4-5-thinking": {
+                  "inputTokens": 11,
+                  "outputTokens": 7,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0,
+                  "costUSD": 0.12
+                }
+              }
+            }"#,
+        )
+        .expect("stats cache");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            root,
+            LocationOrigin::Configured,
+        );
+        let selected = [canonical_display(&root.join("stats-cache.json"))]
+            .into_iter()
+            .collect();
+        let scan = scan_claude_source(
+            &ClaudeCodeAdapter,
+            &source,
+            &ScanOptions {
+                device_id: "device".to_string(),
+                selected_cache_keys: Some(selected),
+            },
+        )
+        .expect("scan");
+
+        assert!(scan.events.is_empty());
+        assert_eq!(scan.summaries.len(), 1);
+        assert!(scan.task_spans.is_empty());
+    }
+
+    #[test]
+    fn claude_task_entry_matches_scanned_file_handles_jsonl_suffix_mismatch() {
+        let path = Path::new("/tmp/example-session");
+        let scanned = [canonical_display(&path.with_extension("jsonl"))]
+            .into_iter()
+            .collect();
+
+        assert!(claude_task_entry_matches_scanned_file(path, &scanned));
+        assert!(claude_task_entry_matches_scanned_file(
+            &path.with_extension("jsonl"),
+            &scanned
+        ));
+    }
+
+    #[test]
+    fn claude_task_spans_use_reconciliation_hash_for_suffix_mismatched_index_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_store = root.join("projects").join("example-workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+
+        let session = project_store.join("session-a.jsonl");
+        std::fs::write(
+            &session,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"sessionId\":\"session-a\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        )
+        .expect("session");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            format!(
+                "{{\"version\":1,\"entries\":[{{\"sessionId\":\"session-a\",\"fullPath\":\"{}\",\"summary\":\"Investigate cleanup mismatch\"}}]}}",
+                session.with_extension("").display()
+            ),
+        )
+        .expect("session index");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.task_spans.len(), 1);
+        assert_eq!(
+            scan.task_spans[0].source_file_path_hash.as_deref(),
+            Some(hash_text(&canonical_display(&session)).as_str())
+        );
     }
 
     #[test]
@@ -5443,14 +6657,22 @@ mod tests {
         std::fs::create_dir_all(&sessions).expect("sessions");
         std::fs::create_dir_all(&workspace_a).expect("workspace a");
         std::fs::create_dir_all(&workspace_b).expect("workspace b");
-        write_git_fixture(&workspace_a, "git@github.com:StarkDmi/StatsAI.git", "main");
-        write_git_fixture(&workspace_b, "git@github.com:StarkDmi/StatsAI.git", "main");
+        write_git_fixture(
+            &workspace_a,
+            "git@github.com:example-org/example-workspace.git",
+            "main",
+        );
+        write_git_fixture(
+            &workspace_b,
+            "git@github.com:example-org/example-workspace.git",
+            "main",
+        );
 
         for (name, workspace) in [("a.jsonl", &workspace_a), ("b.jsonl", &workspace_b)] {
             let mut file = File::create(sessions.join(name)).expect("fixture");
             writeln!(
                 file,
-                r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{{"cwd":"{}","git":{{"repository_url":"git@github.com:StarkDmi/StatsAI.git","branch":"main"}}}}}}"#,
+                r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{{"cwd":"{}","git":{{"repository_url":"git@github.com:example-org/example-workspace.git","branch":"main"}}}}}}"#,
                 workspace.display()
             )
             .expect("write session meta");
@@ -5518,13 +6740,17 @@ mod tests {
         let workspace = dir.path().join("workspace").join("ai-stats");
         std::fs::create_dir_all(&sessions).expect("sessions");
         std::fs::create_dir_all(&workspace).expect("workspace");
-        write_git_fixture(&workspace, "git@github.com:StarkDmi/StatsAI.git", "main");
+        write_git_fixture(
+            &workspace,
+            "git@github.com:example-org/example-workspace.git",
+            "main",
+        );
 
         for (name, branch_name) in [("main.jsonl", "main"), ("feature.jsonl", "feature-x")] {
             let mut file = File::create(sessions.join(name)).expect("fixture");
             writeln!(
                 file,
-                r#"{{"timestamp":"2026-06-03T08:00:00Z","type":"session_meta","payload":{{"cwd":"{}","git":{{"repository_url":"git@github.com:StarkDmi/StatsAI.git","branch":"{}"}}}}}}"#,
+                r#"{{"timestamp":"2026-06-03T08:00:00Z","type":"session_meta","payload":{{"cwd":"{}","git":{{"repository_url":"git@github.com:example-org/example-workspace.git","branch":"{}"}}}}}}"#,
                 workspace.display(),
                 branch_name
             )

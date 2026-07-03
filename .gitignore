@@ -34,3 +34,4 @@ node_modules/
 /functions
 DEPLOY.md
 PUBLISH.md
+tmp-statsai-*.sqlite*

@@ -1,6 +1,7 @@
 //! Local SQLite storage for `statsai`.
 
 mod migrations;
+mod tasks;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
@@ -22,6 +23,11 @@ use statsai_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+
+pub use tasks::{
+    derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
+    TaskDeletionImpact, TaskStats,
+};
 
 const SYNC_ROLLUP_SUMMARY_VERSION: &str = "10";
 
@@ -4956,7 +4962,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
@@ -5061,7 +5067,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
@@ -5165,7 +5171,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
@@ -5284,7 +5290,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
@@ -5399,7 +5405,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
