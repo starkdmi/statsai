@@ -1369,63 +1369,32 @@ fn build_localized_rebuild_plan(
             continue;
         }
 
-        ranges = expand_ranges_by_window(
+        ranges = merge_index_ranges(expand_ranges_by_window(
             &merge_index_ranges(ranges),
             bucket_contexts.len(),
             TOPIC_COHESION_WINDOW_SPANS,
-        );
+        ));
 
-        let mut additional_bounds = Vec::new();
-        for layout in &bucket_layouts {
-            let touched_by_deleted = layout
-                .span_ids
-                .iter()
-                .any(|span_id| deleted_span_ids.contains(span_id));
-            let touched_by_changed = layout
-                .span_ids
-                .iter()
-                .any(|span_id| changed_span_ids.contains(span_id));
-            if !(touched_by_deleted
-                || touched_by_changed
-                || ranges_intersect_layout(&ranges, &index_map, layout))
-            {
-                continue;
-            }
-            plan.work_item_ids_to_delete
-                .insert(layout.work_item_id.0.clone());
-            if let Some(bounds) = layout_bounds(layout, &index_map) {
-                additional_bounds.push(bounds);
-            }
-        }
+        // A touched layout can expand the rebuild segment far enough to reach other
+        // existing layouts. Keep expanding until both the ranges and delete set
+        // stabilize so rebuilt inserts never race leftover rows.
+        loop {
+            let delete_count_before = plan.work_item_ids_to_delete.len();
+            let mut additional_bounds = Vec::new();
 
-        for verification in verifications {
-            let TaskVerificationAction::Merge {
-                left_anchor_span_id,
-                right_anchor_span_id,
-                ..
-            } = &verification.action
-            else {
-                continue;
-            };
-            let left_touched = range_or_deleted_contains_span_id(
-                &ranges,
-                &index_map,
-                &deleted_span_ids,
-                &left_anchor_span_id.0,
-            );
-            let right_touched = range_or_deleted_contains_span_id(
-                &ranges,
-                &index_map,
-                &deleted_span_ids,
-                &right_anchor_span_id.0,
-            );
-            if !left_touched && !right_touched {
-                continue;
-            }
             for layout in &bucket_layouts {
-                if !layout.span_ids.iter().any(|span_id| {
-                    span_id == &left_anchor_span_id.0 || span_id == &right_anchor_span_id.0
-                }) {
+                let touched_by_deleted = layout
+                    .span_ids
+                    .iter()
+                    .any(|span_id| deleted_span_ids.contains(span_id));
+                let touched_by_changed = layout
+                    .span_ids
+                    .iter()
+                    .any(|span_id| changed_span_ids.contains(span_id));
+                if !(touched_by_deleted
+                    || touched_by_changed
+                    || ranges_intersect_layout(&ranges, &index_map, layout))
+                {
                     continue;
                 }
                 plan.work_item_ids_to_delete
@@ -1434,23 +1403,57 @@ fn build_localized_rebuild_plan(
                     additional_bounds.push(bounds);
                 }
             }
-        }
 
-        ranges.extend(additional_bounds);
-        ranges = merge_index_ranges(ranges);
+            for verification in verifications {
+                let TaskVerificationAction::Merge {
+                    left_anchor_span_id,
+                    right_anchor_span_id,
+                    ..
+                } = &verification.action
+                else {
+                    continue;
+                };
+                let left_touched = range_or_deleted_contains_span_id(
+                    &ranges,
+                    &index_map,
+                    &deleted_span_ids,
+                    &left_anchor_span_id.0,
+                );
+                let right_touched = range_or_deleted_contains_span_id(
+                    &ranges,
+                    &index_map,
+                    &deleted_span_ids,
+                    &right_anchor_span_id.0,
+                );
+                if !left_touched && !right_touched {
+                    continue;
+                }
+                for layout in &bucket_layouts {
+                    if !layout.span_ids.iter().any(|span_id| {
+                        span_id == &left_anchor_span_id.0 || span_id == &right_anchor_span_id.0
+                    }) {
+                        continue;
+                    }
+                    plan.work_item_ids_to_delete
+                        .insert(layout.work_item_id.0.clone());
+                    if let Some(bounds) = layout_bounds(layout, &index_map) {
+                        additional_bounds.push(bounds);
+                    }
+                }
+            }
 
-        for layout in &bucket_layouts {
-            if layout
-                .span_ids
-                .iter()
-                .any(|span_id| deleted_span_ids.contains(span_id))
-            {
-                plan.work_item_ids_to_delete
-                    .insert(layout.work_item_id.0.clone());
+            let mut expanded_ranges = ranges.clone();
+            expanded_ranges.extend(additional_bounds);
+            expanded_ranges = merge_index_ranges(expanded_ranges);
+            let stabilized = expanded_ranges == ranges
+                && plan.work_item_ids_to_delete.len() == delete_count_before;
+            ranges = expanded_ranges;
+            if stabilized {
+                break;
             }
         }
 
-        for (start, end) in merge_index_ranges(ranges) {
+        for (start, end) in ranges {
             if start >= bucket_contexts.len() || start > end {
                 continue;
             }
@@ -4775,5 +4778,114 @@ mod tests {
             &[span_a.span, span_x.span, span_b.span],
             &[verification],
         ));
+    }
+
+    #[test]
+    fn localized_rebuild_deletes_layouts_reached_by_merged_ranges() {
+        let store = Store::in_memory().expect("store");
+        let started_at = Utc.with_ymd_and_hms(2026, 7, 2, 11, 0, 0).unwrap();
+        let bucket = "bucket-a".to_string();
+        let spans = vec![
+            test_span_with_options(
+                "span-a",
+                "codex",
+                Some("session-a"),
+                &bucket,
+                started_at,
+                "Alpha payments cleanup",
+                Some("Alpha payments cleanup"),
+            )
+            .span,
+            test_span_with_options(
+                "span-b",
+                "codex",
+                Some("session-b"),
+                &bucket,
+                started_at + chrono::Duration::minutes(10),
+                "Vector search benchmark",
+                Some("Vector search benchmark"),
+            )
+            .span,
+            test_span_with_options(
+                "span-c",
+                "codex",
+                Some("session-c"),
+                &bucket,
+                started_at + chrono::Duration::minutes(20),
+                "Kernel tuning audit",
+                Some("Kernel tuning audit"),
+            )
+            .span,
+            test_span_with_options(
+                "span-d",
+                "codex",
+                Some("session-d"),
+                &bucket,
+                started_at + chrono::Duration::minutes(30),
+                "Latency regression report",
+                Some("Latency regression report"),
+            )
+            .span,
+            test_span_with_options(
+                "span-e",
+                "codex",
+                Some("session-e"),
+                &bucket,
+                started_at + chrono::Duration::minutes(40),
+                "Schema export polish",
+                Some("Schema export polish"),
+            )
+            .span,
+        ];
+        store.upsert_task_spans(&spans).expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild without merge");
+
+        let initial = store.work_items().expect("initial work items");
+        assert_eq!(initial.len(), 5);
+        let left = initial
+            .iter()
+            .find(|item| item.anchor_span_id.0 == "span-a")
+            .expect("left work item");
+        let right = initial
+            .iter()
+            .find(|item| item.anchor_span_id.0 == "span-e")
+            .expect("right work item");
+        store
+            .upsert_task_verification(TaskVerificationAction::Merge {
+                left_work_item_id: left.work_item_id.clone(),
+                right_work_item_id: right.work_item_id.clone(),
+                left_anchor_span_id: TaskSpanId("span-a".to_string()),
+                right_anchor_span_id: TaskSpanId("span-e".to_string()),
+                title: Some("Merged endpoint work".to_string()),
+            })
+            .expect("merge verification");
+        store
+            .rebuild_all_task_work_items()
+            .expect("rebuild merged layouts");
+
+        let merged = store.work_items().expect("merged work items");
+        assert_eq!(merged.len(), 4);
+
+        let report = store
+            .rebuild_task_work_items_for_changes_report(
+                &BTreeSet::from([bucket.clone()]),
+                &BTreeSet::from(["span-a".to_string()]),
+                &[],
+            )
+            .expect("localized rebuild after endpoint merge");
+        assert_eq!(report.work_items_deleted, 4);
+        assert_eq!(report.work_items_rebuilt, 4);
+        assert_eq!(report.touched_span_count, 5);
+
+        let after = store
+            .work_items()
+            .expect("work items after localized rebuild");
+        assert_eq!(after.len(), 4);
+        let members = store.work_item_members_map().expect("member map");
+        assert_eq!(members.len(), 5);
+        assert_eq!(members.values().cloned().collect::<HashSet<_>>().len(), 4);
+        assert!(members.contains_key("span-d"));
     }
 }
