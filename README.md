@@ -86,6 +86,11 @@ cargo run -p statsai -- subscription change --provider codex --email work@exampl
 cargo run -p statsai -- import summary --path ./reported_usage_summaries.json --dry-run --verbose
 cargo run -p statsai -- report weekly
 cargo run -p statsai -- report monthly --subscriptions
+cargo run -p statsai -- task list
+cargo run -p statsai -- task show work_123 --include-evidence
+cargo run -p statsai -- task verify accept work_123
+cargo run -p statsai -- task benchmark
+cargo run -p statsai -- task export --level span --format jsonl
 cargo run -p statsai -- sync --sink file --output ./statsai-sync-batch.json
 cargo run -p statsai -- sync --sink http --since-last
 cargo run -p statsai -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
@@ -136,6 +141,29 @@ readable; `--json --verbose` includes source IDs, local path labels, token
 split totals, and `estimated_cost_usd` for SDKs or scripts.
 
 `import summary` accepts a single `reported_usage_summary_input.v1` object or an array of them. Use it for user-reported or external aggregate evidence when raw local history is gone or incomplete. Imported summaries are idempotent and are shown under `summary reports (not added to event totals)` with their source paths, summary kind, token split, and the gap versus direct local events.
+
+## Local Task Collection
+
+`scan` also extracts local task spans and rebuilds derived work items in SQLite.
+A normal review loop is:
+
+1. `scan`
+2. `task list`
+3. `task show <work_item_id> --include-evidence`
+4. `task verify ...`
+5. `task benchmark`
+
+`task list` hides `rejected_meta` items by default. Use
+`task list --status rejected_meta` to inspect work the collector currently
+treats as meta, system, or noise.
+
+`task benchmark` is a local evaluation loop. It only becomes a real shipping
+gate after you have recorded verified ground truth with `task verify ...`.
+
+See:
+
+- `docs/task-collection.md`
+- `docs/task-benchmarking.md`
 
 ## Design Notes
 
