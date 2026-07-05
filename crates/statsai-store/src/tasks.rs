@@ -646,15 +646,21 @@ impl Store {
 
     pub fn task_benchmark_report(&self) -> Result<TaskBenchmarkReport> {
         let spans = self.task_spans()?;
-        let predicted = self.work_items()?;
-        let predicted_members = self.work_item_members_map()?;
+        let current_output = self.work_items()?;
+        let current_output_members = self.work_item_members_map()?;
         let verifications = self.task_verifications()?;
-        let truth =
-            ground_truth_from_store(&spans, &predicted, &predicted_members, &verifications)?;
+        let (predicted, predicted_members) = derive_task_work_items(spans.clone(), &[]);
+        let predicted_member_map = work_item_members_map_from_members(&predicted_members);
+        let truth = ground_truth_from_store(
+            &spans,
+            &current_output,
+            &current_output_members,
+            &verifications,
+        )?;
         let current_metrics = evaluate_prediction(
             &truth,
-            &predicted_members,
-            &rejected_span_ids_from_work_items(&predicted, &predicted_members),
+            &predicted_member_map,
+            &rejected_span_ids_from_work_items(&predicted, &predicted_member_map),
         );
         let baseline_strategies = vec![
             BenchmarkStrategy::GapHours(2),
@@ -677,7 +683,7 @@ impl Store {
         let has_verified_ground_truth = !truth.verified_span_ids.is_empty();
         let has_verified_pairwise_ground_truth = truth.verified_adjacent_pairs > 0;
         let manual_constraints_preserved =
-            manual_constraints_preserved(&predicted_members, &spans, &verifications);
+            manual_constraints_preserved(&current_output_members, &spans, &verifications);
         let failing_baselines = if has_verified_pairwise_ground_truth {
             baselines
                 .iter()
@@ -1616,8 +1622,33 @@ fn build_work_items(
     (work_items, members, timings)
 }
 
-fn build_bucket_label_stats(_groups: &[PendingGroup]) -> BucketLabelStats {
-    BucketLabelStats::default()
+fn build_bucket_label_stats(groups: &[PendingGroup]) -> BucketLabelStats {
+    let mut stats = BucketLabelStats::default();
+    for group in groups {
+        let candidates = collect_title_candidates(&group.spans);
+        let mut document_titles = BTreeSet::new();
+        let mut document_tokens = BTreeSet::new();
+        for candidate in candidates {
+            if candidate.normalized.is_empty() {
+                continue;
+            }
+            document_titles.insert(candidate.normalized);
+            for token in candidate.topic_tokens {
+                document_tokens.insert(token);
+            }
+        }
+        if document_titles.is_empty() && document_tokens.is_empty() {
+            continue;
+        }
+        stats.document_count += 1;
+        for title in document_titles {
+            *stats.title_document_frequency.entry(title).or_default() += 1;
+        }
+        for token in document_tokens {
+            *stats.token_document_frequency.entry(token).or_default() += 1;
+        }
+    }
+    stats
 }
 
 fn group_spans(
@@ -2241,6 +2272,7 @@ fn apply_split_verifications(
     for verification in verifications {
         let TaskVerificationAction::Split {
             after_span_id,
+            before_span_id,
             left_title,
             right_title,
         } = &verification.action
@@ -2257,7 +2289,12 @@ fn apply_split_verifications(
                 continue;
             };
             if span_index + 1 >= group.spans.len() {
-                break;
+                continue;
+            }
+            if before_span_id.as_ref().is_some_and(|before_span_id| {
+                group.spans[span_index + 1].span.span_id != *before_span_id
+            }) {
+                continue;
             }
             let mut left = PendingGroup::default();
             let mut right = PendingGroup::default();
@@ -2414,7 +2451,8 @@ fn ground_truth_from_store(
                 if let Some(work_item_id) = member_map.get(after_span_id.0.as_str()) {
                     verified_work_item_ids.insert(work_item_id.clone());
                 }
-                if let Some(next_span_id) = next_span_id_in_bucket(after_span_id, &spans_by_id) {
+                if let Some(next_span_id) = split_right_span_id(&verification.action, &spans_by_id)
+                {
                     if let Some(work_item_id) = member_map.get(next_span_id.as_str()) {
                         verified_work_item_ids.insert(work_item_id.clone());
                     }
@@ -2500,6 +2538,29 @@ fn next_span_id_in_bucket(
         .map(|span| span.span_id.0.clone())
 }
 
+fn split_right_span_id(
+    action: &TaskVerificationAction,
+    spans_by_id: &HashMap<String, TaskSpan>,
+) -> Option<String> {
+    let TaskVerificationAction::Split {
+        after_span_id,
+        before_span_id,
+        ..
+    } = action
+    else {
+        return None;
+    };
+    let anchor = spans_by_id.get(after_span_id.0.as_str())?;
+    if let Some(before_span_id) = before_span_id.as_ref() {
+        let right = spans_by_id.get(before_span_id.0.as_str())?;
+        if right.project_bucket == anchor.project_bucket {
+            return Some(before_span_id.0.clone());
+        }
+        return None;
+    }
+    next_span_id_in_bucket(after_span_id, spans_by_id)
+}
+
 fn evaluate_prediction(
     truth: &GroundTruthData,
     predicted_assignments: &HashMap<String, String>,
@@ -2571,6 +2632,14 @@ fn anchor_task_verification_action_keys(action: &TaskVerificationAction) -> Opti
         format!("reject:{}", anchor_span_id.0),
         format!("rename:{}", anchor_span_id.0),
     ])
+}
+
+fn work_item_members_map_from_members(members: &[WorkItemMember]) -> HashMap<String, String> {
+    let mut assignments = HashMap::new();
+    for member in members {
+        assignments.insert(member.span_id.0.clone(), member.work_item_id.0.clone());
+    }
+    assignments
 }
 
 fn resolve_task_verifications(verifications: Vec<TaskVerification>) -> Vec<TaskVerification> {
@@ -2702,9 +2771,14 @@ fn manual_constraints_preserved(
         .collect::<HashMap<_, _>>();
     for verification in verifications {
         match &verification.action {
-            TaskVerificationAction::Split { after_span_id, .. } => {
-                let Some(next_span_id) = next_span_id_in_bucket(after_span_id, &spans_by_id) else {
+            TaskVerificationAction::Split { .. } => {
+                let Some(next_span_id) = split_right_span_id(&verification.action, &spans_by_id)
+                else {
                     continue;
+                };
+                let after_span_id = match &verification.action {
+                    TaskVerificationAction::Split { after_span_id, .. } => after_span_id,
+                    _ => unreachable!(),
                 };
                 let left = predicted_assignments.get(after_span_id.0.as_str());
                 let right = predicted_assignments.get(next_span_id.as_str());
@@ -3806,7 +3880,7 @@ mod tests {
     }
 
     #[test]
-    fn release_path_ignores_bucket_corpus_specificity_stats() {
+    fn bucket_label_stats_penalize_repeated_banner_titles() {
         let started_at = Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap();
         let repeated_groups = (0..5)
             .map(|index| PendingGroup {
@@ -3842,16 +3916,27 @@ mod tests {
         groups.push(unique_group);
         let stats = build_bucket_label_stats(&groups);
 
-        assert_eq!(stats.document_count, 0);
-        assert!(stats.title_document_frequency.is_empty());
-        assert!(stats.token_document_frequency.is_empty());
+        assert_eq!(stats.document_count, 6);
         assert_eq!(
-            task_title_corpus_specificity_score("This is NOT the framework you know", &stats),
-            0
+            stats
+                .title_document_frequency
+                .get("this is not the framework you know")
+                .copied(),
+            Some(5)
         );
         assert_eq!(
-            task_title_corpus_specificity_score("Implement task verification workflow", &stats),
-            0
+            stats
+                .title_document_frequency
+                .get("implement task verification workflow")
+                .copied(),
+            Some(1)
+        );
+        assert!(
+            task_title_corpus_specificity_score("This is NOT the framework you know", &stats)
+                < task_title_corpus_specificity_score(
+                    "Implement task verification workflow",
+                    &stats,
+                )
         );
     }
 
@@ -4375,7 +4460,7 @@ mod tests {
         assert!(work_items
             .iter()
             .all(|item| item.title == "This is NOT the framework you know"));
-        assert!(work_items.iter().all(|item| !item
+        assert!(work_items.iter().all(|item| item
             .review_reasons
             .contains(&"low_specificity_title".to_string())));
     }
@@ -4633,6 +4718,62 @@ mod tests {
         assert!(matches!(
             resolved[0].action,
             TaskVerificationAction::Rename { .. }
+        ));
+    }
+
+    #[test]
+    fn manual_split_preservation_uses_explicit_right_boundary() {
+        let started_at = Utc.with_ymd_and_hms(2026, 7, 2, 10, 0, 0).unwrap();
+        let span_a = test_span_with_options(
+            "span-a",
+            "codex",
+            Some("session-a"),
+            "bucket-a",
+            started_at,
+            "Implement task benchmark reporting",
+            Some("Implement task benchmark reporting"),
+        );
+        let span_x = test_span_with_options(
+            "span-x",
+            "codex",
+            Some("session-a"),
+            "bucket-a",
+            started_at + chrono::Duration::minutes(1),
+            "Implement task benchmark reporting",
+            Some("Implement task benchmark reporting"),
+        );
+        let span_b = test_span_with_options(
+            "span-b",
+            "codex",
+            Some("session-a"),
+            "bucket-a",
+            started_at + chrono::Duration::minutes(2),
+            "Implement task benchmark reporting",
+            Some("Implement task benchmark reporting"),
+        );
+        let predicted_assignments = HashMap::from([
+            ("span-a".to_string(), "work-left".to_string()),
+            ("span-x".to_string(), "work-right".to_string()),
+            ("span-b".to_string(), "work-left".to_string()),
+        ]);
+        let verification = TaskVerification {
+            schema_version: TASK_VERIFICATION_SCHEMA_VERSION.to_string(),
+            verification_id: task_verification_id("split", "split:span-a:span-b"),
+            action_key: "split:span-a:span-b".to_string(),
+            action: TaskVerificationAction::Split {
+                after_span_id: TaskSpanId("span-a".to_string()),
+                before_span_id: Some(TaskSpanId("span-b".to_string())),
+                left_title: None,
+                right_title: None,
+            },
+            created_at: started_at,
+            updated_at: started_at,
+        };
+
+        assert!(!manual_constraints_preserved(
+            &predicted_assignments,
+            &[span_a.span, span_x.span, span_b.span],
+            &[verification],
         ));
     }
 }

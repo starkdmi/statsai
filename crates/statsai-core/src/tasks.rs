@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 pub const TASK_SPAN_SCHEMA_VERSION: &str = "task_span.v1";
 pub const WORK_ITEM_SCHEMA_VERSION: &str = "work_item.v1";
-pub const TASK_VERIFICATION_SCHEMA_VERSION: &str = "task_verification.v1";
+pub const TASK_VERIFICATION_SCHEMA_VERSION: &str = "task_verification.v2";
 
 const GENERIC_PLACEHOLDER_EXACT: &[&str] = &[
     "no prompt",
@@ -508,6 +508,8 @@ pub enum TaskVerificationAction {
     },
     Split {
         after_span_id: TaskSpanId,
+        #[serde(default)]
+        before_span_id: Option<TaskSpanId>,
         left_title: Option<String>,
         right_title: Option<String>,
     },
@@ -633,7 +635,17 @@ impl TaskVerificationAction {
             Self::Accept { anchor_span_id, .. }
             | Self::Reject { anchor_span_id, .. }
             | Self::Rename { anchor_span_id, .. } => format!("anchor:{}", anchor_span_id.0),
-            Self::Split { after_span_id, .. } => format!("split:{}", after_span_id.0),
+            Self::Split {
+                after_span_id,
+                before_span_id,
+                ..
+            } => {
+                if let Some(before_span_id) = before_span_id {
+                    format!("split:{}:{}", after_span_id.0, before_span_id.0)
+                } else {
+                    format!("split:{}", after_span_id.0)
+                }
+            }
             Self::Merge {
                 left_anchor_span_id,
                 right_anchor_span_id,
@@ -655,7 +667,17 @@ impl TaskVerificationAction {
             Self::Accept { anchor_span_id, .. }
             | Self::Reject { anchor_span_id, .. }
             | Self::Rename { anchor_span_id, .. } => vec![anchor_span_id],
-            Self::Split { after_span_id, .. } => vec![after_span_id],
+            Self::Split {
+                after_span_id,
+                before_span_id,
+                ..
+            } => {
+                let mut span_ids = vec![after_span_id];
+                if let Some(before_span_id) = before_span_id {
+                    span_ids.push(before_span_id);
+                }
+                span_ids
+            }
             Self::Merge {
                 left_anchor_span_id,
                 right_anchor_span_id,
@@ -3339,5 +3361,25 @@ mod tests {
         assert_eq!(accept.action_key(), "anchor:span-anchor");
         assert_eq!(reject.action_key(), "anchor:span-anchor");
         assert_eq!(rename.action_key(), "anchor:span-anchor");
+    }
+
+    #[test]
+    fn split_verification_action_key_and_span_ids_include_explicit_right_boundary() {
+        let action = TaskVerificationAction::Split {
+            after_span_id: TaskSpanId("span-left".to_string()),
+            before_span_id: Some(TaskSpanId("span-right".to_string())),
+            left_title: None,
+            right_title: None,
+        };
+
+        assert_eq!(action.action_key(), "split:span-left:span-right");
+        assert_eq!(
+            action
+                .span_ids()
+                .into_iter()
+                .map(|span_id| span_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["span-left", "span-right"]
+        );
     }
 }

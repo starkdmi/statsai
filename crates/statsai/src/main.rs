@@ -1601,9 +1601,11 @@ fn task(command: TaskCommand, store: &Store) -> Result<()> {
                     if span_index + 1 >= spans.len() {
                         bail!("cannot split after the last span in a work item");
                     }
+                    let before_span_id = spans[span_index + 1].span_id.clone();
                     let verification =
                         store.upsert_task_verification(TaskVerificationAction::Split {
                             after_span_id,
+                            before_span_id: Some(before_span_id),
                             left_title,
                             right_title,
                         })?;
@@ -1912,11 +1914,16 @@ fn format_task_verification(verification: &TaskVerification) -> String {
         } => format!("rename(anchor={}, title={title})", anchor_span_id.0),
         TaskVerificationAction::Split {
             after_span_id,
+            before_span_id,
             left_title,
             right_title,
         } => format!(
-            "split(after={}, left_title={}, right_title={})",
+            "split(after={}, before={}, left_title={}, right_title={})",
             after_span_id.0,
+            before_span_id
+                .as_ref()
+                .map(|span_id| span_id.0.as_str())
+                .unwrap_or("-"),
             left_title.as_deref().unwrap_or("-"),
             right_title.as_deref().unwrap_or("-")
         ),
@@ -12209,6 +12216,101 @@ mod tests {
             report.beats_all_baselines
         );
         assert_eq!(report.shipping_gate_ready, report.gate_blockers.is_empty());
+    }
+
+    #[test]
+    fn task_benchmark_scores_raw_grouper_not_manual_split_output() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-benchmark-raw-grouper"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-benchmark-raw-grouper/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 14, 11, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_a = test_scan_event(&source, file_path, started_at, "raw-a", 100);
+        let event_b = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "raw-b",
+            120,
+        );
+        let event_c = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(4),
+            "raw-c",
+            140,
+        );
+        let span_a = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "raw-span-a",
+            "Implement benchmark reporting",
+            &event_a,
+        );
+        let span_b = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "raw-span-b",
+            "Implement benchmark reporting",
+            &event_b,
+        );
+        let span_c = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(4),
+            "raw-span-c",
+            "Implement benchmark reporting",
+            &event_c,
+        );
+        store
+            .insert_events(&[event_a, event_b, event_c])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_a.clone(), span_b.clone(), span_c.clone()])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let initial = store.work_items().expect("initial work items");
+        assert_eq!(initial.len(), 1);
+        let work_item = initial.first().expect("work item");
+
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Split {
+                        work_item_id: work_item.work_item_id.0.clone(),
+                        after_span: span_a.span_id.0.clone(),
+                        left_title: Some("Investigate benchmark regression".to_string()),
+                        right_title: Some("Implement benchmark reporting".to_string()),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("split verify");
+
+        let split_items = store.work_items().expect("split items");
+        assert_eq!(split_items.len(), 2);
+
+        let report = store.task_benchmark_report().expect("benchmark report");
+        assert!(report.has_verified_ground_truth);
+        assert!(report.has_verified_pairwise_ground_truth);
+        assert!(report.manual_constraints_preserved);
+        assert!(report.current.adjacent_f1 < 1.0);
     }
 
     #[test]
