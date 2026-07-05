@@ -12,8 +12,8 @@ use statsai_core::{
     project_contains_file_paths, project_has_stable_identity, provider_account_id,
     provider_account_id_from_identity, sanitize_summary_for_sync, semantic_event_fingerprint,
     source_account_assignment_id, subscription_id, summary_id, timestamp_in_period, BillingPeriod,
-    Confidence, CostInfo, DailyRollup, EventSource, IdentitySource, LatencySource, MetricStats,
-    ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
+    Confidence, CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource,
+    MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
     SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
     SourceLocation, SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
     SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage, UsageCounts, UsageEvent,
@@ -21,12 +21,12 @@ use statsai_core::{
     SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
-    TaskDeletionImpact, TaskStats,
+    TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
 };
 
 const SYNC_ROLLUP_SUMMARY_VERSION: &str = "10";
@@ -74,6 +74,12 @@ pub struct SyncState {
 pub struct ScanFileStateEntry {
     pub cache_key: String,
     pub cache_signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EventInsertBatchResult {
+    pub inserted: u64,
+    pub canonical_event_ids: HashMap<EventId, EventId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +209,7 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self { conn };
         store.migrate()?;
+        store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
     }
 
@@ -212,6 +219,7 @@ impl Store {
         };
         store.conn.busy_timeout(std::time::Duration::from_secs(5))?;
         store.migrate()?;
+        store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
     }
 
@@ -766,6 +774,13 @@ impl Store {
     }
 
     pub fn insert_events(&self, events: &[UsageEvent]) -> Result<u64> {
+        Ok(self.insert_events_with_resolution(events)?.inserted)
+    }
+
+    pub fn insert_events_with_resolution(
+        &self,
+        events: &[UsageEvent],
+    ) -> Result<EventInsertBatchResult> {
         let events = events
             .iter()
             .map(event_with_valid_project)
@@ -781,8 +796,10 @@ impl Store {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             let mut inserted = 0u64;
+            let mut canonical_event_ids = HashMap::with_capacity(events.len());
             let mut dirty_keys = BTreeSet::new();
             for (index, event) in events.iter().enumerate() {
+                let incoming_event_id = event.event_id.clone();
                 let matched_event_id =
                     conflict_map
                         .get(&conflict_keys[index])
@@ -805,6 +822,7 @@ impl Store {
                         existing_id.as_str(),
                     );
                     dirty_keys.extend(self.update_event_payload(&refreshed)?);
+                    canonical_event_ids.insert(incoming_event_id, EventId(existing_id.clone()));
                     if let Some(candidates) = conflict_map.get_mut(&conflict_keys[index]) {
                         if let Some(candidate) = candidates
                             .iter_mut()
@@ -820,16 +838,20 @@ impl Store {
                 if outcome.inserted {
                     inserted += 1;
                 }
+                canonical_event_ids.insert(incoming_event_id, outcome.canonical_event_id.clone());
                 dirty_keys.extend(outcome.dirty_keys);
             }
             self.refresh_sync_rollups_for_keys(&dirty_keys)?;
-            Ok(inserted)
+            Ok(EventInsertBatchResult {
+                inserted,
+                canonical_event_ids,
+            })
         })();
 
         match result {
-            Ok(inserted) => {
+            Ok(insert_result) => {
                 self.conn.execute_batch("COMMIT")?;
-                Ok(inserted)
+                Ok(insert_result)
             }
             Err(error) => {
                 rollback(&self.conn);
@@ -886,6 +908,7 @@ impl Store {
                 refreshed_duplicate_event(existing.as_ref(), event, existing_id.as_str());
             return Ok(EventInsertOutcome {
                 inserted: false,
+                canonical_event_id: EventId(existing_id),
                 dirty_keys: self.update_event_payload(&refreshed)?,
             });
         }
@@ -916,11 +939,13 @@ impl Store {
                 refreshed_duplicate_event(existing.as_ref(), event, event.event_id.0.as_str());
             return Ok(EventInsertOutcome {
                 inserted: false,
+                canonical_event_id: event.event_id.clone(),
                 dirty_keys: self.update_event_payload(&refreshed)?,
             });
         }
         Ok(EventInsertOutcome {
             inserted: true,
+            canonical_event_id: event.event_id.clone(),
             dirty_keys: BTreeSet::from([sync_rollup_bucket_key(event)]),
         })
     }
@@ -3488,9 +3513,10 @@ struct SyncRollupBucketKey {
     project_key: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct EventInsertOutcome {
     inserted: bool,
+    canonical_event_id: EventId,
     dirty_keys: BTreeSet<SyncRollupBucketKey>,
 }
 
@@ -4793,6 +4819,38 @@ mod tests {
                 .and_then(|model| model.reasoning_level_raw.as_deref()),
             Some("high")
         );
+    }
+
+    #[test]
+    fn insert_events_with_resolution_returns_canonical_duplicate_event_ids() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-batch-resolution"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let existing = test_store_event(&source, now, "existing-record");
+        let mut duplicate = existing.clone();
+        duplicate.event_id = event_id("codex", &source.source_id, "duplicate-record", None, now);
+        duplicate.source.source_record_id = Some("duplicate-record".to_string());
+        duplicate.parse_evidence = None;
+
+        assert!(store.insert_event(&existing).expect("insert existing"));
+        let result = store
+            .insert_events_with_resolution(&[duplicate.clone()])
+            .expect("insert duplicate");
+
+        assert_eq!(result.inserted, 0);
+        assert_eq!(
+            result.canonical_event_ids.get(&duplicate.event_id),
+            Some(&existing.event_id)
+        );
+        assert_eq!(store.event_count().expect("count"), 1);
     }
 
     #[test]

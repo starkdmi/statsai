@@ -6,6 +6,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 pub const TASK_SPAN_SCHEMA_VERSION: &str = "task_span.v1";
@@ -554,6 +555,18 @@ pub struct TaskSpan {
     pub git: Option<GitInfo>,
     pub usage: UsageCounts,
     pub estimated_cost_usd: Option<i64>,
+    #[serde(default)]
+    pub event_count: u64,
+    #[serde(default)]
+    pub has_usage_evidence: bool,
+    #[serde(default)]
+    pub total_messages: u64,
+    #[serde(default)]
+    pub user_messages: u64,
+    #[serde(default)]
+    pub assistant_messages: u64,
+    #[serde(default)]
+    pub developer_messages: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub linked_event_ids: Vec<EventId>,
     pub confidence: Confidence,
@@ -567,6 +580,16 @@ impl TaskSpan {
     #[must_use]
     pub fn effective_ended_at(&self) -> DateTime<Utc> {
         self.ended_at.unwrap_or(self.started_at)
+    }
+
+    #[must_use]
+    pub fn effective_event_count(&self) -> u64 {
+        self.event_count.max(self.linked_event_ids.len() as u64)
+    }
+
+    #[must_use]
+    pub fn effective_has_usage_evidence(&self) -> bool {
+        self.has_usage_evidence || !self.linked_event_ids.is_empty()
     }
 
     #[must_use]
@@ -751,10 +774,108 @@ pub fn task_title_from_prompt(value: Option<&str>) -> Option<String> {
     task_preview_from_prompt(value, 90)
 }
 
+const TASK_PREVIEW_MAX_INPUT_BYTES: usize = 24 * 1024;
+const TASK_PREVIEW_MAX_INPUT_LINES: usize = 128;
+const TASK_PREVIEW_FAST_SCAN_BYTES: usize = 16 * 1024;
+const TASK_PREVIEW_FAST_SCAN_LINES: usize = 128;
+
 #[must_use]
 pub fn task_preview_from_prompt(value: Option<&str>, width: usize) -> Option<String> {
     let raw = value?;
-    select_task_prompt_candidate(raw).and_then(|candidate| truncate_task_text(candidate, width))
+    if let Some(candidate) = fast_structured_task_preview_candidate(raw) {
+        return truncate_task_text(candidate, width);
+    }
+    let bounded = bounded_task_preview_input(raw);
+    select_task_prompt_candidate(bounded.as_ref())
+        .and_then(|candidate| truncate_task_text(candidate, width))
+}
+
+fn bounded_task_preview_input(raw: &str) -> Cow<'_, str> {
+    if raw.len() <= TASK_PREVIEW_MAX_INPUT_BYTES {
+        return Cow::Borrowed(raw);
+    }
+
+    let mut excerpt = String::new();
+    let mut used_bytes = 0usize;
+    let mut used_lines = 0usize;
+
+    for line in raw.lines() {
+        if used_lines >= TASK_PREVIEW_MAX_INPUT_LINES || used_bytes >= TASK_PREVIEW_MAX_INPUT_BYTES
+        {
+            break;
+        }
+
+        let line_bytes = line.len();
+        let remaining_bytes = TASK_PREVIEW_MAX_INPUT_BYTES.saturating_sub(used_bytes);
+        let fits_with_newline = line_bytes.saturating_add(1) <= remaining_bytes;
+        if !fits_with_newline {
+            if remaining_bytes == 0 {
+                break;
+            }
+            excerpt.push_str(prefix_at_char_boundary(line, remaining_bytes));
+            break;
+        }
+
+        excerpt.push_str(line);
+        excerpt.push('\n');
+        used_bytes = used_bytes.saturating_add(line_bytes).saturating_add(1);
+        used_lines = used_lines.saturating_add(1);
+    }
+
+    if excerpt.is_empty() {
+        return Cow::Borrowed(prefix_at_char_boundary(raw, TASK_PREVIEW_MAX_INPUT_BYTES));
+    }
+
+    Cow::Owned(excerpt)
+}
+
+fn prefix_at_char_boundary(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn fast_structured_task_preview_candidate(raw: &str) -> Option<String> {
+    let window = prefix_at_char_boundary(raw, TASK_PREVIEW_FAST_SCAN_BYTES);
+    for line in window.lines().take(TASK_PREVIEW_FAST_SCAN_LINES) {
+        let sentence_breaks = [". ", "? ", "! "]
+            .into_iter()
+            .map(|marker| line.matches(marker).count())
+            .sum::<usize>();
+        if sentence_breaks > 1 && !line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some(candidate) = clean_task_line(line) else {
+            continue;
+        };
+        let mut polished = polish_task_title_candidate(&candidate);
+        if let Some(stripped) = strip_plain_role_prefix(&polished) {
+            polished = polish_task_title_candidate(&stripped);
+        }
+        let normalized = basic_normalize_phrase(&polished);
+        let token_count = normalized.split_whitespace().count();
+        if polished.is_empty()
+            || polished.len() > 160
+            || token_count > 18
+            || task_title_is_generic(Some(polished.as_str()))
+            || task_title_is_weak_signal(Some(polished.as_str()))
+            || task_scaffolding_line(&polished)
+            || looks_like_metric_result_stub(line, &polished)
+            || (looks_like_statemental_heading(&polished) && !has_explicit_task_intent(&polished))
+            || normalized.starts_with("transcript start")
+            || normalized.starts_with("transcript end")
+        {
+            continue;
+        }
+        return Some(polished);
+    }
+
+    None
 }
 
 #[must_use]
@@ -771,6 +892,9 @@ pub fn task_title_signal_score(value: Option<&str>) -> i32 {
     let value = polish_task_title_candidate(&value);
     if value.is_empty() {
         return -100;
+    }
+    if looks_like_metric_result_stub(raw, &value) {
+        return -24;
     }
 
     let normalized = basic_normalize_phrase(&value);
@@ -855,6 +979,9 @@ pub fn task_title_is_generic(value: Option<&str>) -> bool {
     };
     let value = polish_task_title_candidate(&value);
     if value.is_empty() {
+        return true;
+    }
+    if looks_like_metric_result_stub(raw, &value) {
         return true;
     }
     let lowercase = value.to_ascii_lowercase();
@@ -1271,7 +1398,9 @@ fn looks_like_command_or_output_title(value: &str) -> bool {
         return false;
     }
     if looks_like_test_harness_output_title(value)
+        || looks_like_bracketed_log_prefix_title(value)
         || looks_like_package_version_banner_title(value)
+        || looks_like_progress_measurement_title(value)
         || looks_like_settings_banner_title(value)
         || looks_like_git_ref_review_title(value)
         || looks_like_shell_invocation_title(value)
@@ -1324,6 +1453,55 @@ fn looks_like_command_or_output_title(value: &str) -> bool {
         || (pathlike_token_count >= 2 && command_token_count >= 1)
         || (filelike_token_count >= 2 && command_token_count >= 1)
         || flag_count >= 3
+}
+
+fn looks_like_bracketed_log_prefix_title(value: &str) -> bool {
+    let trimmed = value.trim();
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return false;
+    };
+    let Some((label, remainder)) = rest.split_once(']') else {
+        return false;
+    };
+    let normalized_label = basic_normalize_phrase(label);
+    let label_tokens = normalized_label.split_whitespace().collect::<Vec<_>>();
+    if label_tokens.is_empty() || label_tokens.len() > 2 {
+        return false;
+    }
+    let is_log_label = label_tokens.iter().all(|token| {
+        matches!(
+            *token,
+            "debug" | "info" | "warn" | "warning" | "error" | "trace" | "notice"
+        )
+    });
+    is_log_label && !remainder.trim().is_empty()
+}
+
+fn looks_like_progress_measurement_title(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || basic_has_explicit_task_intent(trimmed) {
+        return false;
+    }
+    let lowercase = trimmed.to_ascii_lowercase();
+    let normalized = basic_normalize_phrase(trimmed);
+    let has_timer = lowercase.contains("[00:")
+        || lowercase.contains("[0:")
+        || lowercase.contains("runtime:")
+        || normalized.starts_with("total runtime")
+        || normalized.starts_with("elapsed time");
+    let has_rate = [
+        "examples/s",
+        "example/s",
+        "steps/s",
+        "step/s",
+        "it/s",
+        "tok/s",
+        "tokens/s",
+        "items/s",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker));
+    has_timer && (has_rate || normalized.starts_with("total runtime"))
 }
 
 fn looks_like_shell_invocation_title(value: &str) -> bool {
@@ -2017,6 +2195,8 @@ fn select_task_prompt_candidate(raw: &str) -> Option<String> {
 
 fn leading_markdown_heading_candidate(raw: &str) -> Option<String> {
     let expanded = expand_inline_markdown_headings(raw);
+    let supporting_topic_sets = prompt_supporting_topic_sets(raw);
+    let mut best = None::<(i32, String)>;
     for line in expanded.lines() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with('#') {
@@ -2032,13 +2212,21 @@ fn leading_markdown_heading_candidate(raw: &str) -> Option<String> {
         let polished = polish_task_title_candidate(&heading);
         if polished.is_empty()
             || looks_like_document_section_heading(&polished)
+            || starts_with_document_section_label(&polished)
             || looks_like_prompt_scaffolding_line(&polished)
         {
             continue;
         }
-        return Some(polished);
+        let score = prompt_candidate_score(&polished)
+            + markdown_heading_support_score(&polished, &supporting_topic_sets);
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, polished));
+        }
     }
-    None
+    best.filter(|(score, _)| *score > 0).map(|(_, title)| title)
 }
 
 fn prompt_candidate_fragments(raw: &str) -> Vec<String> {
@@ -2081,6 +2269,77 @@ fn split_prompt_fragments(value: &str) -> Vec<String> {
         .filter(|fragment| !fragment.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn prompt_supporting_topic_sets(raw: &str) -> Vec<BTreeSet<String>> {
+    let mut topic_sets = Vec::<BTreeSet<String>>::new();
+    let mut seen = BTreeSet::<String>::new();
+    for fragment in raw
+        .lines()
+        .chain(split_prompt_fragments(raw).iter().map(String::as_str))
+    {
+        let trimmed = fragment.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(candidate) = clean_task_text(fragment) else {
+            continue;
+        };
+        if candidate.is_empty() || !seen.insert(candidate.clone()) {
+            continue;
+        }
+        let topic_tokens = title_topic_tokens(&candidate);
+        if !topic_tokens.is_empty() {
+            topic_sets.push(topic_tokens);
+        }
+    }
+    topic_sets
+}
+
+fn markdown_heading_support_score(
+    heading: &str,
+    supporting_topic_sets: &[BTreeSet<String>],
+) -> i32 {
+    let heading_tokens = title_topic_tokens(heading);
+    if heading_tokens.is_empty() {
+        return -6;
+    }
+    let overlap_score = supporting_topic_sets
+        .iter()
+        .map(|topic_set| heading_tokens.intersection(topic_set).count())
+        .sum::<usize>();
+    if overlap_score >= 4 {
+        6
+    } else if overlap_score >= 2 {
+        3
+    } else if overlap_score == 1 && has_explicit_task_intent(heading) {
+        0
+    } else if has_explicit_task_intent(heading) {
+        -2
+    } else if heading_tokens.len() <= 4 && !looks_like_statemental_heading(heading) {
+        0
+    } else if overlap_score == 1 {
+        -8
+    } else {
+        -20
+    }
+}
+
+fn looks_like_statemental_heading(value: &str) -> bool {
+    let tokens = normalized_title_tokens(value);
+    if tokens.len() < 4 || tokens.len() > 10 {
+        return false;
+    }
+    let has_subject = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "this" | "that" | "these" | "those" | "it" | "you" | "your"
+        )
+    });
+    let has_copula = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "is" | "are" | "was" | "were"));
+    has_subject && has_copula
 }
 
 fn expand_inline_markdown_headings(value: &str) -> String {
@@ -2172,6 +2431,32 @@ fn looks_like_document_section_heading(value: &str) -> bool {
         })
         .count();
     section_token_count >= 1 && section_token_count == tokens.len()
+}
+
+fn starts_with_document_section_label(value: &str) -> bool {
+    let normalized = basic_normalize_phrase(value);
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        return false;
+    }
+    matches!(
+        tokens.first().copied(),
+        Some(
+            "approach"
+                | "background"
+                | "context"
+                | "current"
+                | "details"
+                | "implementation"
+                | "issue"
+                | "issues"
+                | "overview"
+                | "problem"
+                | "state"
+                | "steps"
+                | "summary"
+        )
+    )
 }
 
 fn strip_request_wrapper(value: &str) -> String {
@@ -2755,6 +3040,33 @@ mod tests {
     }
 
     #[test]
+    fn task_preview_from_prompt_bounds_large_transcript_wrappers() {
+        let mut wrapped = String::from(
+            "The following is the Codex agent history whose request action you are assessing.\n\
+             >>> TRANSCRIPT START\n\
+             [1] user: Deploy apps/api and ui to production.\n",
+        );
+        wrapped.push_str(&"tool exec_command result\n".repeat(200_000));
+
+        assert_eq!(
+            task_preview_from_prompt(Some(&wrapped), 90),
+            Some("Deploy apps/api and ui to production".to_string())
+        );
+    }
+
+    #[test]
+    fn bounded_task_preview_input_truncates_first_oversized_line() {
+        let raw = format!("{} done", "é".repeat(TASK_PREVIEW_MAX_INPUT_BYTES));
+        let bounded = bounded_task_preview_input(&raw);
+
+        assert!(bounded.len() <= TASK_PREVIEW_MAX_INPUT_BYTES);
+        assert_eq!(
+            bounded.as_ref(),
+            prefix_at_char_boundary(raw.as_str(), TASK_PREVIEW_MAX_INPUT_BYTES)
+        );
+    }
+
+    #[test]
     fn summarize_task_text_reduces_code_review_result_to_issue_title() {
         let wrapped = r#"Here is code review: ``` Found one actionable issue: ::code-comment{title="[P2] Concurrent filter changes can overwrite each other" body="Each update derives from the last rendered searchParams"} ```"#;
         assert_eq!(
@@ -2907,6 +3219,13 @@ mod tests {
     }
 
     #[test]
+    fn task_title_is_generic_for_metric_result_stub() {
+        assert!(task_title_is_generic(Some(
+            "Qwen3.5 8bit ckpt2400: F1_overlap=49.19 Avg_TIoU=74.88 MAE=1.85 TitleF1=39.34"
+        )));
+    }
+
+    #[test]
     fn task_title_from_prompt_keeps_intent_after_sentence_prefixes() {
         assert_eq!(
             task_title_from_prompt(Some(
@@ -2946,6 +3265,33 @@ mod tests {
             )) < 0
         );
         assert!(task_title_signal_score(Some("Add project token tracking")) > 0);
+        assert!(
+            task_title_signal_score(Some(
+                "[DEBUG] ChapterLlamaBoundaryFinder: Wrote stage1 transcript to /tmp/stage1.txt"
+            )) < 0
+        );
+        assert!(
+            task_title_signal_score(Some(
+                "Generating train split: 10 examples [00:00, 674.63 examples/s]"
+            )) < 0
+        );
+        assert!(
+            task_title_signal_score(Some(
+                "Qwen3.5 8bit ckpt2400: F1_overlap=49.19 Avg_TIoU=74.88 MAE=1.85 TitleF1=39.34"
+            )) < 0
+        );
+    }
+
+    #[test]
+    fn task_title_from_prompt_skips_unsupported_markdown_heading_banner() {
+        assert_eq!(
+            task_title_from_prompt(Some(
+                "# This is NOT the framework you know\n\
+                 Read the relevant guide before writing code.\n\
+                 I need device renaming on web and api."
+            )),
+            Some("I need device renaming on web and api".to_string())
+        );
     }
 
     #[test]

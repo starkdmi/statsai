@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_migrations_table(conn)?;
@@ -12,6 +12,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     for version in (current + 1)..=CURRENT_SCHEMA_VERSION {
         apply_migration(conn, version)?;
         record_migration(conn, version)?;
+    }
+    if current != CURRENT_SCHEMA_VERSION {
+        conn.execute_batch("PRAGMA optimize;")?;
     }
 
     Ok(())
@@ -95,6 +98,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         3 => apply_migration_003(conn),
         4 => apply_migration_004(conn),
         5 => apply_migration_005(conn),
+        6 => apply_migration_006(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -250,6 +254,12 @@ fn apply_migration_005(conn: &Connection) -> Result<()> {
     ensure_local_task_tables(conn)
 }
 
+fn apply_migration_006(conn: &Connection) -> Result<()> {
+    ensure_local_task_tables(conn)?;
+    conn.execute_batch("PRAGMA optimize;")?;
+    Ok(())
+}
+
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -295,6 +305,8 @@ fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS task_work_items_bucket_idx
           ON task_work_items (project_bucket, ended_at, work_item_id);
+        CREATE INDEX IF NOT EXISTS task_work_items_bucket_start_idx
+          ON task_work_items (project_bucket, started_at, work_item_id);
         CREATE INDEX IF NOT EXISTS task_work_items_status_idx
           ON task_work_items (status, confidence, total_tokens, ended_at);
 
@@ -306,6 +318,8 @@ fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS task_work_item_members_span_idx
           ON task_work_item_members (span_id, ordinal);
+        CREATE INDEX IF NOT EXISTS task_work_item_members_work_item_ordinal_idx
+          ON task_work_item_members (work_item_id, ordinal, span_id);
 
         CREATE TABLE IF NOT EXISTS task_verifications (
           verification_id TEXT PRIMARY KEY,
@@ -318,6 +332,56 @@ fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
           ON task_verifications (action_kind, updated_at, verification_id);
         "#,
     )?;
+    ensure_column(
+        conn,
+        "task_spans",
+        "event_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "task_spans",
+        "has_usage_evidence",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "task_spans",
+        "total_messages",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "task_spans",
+        "user_messages",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "task_spans",
+        "assistant_messages",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "task_spans",
+        "developer_messages",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut statement = conn.prepare(&pragma)?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    conn.execute(&sql, [])?;
     Ok(())
 }
 

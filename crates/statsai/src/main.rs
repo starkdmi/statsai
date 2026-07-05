@@ -13,7 +13,7 @@ use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
     normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
     project_contains_file_paths, project_has_stable_identity, source_account_assignment_id,
-    source_id as statsai_source_id, subscription_id, timestamp_in_period, BillingPeriod,
+    source_id as statsai_source_id, subscription_id, timestamp_in_period, BillingPeriod, EventId,
     IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
     SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
     SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch, TaskSpan,
@@ -38,7 +38,7 @@ use statsai_store::{
     effective_verified_source_state_is_missing, find_existing_provider_account,
     has_active_verified_source_assignment, reconcile_verified_source_state,
     upsert_provider_account, verified_source_state_hash, ScanFileStateEntry, Store, SyncState,
-    UpsertProviderAccountInput,
+    TaskRebuildReport, UpsertProviderAccountInput,
 };
 use statsai_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -756,6 +756,10 @@ fn scan_with_adapters(
     let mut upsert_summaries_duration_ms = 0u64;
     let mut upsert_task_spans_duration_ms = 0u64;
     let mut rebuild_work_items_duration_ms = 0u64;
+    let mut rebuild_work_item_report = TaskRebuildReport::default();
+    let mut pending_rebuild_project_buckets = BTreeSet::new();
+    let mut pending_rebuild_span_ids = BTreeSet::new();
+    let mut pending_deleted_task_spans = Vec::new();
 
     let configured_sources = store.list_sources()?;
 
@@ -953,7 +957,9 @@ fn scan_with_adapters(
                 let deleted_task_spans =
                     store.delete_task_spans_for_sources(std::slice::from_ref(&source.source_id))?;
                 removed_task_span_count += deleted_task_spans.deleted;
-                affected_project_buckets.extend(deleted_task_spans.affected_project_buckets);
+                affected_project_buckets
+                    .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
+                pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
                 delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
             } else if touched_files {
                 let delete_started_at = Instant::now();
@@ -974,12 +980,24 @@ fn scan_with_adapters(
                     &reconciled_file_hashes,
                 )?;
                 removed_task_span_count += deleted_task_spans.deleted;
-                affected_project_buckets.extend(deleted_task_spans.affected_project_buckets);
+                affected_project_buckets
+                    .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
+                pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
                 delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
             }
             let insert_started_at = Instant::now();
-            inserted_count += store.insert_events(&scan.events)?;
+            let insert_result = store.insert_events_with_resolution(&scan.events)?;
+            inserted_count += insert_result.inserted;
             insert_events_duration_ms += insert_started_at.elapsed().as_millis() as u64;
+            rewrite_task_span_linked_event_ids(
+                &mut scan.task_spans,
+                &insert_result.canonical_event_ids,
+            );
+            populate_task_span_rollups(
+                &mut scan.task_spans,
+                &scan.events,
+                &insert_result.canonical_event_ids,
+            );
             let upsert_summaries_started_at = Instant::now();
             summary_written_count += store.upsert_summaries(&scan.summaries)?;
             upsert_summaries_duration_ms +=
@@ -988,11 +1006,17 @@ fn scan_with_adapters(
             task_span_written_count += store.upsert_task_spans(&scan.task_spans)?;
             upsert_task_spans_duration_ms +=
                 upsert_task_spans_started_at.elapsed().as_millis() as u64;
+            if !scan.task_spans.is_empty() {
+                pending_rebuild_project_buckets.extend(
+                    scan.task_spans
+                        .iter()
+                        .map(|span| span.project_bucket.clone()),
+                );
+                pending_rebuild_span_ids
+                    .extend(scan.task_spans.iter().map(|span| span.span_id.0.clone()));
+            }
             if !affected_project_buckets.is_empty() {
-                let rebuild_started_at = Instant::now();
-                rebuilt_work_item_count +=
-                    store.rebuild_task_work_items_for_project_buckets(&affected_project_buckets)?;
-                rebuild_work_items_duration_ms += rebuild_started_at.elapsed().as_millis() as u64;
+                pending_rebuild_project_buckets.extend(affected_project_buckets);
             }
             let cache_entries_to_record = if replace_source_records || command.no_cache {
                 &file_cache_entries
@@ -1003,6 +1027,20 @@ fn scan_with_adapters(
             let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
             store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
         }
+    }
+
+    if !command.preview
+        && !pending_rebuild_project_buckets.is_empty()
+        && (!pending_rebuild_span_ids.is_empty() || !pending_deleted_task_spans.is_empty())
+    {
+        let rebuild_started_at = Instant::now();
+        rebuild_work_item_report = store.rebuild_task_work_items_for_changes_report(
+            &pending_rebuild_project_buckets,
+            &pending_rebuild_span_ids,
+            &pending_deleted_task_spans,
+        )?;
+        rebuilt_work_item_count += rebuild_work_item_report.work_items_rebuilt;
+        rebuild_work_items_duration_ms += rebuild_started_at.elapsed().as_millis() as u64;
     }
 
     if command.preview {
@@ -1090,13 +1128,19 @@ fn scan_with_adapters(
         }
         if command.verbose {
             println!(
-                "timings_ms: adapter_scan={} delete={} insert_events={} upsert_summaries={} upsert_task_spans={} rebuild_work_items={} total_wall={}",
+                "timings_ms: adapter_scan={} delete={} insert_events={} upsert_summaries={} upsert_task_spans={} rebuild_work_items={} rebuild_delete={} rebuild_span_load={} rebuild_verifications={} rebuild_grouping={} rebuild_title_selection={} rebuild_insert={} total_wall={}",
                 format_u64(adapter_scan_duration_ms),
                 format_u64(delete_duration_ms),
                 format_u64(insert_events_duration_ms),
                 format_u64(upsert_summaries_duration_ms),
                 format_u64(upsert_task_spans_duration_ms),
                 format_u64(rebuild_work_items_duration_ms),
+                format_u64(rebuild_work_item_report.timings.delete_ms),
+                format_u64(rebuild_work_item_report.timings.span_load_ms),
+                format_u64(rebuild_work_item_report.timings.verification_load_ms),
+                format_u64(rebuild_work_item_report.timings.grouping_ms),
+                format_u64(rebuild_work_item_report.timings.title_selection_ms),
+                format_u64(rebuild_work_item_report.timings.insert_ms),
                 format_u64(scan_started_at.elapsed().as_millis() as u64)
             );
         }
@@ -1713,19 +1757,19 @@ fn task(command: TaskCommand, store: &Store) -> Result<()> {
             source_id,
             all,
         } => {
-            let rebuilt = if all || (provider.is_none() && source_id.is_none()) {
-                store.rebuild_all_task_work_items()?
+            let report = if all || (provider.is_none() && source_id.is_none()) {
+                store.rebuild_all_task_work_items_report()?
             } else {
                 let buckets = selected_rebuild_project_buckets(
                     store,
                     provider.as_deref(),
                     source_id.as_deref(),
                 )?;
-                store.rebuild_task_work_items_for_project_buckets(&buckets)?
+                store.rebuild_task_work_items_for_project_buckets_report(&buckets)?
             };
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({ "work_items_rebuilt": rebuilt }))?
+                serde_json::to_string_pretty(&task_rebuild_report_json_value(&report))?
             );
         }
     }
@@ -1967,6 +2011,24 @@ fn stats_json_value(stats: &statsai_store::TaskStats) -> Value {
         "cross_provider_percentage": stats.cross_provider_percentage,
         "rejected_meta_percentage": stats.rejected_meta_percentage,
         "average_spans_per_work_item": stats.average_spans_per_work_item,
+    })
+}
+
+fn task_rebuild_report_json_value(report: &statsai_store::TaskRebuildReport) -> Value {
+    json!({
+        "work_items_rebuilt": report.work_items_rebuilt,
+        "work_items_deleted": report.work_items_deleted,
+        "affected_bucket_count": report.affected_bucket_count,
+        "affected_segment_count": report.affected_segment_count,
+        "touched_span_count": report.touched_span_count,
+        "timings_ms": {
+            "delete": report.timings.delete_ms,
+            "span_load": report.timings.span_load_ms,
+            "verification_load": report.timings.verification_load_ms,
+            "grouping": report.timings.grouping_ms,
+            "title_selection": report.timings.title_selection_ms,
+            "insert": report.timings.insert_ms,
+        }
     })
 }
 
@@ -6059,6 +6121,101 @@ fn scan_file_cache_keys(entries: &[ScanFileStateEntry]) -> Vec<String> {
         .iter()
         .map(|entry| entry.cache_key.clone())
         .collect()
+}
+
+fn rewrite_task_span_linked_event_ids(
+    task_spans: &mut [TaskSpan],
+    canonical_event_ids: &HashMap<EventId, EventId>,
+) {
+    for span in task_spans {
+        if span.linked_event_ids.is_empty() {
+            continue;
+        }
+        let mut rewritten = Vec::with_capacity(span.linked_event_ids.len());
+        let mut seen = HashSet::new();
+        for event_id in &span.linked_event_ids {
+            let canonical = canonical_event_ids
+                .get(event_id)
+                .cloned()
+                .unwrap_or_else(|| event_id.clone());
+            if seen.insert(canonical.clone()) {
+                rewritten.push(canonical);
+            }
+        }
+        span.linked_event_ids = rewritten;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TaskSpanRuntimeRollup {
+    total_messages: u64,
+    user_messages: u64,
+    assistant_messages: u64,
+    developer_messages: u64,
+}
+
+fn populate_task_span_rollups(
+    task_spans: &mut [TaskSpan],
+    events: &[UsageEvent],
+    canonical_event_ids: &HashMap<EventId, EventId>,
+) {
+    let mut event_rollups = HashMap::<String, TaskSpanRuntimeRollup>::new();
+    for event in events {
+        let canonical_event_id = canonical_event_ids
+            .get(&event.event_id)
+            .unwrap_or(&event.event_id)
+            .0
+            .clone();
+        event_rollups
+            .entry(canonical_event_id)
+            .or_insert_with(|| task_span_runtime_rollup(event));
+    }
+
+    for span in task_spans {
+        let mut total_messages = 0u64;
+        let mut user_messages = 0u64;
+        let mut assistant_messages = 0u64;
+        let mut developer_messages = 0u64;
+        let mut seen_event_ids = HashSet::<String>::new();
+        for event_id in &span.linked_event_ids {
+            if !seen_event_ids.insert(event_id.0.clone()) {
+                continue;
+            }
+            let Some(rollup) = event_rollups.get(&event_id.0) else {
+                continue;
+            };
+            total_messages = total_messages.saturating_add(rollup.total_messages);
+            user_messages = user_messages.saturating_add(rollup.user_messages);
+            assistant_messages = assistant_messages.saturating_add(rollup.assistant_messages);
+            developer_messages = developer_messages.saturating_add(rollup.developer_messages);
+        }
+        span.event_count = span.event_count.max(seen_event_ids.len() as u64);
+        span.has_usage_evidence = span.has_usage_evidence || span.event_count > 0;
+        span.total_messages = span.total_messages.max(total_messages);
+        span.user_messages = span.user_messages.max(user_messages);
+        span.assistant_messages = span.assistant_messages.max(assistant_messages);
+        span.developer_messages = span.developer_messages.max(developer_messages);
+    }
+}
+
+fn task_span_runtime_rollup(event: &UsageEvent) -> TaskSpanRuntimeRollup {
+    let Some(runtime) = event.runtime.as_ref() else {
+        return TaskSpanRuntimeRollup::default();
+    };
+    let user_messages = runtime.user_messages.unwrap_or(0);
+    let assistant_messages = runtime.assistant_messages.unwrap_or(0);
+    let developer_messages = runtime.developer_messages.unwrap_or(0);
+    let total_messages = runtime.total_messages.unwrap_or_else(|| {
+        user_messages
+            .saturating_add(assistant_messages)
+            .saturating_add(developer_messages)
+    });
+    TaskSpanRuntimeRollup {
+        total_messages,
+        user_messages,
+        assistant_messages,
+        developer_messages,
+    }
 }
 
 fn format_cache_key_sample<'a>(keys: impl IntoIterator<Item = &'a str>) -> String {
@@ -14030,6 +14187,28 @@ mod tests {
             git: None,
             usage: event.usage.clone(),
             estimated_cost_usd: event.cost.estimated_api_equivalent_usd,
+            event_count: 1,
+            has_usage_evidence: true,
+            total_messages: event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.total_messages)
+                .unwrap_or(0),
+            user_messages: event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.user_messages)
+                .unwrap_or(0),
+            assistant_messages: event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.assistant_messages)
+                .unwrap_or(0),
+            developer_messages: event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.developer_messages)
+                .unwrap_or(0),
             linked_event_ids: vec![event.event_id.clone()],
             confidence: Confidence::High,
             is_meta: false,
@@ -14037,6 +14216,61 @@ mod tests {
             ended_at: Some(started_at),
             duration_seconds: Some(0),
         }
+    }
+
+    #[test]
+    fn scan_rewrites_task_span_links_to_canonical_event_ids() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-link-rewrite"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-link-rewrite/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+            .single()
+            .expect("started_at");
+        let existing_event = test_scan_event(&source, file_path, started_at, "existing", 100);
+        store
+            .insert_event(&existing_event)
+            .expect("insert existing event");
+
+        let mut duplicate_event = existing_event.clone();
+        duplicate_event.event_id =
+            event_id("codex", &source.source_id, "duplicate", None, started_at);
+        duplicate_event.source.source_record_id = Some("duplicate".to_string());
+        if let Some(parse_evidence) = duplicate_event.parse_evidence.as_mut() {
+            parse_evidence.source_record_id = Some("duplicate".to_string());
+        }
+        let span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "duplicate-span",
+            "Rewrite canonical task links",
+            &duplicate_event,
+        );
+
+        let insert_result = store
+            .insert_events_with_resolution(&[duplicate_event])
+            .expect("insert duplicate event");
+        assert_eq!(insert_result.inserted, 0);
+
+        let mut spans = vec![span];
+        rewrite_task_span_linked_event_ids(&mut spans, &insert_result.canonical_event_ids);
+        store.upsert_task_spans(&spans).expect("upsert spans");
+
+        let stored_spans = store.task_spans().expect("task spans");
+        assert_eq!(stored_spans.len(), 1);
+        assert_eq!(
+            stored_spans[0].linked_event_ids,
+            vec![existing_event.event_id.clone()]
+        );
     }
 
     #[test]

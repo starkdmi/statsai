@@ -1,12 +1,16 @@
 use super::*;
 use statsai_core::{
-    normalize_task_title, task_title_from_prompt, task_title_is_generic,
+    normalize_task_title, summarize_task_text, task_title_from_prompt, task_title_is_generic,
     task_title_is_session_meta, task_title_is_weak_signal, task_title_signal_score,
     task_verification_id, title_topic_tokens, work_item_id, Confidence, TaskSpan, TaskSpanId,
-    TaskStatus, TaskVerification, TaskVerificationAction, UsageCounts, UsageEvent, WorkItem,
-    WorkItemId, WorkItemMember, TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
+    TaskStatus, TaskVerification, TaskVerificationAction, UsageCounts, WorkItem, WorkItemId,
+    WorkItemMember, TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::Instant;
+
+const TOPIC_COHESION_WINDOW_SPANS: usize = 2;
+const SQLITE_BUCKET_CHUNK_SIZE: usize = 300;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskBenchmarkMetrics {
@@ -46,6 +50,34 @@ pub struct TaskBenchmarkReport {
 pub struct TaskDeletionImpact {
     pub deleted: u64,
     pub affected_project_buckets: BTreeSet<String>,
+    pub deleted_spans: Vec<DeletedTaskSpanRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedTaskSpanRef {
+    pub span_id: TaskSpanId,
+    pub project_bucket: String,
+    pub started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskRebuildTimings {
+    pub delete_ms: u64,
+    pub span_load_ms: u64,
+    pub verification_load_ms: u64,
+    pub grouping_ms: u64,
+    pub title_selection_ms: u64,
+    pub insert_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskRebuildReport {
+    pub work_items_rebuilt: u64,
+    pub work_items_deleted: u64,
+    pub affected_bucket_count: u64,
+    pub affected_segment_count: u64,
+    pub touched_span_count: u64,
+    pub timings: TaskRebuildTimings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -63,20 +95,46 @@ pub fn derive_task_work_items(
     spans: Vec<TaskSpan>,
     verifications: &[TaskVerification],
 ) -> (Vec<WorkItem>, Vec<WorkItemMember>) {
-    let contexts = spans
-        .into_iter()
-        .map(|span| SpanContext {
-            span,
-            linked_events: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    build_work_items(contexts, verifications)
+    let contexts = spans.into_iter().map(SpanContext::from).collect::<Vec<_>>();
+    let (work_items, members, _) = build_work_items(contexts, verifications);
+    (work_items, members)
 }
 
 #[derive(Debug, Clone)]
 struct SpanContext {
     span: TaskSpan,
-    linked_events: Vec<UsageEvent>,
+    topic_tokens: BTreeSet<String>,
+    title_is_generic: bool,
+    title_is_weak_signal: bool,
+    title_signal_score: i32,
+}
+
+impl From<TaskSpan> for SpanContext {
+    fn from(span: TaskSpan) -> Self {
+        let title_is_generic = task_title_is_generic(Some(span.title.as_str()));
+        let title_is_weak_signal = task_title_is_weak_signal(Some(span.title.as_str()));
+        let title_signal_score = task_title_signal_score(Some(span.title.as_str()));
+        let mut topic_tokens = title_topic_tokens(&span.title);
+        let should_expand_topic_context = topic_tokens.is_empty()
+            || title_is_generic
+            || title_is_weak_signal
+            || title_signal_score < 8;
+        if should_expand_topic_context {
+            if let Some(summary_preview) = span.summary_preview.as_deref() {
+                topic_tokens.extend(title_topic_tokens(summary_preview));
+            }
+            if let Some(todo_excerpt) = span.todo_excerpt.as_deref() {
+                topic_tokens.extend(title_topic_tokens(todo_excerpt));
+            }
+        }
+        Self {
+            span,
+            topic_tokens,
+            title_is_generic,
+            title_is_weak_signal,
+            title_signal_score,
+        }
+    }
 }
 
 impl SpanContext {
@@ -91,83 +149,64 @@ impl SpanContext {
             .or(self.span.session_id.as_deref())
     }
 
-    fn topic_tokens(&self) -> BTreeSet<String> {
-        let mut tokens = title_topic_tokens(&self.span.title);
-        if let Some(summary_preview) = self.span.summary_preview.as_deref() {
-            tokens.extend(title_topic_tokens(summary_preview));
-        }
-        tokens
+    fn topic_tokens(&self) -> &BTreeSet<String> {
+        &self.topic_tokens
+    }
+
+    fn title_is_generic(&self) -> bool {
+        self.title_is_generic
+    }
+
+    fn title_is_weak_signal(&self) -> bool {
+        self.title_is_weak_signal
+    }
+
+    fn title_signal_score(&self) -> i32 {
+        self.title_signal_score
     }
 
     fn usage(&self) -> UsageCounts {
-        if self.linked_events.is_empty() {
-            return self.span.usage.clone();
-        }
-        self.linked_events
-            .iter()
-            .fold(UsageCounts::default(), |usage, event| {
-                sum_usage_counts(&usage, &event.usage)
-            })
+        self.span.usage.clone()
     }
 
     fn estimated_cost_usd(&self) -> Option<i64> {
-        if self.linked_events.is_empty() {
-            return self.span.estimated_cost_usd;
-        }
-        self.linked_events
-            .iter()
-            .filter_map(|event| event.cost.estimated_api_equivalent_usd)
-            .reduce(i64::saturating_add)
-            .or(self.span.estimated_cost_usd)
+        self.span.estimated_cost_usd
+    }
+
+    fn event_count(&self) -> u64 {
+        self.span.effective_event_count()
+    }
+
+    fn has_usage_evidence(&self) -> bool {
+        self.span.effective_has_usage_evidence()
     }
 
     fn total_messages(&self) -> u64 {
-        self.linked_events
-            .iter()
-            .filter_map(|event| {
-                event
-                    .runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.total_messages)
-            })
-            .sum()
+        self.span.total_messages
     }
 
     fn user_messages(&self) -> u64 {
-        self.linked_events
-            .iter()
-            .filter_map(|event| {
-                event
-                    .runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.user_messages)
-            })
-            .sum()
+        self.span.user_messages
     }
 
     fn assistant_messages(&self) -> u64 {
-        self.linked_events
-            .iter()
-            .filter_map(|event| {
-                event
-                    .runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.assistant_messages)
-            })
-            .sum()
+        self.span.assistant_messages
     }
 
     fn developer_messages(&self) -> u64 {
-        self.linked_events
-            .iter()
-            .filter_map(|event| {
-                event
-                    .runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.developer_messages)
-            })
-            .sum()
+        self.span.developer_messages
     }
+}
+
+fn sqlite_in_clause_placeholders(count: usize) -> String {
+    (0..count).map(|_| "?").collect::<Vec<_>>().join(",")
+}
+
+fn sqlite_string_params(values: &[String]) -> Vec<&dyn rusqlite::types::ToSql> {
+    values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -176,6 +215,31 @@ struct PendingGroup {
     continuation_reasons: BTreeSet<String>,
     manual_title: Option<String>,
     force_verified: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BuildWorkItemsTimings {
+    grouping_ms: u64,
+    title_selection_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ExistingWorkItemLayout {
+    work_item_id: WorkItemId,
+    project_bucket: String,
+    span_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalizedRebuildSegment {
+    contexts: Vec<SpanContext>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LocalizedRebuildPlan {
+    work_item_ids_to_delete: BTreeSet<String>,
+    segments: Vec<LocalizedRebuildSegment>,
+    touched_span_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -192,11 +256,26 @@ enum TitleCandidateSource {
     TodoExcerpt,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanTitleOrigin {
+    UserPrompt,
+    ThreadName,
+    SessionTitle,
+    SessionTitleWeak,
+    SummaryDerived,
+    TodoDerived,
+    Default,
+    Other,
+}
+
 #[derive(Debug, Clone)]
 struct TitleCandidate {
     title: String,
     normalized: String,
+    signal_score: i32,
     source: TitleCandidateSource,
+    span_title_origin: Option<SpanTitleOrigin>,
+    span_index: usize,
     topic_tokens: Vec<String>,
 }
 
@@ -204,6 +283,52 @@ struct TitleCandidate {
 struct ContinuationDecision {
     score: i32,
     reasons: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BoundaryEvidence {
+    local_similarity: f64,
+    adjacent_overlap: usize,
+    strong_topic_boundary: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DistributionStats {
+    mean: f64,
+    std_dev: f64,
+}
+
+impl DistributionStats {
+    fn from_values(values: &[f64]) -> Self {
+        if values.is_empty() {
+            return Self::default();
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        Self {
+            mean,
+            std_dev: variance.sqrt(),
+        }
+    }
+
+    fn has_variation(self) -> bool {
+        self.std_dev > f64::EPSILON
+    }
+
+    fn low_outlier_threshold(self) -> f64 {
+        (self.mean - (self.std_dev * 0.5)).max(0.0)
+    }
+
+    fn high_outlier_threshold(self) -> f64 {
+        self.mean + (self.std_dev * 0.5)
+    }
 }
 
 impl Store {
@@ -218,9 +343,11 @@ impl Store {
                 r#"
                 INSERT INTO task_spans (
                   span_id, provider, source_id, project_bucket, started_at, ended_at, title,
-                  normalized_title, is_meta, confidence, source_file_path_hash, payload
+                  normalized_title, is_meta, confidence, source_file_path_hash, event_count,
+                  has_usage_evidence, total_messages, user_messages, assistant_messages,
+                  developer_messages, payload
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                 ON CONFLICT(span_id) DO UPDATE SET
                   provider = excluded.provider,
                   source_id = excluded.source_id,
@@ -232,6 +359,12 @@ impl Store {
                   is_meta = excluded.is_meta,
                   confidence = excluded.confidence,
                   source_file_path_hash = excluded.source_file_path_hash,
+                  event_count = excluded.event_count,
+                  has_usage_evidence = excluded.has_usage_evidence,
+                  total_messages = excluded.total_messages,
+                  user_messages = excluded.user_messages,
+                  assistant_messages = excluded.assistant_messages,
+                  developer_messages = excluded.developer_messages,
                   payload = excluded.payload
                 "#,
             )?;
@@ -259,6 +392,12 @@ impl Store {
                     bool_to_i64(span.is_meta),
                     confidence_as_str(span.confidence.clone()),
                     span.source_file_path_hash.as_deref(),
+                    safe_u64_to_i64(span.effective_event_count()),
+                    bool_to_i64(span.effective_has_usage_evidence()),
+                    safe_u64_to_i64(span.total_messages),
+                    safe_u64_to_i64(span.user_messages),
+                    safe_u64_to_i64(span.assistant_messages),
+                    safe_u64_to_i64(span.developer_messages),
                     &payload,
                 ])? as u64;
                 delete_links.execute(params![&span.span_id.0])?;
@@ -291,11 +430,7 @@ impl Store {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             let targets = self.task_span_targets_for_sources(source_ids)?;
-            let impact = self.delete_task_span_targets_in_tx(&targets)?;
-            self.delete_task_work_items_for_project_buckets_in_tx(
-                &impact.affected_project_buckets,
-            )?;
-            Ok(impact)
+            self.delete_task_span_targets_in_tx(&targets)
         })();
 
         match result {
@@ -321,11 +456,7 @@ impl Store {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             let targets = self.task_span_targets_for_source_file_hashes(source_id, file_hashes)?;
-            let impact = self.delete_task_span_targets_in_tx(&targets)?;
-            self.delete_task_work_items_for_project_buckets_in_tx(
-                &impact.affected_project_buckets,
-            )?;
-            Ok(impact)
+            self.delete_task_span_targets_in_tx(&targets)
         })();
 
         match result {
@@ -587,6 +718,12 @@ impl Store {
     }
 
     pub fn rebuild_all_task_work_items(&self) -> Result<u64> {
+        Ok(self
+            .rebuild_all_task_work_items_report()?
+            .work_items_rebuilt)
+    }
+
+    pub fn rebuild_all_task_work_items_report(&self) -> Result<TaskRebuildReport> {
         let mut statement = self
             .conn
             .prepare("SELECT DISTINCT project_bucket FROM task_spans ORDER BY project_bucket")?;
@@ -595,30 +732,62 @@ impl Store {
         for row in rows {
             buckets.insert(row?);
         }
-        self.rebuild_task_work_items_for_project_buckets(&buckets)
+        self.rebuild_task_work_items_for_project_buckets_report(&buckets)
     }
 
     pub fn rebuild_task_work_items_for_project_buckets(
         &self,
         project_buckets: &BTreeSet<String>,
     ) -> Result<u64> {
+        Ok(self
+            .rebuild_task_work_items_for_project_buckets_report(project_buckets)?
+            .work_items_rebuilt)
+    }
+
+    pub fn rebuild_task_work_items_for_project_buckets_report(
+        &self,
+        project_buckets: &BTreeSet<String>,
+    ) -> Result<TaskRebuildReport> {
         if project_buckets.is_empty() {
-            return Ok(0);
+            return Ok(TaskRebuildReport::default());
         }
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
-            self.delete_task_work_items_for_project_buckets_in_tx(project_buckets)?;
+            let mut report = TaskRebuildReport {
+                affected_bucket_count: project_buckets.len() as u64,
+                ..TaskRebuildReport::default()
+            };
+            let delete_started_at = Instant::now();
+            report.work_items_deleted =
+                self.delete_task_work_items_for_project_buckets_in_tx(project_buckets)?;
+            report.timings.delete_ms = delete_started_at.elapsed().as_millis() as u64;
+
+            let span_load_started_at = Instant::now();
             let contexts = self.load_span_contexts_for_project_buckets(project_buckets)?;
+            report.touched_span_count = contexts.len() as u64;
+            report.timings.span_load_ms = span_load_started_at.elapsed().as_millis() as u64;
+
+            let verification_started_at = Instant::now();
             let verifications = self.relevant_task_verifications(project_buckets)?;
-            let (work_items, members) = build_work_items(contexts, &verifications);
+            report.timings.verification_load_ms =
+                verification_started_at.elapsed().as_millis() as u64;
+
+            let (work_items, members, build_timings) = build_work_items(contexts, &verifications);
+            report.timings.grouping_ms = build_timings.grouping_ms;
+            report.timings.title_selection_ms = build_timings.title_selection_ms;
+            report.affected_segment_count = work_items.len() as u64;
+
+            let insert_started_at = Instant::now();
             self.insert_work_items_in_tx(&work_items, &members)?;
-            Ok(work_items.len() as u64)
+            report.timings.insert_ms = insert_started_at.elapsed().as_millis() as u64;
+            report.work_items_rebuilt = work_items.len() as u64;
+            Ok(report)
         })();
 
         match result {
-            Ok(changed) => {
+            Ok(report) => {
                 self.conn.execute_batch("COMMIT")?;
-                Ok(changed)
+                Ok(report)
             }
             Err(error) => {
                 rollback(&self.conn);
@@ -644,17 +813,26 @@ impl Store {
     fn task_span_targets_for_sources(
         &self,
         source_ids: &[SourceId],
-    ) -> Result<Vec<(TaskSpanId, String)>> {
+    ) -> Result<Vec<DeletedTaskSpanRef>> {
         let mut targets = Vec::new();
         let mut statement = self.conn.prepare(
-            "SELECT span_id, project_bucket FROM task_spans WHERE source_id = ?1 ORDER BY started_at, span_id",
+            "SELECT span_id, project_bucket, started_at FROM task_spans WHERE source_id = ?1 ORDER BY started_at, span_id",
         )?;
         for source_id in source_ids {
             let rows = statement.query_map(params![&source_id.0], |row| {
-                Ok((TaskSpanId(row.get(0)?), row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?;
             for row in rows {
-                targets.push(row?);
+                let (span_id, project_bucket, started_at) = row?;
+                targets.push(DeletedTaskSpanRef {
+                    span_id: TaskSpanId(span_id),
+                    project_bucket,
+                    started_at: parse_rfc3339_utc(&started_at)?,
+                });
             }
         }
         Ok(targets)
@@ -664,11 +842,11 @@ impl Store {
         &self,
         source_id: &SourceId,
         file_hashes: &[String],
-    ) -> Result<Vec<(TaskSpanId, String)>> {
+    ) -> Result<Vec<DeletedTaskSpanRef>> {
         let mut targets = Vec::new();
         let mut statement = self.conn.prepare(
             r#"
-            SELECT span_id, project_bucket
+            SELECT span_id, project_bucket, started_at
             FROM task_spans
             WHERE source_id = ?1 AND source_file_path_hash = ?2
             ORDER BY started_at, span_id
@@ -676,10 +854,19 @@ impl Store {
         )?;
         for file_hash in file_hashes {
             let rows = statement.query_map(params![&source_id.0, file_hash], |row| {
-                Ok((TaskSpanId(row.get(0)?), row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?;
             for row in rows {
-                targets.push(row?);
+                let (span_id, project_bucket, started_at) = row?;
+                targets.push(DeletedTaskSpanRef {
+                    span_id: TaskSpanId(span_id),
+                    project_bucket,
+                    started_at: parse_rfc3339_utc(&started_at)?,
+                });
             }
         }
         Ok(targets)
@@ -687,7 +874,7 @@ impl Store {
 
     fn delete_task_span_targets_in_tx(
         &self,
-        targets: &[(TaskSpanId, String)],
+        targets: &[DeletedTaskSpanRef],
     ) -> Result<TaskDeletionImpact> {
         if targets.is_empty() {
             return Ok(TaskDeletionImpact::default());
@@ -700,14 +887,15 @@ impl Store {
             .prepare("DELETE FROM task_spans WHERE span_id = ?1")?;
         let mut deleted = 0u64;
         let mut affected_project_buckets = BTreeSet::new();
-        for (span_id, bucket) in targets {
-            affected_project_buckets.insert(bucket.clone());
-            delete_links.execute(params![&span_id.0])?;
-            deleted += delete_spans.execute(params![&span_id.0])? as u64;
+        for target in targets {
+            affected_project_buckets.insert(target.project_bucket.clone());
+            delete_links.execute(params![&target.span_id.0])?;
+            deleted += delete_spans.execute(params![&target.span_id.0])? as u64;
         }
         Ok(TaskDeletionImpact {
             deleted,
             affected_project_buckets,
+            deleted_spans: targets.to_vec(),
         })
     }
 
@@ -718,27 +906,33 @@ impl Store {
         if project_buckets.is_empty() {
             return Ok(0);
         }
-        let mut count_stmt = self
-            .conn
-            .prepare("SELECT COUNT(*) FROM task_work_items WHERE project_bucket = ?1")?;
-        let mut delete_members = self.conn.prepare(
-            r#"
-            DELETE FROM task_work_item_members
-            WHERE work_item_id IN (
-              SELECT work_item_id
-              FROM task_work_items
-              WHERE project_bucket = ?1
-            )
-            "#,
-        )?;
-        let mut delete_items = self
-            .conn
-            .prepare("DELETE FROM task_work_items WHERE project_bucket = ?1")?;
+        let buckets = project_buckets.iter().cloned().collect::<Vec<_>>();
         let mut deleted = 0u64;
-        for bucket in project_buckets {
-            deleted += count_stmt.query_row(params![bucket], |row| row.get::<_, u64>(0))?;
-            delete_members.execute(params![bucket])?;
-            delete_items.execute(params![bucket])?;
+        for chunk in buckets.chunks(SQLITE_BUCKET_CHUNK_SIZE) {
+            let placeholders = sqlite_in_clause_placeholders(chunk.len());
+            let params = sqlite_string_params(chunk);
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM task_work_items WHERE project_bucket IN ({placeholders})"
+            );
+            deleted += self
+                .conn
+                .query_row(&count_sql, params.as_slice(), |row| row.get::<_, u64>(0))?;
+
+            let delete_members_sql = format!(
+                r#"
+                DELETE FROM task_work_item_members
+                WHERE work_item_id IN (
+                  SELECT work_item_id
+                  FROM task_work_items
+                  WHERE project_bucket IN ({placeholders})
+                )
+                "#
+            );
+            self.conn.execute(&delete_members_sql, params.as_slice())?;
+
+            let delete_items_sql =
+                format!("DELETE FROM task_work_items WHERE project_bucket IN ({placeholders})");
+            self.conn.execute(&delete_items_sql, params.as_slice())?;
         }
         Ok(deleted)
     }
@@ -791,63 +985,195 @@ impl Store {
         &self,
         project_buckets: &BTreeSet<String>,
     ) -> Result<Vec<SpanContext>> {
-        let mut spans = Vec::<TaskSpan>::new();
-        let mut statement = self.conn.prepare(
-            "SELECT payload FROM task_spans WHERE project_bucket = ?1 ORDER BY started_at, span_id",
-        )?;
-        for bucket in project_buckets {
-            let rows = statement.query_map(params![bucket], |row| row.get::<_, String>(0))?;
+        let mut contexts = Vec::<SpanContext>::new();
+        let buckets = project_buckets.iter().cloned().collect::<Vec<_>>();
+        for chunk in buckets.chunks(SQLITE_BUCKET_CHUNK_SIZE) {
+            let placeholders = sqlite_in_clause_placeholders(chunk.len());
+            let sql = format!(
+                "SELECT payload FROM task_spans \
+                 WHERE project_bucket IN ({placeholders}) \
+                 ORDER BY project_bucket, started_at, span_id"
+            );
+            let params = sqlite_string_params(chunk);
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
             for row in rows {
-                spans.push(serde_json::from_str(&row?)?);
+                contexts.push(SpanContext::from(serde_json::from_str::<TaskSpan>(&row?)?));
             }
         }
-        if spans.is_empty() {
+        Ok(contexts)
+    }
+
+    pub fn rebuild_task_work_items_for_changes_report(
+        &self,
+        project_buckets: &BTreeSet<String>,
+        changed_span_ids: &BTreeSet<String>,
+        deleted_spans: &[DeletedTaskSpanRef],
+    ) -> Result<TaskRebuildReport> {
+        if project_buckets.is_empty() || (changed_span_ids.is_empty() && deleted_spans.is_empty()) {
+            return Ok(TaskRebuildReport::default());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let mut report = TaskRebuildReport {
+                affected_bucket_count: project_buckets.len() as u64,
+                ..TaskRebuildReport::default()
+            };
+
+            let span_load_started_at = Instant::now();
+            let contexts = self.load_span_contexts_for_project_buckets(project_buckets)?;
+            let layouts =
+                self.load_existing_work_item_layouts_for_project_buckets(project_buckets)?;
+            report.timings.span_load_ms = span_load_started_at.elapsed().as_millis() as u64;
+
+            let verification_started_at = Instant::now();
+            let verifications = self.relevant_task_verifications(project_buckets)?;
+            report.timings.verification_load_ms =
+                verification_started_at.elapsed().as_millis() as u64;
+
+            let grouping_started_at = Instant::now();
+            let plan = build_localized_rebuild_plan(
+                contexts,
+                layouts,
+                changed_span_ids,
+                deleted_spans,
+                &verifications,
+            );
+            report.timings.grouping_ms = grouping_started_at.elapsed().as_millis() as u64;
+            report.touched_span_count = plan.touched_span_count;
+            report.affected_segment_count = plan.segments.len() as u64;
+
+            let delete_started_at = Instant::now();
+            report.work_items_deleted =
+                self.delete_task_work_items_by_ids_in_tx(&plan.work_item_ids_to_delete)?;
+            report.timings.delete_ms = delete_started_at.elapsed().as_millis() as u64;
+
+            let mut work_items = Vec::new();
+            let mut members = Vec::new();
+            let mut build_timings = BuildWorkItemsTimings::default();
+            for segment in plan.segments {
+                let (segment_items, segment_members, segment_timings) =
+                    build_work_items(segment.contexts, &verifications);
+                work_items.extend(segment_items);
+                members.extend(segment_members);
+                build_timings.grouping_ms = build_timings
+                    .grouping_ms
+                    .saturating_add(segment_timings.grouping_ms);
+                build_timings.title_selection_ms = build_timings
+                    .title_selection_ms
+                    .saturating_add(segment_timings.title_selection_ms);
+            }
+            report.timings.grouping_ms = report
+                .timings
+                .grouping_ms
+                .saturating_add(build_timings.grouping_ms);
+            report.timings.title_selection_ms = build_timings.title_selection_ms;
+
+            let insert_started_at = Instant::now();
+            self.insert_work_items_in_tx(&work_items, &members)?;
+            report.timings.insert_ms = insert_started_at.elapsed().as_millis() as u64;
+            report.work_items_rebuilt = work_items.len() as u64;
+            Ok(report)
+        })();
+
+        match result {
+            Ok(report) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(report)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    fn load_existing_work_item_layouts_for_project_buckets(
+        &self,
+        project_buckets: &BTreeSet<String>,
+    ) -> Result<Vec<ExistingWorkItemLayout>> {
+        if project_buckets.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut contexts = spans
-            .iter()
-            .cloned()
-            .map(|span| {
-                (
-                    span.span_id.0.clone(),
-                    SpanContext {
-                        span,
-                        linked_events: Vec::new(),
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-
-        let mut event_lookup = self.conn.prepare(
-            r#"
-            SELECT l.span_id, e.payload
-            FROM task_span_event_links l
-            JOIN usage_events e ON e.event_id = l.event_id
-            JOIN task_spans s ON s.span_id = l.span_id
-            WHERE s.project_bucket = ?1
-            ORDER BY s.started_at, l.event_id
-            "#,
-        )?;
-        for bucket in project_buckets {
-            let rows = event_lookup.query_map(params![bucket], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        let buckets = project_buckets.iter().cloned().collect::<Vec<_>>();
+        let mut layouts = Vec::new();
+        for chunk in buckets.chunks(SQLITE_BUCKET_CHUNK_SIZE) {
+            let placeholders = sqlite_in_clause_placeholders(chunk.len());
+            let sql = format!(
+                r#"
+                SELECT w.work_item_id, w.project_bucket, m.span_id
+                FROM task_work_items w
+                JOIN task_work_item_members m ON m.work_item_id = w.work_item_id
+                WHERE w.project_bucket IN ({placeholders})
+                ORDER BY w.project_bucket, w.started_at, w.work_item_id, m.ordinal, m.span_id
+                "#
+            );
+            let params = sqlite_string_params(chunk);
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?;
+            let mut current_layout = None::<ExistingWorkItemLayout>;
             for row in rows {
-                let (span_id, payload) = row?;
-                if let Some(context) = contexts.get_mut(&span_id) {
-                    context.linked_events.push(serde_json::from_str(&payload)?);
+                let (work_item_id, project_bucket, span_id) = row?;
+                match current_layout.as_mut() {
+                    Some(layout) if layout.work_item_id.0 == work_item_id => {
+                        layout.span_ids.push(span_id);
+                    }
+                    Some(layout) => {
+                        layouts.push(layout.clone());
+                        *layout = ExistingWorkItemLayout {
+                            work_item_id: WorkItemId(work_item_id),
+                            project_bucket,
+                            span_ids: vec![span_id],
+                        };
+                    }
+                    None => {
+                        current_layout = Some(ExistingWorkItemLayout {
+                            work_item_id: WorkItemId(work_item_id),
+                            project_bucket,
+                            span_ids: vec![span_id],
+                        });
+                    }
                 }
             }
-        }
-
-        let mut ordered = Vec::with_capacity(spans.len());
-        for span in spans {
-            if let Some(context) = contexts.remove(&span.span_id.0) {
-                ordered.push(context);
+            if let Some(layout) = current_layout {
+                layouts.push(layout);
             }
         }
-        Ok(ordered)
+        Ok(layouts)
+    }
+
+    fn delete_task_work_items_by_ids_in_tx(&self, work_item_ids: &BTreeSet<String>) -> Result<u64> {
+        if work_item_ids.is_empty() {
+            return Ok(0);
+        }
+        let ids = work_item_ids.iter().cloned().collect::<Vec<_>>();
+        let mut deleted = 0u64;
+        for chunk in ids.chunks(SQLITE_BUCKET_CHUNK_SIZE) {
+            let placeholders = sqlite_in_clause_placeholders(chunk.len());
+            let params = sqlite_string_params(chunk);
+            let delete_members_sql = format!(
+                "DELETE FROM task_work_item_members WHERE work_item_id IN ({placeholders})"
+            );
+            self.conn.execute(&delete_members_sql, params.as_slice())?;
+
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM task_work_items WHERE work_item_id IN ({placeholders})"
+            );
+            deleted += self
+                .conn
+                .query_row(&count_sql, params.as_slice(), |row| row.get::<_, u64>(0))?;
+
+            let delete_items_sql =
+                format!("DELETE FROM task_work_items WHERE work_item_id IN ({placeholders})");
+            self.conn.execute(&delete_items_sql, params.as_slice())?;
+        }
+        Ok(deleted)
     }
 
     fn work_item_members_map(&self) -> Result<HashMap<String, String>> {
@@ -914,7 +1240,7 @@ impl Store {
             return Ok(Vec::new());
         }
         let verifications = self.task_verifications()?;
-        let span_bucket_map = self.span_project_bucket_map()?;
+        let relevant_span_ids = self.span_ids_for_project_buckets(project_buckets)?;
         Ok(verifications
             .into_iter()
             .filter(|verification| {
@@ -922,32 +1248,336 @@ impl Store {
                     .action
                     .span_ids()
                     .into_iter()
-                    .filter_map(|span_id| span_bucket_map.get(span_id.0.as_str()))
-                    .any(|bucket| project_buckets.contains(bucket))
+                    .any(|span_id| relevant_span_ids.contains(span_id.0.as_str()))
             })
             .collect())
     }
 
-    fn span_project_bucket_map(&self) -> Result<HashMap<String, String>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT span_id, project_bucket FROM task_spans ORDER BY span_id")?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut map = HashMap::new();
-        for row in rows {
-            let (span_id, project_bucket) = row?;
-            map.insert(span_id, project_bucket);
+    fn span_ids_for_project_buckets(
+        &self,
+        project_buckets: &BTreeSet<String>,
+    ) -> Result<HashSet<String>> {
+        let buckets = project_buckets.iter().cloned().collect::<Vec<_>>();
+        let mut span_ids = HashSet::new();
+        for chunk in buckets.chunks(SQLITE_BUCKET_CHUNK_SIZE) {
+            let placeholders = sqlite_in_clause_placeholders(chunk.len());
+            let sql =
+                format!("SELECT span_id FROM task_spans WHERE project_bucket IN ({placeholders})");
+            let params = sqlite_string_params(chunk);
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                span_ids.insert(row?);
+            }
         }
-        Ok(map)
+        Ok(span_ids)
     }
+}
+
+fn build_localized_rebuild_plan(
+    contexts: Vec<SpanContext>,
+    layouts: Vec<ExistingWorkItemLayout>,
+    changed_span_ids: &BTreeSet<String>,
+    deleted_spans: &[DeletedTaskSpanRef],
+    verifications: &[TaskVerification],
+) -> LocalizedRebuildPlan {
+    let mut contexts_by_bucket = BTreeMap::<String, Vec<SpanContext>>::new();
+    for context in contexts {
+        contexts_by_bucket
+            .entry(context.span.project_bucket.clone())
+            .or_default()
+            .push(context);
+    }
+
+    let mut layouts_by_bucket = BTreeMap::<String, Vec<ExistingWorkItemLayout>>::new();
+    for layout in layouts {
+        layouts_by_bucket
+            .entry(layout.project_bucket.clone())
+            .or_default()
+            .push(layout);
+    }
+
+    let mut deleted_by_bucket = BTreeMap::<String, Vec<DeletedTaskSpanRef>>::new();
+    for deleted in deleted_spans {
+        deleted_by_bucket
+            .entry(deleted.project_bucket.clone())
+            .or_default()
+            .push(deleted.clone());
+    }
+
+    let changed_span_ids = changed_span_ids.iter().cloned().collect::<HashSet<_>>();
+    let all_buckets = contexts_by_bucket
+        .keys()
+        .chain(layouts_by_bucket.keys())
+        .chain(deleted_by_bucket.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut plan = LocalizedRebuildPlan::default();
+
+    for bucket in all_buckets {
+        let bucket_contexts = contexts_by_bucket.remove(&bucket).unwrap_or_default();
+        let bucket_layouts = layouts_by_bucket.remove(&bucket).unwrap_or_default();
+        let bucket_deleted = deleted_by_bucket.remove(&bucket).unwrap_or_default();
+        let deleted_span_ids = bucket_deleted
+            .iter()
+            .map(|deleted| deleted.span_id.0.clone())
+            .collect::<HashSet<_>>();
+
+        if bucket_contexts.is_empty() {
+            for layout in &bucket_layouts {
+                if layout
+                    .span_ids
+                    .iter()
+                    .any(|span_id| deleted_span_ids.contains(span_id))
+                {
+                    plan.work_item_ids_to_delete
+                        .insert(layout.work_item_id.0.clone());
+                }
+            }
+            continue;
+        }
+
+        let index_map = bucket_contexts
+            .iter()
+            .enumerate()
+            .map(|(index, context)| (context.span.span_id.0.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let mut ranges = initial_rebuild_ranges(
+            &bucket_contexts,
+            &index_map,
+            &changed_span_ids,
+            &bucket_deleted,
+        );
+
+        if ranges.is_empty() {
+            for layout in &bucket_layouts {
+                if layout
+                    .span_ids
+                    .iter()
+                    .any(|span_id| deleted_span_ids.contains(span_id))
+                {
+                    plan.work_item_ids_to_delete
+                        .insert(layout.work_item_id.0.clone());
+                }
+            }
+            continue;
+        }
+
+        ranges = expand_ranges_by_window(
+            &merge_index_ranges(ranges),
+            bucket_contexts.len(),
+            TOPIC_COHESION_WINDOW_SPANS,
+        );
+
+        let mut additional_bounds = Vec::new();
+        for layout in &bucket_layouts {
+            let touched_by_deleted = layout
+                .span_ids
+                .iter()
+                .any(|span_id| deleted_span_ids.contains(span_id));
+            let touched_by_changed = layout
+                .span_ids
+                .iter()
+                .any(|span_id| changed_span_ids.contains(span_id));
+            if !(touched_by_deleted
+                || touched_by_changed
+                || ranges_intersect_layout(&ranges, &index_map, layout))
+            {
+                continue;
+            }
+            plan.work_item_ids_to_delete
+                .insert(layout.work_item_id.0.clone());
+            if let Some(bounds) = layout_bounds(layout, &index_map) {
+                additional_bounds.push(bounds);
+            }
+        }
+
+        for verification in verifications {
+            let TaskVerificationAction::Merge {
+                left_anchor_span_id,
+                right_anchor_span_id,
+                ..
+            } = &verification.action
+            else {
+                continue;
+            };
+            let left_touched = range_or_deleted_contains_span_id(
+                &ranges,
+                &index_map,
+                &deleted_span_ids,
+                &left_anchor_span_id.0,
+            );
+            let right_touched = range_or_deleted_contains_span_id(
+                &ranges,
+                &index_map,
+                &deleted_span_ids,
+                &right_anchor_span_id.0,
+            );
+            if !left_touched && !right_touched {
+                continue;
+            }
+            for layout in &bucket_layouts {
+                if !layout.span_ids.iter().any(|span_id| {
+                    span_id == &left_anchor_span_id.0 || span_id == &right_anchor_span_id.0
+                }) {
+                    continue;
+                }
+                plan.work_item_ids_to_delete
+                    .insert(layout.work_item_id.0.clone());
+                if let Some(bounds) = layout_bounds(layout, &index_map) {
+                    additional_bounds.push(bounds);
+                }
+            }
+        }
+
+        ranges.extend(additional_bounds);
+        ranges = merge_index_ranges(ranges);
+
+        for layout in &bucket_layouts {
+            if layout
+                .span_ids
+                .iter()
+                .any(|span_id| deleted_span_ids.contains(span_id))
+            {
+                plan.work_item_ids_to_delete
+                    .insert(layout.work_item_id.0.clone());
+            }
+        }
+
+        for (start, end) in merge_index_ranges(ranges) {
+            if start >= bucket_contexts.len() || start > end {
+                continue;
+            }
+            let slice = bucket_contexts[start..=end].to_vec();
+            if slice.is_empty() {
+                continue;
+            }
+            plan.touched_span_count = plan.touched_span_count.saturating_add(slice.len() as u64);
+            plan.segments
+                .push(LocalizedRebuildSegment { contexts: slice });
+        }
+    }
+
+    plan
+}
+
+fn initial_rebuild_ranges(
+    bucket_contexts: &[SpanContext],
+    index_map: &HashMap<String, usize>,
+    changed_span_ids: &HashSet<String>,
+    deleted_spans: &[DeletedTaskSpanRef],
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for (span_id, index) in index_map {
+        if changed_span_ids.contains(span_id) {
+            ranges.push((*index, *index));
+        }
+    }
+    for deleted in deleted_spans {
+        let insertion_index = bucket_contexts
+            .binary_search_by(|context| context.span.started_at.cmp(&deleted.started_at))
+            .unwrap_or_else(|index| index);
+        if bucket_contexts.is_empty() {
+            continue;
+        }
+        let start = insertion_index.saturating_sub(1);
+        let end = insertion_index.min(bucket_contexts.len().saturating_sub(1));
+        ranges.push((start, end));
+    }
+    merge_index_ranges(ranges)
+}
+
+fn merge_index_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut merged = Vec::with_capacity(ranges.len());
+    let mut current = ranges[0];
+    for range in ranges.into_iter().skip(1) {
+        if range.0 <= current.1.saturating_add(1) {
+            current.1 = current.1.max(range.1);
+        } else {
+            merged.push(current);
+            current = range;
+        }
+    }
+    merged.push(current);
+    merged
+}
+
+fn expand_ranges_by_window(
+    ranges: &[(usize, usize)],
+    context_len: usize,
+    window: usize,
+) -> Vec<(usize, usize)> {
+    if context_len == 0 {
+        return Vec::new();
+    }
+    ranges
+        .iter()
+        .map(|(start, end)| {
+            (
+                start.saturating_sub(window),
+                end.saturating_add(window)
+                    .min(context_len.saturating_sub(1)),
+            )
+        })
+        .collect()
+}
+
+fn layout_bounds(
+    layout: &ExistingWorkItemLayout,
+    index_map: &HashMap<String, usize>,
+) -> Option<(usize, usize)> {
+    let mut indices = layout
+        .span_ids
+        .iter()
+        .filter_map(|span_id| index_map.get(span_id).copied());
+    let first = indices.next()?;
+    let mut min_index = first;
+    let mut max_index = first;
+    for index in indices {
+        min_index = min_index.min(index);
+        max_index = max_index.max(index);
+    }
+    Some((min_index, max_index))
+}
+
+fn ranges_intersect_layout(
+    ranges: &[(usize, usize)],
+    index_map: &HashMap<String, usize>,
+    layout: &ExistingWorkItemLayout,
+) -> bool {
+    layout
+        .span_ids
+        .iter()
+        .filter_map(|span_id| index_map.get(span_id).copied())
+        .any(|index| {
+            ranges
+                .iter()
+                .any(|(start, end)| *start <= index && index <= *end)
+        })
+}
+
+fn range_or_deleted_contains_span_id(
+    ranges: &[(usize, usize)],
+    index_map: &HashMap<String, usize>,
+    deleted_span_ids: &HashSet<String>,
+    span_id: &str,
+) -> bool {
+    deleted_span_ids.contains(span_id)
+        || index_map.get(span_id).is_some_and(|index| {
+            ranges
+                .iter()
+                .any(|(start, end)| *start <= *index && *index <= *end)
+        })
 }
 
 fn build_work_items(
     contexts: Vec<SpanContext>,
     verifications: &[TaskVerification],
-) -> (Vec<WorkItem>, Vec<WorkItemMember>) {
+) -> (Vec<WorkItem>, Vec<WorkItemMember>, BuildWorkItemsTimings) {
     let mut by_bucket = BTreeMap::<String, Vec<SpanContext>>::new();
     for context in contexts {
         by_bucket
@@ -958,6 +1588,7 @@ fn build_work_items(
 
     let mut work_items = Vec::new();
     let mut members = Vec::new();
+    let mut timings = BuildWorkItemsTimings::default();
     for (bucket, mut bucket_contexts) in by_bucket {
         bucket_contexts.sort_by(|left, right| {
             left.span
@@ -965,41 +1596,28 @@ fn build_work_items(
                 .cmp(&right.span.started_at)
                 .then_with(|| left.span.span_id.0.cmp(&right.span.span_id.0))
         });
+        let grouping_started_at = Instant::now();
         let groups = group_spans(bucket_contexts, verifications);
+        timings.grouping_ms = timings
+            .grouping_ms
+            .saturating_add(grouping_started_at.elapsed().as_millis() as u64);
         let bucket_label_stats = build_bucket_label_stats(&groups);
         for group in groups {
+            let title_started_at = Instant::now();
             let (work_item, group_members) =
                 build_work_item(bucket.clone(), group, verifications, &bucket_label_stats);
+            timings.title_selection_ms = timings
+                .title_selection_ms
+                .saturating_add(title_started_at.elapsed().as_millis() as u64);
             members.extend(group_members);
             work_items.push(work_item);
         }
     }
-    (work_items, members)
+    (work_items, members, timings)
 }
 
-fn build_bucket_label_stats(groups: &[PendingGroup]) -> BucketLabelStats {
-    let mut stats = BucketLabelStats {
-        document_count: groups.len(),
-        ..BucketLabelStats::default()
-    };
-    for group in groups {
-        let mut seen_titles = HashSet::<String>::new();
-        let mut seen_tokens = HashSet::<String>::new();
-        for candidate in collect_title_candidates(&group.spans) {
-            seen_titles.insert(candidate.normalized);
-            seen_tokens.extend(candidate.topic_tokens);
-        }
-        for normalized in seen_titles {
-            *stats
-                .title_document_frequency
-                .entry(normalized)
-                .or_default() += 1;
-        }
-        for token in seen_tokens {
-            *stats.token_document_frequency.entry(token).or_default() += 1;
-        }
-    }
-    stats
+fn build_bucket_label_stats(_groups: &[PendingGroup]) -> BucketLabelStats {
+    BucketLabelStats::default()
 }
 
 fn group_spans(
@@ -1007,6 +1625,7 @@ fn group_spans(
     verifications: &[TaskVerification],
 ) -> Vec<PendingGroup> {
     let mut groups = Vec::<PendingGroup>::new();
+    let boundary_evidence = compute_boundary_evidence(&contexts);
     let mut iter = contexts.into_iter();
     let Some(first) = iter.next() else {
         return groups;
@@ -1017,22 +1636,30 @@ fn group_spans(
         manual_title: None,
         force_verified: false,
     };
-    for next in iter {
+    for (boundary_index, next) in iter.enumerate() {
         let previous = current
             .spans
             .last()
             .expect("pending group has at least one span");
-        let decision = continuation_decision(previous, &next);
-        let strong_anchor = decision.reasons.contains("same_issue_key")
-            || decision.reasons.contains("same_session")
-            || decision.reasons.contains("same_title");
+        let decision = continuation_decision(
+            previous,
+            &next,
+            boundary_evidence.get(boundary_index).copied(),
+        );
+        let protected_anchor =
+            decision.reasons.contains("same_issue_key") || decision.reasons.contains("same_title");
+        let strong_anchor = protected_anchor
+            || (decision.reasons.contains("same_session")
+                && !decision.reasons.contains("topic_boundary"));
+        let blocked_by_topic_boundary =
+            decision.reasons.contains("topic_boundary") && !protected_anchor;
         let gap_hours = next
             .span
             .started_at
             .signed_duration_since(previous.ended_at())
             .num_hours();
-        let should_continue =
-            decision.score >= 4 || (decision.score >= 2 && strong_anchor && gap_hours <= 24);
+        let should_continue = !blocked_by_topic_boundary
+            && (decision.score >= 4 || (decision.score >= 2 && strong_anchor && gap_hours <= 24));
         if should_continue {
             current.continuation_reasons.extend(decision.reasons);
             current.spans.push(next);
@@ -1051,13 +1678,17 @@ fn group_spans(
     apply_merge_verifications(groups, verifications)
 }
 
-fn continuation_decision(previous: &SpanContext, next: &SpanContext) -> ContinuationDecision {
+fn continuation_decision(
+    previous: &SpanContext,
+    next: &SpanContext,
+    boundary_evidence: Option<BoundaryEvidence>,
+) -> ContinuationDecision {
     let mut score = 0;
     let mut reasons = BTreeSet::new();
     let same_session =
         previous.session_key().is_some() && previous.session_key() == next.session_key();
-    let previous_generic = task_title_is_generic(Some(previous.span.title.as_str()));
-    let next_generic = task_title_is_generic(Some(next.span.title.as_str()));
+    let previous_generic = previous.title_is_generic();
+    let next_generic = next.title_is_generic();
     let previous_issue_keys = previous
         .span
         .issue_keys
@@ -1092,14 +1723,14 @@ fn continuation_decision(previous: &SpanContext, next: &SpanContext) -> Continua
 
     if !previous.span.normalized_title.is_empty()
         && previous.span.normalized_title == next.span.normalized_title
-        && !task_title_is_generic(Some(previous.span.title.as_str()))
+        && !previous.title_is_generic()
     {
         score += 4;
         reasons.insert("same_title".to_string());
     } else {
         let previous_tokens = previous.topic_tokens();
         let next_tokens = next.topic_tokens();
-        let overlap = previous_tokens.intersection(&next_tokens).count();
+        let overlap = previous_tokens.intersection(next_tokens).count();
         if overlap >= 2 {
             score += 2;
             reasons.insert("shared_topic".to_string());
@@ -1137,7 +1768,168 @@ fn continuation_decision(previous: &SpanContext, next: &SpanContext) -> Continua
         score -= 2;
     }
 
+    if let Some(boundary) = boundary_evidence {
+        if boundary.local_similarity > 0.0 && boundary.adjacent_overlap >= 2 {
+            score += 1;
+            reasons.insert("windowed_topic_cohesion".to_string());
+        }
+        if boundary.strong_topic_boundary {
+            score -= 4;
+            reasons.insert("topic_boundary".to_string());
+        }
+    }
+
     ContinuationDecision { score, reasons }
+}
+
+fn compute_boundary_evidence(contexts: &[SpanContext]) -> Vec<BoundaryEvidence> {
+    if contexts.len() < 2 {
+        return Vec::new();
+    }
+
+    let topic_sets = contexts
+        .iter()
+        .map(|context| context.topic_tokens().clone())
+        .collect::<Vec<_>>();
+    let similarities = (0..topic_sets.len() - 1)
+        .map(|boundary_index| boundary_window_similarity(&topic_sets, boundary_index))
+        .collect::<Vec<_>>();
+    let depth_scores = boundary_depth_scores(&similarities);
+    let similarity_stats = DistributionStats::from_values(&similarities);
+    let depth_stats = DistributionStats::from_values(&depth_scores);
+    let similarity_count = similarities.len();
+
+    similarities
+        .into_iter()
+        .enumerate()
+        .map(|(boundary_index, local_similarity)| {
+            let adjacent_overlap = topic_sets[boundary_index]
+                .intersection(&topic_sets[boundary_index + 1])
+                .count();
+            let previous = &contexts[boundary_index];
+            let next = &contexts[boundary_index + 1];
+            let same_session =
+                previous.session_key().is_some() && previous.session_key() == next.session_key();
+            let anchored = spans_share_non_generic_title(previous, next)
+                || spans_share_issue_keys(previous, next);
+            let pairwise_boundary = similarity_count == 1
+                && same_session
+                && !anchored
+                && adjacent_overlap == 0
+                && local_similarity <= 0.0
+                && spans_have_contentful_topic_signal(previous, next);
+            let statistical_boundary = same_session
+                && !anchored
+                && adjacent_overlap == 0
+                && similarity_stats.has_variation()
+                && depth_stats.has_variation()
+                && local_similarity <= similarity_stats.low_outlier_threshold()
+                && depth_scores[boundary_index] >= depth_stats.high_outlier_threshold();
+            let strong_topic_boundary = pairwise_boundary || statistical_boundary;
+            BoundaryEvidence {
+                local_similarity,
+                adjacent_overlap,
+                strong_topic_boundary,
+            }
+        })
+        .collect()
+}
+
+fn boundary_window_similarity(topic_sets: &[BTreeSet<String>], boundary_index: usize) -> f64 {
+    let left_start = boundary_index.saturating_sub(TOPIC_COHESION_WINDOW_SPANS - 1);
+    let left_counts = aggregate_topic_counts(&topic_sets[left_start..=boundary_index]);
+    let right_end = (boundary_index + TOPIC_COHESION_WINDOW_SPANS).min(topic_sets.len() - 1);
+    let right_counts = aggregate_topic_counts(&topic_sets[boundary_index + 1..=right_end]);
+    weighted_jaccard_similarity(&left_counts, &right_counts)
+}
+
+fn boundary_depth_scores(similarities: &[f64]) -> Vec<f64> {
+    if similarities.is_empty() {
+        return Vec::new();
+    }
+
+    (0..similarities.len())
+        .map(|index| {
+            let left_start = index.saturating_sub(TOPIC_COHESION_WINDOW_SPANS);
+            let right_end = (index + TOPIC_COHESION_WINDOW_SPANS).min(similarities.len() - 1);
+            let current = similarities[index];
+            let left_peak = similarities[left_start..=index]
+                .iter()
+                .copied()
+                .fold(current, f64::max);
+            let right_peak = similarities[index..=right_end]
+                .iter()
+                .copied()
+                .fold(current, f64::max);
+            (left_peak - current).max(0.0) + (right_peak - current).max(0.0)
+        })
+        .collect()
+}
+
+fn aggregate_topic_counts(topic_sets: &[BTreeSet<String>]) -> HashMap<String, usize> {
+    let mut counts = HashMap::<String, usize>::new();
+    for topic_set in topic_sets {
+        for token in topic_set {
+            *counts.entry(token.clone()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+fn weighted_jaccard_similarity(
+    left: &HashMap<String, usize>,
+    right: &HashMap<String, usize>,
+) -> f64 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+
+    let mut tokens = left.keys().cloned().collect::<HashSet<_>>();
+    tokens.extend(right.keys().cloned());
+    let (intersection, union) = tokens.into_iter().fold((0usize, 0usize), |acc, token| {
+        let left_count = left.get(&token).copied().unwrap_or_default();
+        let right_count = right.get(&token).copied().unwrap_or_default();
+        (
+            acc.0 + left_count.min(right_count),
+            acc.1 + left_count.max(right_count),
+        )
+    });
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+fn spans_share_issue_keys(left: &SpanContext, right: &SpanContext) -> bool {
+    let left_issue_keys = left.span.issue_keys.iter().cloned().collect::<HashSet<_>>();
+    let right_issue_keys = right
+        .span
+        .issue_keys
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    !left_issue_keys.is_empty()
+        && left_issue_keys
+            .intersection(&right_issue_keys)
+            .next()
+            .is_some()
+}
+
+fn spans_share_non_generic_title(left: &SpanContext, right: &SpanContext) -> bool {
+    !left.span.normalized_title.is_empty()
+        && left.span.normalized_title == right.span.normalized_title
+        && !left.title_is_generic()
+}
+
+fn spans_have_contentful_topic_signal(left: &SpanContext, right: &SpanContext) -> bool {
+    span_has_contentful_topic_signal(left) && span_has_contentful_topic_signal(right)
+}
+
+fn span_has_contentful_topic_signal(span: &SpanContext) -> bool {
+    let title_signal = span.title_signal_score();
+    let topic_token_count = span.topic_tokens().len();
+    title_signal > 0 && topic_token_count >= 3
 }
 
 fn build_work_item(
@@ -1193,7 +1985,8 @@ fn build_work_item(
     let mut todo_excerpt = None;
     let mut repo_label = None;
     let mut path_label = None;
-    let mut event_ids = BTreeSet::<String>::new();
+    let mut unique_event_ids = BTreeSet::<String>::new();
+    let mut event_count = 0u64;
     let mut usage = UsageCounts::default();
     let mut estimated_cost_usd: Option<i64> = None;
     let mut no_git = true;
@@ -1240,14 +2033,18 @@ fn build_work_item(
             (Some(left), None) => Some(left),
             (None, right) => right,
         };
+        let linked_event_count = context.span.linked_event_ids.len() as u64;
+        let extra_event_count = context.event_count().saturating_sub(linked_event_count);
+        event_count = event_count.saturating_add(extra_event_count);
         for event_id in &context.span.linked_event_ids {
-            event_ids.insert(event_id.0.clone());
+            unique_event_ids.insert(event_id.0.clone());
         }
     }
+    event_count = event_count.saturating_add(unique_event_ids.len() as u64);
 
     let cross_provider = providers.len() > 1;
     let total_tokens = usage.computed_total();
-    let has_usage_evidence = !event_ids.is_empty();
+    let has_usage_evidence = event_count > 0 || spans.iter().any(SpanContext::has_usage_evidence);
     let zero_token_usage = has_usage_evidence && total_tokens == 0;
     let total_messages = spans.iter().map(SpanContext::total_messages).sum::<u64>();
     let user_messages = spans.iter().map(SpanContext::user_messages).sum::<u64>();
@@ -1264,8 +2061,8 @@ fn build_work_item(
         .iter()
         .all(|context| context.span.is_meta || span_is_session_control_meta(&context.span));
     let all_low_signal = spans.iter().all(|context| {
-        task_title_is_generic(Some(context.span.title.as_str()))
-            || task_title_is_weak_signal(Some(context.span.title.as_str()))
+        context.title_is_generic()
+            || context.title_is_weak_signal()
             || span_is_session_control_meta(&context.span)
     });
     let low_volume_exchange = total_messages > 0
@@ -1394,7 +2191,7 @@ fn build_work_item(
         ended_at,
         duration_seconds,
         span_count: spans.len() as u64,
-        event_count: event_ids.len() as u64,
+        event_count,
         total_input_tokens: usage.input_tokens.unwrap_or(0),
         total_cache_creation_tokens: usage.cache_creation_tokens.unwrap_or(0),
         total_cache_read_tokens: usage.cache_read_tokens.unwrap_or(0),
@@ -1952,28 +2749,66 @@ fn f1(true_positive: u64, predicted_positive: u64, truth_positive: u64) -> f64 {
 
 #[cfg(test)]
 fn choose_work_item_title(spans: &[SpanContext]) -> String {
-    let synthetic_group = PendingGroup {
-        spans: spans.to_vec(),
-        continuation_reasons: BTreeSet::new(),
-        manual_title: None,
-        force_verified: false,
-    };
-    let bucket_label_stats = build_bucket_label_stats(&[synthetic_group]);
-    choose_work_item_title_with_stats(spans, &bucket_label_stats)
+    choose_work_item_title_with_stats(spans, &BucketLabelStats::default())
 }
 
 fn choose_work_item_title_with_stats(
     spans: &[SpanContext],
     bucket_label_stats: &BucketLabelStats,
 ) -> String {
+    let primary_candidates = collect_primary_title_candidates(spans);
+    if primary_title_candidates_are_sufficient(&primary_candidates) {
+        if let Some(title) = best_title_from_candidates(&primary_candidates, bucket_label_stats) {
+            return title;
+        }
+    }
+    let ordered_candidates = collect_title_candidates(spans);
+    if let Some(title) = best_title_from_candidates(&ordered_candidates, bucket_label_stats) {
+        return title;
+    }
+    for context in spans {
+        let Some(branch_family) = context.span.branch_family.as_deref() else {
+            continue;
+        };
+        let Some(title) = humanize_branch_family(branch_family) else {
+            continue;
+        };
+        if !task_title_is_generic(Some(title.as_str()))
+            && !task_title_is_weak_signal(Some(title.as_str()))
+        {
+            return title;
+        }
+    }
+    if let Some(title) = choose_relaxed_work_item_title_with_stats(spans, bucket_label_stats) {
+        return title;
+    }
+    "Unresolved work item".to_string()
+}
+
+fn primary_title_candidates_are_sufficient(candidates: &[TitleCandidate]) -> bool {
+    candidates.iter().any(|candidate| {
+        matches!(
+            candidate.span_title_origin,
+            Some(
+                SpanTitleOrigin::UserPrompt
+                    | SpanTitleOrigin::SummaryDerived
+                    | SpanTitleOrigin::TodoDerived
+            )
+        ) && candidate.signal_score > 0
+    })
+}
+
+fn best_title_from_candidates(
+    ordered_candidates: &[TitleCandidate],
+    bucket_label_stats: &BucketLabelStats,
+) -> Option<String> {
     let mut best_title = None::<String>;
     let mut best_score = i32::MIN;
     let mut frequencies = HashMap::<String, usize>::new();
     let mut topic_frequencies = HashMap::<String, usize>::new();
     let mut source_support = HashMap::<String, BTreeSet<TitleCandidateSource>>::new();
-    let ordered_candidates = collect_title_candidates(spans);
 
-    for candidate in &ordered_candidates {
+    for candidate in ordered_candidates {
         *frequencies.entry(candidate.normalized.clone()).or_default() += 1;
         for token in &candidate.topic_tokens {
             *topic_frequencies.entry(token.clone()).or_default() += 1;
@@ -1984,7 +2819,7 @@ fn choose_work_item_title_with_stats(
             .insert(candidate.source);
     }
 
-    for candidate in &ordered_candidates {
+    for candidate in ordered_candidates {
         let frequency = frequencies.get(&candidate.normalized).copied().unwrap_or(1);
         let topic_overlap = candidate
             .topic_tokens
@@ -2004,7 +2839,7 @@ fn choose_work_item_title_with_stats(
             source_support
                 .get(&candidate.normalized)
                 .map_or(1, BTreeSet::len),
-            &ordered_candidates,
+            ordered_candidates,
             &frequencies,
             bucket_label_stats,
         );
@@ -2015,22 +2850,9 @@ fn choose_work_item_title_with_stats(
     }
 
     if let Some(title) = best_title {
-        return title;
+        return Some(title);
     }
-    for context in spans {
-        let Some(branch_family) = context.span.branch_family.as_deref() else {
-            continue;
-        };
-        let Some(title) = humanize_branch_family(branch_family) else {
-            continue;
-        };
-        if !task_title_is_generic(Some(title.as_str()))
-            && !task_title_is_weak_signal(Some(title.as_str()))
-        {
-            return title;
-        }
-    }
-    "Unresolved work item".to_string()
+    None
 }
 
 fn title_candidate_score(
@@ -2043,8 +2865,7 @@ fn title_candidate_score(
     bucket_label_stats: &BucketLabelStats,
 ) -> i32 {
     let title = candidate.title.as_str();
-    let normalized = normalize_task_title(title);
-    let token_count = normalized.split_whitespace().count();
+    let token_count = candidate.normalized.split_whitespace().count();
     let length = title.chars().count();
     let lowercase = title.to_ascii_lowercase();
     let digit_count = title
@@ -2126,12 +2947,13 @@ fn title_candidate_score(
     }
 
     score -= code_penalties * 5;
-    score += task_title_signal_score(Some(title)) * 2;
+    score += candidate.signal_score * 2;
     score += task_title_corpus_specificity_score(title, bucket_label_stats) * 2;
     score += task_title_corpus_phraseness_score(candidate, bucket_label_stats);
     score -= title_candidate_completeness_penalty(candidate, ordered_candidates, frequencies);
-    score += title_candidate_source_bonus(candidate.source, source_support_count);
+    score += title_candidate_source_bonus(candidate, source_support_count);
     score += title_candidate_context_score(candidate, topic_overlap);
+    score += title_candidate_position_bonus(candidate);
     if code_penalties == 0 && (source_support_count > 1 || topic_overlap > 0) {
         score += (frequency.saturating_sub(1).min(2) as i32) * 2;
     }
@@ -2150,6 +2972,17 @@ fn title_candidate_score(
         && task_title_corpus_specificity_score(title, bucket_label_stats) <= 0
     {
         score -= 6;
+    }
+    if matches!(
+        candidate.span_title_origin,
+        Some(SpanTitleOrigin::ThreadName | SpanTitleOrigin::SessionTitleWeak)
+    ) && source_support_count == 1
+        && topic_overlap == 0
+    {
+        score -= 10;
+    }
+    if matches!(candidate.span_title_origin, Some(SpanTitleOrigin::Default)) {
+        score -= 10;
     }
 
     score
@@ -2240,13 +3073,30 @@ fn task_title_corpus_phraseness_score(
         .round() as i32
 }
 
-fn title_candidate_source_bonus(source: TitleCandidateSource, source_support_count: usize) -> i32 {
-    let source_bonus = match source {
-        TitleCandidateSource::SpanTitle => 0,
-        TitleCandidateSource::SummaryPreview => 4,
-        TitleCandidateSource::TodoExcerpt => 5,
+fn title_candidate_source_bonus(candidate: &TitleCandidate, source_support_count: usize) -> i32 {
+    let source_bonus = match candidate.source {
+        TitleCandidateSource::SpanTitle => match candidate.span_title_origin {
+            Some(SpanTitleOrigin::UserPrompt) => 6,
+            Some(SpanTitleOrigin::SummaryDerived) => 5,
+            Some(SpanTitleOrigin::TodoDerived) => 6,
+            Some(SpanTitleOrigin::ThreadName) => -4,
+            Some(SpanTitleOrigin::SessionTitle) => -2,
+            Some(SpanTitleOrigin::SessionTitleWeak) => -5,
+            Some(SpanTitleOrigin::Default) => -8,
+            Some(SpanTitleOrigin::Other) | None => 0,
+        },
+        TitleCandidateSource::SummaryPreview => 5,
+        TitleCandidateSource::TodoExcerpt => 6,
     };
     source_bonus + ((source_support_count.saturating_sub(1).min(2) as i32) * 2)
+}
+
+fn title_candidate_position_bonus(candidate: &TitleCandidate) -> i32 {
+    match candidate.span_index {
+        0 => 2,
+        1 => 1,
+        _ => 0,
+    }
 }
 
 fn title_candidate_context_score(candidate: &TitleCandidate, topic_overlap: usize) -> i32 {
@@ -2311,21 +3161,44 @@ fn title_candidate_completeness_penalty(
 
 fn collect_title_candidates(spans: &[SpanContext]) -> Vec<TitleCandidate> {
     let mut candidates = Vec::<TitleCandidate>::new();
-    for context in spans {
+    for (span_index, context) in spans.iter().enumerate() {
         push_title_candidate(
             &mut candidates,
             Some(context.span.title.as_str()),
             TitleCandidateSource::SpanTitle,
+            context.span.title_source.as_deref(),
+            span_index,
         );
+        if !span_title_needs_fallback_candidates(context) {
+            continue;
+        }
         push_title_candidate(
             &mut candidates,
             context.span.summary_preview.as_deref(),
             TitleCandidateSource::SummaryPreview,
+            None,
+            span_index,
         );
         push_title_candidate(
             &mut candidates,
             context.span.todo_excerpt.as_deref(),
             TitleCandidateSource::TodoExcerpt,
+            None,
+            span_index,
+        );
+    }
+    candidates
+}
+
+fn collect_primary_title_candidates(spans: &[SpanContext]) -> Vec<TitleCandidate> {
+    let mut candidates = Vec::<TitleCandidate>::new();
+    for (span_index, context) in spans.iter().enumerate() {
+        push_title_candidate(
+            &mut candidates,
+            Some(context.span.title.as_str()),
+            TitleCandidateSource::SpanTitle,
+            context.span.title_source.as_deref(),
+            span_index,
         );
     }
     candidates
@@ -2335,8 +3208,10 @@ fn push_title_candidate(
     candidates: &mut Vec<TitleCandidate>,
     raw: Option<&str>,
     source: TitleCandidateSource,
+    title_source: Option<&str>,
+    span_index: usize,
 ) {
-    let Some(title) = task_title_from_prompt(raw) else {
+    let Some(title) = materialize_title_candidate(raw, source) else {
         return;
     };
     if task_title_is_generic(Some(title.as_str()))
@@ -2348,13 +3223,169 @@ fn push_title_candidate(
     if normalized.is_empty() {
         return;
     }
+    let signal_score = task_title_signal_score(Some(title.as_str()));
     let topic_tokens = title_topic_tokens(&title).into_iter().collect::<Vec<_>>();
     candidates.push(TitleCandidate {
         title,
         normalized,
+        signal_score,
         source,
+        span_title_origin: span_title_origin(source, title_source),
+        span_index,
         topic_tokens,
     });
+}
+
+fn choose_relaxed_work_item_title_with_stats(
+    spans: &[SpanContext],
+    bucket_label_stats: &BucketLabelStats,
+) -> Option<String> {
+    let ordered_candidates = collect_relaxed_title_candidates(spans);
+    let best_title = best_title_from_candidates(&ordered_candidates, bucket_label_stats)?;
+    (task_title_signal_score(Some(best_title.as_str())) > -6).then_some(best_title)
+}
+
+fn collect_relaxed_title_candidates(spans: &[SpanContext]) -> Vec<TitleCandidate> {
+    let mut candidates = Vec::<TitleCandidate>::new();
+    for (span_index, context) in spans.iter().enumerate() {
+        push_relaxed_title_candidate(
+            &mut candidates,
+            Some(context.span.title.as_str()),
+            TitleCandidateSource::SpanTitle,
+            context.span.title_source.as_deref(),
+            span_index,
+        );
+        if !span_title_needs_fallback_candidates(context) {
+            continue;
+        }
+        push_relaxed_title_candidate(
+            &mut candidates,
+            context.span.summary_preview.as_deref(),
+            TitleCandidateSource::SummaryPreview,
+            None,
+            span_index,
+        );
+        push_relaxed_title_candidate(
+            &mut candidates,
+            context.span.todo_excerpt.as_deref(),
+            TitleCandidateSource::TodoExcerpt,
+            None,
+            span_index,
+        );
+    }
+    candidates
+}
+
+fn push_relaxed_title_candidate(
+    candidates: &mut Vec<TitleCandidate>,
+    raw: Option<&str>,
+    source: TitleCandidateSource,
+    title_source: Option<&str>,
+    span_index: usize,
+) {
+    if materialize_title_candidate(raw, source).is_some() {
+        return;
+    }
+    let Some(title) = raw.and_then(|value| summarize_task_text(Some(value), 90)) else {
+        return;
+    };
+    if task_title_is_session_meta(Some(title.as_str())) {
+        return;
+    }
+    if !relaxed_candidate_looks_contentful(title.as_str()) {
+        return;
+    }
+    let normalized = normalize_task_title(&title);
+    if normalized.is_empty() {
+        return;
+    }
+    let topic_tokens = title_topic_tokens(&title).into_iter().collect::<Vec<_>>();
+    if topic_tokens.is_empty() && task_title_signal_score(Some(title.as_str())) < 0 {
+        return;
+    }
+    let signal_score = task_title_signal_score(Some(title.as_str()));
+    candidates.push(TitleCandidate {
+        title,
+        normalized,
+        signal_score,
+        source,
+        span_title_origin: span_title_origin(source, title_source),
+        span_index,
+        topic_tokens,
+    });
+}
+
+fn relaxed_candidate_looks_contentful(title: &str) -> bool {
+    if task_title_is_generic(Some(title)) || task_title_is_weak_signal(Some(title)) {
+        return false;
+    }
+    let signal_score = task_title_signal_score(Some(title));
+    if signal_score <= 0 {
+        return false;
+    }
+    let alpha_count = title
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .count();
+    let digit_count = title
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .count();
+    let topic_token_count = title_topic_tokens(title).len();
+    alpha_count > digit_count && (2..=8).contains(&topic_token_count)
+}
+
+fn span_title_needs_fallback_candidates(context: &SpanContext) -> bool {
+    if context.title_is_generic()
+        || context.title_is_weak_signal()
+        || context.title_signal_score() < 8
+    {
+        return true;
+    }
+    !matches!(
+        span_title_origin(
+            TitleCandidateSource::SpanTitle,
+            context.span.title_source.as_deref()
+        ),
+        Some(
+            SpanTitleOrigin::UserPrompt
+                | SpanTitleOrigin::SummaryDerived
+                | SpanTitleOrigin::TodoDerived
+        )
+    )
+}
+
+fn materialize_title_candidate(raw: Option<&str>, source: TitleCandidateSource) -> Option<String> {
+    match source {
+        TitleCandidateSource::SpanTitle => raw
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        TitleCandidateSource::SummaryPreview | TitleCandidateSource::TodoExcerpt => {
+            task_title_from_prompt(raw)
+        }
+    }
+}
+
+fn span_title_origin(
+    source: TitleCandidateSource,
+    title_source: Option<&str>,
+) -> Option<SpanTitleOrigin> {
+    if !matches!(source, TitleCandidateSource::SpanTitle) {
+        return None;
+    }
+    Some(match title_source.unwrap_or_default() {
+        "user_prompt" => SpanTitleOrigin::UserPrompt,
+        "thread_name" => SpanTitleOrigin::ThreadName,
+        "session_title" => SpanTitleOrigin::SessionTitle,
+        "session_title_weak" => SpanTitleOrigin::SessionTitleWeak,
+        "summary" | "summary_diffs" | "generated_title" | "session_summary" => {
+            SpanTitleOrigin::SummaryDerived
+        }
+        "todo_excerpt" => SpanTitleOrigin::TodoDerived,
+        "default" => SpanTitleOrigin::Default,
+        _ => SpanTitleOrigin::Other,
+    })
 }
 
 fn looks_like_opaque_candidate_token(token: &str) -> bool {
@@ -2452,6 +3483,10 @@ fn bool_to_i64(value: bool) -> i64 {
     }
 }
 
+fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2463,39 +3498,51 @@ mod tests {
         summary_preview: Option<&str>,
         branch_family: Option<&str>,
     ) -> SpanContext {
-        SpanContext {
-            span: TaskSpan {
-                schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
-                span_id: TaskSpanId("span_test".to_string()),
-                provider: "codex".to_string(),
-                source_id: SourceId("source_test".to_string()),
-                span_kind: "codex_task".to_string(),
-                source_record_id: None,
-                source_file_path_hash: None,
-                summary_id: None,
-                session_id: Some("session".to_string()),
-                thread_id: None,
-                title: title.to_string(),
-                normalized_title: normalize_task_title(title),
-                title_source: Some("test".to_string()),
-                summary_preview: summary_preview.map(ToOwned::to_owned),
-                todo_excerpt: None,
-                issue_keys: Vec::new(),
-                branch_family: branch_family.map(ToOwned::to_owned),
-                project_bucket: "bucket".to_string(),
-                project: None,
-                git: None,
-                usage: UsageCounts::default(),
-                estimated_cost_usd: None,
-                linked_event_ids: Vec::new(),
-                confidence: Confidence::Medium,
-                is_meta: task_title_is_generic(Some(title)),
-                started_at: Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap(),
-                ended_at: Some(Utc.with_ymd_and_hms(2026, 6, 30, 12, 5, 0).unwrap()),
-                duration_seconds: Some(300),
-            },
-            linked_events: Vec::new(),
-        }
+        test_span_with_title_source(title, summary_preview, branch_family, "test")
+    }
+
+    fn test_span_with_title_source(
+        title: &str,
+        summary_preview: Option<&str>,
+        branch_family: Option<&str>,
+        title_source: &str,
+    ) -> SpanContext {
+        SpanContext::from(TaskSpan {
+            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+            span_id: TaskSpanId("span_test".to_string()),
+            provider: "codex".to_string(),
+            source_id: SourceId("source_test".to_string()),
+            span_kind: "codex_task".to_string(),
+            source_record_id: None,
+            source_file_path_hash: None,
+            summary_id: None,
+            session_id: Some("session".to_string()),
+            thread_id: None,
+            title: title.to_string(),
+            normalized_title: normalize_task_title(title),
+            title_source: Some(title_source.to_string()),
+            summary_preview: summary_preview.map(ToOwned::to_owned),
+            todo_excerpt: None,
+            issue_keys: Vec::new(),
+            branch_family: branch_family.map(ToOwned::to_owned),
+            project_bucket: "bucket".to_string(),
+            project: None,
+            git: None,
+            usage: UsageCounts::default(),
+            estimated_cost_usd: None,
+            event_count: 0,
+            has_usage_evidence: false,
+            total_messages: 0,
+            user_messages: 0,
+            assistant_messages: 0,
+            developer_messages: 0,
+            linked_event_ids: Vec::new(),
+            confidence: Confidence::Medium,
+            is_meta: task_title_is_generic(Some(title)),
+            started_at: Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap(),
+            ended_at: Some(Utc.with_ymd_and_hms(2026, 6, 30, 12, 5, 0).unwrap()),
+            duration_seconds: Some(300),
+        })
     }
 
     fn test_span_with_options(
@@ -2507,116 +3554,42 @@ mod tests {
         title: &str,
         summary_preview: Option<&str>,
     ) -> SpanContext {
-        SpanContext {
-            span: TaskSpan {
-                schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
-                span_id: TaskSpanId(span_id.to_string()),
-                provider: provider.to_string(),
-                source_id: SourceId(format!("source_{provider}")),
-                span_kind: "task".to_string(),
-                source_record_id: None,
-                source_file_path_hash: None,
-                summary_id: None,
-                session_id: session_id.map(ToOwned::to_owned),
-                thread_id: None,
-                title: title.to_string(),
-                normalized_title: normalize_task_title(title),
-                title_source: Some("test".to_string()),
-                summary_preview: summary_preview.map(ToOwned::to_owned),
-                todo_excerpt: None,
-                issue_keys: Vec::new(),
-                branch_family: None,
-                project_bucket: project_bucket.to_string(),
-                project: None,
-                git: None,
-                usage: UsageCounts::default(),
-                estimated_cost_usd: None,
-                linked_event_ids: Vec::new(),
-                confidence: Confidence::Medium,
-                is_meta: task_title_is_generic(Some(title)),
-                started_at,
-                ended_at: Some(started_at + chrono::Duration::minutes(5)),
-                duration_seconds: Some(300),
-            },
-            linked_events: Vec::new(),
-        }
-    }
-
-    fn test_usage_event_with_message_counts(
-        event_id: &str,
-        provider: &str,
-        session_id: &str,
-        started_at: DateTime<Utc>,
-        total_messages: u64,
-        user_messages: u64,
-        assistant_messages: u64,
-    ) -> UsageEvent {
-        UsageEvent {
-            schema_version: statsai_core::USAGE_EVENT_SCHEMA_VERSION.to_string(),
-            event_id: EventId(event_id.to_string()),
-            device_id: "device".to_string(),
+        SpanContext::from(TaskSpan {
+            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+            span_id: TaskSpanId(span_id.to_string()),
             provider: provider.to_string(),
             source_id: SourceId(format!("source_{provider}")),
-            provider_account_id: None,
-            subscription_id: None,
-            source: statsai_core::EventSource {
-                adapter_id: "test".to_string(),
-                adapter_version: "0".to_string(),
-                source_kind: statsai_core::SourceKind::LocalAdapter,
-                location_origin: Some(statsai_core::LocationOrigin::Configured),
-                source_type: "jsonl".to_string(),
-                source_path_hash: None,
-                source_record_id: Some(event_id.to_string()),
-                parse_confidence: Confidence::High,
-            },
-            session: statsai_core::SessionInfo {
-                session_id: session_id.to_string(),
-                local_session_id_hash: Some(session_id.to_string()),
-                title: None,
-                started_at,
-                ended_at: Some(started_at + chrono::Duration::minutes(5)),
-                duration_seconds: Some(300),
-            },
-            model: None,
-            usage: UsageCounts {
-                input_tokens: Some(12),
-                output_tokens: Some(3),
-                total_tokens: Some(15),
-                ..UsageCounts::default()
-            },
-            runtime: Some(statsai_core::RuntimeInfo {
-                runtime_name: None,
-                host_id: None,
-                latency_ms: Some(1_000),
-                latency_source: Some(statsai_core::LatencySource::Explicit),
-                time_to_first_token_ms: None,
-                prompt_eval_duration_ms: None,
-                eval_duration_ms: None,
-                total_messages: Some(total_messages),
-                user_messages: Some(user_messages),
-                assistant_messages: Some(assistant_messages),
-                developer_messages: Some(0),
-            }),
-            cost: statsai_core::CostInfo {
-                currency: "USD".to_string(),
-                estimated_api_equivalent_usd: None,
-                provider_reported_usd: None,
-                pricing_source: Some("unknown".to_string()),
-                pricing_version: None,
-                confidence: Confidence::Low,
-            },
-            parse_evidence: None,
+            span_kind: "task".to_string(),
+            source_record_id: None,
+            source_file_path_hash: None,
+            summary_id: None,
+            session_id: session_id.map(ToOwned::to_owned),
+            thread_id: None,
+            title: title.to_string(),
+            normalized_title: normalize_task_title(title),
+            title_source: Some("test".to_string()),
+            summary_preview: summary_preview.map(ToOwned::to_owned),
+            todo_excerpt: None,
+            issue_keys: Vec::new(),
+            branch_family: None,
+            project_bucket: project_bucket.to_string(),
             project: None,
             git: None,
-            privacy: statsai_core::PrivacyInfo {
-                mode: statsai_core::PrivacyMode::MetadataOnly,
-                contains_prompt_text: false,
-                contains_response_text: false,
-                contains_file_paths: false,
-            },
-            created_at: started_at,
-            imported_at: started_at,
-        }
+            usage: UsageCounts::default(),
+            estimated_cost_usd: None,
+            event_count: 0,
+            has_usage_evidence: false,
+            total_messages: 0,
+            user_messages: 0,
+            assistant_messages: 0,
+            developer_messages: 0,
+            linked_event_ids: Vec::new(),
+            confidence: Confidence::Medium,
+            is_meta: task_title_is_generic(Some(title)),
+            started_at,
+            ended_at: Some(started_at + chrono::Duration::minutes(5)),
+            duration_seconds: Some(300),
+        })
     }
 
     fn test_work_item(
@@ -2788,6 +3761,25 @@ mod tests {
     }
 
     #[test]
+    fn prompt_summary_beats_weak_thread_name_span_title() {
+        let title = choose_work_item_title(&[
+            test_span_with_title_source(
+                "This is NOT the framework you know",
+                Some("Implement device renaming on web and api"),
+                None,
+                "thread_name",
+            ),
+            test_span_with_title_source(
+                "This is NOT the framework you know",
+                Some("Implement device renaming on web and api"),
+                None,
+                "thread_name",
+            ),
+        ]);
+        assert_eq!(title, "Implement device renaming on web and api");
+    }
+
+    #[test]
     fn presentational_code_review_wrapper_without_payload_falls_back_to_unresolved() {
         let title = choose_work_item_title(&[
             test_span("Here is code review", Some("Here is code review"), None),
@@ -2814,7 +3806,7 @@ mod tests {
     }
 
     #[test]
-    fn corpus_specificity_penalizes_repeated_banner_titles() {
+    fn release_path_ignores_bucket_corpus_specificity_stats() {
         let started_at = Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap();
         let repeated_groups = (0..5)
             .map(|index| PendingGroup {
@@ -2850,12 +3842,16 @@ mod tests {
         groups.push(unique_group);
         let stats = build_bucket_label_stats(&groups);
 
-        assert!(
-            task_title_corpus_specificity_score("This is NOT the framework you know", &stats)
-                < task_title_corpus_specificity_score(
-                    "Implement task verification workflow",
-                    &stats,
-                )
+        assert_eq!(stats.document_count, 0);
+        assert!(stats.title_document_frequency.is_empty());
+        assert!(stats.token_document_frequency.is_empty());
+        assert_eq!(
+            task_title_corpus_specificity_score("This is NOT the framework you know", &stats),
+            0
+        );
+        assert_eq!(
+            task_title_corpus_specificity_score("Implement task verification workflow", &stats),
+            0
         );
     }
 
@@ -3025,6 +4021,23 @@ mod tests {
     }
 
     #[test]
+    fn progress_output_cluster_falls_back_to_unresolved() {
+        let title = choose_work_item_title(&[
+            test_span(
+                "[DEBUG] ChapterLlamaBoundaryFinder: Wrote stage1 transcript to /tmp/stage1.txt",
+                Some("[DEBUG] ChapterLlamaBoundaryFinder: Wrote stage1 transcript to /tmp/stage1.txt"),
+                None,
+            ),
+            test_span(
+                "Generating train split: 10 examples [00:00, 674.63 examples/s]",
+                Some("Generating train split: 10 examples [00:00, 674.63 examples/s]"),
+                None,
+            ),
+        ]);
+        assert_eq!(title, "Unresolved work item");
+    }
+
+    #[test]
     fn metric_only_cluster_falls_back_to_unresolved() {
         let title = choose_work_item_title(&[
             test_span(
@@ -3067,10 +4080,121 @@ mod tests {
             ),
         ];
 
-        let (work_items, members) = build_work_items(contexts, &[]);
+        let (work_items, members, _) = build_work_items(contexts, &[]);
         assert_eq!(work_items.len(), 1);
         assert_eq!(members.len(), 2);
         assert_eq!(work_items[0].span_count, 2);
+    }
+
+    #[test]
+    fn two_span_same_session_topic_shift_splits_without_distribution_stats() {
+        let started_at = Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap();
+        let contexts = vec![
+            test_span_with_options(
+                "span-a",
+                "codex",
+                Some("session-a"),
+                "bucket-a",
+                started_at,
+                "Investigate SQLite migration failure in local task store",
+                Some("Analyze sqlite migration failure and schema upgrade rollback behavior"),
+            ),
+            test_span_with_options(
+                "span-b",
+                "codex",
+                Some("session-a"),
+                "bucket-a",
+                started_at + chrono::Duration::minutes(18),
+                "Design benchmark export dashboard for task review",
+                Some("Plan benchmark export dashboard metrics and review workflow"),
+            ),
+        ];
+
+        let (work_items, members, _) = build_work_items(contexts, &[]);
+        assert_eq!(work_items.len(), 2);
+        assert_eq!(members.len(), 2);
+        assert_eq!(work_items[0].span_count, 1);
+        assert_eq!(work_items[1].span_count, 1);
+    }
+
+    #[test]
+    fn same_session_topic_shift_splits_on_cohesion_boundary() {
+        let started_at = Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap();
+        let contexts = vec![
+            test_span_with_options(
+                "span-a",
+                "codex",
+                Some("session-a"),
+                "bucket-a",
+                started_at,
+                "Investigate SQLite migration failure in local task store",
+                Some("Analyze sqlite migration failure and schema upgrade rollback behavior"),
+            ),
+            test_span_with_options(
+                "span-b",
+                "codex",
+                Some("session-a"),
+                "bucket-a",
+                started_at + chrono::Duration::minutes(18),
+                "Design CLI task verification commands",
+                Some("Plan accept reject split merge task verification commands"),
+            ),
+            test_span_with_options(
+                "span-c",
+                "codex",
+                Some("session-a"),
+                "bucket-a",
+                started_at + chrono::Duration::minutes(31),
+                "Implement CLI task verification commands",
+                Some("Implement accept reject split merge task verification output"),
+            ),
+        ];
+
+        let (work_items, members, _) = build_work_items(contexts, &[]);
+        assert_eq!(work_items.len(), 2);
+        assert_eq!(members.len(), 3);
+        assert_eq!(work_items[0].span_count, 1);
+        assert_eq!(work_items[1].span_count, 2);
+    }
+
+    #[test]
+    fn shared_issue_key_overrides_same_session_topic_boundary() {
+        let started_at = Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap();
+        let mut span_a = test_span_with_options(
+            "span-a",
+            "codex",
+            Some("session-a"),
+            "bucket-a",
+            started_at,
+            "Stabilize menubar wake handling",
+            Some("Fix tray wake handling and sleep resume edge cases"),
+        );
+        span_a.span.issue_keys = vec!["OPS-42".to_string()];
+        let mut span_b = test_span_with_options(
+            "span-b",
+            "codex",
+            Some("session-a"),
+            "bucket-a",
+            started_at + chrono::Duration::minutes(18),
+            "Design benchmark JSON export gate",
+            Some("Plan benchmark json export schema and gate metrics"),
+        );
+        span_b.span.issue_keys = vec!["OPS-42".to_string()];
+        let mut span_c = test_span_with_options(
+            "span-c",
+            "codex",
+            Some("session-a"),
+            "bucket-a",
+            started_at + chrono::Duration::minutes(30),
+            "Implement benchmark JSON export gate",
+            Some("Implement benchmark json export schema and gate metrics"),
+        );
+        span_c.span.issue_keys = vec!["OPS-42".to_string()];
+
+        let (work_items, members, _) = build_work_items(vec![span_a, span_b, span_c], &[]);
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(members.len(), 3);
+        assert_eq!(work_items[0].span_count, 3);
     }
 
     #[test]
@@ -3097,7 +4221,7 @@ mod tests {
             ),
         ];
 
-        let (work_items, members) = build_work_items(contexts, &[]);
+        let (work_items, members, _) = build_work_items(contexts, &[]);
         assert_eq!(work_items.len(), 2);
         assert_eq!(members.len(), 2);
     }
@@ -3126,7 +4250,7 @@ mod tests {
             ),
         ];
 
-        let (work_items, members) = build_work_items(contexts, &[]);
+        let (work_items, members, _) = build_work_items(contexts, &[]);
         assert_eq!(work_items.len(), 2);
         assert_eq!(members.len(), 2);
     }
@@ -3144,7 +4268,7 @@ mod tests {
             Some("Implement local task collection"),
         )];
 
-        let (work_items, members) = build_work_items(contexts, &[]);
+        let (work_items, members, _) = build_work_items(contexts, &[]);
         assert_eq!(work_items.len(), 1);
         assert_eq!(members.len(), 1);
         assert_eq!(work_items[0].title, "Implement local task collection");
@@ -3176,7 +4300,7 @@ mod tests {
             ),
         ];
 
-        let (work_items, members) = build_work_items(contexts, &[]);
+        let (work_items, members, _) = build_work_items(contexts, &[]);
         assert_eq!(work_items.len(), 1);
         assert_eq!(members.len(), 2);
         assert!(work_items[0].cross_provider);
@@ -3203,7 +4327,7 @@ mod tests {
             ..UsageCounts::default()
         };
 
-        let (work_items, members) = build_work_items(vec![context], &[]);
+        let (work_items, members, _) = build_work_items(vec![context], &[]);
         assert_eq!(work_items.len(), 1);
         assert_eq!(members.len(), 1);
         assert_eq!(work_items[0].status, TaskStatus::Auto);
@@ -3215,7 +4339,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_banner_titles_with_real_usage_need_review() {
+    fn repeated_banner_titles_with_real_usage_do_not_merge() {
         let started_at = Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap();
         let mut contexts = Vec::new();
         for index in 0..5 {
@@ -3231,32 +4355,27 @@ mod tests {
             );
             context.span.project = Some(test_git_project("main"));
             context.span.linked_event_ids = vec![EventId(format!("event-banner-{index}"))];
+            context.span.event_count = 1;
+            context.span.has_usage_evidence = true;
+            context.span.total_messages = 8;
+            context.span.user_messages = 3;
+            context.span.assistant_messages = 3;
             context.span.usage = UsageCounts {
                 input_tokens: Some(100),
                 output_tokens: Some(20),
                 ..UsageCounts::default()
             };
-            context
-                .linked_events
-                .push(test_usage_event_with_message_counts(
-                    &format!("event-banner-{index}"),
-                    "codex",
-                    &format!("session-banner-{index}"),
-                    timestamp,
-                    8,
-                    3,
-                    3,
-                ));
             contexts.push(context);
         }
 
-        let (work_items, members) = build_work_items(contexts, &[]);
+        let (work_items, members, _) = build_work_items(contexts, &[]);
         assert_eq!(work_items.len(), 5);
         assert_eq!(members.len(), 5);
+        assert!(work_items.iter().all(|item| item.span_count == 1));
         assert!(work_items
             .iter()
-            .all(|item| item.status == TaskStatus::NeedsReview));
-        assert!(work_items.iter().all(|item| item
+            .all(|item| item.title == "This is NOT the framework you know"));
+        assert!(work_items.iter().all(|item| !item
             .review_reasons
             .contains(&"low_specificity_title".to_string())));
     }
@@ -3275,7 +4394,7 @@ mod tests {
         );
         context.span.project = Some(test_git_project("main"));
 
-        let (work_items, members) = build_work_items(vec![context], &[]);
+        let (work_items, members, _) = build_work_items(vec![context], &[]);
         assert_eq!(work_items.len(), 1);
         assert_eq!(members.len(), 1);
         assert_eq!(work_items[0].status, TaskStatus::NeedsReview);
@@ -3302,7 +4421,7 @@ mod tests {
         );
         context.span.project = Some(test_git_project("main"));
 
-        let (work_items, members) = build_work_items(vec![context], &[]);
+        let (work_items, members, _) = build_work_items(vec![context], &[]);
         assert_eq!(work_items.len(), 1);
         assert_eq!(members.len(), 1);
         assert_eq!(work_items[0].status, TaskStatus::RejectedMeta);
@@ -3326,19 +4445,13 @@ mod tests {
             Some("Say hi, nothing else"),
         );
         context.span.linked_event_ids = vec![EventId("event-a".to_string())];
-        context
-            .linked_events
-            .push(test_usage_event_with_message_counts(
-                "event-a",
-                "codex",
-                "session-a",
-                started_at,
-                2,
-                1,
-                1,
-            ));
+        context.span.event_count = 1;
+        context.span.has_usage_evidence = true;
+        context.span.total_messages = 2;
+        context.span.user_messages = 1;
+        context.span.assistant_messages = 1;
 
-        let (work_items, members) = build_work_items(vec![context], &[]);
+        let (work_items, members, _) = build_work_items(vec![context], &[]);
         assert_eq!(work_items.len(), 1);
         assert_eq!(members.len(), 1);
         assert_eq!(work_items[0].status, TaskStatus::RejectedMeta);
@@ -3361,17 +4474,11 @@ mod tests {
             Some("Say hi, nothing else"),
         );
         morning.span.linked_event_ids = vec![EventId("event-a".to_string())];
-        morning
-            .linked_events
-            .push(test_usage_event_with_message_counts(
-                "event-a",
-                "codex",
-                "quota-session",
-                started_at,
-                2,
-                1,
-                1,
-            ));
+        morning.span.event_count = 1;
+        morning.span.has_usage_evidence = true;
+        morning.span.total_messages = 2;
+        morning.span.user_messages = 1;
+        morning.span.assistant_messages = 1;
 
         let mut lunch = test_span_with_options(
             "span-b",
@@ -3383,17 +4490,11 @@ mod tests {
             Some("Say hi, nothing else"),
         );
         lunch.span.linked_event_ids = vec![EventId("event-b".to_string())];
-        lunch
-            .linked_events
-            .push(test_usage_event_with_message_counts(
-                "event-b",
-                "codex",
-                "quota-session",
-                started_at + chrono::Duration::hours(4),
-                2,
-                1,
-                1,
-            ));
+        lunch.span.event_count = 1;
+        lunch.span.has_usage_evidence = true;
+        lunch.span.total_messages = 2;
+        lunch.span.user_messages = 1;
+        lunch.span.assistant_messages = 1;
 
         let mut evening = test_span_with_options(
             "span-c",
@@ -3405,19 +4506,13 @@ mod tests {
             Some("Say hi, nothing else"),
         );
         evening.span.linked_event_ids = vec![EventId("event-c".to_string())];
-        evening
-            .linked_events
-            .push(test_usage_event_with_message_counts(
-                "event-c",
-                "codex",
-                "quota-session",
-                started_at + chrono::Duration::hours(8),
-                2,
-                1,
-                1,
-            ));
+        evening.span.event_count = 1;
+        evening.span.has_usage_evidence = true;
+        evening.span.total_messages = 2;
+        evening.span.user_messages = 1;
+        evening.span.assistant_messages = 1;
 
-        let (work_items, members) = build_work_items(vec![morning, lunch, evening], &[]);
+        let (work_items, members, _) = build_work_items(vec![morning, lunch, evening], &[]);
         assert_eq!(work_items.len(), 1);
         assert_eq!(members.len(), 3);
         assert_eq!(work_items[0].status, TaskStatus::RejectedMeta);
