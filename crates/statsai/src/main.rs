@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
 use statsai_adapters::VerifiedSubscriptionState;
@@ -13,11 +13,13 @@ use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
     normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
     project_contains_file_paths, project_has_stable_identity, source_account_assignment_id,
-    source_id as statsai_source_id, subscription_id, timestamp_in_period, BillingPeriod,
+    source_id as statsai_source_id, subscription_id, timestamp_in_period, BillingPeriod, EventId,
     IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
     SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
     SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch,
-    UsageEvent, UsageReport, UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict, TaskVerification,
+    TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport, UsageSummary,
+    UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -33,15 +35,17 @@ use statsai_sdk::{
 #[cfg(test)]
 use statsai_store::apply_verified_source_state;
 use statsai_store::{
-    close_active_verified_source_linkages, effective_verified_source_state_is_missing,
-    find_existing_provider_account, has_active_verified_source_assignment,
-    reconcile_verified_source_state, upsert_provider_account, verified_source_state_hash,
-    ScanFileStateEntry, Store, SyncState, UpsertProviderAccountInput,
+    close_active_verified_source_linkages, derive_task_work_items,
+    effective_verified_source_state_is_missing, find_existing_provider_account,
+    has_active_verified_source_assignment, reconcile_verified_source_state,
+    upsert_provider_account, verified_source_state_hash, ScanFileStateEntry, Store, SyncState,
+    TaskRebuildReport, UpsertProviderAccountInput,
 };
 use statsai_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use statsai::{auth, default_device_id, default_store_path, service, snapshot};
 
@@ -50,6 +54,8 @@ const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
 const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 const HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE: usize = 90;
 const HTTP_ROLLUP_DAILY_ROLLUP_ROWS_PER_QUERY: usize = 7;
+const TASK_SYNC_SQL_MAX_ROWS_PER_CHUNK: usize = 200;
+const TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK: usize = 512 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -82,6 +88,8 @@ enum Command {
     Import(ImportCommand),
     #[command(about = "Export stored events as JSON")]
     Export(ExportCommand),
+    #[command(about = "Review and rebuild local work items")]
+    Task(TaskCommand),
     #[command(about = "Export a sync batch to a sink")]
     Sync(SyncCommand),
     #[command(about = "Print JSON schemas for backend-facing contracts")]
@@ -168,6 +176,108 @@ struct ScanCommand {
 struct ReportCommand {
     #[command(subcommand)]
     command: ReportSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct TaskCommand {
+    #[command(subcommand)]
+    command: TaskSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskSubcommand {
+    #[command(about = "List derived work items")]
+    List {
+        #[arg(long, help = "Optional provider filter")]
+        provider: Option<String>,
+        #[arg(long, help = "Optional status filter")]
+        status: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Show one derived work item")]
+    Show {
+        #[arg(help = "Work item identifier")]
+        work_item_id: String,
+        #[arg(long, help = "Include member spans and evidence")]
+        include_evidence: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Record manual verification constraints")]
+    Verify {
+        #[command(subcommand)]
+        command: TaskVerifySubcommand,
+    },
+    #[command(about = "Show local task collection stats")]
+    Stats {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Benchmark the current grouper against simple baselines")]
+    Benchmark {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Export local task spans or work items")]
+    Export {
+        #[arg(long, default_value = "work-item", help = "Export level")]
+        level: String,
+        #[arg(long, default_value = "json", help = "Export format")]
+        format: String,
+    },
+    #[command(about = "Rebuild derived work items from stored task spans")]
+    Rebuild {
+        #[arg(long, help = "Optional provider filter")]
+        provider: Option<String>,
+        #[arg(long, help = "Optional source identifier filter")]
+        source_id: Option<String>,
+        #[arg(long, help = "Rebuild every project bucket")]
+        all: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskVerifySubcommand {
+    #[command(about = "Accept the current grouping for a work item")]
+    Accept {
+        #[arg(help = "Work item identifier")]
+        work_item_id: String,
+    },
+    #[command(about = "Reject a work item as meta/system/noise")]
+    Reject {
+        #[arg(help = "Work item identifier")]
+        work_item_id: String,
+        #[arg(long, help = "Reject reason: meta, system, or noise")]
+        reason: String,
+    },
+    #[command(about = "Split a work item after a specific span")]
+    Split {
+        #[arg(help = "Work item identifier")]
+        work_item_id: String,
+        #[arg(long, help = "Split boundary after this span")]
+        after_span: String,
+        #[arg(long, help = "Optional title for the left work item")]
+        left_title: Option<String>,
+        #[arg(long, help = "Optional title for the right work item")]
+        right_title: Option<String>,
+    },
+    #[command(about = "Merge two work items")]
+    Merge {
+        #[arg(help = "Left work item identifier")]
+        left_work_item_id: String,
+        #[arg(help = "Right work item identifier")]
+        right_work_item_id: String,
+        #[arg(long, help = "Optional merged title override")]
+        title: Option<String>,
+    },
+    #[command(about = "Rename a work item")]
+    Rename {
+        #[arg(help = "Work item identifier")]
+        work_item_id: String,
+        #[arg(long, help = "Canonical title override")]
+        title: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -515,6 +625,11 @@ struct SyncCommand {
     yes: bool,
     #[arg(long, help = "Build the sync batch without writing")]
     dry_run: bool,
+    #[arg(
+        long,
+        help = "Include project metadata in synced usage payloads and enable hosted task sync"
+    )]
+    include_projects: bool,
 }
 
 #[derive(Debug, Args)]
@@ -525,7 +640,7 @@ struct SchemaCommand {
 
 #[derive(Debug, Subcommand)]
 enum SchemaSubcommand {
-    #[command(about = "Print the sync_batch.v1 JSON Schema")]
+    #[command(about = "Print the sync_batch.v2 JSON Schema")]
     SyncBatch,
 }
 
@@ -568,6 +683,7 @@ fn main() -> Result<()> {
                 Command::Subscription(command) => subscription(command, &store),
                 Command::Import(command) => import(command, &store, &device_id),
                 Command::Export(command) => export(command, &store),
+                Command::Task(command) => task(command, &store),
                 Command::Sync(command) => sync(command, &store, &device_id),
                 Command::Daemon(command) => daemon(command, store, &device_id),
                 Command::Status => status(&store),
@@ -623,17 +739,35 @@ fn scan_with_adapters(
     device_id: &str,
     adapters: Vec<Box<dyn ProviderAdapter>>,
 ) -> Result<()> {
+    let scan_started_at = Instant::now();
+    let mut preview_task_rebuild = PreviewTaskRebuild::default();
+    let mut preview_work_item_rebuild_count = 0u64;
     let mut event_count = 0u64;
     let mut summary_count = 0u64;
+    let mut task_span_count = 0u64;
     let mut inserted_count = 0u64;
     let mut summary_written_count = 0u64;
+    let mut task_span_written_count = 0u64;
     let mut removed_event_count = 0u64;
     let mut removed_summary_count = 0u64;
+    let mut removed_task_span_count = 0u64;
+    let mut rebuilt_work_item_count = 0u64;
     let mut total_sources = 0u64;
     let mut total_log_rows = 0u64;
     let mut total_diagnostics = ScanDiagnostics::default();
     let mut total_usage = UsageTotals::default();
     let mut total_summary_usage = UsageTotals::default();
+    let mut adapter_scan_duration_ms = 0u64;
+    let mut preview_rebuild_duration_ms = 0u64;
+    let mut delete_duration_ms = 0u64;
+    let mut insert_events_duration_ms = 0u64;
+    let mut upsert_summaries_duration_ms = 0u64;
+    let mut upsert_task_spans_duration_ms = 0u64;
+    let mut rebuild_work_items_duration_ms = 0u64;
+    let mut rebuild_work_item_report = TaskRebuildReport::default();
+    let mut pending_rebuild_project_buckets = BTreeSet::new();
+    let mut pending_rebuild_span_ids = BTreeSet::new();
+    let mut pending_deleted_task_spans = Vec::new();
 
     let configured_sources = store.list_sources()?;
 
@@ -710,7 +844,10 @@ fn scan_with_adapters(
                     && effective_verified_source_state_is_missing(&probed_verified_source_state)
                     && has_active_verified_source_assignment(store, &source.source_id)?;
             let mut scan = if should_run_adapter_scan {
-                adapter.scan(&source, &options)?
+                let started_at = Instant::now();
+                let scan = adapter.scan(&source, &options)?;
+                adapter_scan_duration_ms += started_at.elapsed().as_millis() as u64;
+                scan
             } else {
                 statsai_adapters::AdapterScan {
                     diagnostics: ScanDiagnostics {
@@ -744,9 +881,11 @@ fn scan_with_adapters(
             }
             let source_event_count = scan.events.len() as u64;
             let source_summary_count = scan.summaries.len() as u64;
+            let source_task_span_count = scan.task_spans.len() as u64;
             let has_scan_activity = touched_files
                 || source_event_count > 0
                 || source_summary_count > 0
+                || source_task_span_count > 0
                 || scan.diagnostics.files_scanned > 0
                 || scan.diagnostics.files_skipped_unchanged > 0
                 || log_rows > 0
@@ -756,6 +895,7 @@ fn scan_with_adapters(
                 && !command.explain
                 && source_event_count == 0
                 && source_summary_count == 0
+                && source_task_span_count == 0
                 && !touched_files
                 && !verified_state_changed
                 && !legacy_verified_state_needs_reconciliation;
@@ -768,6 +908,7 @@ fn scan_with_adapters(
             total_log_rows += log_rows;
             event_count += source_event_count;
             summary_count += source_summary_count;
+            task_span_count += source_task_span_count;
             total_usage.add_totals(&source_usage);
             total_summary_usage.add_totals(&source_summary_usage);
             add_diagnostics(&mut total_diagnostics, &scan.diagnostics);
@@ -777,15 +918,29 @@ fn scan_with_adapters(
             }
 
             if command.preview {
-                print_scan_preview_line(
-                    &source,
-                    source_event_count,
-                    &source_usage,
-                    source_summary_count,
-                    &source_summary_usage,
-                    &scan.diagnostics,
-                    command.verbose || command.explain,
-                );
+                let rebuild_started_at = Instant::now();
+                preview_work_item_rebuild_count += preview_task_rebuild.apply_source_changes(
+                    store,
+                    SourceTaskChangeSet {
+                        source_id: &source.source_id,
+                        replace_source_records,
+                        touched_files,
+                        pending_file_entries: &pending_file_entries,
+                        removed_file_entries: &removed_file_entries,
+                        task_spans: &scan.task_spans,
+                    },
+                )?;
+                preview_rebuild_duration_ms += rebuild_started_at.elapsed().as_millis() as u64;
+                print_scan_preview_line(ScanPreviewLine {
+                    source: &source,
+                    usage_events: source_event_count,
+                    usage: &source_usage,
+                    summaries: source_summary_count,
+                    task_spans: source_task_span_count,
+                    summary_usage: &source_summary_usage,
+                    diagnostics: &scan.diagnostics,
+                    verbose: command.verbose || command.explain,
+                });
                 continue;
             }
             reconcile_verified_source_state(
@@ -796,12 +951,26 @@ fn scan_with_adapters(
             )?;
             persist_source_after_preview(store, &source)?;
             apply_source_account_resolution(store, &source, &mut scan.events, &mut scan.summaries)?;
+            let mut affected_project_buckets = scan
+                .task_spans
+                .iter()
+                .map(|span| span.project_bucket.clone())
+                .collect::<BTreeSet<_>>();
             if replace_source_records {
+                let delete_started_at = Instant::now();
                 removed_event_count +=
                     store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
                 removed_summary_count +=
                     store.delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
+                let deleted_task_spans =
+                    store.delete_task_spans_for_sources(std::slice::from_ref(&source.source_id))?;
+                removed_task_span_count += deleted_task_spans.deleted;
+                affected_project_buckets
+                    .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
+                pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
+                delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
             } else if touched_files {
+                let delete_started_at = Instant::now();
                 let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
                     &pending_file_entries,
                     &removed_file_entries,
@@ -814,9 +983,49 @@ fn scan_with_adapters(
                     &source.source_id,
                     &reconciled_file_hashes,
                 )?;
+                let deleted_task_spans = store.delete_task_spans_for_source_file_hashes(
+                    &source.source_id,
+                    &reconciled_file_hashes,
+                )?;
+                removed_task_span_count += deleted_task_spans.deleted;
+                affected_project_buckets
+                    .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
+                pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
+                delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
             }
-            inserted_count += store.insert_events(&scan.events)?;
+            let insert_started_at = Instant::now();
+            let insert_result = store.insert_events_with_resolution(&scan.events)?;
+            inserted_count += insert_result.inserted;
+            insert_events_duration_ms += insert_started_at.elapsed().as_millis() as u64;
+            rewrite_task_span_linked_event_ids(
+                &mut scan.task_spans,
+                &insert_result.canonical_event_ids,
+            );
+            populate_task_span_rollups(
+                &mut scan.task_spans,
+                &scan.events,
+                &insert_result.canonical_event_ids,
+            );
+            let upsert_summaries_started_at = Instant::now();
             summary_written_count += store.upsert_summaries(&scan.summaries)?;
+            upsert_summaries_duration_ms +=
+                upsert_summaries_started_at.elapsed().as_millis() as u64;
+            let upsert_task_spans_started_at = Instant::now();
+            task_span_written_count += store.upsert_task_spans(&scan.task_spans)?;
+            upsert_task_spans_duration_ms +=
+                upsert_task_spans_started_at.elapsed().as_millis() as u64;
+            if !scan.task_spans.is_empty() {
+                pending_rebuild_project_buckets.extend(
+                    scan.task_spans
+                        .iter()
+                        .map(|span| span.project_bucket.clone()),
+                );
+                pending_rebuild_span_ids
+                    .extend(scan.task_spans.iter().map(|span| span.span_id.0.clone()));
+            }
+            if !affected_project_buckets.is_empty() {
+                pending_rebuild_project_buckets.extend(affected_project_buckets);
+            }
             let cache_entries_to_record = if replace_source_records || command.no_cache {
                 &file_cache_entries
             } else {
@@ -826,6 +1035,20 @@ fn scan_with_adapters(
             let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
             store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
         }
+    }
+
+    if !command.preview
+        && !pending_rebuild_project_buckets.is_empty()
+        && (!pending_rebuild_span_ids.is_empty() || !pending_deleted_task_spans.is_empty())
+    {
+        let rebuild_started_at = Instant::now();
+        rebuild_work_item_report = store.rebuild_task_work_items_for_changes_report(
+            &pending_rebuild_project_buckets,
+            &pending_rebuild_span_ids,
+            &pending_deleted_task_spans,
+        )?;
+        rebuilt_work_item_count += rebuild_work_item_report.work_items_rebuilt;
+        rebuild_work_items_duration_ms += rebuild_started_at.elapsed().as_millis() as u64;
     }
 
     if command.preview {
@@ -845,6 +1068,17 @@ fn scan_with_adapters(
                 format_cost(total_summary_usage.estimated_cost_usd),
                 format_u64(total_log_rows)
             );
+            println!(
+                "preview tasks: spans={} work_items_rebuilt={}",
+                format_u64(task_span_count),
+                format_u64(preview_work_item_rebuild_count)
+            );
+            println!(
+                "timings_ms: adapter_scan={} preview_rebuild={} total_wall={}",
+                format_u64(adapter_scan_duration_ms),
+                format_u64(preview_rebuild_duration_ms),
+                format_u64(scan_started_at.elapsed().as_millis() as u64)
+            );
             print_scan_diagnostics_total(&total_diagnostics);
         } else {
             println!(
@@ -861,15 +1095,23 @@ fn scan_with_adapters(
                 format_u64(total_summary_usage.total_tokens),
                 format_cost(total_summary_usage.estimated_cost_usd)
             );
+            println!(
+                "preview tasks: spans={} work_items_rebuilt={}",
+                format_u64(task_span_count),
+                format_u64(preview_work_item_rebuild_count)
+            );
         }
     } else {
         println!(
-            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={}",
+            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} task_spans={} task_spans_written={} work_items_rebuilt={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={}",
             format_u64(total_sources),
             format_u64(event_count),
             format_u64(inserted_count),
             format_u64(summary_count),
             format_u64(summary_written_count),
+            format_u64(task_span_count),
+            format_u64(task_span_written_count),
+            format_u64(rebuilt_work_item_count),
             format_u64(total_usage.input_tokens),
             format_u64(total_usage.cache_creation_tokens),
             format_u64(total_usage.cached_input_tokens),
@@ -880,16 +1122,140 @@ fn scan_with_adapters(
             format_cost(total_summary_usage.estimated_cost_usd),
             format_u64(total_log_rows)
         );
-        if command.replace || removed_event_count > 0 || removed_summary_count > 0 {
+        if command.replace
+            || removed_event_count > 0
+            || removed_summary_count > 0
+            || removed_task_span_count > 0
+        {
             println!(
-                "scan removed stale records: events={} summaries={}",
+                "scan removed stale records: events={} summaries={} task_spans={}",
                 format_u64(removed_event_count),
-                format_u64(removed_summary_count)
+                format_u64(removed_summary_count),
+                format_u64(removed_task_span_count)
+            );
+        }
+        if command.verbose {
+            println!(
+                "timings_ms: adapter_scan={} delete={} insert_events={} upsert_summaries={} upsert_task_spans={} rebuild_work_items={} rebuild_delete={} rebuild_span_load={} rebuild_verifications={} rebuild_grouping={} rebuild_title_selection={} rebuild_insert={} total_wall={}",
+                format_u64(adapter_scan_duration_ms),
+                format_u64(delete_duration_ms),
+                format_u64(insert_events_duration_ms),
+                format_u64(upsert_summaries_duration_ms),
+                format_u64(upsert_task_spans_duration_ms),
+                format_u64(rebuild_work_items_duration_ms),
+                format_u64(rebuild_work_item_report.timings.delete_ms),
+                format_u64(rebuild_work_item_report.timings.span_load_ms),
+                format_u64(rebuild_work_item_report.timings.verification_load_ms),
+                format_u64(rebuild_work_item_report.timings.grouping_ms),
+                format_u64(rebuild_work_item_report.timings.title_selection_ms),
+                format_u64(rebuild_work_item_report.timings.insert_ms),
+                format_u64(scan_started_at.elapsed().as_millis() as u64)
             );
         }
         print_scan_diagnostics_total(&total_diagnostics);
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct PreviewTaskRebuild {
+    projected_spans: Option<HashMap<String, TaskSpan>>,
+    verifications: Option<Vec<TaskVerification>>,
+}
+
+struct SourceTaskChangeSet<'a> {
+    source_id: &'a SourceId,
+    replace_source_records: bool,
+    touched_files: bool,
+    pending_file_entries: &'a [ScanFileStateEntry],
+    removed_file_entries: &'a [ScanFileStateEntry],
+    task_spans: &'a [TaskSpan],
+}
+
+impl PreviewTaskRebuild {
+    fn apply_source_changes(
+        &mut self,
+        store: &Store,
+        changes: SourceTaskChangeSet<'_>,
+    ) -> Result<u64> {
+        if self.projected_spans.is_none() {
+            self.projected_spans = Some(
+                store
+                    .task_spans()?
+                    .into_iter()
+                    .map(|span| (span.span_id.0.clone(), span))
+                    .collect(),
+            );
+        }
+        if self.verifications.is_none() {
+            self.verifications = Some(store.task_verifications()?);
+        }
+
+        let projected_spans = self
+            .projected_spans
+            .as_mut()
+            .expect("projected spans initialized");
+        let verifications = self
+            .verifications
+            .as_ref()
+            .expect("task verifications initialized");
+        let mut affected_project_buckets = BTreeSet::new();
+        if changes.replace_source_records {
+            let removed_span_ids = projected_spans
+                .iter()
+                .filter(|(_, span)| span.source_id == *changes.source_id)
+                .map(|(span_id, span)| {
+                    affected_project_buckets.insert(span.project_bucket.clone());
+                    span_id.clone()
+                })
+                .collect::<Vec<_>>();
+            for span_id in removed_span_ids {
+                projected_spans.remove(span_id.as_str());
+            }
+        } else if changes.touched_files {
+            let reconciled_hashes = scan_file_hashes_for_reconciliation(
+                changes.pending_file_entries,
+                changes.removed_file_entries,
+            )
+            .into_iter()
+            .collect::<HashSet<_>>();
+            if !reconciled_hashes.is_empty() {
+                let removed_span_ids = projected_spans
+                    .iter()
+                    .filter(|(_, span)| span.source_id == *changes.source_id)
+                    .filter(|(_, span)| {
+                        span.source_file_path_hash
+                            .as_deref()
+                            .is_some_and(|hash| reconciled_hashes.contains(hash))
+                    })
+                    .map(|(span_id, span)| {
+                        affected_project_buckets.insert(span.project_bucket.clone());
+                        span_id.clone()
+                    })
+                    .collect::<Vec<_>>();
+                for span_id in removed_span_ids {
+                    projected_spans.remove(span_id.as_str());
+                }
+            }
+        }
+        for span in changes.task_spans {
+            if let Some(previous) = projected_spans.insert(span.span_id.0.clone(), span.clone()) {
+                affected_project_buckets.insert(previous.project_bucket);
+            }
+            affected_project_buckets.insert(span.project_bucket.clone());
+        }
+        if affected_project_buckets.is_empty() {
+            return Ok(0);
+        }
+
+        let preview_spans = projected_spans
+            .values()
+            .filter(|span| affected_project_buckets.contains(&span.project_bucket))
+            .cloned()
+            .collect::<Vec<_>>();
+        let (work_items, _) = derive_task_work_items(preview_spans, verifications);
+        Ok(work_items.len() as u64)
+    }
 }
 
 fn source(command: SourceCommand, store: &Store) -> Result<()> {
@@ -946,6 +1312,19 @@ fn source(command: SourceCommand, store: &Store) -> Result<()> {
             } else {
                 0
             };
+            let deleted_task_spans: statsai_store::TaskDeletionImpact = if delete_data {
+                store.delete_task_spans_for_sources(std::slice::from_ref(&source_id))?
+            } else {
+                Default::default()
+            };
+            let rebuilt_work_items =
+                if delete_data && !deleted_task_spans.affected_project_buckets.is_empty() {
+                    store.rebuild_task_work_items_for_project_buckets(
+                        &deleted_task_spans.affected_project_buckets,
+                    )?
+                } else {
+                    0
+                };
             let deleted = store.delete_source(&source_id)?;
             println!(
                 "{}",
@@ -956,6 +1335,8 @@ fn source(command: SourceCommand, store: &Store) -> Result<()> {
                     "deleted_events": deleted_events,
                     "deleted_summaries": deleted_summaries,
                     "deleted_scan_cache_entries": deleted_scan_entries,
+                    "deleted_task_spans": deleted_task_spans.deleted,
+                    "work_items_rebuilt": rebuilt_work_items,
                     "source": source
                 }))?
             );
@@ -1063,6 +1444,658 @@ fn source(command: SourceCommand, store: &Store) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn task(command: TaskCommand, store: &Store) -> Result<()> {
+    match command.command {
+        TaskSubcommand::List {
+            provider,
+            status,
+            json,
+        } => {
+            let status_filter = status
+                .as_deref()
+                .map(parse_task_status_filter)
+                .transpose()?;
+            let selection =
+                task_list_selection(store, provider.as_deref(), status_filter.as_ref())?;
+            let items = selection.items;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else {
+                if items.is_empty() {
+                    if status_filter.is_none() && selection.hidden_rejected_meta > 0 {
+                        println!(
+                            "no visible work items found; {} rejected meta items are hidden by default. Use `statsai task list --status rejected_meta` to inspect them.",
+                            format_u64(selection.hidden_rejected_meta as u64)
+                        );
+                    } else {
+                        println!(
+                            "no work items found; run `statsai scan` to collect task spans, then `statsai task list` again"
+                        );
+                    }
+                    return Ok(());
+                }
+                for item in items {
+                    println!("{}", format_task_list_item(&item));
+                }
+                if status_filter.is_none() && selection.hidden_rejected_meta > 0 {
+                    println!(
+                        "hidden_rejected_meta={} use `statsai task list --status rejected_meta` to inspect",
+                        format_u64(selection.hidden_rejected_meta as u64)
+                    );
+                }
+            }
+        }
+        TaskSubcommand::Show {
+            work_item_id,
+            include_evidence,
+            json,
+        } => {
+            let work_item_id = WorkItemId(work_item_id);
+            let output = load_task_show_output(store, &work_item_id, include_evidence)?;
+            if json {
+                if include_evidence {
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&output.work_item)?);
+                }
+            } else {
+                print_work_item(&output.work_item);
+                if include_evidence {
+                    for verification in &output.verifications {
+                        println!(
+                            "  verification={} updated_at={}",
+                            format_task_verification(verification),
+                            verification.updated_at.to_rfc3339()
+                        );
+                    }
+                    for span in output.spans {
+                        println!(
+                            "  span={} provider={} start={} end={} tokens={} title={}",
+                            span.span_id.0,
+                            span.provider,
+                            span.started_at.to_rfc3339(),
+                            span.ended_at
+                                .map(|value| value.to_rfc3339())
+                                .unwrap_or_else(|| "open".to_string()),
+                            format_u64(span.usage.computed_total()),
+                            span.title
+                        );
+                        let repo_label = span
+                            .project
+                            .as_ref()
+                            .and_then(|project| project.repo_label.as_deref())
+                            .unwrap_or("-");
+                        let branch_label = span
+                            .project
+                            .as_ref()
+                            .and_then(|project| project.branch_label.as_deref())
+                            .unwrap_or("-");
+                        let session_id = span.session_id.as_deref().unwrap_or("-");
+                        let thread_id = span.thread_id.as_deref().unwrap_or("-");
+                        println!(
+                            "    repo={} branch={} session={} thread={} issues={}",
+                            repo_label,
+                            branch_label,
+                            session_id,
+                            thread_id,
+                            if span.issue_keys.is_empty() {
+                                "-".to_string()
+                            } else {
+                                span.issue_keys.join(",")
+                            }
+                        );
+                        if let Some(summary_preview) = span.summary_preview.as_deref() {
+                            println!("    summary_preview={summary_preview}");
+                        }
+                    }
+                }
+            }
+        }
+        TaskSubcommand::Verify { command } => {
+            let (verification, buckets) = match command {
+                TaskVerifySubcommand::Accept { work_item_id } => {
+                    let work_item_id = WorkItemId(work_item_id);
+                    let work_item = store
+                        .work_item(&work_item_id)?
+                        .with_context(|| format!("unknown work item {}", work_item_id.0))?;
+                    (
+                        store.upsert_task_verification(TaskVerificationAction::Accept {
+                            work_item_id: work_item_id.clone(),
+                            anchor_span_id: work_item.anchor_span_id.clone(),
+                        })?,
+                        BTreeSet::from([work_item.project_bucket.clone()]),
+                    )
+                }
+                TaskVerifySubcommand::Reject {
+                    work_item_id,
+                    reason,
+                } => {
+                    let work_item_id = WorkItemId(work_item_id);
+                    let work_item = store
+                        .work_item(&work_item_id)?
+                        .with_context(|| format!("unknown work item {}", work_item_id.0))?;
+                    (
+                        store.upsert_task_verification(TaskVerificationAction::Reject {
+                            work_item_id: work_item_id.clone(),
+                            anchor_span_id: work_item.anchor_span_id.clone(),
+                            reason: parse_task_verdict(&reason)?,
+                        })?,
+                        BTreeSet::from([work_item.project_bucket.clone()]),
+                    )
+                }
+                TaskVerifySubcommand::Split {
+                    work_item_id,
+                    after_span,
+                    left_title,
+                    right_title,
+                } => {
+                    let work_item_id = WorkItemId(work_item_id);
+                    let work_item = store
+                        .work_item(&work_item_id)?
+                        .with_context(|| format!("unknown work item {}", work_item_id.0))?;
+                    let spans = store.task_spans_for_work_item(&work_item_id)?;
+                    let after_span_id = statsai_core::TaskSpanId(after_span);
+                    let span_index = spans
+                        .iter()
+                        .position(|span| span.span_id == after_span_id)
+                        .with_context(|| {
+                            format!(
+                                "span {} is not a member of work item {}",
+                                after_span_id.0, work_item_id.0
+                            )
+                        })?;
+                    if span_index + 1 >= spans.len() {
+                        bail!("cannot split after the last span in a work item");
+                    }
+                    let before_span_id = spans[span_index + 1].span_id.clone();
+                    let verification =
+                        store.upsert_task_verification(TaskVerificationAction::Split {
+                            after_span_id,
+                            before_span_id: Some(before_span_id),
+                            left_title,
+                            right_title,
+                        })?;
+                    (
+                        verification,
+                        BTreeSet::from([work_item.project_bucket.clone()]),
+                    )
+                }
+                TaskVerifySubcommand::Merge {
+                    left_work_item_id,
+                    right_work_item_id,
+                    title,
+                } => {
+                    let left_work_item_id = WorkItemId(left_work_item_id);
+                    let right_work_item_id = WorkItemId(right_work_item_id);
+                    let left = store
+                        .work_item(&left_work_item_id)?
+                        .with_context(|| format!("unknown work item {}", left_work_item_id.0))?;
+                    let right = store
+                        .work_item(&right_work_item_id)?
+                        .with_context(|| format!("unknown work item {}", right_work_item_id.0))?;
+                    if left.project_bucket != right.project_bucket {
+                        bail!(
+                            "cannot merge work items from different project buckets: {} vs {}",
+                            left.project_bucket,
+                            right.project_bucket
+                        );
+                    }
+                    (
+                        store.upsert_task_verification(TaskVerificationAction::Merge {
+                            left_work_item_id: left_work_item_id.clone(),
+                            right_work_item_id: right_work_item_id.clone(),
+                            left_anchor_span_id: left.anchor_span_id.clone(),
+                            right_anchor_span_id: right.anchor_span_id.clone(),
+                            title,
+                        })?,
+                        BTreeSet::from([left.project_bucket.clone()]),
+                    )
+                }
+                TaskVerifySubcommand::Rename {
+                    work_item_id,
+                    title,
+                } => {
+                    let work_item_id = WorkItemId(work_item_id);
+                    let work_item = store
+                        .work_item(&work_item_id)?
+                        .with_context(|| format!("unknown work item {}", work_item_id.0))?;
+                    (
+                        store.upsert_task_verification(TaskVerificationAction::Rename {
+                            work_item_id: work_item_id.clone(),
+                            anchor_span_id: work_item.anchor_span_id.clone(),
+                            title,
+                        })?,
+                        BTreeSet::from([work_item.project_bucket.clone()]),
+                    )
+                }
+            };
+            let rebuilt = store.rebuild_task_work_items_for_project_buckets(&buckets)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "verification": verification,
+                    "work_items_rebuilt": rebuilt
+                }))?
+            );
+        }
+        TaskSubcommand::Stats { json } => {
+            let stats = store.task_stats()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&stats_json_value(&stats))?
+                );
+            } else {
+                println!(
+                    "task stats: spans={} work_items={} verified={:.1}% no_git={:.1}% cross_provider={:.1}% rejected_meta={:.1}% avg_spans_per_item={:.2}",
+                    format_u64(stats.total_spans),
+                    format_u64(stats.total_work_items),
+                    stats.verified_percentage,
+                    stats.no_git_percentage,
+                    stats.cross_provider_percentage,
+                    stats.rejected_meta_percentage,
+                    stats.average_spans_per_work_item
+                );
+            }
+        }
+        TaskSubcommand::Benchmark { json } => {
+            let report = store.task_benchmark_report()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&benchmark_json_value(&report))?
+                );
+            } else {
+                println!(
+                    "benchmark: verified_spans={} adjacent_pairs={} has_ground_truth={} has_pairwise_ground_truth={} constraints_preserved={} beats_all_baselines={} shipping_gate_ready={}",
+                    format_u64(report.verified_spans),
+                    format_u64(report.verified_adjacent_pairs),
+                    report.has_verified_ground_truth,
+                    report.has_verified_pairwise_ground_truth,
+                    report.manual_constraints_preserved,
+                    report.beats_all_baselines,
+                    report.shipping_gate_ready
+                );
+                if !report.gate_blockers.is_empty() {
+                    println!("  gate_blockers={}", report.gate_blockers.join(","));
+                }
+                if !report.failing_baselines.is_empty() {
+                    println!("  failing_baselines={}", report.failing_baselines.join(","));
+                }
+                if !report.has_verified_ground_truth {
+                    println!(
+                        "  note: no verified task ground truth yet; run `statsai task verify ...` before treating benchmark scores as a shipping gate"
+                    );
+                } else if !report.has_verified_pairwise_ground_truth {
+                    println!(
+                        "  note: verified labels exist, but no adjacent verified span pairs exist yet; verify a multi-span work item or record a split/merge before using the shipping gate"
+                    );
+                }
+                print_benchmark_metrics("current", &report.current);
+                for baseline in &report.baselines {
+                    print_benchmark_metrics(&baseline.name, &baseline.metrics);
+                }
+            }
+        }
+        TaskSubcommand::Export { level, format } => {
+            let level = level.to_ascii_lowercase();
+            let format = format.to_ascii_lowercase();
+            match (level.as_str(), format.as_str()) {
+                ("work-item", "json") | ("work_item", "json") => {
+                    println!("{}", serde_json::to_string_pretty(&store.work_items()?)?);
+                }
+                ("work-item", "jsonl") | ("work_item", "jsonl") => {
+                    for item in store.work_items()? {
+                        println!("{}", serde_json::to_string(&item)?);
+                    }
+                }
+                ("span", "json") => {
+                    println!("{}", serde_json::to_string_pretty(&store.task_spans()?)?);
+                }
+                ("span", "jsonl") => {
+                    for span in store.task_spans()? {
+                        println!("{}", serde_json::to_string(&span)?);
+                    }
+                }
+                _ => bail!("unsupported export level/format: {level}/{format}"),
+            }
+        }
+        TaskSubcommand::Rebuild {
+            provider,
+            source_id,
+            all,
+        } => {
+            let report = if all || (provider.is_none() && source_id.is_none()) {
+                store.rebuild_all_task_work_items_report()?
+            } else {
+                let buckets = selected_rebuild_project_buckets(
+                    store,
+                    provider.as_deref(),
+                    source_id.as_deref(),
+                )?;
+                store.rebuild_task_work_items_for_project_buckets_report(&buckets)?
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&task_rebuild_report_json_value(&report))?
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TaskListSelection {
+    items: Vec<WorkItem>,
+    hidden_rejected_meta: usize,
+}
+
+fn task_list_selection(
+    store: &Store,
+    provider: Option<&str>,
+    status_filter: Option<&TaskStatus>,
+) -> Result<TaskListSelection> {
+    let items = store
+        .work_items()?
+        .into_iter()
+        .filter(|item| {
+            provider
+                .is_none_or(|provider| item.providers.iter().any(|candidate| candidate == provider))
+        })
+        .collect::<Vec<_>>();
+    if let Some(status) = status_filter {
+        return Ok(TaskListSelection {
+            items: items
+                .into_iter()
+                .filter(|item| &item.status == status)
+                .collect::<Vec<_>>(),
+            hidden_rejected_meta: 0,
+        });
+    }
+    let hidden_rejected_meta = items
+        .iter()
+        .filter(|item| item.status == TaskStatus::RejectedMeta)
+        .count();
+    Ok(TaskListSelection {
+        items: items
+            .into_iter()
+            .filter(|item| item.status != TaskStatus::RejectedMeta)
+            .collect::<Vec<_>>(),
+        hidden_rejected_meta,
+    })
+}
+
+#[cfg(test)]
+fn filtered_task_list_items(
+    store: &Store,
+    provider: Option<&str>,
+    status_filter: Option<&TaskStatus>,
+) -> Result<Vec<WorkItem>> {
+    Ok(task_list_selection(store, provider, status_filter)?.items)
+}
+
+fn selected_rebuild_project_buckets(
+    store: &Store,
+    provider: Option<&str>,
+    source_id: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    Ok(store
+        .task_spans()?
+        .into_iter()
+        .filter(|span| provider.is_none_or(|provider| span.provider == provider))
+        .filter(|span| source_id.is_none_or(|source_id| span.source_id.0 == source_id))
+        .map(|span| span.project_bucket)
+        .collect::<BTreeSet<_>>())
+}
+
+#[derive(Debug, Serialize)]
+struct TaskShowOutput {
+    work_item: WorkItem,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    spans: Vec<TaskSpan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    verifications: Vec<TaskVerification>,
+}
+
+fn load_task_show_output(
+    store: &Store,
+    work_item_id: &WorkItemId,
+    include_evidence: bool,
+) -> Result<TaskShowOutput> {
+    let work_item = store
+        .work_item(work_item_id)?
+        .with_context(|| format!("unknown work item {}", work_item_id.0))?;
+    let spans = if include_evidence {
+        store.task_spans_for_work_item(work_item_id)?
+    } else {
+        Vec::new()
+    };
+    let verifications = if include_evidence {
+        relevant_task_verifications(&store.task_verifications()?, &spans)
+    } else {
+        Vec::new()
+    };
+    Ok(TaskShowOutput {
+        work_item,
+        spans,
+        verifications,
+    })
+}
+
+fn relevant_task_verifications(
+    verifications: &[TaskVerification],
+    spans: &[TaskSpan],
+) -> Vec<TaskVerification> {
+    let span_ids = spans
+        .iter()
+        .map(|span| span.span_id.0.as_str())
+        .collect::<HashSet<_>>();
+    verifications
+        .iter()
+        .filter(|verification| {
+            verification
+                .action
+                .span_ids()
+                .into_iter()
+                .any(|span_id| span_ids.contains(span_id.0.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
+fn format_task_verification(verification: &TaskVerification) -> String {
+    match &verification.action {
+        TaskVerificationAction::Accept { anchor_span_id, .. } => {
+            format!("accept(anchor={})", anchor_span_id.0)
+        }
+        TaskVerificationAction::Reject {
+            anchor_span_id,
+            reason,
+            ..
+        } => format!("reject(anchor={}, reason={:?})", anchor_span_id.0, reason),
+        TaskVerificationAction::Rename {
+            anchor_span_id,
+            title,
+            ..
+        } => format!("rename(anchor={}, title={title})", anchor_span_id.0),
+        TaskVerificationAction::Split {
+            after_span_id,
+            before_span_id,
+            left_title,
+            right_title,
+        } => format!(
+            "split(after={}, before={}, left_title={}, right_title={})",
+            after_span_id.0,
+            before_span_id
+                .as_ref()
+                .map(|span_id| span_id.0.as_str())
+                .unwrap_or("-"),
+            left_title.as_deref().unwrap_or("-"),
+            right_title.as_deref().unwrap_or("-")
+        ),
+        TaskVerificationAction::Merge {
+            left_anchor_span_id,
+            right_anchor_span_id,
+            title,
+            ..
+        } => format!(
+            "merge(left={}, right={}, title={})",
+            left_anchor_span_id.0,
+            right_anchor_span_id.0,
+            title.as_deref().unwrap_or("-")
+        ),
+    }
+}
+
+fn parse_task_status_filter(value: &str) -> Result<TaskStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(TaskStatus::Auto),
+        "needs_review" => Ok(TaskStatus::NeedsReview),
+        "verified" => Ok(TaskStatus::Verified),
+        "rejected_meta" => Ok(TaskStatus::RejectedMeta),
+        _ => bail!("unsupported task status {value}"),
+    }
+}
+
+fn parse_task_verdict(value: &str) -> Result<TaskVerdict> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "meta" => Ok(TaskVerdict::Meta),
+        "system" => Ok(TaskVerdict::System),
+        "noise" => Ok(TaskVerdict::Noise),
+        _ => bail!("unsupported task verdict {value}"),
+    }
+}
+
+fn print_work_item(work_item: &WorkItem) {
+    println!(
+        "{} status={:?} confidence={:?} spans={} events={} tokens={} providers={} title={}",
+        work_item.work_item_id.0,
+        work_item.status,
+        work_item.confidence,
+        work_item.span_count,
+        work_item.event_count,
+        format_u64(work_item.total_tokens),
+        work_item.providers.join(","),
+        work_item.title
+    );
+    println!(
+        "  project_bucket={} started_at={} ended_at={} no_git={} cross_provider={}",
+        work_item.project_bucket,
+        work_item.started_at.to_rfc3339(),
+        work_item.ended_at.to_rfc3339(),
+        work_item.no_git,
+        work_item.cross_provider
+    );
+    if !work_item.review_reasons.is_empty() {
+        println!("  review_reasons={}", work_item.review_reasons.join(","));
+    }
+    if !work_item.continuation_reasons.is_empty() {
+        println!(
+            "  continuation_reasons={}",
+            work_item.continuation_reasons.join(",")
+        );
+    }
+}
+
+fn format_task_list_item(work_item: &WorkItem) -> String {
+    let mut line = format!(
+        "{} status={:?} confidence={:?} spans={} tokens={} providers={} title={}",
+        work_item.work_item_id.0,
+        work_item.status,
+        work_item.confidence,
+        work_item.span_count,
+        format_u64(work_item.total_tokens),
+        work_item.providers.join(","),
+        work_item.title
+    );
+    if !work_item.review_reasons.is_empty() {
+        line.push_str(" review=");
+        line.push_str(&work_item.review_reasons.join(","));
+    }
+    line
+}
+
+fn stats_json_value(stats: &statsai_store::TaskStats) -> Value {
+    json!({
+        "total_spans": stats.total_spans,
+        "total_work_items": stats.total_work_items,
+        "verified_percentage": stats.verified_percentage,
+        "no_git_percentage": stats.no_git_percentage,
+        "cross_provider_percentage": stats.cross_provider_percentage,
+        "rejected_meta_percentage": stats.rejected_meta_percentage,
+        "average_spans_per_work_item": stats.average_spans_per_work_item,
+    })
+}
+
+fn task_rebuild_report_json_value(report: &statsai_store::TaskRebuildReport) -> Value {
+    json!({
+        "work_items_rebuilt": report.work_items_rebuilt,
+        "work_items_deleted": report.work_items_deleted,
+        "affected_bucket_count": report.affected_bucket_count,
+        "affected_segment_count": report.affected_segment_count,
+        "touched_span_count": report.touched_span_count,
+        "timings_ms": {
+            "delete": report.timings.delete_ms,
+            "span_load": report.timings.span_load_ms,
+            "verification_load": report.timings.verification_load_ms,
+            "grouping": report.timings.grouping_ms,
+            "title_selection": report.timings.title_selection_ms,
+            "insert": report.timings.insert_ms,
+        }
+    })
+}
+
+fn benchmark_json_value(report: &statsai_store::TaskBenchmarkReport) -> Value {
+    json!({
+        "verified_adjacent_pairs": report.verified_adjacent_pairs,
+        "verified_spans": report.verified_spans,
+        "has_verified_ground_truth": report.has_verified_ground_truth,
+        "has_verified_pairwise_ground_truth": report.has_verified_pairwise_ground_truth,
+        "manual_constraints_preserved": report.manual_constraints_preserved,
+        "beats_all_baselines": report.beats_all_baselines,
+        "shipping_gate_ready": report.shipping_gate_ready,
+        "failing_baselines": report.failing_baselines,
+        "gate_blockers": report.gate_blockers,
+        "current": benchmark_metrics_json_value(&report.current),
+        "baselines": report.baselines.iter().map(|baseline| {
+            json!({
+                "name": baseline.name,
+                "metrics": benchmark_metrics_json_value(&baseline.metrics),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn benchmark_metrics_json_value(metrics: &statsai_store::TaskBenchmarkMetrics) -> Value {
+    json!({
+        "adjacent_precision": metrics.adjacent_precision,
+        "adjacent_recall": metrics.adjacent_recall,
+        "adjacent_f1": metrics.adjacent_f1,
+        "cluster_precision": metrics.cluster_precision,
+        "cluster_recall": metrics.cluster_recall,
+        "cluster_f1": metrics.cluster_f1,
+        "meta_precision": metrics.meta_precision,
+        "meta_recall": metrics.meta_recall,
+        "meta_f1": metrics.meta_f1,
+    })
+}
+
+fn print_benchmark_metrics(name: &str, metrics: &statsai_store::TaskBenchmarkMetrics) {
+    println!(
+        "  {} adjacent_f1={:.3} (p={:.3} r={:.3}) cluster_f1={:.3} (p={:.3} r={:.3}) meta_f1={:.3} (p={:.3} r={:.3})",
+        name,
+        metrics.adjacent_f1,
+        metrics.adjacent_precision,
+        metrics.adjacent_recall,
+        metrics.cluster_f1,
+        metrics.cluster_precision,
+        metrics.cluster_recall,
+        metrics.meta_f1,
+        metrics.meta_precision,
+        metrics.meta_recall
+    );
 }
 
 fn account(command: AccountCommand, store: &Store) -> Result<()> {
@@ -2153,23 +3186,29 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     }
 
     if command.status {
-        return sync_status(store);
+        return sync_status(store, device_id);
     }
 
     let target = sync_target(&command)?;
     if command.sink == "http" {
         maybe_reset_http_sync_tracking_if_remote_changed(&command, store, &target)?;
     }
-    let (batch, payload_mode) = build_sync_batch(&command, store, device_id, &target)?;
+    let (mut batch, payload_mode) = build_sync_batch(&command, store, device_id, &target)?;
+    let hosted_task_sync_enabled =
+        maybe_disable_http_hosted_task_sync_payload(&command, &target, &mut batch)?;
 
     if command.dry_run {
         eprintln!(
-            "dry run: sink={} mode={} sources={} events={} summaries={}",
+            "dry run: sink={} mode={} include_projects={} sources={} events={} summaries={} task_buckets={} task_verifications={}",
             command.sink,
             sync_payload_mode_name(payload_mode),
+            command.include_projects,
             batch.sources.len(),
             batch.events.len(),
             batch.summaries.len()
+            ,
+            batch.task_buckets.len(),
+            batch.task_verifications.len(),
         );
         return Ok(());
     }
@@ -2178,13 +3217,7 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
         match command.sink.as_str() {
             "stdout" => {
                 StdoutSink.send(&batch)?;
-                store.record_sync_success(
-                    &command.sink,
-                    &target,
-                    &batch.batch_id,
-                    &batch.events,
-                    &batch.summaries,
-                )?;
+                record_sync_batch_success(store, &command.sink, &target, &batch)?;
                 Ok(())
             }
             "file" => {
@@ -2193,13 +3226,7 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("statsai-sync-batch.json"));
                 FileSink::new(output).send(&batch)?;
-                store.record_sync_success(
-                    &command.sink,
-                    &target,
-                    &batch.batch_id,
-                    &batch.events,
-                    &batch.summaries,
-                )?;
+                record_sync_batch_success(store, &command.sink, &target, &batch)?;
                 Ok(())
             }
             "http" => {
@@ -2207,12 +3234,15 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
                 let auth_token = resolve_http_auth_token(&command, false)?;
                 send_http_sync_batch(
                     store,
-                    &command.sink,
-                    &target,
-                    &endpoint,
-                    auth_token,
+                    HttpSyncBatchRequest {
+                        sink: &command.sink,
+                        target: &target,
+                        endpoint: &endpoint,
+                        auth_token,
+                        payload_mode,
+                        hosted_task_sync_enabled,
+                    },
                     &batch,
-                    payload_mode,
                 )?;
                 Ok(())
             }
@@ -2244,7 +3274,13 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
     let auth_token = resolve_http_auth_token(command, true)?
         .context("device login required; run `statsai auth login` first")?;
     let remote = http_remote_preflight_status(target, &auth_token)?;
-    let local_verify = sync_local_verify(store, "http", target, Some(&local_state))?;
+    let local_verify = sync_local_verify(
+        store,
+        "http",
+        target,
+        Some(&local_state),
+        command.include_projects,
+    )?;
     let batch_mismatch = !remote_sync_batch_matches_local_state(&remote, &local_state);
     let metadata_gap = remote_metadata_gap_reason(&remote, &local_verify);
     if batch_mismatch || metadata_gap.is_some() {
@@ -2324,6 +3360,7 @@ fn build_sync_batch(
     device_id: &str,
     target: &str,
 ) -> Result<(SyncBatch, SyncPayloadMode)> {
+    let include_projects = command.include_projects;
     let payload_mode = sync_payload_mode(command)?;
     let state = if command.sink == "http" || command.since_last {
         store.sync_state(&command.sink, target)?
@@ -2352,14 +3389,14 @@ fn build_sync_batch(
         store
             .events_after(event_cursor)?
             .into_iter()
-            .map(sanitize_event_for_sync)
+            .map(|event| sanitize_event_for_sync_with_projects(event, include_projects))
             .collect()
     };
     let passthrough_summaries: Vec<_> = if payload_mode == SyncPayloadMode::Rollups {
         store
             .summaries()?
             .into_iter()
-            .map(sanitize_summary_for_sync)
+            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
             .filter(is_http_rollup_passthrough_summary)
             .collect()
     } else {
@@ -2371,7 +3408,7 @@ fn build_sync_batch(
         store
             .summaries_after(summary_cursor)?
             .into_iter()
-            .map(sanitize_summary_for_sync)
+            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
             .collect()
     };
     let all_sources: Vec<_> = store
@@ -2417,6 +3454,29 @@ fn build_sync_batch(
         store.pending_subscriptions_for_sync(&command.sink, target, &all_subscriptions)?
     } else {
         all_subscriptions
+    };
+    let (task_buckets, task_verifications) = if include_projects {
+        let task_verification_cursor = if command.sink == "http" || command.since_last {
+            store.sync_task_verification_cursor(&command.sink, target)?
+        } else {
+            None
+        };
+        let full_task_sync = command.full || state.is_none();
+        let task_buckets = store.pending_task_bucket_snapshots_for_sync(
+            &command.sink,
+            target,
+            device_id,
+            full_task_sync,
+            task_verification_cursor.clone(),
+        )?;
+        let task_verifications = if full_task_sync {
+            store.task_verifications()?
+        } else {
+            store.pending_task_verifications_for_sync(&command.sink, target)?
+        };
+        (task_buckets, task_verifications)
+    } else {
+        (Vec::new(), Vec::new())
     };
 
     if payload_mode == SyncPayloadMode::Rollups {
@@ -2465,7 +3525,7 @@ fn build_sync_batch(
         let all_rollups: Vec<_> = store
             .all_sync_rollup_summaries()?
             .into_iter()
-            .map(sanitize_summary_for_sync)
+            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
             .collect();
         let rollups = if full_rollup_sync {
             all_rollups
@@ -2481,7 +3541,11 @@ fn build_sync_batch(
                 "incremental"
             }
         );
-        summaries.extend(rollups.into_iter().map(sanitize_summary_for_sync));
+        summaries.extend(
+            rollups
+                .into_iter()
+                .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects)),
+        );
     }
 
     Ok((
@@ -2495,6 +3559,8 @@ fn build_sync_batch(
             subscriptions,
             events,
             summaries,
+            task_buckets,
+            task_verifications,
             created_at: Utc::now(),
         },
         payload_mode,
@@ -2531,6 +3597,7 @@ fn record_rollup_sync_chunk_success(
         .filter(|summary| is_daily_rollup_summary(summary))
         .map(|summary| summary.summary_id.clone())
         .collect();
+    let task_verification_cursor = sync_batch_task_verification_cursor(batch);
 
     store.record_sync_success(
         sink,
@@ -2538,6 +3605,7 @@ fn record_rollup_sync_chunk_success(
         logical_batch_id,
         &batch.events,
         &passthrough_summaries,
+        task_verification_cursor.as_ref(),
     )?;
     store.mark_pending_sync_resume(sink, target, logical_batch_id)?;
     store.mark_sync_rollups_synced(&rollup_summary_ids)?;
@@ -2551,21 +3619,98 @@ fn record_rollup_sync_chunk_success(
         &batch.source_account_assignments,
     )?;
     store.record_subscriptions_synced(sink, target, &batch.subscriptions)?;
+    store.record_task_bucket_snapshots_synced(
+        sink,
+        target,
+        &batch.device_id,
+        &batch.task_buckets,
+    )?;
+    store.record_task_verifications_synced(sink, target, &batch.task_verifications)?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
 }
 
-fn send_http_sync_batch(
+fn record_sync_batch_success(
     store: &Store,
     sink: &str,
     target: &str,
-    endpoint: &str,
-    auth_token: Option<String>,
     batch: &SyncBatch,
-    payload_mode: SyncPayloadMode,
 ) -> Result<()> {
-    let http_sink = HttpSink::new(endpoint, auth_token)?;
-    let batches = if payload_mode == SyncPayloadMode::Rollups {
+    let task_verification_cursor = sync_batch_task_verification_cursor(batch);
+    store.record_sync_success(
+        sink,
+        target,
+        &batch.batch_id,
+        &batch.events,
+        &batch.summaries,
+        task_verification_cursor.as_ref(),
+    )?;
+    store.record_task_bucket_snapshots_synced(
+        sink,
+        target,
+        &batch.device_id,
+        &batch.task_buckets,
+    )?;
+    store.record_task_verifications_synced(sink, target, &batch.task_verifications)?;
+    Ok(())
+}
+
+fn maybe_disable_http_hosted_task_sync_payload(
+    command: &SyncCommand,
+    target: &str,
+    batch: &mut SyncBatch,
+) -> Result<bool> {
+    if command.sink != "http" {
+        return Ok(true);
+    }
+    if !command.include_projects {
+        return Ok(false);
+    }
+    if http_remote_hosted_tasks_enabled(command, target)? {
+        return Ok(true);
+    }
+    if batch.task_buckets.is_empty() && batch.task_verifications.is_empty() {
+        return Ok(false);
+    }
+    eprintln!(
+        "http sync: hosted task access is not enabled for this account; skipping {} task buckets and {} task verifications",
+        batch.task_buckets.len(),
+        batch.task_verifications.len()
+    );
+    batch.task_buckets.clear();
+    batch.task_verifications.clear();
+    Ok(false)
+}
+
+fn sync_batch_task_verification_cursor(batch: &SyncBatch) -> Option<TaskVerificationCursor> {
+    batch
+        .task_buckets
+        .iter()
+        .filter_map(|bucket| bucket.applied_verification_cursor.clone())
+        .max_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.verification_id.0.cmp(&right.verification_id.0))
+        })
+}
+
+struct HttpSyncBatchRequest<'a> {
+    sink: &'a str,
+    target: &'a str,
+    endpoint: &'a str,
+    auth_token: Option<String>,
+    payload_mode: SyncPayloadMode,
+    hosted_task_sync_enabled: bool,
+}
+
+fn send_http_sync_batch(
+    store: &Store,
+    request: HttpSyncBatchRequest<'_>,
+    batch: &SyncBatch,
+) -> Result<()> {
+    let task_sync_auth_token = request.auth_token.clone();
+    let http_sink = HttpSink::new(request.endpoint, request.auth_token)?;
+    let batches = if request.payload_mode == SyncPayloadMode::Rollups {
         split_http_rollup_sync_batches(batch)
     } else {
         vec![batch.clone()]
@@ -2589,12 +3734,12 @@ fn send_http_sync_batch(
                 chunk.batch_id
             );
         }
-        if payload_mode == SyncPayloadMode::Rollups {
+        if request.payload_mode == SyncPayloadMode::Rollups {
             send_http_rollup_chunk_with_retry(&http_sink, chunk, &|synced_chunk| {
                 record_rollup_sync_chunk_success(
                     store,
-                    sink,
-                    target,
+                    request.sink,
+                    request.target,
                     &logical_batch_id,
                     synced_chunk,
                 )
@@ -2602,19 +3747,79 @@ fn send_http_sync_batch(
         } else {
             let ack = http_sink.send_with_ack(chunk)?;
             println!("{}", serde_json::to_string_pretty(&ack)?);
+            record_sync_batch_success(store, request.sink, request.target, batch)?;
+        }
+    }
+    if request.payload_mode == SyncPayloadMode::Rollups {
+        store.clear_pending_sync_resume(request.sink, request.target)?;
+    }
+    if request.hosted_task_sync_enabled {
+        let pulled_cursor = pull_remote_task_verifications(
+            store,
+            request.sink,
+            request.target,
+            request.endpoint,
+            task_sync_auth_token.as_deref(),
+        )?;
+        if let Some(cursor) = pulled_cursor.as_ref() {
             store.record_sync_success(
-                sink,
-                target,
+                request.sink,
+                request.target,
                 &batch.batch_id,
-                &batch.events,
-                &batch.summaries,
+                &[],
+                &[],
+                Some(cursor),
             )?;
         }
     }
-    if payload_mode == SyncPayloadMode::Rollups {
-        store.clear_pending_sync_resume(sink, target)?;
-    }
     Ok(())
+}
+
+fn pull_remote_task_verifications(
+    store: &Store,
+    sink: &str,
+    target: &str,
+    endpoint: &str,
+    auth_token: Option<&str>,
+) -> Result<Option<TaskVerificationCursor>> {
+    let Some(auth_token) = auth_token.filter(|token| !token.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(feed_url) = http_task_verification_feed_url(endpoint) else {
+        return Ok(None);
+    };
+    let mut request = ureq::get(&feed_url).set("Authorization", &format!("Bearer {auth_token}"));
+    if let Some(cursor) = store.sync_task_verification_cursor(sink, target)? {
+        request = request
+            .query("updatedAt", &cursor.updated_at.to_rfc3339())
+            .query("verificationId", &cursor.verification_id.0);
+    }
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) if optional_task_verification_feed_status(code) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(http_request_error("pull task verifications", error)),
+    };
+    let feed: TaskVerificationFeedResponse = response
+        .into_json()
+        .context("parse task verification feed")?;
+    let mut affected_buckets = BTreeSet::new();
+    for verification in &feed.verifications {
+        if store.merge_task_verification(verification)? {
+            affected_buckets.extend(store.project_buckets_for_task_verification(verification)?);
+        }
+    }
+    store.record_task_verifications_synced(sink, target, &feed.verifications)?;
+    if !affected_buckets.is_empty() {
+        store.rebuild_task_work_items_for_project_buckets(&affected_buckets)?;
+        snapshot::invalidate_dashboard_cache();
+    }
+    Ok(feed.next_cursor)
+}
+
+fn optional_task_verification_feed_status(status: u16) -> bool {
+    matches!(status, 404 | 405 | 501)
 }
 
 fn send_http_rollup_chunk_with_retry<F>(
@@ -2670,6 +3875,9 @@ fn should_retry_http_rollup_chunk_after_error(chunk: &SyncBatch, error: &anyhow:
         || chunk.accounts.len() > 1
         || chunk.source_account_assignments.len() > 1
         || chunk.subscriptions.len() > 1
+        || chunk.task_buckets.len() > 1
+        || chunk.task_verifications.len() > 1
+        || (!chunk.task_buckets.is_empty() && !chunk.task_verifications.is_empty())
         || (http_rollup_metadata_count(chunk) > 0 && !chunk.summaries.is_empty())
 }
 
@@ -2708,11 +3916,22 @@ fn parse_http_sync_error(error: &anyhow::Error) -> Option<ParsedHttpSyncError> {
 }
 
 fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch> {
+    let task_chunks = split_http_rollup_task_chunks(
+        batch,
+        HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH,
+        HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH,
+    );
+    let has_task_payload = !task_chunks.is_empty();
     let metadata_count = http_rollup_metadata_count(batch);
-    if batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
+    let has_rollup_payload = metadata_count > 0 || !batch.summaries.is_empty();
+    if !has_task_payload
+        && batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
         && metadata_count <= HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH
     {
         return fit_http_rollup_batches_to_d1_budget(vec![batch.clone()]);
+    }
+    if has_task_payload && !has_rollup_payload {
+        return fit_http_rollup_batches_to_d1_budget(task_chunks);
     }
 
     let total_chunks = batch
@@ -2720,12 +3939,13 @@ fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch> {
         .len()
         .div_ceil(HTTP_ROLLUP_SUMMARIES_PER_BATCH);
     let metadata_chunks = metadata_count.div_ceil(HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH);
-    let mut chunks = Vec::with_capacity(total_chunks + metadata_chunks);
+    let mut chunks = Vec::with_capacity(total_chunks + metadata_chunks + task_chunks.len());
 
     chunks.extend(split_http_rollup_metadata_chunks(
         batch,
         HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH,
     ));
+    chunks.extend(task_chunks);
     chunks.extend(split_http_rollup_summary_chunks(
         batch,
         HTTP_ROLLUP_SUMMARIES_PER_BATCH,
@@ -2735,6 +3955,30 @@ fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch> {
 }
 
 fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<SyncBatch> {
+    if !batch.task_buckets.is_empty() || !batch.task_verifications.is_empty() {
+        if !batch.task_buckets.is_empty() && !batch.task_verifications.is_empty() {
+            return split_http_rollup_task_chunks(
+                batch,
+                batch.task_buckets.len(),
+                batch.task_verifications.len(),
+            );
+        }
+        if batch.task_buckets.len() > 1 {
+            return split_http_rollup_task_chunks(
+                batch,
+                batch.task_buckets.len().div_ceil(2),
+                batch.task_verifications.len().max(1),
+            );
+        }
+        if batch.task_verifications.len() > 1 {
+            return split_http_rollup_task_chunks(
+                batch,
+                batch.task_buckets.len().max(1),
+                batch.task_verifications.len().div_ceil(2),
+            );
+        }
+    }
+
     if http_rollup_metadata_count(batch) > 0 && !batch.summaries.is_empty() {
         let mut chunks =
             split_http_rollup_metadata_chunks(batch, HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH);
@@ -2773,6 +4017,42 @@ fn http_rollup_metadata_count(batch: &SyncBatch) -> usize {
         + batch.accounts.len()
         + batch.source_account_assignments.len()
         + batch.subscriptions.len()
+}
+
+fn split_http_rollup_task_chunks(
+    batch: &SyncBatch,
+    task_bucket_chunk_size: usize,
+    task_verification_chunk_size: usize,
+) -> Vec<SyncBatch> {
+    let mut chunks = Vec::new();
+    let task_bucket_chunk_size = task_bucket_chunk_size.max(1);
+    let task_verification_chunk_size = task_verification_chunk_size.max(1);
+
+    chunks.extend(
+        batch
+            .task_buckets
+            .chunks(task_bucket_chunk_size)
+            .enumerate()
+            .map(|(index, buckets)| {
+                let mut chunk =
+                    empty_http_rollup_chunk(batch, &format!("task_buckets_{}", index + 1));
+                chunk.task_buckets = buckets.to_vec();
+                chunk
+            }),
+    );
+    chunks.extend(
+        batch
+            .task_verifications
+            .chunks(task_verification_chunk_size)
+            .enumerate()
+            .map(|(index, verifications)| {
+                let mut chunk =
+                    empty_http_rollup_chunk(batch, &format!("task_verifications_{}", index + 1));
+                chunk.task_verifications = verifications.to_vec();
+                chunk
+            }),
+    );
+    chunks
 }
 
 fn fit_http_rollup_batches_to_d1_budget(chunks: Vec<SyncBatch>) -> Vec<SyncBatch> {
@@ -2857,7 +4137,200 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
         + daily_rollup_write_queries
         + monthly_rollup_queries
         + dashboard_snapshot_queries
+        + estimate_http_rollup_task_queries(batch)
         + final_sync_bookkeeping_queries
+}
+
+fn estimate_http_rollup_task_queries(batch: &SyncBatch) -> usize {
+    let source_lookup_queries = http_rollup_query_chunks(
+        batch
+            .task_buckets
+            .iter()
+            .flat_map(|bucket| bucket.spans.iter())
+            .filter_map(|span| {
+                let source_id = span.source_id.0.trim();
+                (!source_id.is_empty()).then_some(source_id)
+            })
+            .collect::<BTreeSet<_>>()
+            .len(),
+        HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE,
+    );
+    let project_lookup_queries = http_rollup_query_chunks(
+        batch
+            .task_buckets
+            .iter()
+            .flat_map(|bucket| bucket.spans.iter())
+            .filter_map(|span| {
+                let project = span.project.as_ref()?;
+                Some(
+                    [
+                        Some(project.project_id.as_str()),
+                        project.path_hash.as_deref(),
+                        project.repo_remote_hash.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(":"),
+                )
+            })
+            .filter(|descriptor| !descriptor.is_empty())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE,
+    );
+    let verification_span_lookup_queries = http_rollup_query_chunks(
+        batch
+            .task_verifications
+            .iter()
+            .flat_map(|verification| verification.action.span_ids())
+            .filter_map(|span_id| {
+                let value = span_id.0.trim();
+                (!value.is_empty()).then_some(value)
+            })
+            .collect::<BTreeSet<_>>()
+            .len(),
+        HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE,
+    );
+    let write_queries = batch
+        .task_buckets
+        .iter()
+        .map(estimate_task_bucket_write_queries)
+        .sum::<usize>()
+        + batch.task_verifications.len();
+
+    source_lookup_queries
+        + project_lookup_queries
+        + verification_span_lookup_queries
+        + write_queries
+}
+
+fn estimate_task_bucket_write_queries(bucket: &TaskBucketSnapshot) -> usize {
+    let member_work_item_ids_by_span_id = bucket
+        .members
+        .iter()
+        .map(|member| (member.span_id.0.as_str(), member.work_item_id.0.as_str()))
+        .collect::<HashMap<_, _>>();
+    let spans_by_id = bucket
+        .spans
+        .iter()
+        .map(|span| (span.span_id.0.as_str(), span))
+        .collect::<HashMap<_, _>>();
+    4 + count_task_sync_json_chunks(&bucket.spans, |span| {
+        estimate_task_sync_span_insert_row_json(
+            span,
+            member_work_item_ids_by_span_id
+                .get(span.span_id.0.as_str())
+                .copied(),
+        )
+    }) + count_task_sync_json_chunks(&bucket.work_items, |work_item| {
+        estimate_task_sync_work_item_insert_row_json(
+            work_item,
+            spans_by_id
+                .get(work_item.anchor_span_id.0.as_str())
+                .copied(),
+        )
+    }) + count_task_sync_json_chunks(&bucket.members, estimate_task_sync_member_insert_row_json)
+}
+
+fn count_task_sync_json_chunks<T>(rows: &[T], serialize_row: impl Fn(&T) -> String) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let mut chunk_count = 0usize;
+    let mut current_row_count = 0usize;
+    let mut current_bytes = 2usize;
+    for row in rows {
+        let serialized = serialize_row(row);
+        let row_bytes = serialized.len();
+        let next_bytes = if current_row_count == 0 {
+            2 + row_bytes
+        } else {
+            current_bytes + 1 + row_bytes
+        };
+        if current_row_count > 0
+            && (current_row_count >= TASK_SYNC_SQL_MAX_ROWS_PER_CHUNK
+                || next_bytes > TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK)
+        {
+            chunk_count += 1;
+            current_row_count = 0;
+            current_bytes = 2;
+        }
+        current_row_count += 1;
+        current_bytes = if current_row_count == 1 {
+            2 + row_bytes
+        } else {
+            current_bytes + 1 + row_bytes
+        };
+    }
+    chunk_count + usize::from(current_row_count > 0)
+}
+
+fn estimate_task_sync_project_fields(span: &TaskSpan) -> (Option<&str>, Option<String>) {
+    let Some(project) = span.project.as_ref() else {
+        return (None, None);
+    };
+    let project_location_id = [
+        project.path_hash.as_deref(),
+        project.repo_remote_hash.as_deref(),
+        Some(project.project_id.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join(":");
+    (
+        Some(project.project_id.as_str()),
+        (!project_location_id.is_empty()).then_some(project_location_id),
+    )
+}
+
+fn estimate_task_sync_span_insert_row_json(span: &TaskSpan, work_item_id: Option<&str>) -> String {
+    let (project_id, project_location_id) = estimate_task_sync_project_fields(span);
+    json!({
+        "span_id": span.span_id.0,
+        "work_item_id": work_item_id,
+        "provider": span.provider,
+        "provider_account_id": Value::Null,
+        "project_id": project_id,
+        "project_location_id": project_location_id,
+        "started_at": span.started_at.to_rfc3339(),
+        "ended_at": span.ended_at.map(|timestamp| timestamp.to_rfc3339()),
+        "payload_json": serde_json::to_string(span).unwrap_or_default(),
+    })
+    .to_string()
+}
+
+fn estimate_task_sync_work_item_insert_row_json(
+    work_item: &WorkItem,
+    anchor_span: Option<&TaskSpan>,
+) -> String {
+    let (project_id, project_location_id) = anchor_span
+        .map(estimate_task_sync_project_fields)
+        .unwrap_or((None, None));
+    json!({
+        "work_item_id": work_item.work_item_id.0,
+        "anchor_span_id": work_item.anchor_span_id.0,
+        "status": work_item.status,
+        "confidence": work_item.confidence,
+        "started_at": work_item.started_at.to_rfc3339(),
+        "ended_at": work_item.ended_at.to_rfc3339(),
+        "project_id": project_id,
+        "project_location_id": project_location_id,
+        "payload_json": serde_json::to_string(work_item).unwrap_or_default(),
+    })
+    .to_string()
+}
+
+fn estimate_task_sync_member_insert_row_json(member: &statsai_core::WorkItemMember) -> String {
+    json!({
+        "work_item_id": member.work_item_id.0,
+        "span_id": member.span_id.0,
+        "ordinal": member.ordinal,
+    })
+    .to_string()
 }
 
 fn http_rollup_query_chunks(item_count: usize, chunk_size: usize) -> usize {
@@ -3032,6 +4505,8 @@ fn split_http_rollup_summary_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec
             chunk.subscriptions.clear();
             chunk.events.clear();
             chunk.summaries = summaries.to_vec();
+            chunk.task_buckets.clear();
+            chunk.task_verifications.clear();
             chunk
         })
         .collect()
@@ -3046,10 +4521,12 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
     chunk.subscriptions.clear();
     chunk.events.clear();
     chunk.summaries.clear();
+    chunk.task_buckets.clear();
+    chunk.task_verifications.clear();
     chunk
 }
 
-fn sync_status(store: &Store) -> Result<()> {
+fn sync_status(store: &Store, device_id: &str) -> Result<()> {
     let states = store.list_sync_states()?;
     if states.is_empty() {
         println!("no sync state recorded");
@@ -3057,8 +4534,10 @@ fn sync_status(store: &Store) -> Result<()> {
     }
     for state in states {
         let display_batch_id = logical_http_rollup_batch_id(&state.last_batch_id);
+        let task_bucket_status =
+            store.task_bucket_sync_status(&state.sink, &state.target, device_id)?;
         println!(
-            "{} target={} last_success={} batch={} event_cursor={} summary_cursor={} failures={}",
+            "{} target={} last_success={} batch={} event_cursor={} summary_cursor={} task_verification_cursor={} task_bucket_backlog={}/{} failures={}",
             state.sink,
             state.target,
             state.last_success_at.to_rfc3339(),
@@ -3077,6 +4556,15 @@ fn sync_status(store: &Store) -> Result<()> {
                     .map(DateTime::to_rfc3339),
                 state.last_summary_id.as_deref()
             ),
+            format_cursor(
+                state
+                    .last_task_verification_updated_at
+                    .as_ref()
+                    .map(DateTime::to_rfc3339),
+                state.last_task_verification_id.as_deref()
+            ),
+            task_bucket_status.dirty,
+            task_bucket_status.total,
             state.failure_count
         );
     }
@@ -3100,7 +4588,13 @@ fn sync_http_verify(command: SyncCommand, store: &Store, device_id: &str) -> Res
         target: endpoint.clone(),
         endpoint: endpoint.clone(),
         device_id: device_id.to_string(),
-        local: sync_local_verify(store, "http", &endpoint, local_state.as_ref())?,
+        local: sync_local_verify(
+            store,
+            "http",
+            &endpoint,
+            local_state.as_ref(),
+            command.include_projects,
+        )?,
         remote: http_remote_verify(&endpoint, &auth_token)?,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3112,6 +4606,7 @@ fn sync_local_verify(
     sink: &str,
     target: &str,
     local_state: Option<&SyncState>,
+    include_projects: bool,
 ) -> Result<SyncLocalVerify> {
     let all_sources = store.list_sources()?;
     let all_accounts = store.list_accounts()?;
@@ -3140,13 +4635,13 @@ fn sync_local_verify(
     let passthrough_summaries: Vec<_> = store
         .summaries()?
         .into_iter()
-        .map(sanitize_summary_for_sync)
+        .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
         .filter(is_http_rollup_passthrough_summary)
         .collect();
     let rollup_summaries: Vec<_> = store
         .all_sync_rollup_summaries()?
         .into_iter()
-        .map(sanitize_summary_for_sync)
+        .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
         .collect();
 
     Ok(SyncLocalVerify {
@@ -3296,6 +4791,13 @@ struct SyncStateReport {
     failure_count: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct TaskVerificationFeedResponse {
+    #[serde(default)]
+    verifications: Vec<TaskVerification>,
+    next_cursor: Option<TaskVerificationCursor>,
+}
+
 fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
     let url = http_verify_status_url(endpoint)?;
     let request = ureq::get(&url).set("Authorization", &format!("Bearer {auth_token}"));
@@ -3361,6 +4863,14 @@ fn http_reset_url(endpoint: &str) -> Result<String> {
     )
 }
 
+fn http_task_verification_feed_url(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim_end_matches('/');
+    if let Some(prefix) = endpoint.strip_suffix("/api/sync/batches") {
+        return Some(format!("{prefix}/api/task-sync/verifications"));
+    }
+    None
+}
+
 fn http_request_error(action: &str, error: ureq::Error) -> anyhow::Error {
     match error {
         ureq::Error::Status(code, response) => {
@@ -3369,6 +4879,36 @@ fn http_request_error(action: &str, error: ureq::Error) -> anyhow::Error {
         }
         other => anyhow::anyhow!("HTTP {action} failed: {other}"),
     }
+}
+
+fn http_remote_hosted_tasks_enabled(command: &SyncCommand, endpoint: &str) -> Result<bool> {
+    let Some(preflight_url) = http_preflight_status_url(endpoint).ok() else {
+        return Ok(true);
+    };
+    let Some(auth_token) = resolve_http_auth_token(command, false)? else {
+        return Ok(true);
+    };
+    let request = ureq::get(&preflight_url).set("Authorization", &format!("Bearer {auth_token}"));
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) if optional_http_sync_preflight_status(code) => {
+            return Ok(true);
+        }
+        Err(error) => return Err(http_request_error("load sync preflight status", error)),
+    };
+    let remote = http_response_json(response, "load sync preflight status")?;
+    Ok(remote_hosted_tasks_enabled(&remote))
+}
+
+fn remote_hosted_tasks_enabled(remote: &Value) -> bool {
+    remote
+        .pointer("/capabilities/hostedTasks")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn optional_http_sync_preflight_status(status: u16) -> bool {
+    matches!(status, 404 | 405 | 501)
 }
 
 fn http_response_json(response: ureq::Response, action: &str) -> Result<Value> {
@@ -3416,6 +4956,8 @@ fn strip_one_http_rollup_batch_suffix(batch_id: &str) -> String {
         "_accounts_",
         "_assignments_",
         "_subscriptions_",
+        "_task_buckets_",
+        "_task_verifications_",
     ] {
         if let Some(index) = batch_id.rfind(marker) {
             let suffix = &batch_id[(index + marker.len())..];
@@ -4931,57 +6473,62 @@ fn path_label_from_hashless_source(source: &SourceLocation) -> Option<String> {
     }
 }
 
-fn print_scan_preview_line(
-    source: &SourceLocation,
+struct ScanPreviewLine<'a> {
+    source: &'a SourceLocation,
     usage_events: u64,
-    usage: &UsageTotals,
+    usage: &'a UsageTotals,
     summaries: u64,
-    summary_usage: &UsageTotals,
-    diagnostics: &ScanDiagnostics,
+    task_spans: u64,
+    summary_usage: &'a UsageTotals,
+    diagnostics: &'a ScanDiagnostics,
     verbose: bool,
-) {
-    if verbose {
+}
+
+fn print_scan_preview_line(line: ScanPreviewLine<'_>) {
+    if line.verbose {
         println!(
-            "{} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
-            source.provider,
-            preview_path_label(source),
-            usage_events,
-            summaries,
-            format_u64(usage.input_tokens),
-            format_u64(usage.cache_creation_tokens),
-            format_u64(usage.cached_input_tokens),
-            format_u64(usage.output_tokens),
-            format_u64(usage.total_tokens),
-            format_cost(usage.estimated_cost_usd),
-            format_u64(summary_usage.total_tokens),
-            format_cost(summary_usage.estimated_cost_usd),
-            format_u64(diagnostics.raw_rows),
-            format_u64(diagnostics.candidate_usage_rows),
-            format_u64(diagnostics.duplicate_events),
-            format_u64(diagnostics.skipped_zero_events),
-            format_u64(diagnostics.invalid_rows),
-            format_u64(diagnostics.files_scanned),
-            format_u64(diagnostics.files_skipped_unchanged),
-            format_u64(diagnostics.timestamp_fallbacks),
-            format_u64(diagnostics.model_fallbacks),
-            location_origin_label(&source.location_origin),
-            source.source_id.0
+            "{} path={} usage_events={} summaries={} task_spans={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
+            line.source.provider,
+            preview_path_label(line.source),
+            line.usage_events,
+            line.summaries,
+            line.task_spans,
+            format_u64(line.usage.input_tokens),
+            format_u64(line.usage.cache_creation_tokens),
+            format_u64(line.usage.cached_input_tokens),
+            format_u64(line.usage.output_tokens),
+            format_u64(line.usage.total_tokens),
+            format_cost(line.usage.estimated_cost_usd),
+            format_u64(line.summary_usage.total_tokens),
+            format_cost(line.summary_usage.estimated_cost_usd),
+            format_u64(line.diagnostics.raw_rows),
+            format_u64(line.diagnostics.candidate_usage_rows),
+            format_u64(line.diagnostics.duplicate_events),
+            format_u64(line.diagnostics.skipped_zero_events),
+            format_u64(line.diagnostics.invalid_rows),
+            format_u64(line.diagnostics.files_scanned),
+            format_u64(line.diagnostics.files_skipped_unchanged),
+            format_u64(line.diagnostics.timestamp_fallbacks),
+            format_u64(line.diagnostics.model_fallbacks),
+            location_origin_label(&line.source.location_origin),
+            line.source.source_id.0
         );
     } else {
         println!(
-            "{} path={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={}",
-            source.provider,
-            preview_path_label(source),
-            usage_events,
-            summaries,
-            format_u64(usage.input_tokens),
-            format_u64(usage.cache_creation_tokens),
-            format_u64(usage.cached_input_tokens),
-            format_u64(usage.output_tokens),
-            format_u64(usage.total_tokens),
-            format_cost(usage.estimated_cost_usd),
-            format_u64(summary_usage.total_tokens),
-            format_cost(summary_usage.estimated_cost_usd)
+            "{} path={} usage_events={} summaries={} task_spans={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={}",
+            line.source.provider,
+            preview_path_label(line.source),
+            line.usage_events,
+            line.summaries,
+            line.task_spans,
+            format_u64(line.usage.input_tokens),
+            format_u64(line.usage.cache_creation_tokens),
+            format_u64(line.usage.cached_input_tokens),
+            format_u64(line.usage.output_tokens),
+            format_u64(line.usage.total_tokens),
+            format_cost(line.usage.estimated_cost_usd),
+            format_u64(line.summary_usage.total_tokens),
+            format_cost(line.summary_usage.estimated_cost_usd)
         );
     }
 }
@@ -5098,6 +6645,101 @@ fn scan_file_cache_keys(entries: &[ScanFileStateEntry]) -> Vec<String> {
         .iter()
         .map(|entry| entry.cache_key.clone())
         .collect()
+}
+
+fn rewrite_task_span_linked_event_ids(
+    task_spans: &mut [TaskSpan],
+    canonical_event_ids: &HashMap<EventId, EventId>,
+) {
+    for span in task_spans {
+        if span.linked_event_ids.is_empty() {
+            continue;
+        }
+        let mut rewritten = Vec::with_capacity(span.linked_event_ids.len());
+        let mut seen = HashSet::new();
+        for event_id in &span.linked_event_ids {
+            let canonical = canonical_event_ids
+                .get(event_id)
+                .cloned()
+                .unwrap_or_else(|| event_id.clone());
+            if seen.insert(canonical.clone()) {
+                rewritten.push(canonical);
+            }
+        }
+        span.linked_event_ids = rewritten;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TaskSpanRuntimeRollup {
+    total_messages: u64,
+    user_messages: u64,
+    assistant_messages: u64,
+    developer_messages: u64,
+}
+
+fn populate_task_span_rollups(
+    task_spans: &mut [TaskSpan],
+    events: &[UsageEvent],
+    canonical_event_ids: &HashMap<EventId, EventId>,
+) {
+    let mut event_rollups = HashMap::<String, TaskSpanRuntimeRollup>::new();
+    for event in events {
+        let canonical_event_id = canonical_event_ids
+            .get(&event.event_id)
+            .unwrap_or(&event.event_id)
+            .0
+            .clone();
+        event_rollups
+            .entry(canonical_event_id)
+            .or_insert_with(|| task_span_runtime_rollup(event));
+    }
+
+    for span in task_spans {
+        let mut total_messages = 0u64;
+        let mut user_messages = 0u64;
+        let mut assistant_messages = 0u64;
+        let mut developer_messages = 0u64;
+        let mut seen_event_ids = HashSet::<String>::new();
+        for event_id in &span.linked_event_ids {
+            if !seen_event_ids.insert(event_id.0.clone()) {
+                continue;
+            }
+            let Some(rollup) = event_rollups.get(&event_id.0) else {
+                continue;
+            };
+            total_messages = total_messages.saturating_add(rollup.total_messages);
+            user_messages = user_messages.saturating_add(rollup.user_messages);
+            assistant_messages = assistant_messages.saturating_add(rollup.assistant_messages);
+            developer_messages = developer_messages.saturating_add(rollup.developer_messages);
+        }
+        span.event_count = span.event_count.max(seen_event_ids.len() as u64);
+        span.has_usage_evidence = span.has_usage_evidence || span.event_count > 0;
+        span.total_messages = span.total_messages.max(total_messages);
+        span.user_messages = span.user_messages.max(user_messages);
+        span.assistant_messages = span.assistant_messages.max(assistant_messages);
+        span.developer_messages = span.developer_messages.max(developer_messages);
+    }
+}
+
+fn task_span_runtime_rollup(event: &UsageEvent) -> TaskSpanRuntimeRollup {
+    let Some(runtime) = event.runtime.as_ref() else {
+        return TaskSpanRuntimeRollup::default();
+    };
+    let user_messages = runtime.user_messages.unwrap_or(0);
+    let assistant_messages = runtime.assistant_messages.unwrap_or(0);
+    let developer_messages = runtime.developer_messages.unwrap_or(0);
+    let total_messages = runtime.total_messages.unwrap_or_else(|| {
+        user_messages
+            .saturating_add(assistant_messages)
+            .saturating_add(developer_messages)
+    });
+    TaskSpanRuntimeRollup {
+        total_messages,
+        user_messages,
+        assistant_messages,
+        developer_messages,
+    }
 }
 
 fn format_cache_key_sample<'a>(keys: impl IntoIterator<Item = &'a str>) -> String {
@@ -5367,6 +7009,14 @@ fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
     event
 }
 
+fn sanitize_event_for_sync_with_projects(event: UsageEvent, include_projects: bool) -> UsageEvent {
+    let mut event = sanitize_event_for_sync(event);
+    if !include_projects {
+        event.project = None;
+    }
+    event
+}
+
 fn sanitize_project_for_sync(project: ProjectInfo) -> Option<ProjectInfo> {
     statsai_core::sanitize_project_for_sync(project)
 }
@@ -5542,6 +7192,17 @@ fn sanitize_summary_for_sync(summary: UsageSummary) -> UsageSummary {
     statsai_core::sanitize_summary_for_sync(summary)
 }
 
+fn sanitize_summary_for_sync_with_projects(
+    summary: UsageSummary,
+    include_projects: bool,
+) -> UsageSummary {
+    let mut summary = sanitize_summary_for_sync(summary);
+    if !include_projects {
+        summary.project = None;
+    }
+    summary
+}
+
 fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
     summary.metadata.summary_format == "daily_rollup.v1"
 }
@@ -5617,13 +7278,17 @@ fn sanitize_subscription_for_sync(mut subscription: Subscription) -> Subscriptio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{DateTime, Duration, TimeZone};
     use statsai_core::{
-        event_id, hash_text, subscription_id, summary_id, BillingPeriod, CostInfo, EventSource,
-        IdentitySource, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo,
-        ProviderAccount, SessionInfo, SourceKind, Subscription, SubscriptionStatus,
-        SummaryMetadata, UsageCounts, UsageSummary, PROVIDER_ACCOUNT_SCHEMA_VERSION,
-        SUBSCRIPTION_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+        branch_family, event_id, hash_text, normalize_task_title, project_bucket_key,
+        subscription_id, summary_id, task_span_id, BillingPeriod, Confidence, CostInfo,
+        EventSource, IdentitySource, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode,
+        ProjectInfo, ProviderAccount, SessionInfo, SourceKind, Subscription, SubscriptionStatus,
+        SummaryMetadata, TaskBucketSnapshot, TaskSpan, TaskSpanId, TaskStatus, TaskVerdict,
+        TaskVerification, TaskVerificationAction, TaskVerificationId, UsageCounts, UsageSummary,
+        WorkItem, WorkItemId, WorkItemMember, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+        SUBSCRIPTION_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION, TASK_VERIFICATION_SCHEMA_VERSION,
+        USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
     };
     use std::path::Path;
 
@@ -7872,6 +9537,109 @@ mod tests {
     }
 
     #[test]
+    fn source_remove_delete_data_clears_task_spans_and_rebuilds_surviving_work_items() {
+        let store = Store::in_memory().expect("store");
+        let source_a = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-source-remove-a"),
+            LocationOrigin::Configured,
+        );
+        let source_b = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-source-remove-b"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source_a).expect("source a");
+        store.upsert_source(&source_b).expect("source b");
+
+        let started_at_a = Utc
+            .with_ymd_and_hms(2026, 6, 1, 10, 0, 0)
+            .single()
+            .expect("started_at_a");
+        let started_at_b = started_at_a + Duration::days(10);
+        let event_a = test_scan_event(
+            &source_a,
+            "/tmp/codex-source-remove-a/session.jsonl",
+            started_at_a,
+            "event-a",
+            100,
+        );
+        let event_b = test_scan_event(
+            &source_b,
+            "/tmp/codex-source-remove-b/session.jsonl",
+            started_at_b,
+            "event-b",
+            120,
+        );
+        store.insert_event(&event_a).expect("event a");
+        store.insert_event(&event_b).expect("event b");
+
+        let mut span_a = test_task_span(
+            &source_a,
+            "/tmp/codex-source-remove-a/session.jsonl",
+            started_at_a,
+            "span-a",
+            "Implement source delete cleanup alpha",
+            &event_a,
+        );
+        span_a.session_id = Some("session-a".to_string());
+        let mut span_b = test_task_span(
+            &source_b,
+            "/tmp/codex-source-remove-b/session.jsonl",
+            started_at_b,
+            "span-b",
+            "Implement source delete cleanup beta",
+            &event_b,
+        );
+        span_b.session_id = Some("session-b".to_string());
+        store
+            .upsert_task_spans(&[span_a.clone(), span_b.clone()])
+            .expect("task spans");
+        store
+            .rebuild_task_work_items_for_project_buckets(&BTreeSet::from([span_a
+                .project_bucket
+                .clone()]))
+            .expect("rebuild");
+
+        assert_eq!(store.task_spans().expect("task spans before").len(), 2);
+        assert_eq!(store.work_items().expect("work items before").len(), 2);
+
+        source(
+            SourceCommand {
+                command: SourceSubcommand::Remove {
+                    source_id: source_a.source_id.0.clone(),
+                    delete_data: true,
+                },
+            },
+            &store,
+        )
+        .expect("remove source");
+
+        assert!(store
+            .source(&source_a.source_id)
+            .expect("source a lookup")
+            .is_none());
+        assert!(store
+            .source(&source_b.source_id)
+            .expect("source b lookup")
+            .is_some());
+
+        let spans = store.task_spans().expect("task spans after");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].source_id, source_b.source_id);
+        assert_eq!(spans[0].span_id, span_b.span_id);
+
+        let work_items = store.work_items().expect("work items after");
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(work_items[0].anchor_span_id, span_b.span_id);
+        assert_eq!(work_items[0].total_tokens, 120);
+    }
+
+    #[test]
     fn subscription_change_closes_existing_period() {
         let store = Store::in_memory().expect("store");
 
@@ -8813,6 +10581,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
@@ -8926,6 +10696,8 @@ mod tests {
             subscriptions,
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
@@ -8989,6 +10761,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
         let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
@@ -9077,6 +10851,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
         let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
@@ -9404,6 +11180,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries: vec![],
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
@@ -9432,6 +11210,165 @@ mod tests {
         assert!(chunks.iter().all(|chunk| chunk.events.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.sources.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.accounts.is_empty()));
+    }
+
+    #[test]
+    fn http_rollup_retry_splits_mixed_task_payloads() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+
+        assert!(should_retry_http_rollup_chunk_after_error(
+            &batch,
+            &anyhow::anyhow!(
+                r#"sync endpoint returned HTTP 413: {{"error":"sync_batch_too_large"}}"#
+            ),
+        ));
+
+        let chunks = split_http_rollup_sync_batch_after_budget_error(&batch);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.task_buckets.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.task_verifications.len())
+                .sum::<usize>(),
+            1
+        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| { chunk.task_buckets.is_empty() || chunk.task_verifications.is_empty() }));
+    }
+
+    #[test]
+    fn http_rollup_retry_halves_task_only_bucket_chunks() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 3, 0);
+
+        assert!(should_retry_http_rollup_chunk_after_error(
+            &batch,
+            &anyhow::anyhow!(
+                r#"sync endpoint returned HTTP 413: {{"error":"sync_batch_d1_query_budget_exceeded"}}"#
+            ),
+        ));
+
+        let chunks = split_http_rollup_sync_batch_after_budget_error(&batch);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].task_buckets.len(), 2);
+        assert_eq!(chunks[1].task_buckets.len(), 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.task_verifications.is_empty()));
+    }
+
+    #[test]
+    fn record_sync_batch_success_marks_task_entities_synced_for_file_sink() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let store = Store::in_memory().expect("store");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+        for bucket in &batch.task_buckets {
+            store
+                .replace_task_bucket_snapshot(bucket)
+                .expect("seed task bucket snapshot");
+        }
+        for verification in &batch.task_verifications {
+            store
+                .merge_task_verification(verification)
+                .expect("seed task verification");
+        }
+
+        record_sync_batch_success(&store, "file", "/tmp/statsai-sync-batch.json", &batch)
+            .expect("record sync batch success");
+
+        assert!(store
+            .pending_task_bucket_snapshots_for_sync(
+                "file",
+                "/tmp/statsai-sync-batch.json",
+                &batch.device_id,
+                false,
+                None,
+            )
+            .expect("pending task buckets")
+            .is_empty());
+        assert!(store
+            .pending_task_verifications_for_sync("file", "/tmp/statsai-sync-batch.json")
+            .expect("pending task verifications")
+            .is_empty());
+    }
+
+    #[test]
+    fn http_rollup_sends_metadata_before_task_chunks() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-metadata-before-task"),
+            LocationOrigin::Configured,
+        );
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_metadata_before_task".to_string(),
+            device_id: "device".to_string(),
+            sources: vec![source],
+            accounts: vec![],
+            source_account_assignments: vec![],
+            subscriptions: vec![],
+            events: vec![],
+            summaries: vec![],
+            task_buckets: test_task_only_sync_batch(now, 1, 0).task_buckets,
+            task_verifications: vec![],
+            created_at: now,
+        };
+
+        let chunks = split_http_rollup_sync_batches(&batch);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].sources.len(), 1);
+        assert!(chunks[0].task_buckets.is_empty());
+        assert!(chunks[1].sources.is_empty());
+        assert_eq!(chunks[1].task_buckets.len(), 1);
+    }
+
+    #[test]
+    fn custom_http_sinks_skip_task_verification_feed_derivation() {
+        assert_eq!(
+            http_task_verification_feed_url("https://example.com/custom-sync"),
+            None
+        );
+        assert_eq!(
+            http_task_verification_feed_url("https://api.example.com/api/sync/batches"),
+            Some("https://api.example.com/api/task-sync/verifications".to_string())
+        );
+    }
+
+    #[test]
+    fn optional_task_verification_feed_statuses_do_not_fail_sync() {
+        assert!(optional_task_verification_feed_status(404));
+        assert!(optional_task_verification_feed_status(405));
+        assert!(optional_task_verification_feed_status(501));
+        assert!(!optional_task_verification_feed_status(400));
+        assert!(!optional_task_verification_feed_status(429));
+        assert!(!optional_task_verification_feed_status(500));
     }
 
     #[test]
@@ -9480,6 +11417,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
@@ -9540,11 +11479,474 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries: vec![summary],
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
         assert_eq!(http_rollup_project_count(&batch), 1);
         assert_eq!(http_rollup_project_location_count(&batch), 1);
+    }
+
+    fn test_task_only_sync_batch(
+        now: DateTime<Utc>,
+        bucket_count: usize,
+        verification_count: usize,
+    ) -> SyncBatch {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollup-task-only"),
+            LocationOrigin::Configured,
+        );
+        let task_buckets = (0..bucket_count)
+            .map(|index| {
+                let started_at = now + Duration::minutes(index as i64);
+                let ended_at = started_at + Duration::minutes(5);
+                let span_id = TaskSpanId(format!("span-task-{index}"));
+                let work_item_id = WorkItemId(format!("work-task-{index}"));
+                TaskBucketSnapshot {
+                    project_bucket: format!("bucket-task-{index}"),
+                    generated_at: ended_at,
+                    applied_verification_cursor: None,
+                    work_items: vec![WorkItem {
+                        schema_version: WORK_ITEM_SCHEMA_VERSION.to_string(),
+                        work_item_id: work_item_id.clone(),
+                        anchor_span_id: span_id.clone(),
+                        tail_span_id: span_id.clone(),
+                        project_bucket: format!("bucket-task-{index}"),
+                        title: format!("Task {index}"),
+                        normalized_title: format!("task {index}"),
+                        status: TaskStatus::NeedsReview,
+                        confidence: Confidence::Medium,
+                        started_at,
+                        ended_at,
+                        duration_seconds: Some(300),
+                        span_count: 1,
+                        event_count: 1,
+                        total_input_tokens: 10,
+                        total_cache_creation_tokens: 0,
+                        total_cache_read_tokens: 0,
+                        total_output_tokens: 5,
+                        total_reasoning_tokens: 0,
+                        total_tokens: 15,
+                        estimated_cost_usd: Some(25),
+                        providers: vec!["codex".to_string()],
+                        issue_keys: Vec::new(),
+                        repo_label: Some("statsai/repo".to_string()),
+                        branch_labels: vec!["main".to_string()],
+                        path_label: Some("/workspace/statsai".to_string()),
+                        summary_preview: None,
+                        todo_excerpt: None,
+                        no_git: false,
+                        cross_provider: false,
+                        continuation_reasons: Vec::new(),
+                        review_reasons: vec!["needs_review".to_string()],
+                    }],
+                    members: vec![WorkItemMember {
+                        work_item_id,
+                        span_id: span_id.clone(),
+                        ordinal: 0,
+                    }],
+                    spans: vec![TaskSpan {
+                        schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                        span_id,
+                        provider: "codex".to_string(),
+                        source_id: source.source_id.clone(),
+                        span_kind: "codex_task".to_string(),
+                        source_record_id: None,
+                        source_file_path_hash: None,
+                        summary_id: None,
+                        session_id: Some(format!("session-task-{index}")),
+                        thread_id: Some(format!("thread-task-{index}")),
+                        title: format!("Task {index}"),
+                        normalized_title: format!("task {index}"),
+                        title_source: Some("thread_name".to_string()),
+                        summary_preview: None,
+                        todo_excerpt: None,
+                        issue_keys: Vec::new(),
+                        branch_family: Some("main".to_string()),
+                        project_bucket: format!("bucket-task-{index}"),
+                        project: None,
+                        git: None,
+                        usage: UsageCounts {
+                            input_tokens: Some(10),
+                            output_tokens: Some(5),
+                            total_tokens: Some(15),
+                            requests: Some(1),
+                            ..UsageCounts::default()
+                        },
+                        estimated_cost_usd: Some(25),
+                        event_count: 1,
+                        has_usage_evidence: true,
+                        total_messages: 2,
+                        user_messages: 1,
+                        assistant_messages: 1,
+                        developer_messages: 0,
+                        linked_event_ids: Vec::new(),
+                        confidence: Confidence::High,
+                        is_meta: false,
+                        started_at,
+                        ended_at: Some(ended_at),
+                        duration_seconds: Some(300),
+                    }],
+                }
+            })
+            .collect::<Vec<_>>();
+        let task_verifications = (0..verification_count)
+            .map(|index| {
+                let timestamp = now + Duration::minutes(index as i64);
+                TaskVerification {
+                    schema_version: TASK_VERIFICATION_SCHEMA_VERSION.to_string(),
+                    verification_id: TaskVerificationId(format!("tvf-task-{index}")),
+                    action_key: format!("status:span-task-{index}"),
+                    action: TaskVerificationAction::Reject {
+                        work_item_id: WorkItemId(format!("work-task-{index}")),
+                        anchor_span_id: TaskSpanId(format!("span-task-{index}")),
+                        reason: TaskVerdict::Meta,
+                    },
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_task_only".to_string(),
+            device_id: "device".to_string(),
+            sources: Vec::new(),
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: Vec::new(),
+            task_buckets,
+            task_verifications,
+            created_at: now,
+        }
+    }
+
+    fn test_dense_task_only_sync_batch(now: DateTime<Utc>, span_count: usize) -> SyncBatch {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollup-dense-task-only"),
+            LocationOrigin::Configured,
+        );
+        let spans = (0..span_count)
+            .map(|index| {
+                let started_at = now + Duration::minutes(index as i64);
+                let ended_at = started_at + Duration::minutes(1);
+                TaskSpan {
+                    schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                    span_id: TaskSpanId(format!("dense-span-{index}")),
+                    provider: "codex".to_string(),
+                    source_id: source.source_id.clone(),
+                    span_kind: "codex_task".to_string(),
+                    source_record_id: None,
+                    source_file_path_hash: None,
+                    summary_id: None,
+                    session_id: Some(format!("dense-session-{index}")),
+                    thread_id: Some(format!("dense-thread-{index}")),
+                    title: format!("Dense task {index}"),
+                    normalized_title: format!("dense task {index}"),
+                    title_source: Some("thread_name".to_string()),
+                    summary_preview: None,
+                    todo_excerpt: None,
+                    issue_keys: Vec::new(),
+                    branch_family: Some("main".to_string()),
+                    project_bucket: "dense-bucket".to_string(),
+                    project: Some(ProjectInfo {
+                        project_id: "project-dense".to_string(),
+                        project_label: Some("Dense".to_string()),
+                        repo_remote_hash: Some("repo-dense".to_string()),
+                        repo_label: Some("statsai/dense".to_string()),
+                        branch_hash: Some("branch-dense".to_string()),
+                        branch_label: Some("main".to_string()),
+                        path_hash: Some("path-dense".to_string()),
+                        path_label: Some("/workspace/dense".to_string()),
+                    }),
+                    git: None,
+                    usage: UsageCounts {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        total_tokens: Some(15),
+                        requests: Some(1),
+                        ..UsageCounts::default()
+                    },
+                    estimated_cost_usd: Some(25),
+                    event_count: 1,
+                    has_usage_evidence: true,
+                    total_messages: 2,
+                    user_messages: 1,
+                    assistant_messages: 1,
+                    developer_messages: 0,
+                    linked_event_ids: Vec::new(),
+                    confidence: Confidence::High,
+                    is_meta: false,
+                    started_at,
+                    ended_at: Some(ended_at),
+                    duration_seconds: Some(60),
+                }
+            })
+            .collect::<Vec<_>>();
+        let members = spans
+            .iter()
+            .enumerate()
+            .map(|(index, span)| WorkItemMember {
+                work_item_id: WorkItemId("dense-work-item".to_string()),
+                span_id: span.span_id.clone(),
+                ordinal: index,
+            })
+            .collect::<Vec<_>>();
+        let last_span = spans.last().expect("last dense span");
+
+        SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_dense_task_only".to_string(),
+            device_id: "device".to_string(),
+            sources: Vec::new(),
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: Vec::new(),
+            task_buckets: vec![TaskBucketSnapshot {
+                project_bucket: "dense-bucket".to_string(),
+                generated_at: last_span.ended_at.expect("dense task bucket end timestamp"),
+                applied_verification_cursor: None,
+                work_items: vec![WorkItem {
+                    schema_version: WORK_ITEM_SCHEMA_VERSION.to_string(),
+                    work_item_id: WorkItemId("dense-work-item".to_string()),
+                    anchor_span_id: spans.first().expect("first dense span").span_id.clone(),
+                    tail_span_id: last_span.span_id.clone(),
+                    project_bucket: "dense-bucket".to_string(),
+                    title: "Dense task".to_string(),
+                    normalized_title: "dense task".to_string(),
+                    status: TaskStatus::NeedsReview,
+                    confidence: Confidence::Medium,
+                    started_at: spans.first().expect("first dense span").started_at,
+                    ended_at: last_span.ended_at.expect("dense task bucket end timestamp"),
+                    duration_seconds: Some((span_count as u64).saturating_mul(60)),
+                    span_count: span_count as u64,
+                    event_count: span_count as u64,
+                    total_input_tokens: (span_count as u64).saturating_mul(10),
+                    total_cache_creation_tokens: 0,
+                    total_cache_read_tokens: 0,
+                    total_output_tokens: (span_count as u64).saturating_mul(5),
+                    total_reasoning_tokens: 0,
+                    total_tokens: (span_count as u64).saturating_mul(15),
+                    estimated_cost_usd: Some((span_count as i64).saturating_mul(25)),
+                    providers: vec!["codex".to_string()],
+                    issue_keys: Vec::new(),
+                    repo_label: Some("statsai/dense".to_string()),
+                    branch_labels: vec!["main".to_string()],
+                    path_label: Some("/workspace/dense".to_string()),
+                    summary_preview: None,
+                    todo_excerpt: None,
+                    no_git: false,
+                    cross_provider: false,
+                    continuation_reasons: Vec::new(),
+                    review_reasons: vec!["needs_review".to_string()],
+                }],
+                members,
+                spans,
+            }],
+            task_verifications: Vec::new(),
+            created_at: now,
+        }
+    }
+
+    fn test_multi_bucket_dense_task_only_sync_batch(
+        now: DateTime<Utc>,
+        bucket_count: usize,
+        span_count_per_bucket: usize,
+    ) -> SyncBatch {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollup-multi-dense-task-only"),
+            LocationOrigin::Configured,
+        );
+        let task_buckets = (0..bucket_count)
+            .map(|bucket_index| {
+                let project_bucket = format!("dense-bucket-{bucket_index}");
+                let work_item_id = WorkItemId(format!("dense-work-item-{bucket_index}"));
+                let spans = (0..span_count_per_bucket)
+                    .map(|span_index| {
+                        let offset_minutes =
+                            (bucket_index * span_count_per_bucket + span_index) as i64;
+                        let started_at = now + Duration::minutes(offset_minutes);
+                        let ended_at = started_at + Duration::minutes(1);
+                        TaskSpan {
+                            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                            span_id: TaskSpanId(format!(
+                                "dense-bucket-{bucket_index}-span-{span_index}"
+                            )),
+                            provider: "codex".to_string(),
+                            source_id: source.source_id.clone(),
+                            span_kind: "codex_task".to_string(),
+                            source_record_id: None,
+                            source_file_path_hash: None,
+                            summary_id: None,
+                            session_id: Some(format!(
+                                "dense-bucket-{bucket_index}-session-{span_index}"
+                            )),
+                            thread_id: Some(format!(
+                                "dense-bucket-{bucket_index}-thread-{span_index}"
+                            )),
+                            title: format!("Dense task {bucket_index}-{span_index}"),
+                            normalized_title: format!("dense task {bucket_index}-{span_index}"),
+                            title_source: Some("thread_name".to_string()),
+                            summary_preview: None,
+                            todo_excerpt: None,
+                            issue_keys: Vec::new(),
+                            branch_family: Some("main".to_string()),
+                            project_bucket: project_bucket.clone(),
+                            project: Some(ProjectInfo {
+                                project_id: format!("project-dense-{bucket_index}"),
+                                project_label: Some(format!("Dense {bucket_index}")),
+                                repo_remote_hash: Some(format!("repo-dense-{bucket_index}")),
+                                repo_label: Some(format!("statsai/dense-{bucket_index}")),
+                                branch_hash: Some("branch-dense".to_string()),
+                                branch_label: Some("main".to_string()),
+                                path_hash: Some(format!("path-dense-{bucket_index}")),
+                                path_label: Some(format!("/workspace/dense-{bucket_index}")),
+                            }),
+                            git: None,
+                            usage: UsageCounts {
+                                input_tokens: Some(10),
+                                output_tokens: Some(5),
+                                total_tokens: Some(15),
+                                requests: Some(1),
+                                ..UsageCounts::default()
+                            },
+                            estimated_cost_usd: Some(25),
+                            event_count: 1,
+                            has_usage_evidence: true,
+                            total_messages: 2,
+                            user_messages: 1,
+                            assistant_messages: 1,
+                            developer_messages: 0,
+                            linked_event_ids: Vec::new(),
+                            confidence: Confidence::High,
+                            is_meta: false,
+                            started_at,
+                            ended_at: Some(ended_at),
+                            duration_seconds: Some(60),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let members = spans
+                    .iter()
+                    .enumerate()
+                    .map(|(span_index, span)| WorkItemMember {
+                        work_item_id: work_item_id.clone(),
+                        span_id: span.span_id.clone(),
+                        ordinal: span_index,
+                    })
+                    .collect::<Vec<_>>();
+                let first_span = spans.first().expect("first dense span");
+                let last_span = spans.last().expect("last dense span");
+                TaskBucketSnapshot {
+                    project_bucket: project_bucket.clone(),
+                    generated_at: last_span.ended_at.expect("dense task bucket end timestamp"),
+                    applied_verification_cursor: None,
+                    work_items: vec![WorkItem {
+                        schema_version: WORK_ITEM_SCHEMA_VERSION.to_string(),
+                        work_item_id: work_item_id.clone(),
+                        anchor_span_id: first_span.span_id.clone(),
+                        tail_span_id: last_span.span_id.clone(),
+                        project_bucket,
+                        title: format!("Dense task bucket {bucket_index}"),
+                        normalized_title: format!("dense task bucket {bucket_index}"),
+                        status: TaskStatus::NeedsReview,
+                        confidence: Confidence::Medium,
+                        started_at: first_span.started_at,
+                        ended_at: last_span.ended_at.expect("dense task bucket end timestamp"),
+                        duration_seconds: Some((span_count_per_bucket as u64).saturating_mul(60)),
+                        span_count: span_count_per_bucket as u64,
+                        event_count: span_count_per_bucket as u64,
+                        total_input_tokens: (span_count_per_bucket as u64).saturating_mul(10),
+                        total_cache_creation_tokens: 0,
+                        total_cache_read_tokens: 0,
+                        total_output_tokens: (span_count_per_bucket as u64).saturating_mul(5),
+                        total_reasoning_tokens: 0,
+                        total_tokens: (span_count_per_bucket as u64).saturating_mul(15),
+                        estimated_cost_usd: Some((span_count_per_bucket as i64).saturating_mul(25)),
+                        providers: vec!["codex".to_string()],
+                        issue_keys: Vec::new(),
+                        repo_label: Some(format!("statsai/dense-{bucket_index}")),
+                        branch_labels: vec!["main".to_string()],
+                        path_label: Some(format!("/workspace/dense-{bucket_index}")),
+                        summary_preview: None,
+                        todo_excerpt: None,
+                        no_git: false,
+                        cross_provider: false,
+                        continuation_reasons: Vec::new(),
+                        review_reasons: vec!["needs_review".to_string()],
+                    }],
+                    members,
+                    spans,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_multi_dense_task_only".to_string(),
+            device_id: "device".to_string(),
+            sources: Vec::new(),
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: Vec::new(),
+            task_buckets,
+            task_verifications: Vec::new(),
+            created_at: now,
+        }
+    }
+
+    #[test]
+    fn dense_single_task_bucket_stays_within_batched_d1_budget_estimate() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_dense_task_only_sync_batch(now, 240);
+
+        assert!(
+            estimate_http_rollup_d1_queries(&batch) <= HTTP_ROLLUP_D1_QUERY_BUDGET,
+            "dense single-bucket task sync should fit after batched task writes"
+        );
+    }
+
+    #[test]
+    fn multi_bucket_dense_task_sync_splits_to_fit_chunked_write_budget() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_multi_bucket_dense_task_only_sync_batch(now, 5, 600);
+
+        let chunks = split_http_rollup_sync_batches(&batch);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.task_buckets.len())
+                .sum::<usize>(),
+            batch.task_buckets.len()
+        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| estimate_http_rollup_d1_queries(chunk) <= HTTP_ROLLUP_D1_QUERY_BUDGET));
     }
 
     #[test]
@@ -9557,6 +11959,7 @@ mod tests {
                 "batch_1_part_2_of_2",
                 &[],
                 &[],
+                None,
             )
             .expect("record sync success");
         let local_state = store
@@ -9607,6 +12010,14 @@ mod tests {
         );
         assert_eq!(
             logical_http_rollup_batch_id("batch_1_subscriptions_2"),
+            "batch_1"
+        );
+        assert_eq!(
+            logical_http_rollup_batch_id("batch_1_task_buckets_2"),
+            "batch_1"
+        );
+        assert_eq!(
+            logical_http_rollup_batch_id("batch_1_part_3_of_9_task_verifications_4"),
             "batch_1"
         );
         assert_eq!(logical_http_rollup_batch_id("batch_1"), "batch_1");
@@ -9727,8 +12138,8 @@ mod tests {
             .sync_state("http", &target)
             .expect("state")
             .expect("present");
-        let local_verify =
-            sync_local_verify(&store, "http", &target, Some(&local_state)).expect("local verify");
+        let local_verify = sync_local_verify(&store, "http", &target, Some(&local_state), false)
+            .expect("local verify");
         assert_eq!(
             remote_metadata_gap_reason(
                 &json!({
@@ -9778,6 +12189,33 @@ mod tests {
             http_preflight_status_url("https://api.example.com/api/sync/batches").expect("status"),
             "https://api.example.com/api/sync/status?view=preflight"
         );
+    }
+
+    #[test]
+    fn remote_hosted_tasks_enabled_defaults_true_when_capability_missing() {
+        assert!(remote_hosted_tasks_enabled(&json!({
+            "device": {
+                "last_sync_batch_id": "batch-1"
+            }
+        })));
+    }
+
+    #[test]
+    fn remote_hosted_tasks_enabled_reads_explicit_false_capability() {
+        assert!(!remote_hosted_tasks_enabled(&json!({
+            "capabilities": {
+                "hostedTasks": false
+            }
+        })));
+    }
+
+    #[test]
+    fn optional_http_sync_preflight_statuses_do_not_disable_task_sync() {
+        assert!(optional_http_sync_preflight_status(404));
+        assert!(optional_http_sync_preflight_status(405));
+        assert!(optional_http_sync_preflight_status(501));
+        assert!(!optional_http_sync_preflight_status(400));
+        assert!(!optional_http_sync_preflight_status(500));
     }
 
     #[test]
@@ -10000,6 +12438,1876 @@ mod tests {
     }
 
     #[test]
+    fn scan_persists_task_spans_and_rebuilds_work_items() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-spans"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-spans/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 12, 9, 30, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "event-task", 150);
+        let task_span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "task-span-a",
+            "Implement local task collection",
+            &event,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(file_path, "sig-a")],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event],
+                task_spans: vec![task_span],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        let spans = store.task_spans().expect("task spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].title, "Implement local task collection");
+
+        let work_items = store.work_items().expect("work items");
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(work_items[0].title, "Implement local task collection");
+        assert_eq!(work_items[0].span_count, 1);
+        assert_eq!(work_items[0].total_tokens, 150);
+    }
+
+    #[test]
+    fn scan_rebuild_prefers_real_work_item_title_over_metric_spans() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-title-quality"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-title-quality/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 12, 10, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_a = test_scan_event(&source, file_path, started_at, "event-a", 200);
+        let event_b = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(1),
+            "event-b",
+            220,
+        );
+        let event_c = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "event-c",
+            240,
+        );
+        let span_metric = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "metric-a",
+            "Qwen3.5 8bit ckpt2400: F1_overlap=49.19 Avg_TIoU=74.88 MAE=1.85 TitleF1=39.34",
+            &event_a,
+        );
+        let span_coverage = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(1),
+            "metric-b",
+            "coverage=1.000 (100/100) F1@0.5=67.10 F1@0.7=51.60 MAE=2.230",
+            &event_b,
+        );
+        let span_intent = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "intent-c",
+            "I want to choose the best adapters to average",
+            &event_c,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(file_path, "sig-quality")],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event_a, event_b, event_c],
+                task_spans: vec![span_metric, span_coverage, span_intent],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        let work_items = store.work_items().expect("work items");
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(
+            work_items[0].title,
+            "I want to choose the best adapters to average"
+        );
+    }
+
+    #[test]
+    fn scan_preview_does_not_persist_task_tables() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-preview"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-preview/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 12, 9, 45, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "preview-event", 80);
+        let task_span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "preview-span",
+            "Preview task collection",
+            &event,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(file_path, "sig-preview")],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event],
+                task_spans: vec![task_span],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: true,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("preview scan");
+
+        assert_eq!(store.event_count().expect("event count"), 0);
+        assert_eq!(store.summary_count().expect("summary count"), 0);
+        assert!(store.task_spans().expect("task spans").is_empty());
+        assert!(store.work_items().expect("work items").is_empty());
+    }
+
+    #[test]
+    fn preview_task_rebuild_counts_only_affected_work_items() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-preview-rebuild"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_a = "/tmp/codex-task-preview-rebuild/a.jsonl";
+        let file_b = "/tmp/codex-task-preview-rebuild/b.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 12, 10, 30, 0)
+            .single()
+            .expect("started_at");
+        let event_a = test_scan_event(&source, file_a, started_at, "preview-a", 90);
+        let event_b = test_scan_event(
+            &source,
+            file_b,
+            started_at + Duration::minutes(10),
+            "preview-b",
+            110,
+        );
+        let mut span_a = test_task_span(
+            &source,
+            file_a,
+            started_at,
+            "preview-span-a",
+            "Preview rebuild task A",
+            &event_a,
+        );
+        let mut span_b = test_task_span(
+            &source,
+            file_b,
+            started_at + Duration::minutes(10),
+            "preview-span-b",
+            "Preview rebuild task B",
+            &event_b,
+        );
+        span_a.project = Some(ProjectInfo {
+            project_id: "project-a".to_string(),
+            project_label: Some("project-a".to_string()),
+            repo_remote_hash: Some("repo-a".to_string()),
+            repo_label: Some("owner/project-a".to_string()),
+            branch_hash: Some("branch-a".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-a".to_string()),
+            path_label: Some("/tmp/project-a".to_string()),
+        });
+        span_a.project_bucket = project_bucket_key(span_a.project.as_ref());
+        span_a.branch_family = branch_family(Some("main"));
+        span_b.project = Some(ProjectInfo {
+            project_id: "project-b".to_string(),
+            project_label: Some("project-b".to_string()),
+            repo_remote_hash: Some("repo-b".to_string()),
+            repo_label: Some("owner/project-b".to_string()),
+            branch_hash: Some("branch-b".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-b".to_string()),
+            path_label: Some("/tmp/project-b".to_string()),
+        });
+        span_b.project_bucket = project_bucket_key(span_b.project.as_ref());
+        span_b.branch_family = branch_family(Some("main"));
+
+        store
+            .insert_events(&[event_a.clone(), event_b.clone()])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_a.clone(), span_b.clone()])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let mut updated_span_a = span_a.clone();
+        updated_span_a.title = "Preview rebuild task A updated".to_string();
+        updated_span_a.summary_preview = Some("Preview rebuild task A updated".to_string());
+        updated_span_a.normalized_title = normalize_task_title(&updated_span_a.title);
+
+        let pending_entries = scan_file_state_entries(&[test_scan_candidate(file_a, "sig-a-2")]);
+        let mut preview = PreviewTaskRebuild::default();
+        let rebuilt = preview
+            .apply_source_changes(
+                &store,
+                SourceTaskChangeSet {
+                    source_id: &source.source_id,
+                    replace_source_records: false,
+                    touched_files: true,
+                    pending_file_entries: &pending_entries,
+                    removed_file_entries: &[],
+                    task_spans: &[updated_span_a],
+                },
+            )
+            .expect("preview work items rebuilt");
+        assert_eq!(rebuilt, 1);
+        assert_eq!(store.task_spans().expect("task spans").len(), 2);
+        assert_eq!(store.work_items().expect("work items").len(), 2);
+    }
+
+    #[test]
+    fn preview_task_rebuild_counts_shared_bucket_rebuilds_per_source_step() {
+        let store = Store::in_memory().expect("store");
+        let source_a = SourceLocation::local_adapter(
+            "claude_code",
+            "test-a",
+            "0",
+            Path::new("/tmp/preview-shared-a"),
+            LocationOrigin::Configured,
+        );
+        let source_b = SourceLocation::local_adapter(
+            "claude_code",
+            "test-b",
+            "0",
+            Path::new("/tmp/preview-shared-b"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source_a).expect("source a");
+        store.upsert_source(&source_b).expect("source b");
+
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 12, 11, 0, 0)
+            .single()
+            .expect("started_at");
+        let file_a = "/tmp/preview-shared-a/session.jsonl";
+        let file_b = "/tmp/preview-shared-b/session.jsonl";
+        let event_a = test_scan_event(&source_a, file_a, started_at, "shared-a", 120);
+        let event_b = test_scan_event(
+            &source_b,
+            file_b,
+            started_at + Duration::minutes(20),
+            "shared-b",
+            140,
+        );
+        let mut span_a = test_task_span(
+            &source_a,
+            file_a,
+            started_at,
+            "shared-span-a",
+            "Shared bucket task",
+            &event_a,
+        );
+        let mut span_b = test_task_span(
+            &source_b,
+            file_b,
+            started_at + Duration::minutes(20),
+            "shared-span-b",
+            "Shared bucket task",
+            &event_b,
+        );
+        let shared_project = ProjectInfo {
+            project_id: "shared-project".to_string(),
+            project_label: Some("shared-project".to_string()),
+            repo_remote_hash: Some("shared-repo".to_string()),
+            repo_label: Some("owner/shared".to_string()),
+            branch_hash: Some("shared-branch".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("shared-path".to_string()),
+            path_label: Some("/tmp/shared-project".to_string()),
+        };
+        span_a.project = Some(shared_project.clone());
+        span_b.project = Some(shared_project);
+        span_a.project_bucket = project_bucket_key(span_a.project.as_ref());
+        span_b.project_bucket = project_bucket_key(span_b.project.as_ref());
+        span_a.branch_family = branch_family(Some("main"));
+        span_b.branch_family = branch_family(Some("main"));
+
+        store
+            .insert_events(&[event_a.clone(), event_b.clone()])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_a.clone(), span_b.clone()])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let mut updated_span_a = span_a.clone();
+        updated_span_a.title = "Shared bucket task updated".to_string();
+        updated_span_a.summary_preview = Some("Shared bucket task updated".to_string());
+        updated_span_a.normalized_title = normalize_task_title(&updated_span_a.title);
+
+        let mut updated_span_b = span_b.clone();
+        updated_span_b.summary_preview = Some("Shared bucket task follow-up".to_string());
+
+        let pending_a = scan_file_state_entries(&[test_scan_candidate(file_a, "shared-a-2")]);
+        let pending_b = scan_file_state_entries(&[test_scan_candidate(file_b, "shared-b-2")]);
+        let mut preview = PreviewTaskRebuild::default();
+        let rebuilt_a = preview
+            .apply_source_changes(
+                &store,
+                SourceTaskChangeSet {
+                    source_id: &source_a.source_id,
+                    replace_source_records: false,
+                    touched_files: true,
+                    pending_file_entries: &pending_a,
+                    removed_file_entries: &[],
+                    task_spans: &[updated_span_a],
+                },
+            )
+            .expect("preview rebuild a");
+        let rebuilt_b = preview
+            .apply_source_changes(
+                &store,
+                SourceTaskChangeSet {
+                    source_id: &source_b.source_id,
+                    replace_source_records: false,
+                    touched_files: true,
+                    pending_file_entries: &pending_b,
+                    removed_file_entries: &[],
+                    task_spans: &[updated_span_b],
+                },
+            )
+            .expect("preview rebuild b");
+
+        assert_eq!(rebuilt_a, 1);
+        assert_eq!(rebuilt_b, 1);
+        assert_eq!(rebuilt_a + rebuilt_b, 2);
+        assert_eq!(store.work_items().expect("work items").len(), 1);
+    }
+
+    #[test]
+    fn partial_scan_removes_stale_task_spans_and_rebuilds_work_items() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-partial-rescan"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_a = "/tmp/codex-task-partial-rescan/a.jsonl";
+        let file_b = "/tmp/codex-task-partial-rescan/b.jsonl";
+        let initial_candidates = vec![
+            test_scan_candidate(file_a, "sig-a-1"),
+            test_scan_candidate(file_b, "sig-b-1"),
+        ];
+        let next_candidates = vec![
+            test_scan_candidate(file_a, "sig-a-2"),
+            test_scan_candidate(file_b, "sig-b-1"),
+        ];
+        let a_started_at = Utc
+            .with_ymd_and_hms(2026, 6, 12, 11, 0, 0)
+            .single()
+            .expect("a_started_at");
+        let b_started_at = Utc
+            .with_ymd_and_hms(2026, 6, 14, 11, 0, 0)
+            .single()
+            .expect("b_started_at");
+        let event_a = test_scan_event(&source, file_a, a_started_at, "event-a", 100);
+        let event_b = test_scan_event(&source, file_b, b_started_at, "event-b", 200);
+        let mut span_a = test_task_span(
+            &source,
+            file_a,
+            a_started_at,
+            "span-a",
+            "Implement task cleanup",
+            &event_a,
+        );
+        let mut span_b = test_task_span(
+            &source,
+            file_b,
+            b_started_at,
+            "span-b",
+            "Implement task benchmark reporting",
+            &event_b,
+        );
+        span_a.session_id = Some("session-a".to_string());
+        span_b.session_id = Some("session-b".to_string());
+
+        let initial_adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: initial_candidates,
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event_a.clone(), event_b.clone()],
+                task_spans: vec![span_a, span_b.clone()],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(initial_adapter)],
+        )
+        .expect("initial scan");
+
+        assert_eq!(store.task_spans().expect("task spans").len(), 2);
+        assert_eq!(store.work_items().expect("work items").len(), 2);
+
+        let changed_only_adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: next_candidates,
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(changed_only_adapter)],
+        )
+        .expect("partial scan");
+
+        let spans = store.task_spans().expect("task spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].source_record_id.as_deref(), Some("span-b"));
+
+        let work_items = store.work_items().expect("work items");
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(work_items[0].title, span_b.title);
+    }
+
+    #[test]
+    fn task_verify_split_merge_and_reject_survive_rebuilds() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-verify"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-verify/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 13, 9, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_a = test_scan_event(&source, file_path, started_at, "event-a", 100);
+        let event_b = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(5),
+            "event-b",
+            120,
+        );
+        let span_a = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "span-a",
+            "Implement task verification",
+            &event_a,
+        );
+        let span_b = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(5),
+            "span-b",
+            "Implement task verification",
+            &event_b,
+        );
+        store
+            .insert_events(&[event_a.clone(), event_b.clone()])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_a.clone(), span_b.clone()])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let initial = store.work_items().expect("initial work items");
+        assert_eq!(initial.len(), 1);
+
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Split {
+                        work_item_id: initial[0].work_item_id.0.clone(),
+                        after_span: span_a.span_id.0.clone(),
+                        left_title: Some("Left investigation".to_string()),
+                        right_title: Some("Right implementation".to_string()),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("split verify");
+
+        let split_items = store.work_items().expect("split work items");
+        assert_eq!(split_items.len(), 2);
+        assert!(split_items
+            .iter()
+            .all(|item| item.status == TaskStatus::Verified));
+        assert!(split_items
+            .iter()
+            .any(|item| item.title == "Left investigation"));
+        assert!(split_items
+            .iter()
+            .any(|item| item.title == "Right implementation"));
+
+        let left = split_items
+            .iter()
+            .find(|item| item.title == "Left investigation")
+            .expect("left work item");
+        let right = split_items
+            .iter()
+            .find(|item| item.title == "Right implementation")
+            .expect("right work item");
+
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Merge {
+                        left_work_item_id: left.work_item_id.0.clone(),
+                        right_work_item_id: right.work_item_id.0.clone(),
+                        title: Some("Unified verification work".to_string()),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("merge verify");
+
+        let merged = store.work_items().expect("merged work items");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].title, "Unified verification work");
+        assert_eq!(merged[0].status, TaskStatus::Verified);
+
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Reject {
+                        work_item_id: merged[0].work_item_id.0.clone(),
+                        reason: "meta".to_string(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("reject verify");
+
+        let rejected = store.work_items().expect("rejected work items");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].status, TaskStatus::RejectedMeta);
+        assert_eq!(store.task_verifications().expect("verifications").len(), 3);
+    }
+
+    #[test]
+    fn task_show_include_evidence_includes_spans_and_rename_verification() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-show"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-show/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 13, 11, 0, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "show-event", 90);
+        let span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "show-span",
+            "Investigate work item evidence",
+            &event,
+        );
+        store.insert_events(&[event]).expect("insert events");
+        store.upsert_task_spans(&[span]).expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let initial = store.work_items().expect("initial work items");
+        let initial_item = initial.first().expect("initial work item");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Rename {
+                        work_item_id: initial_item.work_item_id.0.clone(),
+                        title: "Verified evidence task".to_string(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("rename verify");
+
+        let renamed = store.work_items().expect("renamed work items");
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(renamed[0].title, "Verified evidence task");
+        assert_eq!(renamed[0].status, TaskStatus::Verified);
+
+        let output = load_task_show_output(&store, &renamed[0].work_item_id, true)
+            .expect("task show output");
+        assert_eq!(output.work_item.title, "Verified evidence task");
+        assert_eq!(output.spans.len(), 1);
+        assert_eq!(output.verifications.len(), 1);
+        assert!(matches!(
+            output.verifications[0].action,
+            TaskVerificationAction::Rename { .. }
+        ));
+    }
+
+    #[test]
+    fn rename_and_accept_coexist_for_same_anchor() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-rename-accept"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-rename-accept/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 13, 11, 30, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "rename-accept-event", 90);
+        let span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "rename-accept-span",
+            "Investigate rename and accept coexistence",
+            &event,
+        );
+        store.insert_events(&[event]).expect("insert events");
+        store.upsert_task_spans(&[span]).expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let initial = store.work_items().expect("initial work items");
+        let work_item = initial.first().expect("initial work item");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Rename {
+                        work_item_id: work_item.work_item_id.0.clone(),
+                        title: "Hosted-verified task title".to_string(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("rename verify");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Accept {
+                        work_item_id: work_item.work_item_id.0.clone(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("accept verify");
+
+        let rebuilt = store.work_items().expect("rebuilt work items");
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].status, TaskStatus::Verified);
+        assert_eq!(rebuilt[0].title, "Hosted-verified task title");
+
+        let verifications = store.task_verifications().expect("verifications");
+        assert_eq!(verifications.len(), 2);
+        assert!(verifications.iter().any(|verification| matches!(
+            verification.action,
+            TaskVerificationAction::Rename { .. }
+        )));
+        assert!(verifications.iter().any(|verification| matches!(
+            verification.action,
+            TaskVerificationAction::Accept { .. }
+        )));
+    }
+
+    #[test]
+    fn accept_after_reject_supersedes_manual_reject_for_same_anchor() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-verify-supersede"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-verify-supersede/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 13, 12, 0, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "supersede-event", 95);
+        let span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "supersede-span",
+            "Supersede conflicting verification actions",
+            &event,
+        );
+        store.insert_events(&[event]).expect("insert events");
+        store.upsert_task_spans(&[span]).expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let initial = store.work_items().expect("initial work items");
+        let work_item = initial.first().expect("initial work item");
+        let anchor_action_key = format!("status:{}", work_item.anchor_span_id.0);
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Reject {
+                        work_item_id: work_item.work_item_id.0.clone(),
+                        reason: "meta".to_string(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("reject verify");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Accept {
+                        work_item_id: work_item.work_item_id.0.clone(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("accept verify");
+
+        let rebuilt = store.work_items().expect("rebuilt work items");
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].status, TaskStatus::Verified);
+        assert!(!rebuilt[0]
+            .review_reasons
+            .iter()
+            .any(|reason| reason.starts_with("manual_reject:")));
+
+        let verifications = store.task_verifications().expect("verifications");
+        assert_eq!(verifications.len(), 1);
+        assert!(matches!(
+            verifications[0].action,
+            TaskVerificationAction::Accept { .. }
+        ));
+        assert_eq!(verifications[0].action_key, anchor_action_key);
+
+        let output = load_task_show_output(&store, &rebuilt[0].work_item_id, true)
+            .expect("task show output");
+        assert_eq!(output.verifications.len(), 1);
+        assert!(matches!(
+            output.verifications[0].action,
+            TaskVerificationAction::Accept { .. }
+        ));
+    }
+
+    #[test]
+    fn task_show_without_evidence_omits_spans_and_verifications() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-show-no-evidence"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-show-no-evidence/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 13, 11, 30, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "show-no-evidence", 90);
+        let span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "show-no-evidence-span",
+            "Inspect task show output",
+            &event,
+        );
+        store.insert_events(&[event]).expect("insert events");
+        store.upsert_task_spans(&[span]).expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let work_item = store
+            .work_items()
+            .expect("work items")
+            .into_iter()
+            .next()
+            .expect("work item");
+        let output = load_task_show_output(&store, &work_item.work_item_id, false)
+            .expect("task show output");
+        assert_eq!(output.work_item.work_item_id, work_item.work_item_id);
+        assert!(output.spans.is_empty());
+        assert!(output.verifications.is_empty());
+    }
+
+    #[test]
+    fn task_benchmark_reports_current_and_baselines() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-benchmark"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-benchmark/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 14, 10, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_a = test_scan_event(&source, file_path, started_at, "bench-a", 100);
+        let event_b = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "bench-b",
+            120,
+        );
+        let event_c = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::hours(30),
+            "bench-c",
+            20,
+        );
+        let span_a = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "bench-span-a",
+            "Implement benchmark reporting",
+            &event_a,
+        );
+        let span_b = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "bench-span-b",
+            "Implement benchmark reporting",
+            &event_b,
+        );
+        let span_c = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::hours(30),
+            "bench-span-c",
+            "review uncommitted changes",
+            &event_c,
+        );
+        store
+            .insert_events(&[event_a, event_b, event_c])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_a.clone(), span_b.clone(), span_c.clone()])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let work_items = store.work_items().expect("work items");
+        let implementation_item = work_items
+            .iter()
+            .find(|item| item.title == "Implement benchmark reporting")
+            .expect("implementation item");
+        let review_item = work_items
+            .iter()
+            .find(|item| item.anchor_span_id == span_c.span_id)
+            .expect("review item");
+
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Accept {
+                        work_item_id: implementation_item.work_item_id.0.clone(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("accept verify");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Reject {
+                        work_item_id: review_item.work_item_id.0.clone(),
+                        reason: "noise".to_string(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("reject verify");
+
+        let report = store.task_benchmark_report().expect("benchmark report");
+        assert!(report.verified_spans >= 3);
+        assert!(report.verified_adjacent_pairs >= 1);
+        assert!(report.has_verified_ground_truth);
+        assert!(report.has_verified_pairwise_ground_truth);
+        assert_eq!(report.baselines.len(), 6);
+        assert!(report.manual_constraints_preserved);
+        assert_eq!(
+            report.failing_baselines.is_empty(),
+            report.beats_all_baselines
+        );
+        assert_eq!(report.shipping_gate_ready, report.gate_blockers.is_empty());
+    }
+
+    #[test]
+    fn task_benchmark_scores_raw_grouper_not_manual_split_output() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-benchmark-raw-grouper"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-benchmark-raw-grouper/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 14, 11, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_a = test_scan_event(&source, file_path, started_at, "raw-a", 100);
+        let event_b = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "raw-b",
+            120,
+        );
+        let event_c = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(4),
+            "raw-c",
+            140,
+        );
+        let span_a = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "raw-span-a",
+            "Implement benchmark reporting",
+            &event_a,
+        );
+        let span_b = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "raw-span-b",
+            "Implement benchmark reporting",
+            &event_b,
+        );
+        let span_c = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(4),
+            "raw-span-c",
+            "Implement benchmark reporting",
+            &event_c,
+        );
+        store
+            .insert_events(&[event_a, event_b, event_c])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_a.clone(), span_b.clone(), span_c.clone()])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let initial = store.work_items().expect("initial work items");
+        assert_eq!(initial.len(), 1);
+        let work_item = initial.first().expect("work item");
+
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Split {
+                        work_item_id: work_item.work_item_id.0.clone(),
+                        after_span: span_a.span_id.0.clone(),
+                        left_title: Some("Investigate benchmark regression".to_string()),
+                        right_title: Some("Implement benchmark reporting".to_string()),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("split verify");
+
+        let split_items = store.work_items().expect("split items");
+        assert_eq!(split_items.len(), 2);
+
+        let report = store.task_benchmark_report().expect("benchmark report");
+        assert!(report.has_verified_ground_truth);
+        assert!(report.has_verified_pairwise_ground_truth);
+        assert!(report.manual_constraints_preserved);
+        assert!(report.current.adjacent_f1 < 1.0);
+    }
+
+    #[test]
+    fn task_benchmark_reports_missing_ground_truth_explicitly() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-benchmark-empty"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-benchmark-empty/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 14, 12, 0, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "bench-empty", 75);
+        let span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "bench-empty-span",
+            "Investigate benchmark readiness",
+            &event,
+        );
+        store.insert_events(&[event]).expect("insert events");
+        store.upsert_task_spans(&[span]).expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let report = store.task_benchmark_report().expect("benchmark report");
+        assert_eq!(report.verified_spans, 0);
+        assert_eq!(report.verified_adjacent_pairs, 0);
+        assert!(!report.has_verified_ground_truth);
+        assert!(!report.has_verified_pairwise_ground_truth);
+        assert!(report.manual_constraints_preserved);
+        assert!(!report.beats_all_baselines);
+        assert!(!report.shipping_gate_ready);
+        assert!(report.failing_baselines.is_empty());
+        assert_eq!(
+            report.gate_blockers,
+            vec!["missing_verified_ground_truth".to_string()]
+        );
+
+        let json = benchmark_json_value(&report);
+        assert_eq!(json["has_verified_ground_truth"], json!(false));
+        assert_eq!(json["has_verified_pairwise_ground_truth"], json!(false));
+        assert_eq!(json["shipping_gate_ready"], json!(false));
+        assert_eq!(json["verified_spans"], json!(0));
+        assert_eq!(json["failing_baselines"], json!([]));
+        assert_eq!(
+            json["gate_blockers"],
+            json!(["missing_verified_ground_truth"])
+        );
+    }
+
+    #[test]
+    fn task_benchmark_reports_label_only_ground_truth_explicitly() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-benchmark-label-only"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_a = "/tmp/codex-task-benchmark-label-only/a.jsonl";
+        let file_b = "/tmp/codex-task-benchmark-label-only/b.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 14, 15, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_a = test_scan_event(&source, file_a, started_at, "label-only-a", 80);
+        let event_b = test_scan_event(
+            &source,
+            file_b,
+            started_at + Duration::minutes(30),
+            "label-only-b",
+            90,
+        );
+        let span_a = test_task_span(
+            &source,
+            file_a,
+            started_at,
+            "label-only-span-a",
+            "Implement label-only benchmark reporting",
+            &event_a,
+        );
+        let span_b = test_task_span(
+            &source,
+            file_b,
+            started_at + Duration::minutes(30),
+            "label-only-span-b",
+            "Clearing Conversation History",
+            &event_b,
+        );
+        let mut span_a = span_a;
+        let mut span_b = span_b;
+        span_a.project = Some(ProjectInfo {
+            project_id: "label-only-a".to_string(),
+            project_label: Some("label-only-a".to_string()),
+            repo_remote_hash: Some("repo-label-a".to_string()),
+            repo_label: Some("owner/label-a".to_string()),
+            branch_hash: Some("branch-label-a".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-label-a".to_string()),
+            path_label: Some("/tmp/label-only-a".to_string()),
+        });
+        span_a.project_bucket = project_bucket_key(span_a.project.as_ref());
+        span_a.branch_family = branch_family(Some("main"));
+        span_b.project = Some(ProjectInfo {
+            project_id: "label-only-b".to_string(),
+            project_label: Some("label-only-b".to_string()),
+            repo_remote_hash: Some("repo-label-b".to_string()),
+            repo_label: Some("owner/label-b".to_string()),
+            branch_hash: Some("branch-label-b".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-label-b".to_string()),
+            path_label: Some("/tmp/label-only-b".to_string()),
+        });
+        span_b.project_bucket = project_bucket_key(span_b.project.as_ref());
+        span_b.branch_family = branch_family(Some("main"));
+        let span_a_id = span_a.span_id.clone();
+        let span_b_id = span_b.span_id.clone();
+        store
+            .insert_events(&[event_a, event_b])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_a, span_b])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let work_items = store.work_items().expect("work items");
+        let accepted_item = work_items
+            .iter()
+            .find(|item| item.anchor_span_id == span_a_id)
+            .expect("accepted item");
+        let rejected_item = work_items
+            .iter()
+            .find(|item| item.anchor_span_id == span_b_id)
+            .expect("rejected item");
+
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Accept {
+                        work_item_id: accepted_item.work_item_id.0.clone(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("accept verify");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Reject {
+                        work_item_id: rejected_item.work_item_id.0.clone(),
+                        reason: "meta".to_string(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("reject verify");
+
+        let report = store.task_benchmark_report().expect("benchmark report");
+        assert_eq!(report.verified_spans, 2);
+        assert_eq!(report.verified_adjacent_pairs, 0);
+        assert!(report.has_verified_ground_truth);
+        assert!(!report.has_verified_pairwise_ground_truth);
+        assert!(report.manual_constraints_preserved);
+        assert!(!report.beats_all_baselines);
+        assert!(!report.shipping_gate_ready);
+        assert_eq!(report.failing_baselines, Vec::<String>::new());
+        assert_eq!(
+            report.gate_blockers,
+            vec!["missing_pairwise_ground_truth".to_string()]
+        );
+
+        let json = benchmark_json_value(&report);
+        assert_eq!(json["has_verified_ground_truth"], json!(true));
+        assert_eq!(json["has_verified_pairwise_ground_truth"], json!(false));
+        assert_eq!(json["verified_spans"], json!(2));
+        assert_eq!(json["verified_adjacent_pairs"], json!(0));
+        assert_eq!(
+            json["gate_blockers"],
+            json!(["missing_pairwise_ground_truth"])
+        );
+    }
+
+    #[test]
+    fn task_benchmark_reports_failing_baselines_when_current_ties_them() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-benchmark-baseline-tie"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-benchmark-baseline-tie/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 14, 16, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_a = test_scan_event(&source, file_path, started_at, "tie-a", 80);
+        let event_b = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "tie-b",
+            90,
+        );
+        let span_a = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "tie-span-a",
+            "Implement benchmark blocking report",
+            &event_a,
+        );
+        let span_b = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(2),
+            "tie-span-b",
+            "Implement benchmark blocking report",
+            &event_b,
+        );
+        store
+            .insert_events(&[event_a, event_b])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_a, span_b])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let work_item = store
+            .work_items()
+            .expect("work items")
+            .into_iter()
+            .next()
+            .expect("work item");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Accept {
+                        work_item_id: work_item.work_item_id.0.clone(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("accept verify");
+
+        let report = store.task_benchmark_report().expect("benchmark report");
+        assert!(report.has_verified_ground_truth);
+        assert!(report.has_verified_pairwise_ground_truth);
+        assert!(report.manual_constraints_preserved);
+        assert!(!report.beats_all_baselines);
+        assert!(!report.shipping_gate_ready);
+        assert_eq!(
+            report.failing_baselines,
+            vec![
+                "gap_only_2h".to_string(),
+                "gap_only_6h".to_string(),
+                "gap_only_12h".to_string(),
+                "gap_only_24h".to_string(),
+                "repo_plus_title".to_string(),
+                "repo_plus_branch_plus_title".to_string(),
+            ]
+        );
+        assert_eq!(
+            report.gate_blockers,
+            vec!["baseline_regressions".to_string()]
+        );
+    }
+
+    #[test]
+    fn task_list_filters_by_provider_and_status() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-list-filters"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-list-filters/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 14, 14, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_auto = test_scan_event(&source, file_path, started_at, "event-auto", 50);
+        let event_review = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(10),
+            "event-review",
+            60,
+        );
+        let event_reject = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(20),
+            "event-reject",
+            70,
+        );
+        let mut span_auto = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "span-auto",
+            "Implement task list filters",
+            &event_auto,
+        );
+        let mut span_review = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(10),
+            "span-review",
+            "Review task list filtering behavior",
+            &event_review,
+        );
+        let mut span_reject = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(20),
+            "span-reject",
+            "Noise task entry",
+            &event_reject,
+        );
+        span_auto.project = Some(ProjectInfo {
+            project_id: "project-auto".to_string(),
+            project_label: Some("auto".to_string()),
+            repo_remote_hash: Some("repo-auto".to_string()),
+            repo_label: Some("owner/auto".to_string()),
+            branch_hash: Some("branch-auto".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-auto".to_string()),
+            path_label: Some("/tmp/project-auto".to_string()),
+        });
+        span_auto.project_bucket = project_bucket_key(span_auto.project.as_ref());
+        span_auto.branch_family = branch_family(Some("main"));
+
+        span_review.provider = "opencode".to_string();
+        span_review.project = Some(ProjectInfo {
+            project_id: "project-review".to_string(),
+            project_label: Some("review".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-review".to_string()),
+            path_label: Some("/tmp/project-review".to_string()),
+        });
+        span_review.project_bucket = project_bucket_key(span_review.project.as_ref());
+
+        span_reject.project = Some(ProjectInfo {
+            project_id: "project-reject".to_string(),
+            project_label: Some("reject".to_string()),
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-reject".to_string()),
+            path_label: Some("/tmp/project-reject".to_string()),
+        });
+        span_reject.project_bucket = project_bucket_key(span_reject.project.as_ref());
+
+        store
+            .insert_events(&[event_auto, event_review, event_reject])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_auto.clone(), span_review.clone(), span_reject.clone()])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let initial = store.work_items().expect("work items");
+        let reject_item = initial
+            .iter()
+            .find(|item| item.anchor_span_id == span_reject.span_id)
+            .expect("reject item");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Reject {
+                        work_item_id: reject_item.work_item_id.0.clone(),
+                        reason: "noise".to_string(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("reject verify");
+
+        let codex_items =
+            filtered_task_list_items(&store, Some("codex"), None).expect("codex filtered items");
+        assert_eq!(codex_items.len(), 1);
+        assert!(codex_items
+            .iter()
+            .all(|item| item.providers.iter().any(|provider| provider == "codex")));
+        assert!(codex_items
+            .iter()
+            .all(|item| item.status != TaskStatus::RejectedMeta));
+
+        let auto_items = filtered_task_list_items(&store, None, Some(&TaskStatus::Auto))
+            .expect("auto filtered items");
+        assert_eq!(auto_items.len(), 1);
+        assert_eq!(auto_items[0].anchor_span_id, span_auto.span_id);
+
+        let rejected_items =
+            filtered_task_list_items(&store, None, Some(&TaskStatus::RejectedMeta))
+                .expect("rejected filtered items");
+        assert_eq!(rejected_items.len(), 1);
+        assert_eq!(rejected_items[0].anchor_span_id, span_reject.span_id);
+
+        let default_selection = task_list_selection(&store, None, None).expect("default selection");
+        assert_eq!(default_selection.items.len(), 2);
+        assert_eq!(default_selection.hidden_rejected_meta, 1);
+    }
+
+    #[test]
+    fn format_task_list_item_appends_review_reasons_when_present() {
+        let ended_at = Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap();
+        let mut work_item = WorkItem {
+            schema_version: "work_item.v1".to_string(),
+            work_item_id: WorkItemId("work-review".to_string()),
+            anchor_span_id: statsai_core::TaskSpanId("span-review".to_string()),
+            tail_span_id: statsai_core::TaskSpanId("span-review".to_string()),
+            project_bucket: "bucket".to_string(),
+            title: "Reviewable item".to_string(),
+            normalized_title: "reviewable item".to_string(),
+            status: TaskStatus::NeedsReview,
+            confidence: Confidence::Low,
+            started_at: ended_at - Duration::minutes(5),
+            ended_at,
+            duration_seconds: Some(300),
+            span_count: 1,
+            event_count: 0,
+            total_input_tokens: 0,
+            total_cache_creation_tokens: 0,
+            total_cache_read_tokens: 0,
+            total_output_tokens: 0,
+            total_reasoning_tokens: 0,
+            total_tokens: 0,
+            estimated_cost_usd: None,
+            providers: vec!["claude_code".to_string()],
+            issue_keys: Vec::new(),
+            repo_label: None,
+            branch_labels: Vec::new(),
+            path_label: None,
+            summary_preview: None,
+            todo_excerpt: None,
+            no_git: false,
+            cross_provider: false,
+            continuation_reasons: Vec::new(),
+            review_reasons: vec!["no_usage_evidence".to_string(), "generic_title".to_string()],
+        };
+
+        let line = format_task_list_item(&work_item);
+        assert!(line.contains("review=no_usage_evidence,generic_title"));
+
+        work_item.review_reasons.clear();
+        let clean_line = format_task_list_item(&work_item);
+        assert!(!clean_line.contains("review="));
+    }
+
+    #[test]
+    fn selected_rebuild_project_buckets_filter_by_provider_and_source() {
+        let store = Store::in_memory().expect("store");
+        let source_codex = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-rebuild-filter-a"),
+            LocationOrigin::Configured,
+        );
+        let source_open = SourceLocation::local_adapter(
+            "opencode",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-rebuild-filter-b"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source_codex).expect("codex source");
+        store.upsert_source(&source_open).expect("opencode source");
+
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 15, 9, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_codex = test_scan_event(
+            &source_codex,
+            "/tmp/codex-task-rebuild-filter-a/session.jsonl",
+            started_at,
+            "event-codex",
+            50,
+        );
+        let event_open = test_scan_event(
+            &source_open,
+            "/tmp/codex-task-rebuild-filter-b/session.jsonl",
+            started_at + Duration::minutes(5),
+            "event-open",
+            60,
+        );
+        let span_codex = test_task_span(
+            &source_codex,
+            "/tmp/codex-task-rebuild-filter-a/session.jsonl",
+            started_at,
+            "span-codex",
+            "Codex rebuild target",
+            &event_codex,
+        );
+        let mut span_open = test_task_span(
+            &source_open,
+            "/tmp/codex-task-rebuild-filter-b/session.jsonl",
+            started_at + Duration::minutes(5),
+            "span-open",
+            "OpenCode rebuild target",
+            &event_open,
+        );
+        span_open.provider = "opencode".to_string();
+
+        store
+            .insert_events(&[event_codex, event_open])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_codex.clone(), span_open.clone()])
+            .expect("insert spans");
+
+        let codex_buckets =
+            selected_rebuild_project_buckets(&store, Some("codex"), None).expect("codex buckets");
+        assert_eq!(
+            codex_buckets,
+            BTreeSet::from([span_codex.project_bucket.clone()])
+        );
+
+        let open_buckets = selected_rebuild_project_buckets(&store, Some("opencode"), None)
+            .expect("opencode buckets");
+        assert_eq!(
+            open_buckets,
+            BTreeSet::from([span_open.project_bucket.clone()])
+        );
+
+        let source_buckets =
+            selected_rebuild_project_buckets(&store, None, Some(&source_codex.source_id.0))
+                .expect("source buckets");
+        assert_eq!(
+            source_buckets,
+            BTreeSet::from([span_codex.project_bucket.clone()])
+        );
+    }
+
+    #[test]
+    fn task_status_and_verdict_parsers_reject_unknown_values() {
+        assert_eq!(
+            parse_task_status_filter("verified").expect("verified status"),
+            TaskStatus::Verified
+        );
+        assert_eq!(
+            parse_task_verdict("noise").expect("noise verdict"),
+            TaskVerdict::Noise
+        );
+        assert!(parse_task_status_filter("mystery").is_err());
+        assert!(parse_task_verdict("mystery").is_err());
+    }
+
+    #[test]
+    fn stats_json_value_exposes_expected_fields() {
+        let stats = statsai_store::TaskStats {
+            total_spans: 10,
+            total_work_items: 3,
+            verified_percentage: 25.0,
+            no_git_percentage: 50.0,
+            cross_provider_percentage: 10.0,
+            rejected_meta_percentage: 5.0,
+            average_spans_per_work_item: 3.33,
+        };
+
+        let json = stats_json_value(&stats);
+        assert_eq!(json["total_spans"], json!(10));
+        assert_eq!(json["total_work_items"], json!(3));
+        assert_eq!(json["verified_percentage"], json!(25.0));
+        assert_eq!(json["no_git_percentage"], json!(50.0));
+        assert_eq!(json["cross_provider_percentage"], json!(10.0));
+        assert_eq!(json["rejected_meta_percentage"], json!(5.0));
+        assert_eq!(json["average_spans_per_work_item"], json!(3.33));
+    }
+
+    #[test]
+    fn sync_batch_serialization_excludes_local_task_entities() {
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch-test".to_string(),
+            device_id: "device-test".to_string(),
+            sources: Vec::new(),
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: Vec::new(),
+            task_buckets: Vec::new(),
+            task_verifications: Vec::new(),
+            created_at: Utc
+                .with_ymd_and_hms(2026, 6, 14, 13, 0, 0)
+                .single()
+                .expect("created_at"),
+        };
+
+        let value = serde_json::to_value(&batch).expect("serialize sync batch");
+        assert!(value.get("task_buckets").is_none());
+        assert!(value.get("task_verifications").is_none());
+    }
+
+    #[test]
+    fn task_rebuild_is_idempotent() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-rebuild"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-rebuild/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 14, 14, 0, 0)
+            .single()
+            .expect("started_at");
+        let event_a = test_scan_event(&source, file_path, started_at, "rebuild-a", 75);
+        let event_b = test_scan_event(
+            &source,
+            file_path,
+            started_at + Duration::minutes(3),
+            "rebuild-b",
+            60,
+        );
+        let span_a = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "rebuild-span-a",
+            "Rebuild task work items",
+            &event_a,
+        );
+        let span_b = test_task_span(
+            &source,
+            file_path,
+            started_at + Duration::minutes(3),
+            "rebuild-span-b",
+            "Rebuild task work items",
+            &event_b,
+        );
+        store
+            .insert_events(&[event_a, event_b])
+            .expect("insert events");
+        store
+            .upsert_task_spans(&[span_a, span_b])
+            .expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let first = store.work_items().expect("first rebuild work items");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Rebuild {
+                    provider: None,
+                    source_id: None,
+                    all: true,
+                },
+            },
+            &store,
+        )
+        .expect("first task rebuild");
+        let second = store.work_items().expect("second rebuild work items");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Rebuild {
+                    provider: None,
+                    source_id: None,
+                    all: true,
+                },
+            },
+            &store,
+        )
+        .expect("second task rebuild");
+        let third = store.work_items().expect("third rebuild work items");
+
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+    }
+
+    #[test]
     fn partial_scan_with_legacy_rows_falls_back_to_full_source_reconcile() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
@@ -10206,7 +14514,7 @@ mod tests {
             )
             .expect("record summaries");
 
-        let local = sync_local_verify(&store, "http", &target, None).expect("local verify");
+        let local = sync_local_verify(&store, "http", &target, None, false).expect("local verify");
         assert_eq!(local.pending_sources, 0);
         assert_eq!(local.pending_accounts, 0);
         assert_eq!(local.pending_source_account_assignments, 0);
@@ -10267,9 +14575,136 @@ mod tests {
             .record_summaries_synced("http", &target, &rollups)
             .expect("record rollups");
 
-        let local = sync_local_verify(&store, "http", &target, None).expect("local verify");
+        let local = sync_local_verify(&store, "http", &target, None, true).expect("local verify");
         assert_eq!(local.total_rollups, 1);
         assert_eq!(local.pending_rollups, 0);
+    }
+
+    #[test]
+    fn sync_local_verify_respects_project_sync_opt_in() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-verify-project-opt-in"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let mut event = test_event(
+            "codex",
+            &source,
+            Utc::now(),
+            Some(provider_account_id("codex", "personal")),
+            TokenParts::total(42),
+        );
+        event.project = Some(ProjectInfo {
+            project_id: "project-repo-backed".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/work/ai-stats".to_string()),
+        });
+        store.insert_event(&event).expect("event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let target = "https://api.example.com/api/sync/batches".to_string();
+        let rollups: Vec<_> = store
+            .all_sync_rollup_summaries()
+            .expect("rollups")
+            .into_iter()
+            .map(|summary| sanitize_summary_for_sync_with_projects(summary, false))
+            .collect();
+        store
+            .record_summaries_synced("http", &target, &rollups)
+            .expect("record rollups");
+
+        let hidden = sync_local_verify(&store, "http", &target, None, false)
+            .expect("local verify without projects");
+        let opted_in = sync_local_verify(&store, "http", &target, None, true)
+            .expect("local verify with projects");
+
+        assert_eq!(hidden.pending_rollups, 0);
+        assert_eq!(opted_in.pending_rollups, 1);
+    }
+
+    #[test]
+    fn build_sync_batch_omits_project_data_without_opt_in() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-project-sync-opt-in"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 7, 12, 0, 0)
+            .single()
+            .expect("now");
+        let mut event = test_event("codex", &source, now, None, TokenParts::total(120));
+        event.project = Some(ProjectInfo {
+            project_id: "project-repo-backed".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: Some("branch-hash".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/work/ai-stats".to_string()),
+        });
+        store.insert_event(&event).expect("event");
+
+        let mut summary = test_summary("codex", &source, now, 120, None);
+        summary.project = event.project.clone();
+        store.upsert_summary(&summary).expect("summary");
+
+        let task_batch = test_task_only_sync_batch(now, 1, 1);
+        for bucket in &task_batch.task_buckets {
+            store
+                .replace_task_bucket_snapshot(bucket)
+                .expect("seed task bucket");
+        }
+        for verification in &task_batch.task_verifications {
+            store
+                .merge_task_verification(verification)
+                .expect("seed task verification");
+        }
+
+        let default_command = test_sync_command("file");
+        let default_target = sync_target(&default_command).expect("default target");
+        let (default_batch, default_mode) =
+            build_sync_batch(&default_command, &store, "device", &default_target)
+                .expect("default batch");
+        assert_eq!(default_mode, SyncPayloadMode::Raw);
+        assert_eq!(default_batch.events.len(), 1);
+        assert!(default_batch.events[0].project.is_none());
+        assert_eq!(default_batch.summaries.len(), 1);
+        assert!(default_batch.summaries[0].project.is_none());
+        assert!(default_batch.task_buckets.is_empty());
+        assert!(default_batch.task_verifications.is_empty());
+
+        let opt_in_command = SyncCommand {
+            include_projects: true,
+            ..test_sync_command("file")
+        };
+        let opt_in_target = sync_target(&opt_in_command).expect("opt-in target");
+        let (opt_in_batch, opt_in_mode) =
+            build_sync_batch(&opt_in_command, &store, "device", &opt_in_target)
+                .expect("opt-in batch");
+        assert_eq!(opt_in_mode, SyncPayloadMode::Raw);
+        assert_eq!(opt_in_batch.events.len(), 1);
+        assert!(opt_in_batch.events[0].project.is_some());
+        assert_eq!(opt_in_batch.summaries.len(), 1);
+        assert!(opt_in_batch.summaries[0].project.is_some());
+        assert_eq!(opt_in_batch.task_buckets.len(), 1);
+        assert_eq!(opt_in_batch.task_verifications.len(), 1);
     }
 
     #[test]
@@ -10475,7 +14910,7 @@ mod tests {
             )
             .expect("sync assignments");
         store
-            .record_sync_success("http", target, "batch_1", &[], &[])
+            .record_sync_success("http", target, "batch_1", &[], &[], None)
             .expect("sync success");
 
         let report =
@@ -10670,6 +15105,7 @@ mod tests {
                 "batch_1",
                 &[],
                 &[],
+                None,
             )
             .expect("sync success");
 
@@ -10699,6 +15135,7 @@ mod tests {
             reset_remote: false,
             yes: false,
             dry_run: false,
+            include_projects: false,
         }
     }
 
@@ -11232,6 +15669,123 @@ mod tests {
             account_identity_source: IdentitySource::Unresolved,
         });
         summary
+    }
+
+    fn test_task_span(
+        source: &SourceLocation,
+        file_path: &str,
+        started_at: DateTime<Utc>,
+        record_id: &str,
+        title: &str,
+        event: &UsageEvent,
+    ) -> TaskSpan {
+        TaskSpan {
+            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+            span_id: task_span_id("codex", &source.source_id, record_id),
+            provider: "codex".to_string(),
+            source_id: source.source_id.clone(),
+            span_kind: "codex_task".to_string(),
+            source_record_id: Some(record_id.to_string()),
+            source_file_path_hash: Some(hash_text(file_path)),
+            summary_id: None,
+            session_id: Some("session-test".to_string()),
+            thread_id: None,
+            title: title.to_string(),
+            normalized_title: normalize_task_title(title),
+            title_source: Some("thread_name".to_string()),
+            summary_preview: Some(title.to_string()),
+            todo_excerpt: None,
+            issue_keys: Vec::new(),
+            branch_family: None,
+            project_bucket: project_bucket_key(event.project.as_ref()),
+            project: event.project.clone(),
+            git: None,
+            usage: event.usage.clone(),
+            estimated_cost_usd: event.cost.estimated_api_equivalent_usd,
+            event_count: 1,
+            has_usage_evidence: true,
+            total_messages: event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.total_messages)
+                .unwrap_or(0),
+            user_messages: event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.user_messages)
+                .unwrap_or(0),
+            assistant_messages: event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.assistant_messages)
+                .unwrap_or(0),
+            developer_messages: event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.developer_messages)
+                .unwrap_or(0),
+            linked_event_ids: vec![event.event_id.clone()],
+            confidence: Confidence::High,
+            is_meta: false,
+            started_at,
+            ended_at: Some(started_at),
+            duration_seconds: Some(0),
+        }
+    }
+
+    #[test]
+    fn scan_rewrites_task_span_links_to_canonical_event_ids() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-link-rewrite"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-link-rewrite/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+            .single()
+            .expect("started_at");
+        let existing_event = test_scan_event(&source, file_path, started_at, "existing", 100);
+        store
+            .insert_event(&existing_event)
+            .expect("insert existing event");
+
+        let mut duplicate_event = existing_event.clone();
+        duplicate_event.event_id =
+            event_id("codex", &source.source_id, "duplicate", None, started_at);
+        duplicate_event.source.source_record_id = Some("duplicate".to_string());
+        if let Some(parse_evidence) = duplicate_event.parse_evidence.as_mut() {
+            parse_evidence.source_record_id = Some("duplicate".to_string());
+        }
+        let span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "duplicate-span",
+            "Rewrite canonical task links",
+            &duplicate_event,
+        );
+
+        let insert_result = store
+            .insert_events_with_resolution(&[duplicate_event])
+            .expect("insert duplicate event");
+        assert_eq!(insert_result.inserted, 0);
+
+        let mut spans = vec![span];
+        rewrite_task_span_linked_event_ids(&mut spans, &insert_result.canonical_event_ids);
+        store.upsert_task_spans(&spans).expect("upsert spans");
+
+        let stored_spans = store.task_spans().expect("task spans");
+        assert_eq!(stored_spans.len(), 1);
+        assert_eq!(
+            stored_spans[0].linked_event_ids,
+            vec![existing_event.event_id.clone()]
+        );
     }
 
     #[test]

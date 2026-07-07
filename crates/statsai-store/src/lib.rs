@@ -1,6 +1,7 @@
 //! Local SQLite storage for `statsai`.
 
 mod migrations;
+mod tasks;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
@@ -11,17 +12,23 @@ use statsai_core::{
     project_contains_file_paths, project_has_stable_identity, provider_account_id,
     provider_account_id_from_identity, sanitize_summary_for_sync, semantic_event_fingerprint,
     source_account_assignment_id, subscription_id, summary_id, timestamp_in_period, BillingPeriod,
-    Confidence, CostInfo, DailyRollup, EventSource, IdentitySource, LatencySource, MetricStats,
-    ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
+    Confidence, CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource,
+    MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
     SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
     SourceLocation, SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
-    SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage, UsageCounts, UsageEvent,
-    UsageSummary, VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage, TaskVerificationCursor,
+    TaskVerificationId, UsageCounts, UsageEvent, UsageSummary, VerifiedSourceState,
+    VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
     SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+
+pub use tasks::{
+    derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
+    TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
+};
 
 const SYNC_ROLLUP_SUMMARY_VERSION: &str = "10";
 
@@ -60,14 +67,28 @@ pub struct SyncState {
     pub last_event_id: Option<String>,
     pub last_summary_observed_at: Option<DateTime<Utc>>,
     pub last_summary_id: Option<String>,
+    pub last_task_verification_updated_at: Option<DateTime<Utc>>,
+    pub last_task_verification_id: Option<String>,
     pub failure_count: u64,
     pub pending_resume_batch_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskBucketSyncStatus {
+    pub total: u64,
+    pub dirty: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanFileStateEntry {
     pub cache_key: String,
     pub cache_signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EventInsertBatchResult {
+    pub inserted: u64,
+    pub canonical_event_ids: HashMap<EventId, EventId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +218,7 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self { conn };
         store.migrate()?;
+        store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
     }
 
@@ -206,6 +228,7 @@ impl Store {
         };
         store.conn.busy_timeout(std::time::Duration::from_secs(5))?;
         store.migrate()?;
+        store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
     }
 
@@ -760,6 +783,13 @@ impl Store {
     }
 
     pub fn insert_events(&self, events: &[UsageEvent]) -> Result<u64> {
+        Ok(self.insert_events_with_resolution(events)?.inserted)
+    }
+
+    pub fn insert_events_with_resolution(
+        &self,
+        events: &[UsageEvent],
+    ) -> Result<EventInsertBatchResult> {
         let events = events
             .iter()
             .map(event_with_valid_project)
@@ -775,8 +805,10 @@ impl Store {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             let mut inserted = 0u64;
+            let mut canonical_event_ids = HashMap::with_capacity(events.len());
             let mut dirty_keys = BTreeSet::new();
             for (index, event) in events.iter().enumerate() {
+                let incoming_event_id = event.event_id.clone();
                 let matched_event_id =
                     conflict_map
                         .get(&conflict_keys[index])
@@ -799,6 +831,7 @@ impl Store {
                         existing_id.as_str(),
                     );
                     dirty_keys.extend(self.update_event_payload(&refreshed)?);
+                    canonical_event_ids.insert(incoming_event_id, EventId(existing_id.clone()));
                     if let Some(candidates) = conflict_map.get_mut(&conflict_keys[index]) {
                         if let Some(candidate) = candidates
                             .iter_mut()
@@ -814,16 +847,20 @@ impl Store {
                 if outcome.inserted {
                     inserted += 1;
                 }
+                canonical_event_ids.insert(incoming_event_id, outcome.canonical_event_id.clone());
                 dirty_keys.extend(outcome.dirty_keys);
             }
             self.refresh_sync_rollups_for_keys(&dirty_keys)?;
-            Ok(inserted)
+            Ok(EventInsertBatchResult {
+                inserted,
+                canonical_event_ids,
+            })
         })();
 
         match result {
-            Ok(inserted) => {
+            Ok(insert_result) => {
                 self.conn.execute_batch("COMMIT")?;
-                Ok(inserted)
+                Ok(insert_result)
             }
             Err(error) => {
                 rollback(&self.conn);
@@ -880,6 +917,7 @@ impl Store {
                 refreshed_duplicate_event(existing.as_ref(), event, existing_id.as_str());
             return Ok(EventInsertOutcome {
                 inserted: false,
+                canonical_event_id: EventId(existing_id),
                 dirty_keys: self.update_event_payload(&refreshed)?,
             });
         }
@@ -910,11 +948,13 @@ impl Store {
                 refreshed_duplicate_event(existing.as_ref(), event, event.event_id.0.as_str());
             return Ok(EventInsertOutcome {
                 inserted: false,
+                canonical_event_id: event.event_id.clone(),
                 dirty_keys: self.update_event_payload(&refreshed)?,
             });
         }
         Ok(EventInsertOutcome {
             inserted: true,
+            canonical_event_id: event.event_id.clone(),
             dirty_keys: BTreeSet::from([sync_rollup_bucket_key(event)]),
         })
     }
@@ -1450,8 +1490,9 @@ impl Store {
             .query_row(
                 r#"
                 SELECT sink, target, last_success_at, last_batch_id, last_event_started_at,
-                       last_event_id, last_summary_observed_at, last_summary_id, failure_count,
-                       pending_resume_batch_id
+                       last_event_id, last_summary_observed_at, last_summary_id,
+                       last_task_verification_updated_at, last_task_verification_id,
+                       failure_count, pending_resume_batch_id
                 FROM sync_state
                 WHERE sink = ?1 AND target = ?2
                 "#,
@@ -1466,8 +1507,9 @@ impl Store {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT sink, target, last_success_at, last_batch_id, last_event_started_at,
-                   last_event_id, last_summary_observed_at, last_summary_id, failure_count,
-                   pending_resume_batch_id
+                   last_event_id, last_summary_observed_at, last_summary_id,
+                   last_task_verification_updated_at, last_task_verification_id,
+                   failure_count, pending_resume_batch_id
             FROM sync_state
             ORDER BY sink, target
             "#,
@@ -1484,6 +1526,8 @@ impl Store {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             self.conn.execute("DELETE FROM entity_sync_state", [])?;
+            self.conn
+                .execute("DELETE FROM task_bucket_sync_state", [])?;
             self.conn.execute("DELETE FROM sync_state", [])?;
             Ok(())
         })();
@@ -1505,6 +1549,10 @@ impl Store {
         let result = (|| {
             self.conn.execute(
                 "DELETE FROM entity_sync_state WHERE sink = ?1 AND target = ?2",
+                params![sink, target],
+            )?;
+            self.conn.execute(
+                "DELETE FROM task_bucket_sync_state WHERE sink = ?1 AND target = ?2",
                 params![sink, target],
             )?;
             self.conn.execute(
@@ -1533,6 +1581,7 @@ impl Store {
         batch_id: &str,
         events: &[UsageEvent],
         summaries: &[UsageSummary],
+        task_verification_cursor: Option<&TaskVerificationCursor>,
     ) -> Result<()> {
         let event_cursor = events
             .iter()
@@ -1572,15 +1621,30 @@ impl Store {
                 .as_ref()
                 .and_then(|state| state.last_summary_id.clone())
         });
+        let task_verification_updated_at = task_verification_cursor
+            .map(|cursor| cursor.updated_at)
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|state| state.last_task_verification_updated_at)
+            });
+        let task_verification_id = task_verification_cursor
+            .map(|cursor| cursor.verification_id.0.clone())
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|state| state.last_task_verification_id.clone())
+            });
         let now = Utc::now();
 
         self.conn.execute(
             r#"
             INSERT INTO sync_state (
               sink, target, last_success_at, last_batch_id, last_event_started_at,
-              last_event_id, last_summary_observed_at, last_summary_id, failure_count
+              last_event_id, last_summary_observed_at, last_summary_id,
+              last_task_verification_updated_at, last_task_verification_id, failure_count
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)
             ON CONFLICT(sink, target) DO UPDATE SET
               last_success_at = excluded.last_success_at,
               last_batch_id = excluded.last_batch_id,
@@ -1588,6 +1652,8 @@ impl Store {
               last_event_id = excluded.last_event_id,
               last_summary_observed_at = excluded.last_summary_observed_at,
               last_summary_id = excluded.last_summary_id,
+              last_task_verification_updated_at = excluded.last_task_verification_updated_at,
+              last_task_verification_id = excluded.last_task_verification_id,
               failure_count = 0
             "#,
             params![
@@ -1599,9 +1665,65 @@ impl Store {
                 event_id,
                 summary_observed_at.map(|date| date.to_rfc3339()),
                 summary_id,
+                task_verification_updated_at.map(|date| date.to_rfc3339()),
+                task_verification_id,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn sync_task_verification_cursor(
+        &self,
+        sink: &str,
+        target: &str,
+    ) -> Result<Option<TaskVerificationCursor>> {
+        let Some(state) = self.sync_state(sink, target)? else {
+            return Ok(None);
+        };
+        let Some(updated_at) = state.last_task_verification_updated_at else {
+            return Ok(None);
+        };
+        let Some(verification_id) = state.last_task_verification_id else {
+            return Ok(None);
+        };
+        Ok(Some(TaskVerificationCursor {
+            updated_at,
+            verification_id: TaskVerificationId(verification_id),
+        }))
+    }
+
+    pub fn task_bucket_sync_status(
+        &self,
+        sink: &str,
+        target: &str,
+        device_id: &str,
+    ) -> Result<TaskBucketSyncStatus> {
+        let local_buckets = self.task_project_buckets()?;
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT project_bucket, dirty
+            FROM task_bucket_sync_state
+            WHERE sink = ?1 AND target = ?2 AND device_id = ?3
+            "#,
+        )?;
+        let rows = statement.query_map(params![sink, target, device_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut tracked = HashMap::<String, i64>::new();
+        for row in rows {
+            let (project_bucket, dirty) = row?;
+            tracked.insert(project_bucket, dirty);
+        }
+        let tracked_total = tracked.len() as u64;
+        let tracked_dirty = tracked.values().filter(|dirty| **dirty == 1).count() as u64;
+        let missing_local = local_buckets
+            .iter()
+            .filter(|project_bucket| !tracked.contains_key(project_bucket.as_str()))
+            .count() as u64;
+        Ok(TaskBucketSyncStatus {
+            total: tracked_total.saturating_add(missing_local),
+            dirty: tracked_dirty.saturating_add(missing_local),
+        })
     }
 
     pub fn record_sync_failure(&self, sink: &str, target: &str) -> Result<()> {
@@ -3482,9 +3604,10 @@ struct SyncRollupBucketKey {
     project_key: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct EventInsertOutcome {
     inserted: bool,
+    canonical_event_id: EventId,
     dirty_keys: BTreeSet<SyncRollupBucketKey>,
 }
 
@@ -3904,7 +4027,8 @@ fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {
     let last_success_at: String = row.get(2)?;
     let last_event_started_at: Option<String> = row.get(4)?;
     let last_summary_observed_at: Option<String> = row.get(6)?;
-    let failure_count: i64 = row.get(8)?;
+    let last_task_verification_updated_at: Option<String> = row.get(8)?;
+    let failure_count: i64 = row.get(10)?;
     Ok(SyncState {
         sink: row.get(0)?,
         target: row.get(1)?,
@@ -3914,8 +4038,13 @@ fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {
         last_event_id: row.get(5)?,
         last_summary_observed_at: parse_optional_rfc3339_for_row(last_summary_observed_at, 6)?,
         last_summary_id: row.get(7)?,
+        last_task_verification_updated_at: parse_optional_rfc3339_for_row(
+            last_task_verification_updated_at,
+            8,
+        )?,
+        last_task_verification_id: row.get(9)?,
         failure_count: failure_count.max(0) as u64,
-        pending_resume_batch_id: row.get(9)?,
+        pending_resume_batch_id: row.get(11)?,
     })
 }
 
@@ -4201,6 +4330,59 @@ mod tests {
 
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[test]
+    fn task_bucket_sync_status_counts_tracked_and_local_bucket_union() {
+        let store = Store::in_memory().expect("store");
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO task_spans (
+                  span_id, provider, source_id, project_bucket, started_at, ended_at, title,
+                  normalized_title, is_meta, confidence, source_file_path_hash, payload
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, NULL, ?10)
+                "#,
+                params![
+                    "span-local",
+                    "codex",
+                    "source-local",
+                    "bucket-local",
+                    "2026-07-05T10:00:00Z",
+                    "2026-07-05T10:05:00Z",
+                    "Local span",
+                    "local span",
+                    "medium",
+                    r#"{"span_id":"span-local","project_bucket":"bucket-local"}"#,
+                ],
+            )
+            .expect("insert local task span");
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO task_bucket_sync_state (
+                  sink, target, device_id, project_bucket, dirty, payload_hash, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, 1, NULL, ?5)
+                "#,
+                params![
+                    "http",
+                    "target",
+                    "device-1",
+                    "bucket-tracked",
+                    "2026-07-05T11:00:00Z",
+                ],
+            )
+            .expect("insert tracked bucket state");
+
+        let status = store
+            .task_bucket_sync_status("http", "target", "device-1")
+            .expect("task bucket sync status");
+        assert_eq!(status.total, 2);
+        assert_eq!(status.dirty, 2);
     }
 
     #[test]
@@ -4790,6 +4972,38 @@ mod tests {
     }
 
     #[test]
+    fn insert_events_with_resolution_returns_canonical_duplicate_event_ids() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-batch-resolution"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let existing = test_store_event(&source, now, "existing-record");
+        let mut duplicate = existing.clone();
+        duplicate.event_id = event_id("codex", &source.source_id, "duplicate-record", None, now);
+        duplicate.source.source_record_id = Some("duplicate-record".to_string());
+        duplicate.parse_evidence = None;
+
+        assert!(store.insert_event(&existing).expect("insert existing"));
+        let result = store
+            .insert_events_with_resolution(&[duplicate.clone()])
+            .expect("insert duplicate");
+
+        assert_eq!(result.inserted, 0);
+        assert_eq!(
+            result.canonical_event_ids.get(&duplicate.event_id),
+            Some(&existing.event_id)
+        );
+        assert_eq!(store.event_count().expect("count"), 1);
+    }
+
+    #[test]
     fn insert_events_refreshes_preloaded_conflicts_before_matching_new_reasoning_variant() {
         let store = Store::in_memory().expect("store");
         let source = statsai_core::SourceLocation::local_adapter(
@@ -4956,7 +5170,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
@@ -5061,7 +5275,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
@@ -5165,7 +5379,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
@@ -5284,7 +5498,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
@@ -5399,7 +5613,7 @@ mod tests {
             project_id: "project_shared".to_string(),
             project_label: Some("ai-stats".to_string()),
             repo_remote_hash: Some("repo-hash".to_string()),
-            repo_label: Some("starkdmi/statsai".to_string()),
+            repo_label: Some("example/statsai".to_string()),
             branch_hash: Some("branch-hash".to_string()),
             branch_label: Some("main".to_string()),
             path_hash: Some("path-hash".to_string()),
@@ -5671,7 +5885,14 @@ mod tests {
             .expect("events");
 
         store
-            .record_sync_success("http", "http://localhost/sync", "batch_1", &[first], &[])
+            .record_sync_success(
+                "http",
+                "http://localhost/sync",
+                "batch_1",
+                &[first],
+                &[],
+                None,
+            )
             .expect("record success");
         let state = store
             .sync_state("http", "http://localhost/sync")
@@ -6373,6 +6594,7 @@ mod tests {
                 "batch_1",
                 &[],
                 &[],
+                None,
             )
             .expect("record success");
         store
@@ -6382,6 +6604,7 @@ mod tests {
                 "batch_2",
                 &[],
                 &[],
+                None,
             )
             .expect("record success other target");
 
