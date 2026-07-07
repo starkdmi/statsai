@@ -322,22 +322,29 @@ pub fn get_or_refresh_token() -> Result<Option<String>> {
         }
     }
 
+    let access_token = refresh_cloudflare_access_token(&path, &mut credentials, &api_base_url)?;
+    Ok(Some(access_token))
+}
+
+fn refresh_cloudflare_access_token(
+    path: &Path,
+    credentials: &mut AuthCredentials,
+    api_base_url: &str,
+) -> Result<String> {
     let refresh_token = credentials
         .cloudflare_refresh_token
         .clone()
         .filter(|token| !token.trim().is_empty())
         .context("Cloudflare refresh token missing; run `statsai auth login`")?;
     let url = format!("{}/api/devices/token", api_base_url.trim_end_matches('/'));
-    let response = ureq::post(&url).send_json(serde_json::json!({
-        "refreshToken": refresh_token
-    }));
+    let response = ureq::post(&url).send_json(token_refresh_request_payload(&refresh_token));
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
             let body = response.into_string().unwrap_or_default();
             if code == 400 || code == 401 {
-                let _ = std::fs::remove_file(&path);
-                delete_tokens_from_keyring(&credentials);
+                let _ = std::fs::remove_file(path);
+                delete_tokens_from_keyring(credentials);
                 bail!("Cloudflare device session expired. Please run 'statsai auth login' again.");
             }
             bail!("Cloudflare token refresh failed (HTTP {}): {}", code, body);
@@ -359,17 +366,17 @@ pub fn get_or_refresh_token() -> Result<Option<String>> {
     let refresh_expires_at = json["refreshExpiresAt"].as_u64().unwrap_or(0);
 
     credentials.backend = Some("cloudflare".to_string());
-    credentials.api_base_url = Some(api_base_url.clone());
+    credentials.api_base_url = Some(api_base_url.to_string());
     credentials.cloudflare_refresh_token = Some(next_refresh_token);
     credentials.cloudflare_refresh_expires_at_secs = refresh_expires_at;
     credentials.cloudflare_access_token = Some(access_token.clone());
     credentials.cloudflare_access_expires_at_secs = access_expires_at;
     if let Some(device_id) = json["deviceId"].as_str() {
         credentials.device_id = Some(device_id.to_string());
-        remember_auth_device_id(&api_base_url, device_id);
+        remember_auth_device_id(api_base_url, device_id);
     }
-    write_credentials(&path, &credentials)?;
-    Ok(Some(access_token))
+    write_credentials(path, credentials)?;
+    Ok(access_token)
 }
 
 pub fn cloudflare_api_url() -> String {
@@ -700,6 +707,27 @@ fn response_error_code(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|json| json["error"].as_str().map(str::to_owned))
+}
+
+fn append_collector_metadata(payload: &mut serde_json::Map<String, serde_json::Value>) {
+    payload.insert(
+        "platform".to_string(),
+        serde_json::Value::String(std::env::consts::OS.to_string()),
+    );
+    payload.insert(
+        "collectorVersion".to_string(),
+        serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+    );
+}
+
+fn token_refresh_request_payload(refresh_token: &str) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "refreshToken".to_string(),
+        serde_json::Value::String(refresh_token.to_string()),
+    );
+    append_collector_metadata(&mut payload);
+    serde_json::Value::Object(payload)
 }
 
 fn default_device_name() -> String {
@@ -1168,6 +1196,17 @@ mod tests {
         let record =
             auth_record_for_backend(dir.path(), "https://api.example.com").expect("auth record");
         assert!(record.is_none());
+    }
+
+    #[test]
+    fn token_refresh_sends_current_collector_metadata() {
+        let json = token_refresh_request_payload("refresh-token");
+        assert_eq!(json["refreshToken"].as_str(), Some("refresh-token"));
+        assert_eq!(
+            json["collectorVersion"].as_str(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(json["platform"].as_str(), Some(std::env::consts::OS));
     }
 
     #[test]
