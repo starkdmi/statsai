@@ -1834,10 +1834,7 @@ fn polish_task_title_candidate(value: &str) -> String {
         title = stripped;
     }
 
-    loop {
-        let Some(stripped) = strip_conversational_prefix(&title) else {
-            break;
-        };
+    while let Some(stripped) = strip_conversational_prefix(&title) {
         if stripped == title || stripped.is_empty() {
             break;
         }
