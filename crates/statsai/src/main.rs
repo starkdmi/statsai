@@ -625,6 +625,11 @@ struct SyncCommand {
     yes: bool,
     #[arg(long, help = "Build the sync batch without writing")]
     dry_run: bool,
+    #[arg(
+        long,
+        help = "Include project metadata in synced usage payloads and enable hosted task sync"
+    )]
+    include_projects: bool,
 }
 
 #[derive(Debug, Args)]
@@ -3194,9 +3199,10 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
 
     if command.dry_run {
         eprintln!(
-            "dry run: sink={} mode={} sources={} events={} summaries={} task_buckets={} task_verifications={}",
+            "dry run: sink={} mode={} include_projects={} sources={} events={} summaries={} task_buckets={} task_verifications={}",
             command.sink,
             sync_payload_mode_name(payload_mode),
+            command.include_projects,
             batch.sources.len(),
             batch.events.len(),
             batch.summaries.len()
@@ -3268,7 +3274,13 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
     let auth_token = resolve_http_auth_token(command, true)?
         .context("device login required; run `statsai auth login` first")?;
     let remote = http_remote_preflight_status(target, &auth_token)?;
-    let local_verify = sync_local_verify(store, "http", target, Some(&local_state))?;
+    let local_verify = sync_local_verify(
+        store,
+        "http",
+        target,
+        Some(&local_state),
+        command.include_projects,
+    )?;
     let batch_mismatch = !remote_sync_batch_matches_local_state(&remote, &local_state);
     let metadata_gap = remote_metadata_gap_reason(&remote, &local_verify);
     if batch_mismatch || metadata_gap.is_some() {
@@ -3348,6 +3360,7 @@ fn build_sync_batch(
     device_id: &str,
     target: &str,
 ) -> Result<(SyncBatch, SyncPayloadMode)> {
+    let include_projects = command.include_projects;
     let payload_mode = sync_payload_mode(command)?;
     let state = if command.sink == "http" || command.since_last {
         store.sync_state(&command.sink, target)?
@@ -3376,14 +3389,14 @@ fn build_sync_batch(
         store
             .events_after(event_cursor)?
             .into_iter()
-            .map(sanitize_event_for_sync)
+            .map(|event| sanitize_event_for_sync_with_projects(event, include_projects))
             .collect()
     };
     let passthrough_summaries: Vec<_> = if payload_mode == SyncPayloadMode::Rollups {
         store
             .summaries()?
             .into_iter()
-            .map(sanitize_summary_for_sync)
+            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
             .filter(is_http_rollup_passthrough_summary)
             .collect()
     } else {
@@ -3395,7 +3408,7 @@ fn build_sync_batch(
         store
             .summaries_after(summary_cursor)?
             .into_iter()
-            .map(sanitize_summary_for_sync)
+            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
             .collect()
     };
     let all_sources: Vec<_> = store
@@ -3442,23 +3455,28 @@ fn build_sync_batch(
     } else {
         all_subscriptions
     };
-    let task_verification_cursor = if command.sink == "http" || command.since_last {
-        store.sync_task_verification_cursor(&command.sink, target)?
+    let (task_buckets, task_verifications) = if include_projects {
+        let task_verification_cursor = if command.sink == "http" || command.since_last {
+            store.sync_task_verification_cursor(&command.sink, target)?
+        } else {
+            None
+        };
+        let full_task_sync = command.full || state.is_none();
+        let task_buckets = store.pending_task_bucket_snapshots_for_sync(
+            &command.sink,
+            target,
+            device_id,
+            full_task_sync,
+            task_verification_cursor.clone(),
+        )?;
+        let task_verifications = if full_task_sync {
+            store.task_verifications()?
+        } else {
+            store.pending_task_verifications_for_sync(&command.sink, target)?
+        };
+        (task_buckets, task_verifications)
     } else {
-        None
-    };
-    let full_task_sync = command.full || state.is_none();
-    let task_buckets = store.pending_task_bucket_snapshots_for_sync(
-        &command.sink,
-        target,
-        device_id,
-        full_task_sync,
-        task_verification_cursor.clone(),
-    )?;
-    let task_verifications = if full_task_sync {
-        store.task_verifications()?
-    } else {
-        store.pending_task_verifications_for_sync(&command.sink, target)?
+        (Vec::new(), Vec::new())
     };
 
     if payload_mode == SyncPayloadMode::Rollups {
@@ -3507,7 +3525,7 @@ fn build_sync_batch(
         let all_rollups: Vec<_> = store
             .all_sync_rollup_summaries()?
             .into_iter()
-            .map(sanitize_summary_for_sync)
+            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
             .collect();
         let rollups = if full_rollup_sync {
             all_rollups
@@ -3523,7 +3541,11 @@ fn build_sync_batch(
                 "incremental"
             }
         );
-        summaries.extend(rollups.into_iter().map(sanitize_summary_for_sync));
+        summaries.extend(
+            rollups
+                .into_iter()
+                .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects)),
+        );
     }
 
     Ok((
@@ -3640,6 +3662,9 @@ fn maybe_disable_http_hosted_task_sync_payload(
 ) -> Result<bool> {
     if command.sink != "http" {
         return Ok(true);
+    }
+    if !command.include_projects {
+        return Ok(false);
     }
     if http_remote_hosted_tasks_enabled(command, target)? {
         return Ok(true);
@@ -4563,7 +4588,13 @@ fn sync_http_verify(command: SyncCommand, store: &Store, device_id: &str) -> Res
         target: endpoint.clone(),
         endpoint: endpoint.clone(),
         device_id: device_id.to_string(),
-        local: sync_local_verify(store, "http", &endpoint, local_state.as_ref())?,
+        local: sync_local_verify(
+            store,
+            "http",
+            &endpoint,
+            local_state.as_ref(),
+            command.include_projects,
+        )?,
         remote: http_remote_verify(&endpoint, &auth_token)?,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -4575,6 +4606,7 @@ fn sync_local_verify(
     sink: &str,
     target: &str,
     local_state: Option<&SyncState>,
+    include_projects: bool,
 ) -> Result<SyncLocalVerify> {
     let all_sources = store.list_sources()?;
     let all_accounts = store.list_accounts()?;
@@ -4603,13 +4635,13 @@ fn sync_local_verify(
     let passthrough_summaries: Vec<_> = store
         .summaries()?
         .into_iter()
-        .map(sanitize_summary_for_sync)
+        .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
         .filter(is_http_rollup_passthrough_summary)
         .collect();
     let rollup_summaries: Vec<_> = store
         .all_sync_rollup_summaries()?
         .into_iter()
-        .map(sanitize_summary_for_sync)
+        .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
         .collect();
 
     Ok(SyncLocalVerify {
@@ -6977,6 +7009,14 @@ fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
     event
 }
 
+fn sanitize_event_for_sync_with_projects(event: UsageEvent, include_projects: bool) -> UsageEvent {
+    let mut event = sanitize_event_for_sync(event);
+    if !include_projects {
+        event.project = None;
+    }
+    event
+}
+
 fn sanitize_project_for_sync(project: ProjectInfo) -> Option<ProjectInfo> {
     statsai_core::sanitize_project_for_sync(project)
 }
@@ -7150,6 +7190,17 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
 
 fn sanitize_summary_for_sync(summary: UsageSummary) -> UsageSummary {
     statsai_core::sanitize_summary_for_sync(summary)
+}
+
+fn sanitize_summary_for_sync_with_projects(
+    summary: UsageSummary,
+    include_projects: bool,
+) -> UsageSummary {
+    let mut summary = sanitize_summary_for_sync(summary);
+    if !include_projects {
+        summary.project = None;
+    }
+    summary
 }
 
 fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
@@ -12087,8 +12138,8 @@ mod tests {
             .sync_state("http", &target)
             .expect("state")
             .expect("present");
-        let local_verify =
-            sync_local_verify(&store, "http", &target, Some(&local_state)).expect("local verify");
+        let local_verify = sync_local_verify(&store, "http", &target, Some(&local_state), false)
+            .expect("local verify");
         assert_eq!(
             remote_metadata_gap_reason(
                 &json!({
@@ -14463,7 +14514,7 @@ mod tests {
             )
             .expect("record summaries");
 
-        let local = sync_local_verify(&store, "http", &target, None).expect("local verify");
+        let local = sync_local_verify(&store, "http", &target, None, false).expect("local verify");
         assert_eq!(local.pending_sources, 0);
         assert_eq!(local.pending_accounts, 0);
         assert_eq!(local.pending_source_account_assignments, 0);
@@ -14524,9 +14575,136 @@ mod tests {
             .record_summaries_synced("http", &target, &rollups)
             .expect("record rollups");
 
-        let local = sync_local_verify(&store, "http", &target, None).expect("local verify");
+        let local = sync_local_verify(&store, "http", &target, None, true).expect("local verify");
         assert_eq!(local.total_rollups, 1);
         assert_eq!(local.pending_rollups, 0);
+    }
+
+    #[test]
+    fn sync_local_verify_respects_project_sync_opt_in() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-verify-project-opt-in"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let mut event = test_event(
+            "codex",
+            &source,
+            Utc::now(),
+            Some(provider_account_id("codex", "personal")),
+            TokenParts::total(42),
+        );
+        event.project = Some(ProjectInfo {
+            project_id: "project-repo-backed".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/work/ai-stats".to_string()),
+        });
+        store.insert_event(&event).expect("event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let target = "https://api.example.com/api/sync/batches".to_string();
+        let rollups: Vec<_> = store
+            .all_sync_rollup_summaries()
+            .expect("rollups")
+            .into_iter()
+            .map(|summary| sanitize_summary_for_sync_with_projects(summary, false))
+            .collect();
+        store
+            .record_summaries_synced("http", &target, &rollups)
+            .expect("record rollups");
+
+        let hidden = sync_local_verify(&store, "http", &target, None, false)
+            .expect("local verify without projects");
+        let opted_in = sync_local_verify(&store, "http", &target, None, true)
+            .expect("local verify with projects");
+
+        assert_eq!(hidden.pending_rollups, 0);
+        assert_eq!(opted_in.pending_rollups, 1);
+    }
+
+    #[test]
+    fn build_sync_batch_omits_project_data_without_opt_in() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-project-sync-opt-in"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 7, 12, 0, 0)
+            .single()
+            .expect("now");
+        let mut event = test_event("codex", &source, now, None, TokenParts::total(120));
+        event.project = Some(ProjectInfo {
+            project_id: "project-repo-backed".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: Some("branch-hash".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/work/ai-stats".to_string()),
+        });
+        store.insert_event(&event).expect("event");
+
+        let mut summary = test_summary("codex", &source, now, 120, None);
+        summary.project = event.project.clone();
+        store.upsert_summary(&summary).expect("summary");
+
+        let task_batch = test_task_only_sync_batch(now, 1, 1);
+        for bucket in &task_batch.task_buckets {
+            store
+                .replace_task_bucket_snapshot(bucket)
+                .expect("seed task bucket");
+        }
+        for verification in &task_batch.task_verifications {
+            store
+                .merge_task_verification(verification)
+                .expect("seed task verification");
+        }
+
+        let default_command = test_sync_command("file");
+        let default_target = sync_target(&default_command).expect("default target");
+        let (default_batch, default_mode) =
+            build_sync_batch(&default_command, &store, "device", &default_target)
+                .expect("default batch");
+        assert_eq!(default_mode, SyncPayloadMode::Raw);
+        assert_eq!(default_batch.events.len(), 1);
+        assert!(default_batch.events[0].project.is_none());
+        assert_eq!(default_batch.summaries.len(), 1);
+        assert!(default_batch.summaries[0].project.is_none());
+        assert!(default_batch.task_buckets.is_empty());
+        assert!(default_batch.task_verifications.is_empty());
+
+        let opt_in_command = SyncCommand {
+            include_projects: true,
+            ..test_sync_command("file")
+        };
+        let opt_in_target = sync_target(&opt_in_command).expect("opt-in target");
+        let (opt_in_batch, opt_in_mode) =
+            build_sync_batch(&opt_in_command, &store, "device", &opt_in_target)
+                .expect("opt-in batch");
+        assert_eq!(opt_in_mode, SyncPayloadMode::Raw);
+        assert_eq!(opt_in_batch.events.len(), 1);
+        assert!(opt_in_batch.events[0].project.is_some());
+        assert_eq!(opt_in_batch.summaries.len(), 1);
+        assert!(opt_in_batch.summaries[0].project.is_some());
+        assert_eq!(opt_in_batch.task_buckets.len(), 1);
+        assert_eq!(opt_in_batch.task_verifications.len(), 1);
     }
 
     #[test]
@@ -14957,6 +15135,7 @@ mod tests {
             reset_remote: false,
             yes: false,
             dry_run: false,
+            include_projects: false,
         }
     }
 
