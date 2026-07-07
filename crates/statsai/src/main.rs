@@ -3188,7 +3188,9 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     if command.sink == "http" {
         maybe_reset_http_sync_tracking_if_remote_changed(&command, store, &target)?;
     }
-    let (batch, payload_mode) = build_sync_batch(&command, store, device_id, &target)?;
+    let (mut batch, payload_mode) = build_sync_batch(&command, store, device_id, &target)?;
+    let hosted_task_sync_enabled =
+        maybe_disable_http_hosted_task_sync_payload(&command, &target, &mut batch)?;
 
     if command.dry_run {
         eprintln!(
@@ -3226,12 +3228,15 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
                 let auth_token = resolve_http_auth_token(&command, false)?;
                 send_http_sync_batch(
                     store,
-                    &command.sink,
-                    &target,
-                    &endpoint,
-                    auth_token,
+                    HttpSyncBatchRequest {
+                        sink: &command.sink,
+                        target: &target,
+                        endpoint: &endpoint,
+                        auth_token,
+                        payload_mode,
+                        hosted_task_sync_enabled,
+                    },
                     &batch,
-                    payload_mode,
                 )?;
                 Ok(())
             }
@@ -3628,6 +3633,30 @@ fn record_sync_batch_success(
     Ok(())
 }
 
+fn maybe_disable_http_hosted_task_sync_payload(
+    command: &SyncCommand,
+    target: &str,
+    batch: &mut SyncBatch,
+) -> Result<bool> {
+    if command.sink != "http" {
+        return Ok(true);
+    }
+    if http_remote_hosted_tasks_enabled(command, target)? {
+        return Ok(true);
+    }
+    if batch.task_buckets.is_empty() && batch.task_verifications.is_empty() {
+        return Ok(false);
+    }
+    eprintln!(
+        "http sync: hosted task access is not enabled for this account; skipping {} task buckets and {} task verifications",
+        batch.task_buckets.len(),
+        batch.task_verifications.len()
+    );
+    batch.task_buckets.clear();
+    batch.task_verifications.clear();
+    Ok(false)
+}
+
 fn sync_batch_task_verification_cursor(batch: &SyncBatch) -> Option<TaskVerificationCursor> {
     batch
         .task_buckets
@@ -3640,18 +3669,23 @@ fn sync_batch_task_verification_cursor(batch: &SyncBatch) -> Option<TaskVerifica
         })
 }
 
+struct HttpSyncBatchRequest<'a> {
+    sink: &'a str,
+    target: &'a str,
+    endpoint: &'a str,
+    auth_token: Option<String>,
+    payload_mode: SyncPayloadMode,
+    hosted_task_sync_enabled: bool,
+}
+
 fn send_http_sync_batch(
     store: &Store,
-    sink: &str,
-    target: &str,
-    endpoint: &str,
-    auth_token: Option<String>,
+    request: HttpSyncBatchRequest<'_>,
     batch: &SyncBatch,
-    payload_mode: SyncPayloadMode,
 ) -> Result<()> {
-    let task_sync_auth_token = auth_token.clone();
-    let http_sink = HttpSink::new(endpoint, auth_token)?;
-    let batches = if payload_mode == SyncPayloadMode::Rollups {
+    let task_sync_auth_token = request.auth_token.clone();
+    let http_sink = HttpSink::new(request.endpoint, request.auth_token)?;
+    let batches = if request.payload_mode == SyncPayloadMode::Rollups {
         split_http_rollup_sync_batches(batch)
     } else {
         vec![batch.clone()]
@@ -3675,12 +3709,12 @@ fn send_http_sync_batch(
                 chunk.batch_id
             );
         }
-        if payload_mode == SyncPayloadMode::Rollups {
+        if request.payload_mode == SyncPayloadMode::Rollups {
             send_http_rollup_chunk_with_retry(&http_sink, chunk, &|synced_chunk| {
                 record_rollup_sync_chunk_success(
                     store,
-                    sink,
-                    target,
+                    request.sink,
+                    request.target,
                     &logical_batch_id,
                     synced_chunk,
                 )
@@ -3688,21 +3722,30 @@ fn send_http_sync_batch(
         } else {
             let ack = http_sink.send_with_ack(chunk)?;
             println!("{}", serde_json::to_string_pretty(&ack)?);
-            record_sync_batch_success(store, sink, target, batch)?;
+            record_sync_batch_success(store, request.sink, request.target, batch)?;
         }
     }
-    if payload_mode == SyncPayloadMode::Rollups {
-        store.clear_pending_sync_resume(sink, target)?;
+    if request.payload_mode == SyncPayloadMode::Rollups {
+        store.clear_pending_sync_resume(request.sink, request.target)?;
     }
-    let pulled_cursor = pull_remote_task_verifications(
-        store,
-        sink,
-        target,
-        endpoint,
-        task_sync_auth_token.as_deref(),
-    )?;
-    if let Some(cursor) = pulled_cursor.as_ref() {
-        store.record_sync_success(sink, target, &batch.batch_id, &[], &[], Some(cursor))?;
+    if request.hosted_task_sync_enabled {
+        let pulled_cursor = pull_remote_task_verifications(
+            store,
+            request.sink,
+            request.target,
+            request.endpoint,
+            task_sync_auth_token.as_deref(),
+        )?;
+        if let Some(cursor) = pulled_cursor.as_ref() {
+            store.record_sync_success(
+                request.sink,
+                request.target,
+                &batch.batch_id,
+                &[],
+                &[],
+                Some(cursor),
+            )?;
+        }
     }
     Ok(())
 }
@@ -4804,6 +4847,36 @@ fn http_request_error(action: &str, error: ureq::Error) -> anyhow::Error {
         }
         other => anyhow::anyhow!("HTTP {action} failed: {other}"),
     }
+}
+
+fn http_remote_hosted_tasks_enabled(command: &SyncCommand, endpoint: &str) -> Result<bool> {
+    let Some(preflight_url) = http_preflight_status_url(endpoint).ok() else {
+        return Ok(true);
+    };
+    let Some(auth_token) = resolve_http_auth_token(command, false)? else {
+        return Ok(true);
+    };
+    let request = ureq::get(&preflight_url).set("Authorization", &format!("Bearer {auth_token}"));
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) if optional_http_sync_preflight_status(code) => {
+            return Ok(true);
+        }
+        Err(error) => return Err(http_request_error("load sync preflight status", error)),
+    };
+    let remote = http_response_json(response, "load sync preflight status")?;
+    Ok(remote_hosted_tasks_enabled(&remote))
+}
+
+fn remote_hosted_tasks_enabled(remote: &Value) -> bool {
+    remote
+        .pointer("/capabilities/hostedTasks")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn optional_http_sync_preflight_status(status: u16) -> bool {
+    matches!(status, 404 | 405 | 501)
 }
 
 fn http_response_json(response: ureq::Response, action: &str) -> Result<Value> {
@@ -12065,6 +12138,33 @@ mod tests {
             http_preflight_status_url("https://api.example.com/api/sync/batches").expect("status"),
             "https://api.example.com/api/sync/status?view=preflight"
         );
+    }
+
+    #[test]
+    fn remote_hosted_tasks_enabled_defaults_true_when_capability_missing() {
+        assert!(remote_hosted_tasks_enabled(&json!({
+            "device": {
+                "last_sync_batch_id": "batch-1"
+            }
+        })));
+    }
+
+    #[test]
+    fn remote_hosted_tasks_enabled_reads_explicit_false_capability() {
+        assert!(!remote_hosted_tasks_enabled(&json!({
+            "capabilities": {
+                "hostedTasks": false
+            }
+        })));
+    }
+
+    #[test]
+    fn optional_http_sync_preflight_statuses_do_not_disable_task_sync() {
+        assert!(optional_http_sync_preflight_status(404));
+        assert!(optional_http_sync_preflight_status(405));
+        assert!(optional_http_sync_preflight_status(501));
+        assert!(!optional_http_sync_preflight_status(400));
+        assert!(!optional_http_sync_preflight_status(500));
     }
 
     #[test]
