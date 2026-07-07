@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
 use statsai_adapters::VerifiedSubscriptionState;
@@ -16,9 +16,10 @@ use statsai_core::{
     source_id as statsai_source_id, subscription_id, timestamp_in_period, BillingPeriod, EventId,
     IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
     SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
-    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch, TaskSpan,
-    TaskStatus, TaskVerdict, TaskVerification, TaskVerificationAction, UsageEvent, UsageReport,
-    UsageSummary, UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch,
+    TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict, TaskVerification,
+    TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport, UsageSummary,
+    UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -53,6 +54,8 @@ const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
 const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 const HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE: usize = 90;
 const HTTP_ROLLUP_DAILY_ROLLUP_ROWS_PER_QUERY: usize = 7;
+const TASK_SYNC_SQL_MAX_ROWS_PER_CHUNK: usize = 200;
+const TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK: usize = 512 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -632,7 +635,7 @@ struct SchemaCommand {
 
 #[derive(Debug, Subcommand)]
 enum SchemaSubcommand {
-    #[command(about = "Print the sync_batch.v1 JSON Schema")]
+    #[command(about = "Print the sync_batch.v2 JSON Schema")]
     SyncBatch,
 }
 
@@ -3178,7 +3181,7 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     }
 
     if command.status {
-        return sync_status(store);
+        return sync_status(store, device_id);
     }
 
     let target = sync_target(&command)?;
@@ -3189,12 +3192,15 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
 
     if command.dry_run {
         eprintln!(
-            "dry run: sink={} mode={} sources={} events={} summaries={}",
+            "dry run: sink={} mode={} sources={} events={} summaries={} task_buckets={} task_verifications={}",
             command.sink,
             sync_payload_mode_name(payload_mode),
             batch.sources.len(),
             batch.events.len(),
             batch.summaries.len()
+            ,
+            batch.task_buckets.len(),
+            batch.task_verifications.len(),
         );
         return Ok(());
     }
@@ -3203,13 +3209,7 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
         match command.sink.as_str() {
             "stdout" => {
                 StdoutSink.send(&batch)?;
-                store.record_sync_success(
-                    &command.sink,
-                    &target,
-                    &batch.batch_id,
-                    &batch.events,
-                    &batch.summaries,
-                )?;
+                record_sync_batch_success(store, &command.sink, &target, &batch)?;
                 Ok(())
             }
             "file" => {
@@ -3218,13 +3218,7 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("statsai-sync-batch.json"));
                 FileSink::new(output).send(&batch)?;
-                store.record_sync_success(
-                    &command.sink,
-                    &target,
-                    &batch.batch_id,
-                    &batch.events,
-                    &batch.summaries,
-                )?;
+                record_sync_batch_success(store, &command.sink, &target, &batch)?;
                 Ok(())
             }
             "http" => {
@@ -3443,6 +3437,24 @@ fn build_sync_batch(
     } else {
         all_subscriptions
     };
+    let task_verification_cursor = if command.sink == "http" || command.since_last {
+        store.sync_task_verification_cursor(&command.sink, target)?
+    } else {
+        None
+    };
+    let full_task_sync = command.full || state.is_none();
+    let task_buckets = store.pending_task_bucket_snapshots_for_sync(
+        &command.sink,
+        target,
+        device_id,
+        full_task_sync,
+        task_verification_cursor.clone(),
+    )?;
+    let task_verifications = if full_task_sync {
+        store.task_verifications()?
+    } else {
+        store.pending_task_verifications_for_sync(&command.sink, target)?
+    };
 
     if payload_mode == SyncPayloadMode::Rollups {
         let label = rollup_mode_label(command);
@@ -3520,6 +3532,8 @@ fn build_sync_batch(
             subscriptions,
             events,
             summaries,
+            task_buckets,
+            task_verifications,
             created_at: Utc::now(),
         },
         payload_mode,
@@ -3556,6 +3570,7 @@ fn record_rollup_sync_chunk_success(
         .filter(|summary| is_daily_rollup_summary(summary))
         .map(|summary| summary.summary_id.clone())
         .collect();
+    let task_verification_cursor = sync_batch_task_verification_cursor(batch);
 
     store.record_sync_success(
         sink,
@@ -3563,6 +3578,7 @@ fn record_rollup_sync_chunk_success(
         logical_batch_id,
         &batch.events,
         &passthrough_summaries,
+        task_verification_cursor.as_ref(),
     )?;
     store.mark_pending_sync_resume(sink, target, logical_batch_id)?;
     store.mark_sync_rollups_synced(&rollup_summary_ids)?;
@@ -3576,8 +3592,52 @@ fn record_rollup_sync_chunk_success(
         &batch.source_account_assignments,
     )?;
     store.record_subscriptions_synced(sink, target, &batch.subscriptions)?;
+    store.record_task_bucket_snapshots_synced(
+        sink,
+        target,
+        &batch.device_id,
+        &batch.task_buckets,
+    )?;
+    store.record_task_verifications_synced(sink, target, &batch.task_verifications)?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
+}
+
+fn record_sync_batch_success(
+    store: &Store,
+    sink: &str,
+    target: &str,
+    batch: &SyncBatch,
+) -> Result<()> {
+    let task_verification_cursor = sync_batch_task_verification_cursor(batch);
+    store.record_sync_success(
+        sink,
+        target,
+        &batch.batch_id,
+        &batch.events,
+        &batch.summaries,
+        task_verification_cursor.as_ref(),
+    )?;
+    store.record_task_bucket_snapshots_synced(
+        sink,
+        target,
+        &batch.device_id,
+        &batch.task_buckets,
+    )?;
+    store.record_task_verifications_synced(sink, target, &batch.task_verifications)?;
+    Ok(())
+}
+
+fn sync_batch_task_verification_cursor(batch: &SyncBatch) -> Option<TaskVerificationCursor> {
+    batch
+        .task_buckets
+        .iter()
+        .filter_map(|bucket| bucket.applied_verification_cursor.clone())
+        .max_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.verification_id.0.cmp(&right.verification_id.0))
+        })
 }
 
 fn send_http_sync_batch(
@@ -3589,6 +3649,7 @@ fn send_http_sync_batch(
     batch: &SyncBatch,
     payload_mode: SyncPayloadMode,
 ) -> Result<()> {
+    let task_sync_auth_token = auth_token.clone();
     let http_sink = HttpSink::new(endpoint, auth_token)?;
     let batches = if payload_mode == SyncPayloadMode::Rollups {
         split_http_rollup_sync_batches(batch)
@@ -3627,19 +3688,70 @@ fn send_http_sync_batch(
         } else {
             let ack = http_sink.send_with_ack(chunk)?;
             println!("{}", serde_json::to_string_pretty(&ack)?);
-            store.record_sync_success(
-                sink,
-                target,
-                &batch.batch_id,
-                &batch.events,
-                &batch.summaries,
-            )?;
+            record_sync_batch_success(store, sink, target, batch)?;
         }
     }
     if payload_mode == SyncPayloadMode::Rollups {
         store.clear_pending_sync_resume(sink, target)?;
     }
+    let pulled_cursor = pull_remote_task_verifications(
+        store,
+        sink,
+        target,
+        endpoint,
+        task_sync_auth_token.as_deref(),
+    )?;
+    if let Some(cursor) = pulled_cursor.as_ref() {
+        store.record_sync_success(sink, target, &batch.batch_id, &[], &[], Some(cursor))?;
+    }
     Ok(())
+}
+
+fn pull_remote_task_verifications(
+    store: &Store,
+    sink: &str,
+    target: &str,
+    endpoint: &str,
+    auth_token: Option<&str>,
+) -> Result<Option<TaskVerificationCursor>> {
+    let Some(auth_token) = auth_token.filter(|token| !token.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(feed_url) = http_task_verification_feed_url(endpoint) else {
+        return Ok(None);
+    };
+    let mut request = ureq::get(&feed_url).set("Authorization", &format!("Bearer {auth_token}"));
+    if let Some(cursor) = store.sync_task_verification_cursor(sink, target)? {
+        request = request
+            .query("updatedAt", &cursor.updated_at.to_rfc3339())
+            .query("verificationId", &cursor.verification_id.0);
+    }
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) if optional_task_verification_feed_status(code) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(http_request_error("pull task verifications", error)),
+    };
+    let feed: TaskVerificationFeedResponse = response
+        .into_json()
+        .context("parse task verification feed")?;
+    let mut affected_buckets = BTreeSet::new();
+    for verification in &feed.verifications {
+        if store.merge_task_verification(verification)? {
+            affected_buckets.extend(store.project_buckets_for_task_verification(verification)?);
+        }
+    }
+    store.record_task_verifications_synced(sink, target, &feed.verifications)?;
+    if !affected_buckets.is_empty() {
+        store.rebuild_task_work_items_for_project_buckets(&affected_buckets)?;
+        snapshot::invalidate_dashboard_cache();
+    }
+    Ok(feed.next_cursor)
+}
+
+fn optional_task_verification_feed_status(status: u16) -> bool {
+    matches!(status, 404 | 405 | 501)
 }
 
 fn send_http_rollup_chunk_with_retry<F>(
@@ -3695,6 +3807,9 @@ fn should_retry_http_rollup_chunk_after_error(chunk: &SyncBatch, error: &anyhow:
         || chunk.accounts.len() > 1
         || chunk.source_account_assignments.len() > 1
         || chunk.subscriptions.len() > 1
+        || chunk.task_buckets.len() > 1
+        || chunk.task_verifications.len() > 1
+        || (!chunk.task_buckets.is_empty() && !chunk.task_verifications.is_empty())
         || (http_rollup_metadata_count(chunk) > 0 && !chunk.summaries.is_empty())
 }
 
@@ -3733,11 +3848,22 @@ fn parse_http_sync_error(error: &anyhow::Error) -> Option<ParsedHttpSyncError> {
 }
 
 fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch> {
+    let task_chunks = split_http_rollup_task_chunks(
+        batch,
+        HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH,
+        HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH,
+    );
+    let has_task_payload = !task_chunks.is_empty();
     let metadata_count = http_rollup_metadata_count(batch);
-    if batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
+    let has_rollup_payload = metadata_count > 0 || !batch.summaries.is_empty();
+    if !has_task_payload
+        && batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
         && metadata_count <= HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH
     {
         return fit_http_rollup_batches_to_d1_budget(vec![batch.clone()]);
+    }
+    if has_task_payload && !has_rollup_payload {
+        return fit_http_rollup_batches_to_d1_budget(task_chunks);
     }
 
     let total_chunks = batch
@@ -3745,12 +3871,13 @@ fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch> {
         .len()
         .div_ceil(HTTP_ROLLUP_SUMMARIES_PER_BATCH);
     let metadata_chunks = metadata_count.div_ceil(HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH);
-    let mut chunks = Vec::with_capacity(total_chunks + metadata_chunks);
+    let mut chunks = Vec::with_capacity(total_chunks + metadata_chunks + task_chunks.len());
 
     chunks.extend(split_http_rollup_metadata_chunks(
         batch,
         HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH,
     ));
+    chunks.extend(task_chunks);
     chunks.extend(split_http_rollup_summary_chunks(
         batch,
         HTTP_ROLLUP_SUMMARIES_PER_BATCH,
@@ -3760,6 +3887,30 @@ fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch> {
 }
 
 fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<SyncBatch> {
+    if !batch.task_buckets.is_empty() || !batch.task_verifications.is_empty() {
+        if !batch.task_buckets.is_empty() && !batch.task_verifications.is_empty() {
+            return split_http_rollup_task_chunks(
+                batch,
+                batch.task_buckets.len(),
+                batch.task_verifications.len(),
+            );
+        }
+        if batch.task_buckets.len() > 1 {
+            return split_http_rollup_task_chunks(
+                batch,
+                batch.task_buckets.len().div_ceil(2),
+                batch.task_verifications.len().max(1),
+            );
+        }
+        if batch.task_verifications.len() > 1 {
+            return split_http_rollup_task_chunks(
+                batch,
+                batch.task_buckets.len().max(1),
+                batch.task_verifications.len().div_ceil(2),
+            );
+        }
+    }
+
     if http_rollup_metadata_count(batch) > 0 && !batch.summaries.is_empty() {
         let mut chunks =
             split_http_rollup_metadata_chunks(batch, HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH);
@@ -3798,6 +3949,42 @@ fn http_rollup_metadata_count(batch: &SyncBatch) -> usize {
         + batch.accounts.len()
         + batch.source_account_assignments.len()
         + batch.subscriptions.len()
+}
+
+fn split_http_rollup_task_chunks(
+    batch: &SyncBatch,
+    task_bucket_chunk_size: usize,
+    task_verification_chunk_size: usize,
+) -> Vec<SyncBatch> {
+    let mut chunks = Vec::new();
+    let task_bucket_chunk_size = task_bucket_chunk_size.max(1);
+    let task_verification_chunk_size = task_verification_chunk_size.max(1);
+
+    chunks.extend(
+        batch
+            .task_buckets
+            .chunks(task_bucket_chunk_size)
+            .enumerate()
+            .map(|(index, buckets)| {
+                let mut chunk =
+                    empty_http_rollup_chunk(batch, &format!("task_buckets_{}", index + 1));
+                chunk.task_buckets = buckets.to_vec();
+                chunk
+            }),
+    );
+    chunks.extend(
+        batch
+            .task_verifications
+            .chunks(task_verification_chunk_size)
+            .enumerate()
+            .map(|(index, verifications)| {
+                let mut chunk =
+                    empty_http_rollup_chunk(batch, &format!("task_verifications_{}", index + 1));
+                chunk.task_verifications = verifications.to_vec();
+                chunk
+            }),
+    );
+    chunks
 }
 
 fn fit_http_rollup_batches_to_d1_budget(chunks: Vec<SyncBatch>) -> Vec<SyncBatch> {
@@ -3882,7 +4069,200 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
         + daily_rollup_write_queries
         + monthly_rollup_queries
         + dashboard_snapshot_queries
+        + estimate_http_rollup_task_queries(batch)
         + final_sync_bookkeeping_queries
+}
+
+fn estimate_http_rollup_task_queries(batch: &SyncBatch) -> usize {
+    let source_lookup_queries = http_rollup_query_chunks(
+        batch
+            .task_buckets
+            .iter()
+            .flat_map(|bucket| bucket.spans.iter())
+            .filter_map(|span| {
+                let source_id = span.source_id.0.trim();
+                (!source_id.is_empty()).then_some(source_id)
+            })
+            .collect::<BTreeSet<_>>()
+            .len(),
+        HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE,
+    );
+    let project_lookup_queries = http_rollup_query_chunks(
+        batch
+            .task_buckets
+            .iter()
+            .flat_map(|bucket| bucket.spans.iter())
+            .filter_map(|span| {
+                let project = span.project.as_ref()?;
+                Some(
+                    [
+                        Some(project.project_id.as_str()),
+                        project.path_hash.as_deref(),
+                        project.repo_remote_hash.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(":"),
+                )
+            })
+            .filter(|descriptor| !descriptor.is_empty())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE,
+    );
+    let verification_span_lookup_queries = http_rollup_query_chunks(
+        batch
+            .task_verifications
+            .iter()
+            .flat_map(|verification| verification.action.span_ids())
+            .filter_map(|span_id| {
+                let value = span_id.0.trim();
+                (!value.is_empty()).then_some(value)
+            })
+            .collect::<BTreeSet<_>>()
+            .len(),
+        HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE,
+    );
+    let write_queries = batch
+        .task_buckets
+        .iter()
+        .map(estimate_task_bucket_write_queries)
+        .sum::<usize>()
+        + batch.task_verifications.len();
+
+    source_lookup_queries
+        + project_lookup_queries
+        + verification_span_lookup_queries
+        + write_queries
+}
+
+fn estimate_task_bucket_write_queries(bucket: &TaskBucketSnapshot) -> usize {
+    let member_work_item_ids_by_span_id = bucket
+        .members
+        .iter()
+        .map(|member| (member.span_id.0.as_str(), member.work_item_id.0.as_str()))
+        .collect::<HashMap<_, _>>();
+    let spans_by_id = bucket
+        .spans
+        .iter()
+        .map(|span| (span.span_id.0.as_str(), span))
+        .collect::<HashMap<_, _>>();
+    4 + count_task_sync_json_chunks(&bucket.spans, |span| {
+        estimate_task_sync_span_insert_row_json(
+            span,
+            member_work_item_ids_by_span_id
+                .get(span.span_id.0.as_str())
+                .copied(),
+        )
+    }) + count_task_sync_json_chunks(&bucket.work_items, |work_item| {
+        estimate_task_sync_work_item_insert_row_json(
+            work_item,
+            spans_by_id
+                .get(work_item.anchor_span_id.0.as_str())
+                .copied(),
+        )
+    }) + count_task_sync_json_chunks(&bucket.members, estimate_task_sync_member_insert_row_json)
+}
+
+fn count_task_sync_json_chunks<T>(rows: &[T], serialize_row: impl Fn(&T) -> String) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let mut chunk_count = 0usize;
+    let mut current_row_count = 0usize;
+    let mut current_bytes = 2usize;
+    for row in rows {
+        let serialized = serialize_row(row);
+        let row_bytes = serialized.len();
+        let next_bytes = if current_row_count == 0 {
+            2 + row_bytes
+        } else {
+            current_bytes + 1 + row_bytes
+        };
+        if current_row_count > 0
+            && (current_row_count >= TASK_SYNC_SQL_MAX_ROWS_PER_CHUNK
+                || next_bytes > TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK)
+        {
+            chunk_count += 1;
+            current_row_count = 0;
+            current_bytes = 2;
+        }
+        current_row_count += 1;
+        current_bytes = if current_row_count == 1 {
+            2 + row_bytes
+        } else {
+            current_bytes + 1 + row_bytes
+        };
+    }
+    chunk_count + usize::from(current_row_count > 0)
+}
+
+fn estimate_task_sync_project_fields(span: &TaskSpan) -> (Option<&str>, Option<String>) {
+    let Some(project) = span.project.as_ref() else {
+        return (None, None);
+    };
+    let project_location_id = [
+        project.path_hash.as_deref(),
+        project.repo_remote_hash.as_deref(),
+        Some(project.project_id.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join(":");
+    (
+        Some(project.project_id.as_str()),
+        (!project_location_id.is_empty()).then_some(project_location_id),
+    )
+}
+
+fn estimate_task_sync_span_insert_row_json(span: &TaskSpan, work_item_id: Option<&str>) -> String {
+    let (project_id, project_location_id) = estimate_task_sync_project_fields(span);
+    json!({
+        "span_id": span.span_id.0,
+        "work_item_id": work_item_id,
+        "provider": span.provider,
+        "provider_account_id": Value::Null,
+        "project_id": project_id,
+        "project_location_id": project_location_id,
+        "started_at": span.started_at.to_rfc3339(),
+        "ended_at": span.ended_at.map(|timestamp| timestamp.to_rfc3339()),
+        "payload_json": serde_json::to_string(span).unwrap_or_default(),
+    })
+    .to_string()
+}
+
+fn estimate_task_sync_work_item_insert_row_json(
+    work_item: &WorkItem,
+    anchor_span: Option<&TaskSpan>,
+) -> String {
+    let (project_id, project_location_id) = anchor_span
+        .map(estimate_task_sync_project_fields)
+        .unwrap_or((None, None));
+    json!({
+        "work_item_id": work_item.work_item_id.0,
+        "anchor_span_id": work_item.anchor_span_id.0,
+        "status": work_item.status,
+        "confidence": work_item.confidence,
+        "started_at": work_item.started_at.to_rfc3339(),
+        "ended_at": work_item.ended_at.to_rfc3339(),
+        "project_id": project_id,
+        "project_location_id": project_location_id,
+        "payload_json": serde_json::to_string(work_item).unwrap_or_default(),
+    })
+    .to_string()
+}
+
+fn estimate_task_sync_member_insert_row_json(member: &statsai_core::WorkItemMember) -> String {
+    json!({
+        "work_item_id": member.work_item_id.0,
+        "span_id": member.span_id.0,
+        "ordinal": member.ordinal,
+    })
+    .to_string()
 }
 
 fn http_rollup_query_chunks(item_count: usize, chunk_size: usize) -> usize {
@@ -4057,6 +4437,8 @@ fn split_http_rollup_summary_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec
             chunk.subscriptions.clear();
             chunk.events.clear();
             chunk.summaries = summaries.to_vec();
+            chunk.task_buckets.clear();
+            chunk.task_verifications.clear();
             chunk
         })
         .collect()
@@ -4071,10 +4453,12 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
     chunk.subscriptions.clear();
     chunk.events.clear();
     chunk.summaries.clear();
+    chunk.task_buckets.clear();
+    chunk.task_verifications.clear();
     chunk
 }
 
-fn sync_status(store: &Store) -> Result<()> {
+fn sync_status(store: &Store, device_id: &str) -> Result<()> {
     let states = store.list_sync_states()?;
     if states.is_empty() {
         println!("no sync state recorded");
@@ -4082,8 +4466,10 @@ fn sync_status(store: &Store) -> Result<()> {
     }
     for state in states {
         let display_batch_id = logical_http_rollup_batch_id(&state.last_batch_id);
+        let task_bucket_status =
+            store.task_bucket_sync_status(&state.sink, &state.target, device_id)?;
         println!(
-            "{} target={} last_success={} batch={} event_cursor={} summary_cursor={} failures={}",
+            "{} target={} last_success={} batch={} event_cursor={} summary_cursor={} task_verification_cursor={} task_bucket_backlog={}/{} failures={}",
             state.sink,
             state.target,
             state.last_success_at.to_rfc3339(),
@@ -4102,6 +4488,15 @@ fn sync_status(store: &Store) -> Result<()> {
                     .map(DateTime::to_rfc3339),
                 state.last_summary_id.as_deref()
             ),
+            format_cursor(
+                state
+                    .last_task_verification_updated_at
+                    .as_ref()
+                    .map(DateTime::to_rfc3339),
+                state.last_task_verification_id.as_deref()
+            ),
+            task_bucket_status.dirty,
+            task_bucket_status.total,
             state.failure_count
         );
     }
@@ -4321,6 +4716,13 @@ struct SyncStateReport {
     failure_count: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct TaskVerificationFeedResponse {
+    #[serde(default)]
+    verifications: Vec<TaskVerification>,
+    next_cursor: Option<TaskVerificationCursor>,
+}
+
 fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
     let url = http_verify_status_url(endpoint)?;
     let request = ureq::get(&url).set("Authorization", &format!("Bearer {auth_token}"));
@@ -4386,6 +4788,14 @@ fn http_reset_url(endpoint: &str) -> Result<String> {
     )
 }
 
+fn http_task_verification_feed_url(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim_end_matches('/');
+    if let Some(prefix) = endpoint.strip_suffix("/api/sync/batches") {
+        return Some(format!("{prefix}/api/task-sync/verifications"));
+    }
+    None
+}
+
 fn http_request_error(action: &str, error: ureq::Error) -> anyhow::Error {
     match error {
         ureq::Error::Status(code, response) => {
@@ -4441,6 +4851,8 @@ fn strip_one_http_rollup_batch_suffix(batch_id: &str) -> String {
         "_accounts_",
         "_assignments_",
         "_subscriptions_",
+        "_task_buckets_",
+        "_task_verifications_",
     ] {
         if let Some(index) = batch_id.rfind(marker) {
             let suffix = &batch_id[(index + marker.len())..];
@@ -6742,15 +7154,17 @@ fn sanitize_subscription_for_sync(mut subscription: Subscription) -> Subscriptio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, TimeZone};
+    use chrono::{DateTime, Duration, TimeZone};
     use statsai_core::{
         branch_family, event_id, hash_text, normalize_task_title, project_bucket_key,
         subscription_id, summary_id, task_span_id, BillingPeriod, Confidence, CostInfo,
         EventSource, IdentitySource, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode,
         ProjectInfo, ProviderAccount, SessionInfo, SourceKind, Subscription, SubscriptionStatus,
-        SummaryMetadata, TaskSpan, UsageCounts, UsageSummary, PROVIDER_ACCOUNT_SCHEMA_VERSION,
-        SUBSCRIPTION_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
-        USAGE_SUMMARY_SCHEMA_VERSION,
+        SummaryMetadata, TaskBucketSnapshot, TaskSpan, TaskSpanId, TaskStatus, TaskVerdict,
+        TaskVerification, TaskVerificationAction, TaskVerificationId, UsageCounts, UsageSummary,
+        WorkItem, WorkItemId, WorkItemMember, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+        SUBSCRIPTION_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION, TASK_VERIFICATION_SCHEMA_VERSION,
+        USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
     };
     use std::path::Path;
 
@@ -10043,6 +10457,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
@@ -10156,6 +10572,8 @@ mod tests {
             subscriptions,
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
@@ -10219,6 +10637,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
         let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
@@ -10307,6 +10727,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
         let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
@@ -10634,6 +11056,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries: vec![],
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
@@ -10662,6 +11086,165 @@ mod tests {
         assert!(chunks.iter().all(|chunk| chunk.events.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.sources.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.accounts.is_empty()));
+    }
+
+    #[test]
+    fn http_rollup_retry_splits_mixed_task_payloads() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+
+        assert!(should_retry_http_rollup_chunk_after_error(
+            &batch,
+            &anyhow::anyhow!(
+                r#"sync endpoint returned HTTP 413: {{"error":"sync_batch_too_large"}}"#
+            ),
+        ));
+
+        let chunks = split_http_rollup_sync_batch_after_budget_error(&batch);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.task_buckets.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.task_verifications.len())
+                .sum::<usize>(),
+            1
+        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| { chunk.task_buckets.is_empty() || chunk.task_verifications.is_empty() }));
+    }
+
+    #[test]
+    fn http_rollup_retry_halves_task_only_bucket_chunks() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 3, 0);
+
+        assert!(should_retry_http_rollup_chunk_after_error(
+            &batch,
+            &anyhow::anyhow!(
+                r#"sync endpoint returned HTTP 413: {{"error":"sync_batch_d1_query_budget_exceeded"}}"#
+            ),
+        ));
+
+        let chunks = split_http_rollup_sync_batch_after_budget_error(&batch);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].task_buckets.len(), 2);
+        assert_eq!(chunks[1].task_buckets.len(), 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.task_verifications.is_empty()));
+    }
+
+    #[test]
+    fn record_sync_batch_success_marks_task_entities_synced_for_file_sink() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let store = Store::in_memory().expect("store");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+        for bucket in &batch.task_buckets {
+            store
+                .replace_task_bucket_snapshot(bucket)
+                .expect("seed task bucket snapshot");
+        }
+        for verification in &batch.task_verifications {
+            store
+                .merge_task_verification(verification)
+                .expect("seed task verification");
+        }
+
+        record_sync_batch_success(&store, "file", "/tmp/statsai-sync-batch.json", &batch)
+            .expect("record sync batch success");
+
+        assert!(store
+            .pending_task_bucket_snapshots_for_sync(
+                "file",
+                "/tmp/statsai-sync-batch.json",
+                &batch.device_id,
+                false,
+                None,
+            )
+            .expect("pending task buckets")
+            .is_empty());
+        assert!(store
+            .pending_task_verifications_for_sync("file", "/tmp/statsai-sync-batch.json")
+            .expect("pending task verifications")
+            .is_empty());
+    }
+
+    #[test]
+    fn http_rollup_sends_metadata_before_task_chunks() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-metadata-before-task"),
+            LocationOrigin::Configured,
+        );
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_metadata_before_task".to_string(),
+            device_id: "device".to_string(),
+            sources: vec![source],
+            accounts: vec![],
+            source_account_assignments: vec![],
+            subscriptions: vec![],
+            events: vec![],
+            summaries: vec![],
+            task_buckets: test_task_only_sync_batch(now, 1, 0).task_buckets,
+            task_verifications: vec![],
+            created_at: now,
+        };
+
+        let chunks = split_http_rollup_sync_batches(&batch);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].sources.len(), 1);
+        assert!(chunks[0].task_buckets.is_empty());
+        assert!(chunks[1].sources.is_empty());
+        assert_eq!(chunks[1].task_buckets.len(), 1);
+    }
+
+    #[test]
+    fn custom_http_sinks_skip_task_verification_feed_derivation() {
+        assert_eq!(
+            http_task_verification_feed_url("https://example.com/custom-sync"),
+            None
+        );
+        assert_eq!(
+            http_task_verification_feed_url("https://api.example.com/api/sync/batches"),
+            Some("https://api.example.com/api/task-sync/verifications".to_string())
+        );
+    }
+
+    #[test]
+    fn optional_task_verification_feed_statuses_do_not_fail_sync() {
+        assert!(optional_task_verification_feed_status(404));
+        assert!(optional_task_verification_feed_status(405));
+        assert!(optional_task_verification_feed_status(501));
+        assert!(!optional_task_verification_feed_status(400));
+        assert!(!optional_task_verification_feed_status(429));
+        assert!(!optional_task_verification_feed_status(500));
     }
 
     #[test]
@@ -10710,6 +11293,8 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries,
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
@@ -10770,11 +11355,474 @@ mod tests {
             subscriptions: vec![],
             events: vec![],
             summaries: vec![summary],
+            task_buckets: vec![],
+            task_verifications: vec![],
             created_at: now,
         };
 
         assert_eq!(http_rollup_project_count(&batch), 1);
         assert_eq!(http_rollup_project_location_count(&batch), 1);
+    }
+
+    fn test_task_only_sync_batch(
+        now: DateTime<Utc>,
+        bucket_count: usize,
+        verification_count: usize,
+    ) -> SyncBatch {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollup-task-only"),
+            LocationOrigin::Configured,
+        );
+        let task_buckets = (0..bucket_count)
+            .map(|index| {
+                let started_at = now + Duration::minutes(index as i64);
+                let ended_at = started_at + Duration::minutes(5);
+                let span_id = TaskSpanId(format!("span-task-{index}"));
+                let work_item_id = WorkItemId(format!("work-task-{index}"));
+                TaskBucketSnapshot {
+                    project_bucket: format!("bucket-task-{index}"),
+                    generated_at: ended_at,
+                    applied_verification_cursor: None,
+                    work_items: vec![WorkItem {
+                        schema_version: WORK_ITEM_SCHEMA_VERSION.to_string(),
+                        work_item_id: work_item_id.clone(),
+                        anchor_span_id: span_id.clone(),
+                        tail_span_id: span_id.clone(),
+                        project_bucket: format!("bucket-task-{index}"),
+                        title: format!("Task {index}"),
+                        normalized_title: format!("task {index}"),
+                        status: TaskStatus::NeedsReview,
+                        confidence: Confidence::Medium,
+                        started_at,
+                        ended_at,
+                        duration_seconds: Some(300),
+                        span_count: 1,
+                        event_count: 1,
+                        total_input_tokens: 10,
+                        total_cache_creation_tokens: 0,
+                        total_cache_read_tokens: 0,
+                        total_output_tokens: 5,
+                        total_reasoning_tokens: 0,
+                        total_tokens: 15,
+                        estimated_cost_usd: Some(25),
+                        providers: vec!["codex".to_string()],
+                        issue_keys: Vec::new(),
+                        repo_label: Some("statsai/repo".to_string()),
+                        branch_labels: vec!["main".to_string()],
+                        path_label: Some("/workspace/statsai".to_string()),
+                        summary_preview: None,
+                        todo_excerpt: None,
+                        no_git: false,
+                        cross_provider: false,
+                        continuation_reasons: Vec::new(),
+                        review_reasons: vec!["needs_review".to_string()],
+                    }],
+                    members: vec![WorkItemMember {
+                        work_item_id,
+                        span_id: span_id.clone(),
+                        ordinal: 0,
+                    }],
+                    spans: vec![TaskSpan {
+                        schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                        span_id,
+                        provider: "codex".to_string(),
+                        source_id: source.source_id.clone(),
+                        span_kind: "codex_task".to_string(),
+                        source_record_id: None,
+                        source_file_path_hash: None,
+                        summary_id: None,
+                        session_id: Some(format!("session-task-{index}")),
+                        thread_id: Some(format!("thread-task-{index}")),
+                        title: format!("Task {index}"),
+                        normalized_title: format!("task {index}"),
+                        title_source: Some("thread_name".to_string()),
+                        summary_preview: None,
+                        todo_excerpt: None,
+                        issue_keys: Vec::new(),
+                        branch_family: Some("main".to_string()),
+                        project_bucket: format!("bucket-task-{index}"),
+                        project: None,
+                        git: None,
+                        usage: UsageCounts {
+                            input_tokens: Some(10),
+                            output_tokens: Some(5),
+                            total_tokens: Some(15),
+                            requests: Some(1),
+                            ..UsageCounts::default()
+                        },
+                        estimated_cost_usd: Some(25),
+                        event_count: 1,
+                        has_usage_evidence: true,
+                        total_messages: 2,
+                        user_messages: 1,
+                        assistant_messages: 1,
+                        developer_messages: 0,
+                        linked_event_ids: Vec::new(),
+                        confidence: Confidence::High,
+                        is_meta: false,
+                        started_at,
+                        ended_at: Some(ended_at),
+                        duration_seconds: Some(300),
+                    }],
+                }
+            })
+            .collect::<Vec<_>>();
+        let task_verifications = (0..verification_count)
+            .map(|index| {
+                let timestamp = now + Duration::minutes(index as i64);
+                TaskVerification {
+                    schema_version: TASK_VERIFICATION_SCHEMA_VERSION.to_string(),
+                    verification_id: TaskVerificationId(format!("tvf-task-{index}")),
+                    action_key: format!("status:span-task-{index}"),
+                    action: TaskVerificationAction::Reject {
+                        work_item_id: WorkItemId(format!("work-task-{index}")),
+                        anchor_span_id: TaskSpanId(format!("span-task-{index}")),
+                        reason: TaskVerdict::Meta,
+                    },
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_task_only".to_string(),
+            device_id: "device".to_string(),
+            sources: Vec::new(),
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: Vec::new(),
+            task_buckets,
+            task_verifications,
+            created_at: now,
+        }
+    }
+
+    fn test_dense_task_only_sync_batch(now: DateTime<Utc>, span_count: usize) -> SyncBatch {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollup-dense-task-only"),
+            LocationOrigin::Configured,
+        );
+        let spans = (0..span_count)
+            .map(|index| {
+                let started_at = now + Duration::minutes(index as i64);
+                let ended_at = started_at + Duration::minutes(1);
+                TaskSpan {
+                    schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                    span_id: TaskSpanId(format!("dense-span-{index}")),
+                    provider: "codex".to_string(),
+                    source_id: source.source_id.clone(),
+                    span_kind: "codex_task".to_string(),
+                    source_record_id: None,
+                    source_file_path_hash: None,
+                    summary_id: None,
+                    session_id: Some(format!("dense-session-{index}")),
+                    thread_id: Some(format!("dense-thread-{index}")),
+                    title: format!("Dense task {index}"),
+                    normalized_title: format!("dense task {index}"),
+                    title_source: Some("thread_name".to_string()),
+                    summary_preview: None,
+                    todo_excerpt: None,
+                    issue_keys: Vec::new(),
+                    branch_family: Some("main".to_string()),
+                    project_bucket: "dense-bucket".to_string(),
+                    project: Some(ProjectInfo {
+                        project_id: "project-dense".to_string(),
+                        project_label: Some("Dense".to_string()),
+                        repo_remote_hash: Some("repo-dense".to_string()),
+                        repo_label: Some("statsai/dense".to_string()),
+                        branch_hash: Some("branch-dense".to_string()),
+                        branch_label: Some("main".to_string()),
+                        path_hash: Some("path-dense".to_string()),
+                        path_label: Some("/workspace/dense".to_string()),
+                    }),
+                    git: None,
+                    usage: UsageCounts {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        total_tokens: Some(15),
+                        requests: Some(1),
+                        ..UsageCounts::default()
+                    },
+                    estimated_cost_usd: Some(25),
+                    event_count: 1,
+                    has_usage_evidence: true,
+                    total_messages: 2,
+                    user_messages: 1,
+                    assistant_messages: 1,
+                    developer_messages: 0,
+                    linked_event_ids: Vec::new(),
+                    confidence: Confidence::High,
+                    is_meta: false,
+                    started_at,
+                    ended_at: Some(ended_at),
+                    duration_seconds: Some(60),
+                }
+            })
+            .collect::<Vec<_>>();
+        let members = spans
+            .iter()
+            .enumerate()
+            .map(|(index, span)| WorkItemMember {
+                work_item_id: WorkItemId("dense-work-item".to_string()),
+                span_id: span.span_id.clone(),
+                ordinal: index,
+            })
+            .collect::<Vec<_>>();
+        let last_span = spans.last().expect("last dense span");
+
+        SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_dense_task_only".to_string(),
+            device_id: "device".to_string(),
+            sources: Vec::new(),
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: Vec::new(),
+            task_buckets: vec![TaskBucketSnapshot {
+                project_bucket: "dense-bucket".to_string(),
+                generated_at: last_span.ended_at.expect("dense task bucket end timestamp"),
+                applied_verification_cursor: None,
+                work_items: vec![WorkItem {
+                    schema_version: WORK_ITEM_SCHEMA_VERSION.to_string(),
+                    work_item_id: WorkItemId("dense-work-item".to_string()),
+                    anchor_span_id: spans.first().expect("first dense span").span_id.clone(),
+                    tail_span_id: last_span.span_id.clone(),
+                    project_bucket: "dense-bucket".to_string(),
+                    title: "Dense task".to_string(),
+                    normalized_title: "dense task".to_string(),
+                    status: TaskStatus::NeedsReview,
+                    confidence: Confidence::Medium,
+                    started_at: spans.first().expect("first dense span").started_at,
+                    ended_at: last_span.ended_at.expect("dense task bucket end timestamp"),
+                    duration_seconds: Some((span_count as u64).saturating_mul(60)),
+                    span_count: span_count as u64,
+                    event_count: span_count as u64,
+                    total_input_tokens: (span_count as u64).saturating_mul(10),
+                    total_cache_creation_tokens: 0,
+                    total_cache_read_tokens: 0,
+                    total_output_tokens: (span_count as u64).saturating_mul(5),
+                    total_reasoning_tokens: 0,
+                    total_tokens: (span_count as u64).saturating_mul(15),
+                    estimated_cost_usd: Some((span_count as i64).saturating_mul(25)),
+                    providers: vec!["codex".to_string()],
+                    issue_keys: Vec::new(),
+                    repo_label: Some("statsai/dense".to_string()),
+                    branch_labels: vec!["main".to_string()],
+                    path_label: Some("/workspace/dense".to_string()),
+                    summary_preview: None,
+                    todo_excerpt: None,
+                    no_git: false,
+                    cross_provider: false,
+                    continuation_reasons: Vec::new(),
+                    review_reasons: vec!["needs_review".to_string()],
+                }],
+                members,
+                spans,
+            }],
+            task_verifications: Vec::new(),
+            created_at: now,
+        }
+    }
+
+    fn test_multi_bucket_dense_task_only_sync_batch(
+        now: DateTime<Utc>,
+        bucket_count: usize,
+        span_count_per_bucket: usize,
+    ) -> SyncBatch {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-rollup-multi-dense-task-only"),
+            LocationOrigin::Configured,
+        );
+        let task_buckets = (0..bucket_count)
+            .map(|bucket_index| {
+                let project_bucket = format!("dense-bucket-{bucket_index}");
+                let work_item_id = WorkItemId(format!("dense-work-item-{bucket_index}"));
+                let spans = (0..span_count_per_bucket)
+                    .map(|span_index| {
+                        let offset_minutes =
+                            (bucket_index * span_count_per_bucket + span_index) as i64;
+                        let started_at = now + Duration::minutes(offset_minutes);
+                        let ended_at = started_at + Duration::minutes(1);
+                        TaskSpan {
+                            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                            span_id: TaskSpanId(format!(
+                                "dense-bucket-{bucket_index}-span-{span_index}"
+                            )),
+                            provider: "codex".to_string(),
+                            source_id: source.source_id.clone(),
+                            span_kind: "codex_task".to_string(),
+                            source_record_id: None,
+                            source_file_path_hash: None,
+                            summary_id: None,
+                            session_id: Some(format!(
+                                "dense-bucket-{bucket_index}-session-{span_index}"
+                            )),
+                            thread_id: Some(format!(
+                                "dense-bucket-{bucket_index}-thread-{span_index}"
+                            )),
+                            title: format!("Dense task {bucket_index}-{span_index}"),
+                            normalized_title: format!("dense task {bucket_index}-{span_index}"),
+                            title_source: Some("thread_name".to_string()),
+                            summary_preview: None,
+                            todo_excerpt: None,
+                            issue_keys: Vec::new(),
+                            branch_family: Some("main".to_string()),
+                            project_bucket: project_bucket.clone(),
+                            project: Some(ProjectInfo {
+                                project_id: format!("project-dense-{bucket_index}"),
+                                project_label: Some(format!("Dense {bucket_index}")),
+                                repo_remote_hash: Some(format!("repo-dense-{bucket_index}")),
+                                repo_label: Some(format!("statsai/dense-{bucket_index}")),
+                                branch_hash: Some("branch-dense".to_string()),
+                                branch_label: Some("main".to_string()),
+                                path_hash: Some(format!("path-dense-{bucket_index}")),
+                                path_label: Some(format!("/workspace/dense-{bucket_index}")),
+                            }),
+                            git: None,
+                            usage: UsageCounts {
+                                input_tokens: Some(10),
+                                output_tokens: Some(5),
+                                total_tokens: Some(15),
+                                requests: Some(1),
+                                ..UsageCounts::default()
+                            },
+                            estimated_cost_usd: Some(25),
+                            event_count: 1,
+                            has_usage_evidence: true,
+                            total_messages: 2,
+                            user_messages: 1,
+                            assistant_messages: 1,
+                            developer_messages: 0,
+                            linked_event_ids: Vec::new(),
+                            confidence: Confidence::High,
+                            is_meta: false,
+                            started_at,
+                            ended_at: Some(ended_at),
+                            duration_seconds: Some(60),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let members = spans
+                    .iter()
+                    .enumerate()
+                    .map(|(span_index, span)| WorkItemMember {
+                        work_item_id: work_item_id.clone(),
+                        span_id: span.span_id.clone(),
+                        ordinal: span_index,
+                    })
+                    .collect::<Vec<_>>();
+                let first_span = spans.first().expect("first dense span");
+                let last_span = spans.last().expect("last dense span");
+                TaskBucketSnapshot {
+                    project_bucket: project_bucket.clone(),
+                    generated_at: last_span.ended_at.expect("dense task bucket end timestamp"),
+                    applied_verification_cursor: None,
+                    work_items: vec![WorkItem {
+                        schema_version: WORK_ITEM_SCHEMA_VERSION.to_string(),
+                        work_item_id: work_item_id.clone(),
+                        anchor_span_id: first_span.span_id.clone(),
+                        tail_span_id: last_span.span_id.clone(),
+                        project_bucket,
+                        title: format!("Dense task bucket {bucket_index}"),
+                        normalized_title: format!("dense task bucket {bucket_index}"),
+                        status: TaskStatus::NeedsReview,
+                        confidence: Confidence::Medium,
+                        started_at: first_span.started_at,
+                        ended_at: last_span.ended_at.expect("dense task bucket end timestamp"),
+                        duration_seconds: Some((span_count_per_bucket as u64).saturating_mul(60)),
+                        span_count: span_count_per_bucket as u64,
+                        event_count: span_count_per_bucket as u64,
+                        total_input_tokens: (span_count_per_bucket as u64).saturating_mul(10),
+                        total_cache_creation_tokens: 0,
+                        total_cache_read_tokens: 0,
+                        total_output_tokens: (span_count_per_bucket as u64).saturating_mul(5),
+                        total_reasoning_tokens: 0,
+                        total_tokens: (span_count_per_bucket as u64).saturating_mul(15),
+                        estimated_cost_usd: Some((span_count_per_bucket as i64).saturating_mul(25)),
+                        providers: vec!["codex".to_string()],
+                        issue_keys: Vec::new(),
+                        repo_label: Some(format!("statsai/dense-{bucket_index}")),
+                        branch_labels: vec!["main".to_string()],
+                        path_label: Some(format!("/workspace/dense-{bucket_index}")),
+                        summary_preview: None,
+                        todo_excerpt: None,
+                        no_git: false,
+                        cross_provider: false,
+                        continuation_reasons: Vec::new(),
+                        review_reasons: vec!["needs_review".to_string()],
+                    }],
+                    members,
+                    spans,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_multi_dense_task_only".to_string(),
+            device_id: "device".to_string(),
+            sources: Vec::new(),
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: Vec::new(),
+            task_buckets,
+            task_verifications: Vec::new(),
+            created_at: now,
+        }
+    }
+
+    #[test]
+    fn dense_single_task_bucket_stays_within_batched_d1_budget_estimate() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_dense_task_only_sync_batch(now, 240);
+
+        assert!(
+            estimate_http_rollup_d1_queries(&batch) <= HTTP_ROLLUP_D1_QUERY_BUDGET,
+            "dense single-bucket task sync should fit after batched task writes"
+        );
+    }
+
+    #[test]
+    fn multi_bucket_dense_task_sync_splits_to_fit_chunked_write_budget() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_multi_bucket_dense_task_only_sync_batch(now, 5, 600);
+
+        let chunks = split_http_rollup_sync_batches(&batch);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.task_buckets.len())
+                .sum::<usize>(),
+            batch.task_buckets.len()
+        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| estimate_http_rollup_d1_queries(chunk) <= HTTP_ROLLUP_D1_QUERY_BUDGET));
     }
 
     #[test]
@@ -10787,6 +11835,7 @@ mod tests {
                 "batch_1_part_2_of_2",
                 &[],
                 &[],
+                None,
             )
             .expect("record sync success");
         let local_state = store
@@ -10837,6 +11886,14 @@ mod tests {
         );
         assert_eq!(
             logical_http_rollup_batch_id("batch_1_subscriptions_2"),
+            "batch_1"
+        );
+        assert_eq!(
+            logical_http_rollup_batch_id("batch_1_task_buckets_2"),
+            "batch_1"
+        );
+        assert_eq!(
+            logical_http_rollup_batch_id("batch_1_part_3_of_9_task_verifications_4"),
             "batch_1"
         );
         assert_eq!(logical_http_rollup_batch_id("batch_1"), "batch_1");
@@ -11976,6 +13033,81 @@ mod tests {
     }
 
     #[test]
+    fn rename_and_accept_coexist_for_same_anchor() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-rename-accept"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-rename-accept/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 13, 11, 30, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "rename-accept-event", 90);
+        let span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "rename-accept-span",
+            "Investigate rename and accept coexistence",
+            &event,
+        );
+        store.insert_events(&[event]).expect("insert events");
+        store.upsert_task_spans(&[span]).expect("insert spans");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let initial = store.work_items().expect("initial work items");
+        let work_item = initial.first().expect("initial work item");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Rename {
+                        work_item_id: work_item.work_item_id.0.clone(),
+                        title: "Hosted-verified task title".to_string(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("rename verify");
+        task(
+            TaskCommand {
+                command: TaskSubcommand::Verify {
+                    command: TaskVerifySubcommand::Accept {
+                        work_item_id: work_item.work_item_id.0.clone(),
+                    },
+                },
+            },
+            &store,
+        )
+        .expect("accept verify");
+
+        let rebuilt = store.work_items().expect("rebuilt work items");
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].status, TaskStatus::Verified);
+        assert_eq!(rebuilt[0].title, "Hosted-verified task title");
+
+        let verifications = store.task_verifications().expect("verifications");
+        assert_eq!(verifications.len(), 2);
+        assert!(verifications.iter().any(|verification| matches!(
+            verification.action,
+            TaskVerificationAction::Rename { .. }
+        )));
+        assert!(verifications.iter().any(|verification| matches!(
+            verification.action,
+            TaskVerificationAction::Accept { .. }
+        )));
+    }
+
+    #[test]
     fn accept_after_reject_supersedes_manual_reject_for_same_anchor() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
@@ -12009,7 +13141,7 @@ mod tests {
 
         let initial = store.work_items().expect("initial work items");
         let work_item = initial.first().expect("initial work item");
-        let anchor_action_key = format!("anchor:{}", work_item.anchor_span_id.0);
+        let anchor_action_key = format!("status:{}", work_item.anchor_span_id.0);
         task(
             TaskCommand {
                 command: TaskSubcommand::Verify {
@@ -12930,6 +14062,8 @@ mod tests {
             subscriptions: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
+            task_buckets: Vec::new(),
+            task_verifications: Vec::new(),
             created_at: Utc
                 .with_ymd_and_hms(2026, 6, 14, 13, 0, 0)
                 .single()
@@ -12937,8 +14071,7 @@ mod tests {
         };
 
         let value = serde_json::to_value(&batch).expect("serialize sync batch");
-        assert!(value.get("task_spans").is_none());
-        assert!(value.get("task_work_items").is_none());
+        assert!(value.get("task_buckets").is_none());
         assert!(value.get("task_verifications").is_none());
     }
 
@@ -13499,7 +14632,7 @@ mod tests {
             )
             .expect("sync assignments");
         store
-            .record_sync_success("http", target, "batch_1", &[], &[])
+            .record_sync_success("http", target, "batch_1", &[], &[], None)
             .expect("sync success");
 
         let report =
@@ -13694,6 +14827,7 @@ mod tests {
                 "batch_1",
                 &[],
                 &[],
+                None,
             )
             .expect("sync success");
 

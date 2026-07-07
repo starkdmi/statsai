@@ -1,6 +1,8 @@
 # Sync Contract
 
-`sync_batch.v1` is the first backend-facing contract for `statsai`.
+`sync_batch.v1` is the legacy usage-only backend contract for `statsai`.
+`sync_batch.v2` extends it with hosted task bucket snapshots and task
+verification uploads.
 The collector owns local scanning, normalization, idempotent local storage, and
 privacy scrubbing. The backend owns authentication, validation, deduplication,
 rollups, and user-facing queries. The production path sends sanitized batches to
@@ -37,14 +39,16 @@ The current production sync path strips record-level local evidence before sendi
 - `UsageSummary.parse_evidence.source_record_id`
 - `Subscription.notes`
 
-`ProjectInfo.path_label` is retained for owner-facing project location displays
-and manual project linking. Hashed path, source, event, and summary identifiers
-remain so the server can deduplicate records and keep stable location identity.
+`ProjectInfo.path_label` is retained for owner-facing project location displays,
+manual project linking, and hosted task review. Hashed path, source, event, and
+summary identifiers remain so the server can deduplicate records and keep
+stable location identity.
 
 Canonical provider account identity may now sync through
-`ProviderAccount.provider_user_id` and `ProviderAccount.email`. The backend uses
-that identity to match time-bounded `source_account_assignments` and
-`subscriptions`.
+`ProviderAccount.provider_user_id` and `ProviderAccount.email`. Hosted task
+snapshots can also include bounded task titles, summary previews, todo excerpts,
+repo labels, branch labels, path labels, and task verification actions. The
+backend uses identity plus project metadata to route those hosted task records.
 
 User-defined aliases are still retained in `ProviderAccount.account_label` for
 display, but they are no longer the primary account key.
@@ -71,14 +75,16 @@ The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
 
 - require an authenticated device access token
 - accept `Authorization: Bearer <device_access_token>` from stored auth, `--auth-token`, or `STATSAI_SYNC_TOKEN`
-- validate the request body against `sync_batch.v1`
+- validate the request body against `sync_batch.v1` and `sync_batch.v2`
 - reject unsupported `schema_version` values
 - deduplicate sources, accounts, source-account assignments, subscriptions, and summaries by their IDs when server-side deduplication is needed
 - treat collector IDs as stable client-provided IDs, not database primary keys exposed to users
 - compute daily, monthly, and dashboard rollups server-side from accepted summaries
+- atomically replace accepted task bucket snapshots per `(user, device, project_bucket)`
+- project hosted task verifications onto the latest bucket snapshot when serving task reads
 - return accepted, updated, duplicate, and rejected counts
 
-## MVP Response Shape
+## Response Shapes
 
 ```json
 {
@@ -104,6 +110,9 @@ The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
 }
 ```
 
+`sync_batch.v2` returns `sync_ack.v2`, which adds `task_buckets` and
+`task_verifications` counters under both `accepted` and `duplicates`.
+
 The current loopback daemon returns this shape and reports duplicate events
 when the existing store already has the semantic event. Source, account,
 source-account assignment, subscription, and summary upserts are currently
@@ -118,8 +127,8 @@ summaries after the recorded cursor for that sink target while still including
 the current source, account, source-account assignment, and subscription
 metadata.
 
-The HTTP sink parses `sync_ack.v1` before updating local state. File and stdout
-sinks update state after their local write succeeds.
+The HTTP sink parses `sync_ack.v1` and `sync_ack.v2` before updating local
+state. File and stdout sinks update state after their local write succeeds.
 
 ## Cloudflare Production Backend
 
@@ -151,9 +160,11 @@ Auth token precedence for sync is:
 ```
 
 The Worker rejects raw event cloud sync by default and accepts sanitized daily
-summary rollups plus metadata. The collector now prepares those daily rollups
-before HTTP sync, so a normal Cloudflare sync can populate the dashboard without
-shipping raw events. Repeated batches are idempotent by stable IDs.
+summary rollups plus metadata, along with hosted task snapshots and hosted task
+verification actions for `sync_batch.v2`. The collector now prepares those
+daily rollups before HTTP sync, so a normal Cloudflare sync can populate the
+dashboard without shipping raw events. Repeated batches are idempotent by
+stable IDs.
 The dashboard reads compact API responses backed by D1 rollups instead of
 scanning all synced records in the browser.
 

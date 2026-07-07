@@ -16,8 +16,9 @@ use statsai_core::{
     MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
     SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
     SourceLocation, SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
-    SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage, UsageCounts, UsageEvent,
-    UsageSummary, VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage, TaskVerificationCursor,
+    TaskVerificationId, UsageCounts, UsageEvent, UsageSummary, VerifiedSourceState,
+    VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
     SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
@@ -66,8 +67,16 @@ pub struct SyncState {
     pub last_event_id: Option<String>,
     pub last_summary_observed_at: Option<DateTime<Utc>>,
     pub last_summary_id: Option<String>,
+    pub last_task_verification_updated_at: Option<DateTime<Utc>>,
+    pub last_task_verification_id: Option<String>,
     pub failure_count: u64,
     pub pending_resume_batch_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskBucketSyncStatus {
+    pub total: u64,
+    pub dirty: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1481,8 +1490,9 @@ impl Store {
             .query_row(
                 r#"
                 SELECT sink, target, last_success_at, last_batch_id, last_event_started_at,
-                       last_event_id, last_summary_observed_at, last_summary_id, failure_count,
-                       pending_resume_batch_id
+                       last_event_id, last_summary_observed_at, last_summary_id,
+                       last_task_verification_updated_at, last_task_verification_id,
+                       failure_count, pending_resume_batch_id
                 FROM sync_state
                 WHERE sink = ?1 AND target = ?2
                 "#,
@@ -1497,8 +1507,9 @@ impl Store {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT sink, target, last_success_at, last_batch_id, last_event_started_at,
-                   last_event_id, last_summary_observed_at, last_summary_id, failure_count,
-                   pending_resume_batch_id
+                   last_event_id, last_summary_observed_at, last_summary_id,
+                   last_task_verification_updated_at, last_task_verification_id,
+                   failure_count, pending_resume_batch_id
             FROM sync_state
             ORDER BY sink, target
             "#,
@@ -1515,6 +1526,8 @@ impl Store {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             self.conn.execute("DELETE FROM entity_sync_state", [])?;
+            self.conn
+                .execute("DELETE FROM task_bucket_sync_state", [])?;
             self.conn.execute("DELETE FROM sync_state", [])?;
             Ok(())
         })();
@@ -1536,6 +1549,10 @@ impl Store {
         let result = (|| {
             self.conn.execute(
                 "DELETE FROM entity_sync_state WHERE sink = ?1 AND target = ?2",
+                params![sink, target],
+            )?;
+            self.conn.execute(
+                "DELETE FROM task_bucket_sync_state WHERE sink = ?1 AND target = ?2",
                 params![sink, target],
             )?;
             self.conn.execute(
@@ -1564,6 +1581,7 @@ impl Store {
         batch_id: &str,
         events: &[UsageEvent],
         summaries: &[UsageSummary],
+        task_verification_cursor: Option<&TaskVerificationCursor>,
     ) -> Result<()> {
         let event_cursor = events
             .iter()
@@ -1603,15 +1621,30 @@ impl Store {
                 .as_ref()
                 .and_then(|state| state.last_summary_id.clone())
         });
+        let task_verification_updated_at = task_verification_cursor
+            .map(|cursor| cursor.updated_at)
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|state| state.last_task_verification_updated_at)
+            });
+        let task_verification_id = task_verification_cursor
+            .map(|cursor| cursor.verification_id.0.clone())
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|state| state.last_task_verification_id.clone())
+            });
         let now = Utc::now();
 
         self.conn.execute(
             r#"
             INSERT INTO sync_state (
               sink, target, last_success_at, last_batch_id, last_event_started_at,
-              last_event_id, last_summary_observed_at, last_summary_id, failure_count
+              last_event_id, last_summary_observed_at, last_summary_id,
+              last_task_verification_updated_at, last_task_verification_id, failure_count
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)
             ON CONFLICT(sink, target) DO UPDATE SET
               last_success_at = excluded.last_success_at,
               last_batch_id = excluded.last_batch_id,
@@ -1619,6 +1652,8 @@ impl Store {
               last_event_id = excluded.last_event_id,
               last_summary_observed_at = excluded.last_summary_observed_at,
               last_summary_id = excluded.last_summary_id,
+              last_task_verification_updated_at = excluded.last_task_verification_updated_at,
+              last_task_verification_id = excluded.last_task_verification_id,
               failure_count = 0
             "#,
             params![
@@ -1630,9 +1665,65 @@ impl Store {
                 event_id,
                 summary_observed_at.map(|date| date.to_rfc3339()),
                 summary_id,
+                task_verification_updated_at.map(|date| date.to_rfc3339()),
+                task_verification_id,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn sync_task_verification_cursor(
+        &self,
+        sink: &str,
+        target: &str,
+    ) -> Result<Option<TaskVerificationCursor>> {
+        let Some(state) = self.sync_state(sink, target)? else {
+            return Ok(None);
+        };
+        let Some(updated_at) = state.last_task_verification_updated_at else {
+            return Ok(None);
+        };
+        let Some(verification_id) = state.last_task_verification_id else {
+            return Ok(None);
+        };
+        Ok(Some(TaskVerificationCursor {
+            updated_at,
+            verification_id: TaskVerificationId(verification_id),
+        }))
+    }
+
+    pub fn task_bucket_sync_status(
+        &self,
+        sink: &str,
+        target: &str,
+        device_id: &str,
+    ) -> Result<TaskBucketSyncStatus> {
+        let local_buckets = self.task_project_buckets()?;
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT project_bucket, dirty
+            FROM task_bucket_sync_state
+            WHERE sink = ?1 AND target = ?2 AND device_id = ?3
+            "#,
+        )?;
+        let rows = statement.query_map(params![sink, target, device_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut tracked = HashMap::<String, i64>::new();
+        for row in rows {
+            let (project_bucket, dirty) = row?;
+            tracked.insert(project_bucket, dirty);
+        }
+        let tracked_total = tracked.len() as u64;
+        let tracked_dirty = tracked.values().filter(|dirty| **dirty == 1).count() as u64;
+        let missing_local = local_buckets
+            .iter()
+            .filter(|project_bucket| !tracked.contains_key(project_bucket.as_str()))
+            .count() as u64;
+        Ok(TaskBucketSyncStatus {
+            total: tracked_total.saturating_add(missing_local),
+            dirty: tracked_dirty.saturating_add(missing_local),
+        })
     }
 
     pub fn record_sync_failure(&self, sink: &str, target: &str) -> Result<()> {
@@ -3936,7 +4027,8 @@ fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {
     let last_success_at: String = row.get(2)?;
     let last_event_started_at: Option<String> = row.get(4)?;
     let last_summary_observed_at: Option<String> = row.get(6)?;
-    let failure_count: i64 = row.get(8)?;
+    let last_task_verification_updated_at: Option<String> = row.get(8)?;
+    let failure_count: i64 = row.get(10)?;
     Ok(SyncState {
         sink: row.get(0)?,
         target: row.get(1)?,
@@ -3946,8 +4038,13 @@ fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {
         last_event_id: row.get(5)?,
         last_summary_observed_at: parse_optional_rfc3339_for_row(last_summary_observed_at, 6)?,
         last_summary_id: row.get(7)?,
+        last_task_verification_updated_at: parse_optional_rfc3339_for_row(
+            last_task_verification_updated_at,
+            8,
+        )?,
+        last_task_verification_id: row.get(9)?,
         failure_count: failure_count.max(0) as u64,
-        pending_resume_batch_id: row.get(9)?,
+        pending_resume_batch_id: row.get(11)?,
     })
 }
 
@@ -4233,6 +4330,59 @@ mod tests {
 
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[test]
+    fn task_bucket_sync_status_counts_tracked_and_local_bucket_union() {
+        let store = Store::in_memory().expect("store");
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO task_spans (
+                  span_id, provider, source_id, project_bucket, started_at, ended_at, title,
+                  normalized_title, is_meta, confidence, source_file_path_hash, payload
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, NULL, ?10)
+                "#,
+                params![
+                    "span-local",
+                    "codex",
+                    "source-local",
+                    "bucket-local",
+                    "2026-07-05T10:00:00Z",
+                    "2026-07-05T10:05:00Z",
+                    "Local span",
+                    "local span",
+                    "medium",
+                    r#"{"span_id":"span-local","project_bucket":"bucket-local"}"#,
+                ],
+            )
+            .expect("insert local task span");
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO task_bucket_sync_state (
+                  sink, target, device_id, project_bucket, dirty, payload_hash, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, 1, NULL, ?5)
+                "#,
+                params![
+                    "http",
+                    "target",
+                    "device-1",
+                    "bucket-tracked",
+                    "2026-07-05T11:00:00Z",
+                ],
+            )
+            .expect("insert tracked bucket state");
+
+        let status = store
+            .task_bucket_sync_status("http", "target", "device-1")
+            .expect("task bucket sync status");
+        assert_eq!(status.total, 2);
+        assert_eq!(status.dirty, 2);
     }
 
     #[test]
@@ -5735,7 +5885,14 @@ mod tests {
             .expect("events");
 
         store
-            .record_sync_success("http", "http://localhost/sync", "batch_1", &[first], &[])
+            .record_sync_success(
+                "http",
+                "http://localhost/sync",
+                "batch_1",
+                &[first],
+                &[],
+                None,
+            )
             .expect("record success");
         let state = store
             .sync_state("http", "http://localhost/sync")
@@ -6437,6 +6594,7 @@ mod tests {
                 "batch_1",
                 &[],
                 &[],
+                None,
             )
             .expect("record success");
         store
@@ -6446,6 +6604,7 @@ mod tests {
                 "batch_2",
                 &[],
                 &[],
+                None,
             )
             .expect("record success other target");
 

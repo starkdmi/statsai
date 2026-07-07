@@ -1,8 +1,9 @@
 # Task Collection and Verification
 
 `statsai` can extract local task spans during `scan`, rebuild derived work items
-in SQLite, and let you verify or correct those work items from the CLI. These
-task entities stay local. They are not added to `sync_batch.v1`.
+in SQLite, and let you verify or correct those work items from the CLI. Older
+usage-only clients still emit `sync_batch.v1`, while hosted task sync uses
+`sync_batch.v2` task bucket snapshots and task verification uploads.
 
 ## Normal Loop
 
@@ -151,9 +152,10 @@ such as:
 - `low_signal_exchange`
 - `multi_day_no_anchor`
 
-## Local-Only Boundaries
+## Hosted Sync Boundaries
 
 The task collector keeps bounded derived text such as titles, summaries, todo
-excerpts, and workspace anchors. It does not duplicate full transcripts. Task
-spans, work items, and task verifications are local-only store entities and are
-not emitted in sync payloads.
+excerpts, and workspace anchors. It does not duplicate full transcripts. Hosted
+sync can upload those bounded task snapshots and hosted verification actions to
+your private dashboard. Prompts, model responses, raw provider log lines, parse
+line numbers, and other full-transcript evidence stay local.

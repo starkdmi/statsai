@@ -2,9 +2,10 @@ use super::*;
 use statsai_core::{
     normalize_task_title, summarize_task_text, task_title_from_prompt, task_title_is_generic,
     task_title_is_session_meta, task_title_is_weak_signal, task_title_signal_score,
-    task_verification_id, title_topic_tokens, work_item_id, Confidence, TaskSpan, TaskSpanId,
-    TaskStatus, TaskVerification, TaskVerificationAction, UsageCounts, WorkItem, WorkItemId,
-    WorkItemMember, TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
+    task_verification_id, title_topic_tokens, work_item_id, Confidence, TaskBucketSnapshot,
+    TaskSpan, TaskSpanId, TaskStatus, TaskVerification, TaskVerificationAction,
+    TaskVerificationCursor, UsageCounts, WorkItem, WorkItemId, WorkItemMember,
+    TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
@@ -337,76 +338,7 @@ impl Store {
             return Ok(0);
         }
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            let mut changed = 0u64;
-            let mut span_stmt = self.conn.prepare(
-                r#"
-                INSERT INTO task_spans (
-                  span_id, provider, source_id, project_bucket, started_at, ended_at, title,
-                  normalized_title, is_meta, confidence, source_file_path_hash, event_count,
-                  has_usage_evidence, total_messages, user_messages, assistant_messages,
-                  developer_messages, payload
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-                ON CONFLICT(span_id) DO UPDATE SET
-                  provider = excluded.provider,
-                  source_id = excluded.source_id,
-                  project_bucket = excluded.project_bucket,
-                  started_at = excluded.started_at,
-                  ended_at = excluded.ended_at,
-                  title = excluded.title,
-                  normalized_title = excluded.normalized_title,
-                  is_meta = excluded.is_meta,
-                  confidence = excluded.confidence,
-                  source_file_path_hash = excluded.source_file_path_hash,
-                  event_count = excluded.event_count,
-                  has_usage_evidence = excluded.has_usage_evidence,
-                  total_messages = excluded.total_messages,
-                  user_messages = excluded.user_messages,
-                  assistant_messages = excluded.assistant_messages,
-                  developer_messages = excluded.developer_messages,
-                  payload = excluded.payload
-                "#,
-            )?;
-            let mut delete_links = self
-                .conn
-                .prepare("DELETE FROM task_span_event_links WHERE span_id = ?1")?;
-            let mut link_stmt = self.conn.prepare(
-                r#"
-                INSERT INTO task_span_event_links (span_id, event_id)
-                VALUES (?1, ?2)
-                ON CONFLICT(span_id, event_id) DO NOTHING
-                "#,
-            )?;
-            for span in spans {
-                let payload = serde_json::to_string(span)?;
-                changed += span_stmt.execute(params![
-                    &span.span_id.0,
-                    &span.provider,
-                    &span.source_id.0,
-                    &span.project_bucket,
-                    span.started_at.to_rfc3339(),
-                    span.ended_at.map(|value| value.to_rfc3339()),
-                    &span.title,
-                    &span.normalized_title,
-                    bool_to_i64(span.is_meta),
-                    confidence_as_str(span.confidence.clone()),
-                    span.source_file_path_hash.as_deref(),
-                    safe_u64_to_i64(span.effective_event_count()),
-                    bool_to_i64(span.effective_has_usage_evidence()),
-                    safe_u64_to_i64(span.total_messages),
-                    safe_u64_to_i64(span.user_messages),
-                    safe_u64_to_i64(span.assistant_messages),
-                    safe_u64_to_i64(span.developer_messages),
-                    &payload,
-                ])? as u64;
-                delete_links.execute(params![&span.span_id.0])?;
-                for event_id in &span.linked_event_ids {
-                    link_stmt.execute(params![&span.span_id.0, &event_id.0])?;
-                }
-            }
-            Ok(changed)
-        })();
+        let result = self.upsert_task_spans_in_tx(spans);
 
         match result {
             Ok(changed) => {
@@ -418,6 +350,44 @@ impl Store {
                 Err(error)
             }
         }
+    }
+
+    pub fn replace_task_bucket_snapshot(&self, snapshot: &TaskBucketSnapshot) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            self.delete_task_bucket_snapshot_in_tx(&snapshot.project_bucket)?;
+            self.upsert_task_spans_in_tx(&snapshot.spans)?;
+            self.insert_work_items_in_tx(&snapshot.work_items, &snapshot.members)?;
+            let mut changed_buckets = BTreeSet::new();
+            changed_buckets.insert(snapshot.project_bucket.clone());
+            self.mark_task_buckets_dirty_in_tx(&changed_buckets)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn task_bucket_has_newer_verifications(
+        &self,
+        project_bucket: &str,
+        cursor: Option<&TaskVerificationCursor>,
+    ) -> Result<bool> {
+        let mut project_buckets = BTreeSet::new();
+        project_buckets.insert(project_bucket.to_string());
+        let relevant = self.relevant_task_verifications(&project_buckets)?;
+        let latest = latest_task_verification(relevant.iter());
+        Ok(latest
+            .as_ref()
+            .is_some_and(|verification| task_verification_is_after_cursor(verification, cursor)))
     }
 
     pub fn delete_task_spans_for_sources(
@@ -582,9 +552,8 @@ impl Store {
         let now = Utc::now();
         let action_kind = action.action_kind().to_string();
         let action_key = action.action_key();
-        let action_keys = anchor_task_verification_action_keys(&action)
-            .unwrap_or_else(|| vec![action_key.clone()]);
-        let existing = self.latest_task_verification_by_action_keys(&action_keys)?;
+        let conflicting = self.conflicting_task_verifications(&action)?;
+        let existing = latest_task_verification(conflicting.iter());
         let verification = TaskVerification {
             schema_version: TASK_VERIFICATION_SCHEMA_VERSION.to_string(),
             verification_id: existing
@@ -602,7 +571,12 @@ impl Store {
         let payload = serde_json::to_string(&verification)?;
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
-            self.delete_task_verifications_by_action_keys(&action_keys)?;
+            self.delete_task_verifications_by_ids(
+                &conflicting
+                    .iter()
+                    .map(|verification| verification.verification_id.0.as_str())
+                    .collect::<Vec<_>>(),
+            )?;
             self.conn.execute(
                 r#"
                 INSERT INTO task_verifications (
@@ -642,6 +616,254 @@ impl Store {
             verifications.push(serde_json::from_str(&row?)?);
         }
         Ok(resolve_task_verifications(verifications))
+    }
+
+    pub fn task_project_buckets(&self) -> Result<BTreeSet<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT DISTINCT project_bucket FROM task_spans ORDER BY project_bucket")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut buckets = BTreeSet::new();
+        for row in rows {
+            buckets.insert(row?);
+        }
+        Ok(buckets)
+    }
+
+    pub fn task_bucket_snapshot(
+        &self,
+        project_bucket: &str,
+        applied_verification_cursor: Option<TaskVerificationCursor>,
+    ) -> Result<TaskBucketSnapshot> {
+        let spans = self.task_spans_by_sql(
+            "SELECT payload FROM task_spans WHERE project_bucket = ?1 ORDER BY started_at, span_id",
+            &[&project_bucket],
+        )?;
+        let work_items = self.work_items_for_project_bucket(project_bucket)?;
+        let members = self.work_item_members_for_project_bucket(project_bucket)?;
+        Ok(TaskBucketSnapshot {
+            project_bucket: project_bucket.to_string(),
+            generated_at: Utc::now(),
+            applied_verification_cursor,
+            work_items,
+            members,
+            spans,
+        })
+    }
+
+    pub fn pending_task_bucket_snapshots_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        device_id: &str,
+        full: bool,
+        applied_verification_cursor: Option<TaskVerificationCursor>,
+    ) -> Result<Vec<TaskBucketSnapshot>> {
+        let local_buckets = self.task_project_buckets()?;
+        let tracked_dirty_buckets =
+            self.dirty_task_bucket_keys_for_sync(sink, target, device_id)?;
+        let bucket_ids = if full {
+            local_buckets
+                .union(&tracked_dirty_buckets)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        } else {
+            local_buckets
+                .iter()
+                .filter(|bucket| {
+                    !self.task_bucket_is_clean_for_sync(sink, target, device_id, bucket)
+                })
+                .cloned()
+                .chain(tracked_dirty_buckets.difference(&local_buckets).cloned())
+                .collect::<BTreeSet<_>>()
+        };
+        bucket_ids
+            .into_iter()
+            .map(|bucket| self.task_bucket_snapshot(&bucket, applied_verification_cursor.clone()))
+            .collect()
+    }
+
+    pub fn pending_task_verifications_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+    ) -> Result<Vec<TaskVerification>> {
+        let verifications = self.task_verifications()?;
+        let mut pending = Vec::new();
+        for verification in verifications {
+            let payload_hash = task_verification_payload_hash(&verification)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                "task_verification",
+                &verification.verification_id.0,
+                &payload_hash,
+            )? {
+                pending.push(verification);
+            }
+        }
+        Ok(pending)
+    }
+
+    pub fn record_task_bucket_snapshots_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        device_id: &str,
+        snapshots: &[TaskBucketSnapshot],
+    ) -> Result<()> {
+        if snapshots.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            let now = Utc::now().to_rfc3339();
+            let mut statement = self.conn.prepare(
+                r#"
+                INSERT INTO task_bucket_sync_state (
+                  sink, target, device_id, project_bucket, dirty, payload_hash, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+                ON CONFLICT(sink, target, device_id, project_bucket) DO UPDATE SET
+                  dirty = 0,
+                  payload_hash = excluded.payload_hash,
+                  updated_at = excluded.updated_at
+                "#,
+            )?;
+            for snapshot in snapshots {
+                statement.execute(params![
+                    sink,
+                    target,
+                    device_id,
+                    &snapshot.project_bucket,
+                    task_bucket_snapshot_payload_hash(snapshot)?,
+                    &now,
+                ])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn record_task_verifications_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        verifications: &[TaskVerification],
+    ) -> Result<()> {
+        if verifications.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            for verification in verifications {
+                self.record_entity_synced(
+                    sink,
+                    target,
+                    "task_verification",
+                    &verification.verification_id.0,
+                    &task_verification_payload_hash(verification)?,
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn merge_task_verification(&self, verification: &TaskVerification) -> Result<bool> {
+        let conflicting = self.conflicting_task_verifications(&verification.action)?;
+        let existing = latest_task_verification(conflicting.iter());
+        if existing
+            .as_ref()
+            .is_some_and(|current| !task_verification_is_newer(verification, current))
+        {
+            return Ok(false);
+        }
+
+        let mut verification = verification.clone();
+        verification.action_key = verification.action.action_key();
+        let payload = serde_json::to_string(&verification)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| {
+            self.delete_task_verifications_by_ids(
+                &conflicting
+                    .iter()
+                    .map(|current| current.verification_id.0.as_str())
+                    .collect::<Vec<_>>(),
+            )?;
+            self.conn.execute(
+                r#"
+                INSERT INTO task_verifications (
+                  verification_id, action_kind, action_key, updated_at, payload
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    &verification.verification_id.0,
+                    verification.action.action_kind(),
+                    &verification.action_key,
+                    verification.updated_at.to_rfc3339(),
+                    &payload,
+                ],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(true)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn project_buckets_for_task_verification(
+        &self,
+        verification: &TaskVerification,
+    ) -> Result<BTreeSet<String>> {
+        let span_ids = verification
+            .action
+            .span_ids()
+            .into_iter()
+            .map(|span_id| span_id.0.clone())
+            .collect::<Vec<_>>();
+        if span_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let mut buckets = BTreeSet::new();
+        let mut statement = self
+            .conn
+            .prepare("SELECT project_bucket FROM task_spans WHERE span_id = ?1")?;
+        for span_id in &span_ids {
+            if let Some(project_bucket) = statement
+                .query_row(params![span_id], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                buckets.insert(project_bucket);
+            }
+        }
+        Ok(buckets)
     }
 
     pub fn task_benchmark_report(&self) -> Result<TaskBenchmarkReport> {
@@ -787,6 +1009,7 @@ impl Store {
             self.insert_work_items_in_tx(&work_items, &members)?;
             report.timings.insert_ms = insert_started_at.elapsed().as_millis() as u64;
             report.work_items_rebuilt = work_items.len() as u64;
+            self.mark_task_buckets_dirty_in_tx(project_buckets)?;
             Ok(report)
         })();
 
@@ -814,6 +1037,114 @@ impl Store {
             spans.push(serde_json::from_str(&row?)?);
         }
         Ok(spans)
+    }
+
+    fn upsert_task_spans_in_tx(&self, spans: &[TaskSpan]) -> Result<u64> {
+        let mut changed = 0u64;
+        let mut span_stmt = self.conn.prepare(
+            r#"
+            INSERT INTO task_spans (
+              span_id, provider, source_id, project_bucket, started_at, ended_at, title,
+              normalized_title, is_meta, confidence, source_file_path_hash, event_count,
+              has_usage_evidence, total_messages, user_messages, assistant_messages,
+              developer_messages, payload
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            ON CONFLICT(span_id) DO UPDATE SET
+              provider = excluded.provider,
+              source_id = excluded.source_id,
+              project_bucket = excluded.project_bucket,
+              started_at = excluded.started_at,
+              ended_at = excluded.ended_at,
+              title = excluded.title,
+              normalized_title = excluded.normalized_title,
+              is_meta = excluded.is_meta,
+              confidence = excluded.confidence,
+              source_file_path_hash = excluded.source_file_path_hash,
+              event_count = excluded.event_count,
+              has_usage_evidence = excluded.has_usage_evidence,
+              total_messages = excluded.total_messages,
+              user_messages = excluded.user_messages,
+              assistant_messages = excluded.assistant_messages,
+              developer_messages = excluded.developer_messages,
+              payload = excluded.payload
+            "#,
+        )?;
+        let mut delete_links = self
+            .conn
+            .prepare("DELETE FROM task_span_event_links WHERE span_id = ?1")?;
+        let mut link_stmt = self.conn.prepare(
+            r#"
+            INSERT INTO task_span_event_links (span_id, event_id)
+            VALUES (?1, ?2)
+            ON CONFLICT(span_id, event_id) DO NOTHING
+            "#,
+        )?;
+        for span in spans {
+            let payload = serde_json::to_string(span)?;
+            changed += span_stmt.execute(params![
+                &span.span_id.0,
+                &span.provider,
+                &span.source_id.0,
+                &span.project_bucket,
+                span.started_at.to_rfc3339(),
+                span.ended_at.map(|value| value.to_rfc3339()),
+                &span.title,
+                &span.normalized_title,
+                bool_to_i64(span.is_meta),
+                confidence_as_str(span.confidence.clone()),
+                span.source_file_path_hash.as_deref(),
+                safe_u64_to_i64(span.effective_event_count()),
+                bool_to_i64(span.effective_has_usage_evidence()),
+                safe_u64_to_i64(span.total_messages),
+                safe_u64_to_i64(span.user_messages),
+                safe_u64_to_i64(span.assistant_messages),
+                safe_u64_to_i64(span.developer_messages),
+                &payload,
+            ])? as u64;
+            delete_links.execute(params![&span.span_id.0])?;
+            for event_id in &span.linked_event_ids {
+                link_stmt.execute(params![&span.span_id.0, &event_id.0])?;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn delete_task_bucket_snapshot_in_tx(&self, project_bucket: &str) -> Result<()> {
+        let span_ids = self
+            .task_spans_by_sql(
+                "SELECT payload FROM task_spans WHERE project_bucket = ?1 ORDER BY started_at, span_id",
+                &[&project_bucket],
+            )?
+            .into_iter()
+            .map(|span| span.span_id)
+            .collect::<Vec<_>>();
+        let mut delete_links = self
+            .conn
+            .prepare("DELETE FROM task_span_event_links WHERE span_id = ?1")?;
+        let mut delete_spans = self
+            .conn
+            .prepare("DELETE FROM task_spans WHERE span_id = ?1")?;
+        for span_id in &span_ids {
+            delete_links.execute(params![&span_id.0])?;
+            delete_spans.execute(params![&span_id.0])?;
+        }
+        self.conn.execute(
+            r#"
+            DELETE FROM task_work_item_members
+            WHERE work_item_id IN (
+              SELECT work_item_id
+              FROM task_work_items
+              WHERE project_bucket = ?1
+            )
+            "#,
+            params![project_bucket],
+        )?;
+        self.conn.execute(
+            "DELETE FROM task_work_items WHERE project_bucket = ?1",
+            params![project_bucket],
+        )?;
+        Ok(())
     }
 
     fn task_span_targets_for_sources(
@@ -1079,6 +1410,7 @@ impl Store {
             self.insert_work_items_in_tx(&work_items, &members)?;
             report.timings.insert_ms = insert_started_at.elapsed().as_millis() as u64;
             report.work_items_rebuilt = work_items.len() as u64;
+            self.mark_task_buckets_dirty_in_tx(project_buckets)?;
             Ok(report)
         })();
 
@@ -1197,18 +1529,128 @@ impl Store {
         Ok(assignments)
     }
 
-    fn latest_task_verification_by_action_keys(
+    fn work_items_for_project_bucket(&self, project_bucket: &str) -> Result<Vec<WorkItem>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT payload
+            FROM task_work_items
+            WHERE project_bucket = ?1
+            ORDER BY started_at, work_item_id
+            "#,
+        )?;
+        let rows = statement.query_map(params![project_bucket], |row| row.get::<_, String>(0))?;
+        let mut work_items = Vec::new();
+        for row in rows {
+            work_items.push(serde_json::from_str(&row?)?);
+        }
+        Ok(work_items)
+    }
+
+    fn work_item_members_for_project_bucket(
         &self,
-        action_keys: &[String],
-    ) -> Result<Option<TaskVerification>> {
+        project_bucket: &str,
+    ) -> Result<Vec<WorkItemMember>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT m.work_item_id, m.span_id, m.ordinal
+            FROM task_work_item_members m
+            JOIN task_work_items w ON w.work_item_id = m.work_item_id
+            WHERE w.project_bucket = ?1
+            ORDER BY w.started_at, m.ordinal, m.span_id
+            "#,
+        )?;
+        let rows = statement.query_map(params![project_bucket], |row| {
+            Ok(WorkItemMember {
+                work_item_id: WorkItemId(row.get(0)?),
+                span_id: TaskSpanId(row.get(1)?),
+                ordinal: row.get::<_, i64>(2)?.max(0) as usize,
+            })
+        })?;
+        let mut members = Vec::new();
+        for row in rows {
+            members.push(row?);
+        }
+        Ok(members)
+    }
+
+    fn dirty_task_bucket_keys_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        device_id: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT project_bucket
+            FROM task_bucket_sync_state
+            WHERE sink = ?1 AND target = ?2 AND device_id = ?3 AND dirty = 1
+            ORDER BY project_bucket
+            "#,
+        )?;
+        let rows = statement.query_map(params![sink, target, device_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut buckets = BTreeSet::new();
+        for row in rows {
+            buckets.insert(row?);
+        }
+        Ok(buckets)
+    }
+
+    fn task_bucket_is_clean_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        device_id: &str,
+        project_bucket: &str,
+    ) -> bool {
+        self.conn
+            .query_row(
+                r#"
+                SELECT dirty
+                FROM task_bucket_sync_state
+                WHERE sink = ?1 AND target = ?2 AND device_id = ?3 AND project_bucket = ?4
+                "#,
+                params![sink, target, device_id, project_bucket],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|row| row.is_some_and(|dirty| dirty == 0))
+            .unwrap_or(false)
+    }
+
+    fn mark_task_buckets_dirty_in_tx(&self, project_buckets: &BTreeSet<String>) -> Result<()> {
+        if project_buckets.is_empty() {
+            return Ok(());
+        }
+        let buckets = project_buckets.iter().cloned().collect::<Vec<_>>();
+        let now = Utc::now().to_rfc3339();
+        for chunk in buckets.chunks(SQLITE_BUCKET_CHUNK_SIZE) {
+            let placeholders = sqlite_in_clause_placeholders(chunk.len());
+            let sql = format!(
+                "UPDATE task_bucket_sync_state \
+                 SET dirty = 1, updated_at = ?1 \
+                 WHERE project_bucket IN ({placeholders})"
+            );
+            let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&now];
+            params.extend(sqlite_string_params(chunk));
+            self.conn.execute(&sql, params.as_slice())?;
+        }
+        Ok(())
+    }
+
+    fn conflicting_task_verifications(
+        &self,
+        action: &TaskVerificationAction,
+    ) -> Result<Vec<TaskVerification>> {
         Ok(self
-            .task_verifications_by_action_keys(action_keys)?
+            .task_verifications_by_action_keys(&task_verification_lookup_keys(action))?
             .into_iter()
-            .max_by(|left, right| {
-                left.updated_at
-                    .cmp(&right.updated_at)
-                    .then_with(|| left.verification_id.0.cmp(&right.verification_id.0))
-            }))
+            .filter(|current| {
+                task_verification_resolution_key(&current.action)
+                    == task_verification_resolution_key(action)
+            })
+            .collect())
     }
 
     fn task_verifications_by_action_keys(
@@ -1228,12 +1670,12 @@ impl Store {
         Ok(verifications)
     }
 
-    fn delete_task_verifications_by_action_keys(&self, action_keys: &[String]) -> Result<()> {
+    fn delete_task_verifications_by_ids(&self, verification_ids: &[&str]) -> Result<()> {
         let mut statement = self
             .conn
-            .prepare("DELETE FROM task_verifications WHERE action_key = ?1")?;
-        for action_key in action_keys {
-            statement.execute(params![action_key])?;
+            .prepare("DELETE FROM task_verifications WHERE verification_id = ?1")?;
+        for verification_id in verification_ids {
+            statement.execute(params![verification_id])?;
         }
         Ok(())
     }
@@ -2627,14 +3069,44 @@ fn pairwise_cluster_counts(
     (tp, pred_pos, truth_pos)
 }
 
-fn anchor_task_verification_action_keys(action: &TaskVerificationAction) -> Option<Vec<String>> {
-    let anchor_span_id = action.anchor_span_id()?;
-    Some(vec![
-        format!("anchor:{}", anchor_span_id.0),
-        format!("accept:{}", anchor_span_id.0),
-        format!("reject:{}", anchor_span_id.0),
-        format!("rename:{}", anchor_span_id.0),
-    ])
+fn task_verification_lookup_keys(action: &TaskVerificationAction) -> Vec<String> {
+    match action.anchor_span_id() {
+        Some(anchor_span_id) => vec![
+            format!("status:{}", anchor_span_id.0),
+            format!("rename:{}", anchor_span_id.0),
+            format!("anchor:{}", anchor_span_id.0),
+            format!("accept:{}", anchor_span_id.0),
+            format!("reject:{}", anchor_span_id.0),
+        ],
+        None => vec![action.action_key()],
+    }
+}
+
+fn task_verification_resolution_key(action: &TaskVerificationAction) -> String {
+    match action {
+        TaskVerificationAction::Accept { anchor_span_id, .. }
+        | TaskVerificationAction::Reject { anchor_span_id, .. } => {
+            format!("status:{}", anchor_span_id.0)
+        }
+        TaskVerificationAction::Rename { anchor_span_id, .. } => {
+            format!("rename:{}", anchor_span_id.0)
+        }
+        TaskVerificationAction::Split { .. } | TaskVerificationAction::Merge { .. } => {
+            action.action_key()
+        }
+    }
+}
+
+fn latest_task_verification<'a>(
+    verifications: impl Iterator<Item = &'a TaskVerification>,
+) -> Option<TaskVerification> {
+    verifications
+        .max_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.verification_id.0.cmp(&right.verification_id.0))
+        })
+        .cloned()
 }
 
 fn work_item_members_map_from_members(members: &[WorkItemMember]) -> HashMap<String, String> {
@@ -2645,23 +3117,49 @@ fn work_item_members_map_from_members(members: &[WorkItemMember]) -> HashMap<Str
     assignments
 }
 
+fn task_bucket_snapshot_payload_hash(snapshot: &TaskBucketSnapshot) -> Result<String> {
+    Ok(hash_text(&serde_json::to_string(snapshot)?))
+}
+
+fn task_verification_payload_hash(verification: &TaskVerification) -> Result<String> {
+    Ok(hash_text(&serde_json::to_string(verification)?))
+}
+
+fn task_verification_is_newer(left: &TaskVerification, right: &TaskVerification) -> bool {
+    left.updated_at > right.updated_at
+        || (left.updated_at == right.updated_at && left.verification_id.0 > right.verification_id.0)
+}
+
+fn task_verification_is_after_cursor(
+    verification: &TaskVerification,
+    cursor: Option<&TaskVerificationCursor>,
+) -> bool {
+    let Some(cursor) = cursor else {
+        return true;
+    };
+    verification.updated_at > cursor.updated_at
+        || (verification.updated_at == cursor.updated_at
+            && verification.verification_id.0 > cursor.verification_id.0)
+}
+
 fn resolve_task_verifications(verifications: Vec<TaskVerification>) -> Vec<TaskVerification> {
-    let mut anchor_verifications = HashMap::<String, TaskVerification>::new();
-    let mut non_anchor_verifications = Vec::<TaskVerification>::new();
+    let mut resolved_by_key = HashMap::<String, TaskVerification>::new();
     for verification in verifications {
-        if let Some(anchor_span_id) = verification.action.anchor_span_id() {
-            anchor_verifications.insert(anchor_span_id.0.clone(), verification);
-        } else {
-            non_anchor_verifications.push(verification);
+        let resolution_key = task_verification_resolution_key(&verification.action);
+        let should_replace = resolved_by_key
+            .get(&resolution_key)
+            .is_none_or(|current| task_verification_is_newer(&verification, current));
+        if should_replace {
+            resolved_by_key.insert(resolution_key, verification);
         }
     }
-    non_anchor_verifications.extend(anchor_verifications.into_values());
-    non_anchor_verifications.sort_by(|left, right| {
+    let mut resolved = resolved_by_key.into_values().collect::<Vec<_>>();
+    resolved.sort_by(|left, right| {
         left.updated_at
             .cmp(&right.updated_at)
             .then_with(|| left.verification_id.0.cmp(&right.verification_id.0))
     });
-    non_anchor_verifications
+    resolved
 }
 
 fn meta_counts(
@@ -3726,6 +4224,34 @@ mod tests {
         }
     }
 
+    fn test_task_bucket_snapshot(
+        project_bucket: &str,
+        span_id: &str,
+        title: &str,
+        started_at: DateTime<Utc>,
+    ) -> TaskBucketSnapshot {
+        let span = test_span_with_options(
+            span_id,
+            "codex",
+            Some("session-a"),
+            project_bucket,
+            started_at,
+            title,
+            Some(title),
+        )
+        .span;
+        let spans = vec![span];
+        let (work_items, members) = derive_task_work_items(spans.clone(), &[]);
+        TaskBucketSnapshot {
+            project_bucket: project_bucket.to_string(),
+            generated_at: started_at + chrono::Duration::minutes(1),
+            applied_verification_cursor: None,
+            work_items,
+            members,
+            spans,
+        }
+    }
+
     #[test]
     fn chooses_branch_family_when_span_titles_are_only_generic() {
         let title = choose_work_item_title(&[test_span(
@@ -3734,6 +4260,66 @@ mod tests {
             Some("add project token tracking"),
         )]);
         assert_eq!(title, "Add project token tracking");
+    }
+
+    #[test]
+    fn replacing_task_bucket_snapshot_marks_existing_sync_state_dirty() {
+        let store = Store::in_memory().expect("store");
+        let initial_snapshot = test_task_bucket_snapshot(
+            "bucket-a",
+            "span-a",
+            "Implement sync dirty tracking",
+            Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 0).unwrap(),
+        );
+        store
+            .replace_task_bucket_snapshot(&initial_snapshot)
+            .expect("replace initial snapshot");
+        store
+            .record_task_bucket_snapshots_synced(
+                "http",
+                "https://example.invalid/api/sync/batches",
+                "device-1",
+                std::slice::from_ref(&initial_snapshot),
+            )
+            .expect("record synced snapshot");
+
+        let clean_pending = store
+            .pending_task_bucket_snapshots_for_sync(
+                "http",
+                "https://example.invalid/api/sync/batches",
+                "device-1",
+                false,
+                None,
+            )
+            .expect("pending snapshots before replacement");
+        assert!(clean_pending.is_empty());
+
+        let updated_snapshot = test_task_bucket_snapshot(
+            "bucket-a",
+            "span-a",
+            "Implement sync dirty tracking v2",
+            Utc.with_ymd_and_hms(2026, 7, 6, 11, 0, 0).unwrap(),
+        );
+        store
+            .replace_task_bucket_snapshot(&updated_snapshot)
+            .expect("replace updated snapshot");
+
+        let pending = store
+            .pending_task_bucket_snapshots_for_sync(
+                "http",
+                "https://example.invalid/api/sync/batches",
+                "device-1",
+                false,
+                None,
+            )
+            .expect("pending snapshots after replacement");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].project_bucket, "bucket-a");
+        assert_eq!(pending[0].spans.len(), 1);
+        assert_eq!(
+            pending[0].spans[0].title,
+            "Implement sync dirty tracking v2"
+        );
     }
 
     #[test]
@@ -4687,14 +5273,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_task_verifications_prefers_latest_anchor_verification() {
+    fn resolve_task_verifications_keeps_latest_status_and_rename_per_anchor() {
         let created_at = Utc.with_ymd_and_hms(2026, 7, 1, 10, 0, 0).unwrap();
         let anchor_span_id = TaskSpanId("span-anchor".to_string());
         let work_item_id = WorkItemId("work-anchor".to_string());
         let reject = TaskVerification {
             schema_version: TASK_VERIFICATION_SCHEMA_VERSION.to_string(),
-            verification_id: task_verification_id("reject", "reject:span-anchor"),
-            action_key: "reject:span-anchor".to_string(),
+            verification_id: task_verification_id("reject", "status:span-anchor"),
+            action_key: "status:span-anchor".to_string(),
             action: TaskVerificationAction::Reject {
                 work_item_id: work_item_id.clone(),
                 anchor_span_id: anchor_span_id.clone(),
@@ -4717,11 +5303,82 @@ mod tests {
         };
 
         let resolved = resolve_task_verifications(vec![reject, rename]);
-        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.len(), 2);
         assert!(matches!(
             resolved[0].action,
+            TaskVerificationAction::Reject { .. }
+        ));
+        assert!(matches!(
+            resolved[1].action,
             TaskVerificationAction::Rename { .. }
         ));
+    }
+
+    #[test]
+    fn merge_task_verification_canonicalizes_legacy_anchor_keys_before_insert() {
+        let store = Store::in_memory().expect("store");
+        let created_at = Utc.with_ymd_and_hms(2026, 7, 1, 10, 0, 0).unwrap();
+        let anchor_span_id = TaskSpanId("span-anchor".to_string());
+        let work_item_id = WorkItemId("work-anchor".to_string());
+        let legacy_rename = TaskVerification {
+            schema_version: TASK_VERIFICATION_SCHEMA_VERSION.to_string(),
+            verification_id: TaskVerificationId("legacy-rename".to_string()),
+            action_key: "anchor:span-anchor".to_string(),
+            action: TaskVerificationAction::Rename {
+                work_item_id: work_item_id.clone(),
+                anchor_span_id: anchor_span_id.clone(),
+                title: "Legacy rename".to_string(),
+            },
+            created_at,
+            updated_at: created_at,
+        };
+        let payload = serde_json::to_string(&legacy_rename).expect("legacy payload");
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO task_verifications (
+                  verification_id, action_kind, action_key, updated_at, payload
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                rusqlite::params![
+                    &legacy_rename.verification_id.0,
+                    legacy_rename.action.action_kind(),
+                    &legacy_rename.action_key,
+                    legacy_rename.updated_at.to_rfc3339(),
+                    &payload,
+                ],
+            )
+            .expect("insert legacy rename");
+
+        let legacy_reject = TaskVerification {
+            schema_version: TASK_VERIFICATION_SCHEMA_VERSION.to_string(),
+            verification_id: TaskVerificationId("legacy-reject".to_string()),
+            action_key: "anchor:span-anchor".to_string(),
+            action: TaskVerificationAction::Reject {
+                work_item_id,
+                anchor_span_id,
+                reason: TaskVerdict::Meta,
+            },
+            created_at: created_at + chrono::Duration::minutes(1),
+            updated_at: created_at + chrono::Duration::minutes(1),
+        };
+
+        assert!(store
+            .merge_task_verification(&legacy_reject)
+            .expect("merge legacy reject"));
+
+        let stored = store.task_verifications().expect("task verifications");
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().any(|verification| {
+            matches!(verification.action, TaskVerificationAction::Rename { .. })
+                && verification.action_key == "anchor:span-anchor"
+        }));
+        assert!(stored.iter().any(|verification| {
+            matches!(verification.action, TaskVerificationAction::Reject { .. })
+                && verification.action_key == "status:span-anchor"
+        }));
     }
 
     #[test]

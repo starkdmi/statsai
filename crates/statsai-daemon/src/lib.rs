@@ -3,16 +3,25 @@
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use statsai_core::{
-    SyncAck, SyncBatch, SyncEntityCounts, SyncRejectedRecord, SYNC_ACK_SCHEMA_VERSION,
-    SYNC_BATCH_SCHEMA_VERSION,
+    SyncAck, SyncBatch, SyncEntityCounts, SyncRejectedRecord, SYNC_ACK_V1_SCHEMA_VERSION,
+    SYNC_ACK_V2_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
 };
 use statsai_store::Store;
+use std::collections::BTreeSet;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn sync_ack_schema_version(batch_schema_version: &str) -> &'static str {
+    if batch_schema_version == SYNC_BATCH_V1_SCHEMA_VERSION {
+        SYNC_ACK_V1_SCHEMA_VERSION
+    } else {
+        SYNC_ACK_V2_SCHEMA_VERSION
+    }
 }
 
 pub fn run(addr: &str, store: Arc<Mutex<Store>>) -> Result<()> {
@@ -87,7 +96,9 @@ fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>) -> Result<()>
 }
 
 pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
-    if batch.schema_version != SYNC_BATCH_SCHEMA_VERSION {
+    if batch.schema_version != SYNC_BATCH_V1_SCHEMA_VERSION
+        && batch.schema_version != SYNC_BATCH_V2_SCHEMA_VERSION
+    {
         bail!("unsupported sync batch schema {}", batch.schema_version);
     }
 
@@ -105,9 +116,36 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     }
     let inserted_events = store.insert_events(&batch.events)?;
     let written_summaries = store.upsert_summaries(&batch.summaries)?;
+    let mut buckets_needing_rebuild = BTreeSet::new();
+    for snapshot in &batch.task_buckets {
+        let had_newer_local_verifications = store.task_bucket_has_newer_verifications(
+            &snapshot.project_bucket,
+            snapshot.applied_verification_cursor.as_ref(),
+        )?;
+        store.replace_task_bucket_snapshot(snapshot)?;
+        let has_newer_local_verifications = had_newer_local_verifications
+            || store.task_bucket_has_newer_verifications(
+                &snapshot.project_bucket,
+                snapshot.applied_verification_cursor.as_ref(),
+            )?;
+        if has_newer_local_verifications {
+            buckets_needing_rebuild.insert(snapshot.project_bucket.clone());
+        }
+    }
+    let mut merged_task_verifications = 0u64;
+    for verification in &batch.task_verifications {
+        if store.merge_task_verification(verification)? {
+            merged_task_verifications += 1;
+            buckets_needing_rebuild
+                .extend(store.project_buckets_for_task_verification(verification)?);
+        }
+    }
+    if !buckets_needing_rebuild.is_empty() {
+        store.rebuild_task_work_items_for_project_buckets(&buckets_needing_rebuild)?;
+    }
 
     Ok(SyncAck {
-        schema_version: SYNC_ACK_SCHEMA_VERSION.to_string(),
+        schema_version: sync_ack_schema_version(&batch.schema_version).to_string(),
         batch_id: batch.batch_id.clone(),
         accepted: SyncEntityCounts {
             sources: batch.sources.len() as u64,
@@ -116,6 +154,8 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             subscriptions: batch.subscriptions.len() as u64,
             events: inserted_events,
             summaries: written_summaries,
+            task_buckets: batch.task_buckets.len() as u64,
+            task_verifications: merged_task_verifications,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -124,6 +164,9 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             subscriptions: 0,
             events: (batch.events.len() as u64).saturating_sub(inserted_events),
             summaries: 0,
+            task_buckets: 0,
+            task_verifications: (batch.task_verifications.len() as u64)
+                .saturating_sub(merged_task_verifications),
         },
         rejected: Vec::<SyncRejectedRecord>::new(),
     })
@@ -815,11 +858,17 @@ fn ensure_loopback(addr: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
+    use statsai_core::{
+        source_id, Confidence, ProjectInfo, SourceKind, TaskBucketSnapshot, TaskSpan, TaskSpanId,
+        TaskStatus, TaskVerdict, TaskVerification, TaskVerificationAction, TaskVerificationCursor,
+        TaskVerificationId, UsageCounts, WorkItem, WorkItemId, WorkItemMember,
+        TASK_SPAN_SCHEMA_VERSION, TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
+    };
 
     fn empty_batch() -> SyncBatch {
         SyncBatch {
-            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            schema_version: SYNC_BATCH_V2_SCHEMA_VERSION.to_string(),
             batch_id: "batch_test".to_string(),
             device_id: "device_test".to_string(),
             sources: Vec::new(),
@@ -828,6 +877,8 @@ mod tests {
             subscriptions: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
+            task_buckets: Vec::new(),
+            task_verifications: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -837,11 +888,21 @@ mod tests {
         let store = Store::in_memory().expect("store");
         let ack = ingest_sync_batch(&store, &empty_batch()).expect("ack");
 
-        assert_eq!(ack.schema_version, SYNC_ACK_SCHEMA_VERSION);
+        assert_eq!(ack.schema_version, SYNC_ACK_V2_SCHEMA_VERSION);
         assert_eq!(ack.batch_id, "batch_test");
         assert_eq!(ack.accepted.events, 0);
         assert_eq!(ack.duplicates.events, 0);
         assert!(ack.rejected.is_empty());
+    }
+
+    #[test]
+    fn ingest_v1_batch_returns_v1_ack_schema() {
+        let store = Store::in_memory().expect("store");
+        let mut batch = empty_batch();
+        batch.schema_version = SYNC_BATCH_V1_SCHEMA_VERSION.to_string();
+
+        let ack = ingest_sync_batch(&store, &batch).expect("ack");
+        assert_eq!(ack.schema_version, SYNC_ACK_V1_SCHEMA_VERSION);
     }
 
     #[test]
@@ -852,5 +913,182 @@ mod tests {
 
         let error = ingest_sync_batch(&store, &batch).expect_err("unsupported schema");
         assert!(error.to_string().contains("unsupported sync batch schema"));
+    }
+
+    #[test]
+    fn ingest_persists_task_payloads_before_acknowledging_them() {
+        let store = Store::in_memory().expect("store");
+        let mut batch = empty_batch();
+        batch.task_buckets = vec![test_task_bucket_snapshot()];
+        batch.task_verifications = vec![test_task_verification()];
+
+        let ack = ingest_sync_batch(&store, &batch).expect("ack");
+
+        assert_eq!(ack.accepted.task_buckets, 1);
+        assert_eq!(ack.accepted.task_verifications, 1);
+        assert_eq!(ack.duplicates.task_verifications, 0);
+        assert_eq!(store.task_spans().expect("task spans").len(), 1);
+        assert_eq!(store.work_items().expect("work items").len(), 1);
+        assert_eq!(
+            store
+                .task_verifications()
+                .expect("task verifications")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn ingest_rebuilds_stale_task_buckets_against_newer_local_verifications() {
+        let store = Store::in_memory().expect("store");
+        store
+            .merge_task_verification(&test_task_verification())
+            .expect("seed verification");
+
+        let mut batch = empty_batch();
+        batch.task_buckets = vec![test_task_bucket_snapshot()];
+
+        let ack = ingest_sync_batch(&store, &batch).expect("ack");
+
+        assert_eq!(ack.accepted.task_buckets, 1);
+        assert_eq!(ack.accepted.task_verifications, 0);
+        let work_items = store.work_items().expect("work items");
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(work_items[0].status, TaskStatus::RejectedMeta);
+        assert!(work_items[0]
+            .review_reasons
+            .iter()
+            .any(|reason| reason.starts_with("manual_reject:")));
+    }
+
+    fn test_task_bucket_snapshot() -> TaskBucketSnapshot {
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 7, 5, 10, 0, 0)
+            .single()
+            .expect("start");
+        let ended_at = Utc
+            .with_ymd_and_hms(2026, 7, 5, 10, 5, 0)
+            .single()
+            .expect("end");
+        let span_id = TaskSpanId("span_ingest_test".to_string());
+        let work_item_id = WorkItemId("work_ingest_test".to_string());
+
+        TaskBucketSnapshot {
+            project_bucket: "bucket-ingest".to_string(),
+            generated_at: ended_at,
+            applied_verification_cursor: Some(TaskVerificationCursor {
+                updated_at: ended_at,
+                verification_id: TaskVerificationId("tvf-ingest-cursor".to_string()),
+            }),
+            work_items: vec![WorkItem {
+                schema_version: WORK_ITEM_SCHEMA_VERSION.to_string(),
+                work_item_id: work_item_id.clone(),
+                anchor_span_id: span_id.clone(),
+                tail_span_id: span_id.clone(),
+                project_bucket: "bucket-ingest".to_string(),
+                title: "Implement hosted task sync".to_string(),
+                normalized_title: "implement hosted task sync".to_string(),
+                status: TaskStatus::NeedsReview,
+                confidence: Confidence::Medium,
+                started_at,
+                ended_at,
+                duration_seconds: Some(300),
+                span_count: 1,
+                event_count: 1,
+                total_input_tokens: 10,
+                total_cache_creation_tokens: 0,
+                total_cache_read_tokens: 0,
+                total_output_tokens: 5,
+                total_reasoning_tokens: 0,
+                total_tokens: 15,
+                estimated_cost_usd: Some(25),
+                providers: vec!["codex".to_string()],
+                issue_keys: Vec::new(),
+                repo_label: Some("statsai/repo".to_string()),
+                branch_labels: vec!["main".to_string()],
+                path_label: Some("/workspace/statsai".to_string()),
+                summary_preview: Some("Implement hosted task sync".to_string()),
+                todo_excerpt: Some("todo hosted task sync".to_string()),
+                no_git: false,
+                cross_provider: false,
+                continuation_reasons: Vec::new(),
+                review_reasons: vec!["needs_review".to_string()],
+            }],
+            members: vec![WorkItemMember {
+                work_item_id,
+                span_id: span_id.clone(),
+                ordinal: 0,
+            }],
+            spans: vec![TaskSpan {
+                schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                span_id,
+                provider: "codex".to_string(),
+                source_id: source_id("codex", SourceKind::LocalAdapter, "daemon-ingest"),
+                span_kind: "codex_task".to_string(),
+                source_record_id: None,
+                source_file_path_hash: None,
+                summary_id: None,
+                session_id: Some("session-ingest".to_string()),
+                thread_id: Some("thread-ingest".to_string()),
+                title: "Implement hosted task sync".to_string(),
+                normalized_title: "implement hosted task sync".to_string(),
+                title_source: Some("thread_name".to_string()),
+                summary_preview: Some("Implement hosted task sync".to_string()),
+                todo_excerpt: Some("todo hosted task sync".to_string()),
+                issue_keys: Vec::new(),
+                branch_family: Some("main".to_string()),
+                project_bucket: "bucket-ingest".to_string(),
+                project: Some(ProjectInfo {
+                    project_id: "project-ingest".to_string(),
+                    project_label: Some("StatsAI".to_string()),
+                    repo_remote_hash: Some("repo-hash-ingest".to_string()),
+                    repo_label: Some("statsai/repo".to_string()),
+                    branch_hash: Some("branch-hash-ingest".to_string()),
+                    branch_label: Some("main".to_string()),
+                    path_hash: Some("path-hash-ingest".to_string()),
+                    path_label: Some("/workspace/statsai".to_string()),
+                }),
+                git: None,
+                usage: UsageCounts {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    total_tokens: Some(15),
+                    requests: Some(1),
+                    ..UsageCounts::default()
+                },
+                estimated_cost_usd: Some(25),
+                event_count: 1,
+                has_usage_evidence: true,
+                total_messages: 2,
+                user_messages: 1,
+                assistant_messages: 1,
+                developer_messages: 0,
+                linked_event_ids: Vec::new(),
+                confidence: Confidence::High,
+                is_meta: false,
+                started_at,
+                ended_at: Some(ended_at),
+                duration_seconds: Some(300),
+            }],
+        }
+    }
+
+    fn test_task_verification() -> TaskVerification {
+        let created_at = Utc
+            .with_ymd_and_hms(2026, 7, 5, 10, 6, 0)
+            .single()
+            .expect("created_at");
+        TaskVerification {
+            schema_version: TASK_VERIFICATION_SCHEMA_VERSION.to_string(),
+            verification_id: TaskVerificationId("tvf-ingest-1".to_string()),
+            action_key: "anchor:span_ingest_test".to_string(),
+            action: TaskVerificationAction::Reject {
+                work_item_id: WorkItemId("work_ingest_test".to_string()),
+                anchor_span_id: TaskSpanId("span_ingest_test".to_string()),
+                reason: TaskVerdict::Meta,
+            },
+            created_at,
+            updated_at: created_at,
+        }
     }
 }

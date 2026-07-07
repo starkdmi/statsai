@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_migrations_table(conn)?;
@@ -99,6 +99,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         4 => apply_migration_004(conn),
         5 => apply_migration_005(conn),
         6 => apply_migration_006(conn),
+        7 => apply_migration_007(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -260,6 +261,34 @@ fn apply_migration_006(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn apply_migration_007(conn: &Connection) -> Result<()> {
+    ensure_local_task_tables(conn)?;
+    ensure_column(
+        conn,
+        "sync_state",
+        "last_task_verification_updated_at",
+        "TEXT",
+    )?;
+    ensure_column(conn, "sync_state", "last_task_verification_id", "TEXT")?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS task_bucket_sync_state (
+          sink TEXT NOT NULL,
+          target TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          project_bucket TEXT NOT NULL,
+          dirty INTEGER NOT NULL DEFAULT 1,
+          payload_hash TEXT,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (sink, target, device_id, project_bucket)
+        );
+        CREATE INDEX IF NOT EXISTS task_bucket_sync_state_dirty_idx
+          ON task_bucket_sync_state (sink, target, device_id, dirty, project_bucket);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -404,6 +433,7 @@ mod tests {
             CURRENT_SCHEMA_VERSION
         );
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
+        assert!(table_exists(&conn, "task_bucket_sync_state"));
     }
 
     #[test]
@@ -417,6 +447,7 @@ mod tests {
             CURRENT_SCHEMA_VERSION
         );
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
+        assert!(table_exists(&conn, "task_bucket_sync_state"));
     }
 
     #[test]
@@ -457,6 +488,7 @@ mod tests {
         assert!(table_exists(&conn, "task_work_items"));
         assert!(table_exists(&conn, "task_work_item_members"));
         assert!(table_exists(&conn, "task_verifications"));
+        assert!(table_exists(&conn, "task_bucket_sync_state"));
         assert!(table_exists(&conn, "tasks"));
         assert!(table_exists(&conn, "task_rollups"));
         assert!(table_exists(&conn, "task_evidence"));

@@ -1,4 +1,4 @@
-//! Local-only task collection domain types and helpers.
+//! Task collection domain types and helpers for local rebuilding plus hosted sync snapshots.
 
 use crate::{
     hash_text, Confidence, EventId, GitInfo, ProjectInfo, SourceId, SummaryId, UsageCounts,
@@ -118,6 +118,7 @@ const LOW_SIGNAL_PREFIXES: &[&str] = &[
     "automation:",
     "the user interrupted the previous turn on purpose.",
     "the following is the codex agent history",
+    "you are acting as a reviewer for a proposed code change made by another engineer",
     "new session -",
     "<environment_context>",
     "<codex_internal_context",
@@ -142,6 +143,7 @@ const LOW_SIGNAL_PREFIXES: &[&str] = &[
     "updated the following files:",
     "output:",
     "usage:",
+    "tokens used:",
     "cargo run -p",
     "running `target/debug/",
     "command line invocation:",
@@ -632,9 +634,10 @@ impl TaskVerificationAction {
     #[must_use]
     pub fn action_key(&self) -> String {
         match self {
-            Self::Accept { anchor_span_id, .. }
-            | Self::Reject { anchor_span_id, .. }
-            | Self::Rename { anchor_span_id, .. } => format!("anchor:{}", anchor_span_id.0),
+            Self::Accept { anchor_span_id, .. } | Self::Reject { anchor_span_id, .. } => {
+                format!("status:{}", anchor_span_id.0)
+            }
+            Self::Rename { anchor_span_id, .. } => format!("rename:{}", anchor_span_id.0),
             Self::Split {
                 after_span_id,
                 before_span_id,
@@ -2946,6 +2949,10 @@ mod tests {
         assert!(task_title_is_generic(Some(
             "review changes on main against origin/main"
         )));
+        assert!(task_title_is_generic(Some(
+            "You are acting as a reviewer for a proposed code change made by another engineer"
+        )));
+        assert!(task_title_is_generic(Some("Tokens used: 2631368")));
         assert!(!task_title_is_generic(Some(
             "Implement task verification workflow"
         )));
@@ -3340,7 +3347,7 @@ mod tests {
     }
 
     #[test]
-    fn anchor_level_verification_actions_share_one_action_key() {
+    fn anchor_level_verification_actions_keep_status_and_rename_keys_distinct() {
         let work_item_id = WorkItemId("work-test".to_string());
         let anchor_span_id = TaskSpanId("span-anchor".to_string());
         let accept = TaskVerificationAction::Accept {
@@ -3358,9 +3365,9 @@ mod tests {
             title: "Verified task".to_string(),
         };
 
-        assert_eq!(accept.action_key(), "anchor:span-anchor");
-        assert_eq!(reject.action_key(), "anchor:span-anchor");
-        assert_eq!(rename.action_key(), "anchor:span-anchor");
+        assert_eq!(accept.action_key(), "status:span-anchor");
+        assert_eq!(reject.action_key(), "status:span-anchor");
+        assert_eq!(rename.action_key(), "rename:span-anchor");
     }
 
     #[test]

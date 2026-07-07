@@ -18,8 +18,12 @@ pub const PROVIDER_ACCOUNT_SCHEMA_VERSION: &str = "provider_account.v1";
 pub const SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION: &str = "source_account_assignment.v1";
 pub const SUBSCRIPTION_SCHEMA_VERSION: &str = "subscription.v1";
 pub const DAILY_ROLLUP_SCHEMA_VERSION: &str = "daily_rollup.v1";
-pub const SYNC_BATCH_SCHEMA_VERSION: &str = "sync_batch.v1";
-pub const SYNC_ACK_SCHEMA_VERSION: &str = "sync_ack.v1";
+pub const SYNC_BATCH_V1_SCHEMA_VERSION: &str = "sync_batch.v1";
+pub const SYNC_BATCH_V2_SCHEMA_VERSION: &str = "sync_batch.v2";
+pub const SYNC_ACK_V1_SCHEMA_VERSION: &str = "sync_ack.v1";
+pub const SYNC_ACK_V2_SCHEMA_VERSION: &str = "sync_ack.v2";
+pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V2_SCHEMA_VERSION;
+pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V2_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
@@ -543,7 +547,30 @@ pub struct SyncBatch {
     pub events: Vec<UsageEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub summaries: Vec<UsageSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_buckets: Vec<TaskBucketSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_verifications: Vec<TaskVerification>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskVerificationCursor {
+    pub updated_at: DateTime<Utc>,
+    pub verification_id: TaskVerificationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskBucketSnapshot {
+    pub project_bucket: String,
+    pub generated_at: DateTime<Utc>,
+    pub applied_verification_cursor: Option<TaskVerificationCursor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_items: Vec<WorkItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<WorkItemMember>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<TaskSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -555,6 +582,14 @@ pub struct SyncEntityCounts {
     pub subscriptions: u64,
     pub events: u64,
     pub summaries: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub task_buckets: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub task_verifications: u64,
+}
+
+fn sync_count_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1491,6 +1526,75 @@ mod tests {
         let schema = schemars::schema_for!(UsageSummary);
         let json = serde_json::to_value(schema).expect("summary schema should serialize");
         assert!(json.get("title").is_some());
+    }
+
+    #[test]
+    fn sync_ack_v1_omits_zero_task_counters() {
+        let ack = SyncAck {
+            schema_version: SYNC_ACK_V1_SCHEMA_VERSION.to_string(),
+            batch_id: "batch-1".to_string(),
+            accepted: SyncEntityCounts {
+                sources: 1,
+                accounts: 0,
+                source_account_assignments: 0,
+                subscriptions: 0,
+                events: 0,
+                summaries: 2,
+                task_buckets: 0,
+                task_verifications: 0,
+            },
+            duplicates: SyncEntityCounts {
+                sources: 0,
+                accounts: 0,
+                source_account_assignments: 0,
+                subscriptions: 0,
+                events: 0,
+                summaries: 0,
+                task_buckets: 0,
+                task_verifications: 0,
+            },
+            rejected: Vec::new(),
+        };
+
+        let json = serde_json::to_value(&ack).expect("ack should serialize");
+        assert_eq!(json["schema_version"], SYNC_ACK_V1_SCHEMA_VERSION);
+        assert!(json["accepted"].get("task_buckets").is_none());
+        assert!(json["accepted"].get("task_verifications").is_none());
+        assert!(json["duplicates"].get("task_buckets").is_none());
+        assert!(json["duplicates"].get("task_verifications").is_none());
+    }
+
+    #[test]
+    fn sync_ack_v2_keeps_nonzero_task_counters() {
+        let ack = SyncAck {
+            schema_version: SYNC_ACK_SCHEMA_VERSION.to_string(),
+            batch_id: "batch-2".to_string(),
+            accepted: SyncEntityCounts {
+                sources: 0,
+                accounts: 0,
+                source_account_assignments: 0,
+                subscriptions: 0,
+                events: 0,
+                summaries: 0,
+                task_buckets: 3,
+                task_verifications: 1,
+            },
+            duplicates: SyncEntityCounts {
+                sources: 0,
+                accounts: 0,
+                source_account_assignments: 0,
+                subscriptions: 0,
+                events: 0,
+                summaries: 0,
+                task_buckets: 0,
+                task_verifications: 0,
+            },
+            rejected: Vec::new(),
+        };
+
+        let json = serde_json::to_value(&ack).expect("ack should serialize");
+        assert_eq!(json["accepted"]["task_buckets"], 3);
+        assert_eq!(json["accepted"]["task_verifications"], 1);
     }
 
     fn test_source(provider: &str, path: &str) -> SourceLocation {

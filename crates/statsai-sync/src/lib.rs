@@ -1,7 +1,10 @@
 //! Sync sink interfaces for `statsai`.
 
 use anyhow::{bail, Context, Result};
-use statsai_core::{SyncAck, SyncBatch, SYNC_ACK_SCHEMA_VERSION};
+use statsai_core::{
+    SyncAck, SyncBatch, SYNC_ACK_SCHEMA_VERSION, SYNC_ACK_V1_SCHEMA_VERSION,
+    SYNC_ACK_V2_SCHEMA_VERSION,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -107,7 +110,10 @@ impl SyncSink for HttpSink {
 }
 
 fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
-    if ack.schema_version != SYNC_ACK_SCHEMA_VERSION {
+    if ack.schema_version != SYNC_ACK_SCHEMA_VERSION
+        && ack.schema_version != SYNC_ACK_V1_SCHEMA_VERSION
+        && ack.schema_version != SYNC_ACK_V2_SCHEMA_VERSION
+    {
         bail!("unsupported sync ack schema {}", ack.schema_version);
     }
     if ack.batch_id != batch.batch_id {
@@ -163,6 +169,18 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         batch.summaries.len() as u64,
         ack.accepted.summaries,
         ack.duplicates.summaries,
+    )?;
+    validate_sync_ack_counts(
+        "task_buckets",
+        batch.task_buckets.len() as u64,
+        ack.accepted.task_buckets,
+        ack.duplicates.task_buckets,
+    )?;
+    validate_sync_ack_counts(
+        "task_verifications",
+        batch.task_verifications.len() as u64,
+        ack.accepted.task_verifications,
+        ack.duplicates.task_verifications,
     )?;
     Ok(())
 }
@@ -227,7 +245,7 @@ mod tests {
 
     fn empty_batch() -> SyncBatch {
         SyncBatch {
-            schema_version: "sync_batch.v1".to_string(),
+            schema_version: "sync_batch.v2".to_string(),
             batch_id: "batch_1".to_string(),
             device_id: "device".to_string(),
             sources: Vec::new(),
@@ -236,6 +254,8 @@ mod tests {
             subscriptions: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
+            task_buckets: Vec::new(),
+            task_verifications: Vec::new(),
             created_at: Utc::now(),
         }
     }
@@ -285,7 +305,7 @@ mod tests {
         let (auth, content_type, body) = rx.recv().expect("request body");
         assert_eq!(auth.as_deref(), Some("Bearer token_123"));
         assert_eq!(content_type.as_deref(), Some("application/json"));
-        assert!(body.contains("\"schema_version\":\"sync_batch.v1\""));
+        assert!(body.contains("\"schema_version\":\"sync_batch.v2\""));
         assert!(body.contains("\"batch_id\":\"batch_1\""));
     }
 
