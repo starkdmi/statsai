@@ -154,6 +154,8 @@ enum AuthSubcommand {
 struct ScanCommand {
     #[arg(long, help = "Scan only this provider")]
     provider: Option<String>,
+    #[arg(long, help = "Collect local task spans and rebuild work items")]
+    include_tasks: bool,
     #[arg(long, help = "Preview without persisting to the store")]
     preview: bool,
     #[arg(
@@ -786,6 +788,7 @@ fn scan_with_adapters(
                 &file_cache_entries,
                 command.replace,
                 command.no_cache,
+                command.include_tasks,
             )?;
             let pending_file_entries = file_reconciliation.pending_entries;
             let removed_file_entries = file_reconciliation.removed_entries;
@@ -812,6 +815,7 @@ fn scan_with_adapters(
             };
             let options = ScanOptions {
                 device_id: device_id.to_string(),
+                collect_tasks: command.include_tasks,
                 selected_cache_keys: (should_run_adapter_scan
                     && !replace_source_records
                     && !command.no_cache)
@@ -860,6 +864,9 @@ fn scan_with_adapters(
                     ..statsai_adapters::AdapterScan::default()
                 }
             };
+            if !command.include_tasks {
+                scan.task_spans.clear();
+            }
             let effective_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
                     None
@@ -918,19 +925,21 @@ fn scan_with_adapters(
             }
 
             if command.preview {
-                let rebuild_started_at = Instant::now();
-                preview_work_item_rebuild_count += preview_task_rebuild.apply_source_changes(
-                    store,
-                    SourceTaskChangeSet {
-                        source_id: &source.source_id,
-                        replace_source_records,
-                        touched_files,
-                        pending_file_entries: &pending_file_entries,
-                        removed_file_entries: &removed_file_entries,
-                        task_spans: &scan.task_spans,
-                    },
-                )?;
-                preview_rebuild_duration_ms += rebuild_started_at.elapsed().as_millis() as u64;
+                if command.include_tasks {
+                    let rebuild_started_at = Instant::now();
+                    preview_work_item_rebuild_count += preview_task_rebuild.apply_source_changes(
+                        store,
+                        SourceTaskChangeSet {
+                            source_id: &source.source_id,
+                            replace_source_records,
+                            touched_files,
+                            pending_file_entries: &pending_file_entries,
+                            removed_file_entries: &removed_file_entries,
+                            task_spans: &scan.task_spans,
+                        },
+                    )?;
+                    preview_rebuild_duration_ms += rebuild_started_at.elapsed().as_millis() as u64;
+                }
                 print_scan_preview_line(ScanPreviewLine {
                     source: &source,
                     usage_events: source_event_count,
@@ -951,23 +960,28 @@ fn scan_with_adapters(
             )?;
             persist_source_after_preview(store, &source)?;
             apply_source_account_resolution(store, &source, &mut scan.events, &mut scan.summaries)?;
-            let mut affected_project_buckets = scan
-                .task_spans
-                .iter()
-                .map(|span| span.project_bucket.clone())
-                .collect::<BTreeSet<_>>();
+            let mut affected_project_buckets = if command.include_tasks {
+                scan.task_spans
+                    .iter()
+                    .map(|span| span.project_bucket.clone())
+                    .collect::<BTreeSet<_>>()
+            } else {
+                BTreeSet::new()
+            };
             if replace_source_records {
                 let delete_started_at = Instant::now();
                 removed_event_count +=
                     store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
                 removed_summary_count +=
                     store.delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
-                let deleted_task_spans =
-                    store.delete_task_spans_for_sources(std::slice::from_ref(&source.source_id))?;
-                removed_task_span_count += deleted_task_spans.deleted;
-                affected_project_buckets
-                    .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
-                pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
+                if command.include_tasks {
+                    let deleted_task_spans = store
+                        .delete_task_spans_for_sources(std::slice::from_ref(&source.source_id))?;
+                    removed_task_span_count += deleted_task_spans.deleted;
+                    affected_project_buckets
+                        .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
+                    pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
+                }
                 delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
             } else if touched_files {
                 let delete_started_at = Instant::now();
@@ -983,61 +997,72 @@ fn scan_with_adapters(
                     &source.source_id,
                     &reconciled_file_hashes,
                 )?;
-                let deleted_task_spans = store.delete_task_spans_for_source_file_hashes(
-                    &source.source_id,
-                    &reconciled_file_hashes,
-                )?;
-                removed_task_span_count += deleted_task_spans.deleted;
-                affected_project_buckets
-                    .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
-                pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
+                if command.include_tasks {
+                    let deleted_task_spans = store.delete_task_spans_for_source_file_hashes(
+                        &source.source_id,
+                        &reconciled_file_hashes,
+                    )?;
+                    removed_task_span_count += deleted_task_spans.deleted;
+                    affected_project_buckets
+                        .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
+                    pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
+                }
                 delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
             }
             let insert_started_at = Instant::now();
             let insert_result = store.insert_events_with_resolution(&scan.events)?;
             inserted_count += insert_result.inserted;
             insert_events_duration_ms += insert_started_at.elapsed().as_millis() as u64;
-            rewrite_task_span_linked_event_ids(
-                &mut scan.task_spans,
-                &insert_result.canonical_event_ids,
-            );
-            populate_task_span_rollups(
-                &mut scan.task_spans,
-                &scan.events,
-                &insert_result.canonical_event_ids,
-            );
+            if command.include_tasks {
+                rewrite_task_span_linked_event_ids(
+                    &mut scan.task_spans,
+                    &insert_result.canonical_event_ids,
+                );
+                populate_task_span_rollups(
+                    &mut scan.task_spans,
+                    &scan.events,
+                    &insert_result.canonical_event_ids,
+                );
+            }
             let upsert_summaries_started_at = Instant::now();
             summary_written_count += store.upsert_summaries(&scan.summaries)?;
             upsert_summaries_duration_ms +=
                 upsert_summaries_started_at.elapsed().as_millis() as u64;
-            let upsert_task_spans_started_at = Instant::now();
-            task_span_written_count += store.upsert_task_spans(&scan.task_spans)?;
-            upsert_task_spans_duration_ms +=
-                upsert_task_spans_started_at.elapsed().as_millis() as u64;
-            if !scan.task_spans.is_empty() {
-                pending_rebuild_project_buckets.extend(
-                    scan.task_spans
-                        .iter()
-                        .map(|span| span.project_bucket.clone()),
-                );
-                pending_rebuild_span_ids
-                    .extend(scan.task_spans.iter().map(|span| span.span_id.0.clone()));
-            }
-            if !affected_project_buckets.is_empty() {
-                pending_rebuild_project_buckets.extend(affected_project_buckets);
+            if command.include_tasks {
+                let upsert_task_spans_started_at = Instant::now();
+                task_span_written_count += store.upsert_task_spans(&scan.task_spans)?;
+                upsert_task_spans_duration_ms +=
+                    upsert_task_spans_started_at.elapsed().as_millis() as u64;
+                if !scan.task_spans.is_empty() {
+                    pending_rebuild_project_buckets.extend(
+                        scan.task_spans
+                            .iter()
+                            .map(|span| span.project_bucket.clone()),
+                    );
+                    pending_rebuild_span_ids
+                        .extend(scan.task_spans.iter().map(|span| span.span_id.0.clone()));
+                }
+                if !affected_project_buckets.is_empty() {
+                    pending_rebuild_project_buckets.extend(affected_project_buckets);
+                }
             }
             let cache_entries_to_record = if replace_source_records || command.no_cache {
                 &file_cache_entries
             } else {
                 &pending_file_entries
             };
-            store.record_scan_file_entries(&source.source_id, cache_entries_to_record)?;
+            store.record_scan_file_entries_with_tasks_collected(
+                &source.source_id,
+                cache_entries_to_record,
+                command.include_tasks,
+            )?;
             let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
             store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
         }
     }
 
-    if !command.preview
+    if command.include_tasks
+        && !command.preview
         && !pending_rebuild_project_buckets.is_empty()
         && (!pending_rebuild_span_ids.is_empty() || !pending_deleted_task_spans.is_empty())
     {
@@ -6583,9 +6608,16 @@ fn select_scan_file_reconciliation(
     file_cache_entries: &[ScanFileStateEntry],
     replace: bool,
     no_cache: bool,
+    require_tasks_collected: bool,
 ) -> Result<ScanFileReconciliation> {
-    let pending_entries =
-        select_scan_file_entries(store, source_id, file_cache_entries, replace, no_cache)?;
+    let pending_entries = select_scan_file_entries(
+        store,
+        source_id,
+        file_cache_entries,
+        replace,
+        no_cache,
+        require_tasks_collected,
+    )?;
     let tracked_entries = store.scan_file_entries(source_id)?;
     let current_cache_keys: BTreeSet<_> = file_cache_entries
         .iter()
@@ -6607,11 +6639,16 @@ fn select_scan_file_entries(
     file_cache_entries: &[ScanFileStateEntry],
     replace: bool,
     no_cache: bool,
+    require_tasks_collected: bool,
 ) -> Result<Vec<ScanFileStateEntry>> {
     if replace || no_cache {
         return Ok(file_cache_entries.to_vec());
     }
-    store.pending_scan_file_entries(source_id, file_cache_entries)
+    store.pending_scan_file_entries_with_task_requirement(
+        source_id,
+        file_cache_entries,
+        require_tasks_collected,
+    )
 }
 
 fn should_replace_source_records_for_scan(
@@ -8891,6 +8928,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: false,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -9027,6 +9065,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: false,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -9095,6 +9134,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: false,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -9186,6 +9226,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: false,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -9275,6 +9316,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: false,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -9346,6 +9388,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: false,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -12241,7 +12284,7 @@ mod tests {
             },
         ];
 
-        let initial = select_scan_file_entries(&store, &source_id, &entries, false, false)
+        let initial = select_scan_file_entries(&store, &source_id, &entries, false, false, false)
             .expect("initial selection");
         assert_eq!(initial, entries);
         store
@@ -12249,17 +12292,18 @@ mod tests {
             .expect("record cache state");
 
         let default_selection =
-            select_scan_file_entries(&store, &source_id, &entries, false, false)
+            select_scan_file_entries(&store, &source_id, &entries, false, false, false)
                 .expect("default selection");
         assert!(default_selection.is_empty());
 
         let no_cache_selection =
-            select_scan_file_entries(&store, &source_id, &entries, false, true)
+            select_scan_file_entries(&store, &source_id, &entries, false, true, false)
                 .expect("no-cache selection");
         assert_eq!(no_cache_selection, entries);
 
-        let replace_selection = select_scan_file_entries(&store, &source_id, &entries, true, false)
-            .expect("replace selection");
+        let replace_selection =
+            select_scan_file_entries(&store, &source_id, &entries, true, false, false)
+                .expect("replace selection");
         assert_eq!(replace_selection, entries);
     }
 
@@ -12310,6 +12354,7 @@ mod tests {
                 cache_key: "/tmp/b.jsonl".to_string(),
                 cache_signature: "sig-b-1".to_string(),
             }],
+            false,
             false,
             false,
         )
@@ -12377,6 +12422,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: false,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -12405,6 +12451,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: false,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -12479,6 +12526,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: true,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -12500,6 +12548,229 @@ mod tests {
         assert_eq!(work_items[0].title, "Implement local task collection");
         assert_eq!(work_items[0].span_count, 1);
         assert_eq!(work_items[0].total_tokens, 150);
+    }
+
+    #[test]
+    fn scan_without_include_tasks_does_not_persist_task_tables() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-opt-in"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-opt-in/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 12, 9, 35, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "event-task", 150);
+        let task_span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "task-span-a",
+            "Implement local task collection",
+            &event,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(file_path, "sig-a")],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event],
+                task_spans: vec![task_span],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        assert_eq!(store.event_count().expect("event count"), 1);
+        assert!(store.task_spans().expect("task spans").is_empty());
+        assert!(store.work_items().expect("work items").is_empty());
+    }
+
+    #[test]
+    fn scan_with_include_tasks_backfills_files_cached_without_tasks() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-backfill"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-backfill/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 12, 9, 38, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "event-task", 150);
+        let task_span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "task-span-a",
+            "Backfill local tasks",
+            &event,
+        );
+        let candidate = test_scan_candidate(file_path, "sig-a");
+        let initial_adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![candidate.clone()],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event.clone()],
+                task_spans: vec![task_span.clone()],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(initial_adapter)],
+        )
+        .expect("initial scan");
+        assert!(store.task_spans().expect("initial task spans").is_empty());
+
+        let scan_calls = Arc::new(Mutex::new(0u64));
+        let backfill_adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![candidate],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event],
+                task_spans: vec![task_span],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: Some(scan_calls.clone()),
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: true,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(backfill_adapter)],
+        )
+        .expect("task backfill scan");
+
+        assert_eq!(*scan_calls.lock().expect("scan calls"), 1);
+        let spans = store.task_spans().expect("task spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].title, "Backfill local tasks");
+        let work_items = store.work_items().expect("work items");
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(work_items[0].title, "Backfill local tasks");
+    }
+
+    #[test]
+    fn scan_without_include_tasks_preserves_existing_task_tables() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-task-preserve"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-task-preserve/session.jsonl";
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 12, 9, 40, 0)
+            .single()
+            .expect("started_at");
+        let event = test_scan_event(&source, file_path, started_at, "event-task", 150);
+        let task_span = test_task_span(
+            &source,
+            file_path,
+            started_at,
+            "task-span-a",
+            "Keep local tasks",
+            &event,
+        );
+        store
+            .upsert_task_spans(std::slice::from_ref(&task_span))
+            .expect("insert task span");
+        store
+            .rebuild_all_task_work_items()
+            .expect("initial rebuild");
+
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(file_path, "sig-b")],
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        let spans = store.task_spans().expect("task spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].title, "Keep local tasks");
+
+        let work_items = store.work_items().expect("work items");
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(work_items[0].title, "Keep local tasks");
     }
 
     #[test]
@@ -12574,6 +12845,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: true,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -12636,6 +12908,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: true,
                 preview: true,
                 no_cache: false,
                 replace: false,
@@ -12944,6 +13217,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: true,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -12971,6 +13245,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: true,
                 preview: false,
                 no_cache: false,
                 replace: false,
@@ -14389,6 +14664,7 @@ mod tests {
         scan_with_adapters(
             ScanCommand {
                 provider: None,
+                include_tasks: false,
                 preview: false,
                 no_cache: false,
                 replace: false,

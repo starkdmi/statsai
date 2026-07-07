@@ -402,6 +402,7 @@ mod watch {
                 }
                 let options = ScanOptions {
                     device_id: device_id.to_string(),
+                    collect_tasks: false,
                     selected_cache_keys: Some(
                         pending_file_entries
                             .iter()

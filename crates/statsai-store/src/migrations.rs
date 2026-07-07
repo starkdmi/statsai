@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_migrations_table(conn)?;
@@ -100,6 +100,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         5 => apply_migration_005(conn),
         6 => apply_migration_006(conn),
         7 => apply_migration_007(conn),
+        8 => apply_migration_008(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -289,6 +290,15 @@ fn apply_migration_007(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn apply_migration_008(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "scan_file_state",
+        "tasks_collected",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+}
+
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -434,6 +444,7 @@ mod tests {
         );
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
         assert!(table_exists(&conn, "task_bucket_sync_state"));
+        assert!(column_exists(&conn, "scan_file_state", "tasks_collected"));
     }
 
     #[test]
@@ -448,6 +459,7 @@ mod tests {
         );
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
         assert!(table_exists(&conn, "task_bucket_sync_state"));
+        assert!(column_exists(&conn, "scan_file_state", "tasks_collected"));
     }
 
     #[test]
@@ -489,6 +501,7 @@ mod tests {
         assert!(table_exists(&conn, "task_work_item_members"));
         assert!(table_exists(&conn, "task_verifications"));
         assert!(table_exists(&conn, "task_bucket_sync_state"));
+        assert!(column_exists(&conn, "scan_file_state", "tasks_collected"));
         assert!(table_exists(&conn, "tasks"));
         assert!(table_exists(&conn, "task_rollups"));
         assert!(table_exists(&conn, "task_evidence"));
@@ -502,5 +515,19 @@ mod tests {
         )
         .map(|count| count > 0)
         .expect("read sqlite_master")
+    }
+
+    fn column_exists(conn: &Connection, table_name: &str, column_name: &str) -> bool {
+        let sql = format!("PRAGMA table_info({table_name})");
+        let mut statement = conn.prepare(&sql).expect("prepare table_info");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info");
+        for column in columns {
+            if column.expect("read column") == column_name {
+                return true;
+            }
+        }
+        false
     }
 }

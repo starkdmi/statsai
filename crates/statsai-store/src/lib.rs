@@ -245,17 +245,32 @@ impl Store {
         source_id: &SourceId,
         entries: &[ScanFileStateEntry],
     ) -> Result<Vec<ScanFileStateEntry>> {
+        self.pending_scan_file_entries_with_task_requirement(source_id, entries, false)
+    }
+
+    pub fn pending_scan_file_entries_with_task_requirement(
+        &self,
+        source_id: &SourceId,
+        entries: &[ScanFileStateEntry],
+        require_tasks_collected: bool,
+    ) -> Result<Vec<ScanFileStateEntry>> {
         let mut pending = Vec::with_capacity(entries.len());
         let mut stmt = self.conn.prepare(
-            "SELECT cache_signature FROM scan_file_state WHERE source_id = ?1 AND cache_key = ?2",
+            "SELECT cache_signature, tasks_collected FROM scan_file_state WHERE source_id = ?1 AND cache_key = ?2",
         )?;
         for entry in entries {
             let existing = stmt
                 .query_row(params![&source_id.0, &entry.cache_key], |row| {
-                    row.get::<_, String>(0)
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
                 })
                 .optional()?;
-            if existing.as_deref() != Some(entry.cache_signature.as_str()) {
+            let is_current = existing
+                .as_ref()
+                .is_some_and(|(signature, tasks_collected)| {
+                    signature == &entry.cache_signature
+                        && (!require_tasks_collected || *tasks_collected)
+                });
+            if !is_current {
                 pending.push(entry.clone());
             }
         }
@@ -267,19 +282,35 @@ impl Store {
         source_id: &SourceId,
         entries: &[ScanFileStateEntry],
     ) -> Result<()> {
+        self.record_scan_file_entries_with_tasks_collected(source_id, entries, false)
+    }
+
+    pub fn record_scan_file_entries_with_tasks_collected(
+        &self,
+        source_id: &SourceId,
+        entries: &[ScanFileStateEntry],
+        tasks_collected: bool,
+    ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
         let synced_at = Utc::now().to_rfc3339();
+        let tasks_collected = i64::from(tasks_collected);
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             let mut stmt = self.conn.prepare(
                 r#"
-                INSERT INTO scan_file_state (source_id, cache_key, cache_signature, synced_at)
-                VALUES (?1, ?2, ?3, ?4)
+                INSERT INTO scan_file_state
+                  (source_id, cache_key, cache_signature, synced_at, tasks_collected)
+                VALUES (?1, ?2, ?3, ?4, ?5)
                 ON CONFLICT(source_id, cache_key) DO UPDATE SET
                   cache_signature = excluded.cache_signature,
-                  synced_at = excluded.synced_at
+                  synced_at = excluded.synced_at,
+                  tasks_collected = CASE
+                    WHEN scan_file_state.cache_signature = excluded.cache_signature
+                    THEN MAX(scan_file_state.tasks_collected, excluded.tasks_collected)
+                    ELSE excluded.tasks_collected
+                  END
                 "#,
             )?;
             for entry in entries {
@@ -287,7 +318,8 @@ impl Store {
                     &source_id.0,
                     &entry.cache_key,
                     &entry.cache_signature,
-                    &synced_at
+                    &synced_at,
+                    tasks_collected,
                 ])?;
             }
             Ok(())

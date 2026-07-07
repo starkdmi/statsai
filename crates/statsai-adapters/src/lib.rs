@@ -52,6 +52,7 @@ enum EventDeduplication {
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub device_id: String,
+    pub collect_tasks: bool,
     pub selected_cache_keys: Option<HashSet<String>>,
 }
 
@@ -60,6 +61,10 @@ impl ScanOptions {
         self.selected_cache_keys
             .as_ref()
             .is_none_or(|selected| selected.contains(cache_key))
+    }
+
+    fn should_collect_tasks(&self) -> bool {
+        self.collect_tasks
     }
 }
 
@@ -469,97 +474,103 @@ fn scan_claude_source(
             scan.diagnostics.files_skipped_unchanged += 1;
         }
     }
-    let event_rollups = session_event_rollups(&scan.events);
-    for entry in load_claude_task_entries(&projects) {
-        let event_rollup = event_rollups.get(&hash_text(&entry.session_id));
-        if !should_emit_claude_task_entry(options, &scanned_event_cache_keys, &entry, event_rollup)
-        {
-            continue;
-        }
-        let title = entry
-            .title
-            .clone()
-            .unwrap_or_else(|| "Claude session".to_string());
-        let issue_keys = extract_issue_keys(&[
-            title.as_str(),
-            entry.summary_preview.as_deref().unwrap_or(""),
-            entry
-                .project
-                .as_ref()
-                .and_then(|project| project.branch_label.as_deref())
-                .unwrap_or(""),
-        ]);
-        scan.task_spans.push(TaskSpan {
-            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
-            span_id: task_span_id(
-                adapter.provider(),
-                &source.source_id,
-                &format!(
-                    "claude_task_span.v1:{}:{}",
-                    entry.session_id,
-                    entry.ended_at.to_rfc3339()
-                ),
-            ),
-            provider: adapter.provider().to_string(),
-            source_id: source.source_id.clone(),
-            span_kind: "claude_session".to_string(),
-            source_record_id: Some(entry.session_id.clone()),
-            source_file_path_hash: entry
-                .source_path
-                .as_deref()
-                .map(claude_task_entry_source_file_path_hash),
-            summary_id: None,
-            session_id: Some(entry.session_id.clone()),
-            thread_id: None,
-            title: title.clone(),
-            normalized_title: normalize_task_title(&title),
-            title_source: Some(entry.title_source.to_string()),
-            summary_preview: entry.summary_preview.clone(),
-            todo_excerpt: None,
-            issue_keys,
-            branch_family: branch_family(
+    if options.should_collect_tasks() {
+        let event_rollups = session_event_rollups(&scan.events);
+        for entry in load_claude_task_entries(&projects) {
+            let event_rollup = event_rollups.get(&hash_text(&entry.session_id));
+            if !should_emit_claude_task_entry(
+                options,
+                &scanned_event_cache_keys,
+                &entry,
+                event_rollup,
+            ) {
+                continue;
+            }
+            let title = entry
+                .title
+                .clone()
+                .unwrap_or_else(|| "Claude session".to_string());
+            let issue_keys = extract_issue_keys(&[
+                title.as_str(),
+                entry.summary_preview.as_deref().unwrap_or(""),
                 entry
                     .project
                     .as_ref()
-                    .and_then(|project| project.branch_label.as_deref()),
-            ),
-            project_bucket: project_bucket_key(entry.project.as_ref()),
-            project: entry.project.clone(),
-            git: None,
-            usage: event_rollup
-                .map(|rollup| rollup.usage.clone())
-                .unwrap_or_default(),
-            estimated_cost_usd: event_rollup.and_then(|rollup| rollup.estimated_cost_usd),
-            event_count: event_rollup
-                .map(|rollup| rollup.event_ids.len() as u64)
-                .unwrap_or(0),
-            has_usage_evidence: event_rollup.is_some_and(|rollup| !rollup.event_ids.is_empty()),
-            total_messages: 0,
-            user_messages: 0,
-            assistant_messages: 0,
-            developer_messages: 0,
-            linked_event_ids: event_rollup
-                .map(|rollup| rollup.event_ids.clone())
-                .unwrap_or_default(),
-            confidence: if entry.title_source == "summary"
-                && !task_title_is_generic(Some(title.as_str()))
-            {
-                Confidence::High
-            } else if entry.summary_preview.is_some() {
-                Confidence::Medium
-            } else {
-                Confidence::Low
-            },
-            is_meta: task_title_is_generic(Some(title.as_str())),
-            started_at: entry.started_at,
-            ended_at: Some(entry.ended_at),
-            duration_seconds: entry
-                .ended_at
-                .signed_duration_since(entry.started_at)
-                .num_seconds()
-                .try_into()
-                .ok(),
-        });
+                    .and_then(|project| project.branch_label.as_deref())
+                    .unwrap_or(""),
+            ]);
+            scan.task_spans.push(TaskSpan {
+                schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                span_id: task_span_id(
+                    adapter.provider(),
+                    &source.source_id,
+                    &format!(
+                        "claude_task_span.v1:{}:{}",
+                        entry.session_id,
+                        entry.ended_at.to_rfc3339()
+                    ),
+                ),
+                provider: adapter.provider().to_string(),
+                source_id: source.source_id.clone(),
+                span_kind: "claude_session".to_string(),
+                source_record_id: Some(entry.session_id.clone()),
+                source_file_path_hash: entry
+                    .source_path
+                    .as_deref()
+                    .map(claude_task_entry_source_file_path_hash),
+                summary_id: None,
+                session_id: Some(entry.session_id.clone()),
+                thread_id: None,
+                title: title.clone(),
+                normalized_title: normalize_task_title(&title),
+                title_source: Some(entry.title_source.to_string()),
+                summary_preview: entry.summary_preview.clone(),
+                todo_excerpt: None,
+                issue_keys,
+                branch_family: branch_family(
+                    entry
+                        .project
+                        .as_ref()
+                        .and_then(|project| project.branch_label.as_deref()),
+                ),
+                project_bucket: project_bucket_key(entry.project.as_ref()),
+                project: entry.project.clone(),
+                git: None,
+                usage: event_rollup
+                    .map(|rollup| rollup.usage.clone())
+                    .unwrap_or_default(),
+                estimated_cost_usd: event_rollup.and_then(|rollup| rollup.estimated_cost_usd),
+                event_count: event_rollup
+                    .map(|rollup| rollup.event_ids.len() as u64)
+                    .unwrap_or(0),
+                has_usage_evidence: event_rollup.is_some_and(|rollup| !rollup.event_ids.is_empty()),
+                total_messages: 0,
+                user_messages: 0,
+                assistant_messages: 0,
+                developer_messages: 0,
+                linked_event_ids: event_rollup
+                    .map(|rollup| rollup.event_ids.clone())
+                    .unwrap_or_default(),
+                confidence: if entry.title_source == "summary"
+                    && !task_title_is_generic(Some(title.as_str()))
+                {
+                    Confidence::High
+                } else if entry.summary_preview.is_some() {
+                    Confidence::Medium
+                } else {
+                    Confidence::Low
+                },
+                is_meta: task_title_is_generic(Some(title.as_str())),
+                started_at: entry.started_at,
+                ended_at: Some(entry.ended_at),
+                duration_seconds: entry
+                    .ended_at
+                    .signed_duration_since(entry.started_at)
+                    .num_seconds()
+                    .try_into()
+                    .ok(),
+            });
+        }
     }
     scan.diagnostics.accepted_events = scan.events.len() as u64;
     Ok(scan)
@@ -1014,88 +1025,90 @@ fn scan_opencode_source(
             push_deduped(&mut scan, &mut seen, event);
         }
     }
-    let event_rollups = session_event_rollups(&scan.events);
-    for seed in task_seeds {
-        let session_hash = hash_text(&seed.session_id);
-        let event_rollup = event_rollups.get(&session_hash);
-        let title = seed
-            .title
-            .clone()
-            .unwrap_or_else(|| "OpenCode session".to_string());
-        let issue_keys = extract_issue_keys(&[
-            title.as_str(),
-            seed.summary_preview.as_deref().unwrap_or(""),
-            seed.todo_excerpt.as_deref().unwrap_or(""),
-            seed.project
-                .as_ref()
-                .and_then(|project| project.branch_label.as_deref())
-                .unwrap_or(""),
-        ]);
-        scan.task_spans.push(TaskSpan {
-            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
-            span_id: task_span_id(
-                adapter.provider(),
-                &source.source_id,
-                &format!(
-                    "opencode_task_span.v1:{}:{}",
-                    seed.session_id,
-                    seed.ended_at.to_rfc3339()
-                ),
-            ),
-            provider: adapter.provider().to_string(),
-            source_id: source.source_id.clone(),
-            span_kind: "opencode_session".to_string(),
-            source_record_id: Some(seed.session_id.clone()),
-            source_file_path_hash: Some(hash_text(&canonical_display(&db_path))),
-            summary_id: None,
-            session_id: Some(seed.session_id.clone()),
-            thread_id: None,
-            title: title.clone(),
-            normalized_title: normalize_task_title(&title),
-            title_source: Some(seed.title_source.to_string()),
-            summary_preview: seed.summary_preview.clone(),
-            todo_excerpt: seed.todo_excerpt.clone(),
-            issue_keys,
-            branch_family: branch_family(
+    if options.should_collect_tasks() {
+        let event_rollups = session_event_rollups(&scan.events);
+        for seed in task_seeds {
+            let session_hash = hash_text(&seed.session_id);
+            let event_rollup = event_rollups.get(&session_hash);
+            let title = seed
+                .title
+                .clone()
+                .unwrap_or_else(|| "OpenCode session".to_string());
+            let issue_keys = extract_issue_keys(&[
+                title.as_str(),
+                seed.summary_preview.as_deref().unwrap_or(""),
+                seed.todo_excerpt.as_deref().unwrap_or(""),
                 seed.project
                     .as_ref()
-                    .and_then(|project| project.branch_label.as_deref()),
-            ),
-            project_bucket: project_bucket_key(seed.project.as_ref()),
-            project: seed.project.clone(),
-            git: None,
-            usage: event_rollup
-                .map(|rollup| rollup.usage.clone())
-                .filter(|usage| usage.computed_total() > 0)
-                .unwrap_or_else(|| seed.usage.clone()),
-            estimated_cost_usd: event_rollup
-                .and_then(|rollup| rollup.estimated_cost_usd)
-                .or(seed.estimated_cost_usd),
-            event_count: event_rollup
-                .map(|rollup| rollup.event_ids.len() as u64)
-                .unwrap_or(0),
-            has_usage_evidence: event_rollup.is_some_and(|rollup| !rollup.event_ids.is_empty()),
-            total_messages: 0,
-            user_messages: 0,
-            assistant_messages: 0,
-            developer_messages: 0,
-            linked_event_ids: event_rollup
-                .map(|rollup| rollup.event_ids.clone())
-                .unwrap_or_default(),
-            confidence: if seed.title_source == "session_title"
-                && !task_title_is_generic(Some(title.as_str()))
-            {
-                Confidence::High
-            } else if seed.summary_preview.is_some() || seed.todo_excerpt.is_some() {
-                Confidence::Medium
-            } else {
-                Confidence::Low
-            },
-            is_meta: task_title_is_generic(Some(title.as_str())),
-            started_at: seed.started_at,
-            ended_at: Some(seed.ended_at),
-            duration_seconds: seed.duration_seconds,
-        });
+                    .and_then(|project| project.branch_label.as_deref())
+                    .unwrap_or(""),
+            ]);
+            scan.task_spans.push(TaskSpan {
+                schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                span_id: task_span_id(
+                    adapter.provider(),
+                    &source.source_id,
+                    &format!(
+                        "opencode_task_span.v1:{}:{}",
+                        seed.session_id,
+                        seed.ended_at.to_rfc3339()
+                    ),
+                ),
+                provider: adapter.provider().to_string(),
+                source_id: source.source_id.clone(),
+                span_kind: "opencode_session".to_string(),
+                source_record_id: Some(seed.session_id.clone()),
+                source_file_path_hash: Some(hash_text(&canonical_display(&db_path))),
+                summary_id: None,
+                session_id: Some(seed.session_id.clone()),
+                thread_id: None,
+                title: title.clone(),
+                normalized_title: normalize_task_title(&title),
+                title_source: Some(seed.title_source.to_string()),
+                summary_preview: seed.summary_preview.clone(),
+                todo_excerpt: seed.todo_excerpt.clone(),
+                issue_keys,
+                branch_family: branch_family(
+                    seed.project
+                        .as_ref()
+                        .and_then(|project| project.branch_label.as_deref()),
+                ),
+                project_bucket: project_bucket_key(seed.project.as_ref()),
+                project: seed.project.clone(),
+                git: None,
+                usage: event_rollup
+                    .map(|rollup| rollup.usage.clone())
+                    .filter(|usage| usage.computed_total() > 0)
+                    .unwrap_or_else(|| seed.usage.clone()),
+                estimated_cost_usd: event_rollup
+                    .and_then(|rollup| rollup.estimated_cost_usd)
+                    .or(seed.estimated_cost_usd),
+                event_count: event_rollup
+                    .map(|rollup| rollup.event_ids.len() as u64)
+                    .unwrap_or(0),
+                has_usage_evidence: event_rollup.is_some_and(|rollup| !rollup.event_ids.is_empty()),
+                total_messages: 0,
+                user_messages: 0,
+                assistant_messages: 0,
+                developer_messages: 0,
+                linked_event_ids: event_rollup
+                    .map(|rollup| rollup.event_ids.clone())
+                    .unwrap_or_default(),
+                confidence: if seed.title_source == "session_title"
+                    && !task_title_is_generic(Some(title.as_str()))
+                {
+                    Confidence::High
+                } else if seed.summary_preview.is_some() || seed.todo_excerpt.is_some() {
+                    Confidence::Medium
+                } else {
+                    Confidence::Low
+                },
+                is_meta: task_title_is_generic(Some(title.as_str())),
+                started_at: seed.started_at,
+                ended_at: Some(seed.ended_at),
+                duration_seconds: seed.duration_seconds,
+            });
+        }
     }
     scan.diagnostics.files_scanned = 1;
     scan.diagnostics.accepted_events = scan.events.len() as u64;
@@ -2689,18 +2702,110 @@ fn parse_codex_file(
                     dedupe_salt: None,
                 },
             );
-            let event_id = event.event_id.clone();
-            let event_cost = event.cost.estimated_api_equivalent_usd;
+            let task_span = if ctx.options.should_collect_tasks() {
+                let event_id = event.event_id.clone();
+                let event_cost = event.cost.estimated_api_equivalent_usd;
+                let prompt_previews = materialize_codex_task_previews(&turn.prompt_previews);
+                let prompt_preview = choose_best_task_preview(&prompt_previews);
+                let has_prompt_preview = prompt_preview.is_some();
+                let (title, title_source, is_meta) =
+                    codex_task_title(turn.title.as_deref(), prompt_preview.as_deref());
+                let normalized_title = normalize_task_title(&title);
+                let project = record
+                    .project
+                    .clone()
+                    .or(turn.project.clone())
+                    .or_else(|| file_fallback_project.clone());
+                let issue_keys = extract_issue_keys(&[
+                    title.as_str(),
+                    prompt_preview.as_deref().unwrap_or(""),
+                    project
+                        .as_ref()
+                        .and_then(|project| project.branch_label.as_deref())
+                        .unwrap_or(""),
+                ]);
+                let branch_family = branch_family(
+                    project
+                        .as_ref()
+                        .and_then(|project| project.branch_label.as_deref()),
+                );
+                let project_bucket = project_bucket_key(project.as_ref());
+                let usage_snapshot = event.usage.clone();
+                Some(TaskSpan {
+                    schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+                    span_id: task_span_id(
+                        ctx.adapter.provider(),
+                        &ctx.source.source_id,
+                        &format!(
+                            "codex_task_span.v1:{}:{}:{}:{}",
+                            record.session_raw,
+                            turn.started_at.to_rfc3339(),
+                            completed_at.to_rfc3339(),
+                            record.line_number
+                        ),
+                    ),
+                    provider: ctx.adapter.provider().to_string(),
+                    source_id: ctx.source.source_id.clone(),
+                    span_kind: "codex_task".to_string(),
+                    source_record_id: Some(format!(
+                        "codex_task_span.v1:{}:{}",
+                        record.session_raw, record.line_number
+                    )),
+                    source_file_path_hash: Some(hash_text(&canonical_display(path))),
+                    summary_id: None,
+                    session_id: Some(record.session_raw.clone()),
+                    thread_id: record.thread_id.clone().or(turn.thread_id.clone()),
+                    title,
+                    normalized_title,
+                    title_source: Some(title_source.to_string()),
+                    summary_preview: prompt_preview,
+                    todo_excerpt: None,
+                    issue_keys,
+                    branch_family,
+                    project_bucket,
+                    project,
+                    git: None,
+                    usage: usage_snapshot,
+                    estimated_cost_usd: event_cost,
+                    event_count: 1,
+                    has_usage_evidence: true,
+                    total_messages: turn.message_counts.total,
+                    user_messages: turn.message_counts.user,
+                    assistant_messages: turn.message_counts.assistant,
+                    developer_messages: turn.message_counts.developer,
+                    linked_event_ids: vec![event_id],
+                    confidence: if turn.title.is_some() {
+                        Confidence::High
+                    } else if has_prompt_preview {
+                        Confidence::Medium
+                    } else {
+                        Confidence::Low
+                    },
+                    is_meta,
+                    started_at: turn.started_at,
+                    ended_at: Some(completed_at),
+                    duration_seconds: duration_ms.map(|value| value / 1000),
+                })
+            } else {
+                None
+            };
+            push_deduped(ctx.scan, ctx.seen, event);
+            if let Some(task_span) = task_span {
+                ctx.scan.task_spans.push(task_span);
+            }
+        }
+    }
+
+    if ctx.options.should_collect_tasks() {
+        for turn in active_turns {
             let prompt_previews = materialize_codex_task_previews(&turn.prompt_previews);
             let prompt_preview = choose_best_task_preview(&prompt_previews);
-            let has_prompt_preview = prompt_preview.is_some();
             let (title, title_source, is_meta) =
                 codex_task_title(turn.title.as_deref(), prompt_preview.as_deref());
             let normalized_title = normalize_task_title(&title);
-            let project = record
+            let project = turn
                 .project
                 .clone()
-                .or(turn.project.clone())
                 .or_else(|| file_fallback_project.clone());
             let issue_keys = extract_issue_keys(&[
                 title.as_str(),
@@ -2710,148 +2815,65 @@ fn parse_codex_file(
                     .and_then(|project| project.branch_label.as_deref())
                     .unwrap_or(""),
             ]);
-            let branch_family = branch_family(
-                project
-                    .as_ref()
-                    .and_then(|project| project.branch_label.as_deref()),
-            );
-            let project_bucket = project_bucket_key(project.as_ref());
-            let usage_snapshot = event.usage.clone();
-            push_deduped(ctx.scan, ctx.seen, event);
             ctx.scan.task_spans.push(TaskSpan {
                 schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
                 span_id: task_span_id(
                     ctx.adapter.provider(),
                     &ctx.source.source_id,
                     &format!(
-                        "codex_task_span.v1:{}:{}:{}:{}",
-                        record.session_raw,
-                        turn.started_at.to_rfc3339(),
-                        completed_at.to_rfc3339(),
-                        record.line_number
+                        "codex_task_span.v1:{}:{}:open",
+                        turn.session_raw,
+                        turn.started_at.to_rfc3339()
                     ),
                 ),
                 provider: ctx.adapter.provider().to_string(),
                 source_id: ctx.source.source_id.clone(),
                 span_kind: "codex_task".to_string(),
                 source_record_id: Some(format!(
-                    "codex_task_span.v1:{}:{}",
-                    record.session_raw, record.line_number
+                    "codex_task_span.v1:{}:{}:open",
+                    turn.session_raw,
+                    turn.started_at.to_rfc3339()
                 )),
                 source_file_path_hash: Some(hash_text(&canonical_display(path))),
                 summary_id: None,
-                session_id: Some(record.session_raw.clone()),
-                thread_id: record.thread_id.clone().or(turn.thread_id.clone()),
+                session_id: Some(turn.session_raw.clone()),
+                thread_id: turn.thread_id.clone(),
                 title,
                 normalized_title,
                 title_source: Some(title_source.to_string()),
                 summary_preview: prompt_preview,
                 todo_excerpt: None,
                 issue_keys,
-                branch_family,
-                project_bucket,
+                branch_family: branch_family(
+                    project
+                        .as_ref()
+                        .and_then(|project| project.branch_label.as_deref()),
+                ),
+                project_bucket: project_bucket_key(project.as_ref()),
                 project,
                 git: None,
-                usage: usage_snapshot,
-                estimated_cost_usd: event_cost,
-                event_count: 1,
-                has_usage_evidence: true,
+                usage: turn.accumulated_usage.unwrap_or_default(),
+                estimated_cost_usd: None,
+                event_count: 0,
+                has_usage_evidence: false,
                 total_messages: turn.message_counts.total,
                 user_messages: turn.message_counts.user,
                 assistant_messages: turn.message_counts.assistant,
                 developer_messages: turn.message_counts.developer,
-                linked_event_ids: vec![event_id],
+                linked_event_ids: Vec::new(),
                 confidence: if turn.title.is_some() {
-                    Confidence::High
-                } else if has_prompt_preview {
                     Confidence::Medium
-                } else {
+                } else if turn.prompt_previews.is_empty() {
                     Confidence::Low
+                } else {
+                    Confidence::Medium
                 },
                 is_meta,
                 started_at: turn.started_at,
-                ended_at: Some(completed_at),
-                duration_seconds: duration_ms.map(|value| value / 1000),
+                ended_at: None,
+                duration_seconds: None,
             });
         }
-    }
-
-    for turn in active_turns {
-        let prompt_previews = materialize_codex_task_previews(&turn.prompt_previews);
-        let prompt_preview = choose_best_task_preview(&prompt_previews);
-        let (title, title_source, is_meta) =
-            codex_task_title(turn.title.as_deref(), prompt_preview.as_deref());
-        let normalized_title = normalize_task_title(&title);
-        let project = turn
-            .project
-            .clone()
-            .or_else(|| file_fallback_project.clone());
-        let issue_keys = extract_issue_keys(&[
-            title.as_str(),
-            prompt_preview.as_deref().unwrap_or(""),
-            project
-                .as_ref()
-                .and_then(|project| project.branch_label.as_deref())
-                .unwrap_or(""),
-        ]);
-        ctx.scan.task_spans.push(TaskSpan {
-            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
-            span_id: task_span_id(
-                ctx.adapter.provider(),
-                &ctx.source.source_id,
-                &format!(
-                    "codex_task_span.v1:{}:{}:open",
-                    turn.session_raw,
-                    turn.started_at.to_rfc3339()
-                ),
-            ),
-            provider: ctx.adapter.provider().to_string(),
-            source_id: ctx.source.source_id.clone(),
-            span_kind: "codex_task".to_string(),
-            source_record_id: Some(format!(
-                "codex_task_span.v1:{}:{}:open",
-                turn.session_raw,
-                turn.started_at.to_rfc3339()
-            )),
-            source_file_path_hash: Some(hash_text(&canonical_display(path))),
-            summary_id: None,
-            session_id: Some(turn.session_raw.clone()),
-            thread_id: turn.thread_id.clone(),
-            title,
-            normalized_title,
-            title_source: Some(title_source.to_string()),
-            summary_preview: prompt_preview,
-            todo_excerpt: None,
-            issue_keys,
-            branch_family: branch_family(
-                project
-                    .as_ref()
-                    .and_then(|project| project.branch_label.as_deref()),
-            ),
-            project_bucket: project_bucket_key(project.as_ref()),
-            project,
-            git: None,
-            usage: turn.accumulated_usage.unwrap_or_default(),
-            estimated_cost_usd: None,
-            event_count: 0,
-            has_usage_evidence: false,
-            total_messages: turn.message_counts.total,
-            user_messages: turn.message_counts.user,
-            assistant_messages: turn.message_counts.assistant,
-            developer_messages: turn.message_counts.developer,
-            linked_event_ids: Vec::new(),
-            confidence: if turn.title.is_some() {
-                Confidence::Medium
-            } else if turn.prompt_previews.is_empty() {
-                Confidence::Low
-            } else {
-                Confidence::Medium
-            },
-            is_meta,
-            started_at: turn.started_at,
-            ended_at: None,
-            duration_seconds: None,
-        });
     }
 
     for record in records {
@@ -3905,113 +3927,115 @@ fn parse_grok_summary(
         .saturating_add(stats.events_rows)
         .saturating_add(inference_stats.rows);
     scan.diagnostics.candidate_usage_rows += summary.usage.requests.unwrap_or(0);
-    let generated_title = value
-        .get("generated_title")
-        .and_then(Value::as_str)
-        .and_then(|value| summarize_task_text(Some(value), 90));
-    let session_summary = value
-        .get("session_summary")
-        .and_then(Value::as_str)
-        .and_then(|value| summarize_task_text(Some(value), 220));
-    let title = generated_title
-        .clone()
-        .or_else(|| task_title_from_prompt(session_summary.as_deref()))
-        .unwrap_or_else(|| format!("Grok session {session_id}"));
-    let issue_keys = extract_issue_keys(&[
-        title.as_str(),
-        session_summary.as_deref().unwrap_or(""),
-        summary
-            .project
-            .as_ref()
-            .and_then(|project| project.branch_label.as_deref())
-            .unwrap_or(""),
-    ]);
-    scan.task_spans.push(TaskSpan {
-        schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
-        span_id: task_span_id(
-            adapter.provider(),
-            &source.source_id,
-            &format!(
-                "grok_task_span.v1:{session_id}:{}",
-                observed_at.to_rfc3339()
-            ),
-        ),
-        provider: adapter.provider().to_string(),
-        source_id: source.source_id.clone(),
-        span_kind: "grok_session_summary".to_string(),
-        source_record_id: Some(session_id.clone()),
-        source_file_path_hash: Some(hash_text(&canonical_display(summary_path))),
-        summary_id: Some(summary.summary_id.clone()),
-        session_id: Some(session_id.clone()),
-        thread_id: None,
-        title: title.clone(),
-        normalized_title: normalize_task_title(&title),
-        title_source: Some(
-            if generated_title.is_some() {
-                "generated_title"
-            } else if session_summary.is_some() {
-                "session_summary"
-            } else {
-                "default"
-            }
-            .to_string(),
-        ),
-        summary_preview: session_summary.clone(),
-        todo_excerpt: None,
-        issue_keys,
-        branch_family: branch_family(
+    if options.should_collect_tasks() {
+        let generated_title = value
+            .get("generated_title")
+            .and_then(Value::as_str)
+            .and_then(|value| summarize_task_text(Some(value), 90));
+        let session_summary = value
+            .get("session_summary")
+            .and_then(Value::as_str)
+            .and_then(|value| summarize_task_text(Some(value), 220));
+        let title = generated_title
+            .clone()
+            .or_else(|| task_title_from_prompt(session_summary.as_deref()))
+            .unwrap_or_else(|| format!("Grok session {session_id}"));
+        let issue_keys = extract_issue_keys(&[
+            title.as_str(),
+            session_summary.as_deref().unwrap_or(""),
             summary
                 .project
                 .as_ref()
-                .and_then(|project| project.branch_label.as_deref()),
-        ),
-        project_bucket: project_bucket_key(summary.project.as_ref()),
-        project: summary.project.clone(),
-        git: None,
-        usage: summary.usage.clone(),
-        estimated_cost_usd: summary.cost.estimated_api_equivalent_usd,
-        event_count: 0,
-        has_usage_evidence: false,
-        total_messages: summary
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.total_messages)
-            .unwrap_or(0),
-        user_messages: summary
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.user_messages)
-            .unwrap_or(0),
-        assistant_messages: summary
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.assistant_messages)
-            .unwrap_or(0),
-        developer_messages: summary
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.developer_messages)
-            .unwrap_or(0),
-        linked_event_ids: Vec::new(),
-        confidence: if generated_title.is_some() {
-            Confidence::High
-        } else if session_summary.is_some() {
-            Confidence::Medium
-        } else {
-            Confidence::Low
-        },
-        is_meta: task_title_is_generic(Some(title.as_str())),
-        started_at: value
-            .get("created_at")
-            .and_then(timestamp_from_scalar)
-            .unwrap_or(observed_at),
-        ended_at: Some(observed_at),
-        duration_seconds: summary
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.active_seconds)
-            .map(|seconds| seconds as u64),
-    });
+                .and_then(|project| project.branch_label.as_deref())
+                .unwrap_or(""),
+        ]);
+        scan.task_spans.push(TaskSpan {
+            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+            span_id: task_span_id(
+                adapter.provider(),
+                &source.source_id,
+                &format!(
+                    "grok_task_span.v1:{session_id}:{}",
+                    observed_at.to_rfc3339()
+                ),
+            ),
+            provider: adapter.provider().to_string(),
+            source_id: source.source_id.clone(),
+            span_kind: "grok_session_summary".to_string(),
+            source_record_id: Some(session_id.clone()),
+            source_file_path_hash: Some(hash_text(&canonical_display(summary_path))),
+            summary_id: Some(summary.summary_id.clone()),
+            session_id: Some(session_id.clone()),
+            thread_id: None,
+            title: title.clone(),
+            normalized_title: normalize_task_title(&title),
+            title_source: Some(
+                if generated_title.is_some() {
+                    "generated_title"
+                } else if session_summary.is_some() {
+                    "session_summary"
+                } else {
+                    "default"
+                }
+                .to_string(),
+            ),
+            summary_preview: session_summary.clone(),
+            todo_excerpt: None,
+            issue_keys,
+            branch_family: branch_family(
+                summary
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.branch_label.as_deref()),
+            ),
+            project_bucket: project_bucket_key(summary.project.as_ref()),
+            project: summary.project.clone(),
+            git: None,
+            usage: summary.usage.clone(),
+            estimated_cost_usd: summary.cost.estimated_api_equivalent_usd,
+            event_count: 0,
+            has_usage_evidence: false,
+            total_messages: summary
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.total_messages)
+                .unwrap_or(0),
+            user_messages: summary
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.user_messages)
+                .unwrap_or(0),
+            assistant_messages: summary
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.assistant_messages)
+                .unwrap_or(0),
+            developer_messages: summary
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.developer_messages)
+                .unwrap_or(0),
+            linked_event_ids: Vec::new(),
+            confidence: if generated_title.is_some() {
+                Confidence::High
+            } else if session_summary.is_some() {
+                Confidence::Medium
+            } else {
+                Confidence::Low
+            },
+            is_meta: task_title_is_generic(Some(title.as_str())),
+            started_at: value
+                .get("created_at")
+                .and_then(timestamp_from_scalar)
+                .unwrap_or(observed_at),
+            ended_at: Some(observed_at),
+            duration_seconds: summary
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.active_seconds)
+                .map(|seconds| seconds as u64),
+        });
+    }
     scan.summaries.push(summary);
     Ok(())
 }
@@ -5877,6 +5901,15 @@ mod tests {
     fn options() -> ScanOptions {
         ScanOptions {
             device_id: "device".to_string(),
+            collect_tasks: true,
+            selected_cache_keys: None,
+        }
+    }
+
+    fn options_without_tasks() -> ScanOptions {
+        ScanOptions {
+            device_id: "device".to_string(),
+            collect_tasks: false,
             selected_cache_keys: None,
         }
     }
@@ -6774,6 +6807,7 @@ mod tests {
             &source,
             &ScanOptions {
                 device_id: "device".to_string(),
+                collect_tasks: true,
                 selected_cache_keys: Some(selected),
             },
         )
@@ -6832,6 +6866,7 @@ mod tests {
             &source,
             &ScanOptions {
                 device_id: "device".to_string(),
+                collect_tasks: true,
                 selected_cache_keys: Some(selected),
             },
         )
@@ -6902,6 +6937,7 @@ mod tests {
             &source,
             &ScanOptions {
                 device_id: "device".to_string(),
+                collect_tasks: true,
                 selected_cache_keys: Some(selected),
             },
         )
@@ -6962,6 +6998,42 @@ mod tests {
             scan.task_spans[0].source_file_path_hash.as_deref(),
             Some(hash_text(&canonical_display(&session)).as_str())
         );
+    }
+
+    #[test]
+    fn claude_scan_skips_task_entries_when_task_collection_is_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_store = root.join("projects").join("example-workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+
+        let session = project_store.join("session-a.jsonl");
+        std::fs::write(
+            &session,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"sessionId\":\"session-a\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        )
+        .expect("session");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            format!(
+                "{{\"version\":1,\"entries\":[{{\"sessionId\":\"session-a\",\"fullPath\":\"{}\",\"summary\":\"Skip task collection\"}}]}}",
+                session.display()
+            ),
+        )
+        .expect("session index");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options_without_tasks())
+            .expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert!(scan.task_spans.is_empty());
     }
 
     #[test]
@@ -7029,6 +7101,7 @@ mod tests {
             &source,
             &ScanOptions {
                 device_id: "device".to_string(),
+                collect_tasks: true,
                 selected_cache_keys: Some(selected),
             },
         )
