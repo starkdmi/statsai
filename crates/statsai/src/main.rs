@@ -3417,7 +3417,7 @@ fn build_sync_batch(
             .map(|event| sanitize_event_for_sync_with_projects(event, include_projects))
             .collect()
     };
-    let passthrough_summaries: Vec<_> = if payload_mode == SyncPayloadMode::Rollups {
+    let all_passthrough_summaries: Vec<_> = if payload_mode == SyncPayloadMode::Rollups {
         store
             .summaries()?
             .into_iter()
@@ -3428,7 +3428,7 @@ fn build_sync_batch(
         Vec::new()
     };
     let mut summaries: Vec<_> = if payload_mode == SyncPayloadMode::Rollups {
-        store.pending_summaries_for_sync(&command.sink, target, &passthrough_summaries)?
+        Vec::new()
     } else {
         store
             .summaries_after(summary_cursor)?
@@ -3557,6 +3557,11 @@ fn build_sync_batch(
         } else {
             store.pending_summaries_for_sync(&command.sink, target, &all_rollups)?
         };
+        let passthrough_summaries = if full_rollup_sync {
+            all_passthrough_summaries
+        } else {
+            store.pending_summaries_for_sync(&command.sink, target, &all_passthrough_summaries)?
+        };
         eprintln!(
             "{label}: prepared {} local daily summaries for {} sync",
             rollups.len(),
@@ -3566,6 +3571,7 @@ fn build_sync_batch(
                 "incremental"
             }
         );
+        summaries.extend(passthrough_summaries);
         summaries.extend(
             rollups
                 .into_iter()
@@ -3677,6 +3683,7 @@ fn record_sync_batch_success(
         &batch.task_buckets,
     )?;
     store.record_task_verifications_synced(sink, target, &batch.task_verifications)?;
+    snapshot::invalidate_dashboard_cache();
     Ok(())
 }
 
@@ -10490,6 +10497,23 @@ mod tests {
         store.insert_event(&first).expect("first event");
         store.rebuild_sync_rollups().expect("rebuild");
 
+        let mut passthrough = test_summary(
+            "grok_build",
+            &source,
+            started_at + Duration::minutes(30),
+            70,
+            Some(account_id.clone()),
+        );
+        passthrough.summary_id = summary_id("grok_build", &source.source_id, "session-summary");
+        passthrough.source.source_kind = SourceKind::LocalAdapter;
+        passthrough.source.source_type = "build-session.json".to_string();
+        passthrough.metadata.summary_format = "grok_build_session_summary".to_string();
+        passthrough.period_start = Some(started_at);
+        passthrough.period_end = Some(started_at + Duration::minutes(30));
+        store
+            .upsert_summary(&passthrough)
+            .expect("passthrough summary");
+
         let local_command = SyncCommand {
             endpoint: Some("http://127.0.0.1:8787/api/sync/batches".to_string()),
             ..test_sync_command("http")
@@ -10499,7 +10523,12 @@ mod tests {
             build_sync_batch(&local_command, &store, "device", &local_target)
                 .expect("local initial batch");
         assert_eq!(local_mode, SyncPayloadMode::Rollups);
-        assert_eq!(local_batch.summaries.len(), 1);
+        assert_eq!(local_batch.summaries.len(), 2);
+        assert!(local_batch.summaries.iter().any(is_daily_rollup_summary));
+        assert!(local_batch
+            .summaries
+            .iter()
+            .any(|summary| summary.metadata.summary_format == "grok_build_session_summary"));
         record_rollup_sync_success(&store, "http", &local_target, &local_batch)
             .expect("record local sync");
 
@@ -10523,9 +10552,17 @@ mod tests {
         assert_eq!(local_full_mode, SyncPayloadMode::Rollups);
         assert_eq!(
             local_full_batch.summaries.len(),
-            1,
-            "--full should deliberately resend synced rollups"
+            2,
+            "--full should deliberately resend synced rollups and passthrough summaries"
         );
+        assert!(local_full_batch
+            .summaries
+            .iter()
+            .any(is_daily_rollup_summary));
+        assert!(local_full_batch
+            .summaries
+            .iter()
+            .any(|summary| summary.metadata.summary_format == "grok_build_session_summary"));
 
         let local_incremental_command = SyncCommand {
             endpoint: Some("http://127.0.0.1:8787/api/sync/batches".to_string()),
@@ -10569,7 +10606,12 @@ mod tests {
             build_sync_batch(&remote_command, &store, "device", &remote_target)
                 .expect("remote batch");
         assert_eq!(remote_mode, SyncPayloadMode::Rollups);
-        assert_eq!(remote_batch.summaries.len(), 1);
+        assert_eq!(remote_batch.summaries.len(), 2);
+        assert!(remote_batch.summaries.iter().any(is_daily_rollup_summary));
+        assert!(remote_batch
+            .summaries
+            .iter()
+            .any(|summary| summary.metadata.summary_format == "grok_build_session_summary"));
         record_rollup_sync_success(&store, "http", &remote_target, &remote_batch)
             .expect("record remote sync");
         assert!(store

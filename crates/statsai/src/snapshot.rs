@@ -1,16 +1,17 @@
-use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use anyhow::Result;
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use statsai_adapters::{
+    default_adapters, CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, GROK_BUILD_PROVIDER, OPENCODE_PROVIDER,
+};
 use statsai_core::home_dir;
-use statsai_store::Store;
+use statsai_store::{SourceUsageTotals, Store};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::auth;
 use crate::service;
-
-const STALE_SYNC_HOURS: i64 = 12;
-const DASHBOARD_OVERVIEW_CACHE_TTL_SECS: i64 = 300;
 
 #[derive(Debug, Args)]
 pub struct SnapshotCommand {
@@ -29,6 +30,8 @@ pub enum PrimaryAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSnapshot {
     pub logged_in: bool,
+    #[serde(default)]
+    pub first_run: bool,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub sync_failures: u64,
     pub has_synced: bool,
@@ -47,9 +50,41 @@ pub struct AppSnapshot {
     pub backend_api: String,
     pub backend_web: String,
     pub using_local_dev: bool,
+    #[serde(default)]
+    pub background_tracking: SnapshotBackgroundStatus,
+    #[serde(default)]
+    pub sources: Vec<SnapshotSourceStatus>,
+    #[serde(default)]
+    pub last_scan_summary: Option<String>,
+    #[serde(default)]
+    pub help_url: String,
+    #[serde(default)]
+    pub setup_url: String,
     pub tooltip: String,
     pub menu_layout: String,
     pub status_error: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotBackgroundStatus {
+    pub installed: bool,
+    pub running: bool,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSourceStatus {
+    pub provider: String,
+    pub display_name: String,
+    pub configured: bool,
+    pub discovered: bool,
+    pub enabled: bool,
+    pub has_data: bool,
+    pub event_count: u64,
+    pub token_count: u64,
+    pub estimated_cost_cents: Option<i64>,
+    pub label: String,
+    pub status: String,
 }
 
 pub fn run(command: SnapshotCommand, store_path: &Path) -> Result<()> {
@@ -70,55 +105,62 @@ pub fn run(command: SnapshotCommand, store_path: &Path) -> Result<()> {
 
 pub fn collect(store: &Store) -> Result<AppSnapshot> {
     let login = auth::login_snapshot()?;
-    let _background = service::background_service_state()?;
+    let background = service::background_service_state()?;
 
     let http_target = http_sync_target();
     store.reconcile_sync_rollup_sync_hashes_if_needed()?;
+    let configured_sources = store.list_sources()?;
+    let provider_totals = provider_totals_from_store(store, &configured_sources)?;
+    let sources = build_source_statuses(&configured_sources, &provider_totals);
 
     let http_sync = store
         .list_sync_states()?
         .into_iter()
         .find(|state| state.sink == "http" && state.target == http_target);
 
-    let has_synced = http_sync.is_some();
+    let has_synced = has_successful_sync(http_sync.as_ref());
     let last_sync_at = http_sync.as_ref().map(|state| state.last_success_at);
     let sync_failures = http_sync
         .as_ref()
         .map(|state| state.failure_count)
         .unwrap_or(0);
 
-    let rollup_view =
-        store.snapshot_rollup_view("http", &http_target, calendar_cutoff(7), calendar_cutoff(1))?;
-    let has_pending_rollups = rollup_view.pending_count > 0;
-    let pending_days = pending_upload_days(last_sync_at, has_pending_rollups);
-    let mut today = period_stats_from_rollup(rollup_view.today);
+    let pending_sync = store.pending_http_sync_summary_counts(&http_target)?;
+    let has_pending_upload = pending_sync.total > 0;
+    let pending_days = pending_upload_days(last_sync_at, has_pending_upload, pending_sync.days);
+    let local_day_start = local_period_start(1);
+    let mut today =
+        period_stats_from_rollup(store.usage_event_period_stats_since(local_day_start)?);
+    today.add(period_stats_from_rollup(
+        store.reportable_summary_period_stats_since(local_day_start)?,
+    ));
     let pending_upload = login.logged_in
-        && pending_upload_needed(has_pending_rollups, last_sync_at, today.requests > 0);
+        && pending_upload_needed(has_pending_upload, last_sync_at, today.requests > 0);
 
-    let mut week = period_stats_from_rollup(rollup_view.week);
-    if login.logged_in {
-        match fetch_dashboard_period_stats_cached() {
-            Ok((server_week, server_today)) => {
-                week = server_week;
-                today = server_today;
-            }
-            Err(error) => {
-                eprintln!("snapshot: dashboard stats unavailable, using local rollups ({error:#})");
-            }
-        }
-    }
+    let local_week_start = local_period_start(7);
+    let mut week =
+        period_stats_from_rollup(store.usage_event_period_stats_since(local_week_start)?);
+    week.add(period_stats_from_rollup(
+        store.reportable_summary_period_stats_since(local_week_start)?,
+    ));
 
     let backend_api = auth::cloudflare_api_url();
     let backend_web = auth::cloudflare_web_url();
     let using_local_dev = auth::is_local_backend();
+    let help_url = help_url(&backend_web);
+    let setup_url = setup_url(&backend_web);
 
     let tokens_today = today.tokens;
     let tokens_week = week.tokens;
     let sessions_week = week.requests;
     let cost_week_cents = week.cost_cents;
+    let has_local_usage = week.requests > 0 || sources.iter().any(|source| source.has_data);
+    let first_run = is_first_run(login.logged_in, has_synced, has_local_usage);
+    let last_scan_summary = Some(format_scan_summary(&week, &today));
 
     let ui = build_ui(SnapshotUiInput {
         logged_in: login.logged_in,
+        first_run,
         has_synced,
         sync_failures,
         pending_upload,
@@ -130,12 +172,13 @@ pub fn collect(store: &Store) -> Result<AppSnapshot> {
 
     Ok(AppSnapshot {
         logged_in: login.logged_in,
+        first_run,
         last_sync_at,
         sync_failures,
         has_synced,
         pending_upload,
         pending_days,
-        unsynced_events: rollup_view.pending_count,
+        unsynced_events: pending_sync.total,
         tokens_today,
         tokens_week,
         sessions_week,
@@ -148,6 +191,11 @@ pub fn collect(store: &Store) -> Result<AppSnapshot> {
         backend_api,
         backend_web,
         using_local_dev,
+        background_tracking: background_status(background),
+        sources,
+        last_scan_summary,
+        help_url,
+        setup_url,
         tooltip: ui.tooltip,
         menu_layout: ui.menu_layout,
         status_error: false,
@@ -161,8 +209,22 @@ struct PeriodStats {
     cost_cents: Option<i64>,
 }
 
+impl PeriodStats {
+    fn add(&mut self, other: PeriodStats) {
+        self.tokens = self.tokens.saturating_add(other.tokens);
+        self.requests = self.requests.saturating_add(other.requests);
+        self.cost_cents = match (self.cost_cents, other.cost_cents) {
+            (Some(left), Some(right)) => Some(left.saturating_add(right)),
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (None, None) => None,
+        };
+    }
+}
+
 struct SnapshotUiInput {
     logged_in: bool,
+    first_run: bool,
     has_synced: bool,
     sync_failures: u64,
     pending_upload: bool,
@@ -170,6 +232,245 @@ struct SnapshotUiInput {
     week: PeriodStats,
     today: PeriodStats,
     last_sync_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Default)]
+struct SourceStatusDraft {
+    display_name: &'static str,
+    configured: bool,
+    discovered: bool,
+    enabled: bool,
+    event_count: u64,
+    token_count: u64,
+    estimated_cost_cents: Option<i64>,
+}
+
+fn background_status(background: service::BackgroundServiceState) -> SnapshotBackgroundStatus {
+    let label = if background.launch_agent_loaded {
+        "Tracking automatically".to_string()
+    } else if background.plist_installed {
+        "Tracking installed, starting up".to_string()
+    } else {
+        "Tracking setup needed".to_string()
+    };
+    SnapshotBackgroundStatus {
+        installed: background.plist_installed,
+        running: background.launch_agent_loaded,
+        label,
+    }
+}
+
+fn build_source_statuses(
+    configured_sources: &[statsai_core::SourceLocation],
+    provider_totals: &HashMap<String, SourceUsageTotals>,
+) -> Vec<SnapshotSourceStatus> {
+    let discovered_sources = default_adapters()
+        .into_iter()
+        .map(|adapter| (adapter.provider().to_string(), adapter.discover()))
+        .collect::<Vec<_>>();
+    build_source_statuses_with_discovered(configured_sources, provider_totals, discovered_sources)
+}
+
+fn build_source_statuses_with_discovered(
+    configured_sources: &[statsai_core::SourceLocation],
+    provider_totals: &HashMap<String, SourceUsageTotals>,
+    discovered_sources: Vec<(String, Vec<statsai_core::SourceLocation>)>,
+) -> Vec<SnapshotSourceStatus> {
+    let mut drafts = supported_provider_drafts();
+    let mut configured_source_ids = BTreeSet::new();
+
+    for source in configured_sources {
+        configured_source_ids.insert(source.source_id.0.clone());
+        let draft = drafts
+            .entry(source.provider.clone())
+            .or_insert_with(|| SourceStatusDraft {
+                display_name: provider_display_name(&source.provider),
+                ..SourceStatusDraft::default()
+            });
+        draft.configured = true;
+        draft.enabled |= source.enabled;
+    }
+
+    for (provider, sources) in discovered_sources {
+        if sources.is_empty() {
+            continue;
+        }
+        let draft = drafts
+            .entry(provider.clone())
+            .or_insert_with(|| SourceStatusDraft {
+                display_name: provider_display_name(&provider),
+                ..SourceStatusDraft::default()
+            });
+        draft.discovered = true;
+        for source in sources {
+            if !configured_source_ids.contains(&source.source_id.0) {
+                draft.enabled = true;
+            }
+        }
+    }
+
+    for (provider, totals) in provider_totals {
+        let draft = drafts
+            .entry(provider.clone())
+            .or_insert_with(|| SourceStatusDraft {
+                display_name: provider_display_name(provider),
+                ..SourceStatusDraft::default()
+            });
+        add_source_totals(draft, Some(totals));
+    }
+
+    let configured_providers = configured_sources
+        .iter()
+        .map(|source| source.provider.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut statuses = Vec::new();
+    for provider in provider_order() {
+        if let Some(draft) = drafts.remove(provider) {
+            let status = source_status(provider, draft);
+            if source_status_should_render(&status) {
+                statuses.push(status);
+            }
+        }
+    }
+    for (provider, draft) in drafts {
+        if configured_providers.contains(&provider) {
+            let status = source_status(&provider, draft);
+            if source_status_should_render(&status) {
+                statuses.push(status);
+            }
+        }
+    }
+    statuses
+}
+
+fn source_status_should_render(status: &SnapshotSourceStatus) -> bool {
+    status.has_data || status.configured || status.status == "disabled"
+}
+
+fn supported_provider_drafts() -> BTreeMap<String, SourceStatusDraft> {
+    provider_order()
+        .into_iter()
+        .map(|provider| {
+            (
+                provider.to_string(),
+                SourceStatusDraft {
+                    display_name: provider_display_name(provider),
+                    ..SourceStatusDraft::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn provider_order() -> Vec<&'static str> {
+    vec![
+        CODEX_PROVIDER,
+        CLAUDE_CODE_PROVIDER,
+        OPENCODE_PROVIDER,
+        GROK_BUILD_PROVIDER,
+    ]
+}
+
+fn source_status(provider: &str, draft: SourceStatusDraft) -> SnapshotSourceStatus {
+    let has_data = draft.event_count > 0 || draft.token_count > 0;
+    let status = if (draft.configured || draft.discovered) && !draft.enabled {
+        "disabled"
+    } else if has_data {
+        "tracking"
+    } else if draft.configured || draft.discovered {
+        "found"
+    } else {
+        "not_found"
+    };
+    let label = match status {
+        "disabled" => format!("{} · disabled", draft.display_name),
+        "tracking" => format!(
+            "{} · {} tokens · {}",
+            draft.display_name,
+            format_tokens(draft.token_count),
+            format_source_cost(draft.estimated_cost_cents)
+        ),
+        "found" => format!("{} · 0 tokens · $0", draft.display_name),
+        _ => draft.display_name.to_string(),
+    };
+
+    SnapshotSourceStatus {
+        provider: provider.to_string(),
+        display_name: draft.display_name.to_string(),
+        configured: draft.configured,
+        discovered: draft.discovered,
+        enabled: draft.enabled,
+        has_data,
+        event_count: draft.event_count,
+        token_count: draft.token_count,
+        estimated_cost_cents: draft.estimated_cost_cents,
+        label,
+        status: status.to_string(),
+    }
+}
+
+fn add_source_totals(draft: &mut SourceStatusDraft, totals: Option<&SourceUsageTotals>) {
+    let Some(totals) = totals else {
+        return;
+    };
+    draft.event_count = draft.event_count.saturating_add(totals.events);
+    draft.token_count = draft.token_count.saturating_add(totals.tokens);
+    draft.estimated_cost_cents = match (draft.estimated_cost_cents, totals.estimated_cost_cents) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+}
+
+fn provider_totals_from_store(
+    store: &Store,
+    _configured_sources: &[statsai_core::SourceLocation],
+) -> Result<HashMap<String, SourceUsageTotals>> {
+    store.menu_usage_totals_by_provider()
+}
+
+fn provider_display_name(provider: &str) -> &'static str {
+    match provider {
+        CODEX_PROVIDER => "Codex",
+        CLAUDE_CODE_PROVIDER => "Claude Code",
+        OPENCODE_PROVIDER => "OpenCode",
+        GROK_BUILD_PROVIDER => "Grok Build",
+        _ => "Other",
+    }
+}
+
+fn format_count(count: u64) -> String {
+    if count >= 1_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
+
+fn format_scan_summary(week: &PeriodStats, today: &PeriodStats) -> String {
+    if week.requests == 0 {
+        "Last scan found no requests yet".to_string()
+    } else if today.requests > 0 {
+        format!(
+            "Last scan found {} requests today",
+            format_count(today.requests)
+        )
+    } else {
+        format!(
+            "Last scan found {} requests in the last 7 days",
+            format_count(week.requests)
+        )
+    }
+}
+
+fn help_url(web_base: &str) -> String {
+    format!("{}/help/setup", web_base.trim_end_matches('/'))
+}
+
+fn setup_url(web_base: &str) -> String {
+    format!("{}/dashboard/", web_base.trim_end_matches('/'))
 }
 
 struct UiCopy {
@@ -191,25 +492,31 @@ fn http_sync_target() -> String {
 
 fn pending_upload_needed(
     has_pending_rollups: bool,
-    last_sync_at: Option<DateTime<Utc>>,
-    today_has_activity: bool,
+    _last_sync_at: Option<DateTime<Utc>>,
+    _today_has_activity: bool,
 ) -> bool {
-    if has_pending_rollups {
-        return true;
-    }
-    let Some(last_sync_at) = last_sync_at else {
-        return today_has_activity;
-    };
-    let stale = Utc::now().signed_duration_since(last_sync_at).num_hours() >= STALE_SYNC_HOURS;
-    stale && today_has_activity
+    has_pending_rollups
 }
 
-fn pending_upload_days(last_sync_at: Option<DateTime<Utc>>, has_pending_rollups: bool) -> u64 {
-    if !has_pending_rollups {
+fn has_successful_sync(sync: Option<&statsai_store::SyncState>) -> bool {
+    sync.map(|state| !state.last_batch_id.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn is_first_run(logged_in: bool, has_synced: bool, has_local_usage: bool) -> bool {
+    !logged_in && !has_synced && !has_local_usage
+}
+
+fn pending_upload_days(
+    last_sync_at: Option<DateTime<Utc>>,
+    has_pending_upload: bool,
+    pending_sync_days: u64,
+) -> u64 {
+    if !has_pending_upload {
         return 0;
     }
     let Some(last_sync_at) = last_sync_at else {
-        return 1;
+        return pending_sync_days.max(1);
     };
     let hours = Utc::now()
         .signed_duration_since(last_sync_at)
@@ -218,7 +525,7 @@ fn pending_upload_days(last_sync_at: Option<DateTime<Utc>>, has_pending_rollups:
     if hours < 24 {
         return 0;
     }
-    ((hours + 23) / 24) as u64
+    pending_sync_days.max(((hours + 23) / 24) as u64)
 }
 
 fn period_stats_from_rollup(usage: statsai_store::RollupPeriodStats) -> PeriodStats {
@@ -229,43 +536,17 @@ fn period_stats_from_rollup(usage: statsai_store::RollupPeriodStats) -> PeriodSt
     }
 }
 
-fn calendar_cutoff(days: u64) -> chrono::NaiveDate {
-    let today = Utc::now().date_naive();
-    today - Duration::days(days.saturating_sub(1) as i64)
-}
-
-#[derive(Debug, Deserialize)]
-struct DashboardOverviewTotals {
-    #[serde(rename = "totalTokens", default)]
-    total_tokens: u64,
-    #[serde(default)]
-    requests: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct DashboardOverviewDay {
-    date: String,
-    #[serde(rename = "totalTokens", default)]
-    total_tokens: u64,
-    #[serde(default)]
-    requests: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct DashboardOverviewResponse {
-    totals: DashboardOverviewTotals,
-    #[serde(rename = "daySeries", default)]
-    day_series: Vec<DashboardOverviewDay>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DashboardOverviewCache {
-    api_base_url: String,
-    fetched_at: DateTime<Utc>,
-    week_tokens: u64,
-    week_requests: u64,
-    today_tokens: u64,
-    today_requests: u64,
+fn local_period_start(days: u64) -> DateTime<Utc> {
+    let now = Local::now();
+    let start_day = now.date_naive() - Duration::days(days.saturating_sub(1) as i64);
+    let Some(midnight) = start_day.and_hms_opt(0, 0, 0) else {
+        return now.with_timezone(&Utc);
+    };
+    Local
+        .from_local_datetime(&midnight)
+        .earliest()
+        .unwrap_or(now)
+        .with_timezone(&Utc)
 }
 
 pub fn invalidate_dashboard_cache() {
@@ -279,124 +560,10 @@ fn dashboard_cache_path() -> PathBuf {
         .join("dashboard-overview-cache.json")
 }
 
-fn load_dashboard_cache(
-    api_base_url: &str,
-    now: DateTime<Utc>,
-) -> Option<(PeriodStats, PeriodStats)> {
-    load_dashboard_cache_from_path(&dashboard_cache_path(), api_base_url, now)
-}
-
-fn load_dashboard_cache_from_path(
-    path: &Path,
-    api_base_url: &str,
-    now: DateTime<Utc>,
-) -> Option<(PeriodStats, PeriodStats)> {
-    let file = std::fs::File::open(path).ok()?;
-    let cache: DashboardOverviewCache = serde_json::from_reader(file).ok()?;
-    if cache.api_base_url != api_base_url {
-        return None;
-    }
-    if now.signed_duration_since(cache.fetched_at).num_seconds()
-        >= DASHBOARD_OVERVIEW_CACHE_TTL_SECS
-    {
-        return None;
-    }
-    Some((
-        PeriodStats {
-            tokens: cache.week_tokens,
-            requests: cache.week_requests,
-            cost_cents: None,
-        },
-        PeriodStats {
-            tokens: cache.today_tokens,
-            requests: cache.today_requests,
-            cost_cents: None,
-        },
-    ))
-}
-
-fn save_dashboard_cache(
-    api_base_url: &str,
-    fetched_at: DateTime<Utc>,
-    week: &PeriodStats,
-    today: &PeriodStats,
-) -> Result<()> {
-    let path = dashboard_cache_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let cache = DashboardOverviewCache {
-        api_base_url: api_base_url.to_string(),
-        fetched_at,
-        week_tokens: week.tokens,
-        week_requests: week.requests,
-        today_tokens: today.tokens,
-        today_requests: today.requests,
-    };
-    let file = std::fs::File::create(&path)?;
-    serde_json::to_writer_pretty(file, &cache)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
-}
-
-fn fetch_dashboard_period_stats_cached() -> Result<(PeriodStats, PeriodStats)> {
-    let api = auth::cloudflare_api_url();
-    let now = Utc::now();
-    if let Some(cached) = load_dashboard_cache(&api, now) {
-        return Ok(cached);
-    }
-    let (week, today) = fetch_dashboard_period_stats()?;
-    let _ = save_dashboard_cache(&api, now, &week, &today);
-    Ok((week, today))
-}
-
-fn fetch_dashboard_period_stats() -> Result<(PeriodStats, PeriodStats)> {
-    let token = auth::get_or_refresh_token()?
-        .filter(|value| !value.trim().is_empty())
-        .context("dashboard stats require login")?;
-    let api = auth::cloudflare_api_url();
-    let url = format!(
-        "{}/api/dashboard/overview?range=7d&account=all",
-        api.trim_end_matches('/')
-    );
-    let response = ureq::get(&url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .call()
-        .with_context(|| format!("fetch dashboard overview from {url}"))?;
-    let overview: DashboardOverviewResponse =
-        response.into_json().context("decode dashboard overview")?;
-    let today_key = Utc::now().format("%Y-%m-%d").to_string();
-    let today = overview
-        .day_series
-        .iter()
-        .find(|day| day.date == today_key)
-        .map(|day| PeriodStats {
-            tokens: day.total_tokens,
-            requests: day.requests,
-            cost_cents: None,
-        })
-        .unwrap_or(PeriodStats {
-            tokens: 0,
-            requests: 0,
-            cost_cents: None,
-        });
-    Ok((
-        PeriodStats {
-            tokens: overview.totals.total_tokens,
-            requests: overview.totals.requests,
-            cost_cents: None,
-        },
-        today,
-    ))
-}
-
 fn build_ui(input: SnapshotUiInput) -> UiCopy {
     let SnapshotUiInput {
         logged_in,
+        first_run,
         has_synced,
         sync_failures,
         pending_upload,
@@ -410,8 +577,13 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
     let menu_stat_2 = format_today_line(&today);
 
     if !logged_in {
+        let menu_summary = if first_run {
+            "StatsAI is tracking locally".to_string()
+        } else {
+            "Your usage is tracked locally".to_string()
+        };
         return UiCopy {
-            menu_summary: "Your usage is tracked locally".to_string(),
+            menu_summary,
             menu_stat_1,
             menu_stat_2,
             menu_stat_3: "Dashboard · not connected".to_string(),
@@ -436,7 +608,7 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
     if week.requests == 0 {
         return UiCopy {
             menu_summary: "No usage found yet".to_string(),
-            menu_stat_1: "This week · no requests yet".to_string(),
+            menu_stat_1: "Last 7 days · no requests yet".to_string(),
             menu_stat_2: "Today · no requests yet".to_string(),
             menu_stat_3: dashboard_line_synced(last_sync_at, has_synced, false),
             primary_action: PrimaryAction::None,
@@ -447,11 +619,11 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
 
     if pending_upload {
         let menu_summary = if pending_days > 1 {
-            format!("Not uploaded in {pending_days} days")
+            format!("Dashboard sync {pending_days} days behind")
         } else if pending_days == 1 {
-            "Not uploaded since yesterday".to_string()
+            "Dashboard sync behind since yesterday".to_string()
         } else {
-            "New usage to upload".to_string()
+            "Dashboard sync available".to_string()
         };
         return UiCopy {
             menu_summary,
@@ -477,7 +649,7 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
 
 fn format_week_line(week: &PeriodStats) -> String {
     let mut line = format!(
-        "This week · {} tokens · {} requests",
+        "Last 7 days · {} tokens · {} requests",
         format_tokens(week.tokens),
         week.requests
     );
@@ -541,6 +713,10 @@ fn format_cost(cents: Option<i64>) -> Option<String> {
     }
 }
 
+fn format_source_cost(cents: Option<i64>) -> String {
+    format_cost(cents).unwrap_or_else(|| "cost n/a".to_string())
+}
+
 fn format_relative_time(at: DateTime<Utc>) -> String {
     let ago = Utc::now().signed_duration_since(at);
     if ago.num_seconds() < 60 {
@@ -567,8 +743,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_sync_with_today_activity_needs_upload() {
-        assert!(pending_upload_needed(
+    fn stale_sync_without_pending_rollups_does_not_offer_empty_upload() {
+        assert!(!pending_upload_needed(
             false,
             Some(Utc::now() - Duration::hours(45)),
             true,
@@ -594,29 +770,269 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_cache_honors_ttl_and_api_scope() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("dashboard-overview-cache.json");
-        let api = "http://127.0.0.1:8787";
-        let now = Utc::now();
-        let cache = DashboardOverviewCache {
-            api_base_url: api.to_string(),
-            fetched_at: now - Duration::seconds(30),
-            week_tokens: 100,
-            week_requests: 2,
-            today_tokens: 10,
-            today_requests: 1,
+    fn failed_sync_state_does_not_count_as_synced() {
+        let failed = statsai_store::SyncState {
+            sink: "http".to_string(),
+            target: "https://api.example.com/api/sync/batches".to_string(),
+            last_success_at: Utc::now(),
+            last_batch_id: String::new(),
+            last_event_started_at: None,
+            last_event_id: None,
+            last_summary_observed_at: None,
+            last_summary_id: None,
+            last_task_verification_updated_at: None,
+            last_task_verification_id: None,
+            failure_count: 1,
+            pending_resume_batch_id: None,
         };
-        let file = std::fs::File::create(&path).expect("cache file");
-        serde_json::to_writer_pretty(file, &cache).expect("write cache");
+        assert!(!has_successful_sync(Some(&failed)));
 
-        assert!(load_dashboard_cache_from_path(&path, api, now).is_some());
-        assert!(load_dashboard_cache_from_path(&path, "https://api.statsai.dev", now).is_none());
-        assert!(load_dashboard_cache_from_path(
-            &path,
-            api,
-            now + Duration::seconds(DASHBOARD_OVERVIEW_CACHE_TTL_SECS)
-        )
-        .is_none());
+        let synced = statsai_store::SyncState {
+            last_batch_id: "batch_1".to_string(),
+            failure_count: 0,
+            ..failed
+        };
+        assert!(has_successful_sync(Some(&synced)));
+    }
+
+    #[test]
+    fn local_usage_exits_first_run_state_without_dashboard_sync() {
+        assert!(is_first_run(false, false, false));
+        assert!(!is_first_run(false, false, true));
+        assert!(!is_first_run(true, false, false));
+        assert!(!is_first_run(false, true, false));
+    }
+
+    #[test]
+    fn first_run_unlinked_state_is_local_first() {
+        let ui = build_ui(SnapshotUiInput {
+            logged_in: false,
+            first_run: true,
+            has_synced: false,
+            sync_failures: 0,
+            pending_upload: false,
+            pending_days: 0,
+            week: PeriodStats {
+                tokens: 12_000,
+                requests: 4,
+                cost_cents: None,
+            },
+            today: PeriodStats {
+                tokens: 2_000,
+                requests: 1,
+                cost_cents: None,
+            },
+            last_sync_at: None,
+        });
+
+        assert_eq!(ui.menu_summary, "StatsAI is tracking locally");
+        assert_eq!(ui.primary_action, PrimaryAction::Link);
+        assert_eq!(ui.menu_stat_3, "Dashboard · not connected");
+    }
+
+    #[test]
+    fn pending_upload_copy_names_dashboard_state() {
+        let ui = build_ui(SnapshotUiInput {
+            logged_in: true,
+            first_run: false,
+            has_synced: true,
+            sync_failures: 0,
+            pending_upload: true,
+            pending_days: 0,
+            week: PeriodStats {
+                tokens: 12_000,
+                requests: 4,
+                cost_cents: None,
+            },
+            today: PeriodStats {
+                tokens: 2_000,
+                requests: 1,
+                cost_cents: None,
+            },
+            last_sync_at: Some(Utc::now() - Duration::minutes(30)),
+        });
+
+        assert_eq!(ui.menu_summary, "Dashboard sync available");
+    }
+
+    #[test]
+    fn background_status_maps_launch_agent_state() {
+        let running = background_status(service::BackgroundServiceState {
+            plist_installed: true,
+            launch_agent_loaded: true,
+        });
+        assert!(running.installed);
+        assert!(running.running);
+        assert_eq!(running.label, "Tracking automatically");
+
+        let missing = background_status(service::BackgroundServiceState {
+            plist_installed: false,
+            launch_agent_loaded: false,
+        });
+        assert_eq!(missing.label, "Tracking setup needed");
+    }
+
+    #[test]
+    fn source_status_formats_tracking_disabled_and_missing_states() {
+        let tracking = source_status(
+            CODEX_PROVIDER,
+            SourceStatusDraft {
+                display_name: "Codex",
+                configured: true,
+                discovered: true,
+                enabled: true,
+                event_count: 42,
+                token_count: 12_000,
+                estimated_cost_cents: Some(123),
+            },
+        );
+        assert_eq!(tracking.status, "tracking");
+        assert_eq!(tracking.label, "Codex · 12k tokens · $1.23");
+        assert!(tracking.has_data);
+
+        let disabled = source_status(
+            CLAUDE_CODE_PROVIDER,
+            SourceStatusDraft {
+                display_name: "Claude Code",
+                configured: true,
+                discovered: true,
+                enabled: false,
+                event_count: 0,
+                token_count: 0,
+                estimated_cost_cents: None,
+            },
+        );
+        assert_eq!(disabled.status, "disabled");
+        assert_eq!(disabled.label, "Claude Code · disabled");
+
+        let missing = source_status(
+            OPENCODE_PROVIDER,
+            SourceStatusDraft {
+                display_name: "OpenCode",
+                configured: false,
+                discovered: false,
+                enabled: true,
+                event_count: 0,
+                token_count: 0,
+                estimated_cost_cents: None,
+            },
+        );
+        assert_eq!(missing.status, "not_found");
+        assert_eq!(missing.label, "OpenCode");
+
+        let detected = source_status(
+            GROK_BUILD_PROVIDER,
+            SourceStatusDraft {
+                display_name: "Grok Build",
+                configured: false,
+                discovered: true,
+                enabled: true,
+                event_count: 0,
+                token_count: 0,
+                estimated_cost_cents: None,
+            },
+        );
+        assert_eq!(detected.status, "found");
+        assert_eq!(detected.label, "Grok Build · 0 tokens · $0");
+    }
+
+    #[test]
+    fn source_status_list_hides_unconfigured_empty_sources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let discovered = statsai_core::SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "grok-build-local-sessions",
+            "test",
+            dir.path(),
+            statsai_core::LocationOrigin::Default,
+        );
+
+        let statuses = build_source_statuses_with_discovered(
+            &[],
+            &HashMap::new(),
+            vec![(GROK_BUILD_PROVIDER.to_string(), vec![discovered])],
+        );
+
+        assert!(!statuses
+            .iter()
+            .any(|status| status.provider == GROK_BUILD_PROVIDER));
+    }
+
+    #[test]
+    fn discovered_configured_source_is_not_counted_or_enabled_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut configured = statsai_core::SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "codex-local-jsonl",
+            "test",
+            dir.path(),
+            statsai_core::LocationOrigin::Configured,
+        );
+        configured.enabled = false;
+        let discovered = statsai_core::SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "codex-local-jsonl",
+            "test",
+            dir.path(),
+            statsai_core::LocationOrigin::Default,
+        );
+        assert_eq!(configured.source_id, discovered.source_id);
+
+        let mut totals = HashMap::new();
+        totals.insert(
+            CODEX_PROVIDER.to_string(),
+            SourceUsageTotals {
+                events: 5,
+                tokens: 12_000,
+                estimated_cost_cents: Some(123),
+            },
+        );
+
+        let statuses = build_source_statuses_with_discovered(
+            &[configured],
+            &totals,
+            vec![(CODEX_PROVIDER.to_string(), vec![discovered])],
+        );
+        let codex = statuses
+            .iter()
+            .find(|status| status.provider == CODEX_PROVIDER)
+            .expect("codex status");
+
+        assert!(codex.configured);
+        assert!(codex.discovered);
+        assert!(!codex.enabled);
+        assert_eq!(codex.event_count, 5);
+        assert_eq!(codex.token_count, 12_000);
+        assert_eq!(codex.estimated_cost_cents, Some(123));
+        assert_eq!(codex.status, "disabled");
+        assert_eq!(codex.label, "Codex · disabled");
+    }
+
+    #[test]
+    fn scan_summary_prefers_today_then_week() {
+        let week = PeriodStats {
+            tokens: 100,
+            requests: 7,
+            cost_cents: None,
+        };
+        let today = PeriodStats {
+            tokens: 10,
+            requests: 2,
+            cost_cents: None,
+        };
+        assert_eq!(
+            format_scan_summary(&week, &today),
+            "Last scan found 2 requests today"
+        );
+
+        let no_today = PeriodStats {
+            tokens: 0,
+            requests: 0,
+            cost_cents: None,
+        };
+        assert_eq!(
+            format_scan_summary(&week, &no_today),
+            "Last scan found 7 requests in the last 7 days"
+        );
     }
 }

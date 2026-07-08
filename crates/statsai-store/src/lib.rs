@@ -15,10 +15,10 @@ use statsai_core::{
     Confidence, CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource,
     MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
     SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
-    SourceLocation, SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
-    SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage, TaskVerificationCursor,
-    TaskVerificationId, UsageCounts, UsageEvent, UsageSummary, VerifiedSourceState,
-    VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    SourceKind, SourceLocation, SourceVerificationMode, Subscription, SubscriptionId,
+    SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage,
+    TaskVerificationCursor, TaskVerificationId, UsageCounts, UsageEvent, UsageSummary,
+    VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
     SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
@@ -43,6 +43,13 @@ pub struct UsagePeriodStats {
     pub tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SourceUsageTotals {
+    pub events: u64,
+    pub tokens: u64,
+    pub estimated_cost_cents: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RollupPeriodStats {
     pub tokens: u64,
@@ -55,6 +62,14 @@ pub struct SnapshotRollupView {
     pub pending_days: u64,
     pub today: RollupPeriodStats,
     pub week: RollupPeriodStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PendingSyncSummaryCounts {
+    pub rollups: u64,
+    pub passthrough_summaries: u64,
+    pub total: u64,
+    pub days: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +210,142 @@ fn restrict_file_permissions(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+fn merge_source_totals(existing: &mut SourceUsageTotals, incoming: SourceUsageTotals) {
+    if incoming.tokens > existing.tokens {
+        *existing = incoming;
+        return;
+    }
+    if incoming.tokens == existing.tokens {
+        existing.events = existing.events.max(incoming.events);
+        existing.estimated_cost_cents =
+            max_optional_i64(existing.estimated_cost_cents, incoming.estimated_cost_cents);
+    }
+}
+
+fn merge_additive_source_totals(existing: &mut SourceUsageTotals, incoming: SourceUsageTotals) {
+    existing.events = existing.events.saturating_add(incoming.events);
+    existing.tokens = existing.tokens.saturating_add(incoming.tokens);
+    existing.estimated_cost_cents =
+        match (existing.estimated_cost_cents, incoming.estimated_cost_cents) {
+            (Some(existing), Some(incoming)) => Some(existing.saturating_add(incoming)),
+            (Some(existing), None) => Some(existing),
+            (None, Some(incoming)) => Some(incoming),
+            (None, None) => None,
+        };
+}
+
+fn sanitize_summary_for_default_http_sync(summary: UsageSummary) -> UsageSummary {
+    let mut summary = sanitize_summary_for_sync(summary);
+    summary.project = None;
+    summary
+}
+
+fn summary_sync_day(summary: &UsageSummary) -> NaiveDate {
+    summary
+        .period_start
+        .map(|start| start.date_naive())
+        .unwrap_or_else(|| summary.observed_at.date_naive())
+}
+
+fn summary_period_bounds(summary: &UsageSummary) -> (DateTime<Utc>, DateTime<Utc>) {
+    let start = summary
+        .period_start
+        .or(summary.period_end)
+        .unwrap_or(summary.observed_at);
+    let end = summary
+        .period_end
+        .or(summary.period_start)
+        .unwrap_or(summary.observed_at);
+    if end < start {
+        (end, start)
+    } else {
+        (start, end)
+    }
+}
+
+fn summary_spans_single_day(summary: &UsageSummary) -> bool {
+    let (start, end) = summary_period_bounds(summary);
+    start.date_naive() == end.date_naive()
+}
+
+fn summary_fits_single_daily_report_day(summary: &UsageSummary) -> bool {
+    let (start, end) = summary_period_bounds(summary);
+    if start.date_naive() == end.date_naive() {
+        return true;
+    }
+    let duration = end - start;
+    duration >= chrono::Duration::zero() && duration <= chrono::Duration::hours(25)
+}
+
+fn is_exact_daily_passthrough_summary(summary: &UsageSummary) -> bool {
+    matches!(
+        summary.metadata.summary_format.as_str(),
+        "external_daily" | "manual_daily" | "custom_daily" | "ccusage_daily"
+    )
+}
+
+fn is_exact_period_passthrough_summary(summary: &UsageSummary) -> bool {
+    matches!(
+        summary.metadata.summary_format.as_str(),
+        "manual_period_summary" | "custom_period_summary"
+    )
+}
+
+fn is_http_rollup_passthrough_summary(summary: &UsageSummary) -> bool {
+    if summary.metadata.summary_format == "daily_rollup.v1" {
+        return false;
+    }
+    if summary.metadata.summary_format == "claude_stats_cache" {
+        return false;
+    }
+    if summary.source.source_kind == SourceKind::LocalSummary {
+        return false;
+    }
+    if summary.source.source_kind == SourceKind::LocalAdapter {
+        return true;
+    }
+    (is_exact_daily_passthrough_summary(summary) && summary_fits_single_daily_report_day(summary))
+        || (is_exact_period_passthrough_summary(summary) && !summary_spans_single_day(summary))
+}
+
+fn collect_pending_summary_days<'a>(
+    summaries: impl IntoIterator<Item = &'a UsageSummary>,
+) -> BTreeSet<NaiveDate> {
+    let mut days = BTreeSet::new();
+    for summary in summaries {
+        if summary.metadata.summary_format == "daily_rollup.v1"
+            || (is_exact_daily_passthrough_summary(summary)
+                && summary_fits_single_daily_report_day(summary))
+        {
+            days.insert(summary_sync_day(summary));
+            continue;
+        }
+
+        let (start, end) = summary_period_bounds(summary);
+        let mut day = start.date_naive();
+        let end_day = end.date_naive();
+        loop {
+            days.insert(day);
+            if day >= end_day {
+                break;
+            }
+            let Some(next_day) = day.succ_opt() else {
+                break;
+            };
+            day = next_day;
+        }
+    }
+    days
+}
+
+fn max_optional_i64(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 pub struct Store {
@@ -473,6 +624,158 @@ impl Store {
             sources.push(serde_json::from_str(&row?)?);
         }
         Ok(sources)
+    }
+
+    pub fn event_counts_by_source(&self) -> Result<HashMap<String, u64>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT source_id, COUNT(*)
+            FROM usage_events
+            GROUP BY source_id
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (source_id, count) = row?;
+            counts.insert(source_id, count.max(0) as u64);
+        }
+        Ok(counts)
+    }
+
+    pub fn usage_totals_by_source(&self) -> Result<HashMap<String, SourceUsageTotals>> {
+        let mut totals = HashMap::new();
+        let mut rollup_stmt = self.conn.prepare(
+            r#"
+            SELECT
+              source_id,
+              COALESCE(SUM(CAST(json_extract(payload, '$.usage.requests') AS INTEGER)), 0),
+              COALESCE(SUM(CAST(json_extract(payload, '$.usage.total_tokens') AS INTEGER)), 0),
+              SUM(COALESCE(
+                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER)
+              ))
+            FROM sync_rollups
+            GROUP BY source_id
+            "#,
+        )?;
+        let rollup_rows = rollup_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SourceUsageTotals {
+                    events: row.get::<_, i64>(1)?.max(0) as u64,
+                    tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    estimated_cost_cents: row.get::<_, Option<i64>>(3)?,
+                },
+            ))
+        })?;
+        for row in rollup_rows {
+            let (source_id, source_totals) = row?;
+            totals.insert(source_id, source_totals);
+        }
+
+        let mut summary_stmt = self.conn.prepare(
+            r#"
+            SELECT
+              source_id,
+              COALESCE(SUM(COALESCE(CAST(json_extract(payload, '$.usage.requests') AS INTEGER), 1)), 0),
+              COALESCE(SUM(total_tokens), 0),
+              SUM(COALESCE(
+                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER)
+              ))
+            FROM usage_summaries
+            GROUP BY source_id
+            "#,
+        )?;
+        let summary_rows = summary_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SourceUsageTotals {
+                    events: row.get::<_, i64>(1)?.max(0) as u64,
+                    tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    estimated_cost_cents: row.get::<_, Option<i64>>(3)?,
+                },
+            ))
+        })?;
+        for row in summary_rows {
+            let (source_id, summary_totals) = row?;
+            match totals.get_mut(&source_id) {
+                Some(existing) => merge_source_totals(existing, summary_totals),
+                None => {
+                    totals.insert(source_id, summary_totals);
+                }
+            }
+        }
+        Ok(totals)
+    }
+
+    pub fn menu_usage_totals_by_provider(&self) -> Result<HashMap<String, SourceUsageTotals>> {
+        let mut totals = HashMap::new();
+        let mut rollup_stmt = self.conn.prepare(
+            r#"
+            SELECT
+              provider,
+              COALESCE(SUM(CAST(json_extract(payload, '$.usage.requests') AS INTEGER)), 0),
+              COALESCE(SUM(CAST(json_extract(payload, '$.usage.total_tokens') AS INTEGER)), 0),
+              SUM(COALESCE(
+                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER)
+              ))
+            FROM sync_rollups
+            GROUP BY provider
+            "#,
+        )?;
+        let rollup_rows = rollup_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SourceUsageTotals {
+                    events: row.get::<_, i64>(1)?.max(0) as u64,
+                    tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    estimated_cost_cents: row.get::<_, Option<i64>>(3)?,
+                },
+            ))
+        })?;
+        for row in rollup_rows {
+            let (provider, provider_totals) = row?;
+            totals.insert(provider, provider_totals);
+        }
+
+        let mut summary_stmt = self.conn.prepare(
+            r#"
+            SELECT
+              provider,
+              COALESCE(SUM(COALESCE(CAST(json_extract(payload, '$.usage.requests') AS INTEGER), 1)), 0),
+              COALESCE(SUM(total_tokens), 0),
+              SUM(COALESCE(
+                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER)
+              ))
+            FROM usage_summaries
+            WHERE COALESCE(json_extract(payload, '$.metadata.summary_format'), '') != 'daily_rollup.v1'
+              AND COALESCE(json_extract(payload, '$.metadata.summary_format'), '') != 'claude_stats_cache'
+              AND COALESCE(json_extract(payload, '$.source.source_kind'), '') != 'local_summary'
+            GROUP BY provider
+            "#,
+        )?;
+        let summary_rows = summary_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SourceUsageTotals {
+                    events: row.get::<_, i64>(1)?.max(0) as u64,
+                    tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    estimated_cost_cents: row.get::<_, Option<i64>>(3)?,
+                },
+            ))
+        })?;
+        for row in summary_rows {
+            let (provider, summary_totals) = row?;
+            let entry = totals.entry(provider).or_default();
+            merge_additive_source_totals(entry, summary_totals);
+        }
+        Ok(totals)
     }
 
     pub fn source(&self, source_id: &SourceId) -> Result<Option<SourceLocation>> {
@@ -2057,18 +2360,45 @@ impl Store {
     }
 
     pub fn pending_http_sync_rollup_summaries(&self, target: &str) -> Result<Vec<UsageSummary>> {
-        let rollups = self.all_sync_rollup_summaries()?;
+        let rollups = self
+            .all_sync_rollup_summaries()?
+            .into_iter()
+            .map(sanitize_summary_for_default_http_sync)
+            .collect::<Vec<_>>();
         self.pending_summaries_for_sync("http", target, &rollups)
+    }
+
+    pub fn pending_http_sync_summary_counts(
+        &self,
+        target: &str,
+    ) -> Result<PendingSyncSummaryCounts> {
+        let rollups = self.pending_http_sync_rollup_summaries(target)?;
+        let passthrough_summaries = self.pending_http_passthrough_summaries(target)?;
+        let mut days = collect_pending_summary_days(rollups.iter());
+        days.extend(collect_pending_summary_days(passthrough_summaries.iter()));
+        Ok(PendingSyncSummaryCounts {
+            rollups: rollups.len() as u64,
+            passthrough_summaries: passthrough_summaries.len() as u64,
+            total: rollups.len().saturating_add(passthrough_summaries.len()) as u64,
+            days: days.len() as u64,
+        })
+    }
+
+    fn pending_http_passthrough_summaries(&self, target: &str) -> Result<Vec<UsageSummary>> {
+        let summaries = self
+            .summaries()?
+            .into_iter()
+            .filter(is_http_rollup_passthrough_summary)
+            .map(sanitize_summary_for_default_http_sync)
+            .collect::<Vec<_>>();
+        self.pending_summaries_for_sync("http", target, &summaries)
     }
 
     pub fn sync_rollup_period_stats(&self, cutoff_day: NaiveDate) -> Result<RollupPeriodStats> {
         let mut tokens = 0u64;
         let mut requests = 0u64;
         for summary in self.all_sync_rollup_summaries()? {
-            let day = summary
-                .period_start
-                .map(|start| start.date_naive())
-                .unwrap_or_else(|| summary.observed_at.date_naive());
+            let day = summary_sync_day(&summary);
             if day < cutoff_day {
                 continue;
             }
@@ -2076,6 +2406,83 @@ impl Store {
             requests = requests.saturating_add(summary.usage.requests.unwrap_or(0));
         }
         Ok(RollupPeriodStats { tokens, requests })
+    }
+
+    pub fn usage_event_period_stats_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<RollupPeriodStats> {
+        Ok(self.conn.query_row(
+            r#"
+            SELECT
+              COALESCE(SUM(total_tokens), 0),
+              COUNT(*)
+            FROM usage_events
+            WHERE started_at >= ?1
+            "#,
+            params![since.to_rfc3339()],
+            |row| {
+                Ok(RollupPeriodStats {
+                    tokens: row.get::<_, i64>(0)?.max(0) as u64,
+                    requests: row.get::<_, i64>(1)?.max(0) as u64,
+                })
+            },
+        )?)
+    }
+
+    pub fn reportable_summary_period_stats_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<RollupPeriodStats> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT
+                  COALESCE(SUM(total_tokens), 0),
+                  COALESCE(SUM(COALESCE(CAST(json_extract(payload, '$.usage.requests') AS INTEGER), 1)), 0)
+                FROM usage_summaries
+                WHERE datetime(COALESCE(period_start, observed_at)) >= datetime(?1)
+                  AND COALESCE(json_extract(payload, '$.metadata.summary_format'), '') != 'daily_rollup.v1'
+                  AND COALESCE(json_extract(payload, '$.metadata.summary_format'), '') != 'claude_stats_cache'
+                  AND COALESCE(json_extract(payload, '$.source.source_kind'), '') != 'local_summary'
+                "#,
+                params![since.to_rfc3339()],
+                |row| {
+                    Ok(RollupPeriodStats {
+                        tokens: row.get::<_, i64>(0)?.max(0) as u64,
+                        requests: row.get::<_, i64>(1)?.max(0) as u64,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn reportable_summary_period_stats_since_day(
+        &self,
+        cutoff_day: NaiveDate,
+    ) -> Result<RollupPeriodStats> {
+        let cutoff_day = cutoff_day.format("%Y-%m-%d").to_string();
+        self.conn
+            .query_row(
+                r#"
+                SELECT
+                  COALESCE(SUM(total_tokens), 0),
+                  COALESCE(SUM(COALESCE(CAST(json_extract(payload, '$.usage.requests') AS INTEGER), 1)), 0)
+                FROM usage_summaries
+                WHERE substr(COALESCE(period_start, observed_at), 1, 10) >= ?1
+                  AND COALESCE(json_extract(payload, '$.metadata.summary_format'), '') != 'daily_rollup.v1'
+                  AND COALESCE(json_extract(payload, '$.metadata.summary_format'), '') != 'claude_stats_cache'
+                  AND COALESCE(json_extract(payload, '$.source.source_kind'), '') != 'local_summary'
+                "#,
+                params![cutoff_day],
+                |row| {
+                    Ok(RollupPeriodStats {
+                        tokens: row.get::<_, i64>(0)?.max(0) as u64,
+                        requests: row.get::<_, i64>(1)?.max(0) as u64,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     pub fn snapshot_rollup_view(
@@ -2169,27 +2576,14 @@ impl Store {
     }
 
     fn pending_sync_rollup_counts(&self, sink: &str, target: &str) -> Result<(u64, u64)> {
-        self.conn
-            .query_row(
-                r#"
-                SELECT
-                  COUNT(*),
-                  COUNT(DISTINCT day_key)
-                FROM sync_rollups sr
-                WHERE NOT EXISTS (
-                  SELECT 1
-                  FROM entity_sync_state es
-                  WHERE es.sink = ?1
-                    AND es.target = ?2
-                    AND es.entity_kind = 'summary'
-                    AND es.entity_id = sr.summary_id
-                    AND es.payload_hash = sr.payload_hash
-                )
-                "#,
-                params![sink, target],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
-            )
-            .map_err(Into::into)
+        let rollups = self
+            .all_sync_rollup_summaries()?
+            .into_iter()
+            .map(sanitize_summary_for_default_http_sync)
+            .collect::<Vec<_>>();
+        let pending = self.pending_summaries_for_sync(sink, target, &rollups)?;
+        let days = collect_pending_summary_days(pending.iter());
+        Ok((pending.len() as u64, days.len() as u64))
     }
 
     pub fn reconcile_sync_rollup_dirty_flags(&self, sink: &str, target: &str) -> Result<u64> {
@@ -2385,13 +2779,13 @@ impl Store {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| {
             for summary in summaries {
-                let payload = serde_json::to_string(summary)?;
+                let payload_hash = summary_sync_payload_hash(summary)?;
                 self.record_entity_synced(
                     sink,
                     target,
                     "summary",
                     &summary.summary_id.0,
-                    &hash_text(&payload),
+                    &payload_hash,
                 )?;
             }
             Ok(())
@@ -6785,6 +7179,342 @@ mod tests {
         assert!(store.source(&source_id).expect("reload").is_none());
     }
 
+    #[test]
+    fn usage_event_period_stats_since_counts_recent_events() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-period-stats"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+        let recent = test_store_event(&source, now - chrono::Duration::minutes(5), "recent");
+        let old = test_store_event(&source, now - chrono::Duration::days(2), "old");
+        store.insert_events(&[recent, old]).expect("insert events");
+
+        let stats = store
+            .usage_event_period_stats_since(now - chrono::Duration::hours(1))
+            .expect("period stats");
+
+        assert_eq!(stats.requests, 1);
+        assert_eq!(stats.tokens, 15);
+    }
+
+    #[test]
+    fn usage_totals_by_source_groups_tokens_and_cost() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-source-totals"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+        let mut first = test_store_event(&source, now - chrono::Duration::minutes(5), "first");
+        first.cost.estimated_api_equivalent_usd = Some(10);
+        let mut second = test_store_event(&source, now, "second");
+        second.usage.total_tokens = Some(25);
+        second.cost.estimated_api_equivalent_usd = Some(15);
+        store
+            .insert_events(&[first, second])
+            .expect("insert events");
+        let mut summary = test_store_summary(&source, now, 100);
+        summary.cost.estimated_api_equivalent_usd = Some(40);
+        summary.cost.provider_reported_usd = Some(45);
+        store.upsert_summary(&summary).expect("summary");
+
+        let totals = store.usage_totals_by_source().expect("source totals");
+        let source_totals = totals.get(&source.source_id.0).expect("source entry");
+
+        assert_eq!(
+            *source_totals,
+            SourceUsageTotals {
+                events: 1,
+                tokens: 100,
+                estimated_cost_cents: Some(45),
+            }
+        );
+    }
+
+    #[test]
+    fn menu_usage_totals_by_provider_uses_fast_rollups_and_reportable_summaries() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-menu-provider-totals"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+        let mut event = test_store_event(&source, now, "event");
+        event.usage.total_tokens = Some(25);
+        event.cost.estimated_api_equivalent_usd = Some(15);
+        store.insert_event(&event).expect("insert event");
+
+        let mut reportable = test_store_summary(&source, now, 100);
+        reportable.summary_id = summary_id(&source.provider, &source.source_id, "reportable");
+        reportable.source.source_kind = SourceKind::LocalAdapter;
+        reportable.metadata.summary_format = "ccusage_daily".to_string();
+        reportable.usage.requests = Some(3);
+        reportable.cost.provider_reported_usd = Some(45);
+        store
+            .upsert_summary(&reportable)
+            .expect("reportable summary");
+
+        let mut requestless = test_store_summary(&source, now, 50);
+        requestless.summary_id = summary_id(&source.provider, &source.source_id, "requestless");
+        requestless.source.source_kind = SourceKind::LocalAdapter;
+        requestless.metadata.summary_format = "ccusage_daily".to_string();
+        requestless.cost.provider_reported_usd = Some(5);
+        store
+            .upsert_summary(&requestless)
+            .expect("requestless summary");
+
+        let mut local_summary = test_store_summary(&source, now, 1_000);
+        local_summary.summary_id = summary_id(&source.provider, &source.source_id, "local");
+        local_summary.metadata.summary_format = "claude_stats_cache".to_string();
+        local_summary.cost.provider_reported_usd = Some(9_999);
+        store.upsert_summary(&local_summary).expect("local summary");
+
+        let totals = store
+            .menu_usage_totals_by_provider()
+            .expect("provider totals");
+        let provider_totals = totals.get("codex").expect("codex totals");
+
+        assert_eq!(
+            *provider_totals,
+            SourceUsageTotals {
+                events: 5,
+                tokens: 175,
+                estimated_cost_cents: Some(65),
+            }
+        );
+    }
+
+    #[test]
+    fn reportable_summary_period_stats_include_summary_only_usage() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "grok_build",
+            "test",
+            "0",
+            Path::new("/tmp/grok-summary-period-stats"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+
+        let mut recent = test_store_summary(&source, now, 70);
+        recent.summary_id = summary_id(&source.provider, &source.source_id, "recent");
+        recent.source.source_kind = SourceKind::LocalAdapter;
+        recent.metadata.summary_format = "grok_build_session_summary".to_string();
+        recent.period_start = Some(now);
+        recent.period_end = Some(now);
+        store.upsert_summary(&recent).expect("recent summary");
+
+        let mut explicit_requests = test_store_summary(&source, now, 30);
+        explicit_requests.summary_id =
+            summary_id(&source.provider, &source.source_id, "explicit-requests");
+        explicit_requests.source.source_kind = SourceKind::LocalAdapter;
+        explicit_requests.metadata.summary_format = "grok_build_session_summary".to_string();
+        explicit_requests.period_start = Some(now);
+        explicit_requests.period_end = Some(now);
+        explicit_requests.usage.requests = Some(4);
+        store
+            .upsert_summary(&explicit_requests)
+            .expect("explicit request summary");
+
+        let mut old = test_store_summary(&source, now - chrono::Duration::days(10), 1_000);
+        old.summary_id = summary_id(&source.provider, &source.source_id, "old");
+        old.source.source_kind = SourceKind::LocalAdapter;
+        old.metadata.summary_format = "grok_build_session_summary".to_string();
+        old.period_start = Some(now - chrono::Duration::days(10));
+        old.period_end = Some(now - chrono::Duration::days(10));
+        store.upsert_summary(&old).expect("old summary");
+
+        let mut rollup = test_store_summary(&source, now, 2_000);
+        rollup.summary_id = summary_id(&source.provider, &source.source_id, "rollup");
+        rollup.source.source_kind = SourceKind::LocalAdapter;
+        rollup.metadata.summary_format = "daily_rollup.v1".to_string();
+        rollup.period_start = Some(now);
+        rollup.period_end = Some(now);
+        store.upsert_summary(&rollup).expect("rollup summary");
+
+        let stats = store
+            .reportable_summary_period_stats_since(now - chrono::Duration::hours(1))
+            .expect("summary stats");
+        assert_eq!(
+            stats,
+            RollupPeriodStats {
+                tokens: 100,
+                requests: 5,
+            }
+        );
+
+        let day_stats = store
+            .reportable_summary_period_stats_since_day(now.date_naive())
+            .expect("summary day stats");
+        assert_eq!(day_stats, stats);
+    }
+
+    #[test]
+    fn pending_http_sync_summary_counts_include_summary_only_usage() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "grok_build",
+            "test",
+            "0",
+            Path::new("/tmp/grok-pending-sync-summary"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+        let target = "https://api.example.com/api/sync/batches";
+
+        let mut summary = test_store_summary(&source, now, 70);
+        summary.summary_id = summary_id(&source.provider, &source.source_id, "pending-summary");
+        summary.source.source_kind = SourceKind::LocalAdapter;
+        summary.metadata.summary_format = "grok_build_session_summary".to_string();
+        summary.period_start = Some(now);
+        summary.period_end = Some(now);
+        store.upsert_summary(&summary).expect("summary");
+
+        let mut backfill = test_store_summary(&source, now, 500);
+        backfill.summary_id = summary_id(&source.provider, &source.source_id, "manual-backfill");
+        backfill.source.source_kind = SourceKind::Manual;
+        backfill.metadata.summary_format = "manual_period_summary".to_string();
+        backfill.period_start = Some(now - chrono::Duration::days(4));
+        backfill.period_end = Some(now);
+        store.upsert_summary(&backfill).expect("backfill summary");
+
+        let counts = store
+            .pending_http_sync_summary_counts(target)
+            .expect("pending counts");
+        assert_eq!(
+            counts,
+            PendingSyncSummaryCounts {
+                rollups: 0,
+                passthrough_summaries: 2,
+                total: 2,
+                days: 5,
+            }
+        );
+
+        store
+            .record_summaries_synced("http", target, &[summary, backfill])
+            .expect("record synced");
+
+        let counts = store
+            .pending_http_sync_summary_counts(target)
+            .expect("pending counts after sync");
+        assert_eq!(counts.total, 0);
+    }
+
+    #[test]
+    fn pending_http_sync_summary_counts_include_edited_passthrough_summaries() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "grok_build",
+            "test",
+            "0",
+            Path::new("/tmp/grok-edited-pending-sync-summary"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+        let target = "https://api.example.com/api/sync/batches";
+
+        let mut summary = test_store_summary(&source, now, 70);
+        summary.summary_id = summary_id(&source.provider, &source.source_id, "editable-summary");
+        summary.source.source_kind = SourceKind::LocalAdapter;
+        summary.metadata.summary_format = "grok_build_session_summary".to_string();
+        summary.period_start = Some(now);
+        summary.period_end = Some(now);
+        store.upsert_summary(&summary).expect("summary");
+
+        store
+            .record_summaries_synced("http", target, &[summary.clone()])
+            .expect("record synced");
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts(target)
+                .expect("counts after sync")
+                .total,
+            0
+        );
+
+        let mut edited = summary.clone();
+        edited.usage.total_tokens = Some(80);
+        store.upsert_summary(&edited).expect("edited summary");
+
+        let counts = store
+            .pending_http_sync_summary_counts(target)
+            .expect("pending counts after edit");
+        assert_eq!(
+            counts,
+            PendingSyncSummaryCounts {
+                rollups: 0,
+                passthrough_summaries: 1,
+                total: 1,
+                days: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_http_sync_summary_counts_match_default_http_passthrough_payloads() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "grok_build",
+            "test",
+            "0",
+            Path::new("/tmp/grok-project-pending-sync-summary"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+        let target = "https://api.example.com/api/sync/batches";
+
+        let mut summary = test_store_summary(&source, now, 70);
+        summary.summary_id = summary_id(&source.provider, &source.source_id, "project-summary");
+        summary.source.source_kind = SourceKind::LocalAdapter;
+        summary.metadata.summary_format = "grok_build_session_summary".to_string();
+        summary.period_start = Some(now);
+        summary.period_end = Some(now);
+        summary.project = Some(ProjectInfo {
+            project_id: "project-repo-backed".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/work/ai-stats".to_string()),
+        });
+        summary.privacy.contains_file_paths = true;
+        store.upsert_summary(&summary).expect("summary");
+
+        store
+            .record_summaries_synced(
+                "http",
+                target,
+                &[sanitize_summary_for_default_http_sync(summary.clone())],
+            )
+            .expect("record synced");
+
+        let counts = store
+            .pending_http_sync_summary_counts(target)
+            .expect("pending counts after sync");
+        assert_eq!(counts.total, 0);
+    }
+
     fn test_store_event(
         source: &statsai_core::SourceLocation,
         now: chrono::DateTime<Utc>,
@@ -6853,9 +7583,9 @@ mod tests {
     ) -> UsageSummary {
         UsageSummary {
             schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
-            summary_id: summary_id("claude_code", &source.source_id, "summary"),
+            summary_id: summary_id(&source.provider, &source.source_id, "summary"),
             device_id: "device".to_string(),
-            provider: "claude_code".to_string(),
+            provider: source.provider.clone(),
             source_id: source.source_id.clone(),
             provider_account_id: None,
             source: EventSource {
