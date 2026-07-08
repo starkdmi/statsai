@@ -15,8 +15,8 @@ dist = true
 formula = "statsai"
 display-name = "statsai"
 
-# Used by `cargo binstall --git … statsai` today; plain `cargo binstall statsai`
-# needs a crates.io publish with versioned path deps first.
+# For crates.io releases, plain `cargo binstall statsai` resolves the published
+# crate version and downloads the matching GitHub release archive.
 [package.metadata.binstall]
 pkg-url = "https://github.com/starkdmi/statsai/releases/download/v{version}/statsai-{target}.tar.xz"
 pkg-fmt = "txz"

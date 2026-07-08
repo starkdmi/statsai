@@ -41,14 +41,22 @@ imported/manual gaps without double-counting.
 brew install starkdmi/tap/statsai
 ```
 
-Or use the release installer script (no crates.io publish required):
+Or use the GitHub release installer script:
 
 ```sh
 curl -LsSf https://github.com/starkdmi/statsai/releases/latest/download/statsai-installer.sh | sh
 ```
 
-GitHub Releases also ship `statsai-universal-apple-darwin.tar.xz` and `StatsAI.app.zip`.
-`cargo binstall statsai` will work after the workspace is published to crates.io.
+Or install the published crate:
+
+```sh
+cargo install statsai
+# or
+cargo binstall statsai
+```
+
+GitHub Releases also ship `statsai-universal-apple-darwin.tar.xz` and
+`StatsAI.app.zip`.
 
 ## Local Checks
 

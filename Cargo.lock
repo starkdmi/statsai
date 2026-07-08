@@ -2218,7 +2218,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "statsai"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2242,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-adapters"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "hex",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-menubar"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "block2",
  "libc",
@@ -2304,14 +2304,14 @@ dependencies = [
 
 [[package]]
 name = "statsai-pricing"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "statsai-core",
 ]
 
 [[package]]
 name = "statsai-sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2325,7 +2325,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-sync"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
