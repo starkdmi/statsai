@@ -1902,10 +1902,9 @@ impl ProjectContext {
                 "path:{path_hash}:repo:{}",
                 self.repo_remote_hash.as_deref().unwrap_or("none")
             )
-        } else if let Some(repo_remote_hash) = self.repo_remote_hash.as_deref() {
-            format!("repo:{repo_remote_hash}")
         } else {
-            return None;
+            let repo_remote_hash = self.repo_remote_hash.as_deref()?;
+            format!("repo:{repo_remote_hash}")
         };
 
         Some(ProjectInfo {
@@ -3209,7 +3208,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
                 format!(
                     "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                     event_kind_key,
-                    &project_key,
+                    project_key,
                     session_started_at.timestamp_millis(),
                     session_ended_at.timestamp_millis(),
                     model_key,
@@ -3223,7 +3222,7 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
                 format!(
                     "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                     event_kind_key,
-                    &project_key,
+                    project_key,
                     parts.timestamp.timestamp_millis(),
                     model_key,
                     parts.usage.input_tokens.unwrap_or(0),

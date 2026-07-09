@@ -17,6 +17,21 @@ EOF
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 cd "$repo_root"
 
+required_rust_version=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
+if [[ -z "$required_rust_version" ]]; then
+  echo "rust-ci: missing Rust toolchain channel in rust-toolchain.toml" >&2
+  exit 1
+fi
+
+active_rust_version=$(rustc --version | awk '{print $2}')
+if [[ "$active_rust_version" != "$required_rust_version" ]]; then
+  cat >&2 <<EOF
+rust-ci: Rust $required_rust_version is required; found $active_rust_version.
+Install rustup and run: rustup toolchain install $required_rust_version --component rustfmt --component clippy
+EOF
+  exit 1
+fi
+
 run_fmt() {
   cargo fmt --all --check
 }
