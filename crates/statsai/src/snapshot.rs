@@ -108,6 +108,7 @@ pub fn collect(store: &Store) -> Result<AppSnapshot> {
     let background = service::background_service_state()?;
 
     let http_target = http_sync_target();
+    let sync_preferences = store.sync_preferences()?;
     store.reconcile_sync_rollup_sync_hashes_if_needed()?;
     let configured_sources = store.list_sources()?;
     let provider_totals = provider_totals_from_store(store, &configured_sources)?;
@@ -125,7 +126,10 @@ pub fn collect(store: &Store) -> Result<AppSnapshot> {
         .map(|state| state.failure_count)
         .unwrap_or(0);
 
-    let pending_sync = store.pending_http_sync_summary_counts(&http_target)?;
+    let pending_sync = store.pending_http_sync_summary_counts_with_projects(
+        &http_target,
+        sync_preferences.include_projects,
+    )?;
     let has_pending_upload = pending_sync.total > 0;
     let pending_days = pending_upload_days(last_sync_at, has_pending_upload, pending_sync.days);
     let local_day_start = local_period_start(1);

@@ -337,7 +337,7 @@ impl Store {
         if spans.is_empty() {
             return Ok(0);
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        super::begin_immediate_transaction_with_retry(&self.conn)?;
         let result = self.upsert_task_spans_in_tx(spans);
 
         match result {
@@ -353,7 +353,7 @@ impl Store {
     }
 
     pub fn replace_task_bucket_snapshot(&self, snapshot: &TaskBucketSnapshot) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        super::begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             self.delete_task_bucket_snapshot_in_tx(&snapshot.project_bucket)?;
             self.upsert_task_spans_in_tx(&snapshot.spans)?;
@@ -397,7 +397,7 @@ impl Store {
         if source_ids.is_empty() {
             return Ok(TaskDeletionImpact::default());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        super::begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let targets = self.task_span_targets_for_sources(source_ids)?;
             self.delete_task_span_targets_in_tx(&targets)
@@ -423,7 +423,7 @@ impl Store {
         if file_hashes.is_empty() {
             return Ok(TaskDeletionImpact::default());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        super::begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let targets = self.task_span_targets_for_source_file_hashes(source_id, file_hashes)?;
             self.delete_task_span_targets_in_tx(&targets)
@@ -569,7 +569,7 @@ impl Store {
             updated_at: now,
         };
         let payload = serde_json::to_string(&verification)?;
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        super::begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             self.delete_task_verifications_by_ids(
                 &conflicting
@@ -715,43 +715,44 @@ impl Store {
         if snapshots.is_empty() {
             return Ok(());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            let now = Utc::now().to_rfc3339();
-            let mut statement = self.conn.prepare(
-                r#"
-                INSERT INTO task_bucket_sync_state (
-                  sink, target, device_id, project_bucket, dirty, payload_hash, updated_at
-                )
-                VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
-                ON CONFLICT(sink, target, device_id, project_bucket) DO UPDATE SET
-                  dirty = 0,
-                  payload_hash = excluded.payload_hash,
-                  updated_at = excluded.updated_at
-                "#,
-            )?;
-            for snapshot in snapshots {
-                statement.execute(params![
-                    sink,
-                    target,
-                    device_id,
-                    &snapshot.project_bucket,
-                    task_bucket_snapshot_payload_hash(snapshot)?,
-                    &now,
-                ])?;
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
+        self.with_immediate_transaction(|| {
+            self.record_task_bucket_snapshots_synced_in_transaction(
+                sink, target, device_id, snapshots,
+            )
+        })
+    }
+
+    pub(super) fn record_task_bucket_snapshots_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        device_id: &str,
+        snapshots: &[TaskBucketSnapshot],
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut statement = self.conn.prepare(
+            r#"
+            INSERT INTO task_bucket_sync_state (
+              sink, target, device_id, project_bucket, dirty, payload_hash, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+            ON CONFLICT(sink, target, device_id, project_bucket) DO UPDATE SET
+              dirty = 0,
+              payload_hash = excluded.payload_hash,
+              updated_at = excluded.updated_at
+            "#,
+        )?;
+        for snapshot in snapshots {
+            statement.execute(params![
+                sink,
+                target,
+                device_id,
+                &snapshot.project_bucket,
+                task_bucket_snapshot_payload_hash(snapshot)?,
+                &now,
+            ])?;
         }
+        Ok(())
     }
 
     pub fn record_task_verifications_synced(
@@ -763,29 +764,27 @@ impl Store {
         if verifications.is_empty() {
             return Ok(());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            for verification in verifications {
-                self.record_entity_synced(
-                    sink,
-                    target,
-                    "task_verification",
-                    &verification.verification_id.0,
-                    &task_verification_payload_hash(verification)?,
-                )?;
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
+        self.with_immediate_transaction(|| {
+            self.record_task_verifications_synced_in_transaction(sink, target, verifications)
+        })
+    }
+
+    pub(super) fn record_task_verifications_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        verifications: &[TaskVerification],
+    ) -> Result<()> {
+        for verification in verifications {
+            self.record_entity_synced(
+                sink,
+                target,
+                "task_verification",
+                &verification.verification_id.0,
+                &task_verification_payload_hash(verification)?,
+            )?;
         }
+        Ok(())
     }
 
     pub fn merge_task_verification(&self, verification: &TaskVerification) -> Result<bool> {
@@ -801,7 +800,7 @@ impl Store {
         let mut verification = verification.clone();
         verification.action_key = verification.action.action_key();
         let payload = serde_json::to_string(&verification)?;
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        super::begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             self.delete_task_verifications_by_ids(
                 &conflicting
@@ -979,7 +978,7 @@ impl Store {
         if project_buckets.is_empty() {
             return Ok(TaskRebuildReport::default());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        super::begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut report = TaskRebuildReport {
                 affected_bucket_count: project_buckets.len() as u64,
@@ -1350,7 +1349,7 @@ impl Store {
         if project_buckets.is_empty() || (changed_span_ids.is_empty() && deleted_spans.is_empty()) {
             return Ok(TaskRebuildReport::default());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        super::begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut report = TaskRebuildReport {
                 affected_bucket_count: project_buckets.len() as u64,

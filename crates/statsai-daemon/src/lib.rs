@@ -209,7 +209,7 @@ mod watch {
         effective_verified_source_state_is_missing, has_active_verified_source_assignment,
         reconcile_verified_source_state, verified_source_state_hash, ScanFileStateEntry, Store,
     };
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -331,18 +331,28 @@ mod watch {
                         continue;
                     }
                 };
+                let compatible_scan_signatures =
+                    scan_candidate_compatible_signatures(&cache_candidates);
                 let file_cache_entries = scan_file_state_entries(&cache_candidates);
-                let pending_file_entries =
-                    match store.pending_scan_file_entries(&source.source_id, &file_cache_entries) {
-                        Ok(entries) => entries,
-                        Err(e) => {
-                            eprintln!(
-                                "daemon: scan cache lookup failed for {}: {e}",
-                                source.path_label.as_deref().unwrap_or("unknown")
-                            );
-                            continue;
-                        }
-                    };
+                let selection = match store
+                    .select_scan_file_state_entries_with_task_requirement_and_compatibility(
+                        &source.source_id,
+                        &file_cache_entries,
+                        false,
+                        &compatible_scan_signatures,
+                    ) {
+                    Ok(selection) => selection,
+                    Err(e) => {
+                        eprintln!(
+                            "daemon: scan cache lookup failed for {}: {e}",
+                            source.path_label.as_deref().unwrap_or("unknown")
+                        );
+                        continue;
+                    }
+                };
+                let pending_file_entries = selection.pending_entries;
+                let compatible_entries_to_upgrade = selection.compatible_entries_to_upgrade;
+                let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
                 let verification_mode = source.verification_mode.clone();
                 let probed_verified_source_state =
                     if matches!(verification_mode, SourceVerificationMode::Disabled) {
@@ -395,6 +405,7 @@ mod watch {
                             }
                         };
                 if pending_file_entries.is_empty()
+                    && !has_cache_entry_upgrades
                     && !verified_state_changed
                     && !legacy_verified_state_needs_reconciliation
                 {
@@ -443,8 +454,15 @@ mod watch {
                             continue;
                         }
                         if pending_file_entries.is_empty() {
+                            if let Err(e) = store.upgrade_scan_file_entries(
+                                &source.source_id,
+                                &compatible_entries_to_upgrade,
+                            ) {
+                                eprintln!("daemon: upgrade scan cache failed: {e}");
+                                continue;
+                            }
                             eprintln!(
-                                "daemon: reconciled auth state for {} ({})",
+                                "daemon: reconciled auth/cache state for {} ({})",
                                 source.provider,
                                 source.path_label.as_deref().unwrap_or("unknown")
                             );
@@ -477,6 +495,13 @@ mod watch {
                             store.record_scan_file_entries(&source.source_id, &pending_file_entries)
                         {
                             eprintln!("daemon: update scan cache failed: {e}");
+                            continue;
+                        }
+                        if let Err(e) = store.upgrade_scan_file_entries(
+                            &source.source_id,
+                            &compatible_entries_to_upgrade,
+                        ) {
+                            eprintln!("daemon: upgrade scan cache failed: {e}");
                             continue;
                         }
                         eprintln!(
@@ -550,6 +575,21 @@ mod watch {
             .map(|candidate| ScanFileStateEntry {
                 cache_key: candidate.cache_key.clone(),
                 cache_signature: candidate.cache_signature.clone(),
+            })
+            .collect()
+    }
+
+    fn scan_candidate_compatible_signatures(
+        candidates: &[ScanCandidateFile],
+    ) -> HashMap<String, Vec<String>> {
+        candidates
+            .iter()
+            .filter(|candidate| !candidate.compatible_cache_signatures.is_empty())
+            .map(|candidate| {
+                (
+                    candidate.cache_key.clone(),
+                    candidate.compatible_cache_signatures.clone(),
+                )
             })
             .collect()
     }

@@ -73,6 +73,7 @@ pub struct ScanCandidateFile {
     pub path: PathBuf,
     pub cache_key: String,
     pub cache_signature: String,
+    pub compatible_cache_signatures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1626,14 +1627,19 @@ fn codex_jsonl_candidates(
     path: &Path,
     cache_namespace: &str,
 ) -> Result<Vec<ScanCandidateFile>> {
-    let root = codex_source_root(path);
     let roots = codex_usage_roots(path);
-    let auth_dependency = Some(file_metadata_signature(&root.join("auth.json")));
-    let dependency = auth_dependency.as_deref();
+    let legacy_auth_dependencies = vec![codex_legacy_auth_dependency_signature(
+        &codex_source_root(path),
+    )];
     let mut candidates = Vec::new();
     for usage_root in roots {
         for candidate_path in collect_jsonl_files(&usage_root)? {
-            candidates.push(scan_candidate(candidate_path, dependency, cache_namespace));
+            candidates.push(scan_candidate_with_compatible_dependencies(
+                candidate_path,
+                None,
+                &legacy_auth_dependencies,
+                cache_namespace,
+            ));
         }
     }
     Ok(candidates)
@@ -1759,16 +1765,42 @@ fn scan_candidate(
     dependency_signature: Option<&str>,
     cache_namespace: &str,
 ) -> ScanCandidateFile {
+    scan_candidate_with_compatible_dependencies(path, dependency_signature, &[], cache_namespace)
+}
+
+fn scan_candidate_with_compatible_dependencies(
+    path: PathBuf,
+    dependency_signature: Option<&str>,
+    compatible_dependency_signatures: &[String],
+    cache_namespace: &str,
+) -> ScanCandidateFile {
     let cache_key = canonical_display(&path);
     let file_signature = file_metadata_signature(&path);
-    let cache_signature = dependency_signature
-        .map(|dependency| hash_text(&format!("{cache_namespace}:{file_signature}:{dependency}")))
-        .unwrap_or_else(|| hash_text(&format!("{cache_namespace}:{file_signature}")));
+    let cache_signature =
+        build_scan_cache_signature(cache_namespace, &file_signature, dependency_signature);
+    let compatible_cache_signatures = compatible_dependency_signatures
+        .iter()
+        .map(|dependency| {
+            build_scan_cache_signature(cache_namespace, &file_signature, Some(dependency.as_str()))
+        })
+        .filter(|signature| signature != &cache_signature)
+        .collect();
     ScanCandidateFile {
         path,
         cache_key,
         cache_signature,
+        compatible_cache_signatures,
     }
+}
+
+fn build_scan_cache_signature(
+    cache_namespace: &str,
+    file_signature: &str,
+    dependency_signature: Option<&str>,
+) -> String {
+    dependency_signature
+        .map(|dependency| hash_text(&format!("{cache_namespace}:{file_signature}:{dependency}")))
+        .unwrap_or_else(|| hash_text(&format!("{cache_namespace}:{file_signature}")))
 }
 
 fn scan_cache_namespace(source: &SourceLocation, adapter_version: &str) -> String {
@@ -1817,6 +1849,10 @@ fn file_metadata_signature(path: &Path) -> String {
         created_seconds,
         created_nanos
     ))
+}
+
+fn codex_legacy_auth_dependency_signature(root: &Path) -> String {
+    file_metadata_signature(&root.join("auth.json"))
 }
 
 struct FileParseContext<'a, A: ProviderAdapter + ?Sized> {
@@ -7114,7 +7150,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_scan_candidates_change_when_auth_json_changes() {
+    fn codex_scan_candidates_ignore_auth_json_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).expect("sessions");
@@ -7150,7 +7186,84 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
         assert_eq!(first[0].cache_key, canonical_display(&session_path));
-        assert_ne!(first[0].cache_signature, second[0].cache_signature);
+        assert_eq!(first[0].cache_signature, second[0].cache_signature);
+    }
+
+    #[test]
+    fn codex_scan_candidates_accept_legacy_auth_dependent_signatures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let session_path = sessions.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("session");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            "{\"chatgpt_account_id\":\"acct-one\"}\n",
+        )
+        .expect("auth");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+        let candidates = codex_scan_candidates(&source, "test-adapter").expect("candidates");
+        let auth_dependency =
+            file_metadata_signature(&codex_source_root(dir.path()).join("auth.json"));
+        let cache_namespace = scan_cache_namespace(&source, "test-adapter");
+        let legacy_candidate = scan_candidate(
+            session_path.clone(),
+            Some(auth_dependency.as_str()),
+            &cache_namespace,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].compatible_cache_signatures,
+            vec![legacy_candidate.cache_signature]
+        );
+    }
+
+    #[test]
+    fn codex_scan_candidates_accept_legacy_missing_auth_signatures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let session_path = sessions.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("session");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+        let candidates = codex_scan_candidates(&source, "test-adapter").expect("candidates");
+        let auth_dependency =
+            file_metadata_signature(&codex_source_root(dir.path()).join("auth.json"));
+        let cache_namespace = scan_cache_namespace(&source, "test-adapter");
+        let legacy_candidate = scan_candidate(
+            session_path.clone(),
+            Some(auth_dependency.as_str()),
+            &cache_namespace,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].compatible_cache_signatures,
+            vec![legacy_candidate.cache_signature]
+        );
     }
 
     #[test]

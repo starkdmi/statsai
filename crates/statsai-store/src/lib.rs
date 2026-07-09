@@ -16,7 +16,7 @@ use statsai_core::{
     MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
     SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
     SourceKind, SourceLocation, SourceVerificationMode, Subscription, SubscriptionId,
-    SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage,
+    SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage, SyncBatch,
     TaskVerificationCursor, TaskVerificationId, UsageCounts, UsageEvent, UsageSummary,
     VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
     SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
@@ -24,6 +24,7 @@ use statsai_core::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::time::Duration;
 
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
@@ -31,6 +32,19 @@ pub use tasks::{
 };
 
 const SYNC_ROLLUP_SUMMARY_VERSION: &str = "10";
+const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
+const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
+const SQLITE_BUSY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
+const SQLITE_BUSY_RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::from_millis(75)
+} else {
+    Duration::from_millis(250)
+};
+const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 3;
 
 fn summary_sync_payload_hash(summary: &UsageSummary) -> Result<String> {
     let payload = serde_json::to_string(&sanitize_summary_for_sync(summary.clone()))?;
@@ -72,6 +86,24 @@ pub struct PendingSyncSummaryCounts {
     pub days: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyncPreferences {
+    pub include_projects: bool,
+    pub include_tasks: bool,
+}
+
+impl SyncPreferences {
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        let include_projects = self.include_projects || self.include_tasks;
+        let include_tasks = self.include_tasks && include_projects;
+        Self {
+            include_projects,
+            include_tasks,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncState {
     pub sink: String,
@@ -98,6 +130,12 @@ pub struct TaskBucketSyncStatus {
 pub struct ScanFileStateEntry {
     pub cache_key: String,
     pub cache_signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScanFileStateSelection {
+    pub pending_entries: Vec<ScanFileStateEntry>,
+    pub compatible_entries_to_upgrade: Vec<ScanFileStateEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -237,9 +275,27 @@ fn merge_additive_source_totals(existing: &mut SourceUsageTotals, incoming: Sour
 }
 
 fn sanitize_summary_for_default_http_sync(summary: UsageSummary) -> UsageSummary {
+    sanitize_summary_for_http_sync(summary, false)
+}
+
+fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
+    summary.metadata.summary_format == "daily_rollup.v1"
+}
+
+fn sanitize_summary_for_http_sync(summary: UsageSummary, include_projects: bool) -> UsageSummary {
     let mut summary = sanitize_summary_for_sync(summary);
-    summary.project = None;
+    if !include_projects {
+        summary.project = None;
+    }
     summary
+}
+
+fn parse_bool_metadata_value(key: &str, value: &str) -> Result<bool> {
+    match value.trim() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        other => bail!("invalid boolean metadata value for {key}: {other}"),
+    }
 }
 
 fn summary_sync_day(summary: &UsageSummary) -> NaiveDate {
@@ -366,7 +422,7 @@ impl Store {
         }
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         restrict_file_permissions(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         let store = Self { conn };
         store.migrate()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
@@ -377,10 +433,25 @@ impl Store {
         let store = Self {
             conn: Connection::open_in_memory()?,
         };
-        store.conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        store.conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         store.migrate()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
+    }
+
+    fn with_immediate_transaction<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        begin_immediate_transaction_with_retry(&self.conn)?;
+        let result = operation();
+        match result {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
     }
 
     pub fn migrate(&self) -> Result<()> {
@@ -396,7 +467,31 @@ impl Store {
         source_id: &SourceId,
         entries: &[ScanFileStateEntry],
     ) -> Result<Vec<ScanFileStateEntry>> {
-        self.pending_scan_file_entries_with_task_requirement(source_id, entries, false)
+        let compatible_signatures = HashMap::new();
+        Ok(self
+            .select_scan_file_state_entries_with_task_requirement_and_compatibility(
+                source_id,
+                entries,
+                false,
+                &compatible_signatures,
+            )?
+            .pending_entries)
+    }
+
+    pub fn pending_scan_file_entries_with_compatibility(
+        &self,
+        source_id: &SourceId,
+        entries: &[ScanFileStateEntry],
+        compatible_signatures_by_key: &HashMap<String, Vec<String>>,
+    ) -> Result<Vec<ScanFileStateEntry>> {
+        Ok(self
+            .select_scan_file_state_entries_with_task_requirement_and_compatibility(
+                source_id,
+                entries,
+                false,
+                compatible_signatures_by_key,
+            )?
+            .pending_entries)
     }
 
     pub fn pending_scan_file_entries_with_task_requirement(
@@ -405,7 +500,43 @@ impl Store {
         entries: &[ScanFileStateEntry],
         require_tasks_collected: bool,
     ) -> Result<Vec<ScanFileStateEntry>> {
-        let mut pending = Vec::with_capacity(entries.len());
+        let compatible_signatures = HashMap::new();
+        Ok(self
+            .select_scan_file_state_entries_with_task_requirement_and_compatibility(
+                source_id,
+                entries,
+                require_tasks_collected,
+                &compatible_signatures,
+            )?
+            .pending_entries)
+    }
+
+    pub fn pending_scan_file_entries_with_task_requirement_and_compatibility(
+        &self,
+        source_id: &SourceId,
+        entries: &[ScanFileStateEntry],
+        require_tasks_collected: bool,
+        compatible_signatures_by_key: &HashMap<String, Vec<String>>,
+    ) -> Result<Vec<ScanFileStateEntry>> {
+        Ok(self
+            .select_scan_file_state_entries_with_task_requirement_and_compatibility(
+                source_id,
+                entries,
+                require_tasks_collected,
+                compatible_signatures_by_key,
+            )?
+            .pending_entries)
+    }
+
+    pub fn select_scan_file_state_entries_with_task_requirement_and_compatibility(
+        &self,
+        source_id: &SourceId,
+        entries: &[ScanFileStateEntry],
+        require_tasks_collected: bool,
+        compatible_signatures_by_key: &HashMap<String, Vec<String>>,
+    ) -> Result<ScanFileStateSelection> {
+        let mut selection = ScanFileStateSelection::default();
+        selection.pending_entries.reserve(entries.len());
         let mut stmt = self.conn.prepare(
             "SELECT cache_signature, tasks_collected FROM scan_file_state WHERE source_id = ?1 AND cache_key = ?2",
         )?;
@@ -415,17 +546,31 @@ impl Store {
                     Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
                 })
                 .optional()?;
-            let is_current = existing
-                .as_ref()
-                .is_some_and(|(signature, tasks_collected)| {
-                    signature == &entry.cache_signature
-                        && (!require_tasks_collected || *tasks_collected)
+            let Some((signature, tasks_collected)) = existing.as_ref() else {
+                selection.pending_entries.push(entry.clone());
+                continue;
+            };
+            let tasks_satisfied = !require_tasks_collected || *tasks_collected;
+            if signature == &entry.cache_signature {
+                if !tasks_satisfied {
+                    selection.pending_entries.push(entry.clone());
+                }
+                continue;
+            }
+            let compatible_match = compatible_signatures_by_key
+                .get(&entry.cache_key)
+                .is_some_and(|compatible| {
+                    compatible
+                        .iter()
+                        .any(|candidate_signature| candidate_signature == signature)
                 });
-            if !is_current {
-                pending.push(entry.clone());
+            if compatible_match && tasks_satisfied {
+                selection.compatible_entries_to_upgrade.push(entry.clone());
+            } else {
+                selection.pending_entries.push(entry.clone());
             }
         }
-        Ok(pending)
+        Ok(selection)
     }
 
     pub fn record_scan_file_entries(
@@ -447,7 +592,7 @@ impl Store {
         }
         let synced_at = Utc::now().to_rfc3339();
         let tasks_collected = i64::from(tasks_collected);
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut stmt = self.conn.prepare(
                 r#"
@@ -471,6 +616,49 @@ impl Store {
                     &entry.cache_signature,
                     &synced_at,
                     tasks_collected,
+                ])?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn upgrade_scan_file_entries(
+        &self,
+        source_id: &SourceId,
+        entries: &[ScanFileStateEntry],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let synced_at = Utc::now().to_rfc3339();
+        begin_immediate_transaction_with_retry(&self.conn)?;
+        let result = (|| {
+            let mut stmt = self.conn.prepare(
+                r#"
+                UPDATE scan_file_state
+                   SET cache_signature = ?3,
+                       synced_at = ?4
+                 WHERE source_id = ?1
+                   AND cache_key = ?2
+                "#,
+            )?;
+            for entry in entries {
+                stmt.execute(params![
+                    &source_id.0,
+                    &entry.cache_key,
+                    &entry.cache_signature,
+                    &synced_at,
                 ])?;
             }
             Ok(())
@@ -512,7 +700,7 @@ impl Store {
         if cache_keys.is_empty() {
             return Ok(0);
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut deleted = 0u64;
             let mut stmt = self
@@ -537,7 +725,7 @@ impl Store {
     }
 
     pub fn delete_scan_file_entries_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut deleted = 0u64;
             for source_id in source_ids {
@@ -805,7 +993,7 @@ impl Store {
     }
 
     pub fn delete_source(&self, source_id: &SourceId) -> Result<bool> {
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             self.conn.execute(
                 "DELETE FROM source_account_assignments WHERE source_id = ?1",
@@ -1073,6 +1261,43 @@ impl Store {
         Ok(())
     }
 
+    pub fn sync_preferences(&self) -> Result<SyncPreferences> {
+        let include_projects = self
+            .metadata_value(SYNC_INCLUDE_PROJECTS_METADATA_KEY)?
+            .as_deref()
+            .map(|value| parse_bool_metadata_value(SYNC_INCLUDE_PROJECTS_METADATA_KEY, value))
+            .transpose()?
+            .unwrap_or(false);
+        let include_tasks = self
+            .metadata_value(SYNC_INCLUDE_TASKS_METADATA_KEY)?
+            .as_deref()
+            .map(|value| parse_bool_metadata_value(SYNC_INCLUDE_TASKS_METADATA_KEY, value))
+            .transpose()?
+            .unwrap_or(false);
+        Ok(SyncPreferences {
+            include_projects,
+            include_tasks,
+        }
+        .normalized())
+    }
+
+    pub fn set_sync_preferences(&self, preferences: SyncPreferences) -> Result<()> {
+        let preferences = preferences.normalized();
+        self.set_metadata_value(
+            SYNC_INCLUDE_PROJECTS_METADATA_KEY,
+            if preferences.include_projects {
+                "1"
+            } else {
+                "0"
+            },
+        )?;
+        self.set_metadata_value(
+            SYNC_INCLUDE_TASKS_METADATA_KEY,
+            if preferences.include_tasks { "1" } else { "0" },
+        )?;
+        Ok(())
+    }
+
     pub fn insert_event(&self, event: &UsageEvent) -> Result<bool> {
         let event = event_with_valid_project(event);
         let fingerprint = event_fingerprint(&event);
@@ -1137,7 +1362,7 @@ impl Store {
             .collect();
         let mut conflict_map = self.batch_load_conflicts(&conflict_keys)?;
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut inserted = 0u64;
             let mut canonical_event_ids = HashMap::with_capacity(events.len());
@@ -1532,7 +1757,7 @@ impl Store {
         if events.is_empty() {
             return Ok(0);
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut changed = 0u64;
             let mut dirty_keys = BTreeSet::new();
@@ -1557,7 +1782,7 @@ impl Store {
     }
 
     pub fn delete_events_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut deleted = 0u64;
             for source_id in source_ids {
@@ -1591,7 +1816,7 @@ impl Store {
             return Ok(0);
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut deleted = 0u64;
             let mut dirty_keys = BTreeSet::new();
@@ -1678,7 +1903,7 @@ impl Store {
     }
 
     pub fn upsert_summaries(&self, summaries: &[UsageSummary]) -> Result<u64> {
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut changed = 0u64;
             for summary in summaries {
@@ -1710,7 +1935,7 @@ impl Store {
             return Ok(0);
         }
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut deleted = 0u64;
             for file_hash in file_hashes {
@@ -1766,7 +1991,7 @@ impl Store {
         if summaries.is_empty() {
             return Ok(0);
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut changed = 0u64;
             for summary in summaries {
@@ -1858,7 +2083,7 @@ impl Store {
     }
 
     pub fn clear_sync_tracking(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             self.conn.execute("DELETE FROM entity_sync_state", [])?;
             self.conn
@@ -1880,7 +2105,7 @@ impl Store {
     }
 
     pub fn clear_sync_tracking_for_target(&self, sink: &str, target: &str) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             self.conn.execute(
                 "DELETE FROM entity_sync_state WHERE sink = ?1 AND target = ?2",
@@ -2007,6 +2232,77 @@ impl Store {
         Ok(())
     }
 
+    fn sync_batch_task_verification_cursor(batch: &SyncBatch) -> Option<TaskVerificationCursor> {
+        batch
+            .task_buckets
+            .iter()
+            .filter_map(|bucket| bucket.applied_verification_cursor.clone())
+            .max_by(|left, right| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| left.verification_id.0.cmp(&right.verification_id.0))
+            })
+    }
+
+    pub fn record_rollup_chunk_sync_success(
+        &self,
+        sink: &str,
+        target: &str,
+        logical_batch_id: &str,
+        batch: &SyncBatch,
+    ) -> Result<()> {
+        self.ensure_current_sync_rollup_versions()?;
+        let passthrough_summaries: Vec<_> = batch
+            .summaries
+            .iter()
+            .filter(|summary| !is_daily_rollup_summary(summary))
+            .cloned()
+            .collect();
+        let rollup_summary_ids: Vec<_> = batch
+            .summaries
+            .iter()
+            .filter(|summary| is_daily_rollup_summary(summary))
+            .map(|summary| summary.summary_id.clone())
+            .collect();
+        let rollup_summaries = self.all_sync_rollup_summaries()?;
+        let task_verification_cursor = Self::sync_batch_task_verification_cursor(batch);
+
+        self.with_immediate_transaction(|| {
+            self.record_sync_success(
+                sink,
+                target,
+                logical_batch_id,
+                &batch.events,
+                &passthrough_summaries,
+                task_verification_cursor.as_ref(),
+            )?;
+            self.mark_pending_sync_resume(sink, target, logical_batch_id)?;
+            self.mark_sync_rollups_synced_in_transaction(&rollup_summary_ids)?;
+            self.reconcile_sync_rollup_dirty_flags_in_transaction(sink, target, &rollup_summaries)?;
+            self.record_summaries_synced_in_transaction(sink, target, &batch.summaries)?;
+            self.record_sources_synced_in_transaction(sink, target, &batch.sources)?;
+            self.record_accounts_synced_in_transaction(sink, target, &batch.accounts)?;
+            self.record_source_account_assignments_synced_in_transaction(
+                sink,
+                target,
+                &batch.source_account_assignments,
+            )?;
+            self.record_subscriptions_synced_in_transaction(sink, target, &batch.subscriptions)?;
+            self.record_task_bucket_snapshots_synced_in_transaction(
+                sink,
+                target,
+                &batch.device_id,
+                &batch.task_buckets,
+            )?;
+            self.record_task_verifications_synced_in_transaction(
+                sink,
+                target,
+                &batch.task_verifications,
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn sync_task_verification_cursor(
         &self,
         sink: &str,
@@ -2100,7 +2396,7 @@ impl Store {
     }
 
     pub fn delete_summaries_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut deleted = 0u64;
             for source_id in source_ids {
@@ -2125,7 +2421,7 @@ impl Store {
     }
 
     pub fn delete_summaries(&self, summary_ids: &[SummaryId]) -> Result<u64> {
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             let mut deleted = 0u64;
             for summary_id in summary_ids {
@@ -2181,27 +2477,19 @@ impl Store {
         if summary_ids.is_empty() {
             return Ok(());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            for summary_id in summary_ids {
-                self.conn.execute(
-                    "UPDATE sync_rollups SET dirty = 0 WHERE summary_id = ?1",
-                    params![&summary_id.0],
-                )?;
-            }
-            Ok(())
-        })();
+        self.with_immediate_transaction(|| {
+            self.mark_sync_rollups_synced_in_transaction(summary_ids)
+        })
+    }
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
+    fn mark_sync_rollups_synced_in_transaction(&self, summary_ids: &[SummaryId]) -> Result<()> {
+        for summary_id in summary_ids {
+            self.conn.execute(
+                "UPDATE sync_rollups SET dirty = 0 WHERE summary_id = ?1",
+                params![&summary_id.0],
+            )?;
         }
+        Ok(())
     }
 
     pub fn mark_all_sync_rollups_dirty(&self) -> Result<u64> {
@@ -2216,23 +2504,11 @@ impl Store {
         let events = self.events()?;
         let keys: BTreeSet<_> = events.iter().map(sync_rollup_bucket_key).collect();
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             self.conn.execute("DELETE FROM sync_rollups", [])?;
             self.refresh_sync_rollups_for_keys(&keys)?;
             Ok(keys.len() as u64)
-        })();
-
-        match result {
-            Ok(count) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(count)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     fn ensure_current_sync_rollup_versions(&self) -> Result<()> {
@@ -2360,10 +2636,18 @@ impl Store {
     }
 
     pub fn pending_http_sync_rollup_summaries(&self, target: &str) -> Result<Vec<UsageSummary>> {
+        self.pending_http_sync_rollup_summaries_with_projects(target, false)
+    }
+
+    pub fn pending_http_sync_rollup_summaries_with_projects(
+        &self,
+        target: &str,
+        include_projects: bool,
+    ) -> Result<Vec<UsageSummary>> {
         let rollups = self
             .all_sync_rollup_summaries()?
             .into_iter()
-            .map(sanitize_summary_for_default_http_sync)
+            .map(|summary| sanitize_summary_for_http_sync(summary, include_projects))
             .collect::<Vec<_>>();
         self.pending_summaries_for_sync("http", target, &rollups)
     }
@@ -2372,8 +2656,18 @@ impl Store {
         &self,
         target: &str,
     ) -> Result<PendingSyncSummaryCounts> {
-        let rollups = self.pending_http_sync_rollup_summaries(target)?;
-        let passthrough_summaries = self.pending_http_passthrough_summaries(target)?;
+        self.pending_http_sync_summary_counts_with_projects(target, false)
+    }
+
+    pub fn pending_http_sync_summary_counts_with_projects(
+        &self,
+        target: &str,
+        include_projects: bool,
+    ) -> Result<PendingSyncSummaryCounts> {
+        let rollups =
+            self.pending_http_sync_rollup_summaries_with_projects(target, include_projects)?;
+        let passthrough_summaries =
+            self.pending_http_passthrough_summaries_with_projects(target, include_projects)?;
         let mut days = collect_pending_summary_days(rollups.iter());
         days.extend(collect_pending_summary_days(passthrough_summaries.iter()));
         Ok(PendingSyncSummaryCounts {
@@ -2384,12 +2678,16 @@ impl Store {
         })
     }
 
-    fn pending_http_passthrough_summaries(&self, target: &str) -> Result<Vec<UsageSummary>> {
+    fn pending_http_passthrough_summaries_with_projects(
+        &self,
+        target: &str,
+        include_projects: bool,
+    ) -> Result<Vec<UsageSummary>> {
         let summaries = self
             .summaries()?
             .into_iter()
             .filter(is_http_rollup_passthrough_summary)
-            .map(sanitize_summary_for_default_http_sync)
+            .map(|summary| sanitize_summary_for_http_sync(summary, include_projects))
             .collect::<Vec<_>>();
         self.pending_summaries_for_sync("http", target, &summaries)
     }
@@ -2549,11 +2847,10 @@ impl Store {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
 
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut updated = 0u64;
-            for (summary_id, payload) in rows {
-                let summary: UsageSummary = serde_json::from_str(&payload)?;
+            for (summary_id, payload) in &rows {
+                let summary: UsageSummary = serde_json::from_str(payload)?;
                 let payload_hash = summary_sync_payload_hash(&summary)?;
                 updated += self.conn.execute(
                     "UPDATE sync_rollups SET payload_hash = ?1 WHERE summary_id = ?2 AND payload_hash != ?1",
@@ -2561,18 +2858,7 @@ impl Store {
                 )? as u64;
             }
             Ok(updated)
-        })();
-
-        match result {
-            Ok(updated) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(updated)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     fn pending_sync_rollup_counts(&self, sink: &str, target: &str) -> Result<(u64, u64)> {
@@ -2589,38 +2875,35 @@ impl Store {
     pub fn reconcile_sync_rollup_dirty_flags(&self, sink: &str, target: &str) -> Result<u64> {
         self.ensure_current_sync_rollup_versions()?;
         let summaries = self.all_sync_rollup_summaries()?;
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            let mut cleared = 0u64;
-            for summary in summaries {
-                let payload_hash = summary_sync_payload_hash(&summary)?;
-                if self.entity_requires_sync(
-                    sink,
-                    target,
-                    "summary",
-                    &summary.summary_id.0,
-                    &payload_hash,
-                )? {
-                    continue;
-                }
-                cleared += self.conn.execute(
-                    "UPDATE sync_rollups SET dirty = 0 WHERE summary_id = ?1 AND dirty = 1",
-                    params![&summary.summary_id.0],
-                )? as u64;
-            }
-            Ok(cleared)
-        })();
+        self.with_immediate_transaction(|| {
+            self.reconcile_sync_rollup_dirty_flags_in_transaction(sink, target, &summaries)
+        })
+    }
 
-        match result {
-            Ok(cleared) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(cleared)
+    fn reconcile_sync_rollup_dirty_flags_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        summaries: &[UsageSummary],
+    ) -> Result<u64> {
+        let mut cleared = 0u64;
+        for summary in summaries {
+            let payload_hash = summary_sync_payload_hash(summary)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                "summary",
+                &summary.summary_id.0,
+                &payload_hash,
+            )? {
+                continue;
             }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
+            cleared += self.conn.execute(
+                "UPDATE sync_rollups SET dirty = 0 WHERE summary_id = ?1 AND dirty = 1",
+                params![&summary.summary_id.0],
+            )? as u64;
         }
+        Ok(cleared)
     }
 
     pub fn record_sources_synced(
@@ -2632,31 +2915,28 @@ impl Store {
         if sources.is_empty() {
             return Ok(());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            for source in sources {
-                let payload = serde_json::to_string(source)?;
-                self.record_entity_synced(
-                    sink,
-                    target,
-                    "source",
-                    &source.source_id.0,
-                    &hash_text(&payload),
-                )?;
-            }
-            Ok(())
-        })();
+        self.with_immediate_transaction(|| {
+            self.record_sources_synced_in_transaction(sink, target, sources)
+        })
+    }
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
+    fn record_sources_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        sources: &[SourceLocation],
+    ) -> Result<()> {
+        for source in sources {
+            let payload = serde_json::to_string(source)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                "source",
+                &source.source_id.0,
+                &hash_text(&payload),
+            )?;
         }
+        Ok(())
     }
 
     pub fn record_accounts_synced(
@@ -2668,31 +2948,28 @@ impl Store {
         if accounts.is_empty() {
             return Ok(());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            for account in accounts {
-                let payload = serde_json::to_string(account)?;
-                self.record_entity_synced(
-                    sink,
-                    target,
-                    "account",
-                    &account.provider_account_id.0,
-                    &hash_text(&payload),
-                )?;
-            }
-            Ok(())
-        })();
+        self.with_immediate_transaction(|| {
+            self.record_accounts_synced_in_transaction(sink, target, accounts)
+        })
+    }
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
+    fn record_accounts_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        accounts: &[ProviderAccount],
+    ) -> Result<()> {
+        for account in accounts {
+            let payload = serde_json::to_string(account)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                "account",
+                &account.provider_account_id.0,
+                &hash_text(&payload),
+            )?;
         }
+        Ok(())
     }
 
     pub fn record_source_account_assignments_synced(
@@ -2704,31 +2981,28 @@ impl Store {
         if assignments.is_empty() {
             return Ok(());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            for assignment in assignments {
-                let payload = serde_json::to_string(assignment)?;
-                self.record_entity_synced(
-                    sink,
-                    target,
-                    "source_account_assignment",
-                    &assignment.assignment_id.0,
-                    &hash_text(&payload),
-                )?;
-            }
-            Ok(())
-        })();
+        self.with_immediate_transaction(|| {
+            self.record_source_account_assignments_synced_in_transaction(sink, target, assignments)
+        })
+    }
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
+    fn record_source_account_assignments_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        assignments: &[SourceAccountAssignment],
+    ) -> Result<()> {
+        for assignment in assignments {
+            let payload = serde_json::to_string(assignment)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                "source_account_assignment",
+                &assignment.assignment_id.0,
+                &hash_text(&payload),
+            )?;
         }
+        Ok(())
     }
 
     pub fn record_subscriptions_synced(
@@ -2740,31 +3014,28 @@ impl Store {
         if subscriptions.is_empty() {
             return Ok(());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            for subscription in subscriptions {
-                let payload = serde_json::to_string(subscription)?;
-                self.record_entity_synced(
-                    sink,
-                    target,
-                    "subscription",
-                    &subscription.subscription_id.0,
-                    &hash_text(&payload),
-                )?;
-            }
-            Ok(())
-        })();
+        self.with_immediate_transaction(|| {
+            self.record_subscriptions_synced_in_transaction(sink, target, subscriptions)
+        })
+    }
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
+    fn record_subscriptions_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        subscriptions: &[Subscription],
+    ) -> Result<()> {
+        for subscription in subscriptions {
+            let payload = serde_json::to_string(subscription)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                "subscription",
+                &subscription.subscription_id.0,
+                &hash_text(&payload),
+            )?;
         }
+        Ok(())
     }
 
     pub fn record_summaries_synced(
@@ -2776,31 +3047,28 @@ impl Store {
         if summaries.is_empty() {
             return Ok(());
         }
-        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-        let result = (|| {
-            for summary in summaries {
-                let payload_hash = summary_sync_payload_hash(summary)?;
-                self.record_entity_synced(
-                    sink,
-                    target,
-                    "summary",
-                    &summary.summary_id.0,
-                    &payload_hash,
-                )?;
-            }
-            Ok(())
-        })();
+        self.with_immediate_transaction(|| {
+            self.record_summaries_synced_in_transaction(sink, target, summaries)
+        })
+    }
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
+    fn record_summaries_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        summaries: &[UsageSummary],
+    ) -> Result<()> {
+        for summary in summaries {
+            let payload_hash = summary_sync_payload_hash(summary)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                "summary",
+                &summary.summary_id.0,
+                &payload_hash,
+            )?;
         }
+        Ok(())
     }
 
     pub fn compute_daily_rollup(&self, date: &str, device_id: &str) -> Result<DailyRollup> {
@@ -4449,6 +4717,38 @@ fn rollback(conn: &Connection) {
     }
 }
 
+fn begin_immediate_transaction_with_retry(conn: &Connection) -> Result<()> {
+    let mut last_busy_error = None;
+    for attempt in 0..=SQLITE_BUSY_RETRY_ATTEMPTS {
+        match conn.execute_batch("BEGIN IMMEDIATE TRANSACTION") {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_sqlite_busy_or_locked(&error) && attempt < SQLITE_BUSY_RETRY_ATTEMPTS =>
+            {
+                last_busy_error = Some(error);
+                std::thread::sleep(SQLITE_BUSY_RETRY_DELAY);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    match last_busy_error {
+        Some(error) => Err(error.into()),
+        None => bail!("failed to begin immediate SQLite transaction"),
+    }
+}
+
+fn is_sqlite_busy_or_locked(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 fn sync_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncState> {
     let last_success_at: String = row.get(2)?;
     let last_event_started_at: Option<String> = row.get(4)?;
@@ -4725,8 +5025,8 @@ mod tests {
     use statsai_core::{
         event_id, summary_id, Confidence, CostInfo, EventSource, LocationOrigin, ModelInfo,
         ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, SessionInfo,
-        SourceKind, SummaryMetadata, UsageCounts, UsageSummary, USAGE_EVENT_SCHEMA_VERSION,
-        USAGE_SUMMARY_SCHEMA_VERSION,
+        SourceKind, SummaryMetadata, UsageCounts, UsageSummary, SYNC_BATCH_SCHEMA_VERSION,
+        USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
     };
     use std::path::Path;
 
@@ -6292,6 +6592,52 @@ mod tests {
     }
 
     #[test]
+    fn scan_file_state_accepts_compatible_signatures() {
+        let store = Store::in_memory().expect("store");
+        let source_id = SourceId("src_scan_cache_compat".to_string());
+        let legacy = ScanFileStateEntry {
+            cache_key: "/tmp/a.jsonl".to_string(),
+            cache_signature: "legacy-auth-signature".to_string(),
+        };
+        store
+            .record_scan_file_entries(&source_id, std::slice::from_ref(&legacy))
+            .expect("record legacy cache state");
+
+        let current = ScanFileStateEntry {
+            cache_key: legacy.cache_key.clone(),
+            cache_signature: "current-signature".to_string(),
+        };
+        let compatible_signatures = HashMap::from([(
+            current.cache_key.clone(),
+            vec![legacy.cache_signature.clone()],
+        )]);
+
+        let selection = store
+            .select_scan_file_state_entries_with_task_requirement_and_compatibility(
+                &source_id,
+                std::slice::from_ref(&current),
+                false,
+                &compatible_signatures,
+            )
+            .expect("compatible selection");
+
+        assert!(selection.pending_entries.is_empty());
+        assert_eq!(
+            selection.compatible_entries_to_upgrade,
+            vec![current.clone()]
+        );
+
+        store
+            .upgrade_scan_file_entries(&source_id, &selection.compatible_entries_to_upgrade)
+            .expect("upgrade compatible entries");
+
+        let stored_entries = store
+            .scan_file_entries(&source_id)
+            .expect("stored scan file entries");
+        assert_eq!(stored_entries, vec![current]);
+    }
+
+    #[test]
     fn sync_state_tracks_success_and_filters_after_cursor() {
         let store = Store::in_memory().expect("store");
         let source = statsai_core::SourceLocation::local_adapter(
@@ -6430,6 +6776,88 @@ mod tests {
         assert_eq!(dirty[0].models[0].usage.total_tokens, Some(25));
         assert_eq!(dirty[0].models[1].usage.total_tokens, Some(15));
         assert_eq!(dirty[0].metadata.total_sessions, Some(1));
+    }
+
+    #[test]
+    fn record_rollup_chunk_sync_success_retries_busy_database() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("statsai.sqlite");
+        let store = Store::open(&db_path).expect("open store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-sync-rollup-retry"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 9, 10, 0, 0)
+            .single()
+            .expect("now");
+        let event = test_store_event(&source, now, "record-a");
+        assert!(store.insert_event(&event).expect("insert event"));
+        let summaries = store
+            .all_sync_rollup_summaries()
+            .expect("all sync rollup summaries");
+        assert_eq!(summaries.len(), 1);
+
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_retry_chunk_1".to_string(),
+            device_id: "device".to_string(),
+            sources: Vec::new(),
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: summaries.clone(),
+            task_buckets: Vec::new(),
+            task_verifications: Vec::new(),
+            created_at: now,
+        };
+
+        let db_path_for_lock = db_path.clone();
+        let (lock_ready_tx, lock_ready_rx) = std::sync::mpsc::channel();
+        let lock_thread = std::thread::spawn(move || {
+            let conn = Connection::open(&db_path_for_lock).expect("open lock connection");
+            conn.busy_timeout(Duration::from_millis(1))
+                .expect("lock busy timeout");
+            conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
+                .expect("begin lock");
+            lock_ready_tx.send(()).expect("signal lock ready");
+            std::thread::sleep(Duration::from_millis(200));
+            conn.execute_batch("COMMIT").expect("commit lock");
+        });
+        lock_ready_rx.recv().expect("wait for lock");
+
+        store
+            .record_rollup_chunk_sync_success(
+                "http",
+                "https://api.example.com/api/sync/batches",
+                "batch_retry_chunk",
+                &batch,
+            )
+            .expect("record rollup chunk sync success");
+
+        lock_thread.join().expect("join lock thread");
+
+        assert!(store
+            .dirty_sync_rollup_summaries()
+            .expect("dirty summaries after retry")
+            .is_empty());
+        let state = store
+            .sync_state("http", "https://api.example.com/api/sync/batches")
+            .expect("sync state")
+            .expect("sync state present");
+        assert_eq!(state.last_batch_id, "batch_retry_chunk");
+        assert_eq!(
+            state.pending_resume_batch_id.as_deref(),
+            Some("batch_retry_chunk")
+        );
     }
 
     #[test]
@@ -7513,6 +7941,88 @@ mod tests {
             .pending_http_sync_summary_counts(target)
             .expect("pending counts after sync");
         assert_eq!(counts.total, 0);
+    }
+
+    #[test]
+    fn pending_http_sync_summary_counts_with_projects_detect_opt_in_backfill() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "grok_build",
+            "test",
+            "0",
+            Path::new("/tmp/grok-project-opt-in-pending-sync-summary"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+        let target = "https://api.example.com/api/sync/batches";
+
+        let mut summary = test_store_summary(&source, now, 70);
+        summary.summary_id = summary_id(&source.provider, &source.source_id, "project-summary");
+        summary.source.source_kind = SourceKind::LocalAdapter;
+        summary.metadata.summary_format = "grok_build_session_summary".to_string();
+        summary.period_start = Some(now);
+        summary.period_end = Some(now);
+        summary.project = Some(ProjectInfo {
+            project_id: "project-repo-backed".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("repo-hash".to_string()),
+            repo_label: Some("owner/repo".to_string()),
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some("path-hash".to_string()),
+            path_label: Some("/Users/example/work/ai-stats".to_string()),
+        });
+        summary.privacy.contains_file_paths = true;
+        store.upsert_summary(&summary).expect("summary");
+
+        store
+            .record_summaries_synced(
+                "http",
+                target,
+                &[sanitize_summary_for_default_http_sync(summary.clone())],
+            )
+            .expect("record synced");
+
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts(target)
+                .expect("default payload counts")
+                .total,
+            0
+        );
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts_with_projects(target, true)
+                .expect("project payload counts")
+                .total,
+            1
+        );
+    }
+
+    #[test]
+    fn sync_preferences_round_trip_and_normalize_tasks() {
+        let store = Store::in_memory().expect("store");
+
+        assert_eq!(
+            store.sync_preferences().expect("default sync preferences"),
+            SyncPreferences::default()
+        );
+
+        store
+            .set_sync_preferences(SyncPreferences {
+                include_projects: false,
+                include_tasks: true,
+            })
+            .expect("save sync preferences");
+
+        assert_eq!(
+            store.sync_preferences().expect("stored sync preferences"),
+            SyncPreferences {
+                include_projects: true,
+                include_tasks: true,
+            }
+        );
     }
 
     fn test_store_event(

@@ -38,8 +38,8 @@ use statsai_store::{
     close_active_verified_source_linkages, derive_task_work_items,
     effective_verified_source_state_is_missing, find_existing_provider_account,
     has_active_verified_source_assignment, reconcile_verified_source_state,
-    upsert_provider_account, verified_source_state_hash, ScanFileStateEntry, Store, SyncState,
-    TaskRebuildReport, UpsertProviderAccountInput,
+    upsert_provider_account, verified_source_state_hash, ScanFileStateEntry, Store,
+    SyncPreferences, SyncState, TaskRebuildReport, UpsertProviderAccountInput,
 };
 use statsai_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -629,9 +629,27 @@ struct SyncCommand {
     dry_run: bool,
     #[arg(
         long,
-        help = "Include project metadata in synced usage payloads and enable hosted task sync"
+        help = "Enable project metadata sync for this device and future syncs"
     )]
     include_projects: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["include_projects", "include_tasks"],
+        help = "Disable project metadata sync for this device and future syncs"
+    )]
+    exclude_projects: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["exclude_tasks", "exclude_projects"],
+        help = "Enable hosted task sync for this device and future syncs (implies --include-projects)"
+    )]
+    include_tasks: bool,
+    #[arg(
+        long,
+        conflicts_with = "include_tasks",
+        help = "Disable hosted task sync for this device and future syncs"
+    )]
+    exclude_tasks: bool,
 }
 
 #[derive(Debug, Args)]
@@ -781,19 +799,24 @@ fn scan_with_adapters(
                 source.path_label = path_label_from_hashless_source(&source);
             }
             let cache_candidates = adapter.scan_candidates(&source)?;
+            let compatible_scan_signatures =
+                scan_candidate_compatible_signatures(&cache_candidates);
             let file_cache_entries = scan_file_state_entries(&cache_candidates);
             let file_reconciliation = select_scan_file_reconciliation(
                 store,
                 &source.source_id,
                 &file_cache_entries,
+                &compatible_scan_signatures,
                 command.replace,
                 command.no_cache,
                 command.include_tasks,
             )?;
             let pending_file_entries = file_reconciliation.pending_entries;
+            let compatible_entries_to_upgrade = file_reconciliation.compatible_entries_to_upgrade;
             let removed_file_entries = file_reconciliation.removed_entries;
             let touched_files =
                 !pending_file_entries.is_empty() || !removed_file_entries.is_empty();
+            let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let scan_all_current_files = !file_cache_entries.is_empty()
                 && pending_file_entries.len() == file_cache_entries.len();
             let needs_legacy_full_reconcile = !command.replace
@@ -890,6 +913,7 @@ fn scan_with_adapters(
             let source_summary_count = scan.summaries.len() as u64;
             let source_task_span_count = scan.task_spans.len() as u64;
             let has_scan_activity = touched_files
+                || (has_cache_entry_upgrades && !command.preview)
                 || source_event_count > 0
                 || source_summary_count > 0
                 || source_task_span_count > 0
@@ -904,6 +928,7 @@ fn scan_with_adapters(
                 && source_summary_count == 0
                 && source_task_span_count == 0
                 && !touched_files
+                && !has_cache_entry_upgrades
                 && !verified_state_changed
                 && !legacy_verified_state_needs_reconciliation;
 
@@ -1056,6 +1081,7 @@ fn scan_with_adapters(
                 cache_entries_to_record,
                 command.include_tasks,
             )?;
+            store.upgrade_scan_file_entries(&source.source_id, &compatible_entries_to_upgrade)?;
             let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
             store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
         }
@@ -3194,10 +3220,64 @@ fn export(command: ExportCommand, store: &Store) -> Result<()> {
     Ok(())
 }
 
+fn effective_sync_preferences(store: &Store, command: &SyncCommand) -> Result<SyncPreferences> {
+    let mut preferences = store.sync_preferences()?;
+    if command.include_projects {
+        preferences.include_projects = true;
+    }
+    if command.exclude_projects {
+        preferences.include_projects = false;
+        preferences.include_tasks = false;
+    }
+    if command.include_tasks {
+        preferences.include_projects = true;
+        preferences.include_tasks = true;
+    }
+    if command.exclude_tasks {
+        preferences.include_tasks = false;
+    }
+
+    Ok(preferences.normalized())
+}
+
+fn apply_sync_preference_overrides(
+    store: &Store,
+    command: &SyncCommand,
+) -> Result<SyncPreferences> {
+    let original = store.sync_preferences()?;
+    let preferences = effective_sync_preferences(store, command)?;
+    if preferences != original {
+        store.set_sync_preferences(preferences)?;
+        eprintln!(
+            "sync preferences updated: projects={} tasks={}",
+            if preferences.include_projects {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if preferences.include_tasks {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        if (!original.include_projects && preferences.include_projects)
+            || (!original.include_tasks && preferences.include_tasks)
+        {
+            eprintln!(
+                "sync preferences changed privacy/backfill scope; the next sync may resend historical summaries to update the hosted mirror"
+            );
+        }
+    }
+    Ok(preferences)
+}
+
 fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     if command.since_last && (command.full || command.rebuild_rollups) {
         bail!("--since-last cannot be combined with --full or --rebuild-rollups");
     }
+
+    let sync_preferences = effective_sync_preferences(store, &command)?;
 
     if command.reset_remote {
         if command.status || command.verify {
@@ -3215,19 +3295,24 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     }
 
     let target = sync_target(&command)?;
-    if command.sink == "http" {
+    if command.sink == "http" && !command.dry_run {
         maybe_reset_http_sync_tracking_if_remote_changed(&command, store, &target)?;
     }
     let (mut batch, payload_mode) = build_sync_batch(&command, store, device_id, &target)?;
-    let hosted_task_sync_enabled =
-        maybe_disable_http_hosted_task_sync_payload(&command, &target, &mut batch)?;
+    let hosted_task_sync_enabled = maybe_disable_http_hosted_task_sync_payload(
+        &command,
+        &target,
+        sync_preferences,
+        &mut batch,
+    )?;
 
     if command.dry_run {
         eprintln!(
-            "dry run: sink={} mode={} include_projects={} sources={} events={} summaries={} task_buckets={} task_verifications={}",
+            "dry run: sink={} mode={} include_projects={} include_tasks={} sources={} events={} summaries={} task_buckets={} task_verifications={}",
             command.sink,
             sync_payload_mode_name(payload_mode),
-            command.include_projects,
+            sync_preferences.include_projects,
+            sync_preferences.include_tasks,
             batch.sources.len(),
             batch.events.len(),
             batch.summaries.len()
@@ -3237,6 +3322,9 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
         );
         return Ok(());
     }
+
+    let persisted_sync_preferences = apply_sync_preference_overrides(store, &command)?;
+    debug_assert_eq!(persisted_sync_preferences, sync_preferences);
 
     let result = (|| -> Result<()> {
         match command.sink.as_str() {
@@ -3296,6 +3384,7 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
         return Ok(());
     }
 
+    let sync_preferences = effective_sync_preferences(store, command)?;
     let auth_token = resolve_http_auth_token(command, true)?
         .context("device login required; run `statsai auth login` first")?;
     let remote = http_remote_preflight_status(target, &auth_token)?;
@@ -3304,7 +3393,7 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
         "http",
         target,
         Some(&local_state),
-        command.include_projects,
+        sync_preferences.include_projects,
     )?;
     let batch_mismatch = !remote_sync_batch_matches_local_state(&remote, &local_state);
     let metadata_gap = remote_metadata_gap_reason(&remote, &local_verify);
@@ -3385,7 +3474,8 @@ fn build_sync_batch(
     device_id: &str,
     target: &str,
 ) -> Result<(SyncBatch, SyncPayloadMode)> {
-    let include_projects = command.include_projects;
+    let sync_preferences = effective_sync_preferences(store, command)?;
+    let include_projects = sync_preferences.include_projects;
     let payload_mode = sync_payload_mode(command)?;
     let state = if command.sink == "http" || command.since_last {
         store.sync_state(&command.sink, target)?
@@ -3480,7 +3570,7 @@ fn build_sync_batch(
     } else {
         all_subscriptions
     };
-    let (task_buckets, task_verifications) = if include_projects {
+    let (task_buckets, task_verifications) = if sync_preferences.include_tasks {
         let task_verification_cursor = if command.sink == "http" || command.since_last {
             store.sync_task_verification_cursor(&command.sink, target)?
         } else {
@@ -3616,47 +3706,7 @@ fn record_rollup_sync_chunk_success(
     logical_batch_id: &str,
     batch: &SyncBatch,
 ) -> Result<()> {
-    let passthrough_summaries: Vec<_> = batch
-        .summaries
-        .iter()
-        .filter(|summary| !is_daily_rollup_summary(summary))
-        .cloned()
-        .collect();
-    let rollup_summary_ids: Vec<_> = batch
-        .summaries
-        .iter()
-        .filter(|summary| is_daily_rollup_summary(summary))
-        .map(|summary| summary.summary_id.clone())
-        .collect();
-    let task_verification_cursor = sync_batch_task_verification_cursor(batch);
-
-    store.record_sync_success(
-        sink,
-        target,
-        logical_batch_id,
-        &batch.events,
-        &passthrough_summaries,
-        task_verification_cursor.as_ref(),
-    )?;
-    store.mark_pending_sync_resume(sink, target, logical_batch_id)?;
-    store.mark_sync_rollups_synced(&rollup_summary_ids)?;
-    store.reconcile_sync_rollup_dirty_flags(sink, target)?;
-    store.record_summaries_synced(sink, target, &batch.summaries)?;
-    store.record_sources_synced(sink, target, &batch.sources)?;
-    store.record_accounts_synced(sink, target, &batch.accounts)?;
-    store.record_source_account_assignments_synced(
-        sink,
-        target,
-        &batch.source_account_assignments,
-    )?;
-    store.record_subscriptions_synced(sink, target, &batch.subscriptions)?;
-    store.record_task_bucket_snapshots_synced(
-        sink,
-        target,
-        &batch.device_id,
-        &batch.task_buckets,
-    )?;
-    store.record_task_verifications_synced(sink, target, &batch.task_verifications)?;
+    store.record_rollup_chunk_sync_success(sink, target, logical_batch_id, batch)?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
 }
@@ -3690,12 +3740,13 @@ fn record_sync_batch_success(
 fn maybe_disable_http_hosted_task_sync_payload(
     command: &SyncCommand,
     target: &str,
+    sync_preferences: SyncPreferences,
     batch: &mut SyncBatch,
 ) -> Result<bool> {
     if command.sink != "http" {
-        return Ok(true);
+        return Ok(sync_preferences.include_tasks);
     }
-    if !command.include_projects {
+    if !sync_preferences.include_tasks {
         return Ok(false);
     }
     if http_remote_hosted_tasks_enabled(command, target)? {
@@ -4559,6 +4610,20 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
 }
 
 fn sync_status(store: &Store, device_id: &str) -> Result<()> {
+    let sync_preferences = store.sync_preferences()?;
+    println!(
+        "preferences projects={} tasks={}",
+        if sync_preferences.include_projects {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if sync_preferences.include_tasks {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     let states = store.list_sync_states()?;
     if states.is_empty() {
         println!("no sync state recorded");
@@ -4613,6 +4678,7 @@ fn sync_verify(command: SyncCommand, store: &Store, device_id: &str) -> Result<(
 fn sync_http_verify(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     let endpoint = http_sync_endpoint(&command)?;
     let local_state = store.sync_state("http", &endpoint)?;
+    let sync_preferences = effective_sync_preferences(store, &command)?;
     let auth_token = resolve_http_auth_token(&command, true)?
         .context("device login required; run `statsai auth login` first")?;
     let report = HttpVerifyReport {
@@ -4625,7 +4691,7 @@ fn sync_http_verify(command: SyncCommand, store: &Store, device_id: &str) -> Res
             "http",
             &endpoint,
             local_state.as_ref(),
-            command.include_projects,
+            sync_preferences.include_projects,
         )?,
         remote: http_remote_verify(&endpoint, &auth_token)?,
     };
@@ -5158,9 +5224,13 @@ fn doctor(store_path: &Path) -> Result<()> {
         );
         for source in sources {
             let candidates = adapter.scan_candidates(&source)?;
+            let compatible_scan_signatures = scan_candidate_compatible_signatures(&candidates);
             let file_cache_entries = scan_file_state_entries(&candidates);
-            let pending =
-                store.pending_scan_file_entries(&source.source_id, &file_cache_entries)?;
+            let pending = store.pending_scan_file_entries_with_compatibility(
+                &source.source_id,
+                &file_cache_entries,
+                &compatible_scan_signatures,
+            )?;
             let pending_keys: BTreeSet<_> = pending
                 .iter()
                 .map(|entry| entry.cache_key.as_str())
@@ -6603,9 +6673,25 @@ fn scan_file_state_entries(candidates: &[ScanCandidateFile]) -> Vec<ScanFileStat
         .collect()
 }
 
+fn scan_candidate_compatible_signatures(
+    candidates: &[ScanCandidateFile],
+) -> HashMap<String, Vec<String>> {
+    candidates
+        .iter()
+        .filter(|candidate| !candidate.compatible_cache_signatures.is_empty())
+        .map(|candidate| {
+            (
+                candidate.cache_key.clone(),
+                candidate.compatible_cache_signatures.clone(),
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScanFileReconciliation {
     pending_entries: Vec<ScanFileStateEntry>,
+    compatible_entries_to_upgrade: Vec<ScanFileStateEntry>,
     removed_entries: Vec<ScanFileStateEntry>,
 }
 
@@ -6613,14 +6699,16 @@ fn select_scan_file_reconciliation(
     store: &Store,
     source_id: &statsai_core::SourceId,
     file_cache_entries: &[ScanFileStateEntry],
+    compatible_signatures_by_key: &HashMap<String, Vec<String>>,
     replace: bool,
     no_cache: bool,
     require_tasks_collected: bool,
 ) -> Result<ScanFileReconciliation> {
-    let pending_entries = select_scan_file_entries(
+    let selection = select_scan_file_state_entries_with_task_requirement_and_compatibility(
         store,
         source_id,
         file_cache_entries,
+        compatible_signatures_by_key,
         replace,
         no_cache,
         require_tasks_collected,
@@ -6635,26 +6723,56 @@ fn select_scan_file_reconciliation(
         .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
         .collect();
     Ok(ScanFileReconciliation {
-        pending_entries,
+        pending_entries: selection.pending_entries,
+        compatible_entries_to_upgrade: selection.compatible_entries_to_upgrade,
         removed_entries,
     })
 }
 
+fn select_scan_file_state_entries_with_task_requirement_and_compatibility(
+    store: &Store,
+    source_id: &statsai_core::SourceId,
+    file_cache_entries: &[ScanFileStateEntry],
+    compatible_signatures_by_key: &HashMap<String, Vec<String>>,
+    replace: bool,
+    no_cache: bool,
+    require_tasks_collected: bool,
+) -> Result<statsai_store::ScanFileStateSelection> {
+    if replace || no_cache {
+        return Ok(statsai_store::ScanFileStateSelection {
+            pending_entries: file_cache_entries.to_vec(),
+            compatible_entries_to_upgrade: Vec::new(),
+        });
+    }
+    store.select_scan_file_state_entries_with_task_requirement_and_compatibility(
+        source_id,
+        file_cache_entries,
+        require_tasks_collected,
+        compatible_signatures_by_key,
+    )
+}
+
+#[cfg(test)]
 fn select_scan_file_entries(
     store: &Store,
     source_id: &statsai_core::SourceId,
     file_cache_entries: &[ScanFileStateEntry],
+    compatible_signatures_by_key: &HashMap<String, Vec<String>>,
     replace: bool,
     no_cache: bool,
     require_tasks_collected: bool,
 ) -> Result<Vec<ScanFileStateEntry>> {
-    if replace || no_cache {
-        return Ok(file_cache_entries.to_vec());
-    }
-    store.pending_scan_file_entries_with_task_requirement(
-        source_id,
-        file_cache_entries,
-        require_tasks_collected,
+    Ok(
+        select_scan_file_state_entries_with_task_requirement_and_compatibility(
+            store,
+            source_id,
+            file_cache_entries,
+            compatible_signatures_by_key,
+            replace,
+            no_cache,
+            require_tasks_collected,
+        )?
+        .pending_entries,
     )
 }
 
@@ -8988,6 +9106,108 @@ mod tests {
     }
 
     #[test]
+    fn scan_skips_files_when_legacy_codex_auth_signature_is_cached() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-legacy-auth-cache"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let file_path = "/tmp/codex-legacy-auth-cache/session.jsonl";
+        let current_candidate = ScanCandidateFile {
+            path: PathBuf::from(file_path),
+            cache_key: file_path.to_string(),
+            cache_signature: "sig-current".to_string(),
+            compatible_cache_signatures: vec!["sig-legacy-auth".to_string()],
+        };
+        store
+            .record_scan_file_entries(
+                &source.source_id,
+                &[ScanFileStateEntry {
+                    cache_key: current_candidate.cache_key.clone(),
+                    cache_signature: "sig-legacy-auth".to_string(),
+                }],
+            )
+            .expect("record legacy scan cache");
+
+        let scan_calls = Arc::new(Mutex::new(0u64));
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![current_candidate],
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: Some(scan_calls.clone()),
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
+
+        let stored_entries = store
+            .scan_file_entries(&source.source_id)
+            .expect("stored scan file entries");
+        assert_eq!(
+            stored_entries,
+            vec![ScanFileStateEntry {
+                cache_key: file_path.to_string(),
+                cache_signature: "sig-current".to_string(),
+            }]
+        );
+
+        let second_scan_calls = Arc::new(Mutex::new(0u64));
+        let rotated_legacy_adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![ScanCandidateFile {
+                path: PathBuf::from(file_path),
+                cache_key: file_path.to_string(),
+                cache_signature: "sig-current".to_string(),
+                compatible_cache_signatures: vec!["sig-legacy-auth-rotated".to_string()],
+            }],
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: Some(second_scan_calls.clone()),
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(rotated_legacy_adapter)],
+        )
+        .expect("second scan");
+
+        assert_eq!(*second_scan_calls.lock().expect("scan calls"), 0);
+    }
+
+    #[test]
     fn scan_reopens_existing_verified_assignment_when_auth_is_still_current() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
@@ -9838,6 +10058,98 @@ mod tests {
         .expect("sync dry run");
 
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn dry_run_sync_does_not_persist_sync_preferences() {
+        let store = Store::in_memory().expect("store");
+
+        sync(
+            SyncCommand {
+                dry_run: true,
+                include_projects: true,
+                ..test_sync_command("file")
+            },
+            &store,
+            "device",
+        )
+        .expect("sync dry run");
+
+        assert_eq!(
+            store.sync_preferences().expect("sync preferences"),
+            SyncPreferences::default()
+        );
+    }
+
+    #[test]
+    fn http_dry_run_does_not_require_auth_or_clear_sync_tracking() {
+        let store = Store::in_memory().expect("store");
+        let endpoint = "https://api.example.com/api/sync/batches".to_string();
+        store
+            .record_sync_success("http", &endpoint, "batch_local", &[], &[], None)
+            .expect("sync success");
+        let state_before = store
+            .sync_state("http", &endpoint)
+            .expect("sync state")
+            .expect("present");
+
+        let previous_api_url = std::env::var("STATSAI_API_URL").ok();
+        let previous_sync_token = std::env::var("STATSAI_SYNC_TOKEN").ok();
+        std::env::set_var(
+            "STATSAI_API_URL",
+            format!("https://{}-dry-run-authless.invalid", std::process::id()),
+        );
+        std::env::remove_var("STATSAI_SYNC_TOKEN");
+
+        let result = sync(
+            SyncCommand {
+                endpoint: Some(endpoint.clone()),
+                dry_run: true,
+                ..test_sync_command("http")
+            },
+            &store,
+            "device",
+        );
+
+        if let Some(value) = previous_api_url {
+            std::env::set_var("STATSAI_API_URL", value);
+        } else {
+            std::env::remove_var("STATSAI_API_URL");
+        }
+        if let Some(value) = previous_sync_token {
+            std::env::set_var("STATSAI_SYNC_TOKEN", value);
+        } else {
+            std::env::remove_var("STATSAI_SYNC_TOKEN");
+        }
+
+        result.expect("sync dry run");
+
+        let state_after = store
+            .sync_state("http", &endpoint)
+            .expect("sync state")
+            .expect("present");
+        assert_eq!(state_after, state_before);
+    }
+
+    #[test]
+    fn status_sync_does_not_persist_sync_preferences() {
+        let store = Store::in_memory().expect("store");
+
+        sync(
+            SyncCommand {
+                status: true,
+                include_tasks: true,
+                ..test_sync_command("file")
+            },
+            &store,
+            "device",
+        )
+        .expect("sync status");
+
+        assert_eq!(
+            store.sync_preferences().expect("sync preferences"),
+            SyncPreferences::default()
+        );
     }
 
     #[test]
@@ -12315,6 +12627,7 @@ mod tests {
     fn no_cache_scan_reselects_unchanged_files() {
         let store = Store::in_memory().expect("store");
         let source_id = statsai_core::SourceId("src-no-cache".to_string());
+        let compatible_signatures = HashMap::new();
         let entries = vec![
             ScanFileStateEntry {
                 cache_key: "/tmp/a.jsonl".to_string(),
@@ -12326,26 +12639,55 @@ mod tests {
             },
         ];
 
-        let initial = select_scan_file_entries(&store, &source_id, &entries, false, false, false)
-            .expect("initial selection");
+        let initial = select_scan_file_entries(
+            &store,
+            &source_id,
+            &entries,
+            &compatible_signatures,
+            false,
+            false,
+            false,
+        )
+        .expect("initial selection");
         assert_eq!(initial, entries);
         store
             .record_scan_file_entries(&source_id, &entries)
             .expect("record cache state");
 
-        let default_selection =
-            select_scan_file_entries(&store, &source_id, &entries, false, false, false)
-                .expect("default selection");
+        let default_selection = select_scan_file_entries(
+            &store,
+            &source_id,
+            &entries,
+            &compatible_signatures,
+            false,
+            false,
+            false,
+        )
+        .expect("default selection");
         assert!(default_selection.is_empty());
 
-        let no_cache_selection =
-            select_scan_file_entries(&store, &source_id, &entries, false, true, false)
-                .expect("no-cache selection");
+        let no_cache_selection = select_scan_file_entries(
+            &store,
+            &source_id,
+            &entries,
+            &compatible_signatures,
+            false,
+            true,
+            false,
+        )
+        .expect("no-cache selection");
         assert_eq!(no_cache_selection, entries);
 
-        let replace_selection =
-            select_scan_file_entries(&store, &source_id, &entries, true, false, false)
-                .expect("replace selection");
+        let replace_selection = select_scan_file_entries(
+            &store,
+            &source_id,
+            &entries,
+            &compatible_signatures,
+            true,
+            false,
+            false,
+        )
+        .expect("replace selection");
         assert_eq!(replace_selection, entries);
     }
 
@@ -12396,6 +12738,7 @@ mod tests {
                 cache_key: "/tmp/b.jsonl".to_string(),
                 cache_signature: "sig-b-1".to_string(),
             }],
+            &HashMap::new(),
             false,
             false,
             false,
@@ -14951,7 +15294,7 @@ mod tests {
     }
 
     #[test]
-    fn build_sync_batch_omits_project_data_without_opt_in() {
+    fn build_sync_batch_respects_project_and_task_opt_ins() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
             "codex",
@@ -15008,21 +15351,55 @@ mod tests {
         assert!(default_batch.task_buckets.is_empty());
         assert!(default_batch.task_verifications.is_empty());
 
-        let opt_in_command = SyncCommand {
+        let project_opt_in_command = SyncCommand {
             include_projects: true,
             ..test_sync_command("file")
         };
-        let opt_in_target = sync_target(&opt_in_command).expect("opt-in target");
-        let (opt_in_batch, opt_in_mode) =
-            build_sync_batch(&opt_in_command, &store, "device", &opt_in_target)
-                .expect("opt-in batch");
-        assert_eq!(opt_in_mode, SyncPayloadMode::Raw);
-        assert_eq!(opt_in_batch.events.len(), 1);
-        assert!(opt_in_batch.events[0].project.is_some());
-        assert_eq!(opt_in_batch.summaries.len(), 1);
-        assert!(opt_in_batch.summaries[0].project.is_some());
-        assert_eq!(opt_in_batch.task_buckets.len(), 1);
-        assert_eq!(opt_in_batch.task_verifications.len(), 1);
+        let project_opt_in_target =
+            sync_target(&project_opt_in_command).expect("project opt-in target");
+        let (project_opt_in_batch, project_opt_in_mode) = build_sync_batch(
+            &project_opt_in_command,
+            &store,
+            "device",
+            &project_opt_in_target,
+        )
+        .expect("project opt-in batch");
+        assert_eq!(project_opt_in_mode, SyncPayloadMode::Raw);
+        assert_eq!(project_opt_in_batch.events.len(), 1);
+        assert!(project_opt_in_batch.events[0].project.is_some());
+        assert_eq!(project_opt_in_batch.summaries.len(), 1);
+        assert!(project_opt_in_batch.summaries[0].project.is_some());
+        assert!(project_opt_in_batch.task_buckets.is_empty());
+        assert!(project_opt_in_batch.task_verifications.is_empty());
+
+        store
+            .set_sync_preferences(SyncPreferences {
+                include_projects: true,
+                include_tasks: false,
+            })
+            .expect("persist sync preferences");
+        let (persisted_batch, persisted_mode) =
+            build_sync_batch(&default_command, &store, "device", &default_target)
+                .expect("persisted batch");
+        assert_eq!(persisted_mode, SyncPayloadMode::Raw);
+        assert!(persisted_batch.events[0].project.is_some());
+        assert!(persisted_batch.summaries[0].project.is_some());
+        assert!(persisted_batch.task_buckets.is_empty());
+        assert!(persisted_batch.task_verifications.is_empty());
+
+        let task_opt_in_command = SyncCommand {
+            include_tasks: true,
+            ..test_sync_command("file")
+        };
+        let task_opt_in_target = sync_target(&task_opt_in_command).expect("task opt-in target");
+        let (task_opt_in_batch, task_opt_in_mode) =
+            build_sync_batch(&task_opt_in_command, &store, "device", &task_opt_in_target)
+                .expect("task opt-in batch");
+        assert_eq!(task_opt_in_mode, SyncPayloadMode::Raw);
+        assert!(task_opt_in_batch.events[0].project.is_some());
+        assert!(task_opt_in_batch.summaries[0].project.is_some());
+        assert_eq!(task_opt_in_batch.task_buckets.len(), 1);
+        assert_eq!(task_opt_in_batch.task_verifications.len(), 1);
     }
 
     #[test]
@@ -15454,6 +15831,9 @@ mod tests {
             yes: false,
             dry_run: false,
             include_projects: false,
+            exclude_projects: false,
+            include_tasks: false,
+            exclude_tasks: false,
         }
     }
 
@@ -15935,6 +16315,7 @@ mod tests {
             path: PathBuf::from(path),
             cache_key: path.to_string(),
             cache_signature: cache_signature.to_string(),
+            compatible_cache_signatures: Vec::new(),
         }
     }
 
