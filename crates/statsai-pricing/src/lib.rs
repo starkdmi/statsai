@@ -99,6 +99,12 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("grok-composer-2.5") || lower.contains("composer-2.5") {
         return Some("composer-2.5");
     }
+    if lower.contains("grok-4.5-latest")
+        || lower.contains("grok-4.5")
+        || lower.contains("grok-build-latest")
+    {
+        return Some("grok-4.5");
+    }
     if lower.contains("grok-build-0.1") || lower.contains("grok-build") {
         return Some("grok-build-0.1");
     }
@@ -160,6 +166,7 @@ pub fn normalize_model_name(name: &str) -> String {
         "composer-2.5" | "grok-composer-2.5" => "composer-2.5".to_string(),
         "composer-2.5-fast" | "grok-composer-2.5-fast" => "composer-2.5-fast".to_string(),
         "grok-build" | "grok-build-0.1" => "grok-build-0.1".to_string(),
+        "grok-4.5" | "grok-4.5-latest" | "grok-build-latest" => "grok-4.5".to_string(),
         "grok-4.3" | "grok-4.3-latest" => "grok-4.3".to_string(),
         _ => normalize_proxy_wrapped_model_name(&lower)
             .map(ToString::to_string)
@@ -239,6 +246,8 @@ pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
         "composer-2.5-fast" => Some(pricing(3.0, 0.5, 15.0)),
         "grok-build-0.1" => Some(pricing(1.0, 1.0, 2.0)),
         "grok-4.3" => Some(pricing(1.25, 1.25, 2.5)),
+        // xAI lists $2/M input, $0.50/M cached input, and $6/M output.
+        "grok-4.5" => Some(pricing(2.0, 0.5, 6.0)),
         _ => None,
     }
 }
@@ -289,7 +298,9 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
 
     let pricing_source = match model_name.as_str() {
         "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{model_name}"),
-        "grok-build-0.1" | "grok-4.3" => format!("xai_api_pricing:{model_name}"),
+        "grok-build-0.1" | "grok-4.3" | "grok-4.5" => {
+            format!("xai_api_pricing:{model_name}")
+        }
         _ => format!("{provider}_api_pricing:{model_name}"),
     };
 
@@ -408,6 +419,13 @@ mod tests {
     #[test]
     fn normalizes_grok_build_aliases() {
         assert_eq!(normalize_model_name("grok-build"), "grok-build-0.1");
+        assert_eq!(normalize_model_name("grok-4.5-latest"), "grok-4.5");
+        assert_eq!(normalize_model_name("grok-build-latest"), "grok-4.5");
+        assert_eq!(normalize_model_name("openrouter/x-ai/grok-4.5"), "grok-4.5");
+        assert_eq!(
+            normalize_model_name("openrouter/x-ai/grok-build-latest"),
+            "grok-4.5"
+        );
     }
 
     #[test]
@@ -476,6 +494,31 @@ mod tests {
         assert_eq!(
             cost.pricing_source.as_deref(),
             Some("xai_api_pricing:grok-build-0.1")
+        );
+    }
+
+    #[test]
+    fn estimates_grok_4_5_cost_with_cached_input() {
+        let model = statsai_core::ModelInfo {
+            name: Some("grok-4.5-latest".to_string()),
+            normalized_name: Some("grok-4.5".to_string()),
+            provider_model_id: Some("grok-4.5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("grok_build", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(850));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.5")
         );
     }
 
