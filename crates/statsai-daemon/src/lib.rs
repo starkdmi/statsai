@@ -30,7 +30,9 @@ pub fn run(addr: &str, store: Arc<Mutex<Store>>) -> Result<()> {
         Server::http(addr).map_err(|err| anyhow::anyhow!("start local API on {addr}: {err}"))?;
 
     for request in server.incoming_requests() {
-        handle_request(request, &store)?;
+        if let Err(error) = handle_request(request, &store) {
+            eprintln!("daemon: request failed: {error:#}");
+        }
     }
 
     Ok(())
@@ -209,12 +211,13 @@ mod watch {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
     use statsai_adapters::{default_adapters, ProviderAdapter, ScanCandidateFile, ScanOptions};
     use statsai_core::{
-        timestamp_in_period, IdentitySource, ProviderAccountId, SourceAccountAssignment,
+        hash_text, timestamp_in_period, IdentitySource, ProviderAccountId, SourceAccountAssignment,
         SourceKind, SourceLocation, SourceVerificationMode, UsageEvent, UsageSummary,
     };
     use statsai_store::{
         effective_verified_source_state_is_missing, has_active_verified_source_assignment,
-        reconcile_verified_source_state, verified_source_state_hash, ScanFileStateEntry, Store,
+        reconcile_verified_source_state, verified_source_state_hash, ScanFileReplacement,
+        ScanFileStateEntry, Store,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
@@ -231,13 +234,21 @@ mod watch {
             let s = super::lock_store(&store);
             discover_watch_sources(&s)
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let pending_changed_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
+        let callback_pending_paths = Arc::clone(&pending_changed_paths);
 
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
-                if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
-                    let changed: Vec<PathBuf> = event.paths;
-                    let _ = tx.send(changed);
+                if matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                ) {
+                    callback_pending_paths
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .extend(event.paths);
+                    let _ = tx.try_send(());
                 }
             }
         })
@@ -264,7 +275,17 @@ mod watch {
                 return Ok(());
             }
             match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(changed) => {
+                Ok(()) => {
+                    let changed = pending_changed_paths
+                        .lock()
+                        .map(|mut paths| {
+                            std::mem::take(&mut *paths).into_iter().collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|error| {
+                            std::mem::take(&mut *error.into_inner())
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                        });
                     let s = super::lock_store(&store);
                     rescan_changed_sources(&s, device_id, &changed);
                 }
@@ -392,6 +413,21 @@ mod watch {
                 };
                 let pending_file_entries = selection.pending_entries;
                 let compatible_entries_to_upgrade = selection.compatible_entries_to_upgrade;
+                let tracked_file_entries = match store.scan_file_entries(&source.source_id) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        eprintln!("daemon: scan cache listing failed: {e}");
+                        continue;
+                    }
+                };
+                let current_cache_keys = file_cache_entries
+                    .iter()
+                    .map(|entry| entry.cache_key.as_str())
+                    .collect::<HashSet<_>>();
+                let removed_file_entries = tracked_file_entries
+                    .into_iter()
+                    .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
+                    .collect::<Vec<_>>();
                 let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
                 let verification_mode = source.verification_mode.clone();
                 let probed_verified_source_state =
@@ -444,7 +480,13 @@ mod watch {
                                 continue;
                             }
                         };
+                let rescan_file_entries = if removed_file_entries.is_empty() {
+                    &pending_file_entries
+                } else {
+                    &file_cache_entries
+                };
                 if pending_file_entries.is_empty()
+                    && removed_file_entries.is_empty()
                     && !has_cache_entry_upgrades
                     && !verified_state_changed
                     && !legacy_verified_state_needs_reconciliation
@@ -455,13 +497,13 @@ mod watch {
                     device_id: device_id.to_string(),
                     collect_tasks: false,
                     selected_cache_keys: Some(
-                        pending_file_entries
+                        rescan_file_entries
                             .iter()
                             .map(|entry| entry.cache_key.clone())
                             .collect::<HashSet<_>>(),
                     ),
                 };
-                let scan_result = if pending_file_entries.is_empty() {
+                let scan_result = if rescan_file_entries.is_empty() {
                     Ok(statsai_adapters::AdapterScan::default())
                 } else {
                     adapter.scan(&source, &options)
@@ -473,7 +515,7 @@ mod watch {
                         let effective_verified_source_state =
                             if matches!(verification_mode, SourceVerificationMode::Disabled) {
                                 None
-                            } else if pending_file_entries.is_empty() {
+                            } else if rescan_file_entries.is_empty() {
                                 probed_verified_source_state
                             } else {
                                 scan.verified_source_state
@@ -493,7 +535,7 @@ mod watch {
                             eprintln!("daemon: update source verified auth state failed: {e}");
                             continue;
                         }
-                        if pending_file_entries.is_empty() {
+                        if pending_file_entries.is_empty() && removed_file_entries.is_empty() {
                             if let Err(e) = store.upgrade_scan_file_entries(
                                 &source.source_id,
                                 &compatible_entries_to_upgrade,
@@ -517,33 +559,33 @@ mod watch {
                             eprintln!("daemon: account resolution failed: {e}");
                             continue;
                         }
-                        let inserted_events = match store.insert_events(&scan.events) {
-                            Ok(count) => count,
-                            Err(e) => {
-                                eprintln!("daemon: insert events failed: {e}");
-                                continue;
-                            }
-                        };
-                        let written_summaries = match store.upsert_summaries(&scan.summaries) {
-                            Ok(count) => count,
-                            Err(e) => {
-                                eprintln!("daemon: insert summaries failed: {e}");
-                                continue;
-                            }
-                        };
-                        if let Err(e) =
-                            store.record_scan_file_entries(&source.source_id, &pending_file_entries)
-                        {
-                            eprintln!("daemon: update scan cache failed: {e}");
-                            continue;
-                        }
-                        if let Err(e) = store.upgrade_scan_file_entries(
-                            &source.source_id,
-                            &compatible_entries_to_upgrade,
-                        ) {
-                            eprintln!("daemon: upgrade scan cache failed: {e}");
-                            continue;
-                        }
+                        let reconciled_file_hashes = rescan_file_entries
+                            .iter()
+                            .chain(removed_file_entries.iter())
+                            .map(|entry| hash_text(&entry.cache_key))
+                            .collect::<HashSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        let removed_cache_keys = removed_file_entries
+                            .iter()
+                            .map(|entry| entry.cache_key.clone())
+                            .collect::<Vec<_>>();
+                        let replacement =
+                            match store.replace_scan_file_records(ScanFileReplacement {
+                                source_id: &source.source_id,
+                                reconciled_file_hashes: &reconciled_file_hashes,
+                                events: &scan.events,
+                                summaries: &scan.summaries,
+                                pending_entries: &pending_file_entries,
+                                compatible_entries_to_upgrade: &compatible_entries_to_upgrade,
+                                removed_cache_keys: &removed_cache_keys,
+                            }) {
+                                Ok(replacement) => replacement,
+                                Err(e) => {
+                                    eprintln!("daemon: atomic file reconciliation failed: {e}");
+                                    continue;
+                                }
+                            };
                         eprintln!(
                             "daemon: rescanned {} ({}) — files={}, cached={}, parsed_events={}, inserted_events={}, parsed_summaries={}, summaries_written={}",
                             source.provider,
@@ -551,9 +593,9 @@ mod watch {
                             scan.diagnostics.files_scanned,
                             scan.diagnostics.files_skipped_unchanged,
                             parsed_events,
-                            inserted_events,
+                            replacement.inserted_events,
                             parsed_summaries,
-                            written_summaries
+                            replacement.written_summaries
                         );
                     }
                     Err(e) => {
@@ -840,6 +882,50 @@ mod watch {
             }
         }
 
+        struct DuplicateFileAdapter {
+            candidate: ScanCandidateFile,
+            event: UsageEvent,
+            scan_calls: Arc<Mutex<u64>>,
+        }
+
+        impl ProviderAdapter for DuplicateFileAdapter {
+            fn id(&self) -> &'static str {
+                "test-duplicate-file-adapter"
+            }
+
+            fn version(&self) -> &'static str {
+                "0.0.0"
+            }
+
+            fn provider(&self) -> &'static str {
+                "codex"
+            }
+
+            fn discover(&self) -> Vec<SourceLocation> {
+                Vec::new()
+            }
+
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(vec![self.candidate.clone()])
+            }
+
+            fn scan(
+                &self,
+                _source: &SourceLocation,
+                options: &ScanOptions,
+            ) -> Result<statsai_adapters::AdapterScan> {
+                assert!(options
+                    .selected_cache_keys
+                    .as_ref()
+                    .is_some_and(|keys| keys.contains(&self.candidate.cache_key)));
+                *self.scan_calls.lock().expect("scan calls") += 1;
+                Ok(statsai_adapters::AdapterScan {
+                    events: vec![self.event.clone()],
+                    ..statsai_adapters::AdapterScan::default()
+                })
+            }
+        }
+
         #[test]
         fn rescan_changed_sources_reconciles_verified_auth_without_pending_usage_files() {
             let store = Store::in_memory().expect("store");
@@ -922,6 +1008,268 @@ mod watch {
 
             let _ = std::fs::remove_dir_all(&root);
         }
+
+        #[test]
+        fn rescan_changed_sources_removes_records_for_deleted_files() {
+            let store = Store::in_memory().expect("store");
+            let root = tempfile::tempdir().expect("source root");
+            let deleted_file = root.path().join("deleted.jsonl");
+            let source = SourceLocation::local_adapter(
+                "codex",
+                "test",
+                "0",
+                root.path(),
+                LocationOrigin::Configured,
+            );
+            store.upsert_source(&source).expect("source");
+            let cache_key = deleted_file.to_string_lossy().into_owned();
+            store
+                .record_scan_file_entries(
+                    &source.source_id,
+                    &[ScanFileStateEntry {
+                        cache_key: cache_key.clone(),
+                        cache_signature: "old-signature".to_string(),
+                    }],
+                )
+                .expect("scan cache");
+            let now = Utc
+                .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+                .single()
+                .expect("event time");
+            let event: UsageEvent = serde_json::from_value(serde_json::json!({
+                "schema_version": "usage_event.v1",
+                "event_id": "event-deleted-file",
+                "device_id": "device-test",
+                "provider": "codex",
+                "source_id": source.source_id.clone(),
+                "provider_account_id": null,
+                "subscription_id": null,
+                "source": {
+                    "adapter_id": "test-watch-adapter",
+                    "adapter_version": "0.0.0",
+                    "source_kind": "local_adapter",
+                    "location_origin": "configured",
+                    "source_type": "jsonl",
+                    "source_path_hash": null,
+                    "source_record_id": "record-1",
+                    "parse_confidence": "high"
+                },
+                "session": {
+                    "session_id": "session-1",
+                    "local_session_id_hash": null,
+                    "title": null,
+                    "started_at": now,
+                    "ended_at": null,
+                    "duration_seconds": null
+                },
+                "model": null,
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_creation_tokens": null,
+                    "cache_read_tokens": null,
+                    "reasoning_tokens": null,
+                    "total_tokens": 15,
+                    "requests": 1,
+                    "local_prompt_eval_tokens": null,
+                    "local_eval_tokens": null
+                },
+                "runtime": null,
+                "cost": {
+                    "currency": "USD",
+                    "estimated_api_equivalent_usd": null,
+                    "provider_reported_usd": null,
+                    "pricing_source": null,
+                    "pricing_version": null,
+                    "confidence": "low"
+                },
+                "parse_evidence": {
+                    "event_key_version": "v1",
+                    "source_file_path_hash": hash_text(&cache_key),
+                    "source_line_number": 1,
+                    "source_record_id": "record-1",
+                    "model_inferred": false,
+                    "timestamp_inferred": false,
+                    "account_identity_source": "unresolved"
+                },
+                "project": null,
+                "git": null,
+                "privacy": {
+                    "mode": "metadata_only",
+                    "contains_prompt_text": false,
+                    "contains_response_text": false,
+                    "contains_file_paths": false
+                },
+                "created_at": now,
+                "imported_at": now
+            }))
+            .expect("event");
+            assert!(store.insert_event(&event).expect("insert event"));
+
+            let scan_calls = Arc::new(Mutex::new(0u64));
+            let adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(TestAdapter {
+                provider: "codex",
+                verified_state: None,
+                scan_calls: Arc::clone(&scan_calls),
+            })];
+            rescan_changed_sources_with_adapters(
+                &store,
+                "device-test",
+                std::slice::from_ref(&deleted_file),
+                &adapters,
+            );
+
+            assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
+            assert_eq!(store.event_count().expect("event count"), 0);
+            assert!(store
+                .scan_file_entries(&source.source_id)
+                .expect("scan entries")
+                .is_empty());
+        }
+
+        #[test]
+        fn rescan_changed_sources_preserves_event_from_unchanged_duplicate_file() {
+            let store = Store::in_memory().expect("store");
+            let root = tempfile::tempdir().expect("source root");
+            let active_file = root.path().join("sessions/duplicate.jsonl");
+            let archived_file = root.path().join("archived_sessions/duplicate.jsonl");
+            std::fs::create_dir_all(archived_file.parent().expect("archived parent"))
+                .expect("create archived directory");
+            std::fs::write(&archived_file, b"unchanged archived copy")
+                .expect("write archived copy");
+            let source = SourceLocation::local_adapter(
+                "codex",
+                "test",
+                "0",
+                root.path(),
+                LocationOrigin::Configured,
+            );
+            store.upsert_source(&source).expect("source");
+            let active_cache_key = active_file.to_string_lossy().into_owned();
+            let archived_cache_key = archived_file.to_string_lossy().into_owned();
+            store
+                .record_scan_file_entries(
+                    &source.source_id,
+                    &[
+                        ScanFileStateEntry {
+                            cache_key: active_cache_key.clone(),
+                            cache_signature: "active-signature".to_string(),
+                        },
+                        ScanFileStateEntry {
+                            cache_key: archived_cache_key.clone(),
+                            cache_signature: "archived-signature".to_string(),
+                        },
+                    ],
+                )
+                .expect("scan cache");
+            let now = Utc
+                .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+                .single()
+                .expect("event time");
+            let active_file_hash = hash_text(&active_cache_key);
+            let archived_file_hash = hash_text(&archived_cache_key);
+            let event_json = |file_hash: String| {
+                serde_json::json!({
+                    "schema_version": "usage_event.v1",
+                    "event_id": "event-duplicate-file",
+                    "device_id": "device-test",
+                    "provider": "codex",
+                    "source_id": source.source_id.clone(),
+                    "provider_account_id": null,
+                    "subscription_id": null,
+                    "source": {
+                        "adapter_id": "test-duplicate-file-adapter",
+                        "adapter_version": "0.0.0",
+                        "source_kind": "local_adapter",
+                        "location_origin": "configured",
+                        "source_type": "jsonl",
+                        "source_path_hash": null,
+                        "source_record_id": "record-duplicate",
+                        "parse_confidence": "high"
+                    },
+                    "session": {
+                        "session_id": "session-duplicate",
+                        "local_session_id_hash": null,
+                        "title": null,
+                        "started_at": now,
+                        "ended_at": null,
+                        "duration_seconds": null
+                    },
+                    "model": null,
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                        "requests": 1
+                    },
+                    "runtime": null,
+                    "cost": {
+                        "currency": "USD",
+                        "estimated_api_equivalent_usd": null,
+                        "provider_reported_usd": null,
+                        "pricing_source": null,
+                        "pricing_version": null,
+                        "confidence": "low"
+                    },
+                    "parse_evidence": {
+                        "event_key_version": "v1",
+                        "source_file_path_hash": file_hash,
+                        "source_line_number": 1,
+                        "source_record_id": "record-duplicate",
+                        "model_inferred": false,
+                        "timestamp_inferred": false,
+                        "account_identity_source": "unresolved"
+                    },
+                    "project": null,
+                    "git": null,
+                    "privacy": {
+                        "mode": "metadata_only",
+                        "contains_prompt_text": false,
+                        "contains_response_text": false,
+                        "contains_file_paths": false
+                    },
+                    "created_at": now,
+                    "imported_at": now
+                })
+            };
+            let active_event: UsageEvent =
+                serde_json::from_value(event_json(active_file_hash)).expect("active event");
+            let archived_event: UsageEvent =
+                serde_json::from_value(event_json(archived_file_hash.clone()))
+                    .expect("archived event");
+            assert!(store.insert_event(&active_event).expect("insert event"));
+
+            let scan_calls = Arc::new(Mutex::new(0u64));
+            let adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(DuplicateFileAdapter {
+                candidate: ScanCandidateFile {
+                    path: archived_file,
+                    cache_key: archived_cache_key.clone(),
+                    cache_signature: "archived-signature".to_string(),
+                    compatible_cache_signatures: Vec::new(),
+                },
+                event: archived_event,
+                scan_calls: Arc::clone(&scan_calls),
+            })];
+
+            rescan_changed_sources_with_adapters(
+                &store,
+                "device-test",
+                std::slice::from_ref(&active_file),
+                &adapters,
+            );
+
+            assert_eq!(*scan_calls.lock().expect("scan calls"), 1);
+            let events = store.events().expect("events");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_id.0, "event-duplicate-file");
+            assert_eq!(
+                events[0]
+                    .parse_evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.source_file_path_hash.as_deref()),
+                Some(archived_file_hash.as_str())
+            );
+        }
     }
 }
 
@@ -972,6 +1320,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            authoritative_snapshot: None,
             created_at: Utc::now(),
         }
     }

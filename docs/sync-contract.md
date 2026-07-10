@@ -2,7 +2,8 @@
 
 `sync_batch.v1` is the legacy usage-only backend contract for `statsai`.
 `sync_batch.v2` extends it with hosted task bucket snapshots and task
-verification uploads.
+verification uploads. It also supports an optional `authoritative_snapshot`
+marker for deletion reconciliation.
 The collector owns local scanning, normalization, idempotent local storage, and
 privacy scrubbing. The backend owns authentication, validation, deduplication,
 rollups, and user-facing queries. The production path sends sanitized batches to
@@ -81,6 +82,16 @@ The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
 - treat collector IDs as stable client-provided IDs, not database primary keys exposed to users
 - compute daily, monthly, and dashboard rollups server-side from accepted summaries
 - atomically replace accepted task bucket snapshots per `(user, device, project_bucket)`
+- treat the ordered `authoritative_snapshot` fragments sharing one `snapshot_id`
+  as the complete set of metadata and summary IDs owned by the authenticated
+  device; each fragment carries zero-based `part_index` and a common
+  `part_count`, with at most 200 IDs across its ID arrays
+- stage snapshot ownership without pruning until the final in-order fragment;
+  then apply ownership and deletion reconciliation atomically, pruning a hosted
+  entity only when no device still owns its canonical row
+- reject missing or out-of-order snapshot fragments; send them only after all
+  data chunks in the same logical full sync have succeeded, while batches
+  without snapshot fragments remain incremental
 - project hosted task verifications onto the latest bucket snapshot when serving task reads
 - return accepted, updated, duplicate, and rejected counts
 
@@ -126,6 +137,14 @@ cursor, and failure count. Passing `--since-last` sends only events and
 summaries after the recorded cursor for that sink target while still including
 the current source, account, source-account assignment, and subscription
 metadata.
+
+Full HTTP rollup syncs send their authoritative snapshot as the final logical
+chunk. The marker lists all current source, provider-account,
+source-account-assignment, subscription, and summary IDs, including empty lists.
+The backend tracks ownership per authenticated device and keeps device-local IDs
+separate from server-canonical IDs so account alias reconciliation cannot delete
+the canonical row. Incremental and legacy batches omit the marker and never
+prune absent records.
 
 The HTTP sink parses `sync_ack.v1` and `sync_ack.v2` before updating local
 state. File and stdout sinks update state after their local write succeeds.

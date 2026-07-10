@@ -1488,7 +1488,9 @@ fn scan_grok_build_source(
     let (unified_log_index, invalid_unified_rows) =
         parse_grok_unified_log_with_invalid_rows(&root)?;
     scan.diagnostics.invalid_rows += invalid_unified_rows;
-    for candidate in grok_build_scan_candidates(source, adapter.version())? {
+    for candidate in
+        grok_build_scan_candidates_with_unified_log(source, adapter.version(), &unified_log_index)?
+    {
         if !options.should_scan(&candidate.cache_key) {
             scan.diagnostics.files_skipped_unchanged += 1;
             continue;
@@ -1685,12 +1687,23 @@ fn grok_build_scan_candidates(
     let Some(root) = source_root_path(source) else {
         return Ok(Vec::new());
     };
+    let unified_log_index = parse_grok_unified_log(&root)?;
+    grok_build_scan_candidates_with_unified_log(source, adapter_version, &unified_log_index)
+}
+
+fn grok_build_scan_candidates_with_unified_log(
+    source: &SourceLocation,
+    adapter_version: &str,
+    unified_log_index: &GrokUnifiedLogIndex,
+) -> Result<Vec<ScanCandidateFile>> {
+    let Some(root) = source_root_path(source) else {
+        return Ok(Vec::new());
+    };
     let sessions_root = grok_sessions_root(&root);
     if !sessions_root.is_dir() {
         return Ok(Vec::new());
     }
     let cache_namespaces = scan_cache_namespaces(source, adapter_version);
-    let unified_log_index = parse_grok_unified_log(&root)?;
     let mut candidates = Vec::new();
     for entry in WalkDir::new(sessions_root).follow_links(false) {
         let entry = entry?;

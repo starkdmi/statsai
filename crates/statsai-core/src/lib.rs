@@ -551,7 +551,26 @@ pub struct SyncBatch {
     pub task_buckets: Vec<TaskBucketSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_verifications: Vec<TaskVerification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoritative_snapshot: Option<SyncAuthoritativeSnapshot>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub struct SyncAuthoritativeSnapshot {
+    pub snapshot_id: String,
+    pub part_index: u32,
+    pub part_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_ids: Vec<SourceId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_account_ids: Vec<ProviderAccountId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_account_assignment_ids: Vec<SourceAccountAssignmentId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscription_ids: Vec<SubscriptionId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summary_ids: Vec<SummaryId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1102,6 +1121,147 @@ pub struct UsageReport {
     pub total_summary_usage: UsageTotals,
 }
 
+#[derive(Debug, Clone, Default)]
+struct UsagePrefix {
+    usage: UsageTotals,
+    events: u64,
+    estimated_cost_samples: u64,
+}
+
+impl UsagePrefix {
+    fn add_event(&mut self, event: &UsageEvent) {
+        self.usage.add_event(event);
+        self.events += 1;
+        if event.cost.estimated_api_equivalent_usd.is_some() {
+            self.estimated_cost_samples += 1;
+        }
+    }
+
+    fn difference(&self, earlier: &Self) -> (u64, UsageTotals) {
+        let estimated_cost_samples = self
+            .estimated_cost_samples
+            .saturating_sub(earlier.estimated_cost_samples);
+        (
+            self.events.saturating_sub(earlier.events),
+            UsageTotals {
+                input_tokens: self
+                    .usage
+                    .input_tokens
+                    .saturating_sub(earlier.usage.input_tokens),
+                cache_creation_tokens: self
+                    .usage
+                    .cache_creation_tokens
+                    .saturating_sub(earlier.usage.cache_creation_tokens),
+                cached_input_tokens: self
+                    .usage
+                    .cached_input_tokens
+                    .saturating_sub(earlier.usage.cached_input_tokens),
+                output_tokens: self
+                    .usage
+                    .output_tokens
+                    .saturating_sub(earlier.usage.output_tokens),
+                reasoning_tokens: self
+                    .usage
+                    .reasoning_tokens
+                    .saturating_sub(earlier.usage.reasoning_tokens),
+                total_tokens: self
+                    .usage
+                    .total_tokens
+                    .saturating_sub(earlier.usage.total_tokens),
+                estimated_cost_usd: (estimated_cost_samples > 0).then(|| {
+                    self.usage
+                        .estimated_cost_usd
+                        .unwrap_or(0)
+                        .saturating_sub(earlier.usage.estimated_cost_usd.unwrap_or(0))
+                }),
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EventUsageSeries {
+    timestamps: Vec<DateTime<Utc>>,
+    prefixes: Vec<UsagePrefix>,
+}
+
+impl EventUsageSeries {
+    fn from_events(mut events: Vec<&UsageEvent>) -> Self {
+        events.sort_by_key(|event| event.session.started_at);
+        let mut timestamps = Vec::with_capacity(events.len());
+        let mut prefixes = Vec::with_capacity(events.len() + 1);
+        prefixes.push(UsagePrefix::default());
+        for event in events {
+            timestamps.push(event.session.started_at);
+            let mut next = prefixes.last().cloned().unwrap_or_default();
+            next.add_event(event);
+            prefixes.push(next);
+        }
+        Self {
+            timestamps,
+            prefixes,
+        }
+    }
+
+    fn usage_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        end_inclusive: bool,
+    ) -> (u64, UsageTotals) {
+        if end < start {
+            return (0, UsageTotals::default());
+        }
+        let start_index = self
+            .timestamps
+            .partition_point(|timestamp| *timestamp < start);
+        let end_index = if end_inclusive {
+            self.timestamps
+                .partition_point(|timestamp| *timestamp <= end)
+        } else {
+            self.timestamps
+                .partition_point(|timestamp| *timestamp < end)
+        };
+        self.prefixes[end_index].difference(&self.prefixes[start_index.min(end_index)])
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EventUsageIndex {
+    by_account_label: BTreeMap<(String, String), EventUsageSeries>,
+    by_account_id: BTreeMap<(String, String), EventUsageSeries>,
+}
+
+impl EventUsageIndex {
+    fn new(events: &[UsageEvent], accounts: &BTreeMap<&str, &ProviderAccount>) -> Self {
+        let mut by_account_label = BTreeMap::<_, Vec<_>>::new();
+        let mut by_account_id = BTreeMap::<_, Vec<_>>::new();
+        for event in events {
+            let label = report_account_label(event, accounts);
+            by_account_label
+                .entry((event.provider.clone(), label))
+                .or_default()
+                .push(event);
+            if let Some(account_id) = event.provider_account_id.as_ref() {
+                by_account_id
+                    .entry((event.provider.clone(), account_id.0.clone()))
+                    .or_default()
+                    .push(event);
+            }
+        }
+        Self {
+            by_account_label: by_account_label
+                .into_iter()
+                .map(|(key, events)| (key, EventUsageSeries::from_events(events)))
+                .collect(),
+            by_account_id: by_account_id
+                .into_iter()
+                .map(|(key, events)| (key, EventUsageSeries::from_events(events)))
+                .collect(),
+        }
+    }
+}
+
 #[must_use]
 pub fn build_usage_report(
     events: &[UsageEvent],
@@ -1131,6 +1291,7 @@ pub fn build_usage_report(
         .iter()
         .map(|account| (account.provider_account_id.0.as_str(), account))
         .collect();
+    let event_usage_index = EventUsageIndex::new(events, &account_by_id);
     let mut rows: BTreeMap<(String, String), UsageReportRow> = BTreeMap::new();
 
     for event in events {
@@ -1172,7 +1333,7 @@ pub fn build_usage_report(
             let kind = summary.metadata.summary_format.clone();
             let key = (summary.provider.clone(), account.clone(), kind.clone());
             let direct_overlap_usage =
-                direct_usage_for_summary(summary, &account, events, &account_by_id, now);
+                direct_usage_for_summary(summary, &account, &event_usage_index, now);
             let exact_overlap =
                 summary_usage_matches_direct_overlap(summary, &direct_overlap_usage);
             let row = summary_rows
@@ -1233,8 +1394,13 @@ pub fn build_usage_report(
     for row in &summary_rows {
         total_summary_usage.add_totals(&row.usage);
     }
-    let subscription_rows =
-        build_subscription_report_rows(events, subscriptions, &account_by_id, since, now);
+    let subscription_rows = build_subscription_report_rows(
+        subscriptions,
+        &account_by_id,
+        &event_usage_index,
+        since,
+        now,
+    );
 
     UsageReport {
         label,
@@ -1256,26 +1422,16 @@ fn report_account_label(event: &UsageEvent, accounts: &BTreeMap<&str, &ProviderA
 fn direct_usage_for_summary(
     summary: &UsageSummary,
     summary_account: &str,
-    events: &[UsageEvent],
-    accounts: &BTreeMap<&str, &ProviderAccount>,
+    event_usage_index: &EventUsageIndex,
     now: DateTime<Utc>,
 ) -> UsageTotals {
     let start = summary.period_start.unwrap_or(summary.observed_at);
     let end = summary.period_end.unwrap_or(summary.observed_at).min(now);
-    let mut usage = UsageTotals::default();
-    for event in events {
-        if event.provider != summary.provider
-            || event.session.started_at < start
-            || event.session.started_at > end
-        {
-            continue;
-        }
-        if report_account_label(event, accounts) != summary_account {
-            continue;
-        }
-        usage.add_event(event);
-    }
-    usage
+    event_usage_index
+        .by_account_label
+        .get(&(summary.provider.clone(), summary_account.to_string()))
+        .map(|series| series.usage_between(start, end, true).1)
+        .unwrap_or_default()
 }
 
 fn summary_usage_matches_direct_overlap(summary: &UsageSummary, direct: &UsageTotals) -> bool {
@@ -1345,9 +1501,9 @@ pub fn periods_overlap(
 }
 
 fn build_subscription_report_rows(
-    events: &[UsageEvent],
     subscriptions: &[Subscription],
     accounts: &BTreeMap<&str, &ProviderAccount>,
+    event_usage_index: &EventUsageIndex,
     since: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Vec<SubscriptionReportRow> {
@@ -1359,26 +1515,15 @@ fn build_subscription_report_rows(
         if !subscription_intersects_report_window(started_at, ended_at, since, now) {
             continue;
         }
-        let mut usage = UsageTotals::default();
-        let mut events_count = 0u64;
-        for event in events {
-            if event.provider != subscription.provider {
-                continue;
-            }
-            if event.provider_account_id.as_ref() != Some(provider_account_id) {
-                continue;
-            }
-            if since.is_some_and(|since| event.session.started_at < since)
-                || event.session.started_at > now
-            {
-                continue;
-            }
-            if !timestamp_in_period(event.session.started_at, started_at, ended_at) {
-                continue;
-            }
-            events_count += 1;
-            usage.add_event(event);
-        }
+        let range_start = since.map_or(started_at, |since| started_at.max(since));
+        let (range_end, end_inclusive) = ended_at
+            .filter(|ended_at| *ended_at <= now)
+            .map_or((now, true), |ended_at| (ended_at, false));
+        let (events_count, usage) = event_usage_index
+            .by_account_id
+            .get(&(subscription.provider.clone(), provider_account_id.0.clone()))
+            .map(|series| series.usage_between(range_start, range_end, end_inclusive))
+            .unwrap_or_default();
         let account = accounts
             .get(provider_account_id.0.as_str())
             .map(|account| display_account_identity(account))
@@ -1526,6 +1671,21 @@ mod tests {
         let schema = schemars::schema_for!(UsageSummary);
         let json = serde_json::to_value(schema).expect("summary schema should serialize");
         assert!(json.get("title").is_some());
+    }
+
+    #[test]
+    fn sync_batch_without_authoritative_snapshot_remains_backward_compatible() {
+        let batch: SyncBatch = serde_json::from_value(serde_json::json!({
+            "schema_version": SYNC_BATCH_SCHEMA_VERSION,
+            "batch_id": "batch-legacy-v2",
+            "device_id": "device-1",
+            "created_at": "2026-05-31T10:00:00Z"
+        }))
+        .expect("legacy v2 batch should deserialize");
+
+        assert!(batch.authoritative_snapshot.is_none());
+        let serialized = serde_json::to_value(batch).expect("batch should serialize");
+        assert!(serialized.get("authoritative_snapshot").is_none());
     }
 
     #[test]

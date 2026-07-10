@@ -3,6 +3,7 @@ use chrono::Utc;
 use keyring::{Entry, Error as KeyringError};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
@@ -11,10 +12,24 @@ use getrandom::getrandom;
 
 const DEFAULT_CLOUDFLARE_API_URL: &str = "https://api.statsai.dev";
 const DEFAULT_CLOUDFLARE_WEB_URL: &str = "https://statsai.dev";
+const AUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg_attr(test, allow(dead_code))]
 fn keyring_backend_key(api_base_url: &str) -> String {
+    backend_namespace_key(api_base_url)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn legacy_keyring_backend_key(api_base_url: &str) -> String {
     api_base_url.replace([':', '/', '.', ' '], "_")
+}
+
+fn legacy_refresh_keyring_account(api_base_url: &str) -> String {
+    format!("cf-refresh-{}", legacy_keyring_backend_key(api_base_url))
+}
+
+fn legacy_access_keyring_account(api_base_url: &str) -> String {
+    format!("cf-access-{}", legacy_keyring_backend_key(api_base_url))
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -27,22 +42,24 @@ fn session_entry(api_base_url: &str) -> Result<Entry> {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn legacy_token_entry(api_base_url: &str, kind: &str) -> Result<Entry> {
+fn legacy_session_entry(api_base_url: &str) -> Result<Entry> {
     Entry::new(
         "statsai",
-        &format!("cf-{}-{}", kind, keyring_backend_key(api_base_url)),
+        &format!("cf-session-{}", legacy_keyring_backend_key(api_base_url)),
     )
-    .with_context(|| format!("failed to open legacy keyring for {kind} token"))
+    .context("failed to open legacy keyring for auth session")
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn access_token_entry(api_base_url: &str) -> Result<Entry> {
-    legacy_token_entry(api_base_url, "access").context("failed to open keyring for access token")
+fn legacy_refresh_entry(api_base_url: &str) -> Result<Entry> {
+    Entry::new("statsai", &legacy_refresh_keyring_account(api_base_url))
+        .context("failed to open legacy keyring refresh token")
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn refresh_token_entry(api_base_url: &str) -> Result<Entry> {
-    legacy_token_entry(api_base_url, "refresh").context("failed to open keyring for refresh token")
+fn legacy_access_entry(api_base_url: &str) -> Result<Entry> {
+    Entry::new("statsai", &legacy_access_keyring_account(api_base_url))
+        .context("failed to open legacy keyring access token")
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -60,6 +77,8 @@ fn load_secret_from_keyring(entry: &Entry, label: &str) -> Result<Option<String>
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct KeyringSession {
     #[serde(default)]
+    api_base_url: Option<String>,
+    #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
     access_token: Option<String>,
@@ -71,21 +90,40 @@ fn load_session_from_keyring(api_base_url: &str) -> Result<Option<KeyringSession
     else {
         return Ok(None);
     };
-    serde_json::from_str::<KeyringSession>(&secret)
-        .context("parse auth session stored in OS keyring")
-        .map(Some)
+    let session: KeyringSession =
+        serde_json::from_str(&secret).context("parse auth session stored in OS keyring")?;
+    Ok(keyring_session_matches_backend(&session, api_base_url).then_some(session))
 }
 
 #[cfg_attr(test, allow(dead_code))]
 fn load_legacy_session_from_keyring(api_base_url: &str) -> Result<Option<KeyringSession>> {
-    let refresh_token =
-        load_secret_from_keyring(&refresh_token_entry(api_base_url)?, "refresh token")?;
-    let access_token =
-        load_secret_from_keyring(&access_token_entry(api_base_url)?, "access token")?;
+    let Some(secret) =
+        load_secret_from_keyring(&legacy_session_entry(api_base_url)?, "legacy auth session")?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_str(&secret)
+        .context("parse legacy auth session stored in OS keyring")
+        .map(Some)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn load_legacy_split_session_from_keyring(api_base_url: &str) -> Result<Option<KeyringSession>> {
+    let refresh_token = load_secret_from_keyring(
+        &legacy_refresh_entry(api_base_url)?,
+        "legacy auth refresh token",
+    )?
+    .filter(|token| !token.trim().is_empty());
+    let access_token = load_secret_from_keyring(
+        &legacy_access_entry(api_base_url)?,
+        "legacy auth access token",
+    )?
+    .filter(|token| !token.trim().is_empty());
     if refresh_token.is_none() && access_token.is_none() {
         return Ok(None);
     }
     Ok(Some(KeyringSession {
+        api_base_url: None,
         refresh_token,
         access_token,
     }))
@@ -120,15 +158,19 @@ fn legacy_auth_path(base: &Path) -> PathBuf {
 }
 
 fn auth_path_for_api_base_url(base: &Path, api_base_url: &str) -> PathBuf {
-    base.join(format!(
-        "auth-{}.json",
-        sanitize_backend_key(&normalize_base_url(api_base_url))
-    ))
+    base.join(format!("auth-{}.json", backend_namespace_key(api_base_url)))
 }
 
 fn auth_device_id_path_for_api_base_url(base: &Path, api_base_url: &str) -> PathBuf {
     base.join(format!(
         "auth-device-{}",
+        backend_namespace_key(api_base_url)
+    ))
+}
+
+fn legacy_scoped_auth_path(base: &Path, api_base_url: &str) -> PathBuf {
+    base.join(format!(
+        "auth-{}.json",
         sanitize_backend_key(&normalize_base_url(api_base_url))
     ))
 }
@@ -293,13 +335,13 @@ pub fn status() -> Result<()> {
 }
 
 pub fn logout() -> Result<()> {
-    if let Some((path, credentials)) =
-        auth_record_for_backend(&auth_base_dir(), &cloudflare_api_url())?
-    {
+    let api_base_url = cloudflare_api_url();
+    if let Some((path, _credentials)) = auth_record_for_backend(&auth_base_dir(), &api_base_url)? {
         std::fs::remove_file(&path)?;
-        delete_tokens_from_keyring(&credentials);
+        delete_tokens_from_keyring_for_api_base_url(&api_base_url);
         println!("Successfully logged out.");
     } else {
+        delete_tokens_from_keyring_for_api_base_url(&api_base_url);
         println!("Already logged out.");
     }
     Ok(())
@@ -337,7 +379,9 @@ fn refresh_cloudflare_access_token(
         .filter(|token| !token.trim().is_empty())
         .context("Cloudflare refresh token missing; run `statsai auth login`")?;
     let url = format!("{}/api/devices/token", api_base_url.trim_end_matches('/'));
-    let response = ureq::post(&url).send_json(token_refresh_request_payload(&refresh_token));
+    let response = ureq::post(&url)
+        .timeout(AUTH_HTTP_TIMEOUT)
+        .send_json(token_refresh_request_payload(&refresh_token));
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
@@ -411,14 +455,16 @@ fn exchange_cloudflare_device_code(
         "{}/api/devices/exchange",
         api_base_url.trim_end_matches('/')
     );
-    let response = ureq::post(&url).send_json(serde_json::json!({
-        "code": code,
-        "state": state,
-        "deviceId": device_id,
-        "deviceName": device_name,
-        "platform": std::env::consts::OS,
-        "collectorVersion": env!("CARGO_PKG_VERSION")
-    }));
+    let response = ureq::post(&url)
+        .timeout(AUTH_HTTP_TIMEOUT)
+        .send_json(serde_json::json!({
+            "code": code,
+            "state": state,
+            "deviceId": device_id,
+            "deviceName": device_name,
+            "platform": std::env::consts::OS,
+            "collectorVersion": env!("CARGO_PKG_VERSION")
+        }));
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
@@ -450,12 +496,14 @@ fn start_headless_device_login(
     device_name: &str,
 ) -> DeviceSessionRequestResult<HeadlessLoginStart> {
     let url = format!("{}/api/devices/start", api_base_url.trim_end_matches('/'));
-    let response = ureq::post(&url).send_json(serde_json::json!({
-        "deviceId": device_id,
-        "deviceName": device_name,
-        "platform": std::env::consts::OS,
-        "collectorVersion": env!("CARGO_PKG_VERSION")
-    }));
+    let response = ureq::post(&url)
+        .timeout(AUTH_HTTP_TIMEOUT)
+        .send_json(serde_json::json!({
+            "deviceId": device_id,
+            "deviceName": device_name,
+            "platform": std::env::consts::OS,
+            "collectorVersion": env!("CARGO_PKG_VERSION")
+        }));
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
@@ -495,9 +543,11 @@ fn poll_headless_device_login(
         }
 
         sleep(Duration::from_secs(interval));
-        let response = ureq::post(&url).send_json(serde_json::json!({
-            "deviceCode": start.device_code
-        }));
+        let response = ureq::post(&url)
+            .timeout(AUTH_HTTP_TIMEOUT)
+            .send_json(serde_json::json!({
+                "deviceCode": start.device_code
+            }));
         let response = match response {
             Ok(response) => response,
             Err(ureq::Error::Status(code, response)) => {
@@ -746,11 +796,36 @@ fn auth_record_from_file(
     base: &Path,
     api_base_url: &str,
 ) -> Result<Option<(PathBuf, AuthCredentials)>> {
+    auth_record_from_file_with_loader(base, api_base_url, load_credentials)
+}
+
+fn auth_record_from_file_with_loader(
+    base: &Path,
+    api_base_url: &str,
+    credential_loader: impl Fn(&Path) -> Result<AuthCredentials>,
+) -> Result<Option<(PathBuf, AuthCredentials)>> {
     let api_base_url = normalize_url(api_base_url, DEFAULT_CLOUDFLARE_API_URL);
     let path = auth_path_for_api_base_url(base, &api_base_url);
     if path.exists() {
         let credentials = load_credentials_from_file(&path)?;
-        return Ok(Some((path, credentials)));
+        return Ok(
+            credentials_match_backend(&credentials, &api_base_url).then_some((path, credentials))
+        );
+    }
+
+    let old_scoped_path = legacy_scoped_auth_path(base, &api_base_url);
+    if old_scoped_path.exists() && old_scoped_path != path {
+        let stored_credentials = load_credentials_from_file(&old_scoped_path)?;
+        if credentials_match_backend(&stored_credentials, &api_base_url) {
+            let credentials = credential_loader(&old_scoped_path)?;
+            if credentials_match_backend(&credentials, &api_base_url)
+                && has_cloudflare_session(&credentials)
+            {
+                write_credentials(&path, &credentials)?;
+                let _ = std::fs::remove_file(old_scoped_path);
+                return Ok(Some((path, credentials)));
+            }
+        }
     }
 
     let legacy_path = legacy_auth_path(base);
@@ -758,7 +833,7 @@ fn auth_record_from_file(
         return Ok(None);
     }
 
-    let credentials = load_credentials(&legacy_path)?;
+    let credentials = credential_loader(&legacy_path)?;
     if has_cloudflare_session(&credentials)
         && credentials_match_backend(&credentials, &api_base_url)
     {
@@ -792,8 +867,27 @@ fn auth_record_for_backend(
     let api_base_url = normalize_url(api_base_url, DEFAULT_CLOUDFLARE_API_URL);
     let path = auth_path_for_api_base_url(base, &api_base_url);
     if path.exists() {
+        let credentials = load_credentials_from_file(&path)?;
+        if !credentials_match_backend(&credentials, &api_base_url) {
+            return Ok(None);
+        }
         let credentials = load_credentials(&path)?;
         return Ok(Some((path, credentials)));
+    }
+
+    let old_scoped_path = legacy_scoped_auth_path(base, &api_base_url);
+    if old_scoped_path.exists() && old_scoped_path != path {
+        let credentials = load_credentials_from_file(&old_scoped_path)?;
+        if credentials_match_backend(&credentials, &api_base_url) {
+            let mut credentials = credentials;
+            hydrate_credentials_from_keyring(&mut credentials)?;
+            if !has_cloudflare_session(&credentials) {
+                return Ok(None);
+            }
+            write_credentials(&path, &credentials)?;
+            let _ = std::fs::remove_file(old_scoped_path);
+            return Ok(Some((path, credentials)));
+        }
     }
 
     let legacy_path = legacy_auth_path(base);
@@ -837,13 +931,10 @@ fn is_device_linked(credentials: &AuthCredentials) -> bool {
 }
 
 fn credentials_match_backend(credentials: &AuthCredentials, api_base_url: &str) -> bool {
-    normalize_url(
-        credentials
-            .api_base_url
-            .as_deref()
-            .unwrap_or(DEFAULT_CLOUDFLARE_API_URL),
-        DEFAULT_CLOUDFLARE_API_URL,
-    ) == normalize_url(api_base_url, DEFAULT_CLOUDFLARE_API_URL)
+    credentials.api_base_url.as_deref().is_some_and(|stored| {
+        normalize_url(stored, DEFAULT_CLOUDFLARE_API_URL)
+            == normalize_url(api_base_url, DEFAULT_CLOUDFLARE_API_URL)
+    })
 }
 
 fn ensure_cloudflare_session(path: &Path, credentials: &AuthCredentials) -> Result<()> {
@@ -897,24 +988,29 @@ fn hydrate_credentials_from_keyring(credentials: &mut AuthCredentials) -> Result
     {
         let api_base = credentials
             .api_base_url
-            .as_deref()
-            .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
-        if let Some(session) = load_session_from_keyring(api_base)? {
-            if credentials.cloudflare_refresh_token.is_none() {
-                credentials.cloudflare_refresh_token = session.refresh_token;
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CLOUDFLARE_API_URL.to_string());
+        let current_session = load_session_from_keyring(&api_base)?;
+        if current_session.is_some() {
+            hydrate_credentials_from_sessions(credentials, &api_base, current_session, None, None);
+        } else if credentials_match_backend(credentials, &api_base) {
+            let legacy_session = load_legacy_session_from_keyring(&api_base)?;
+            let legacy_split_session = load_legacy_split_session_from_keyring(&api_base)?;
+            if hydrate_credentials_from_sessions(
+                credentials,
+                &api_base,
+                None,
+                legacy_session,
+                legacy_split_session,
+            ) {
+                let migrated = KeyringSession {
+                    api_base_url: Some(normalize_base_url(&api_base)),
+                    refresh_token: credentials.cloudflare_refresh_token.clone(),
+                    access_token: credentials.cloudflare_access_token.clone(),
+                };
+                store_session_in_keyring(&api_base, &migrated)?;
+                delete_legacy_tokens_from_keyring(&api_base);
             }
-            if credentials.cloudflare_access_token.is_none() {
-                credentials.cloudflare_access_token = session.access_token;
-            }
-        } else if let Some(session) = load_legacy_session_from_keyring(api_base)? {
-            if credentials.cloudflare_refresh_token.is_none() {
-                credentials.cloudflare_refresh_token = session.refresh_token.clone();
-            }
-            if credentials.cloudflare_access_token.is_none() {
-                credentials.cloudflare_access_token = session.access_token.clone();
-            }
-            let _ = store_session_in_keyring(api_base, &session);
-            delete_legacy_tokens_from_keyring(api_base);
         }
     }
     #[cfg(test)]
@@ -922,6 +1018,53 @@ fn hydrate_credentials_from_keyring(credentials: &mut AuthCredentials) -> Result
         let _ = credentials;
     }
     Ok(())
+}
+
+fn hydrate_credentials_from_sessions(
+    credentials: &mut AuthCredentials,
+    api_base_url: &str,
+    current_session: Option<KeyringSession>,
+    legacy_session: Option<KeyringSession>,
+    legacy_split_session: Option<KeyringSession>,
+) -> bool {
+    let (session, migrated) = if let Some(session) =
+        current_session.filter(|session| keyring_session_matches_backend(session, api_base_url))
+    {
+        (Some(session), false)
+    } else if credentials_match_backend(credentials, api_base_url) {
+        (
+            merge_legacy_keyring_sessions(legacy_session, legacy_split_session),
+            true,
+        )
+    } else {
+        (None, false)
+    };
+    let Some(session) = session else {
+        return false;
+    };
+    if credentials.cloudflare_refresh_token.is_none() {
+        credentials.cloudflare_refresh_token = session.refresh_token;
+    }
+    if credentials.cloudflare_access_token.is_none() {
+        credentials.cloudflare_access_token = session.access_token;
+    }
+    migrated
+}
+
+fn merge_legacy_keyring_sessions(
+    legacy_session: Option<KeyringSession>,
+    legacy_split_session: Option<KeyringSession>,
+) -> Option<KeyringSession> {
+    let mut merged = legacy_session.unwrap_or_default();
+    if let Some(split) = legacy_split_session {
+        if merged.refresh_token.is_none() {
+            merged.refresh_token = split.refresh_token;
+        }
+        if merged.access_token.is_none() {
+            merged.access_token = split.access_token;
+        }
+    }
+    (merged.refresh_token.is_some() || merged.access_token.is_some()).then_some(merged)
 }
 
 fn write_tokens_to_keyring(credentials: &AuthCredentials) -> Result<()> {
@@ -932,6 +1075,7 @@ fn write_tokens_to_keyring(credentials: &AuthCredentials) -> Result<()> {
             .as_deref()
             .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
         let session = KeyringSession {
+            api_base_url: Some(normalize_base_url(api_base)),
             refresh_token: credentials
                 .cloudflare_refresh_token
                 .clone()
@@ -960,10 +1104,7 @@ fn delete_tokens_from_keyring(credentials: &AuthCredentials) {
             .api_base_url
             .as_deref()
             .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
-        if let Ok(entry) = session_entry(api_base) {
-            let _ = entry.delete_credential();
-        }
-        delete_legacy_tokens_from_keyring(api_base);
+        delete_tokens_from_keyring_for_api_base_url(api_base);
     }
     #[cfg(test)]
     {
@@ -971,24 +1112,51 @@ fn delete_tokens_from_keyring(credentials: &AuthCredentials) {
     }
 }
 
+fn delete_tokens_from_keyring_for_api_base_url(api_base_url: &str) {
+    #[cfg(not(test))]
+    {
+        if let Ok(entry) = session_entry(api_base_url) {
+            let _ = entry.delete_credential();
+        }
+        delete_legacy_tokens_from_keyring(api_base_url);
+    }
+    #[cfg(test)]
+    {
+        let _ = api_base_url;
+    }
+}
+
 #[cfg_attr(test, allow(dead_code))]
 fn delete_legacy_tokens_from_keyring(api_base_url: &str) {
-    if let Ok(entry) = refresh_token_entry(api_base_url) {
-        let _ = entry.delete_credential();
-    }
-    if let Ok(entry) = access_token_entry(api_base_url) {
+    for entry in [
+        legacy_session_entry(api_base_url),
+        legacy_refresh_entry(api_base_url),
+        legacy_access_entry(api_base_url),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let _ = entry.delete_credential();
     }
 }
 
 #[cfg_attr(test, allow(dead_code))]
 fn store_session_in_keyring(api_base_url: &str, session: &KeyringSession) -> Result<()> {
+    let mut session = session.clone();
+    session.api_base_url = Some(normalize_base_url(api_base_url));
     let payload =
-        serde_json::to_string(session).context("serialize auth session for OS keyring")?;
+        serde_json::to_string(&session).context("serialize auth session for OS keyring")?;
     session_entry(api_base_url)?
         .set_secret(payload.as_bytes())
         .context("store auth session in OS keyring")?;
     Ok(())
+}
+
+fn keyring_session_matches_backend(session: &KeyringSession, api_base_url: &str) -> bool {
+    session
+        .api_base_url
+        .as_deref()
+        .is_some_and(|stored| normalize_base_url(stored) == normalize_base_url(api_base_url))
 }
 
 fn generate_random_string(len: usize) -> Result<String> {
@@ -1083,6 +1251,11 @@ fn sanitize_backend_key(value: &str) -> String {
     }
 }
 
+fn backend_namespace_key(api_base_url: &str) -> String {
+    let normalized = normalize_base_url(api_base_url);
+    hex::encode(Sha256::digest(normalized.as_bytes()))
+}
+
 fn restrict_file_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1145,8 +1318,243 @@ mod tests {
         let hosted = auth_path_for_api_base_url(dir.path(), "https://api.example.com");
 
         assert_ne!(local, hosted);
-        assert!(local.ends_with("auth-http___127_0_0_1_8787.json"));
-        assert!(hosted.ends_with("auth-https___api_example_com.json"));
+        assert_eq!(
+            local
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::len),
+            Some("auth-.json".len() + 64)
+        );
+        assert_eq!(
+            hosted
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::len),
+            Some("auth-.json".len() + 64)
+        );
+    }
+
+    #[test]
+    fn colliding_legacy_backend_names_have_distinct_auth_namespaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dotted = auth_path_for_api_base_url(dir.path(), "https://api.statsai.dev");
+        let dashed = auth_path_for_api_base_url(dir.path(), "https://api-statsai.dev");
+
+        assert_eq!(
+            legacy_scoped_auth_path(dir.path(), "https://api.statsai.dev"),
+            legacy_scoped_auth_path(dir.path(), "https://api-statsai.dev")
+        );
+        assert_ne!(dotted, dashed);
+        assert_ne!(
+            keyring_backend_key("https://api.statsai.dev"),
+            keyring_backend_key("https://api-statsai.dev")
+        );
+    }
+
+    #[test]
+    fn scoped_auth_file_with_mismatched_backend_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let requested_backend = "https://api.statsai.dev";
+        let path = auth_path_for_api_base_url(dir.path(), requested_backend);
+        let credentials = AuthCredentials {
+            backend: Some("cloudflare".to_string()),
+            api_base_url: Some("https://attacker.invalid".to_string()),
+            cloudflare_refresh_token: Some("must-not-load".to_string()),
+            cloudflare_refresh_expires_at_secs: 0,
+            cloudflare_access_token: None,
+            cloudflare_access_expires_at_secs: 0,
+            device_id: Some("device-1".to_string()),
+        };
+        write_credentials(&path, &credentials).expect("write mismatched credentials");
+
+        assert!(auth_record_from_file(dir.path(), requested_backend)
+            .expect("read auth record")
+            .is_none());
+    }
+
+    #[test]
+    fn scoped_auth_file_without_embedded_backend_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let requested_backend = "https://api.statsai.dev";
+        let path = auth_path_for_api_base_url(dir.path(), requested_backend);
+        let credentials = AuthCredentials {
+            backend: Some("cloudflare".to_string()),
+            api_base_url: None,
+            cloudflare_refresh_token: Some("must-not-load".to_string()),
+            cloudflare_refresh_expires_at_secs: 0,
+            cloudflare_access_token: None,
+            cloudflare_access_expires_at_secs: 0,
+            device_id: Some("device-1".to_string()),
+        };
+        write_credentials(&path, &credentials).expect("write credentials");
+
+        assert!(auth_record_from_file(dir.path(), requested_backend)
+            .expect("read auth record")
+            .is_none());
+    }
+
+    #[test]
+    fn colliding_legacy_auth_file_is_not_migrated_for_another_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let requested_backend = "https://api.statsai.dev";
+        let colliding_backend = "https://api-statsai.dev";
+        let legacy_path = legacy_scoped_auth_path(dir.path(), colliding_backend);
+        let credentials = AuthCredentials {
+            backend: Some("cloudflare".to_string()),
+            api_base_url: Some(colliding_backend.to_string()),
+            cloudflare_refresh_token: Some("must-not-migrate".to_string()),
+            cloudflare_refresh_expires_at_secs: 0,
+            cloudflare_access_token: None,
+            cloudflare_access_expires_at_secs: 0,
+            device_id: Some("device-1".to_string()),
+        };
+        write_credentials(&legacy_path, &credentials).expect("write legacy credentials");
+
+        assert!(auth_record_from_file(dir.path(), requested_backend)
+            .expect("read auth record")
+            .is_none());
+        assert!(!auth_path_for_api_base_url(dir.path(), requested_backend).exists());
+    }
+
+    #[test]
+    fn legacy_scoped_auth_record_hydrates_before_session_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_base_url = "https://api.statsai.dev";
+        let legacy_path = legacy_scoped_auth_path(dir.path(), api_base_url);
+        let redacted = AuthCredentials {
+            backend: Some("cloudflare".to_string()),
+            api_base_url: Some(api_base_url.to_string()),
+            cloudflare_refresh_token: None,
+            cloudflare_refresh_expires_at_secs: 0,
+            cloudflare_access_token: None,
+            cloudflare_access_expires_at_secs: 0,
+            device_id: Some("device-1".to_string()),
+        };
+        write_credentials(&legacy_path, &redacted).expect("write legacy credentials");
+
+        let record = auth_record_from_file_with_loader(dir.path(), api_base_url, |path| {
+            let mut hydrated = load_credentials_from_file(path)?;
+            hydrated.cloudflare_refresh_token = Some("legacy-refresh".to_string());
+            Ok(hydrated)
+        })
+        .expect("migrate legacy auth record");
+
+        let (path, credentials) = record.expect("hydrated auth record");
+        assert_eq!(path, auth_path_for_api_base_url(dir.path(), api_base_url));
+        assert_eq!(
+            credentials.cloudflare_refresh_token.as_deref(),
+            Some("legacy-refresh")
+        );
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn keyring_session_requires_matching_embedded_backend() {
+        let session = KeyringSession {
+            api_base_url: Some("https://api.statsai.dev".to_string()),
+            refresh_token: Some("refresh-token".to_string()),
+            access_token: None,
+        };
+
+        assert!(keyring_session_matches_backend(
+            &session,
+            "https://api.statsai.dev/"
+        ));
+        assert!(!keyring_session_matches_backend(
+            &session,
+            "https://api-statsai.dev"
+        ));
+        assert!(!keyring_session_matches_backend(
+            &KeyringSession {
+                api_base_url: None,
+                ..session
+            },
+            "https://api.statsai.dev"
+        ));
+    }
+
+    #[test]
+    fn legacy_keyring_session_hydrates_validated_upgrade_credentials() {
+        let mut credentials = AuthCredentials {
+            backend: Some("cloudflare".to_string()),
+            api_base_url: Some("https://api.statsai.dev".to_string()),
+            cloudflare_refresh_token: None,
+            cloudflare_refresh_expires_at_secs: 0,
+            cloudflare_access_token: None,
+            cloudflare_access_expires_at_secs: 0,
+            device_id: Some("device-1".to_string()),
+        };
+        let legacy_session = KeyringSession {
+            api_base_url: None,
+            refresh_token: Some("legacy-refresh".to_string()),
+            access_token: Some("legacy-access".to_string()),
+        };
+
+        let migrated = hydrate_credentials_from_sessions(
+            &mut credentials,
+            "https://api.statsai.dev",
+            None,
+            Some(legacy_session),
+            None,
+        );
+
+        assert!(migrated);
+        assert_eq!(
+            credentials.cloudflare_refresh_token.as_deref(),
+            Some("legacy-refresh")
+        );
+        assert_eq!(
+            credentials.cloudflare_access_token.as_deref(),
+            Some("legacy-access")
+        );
+    }
+
+    #[test]
+    fn split_legacy_keyring_tokens_hydrate_validated_upgrade_credentials() {
+        let mut credentials = AuthCredentials {
+            backend: Some("cloudflare".to_string()),
+            api_base_url: Some("https://api.statsai.dev".to_string()),
+            cloudflare_refresh_token: None,
+            cloudflare_refresh_expires_at_secs: 0,
+            cloudflare_access_token: None,
+            cloudflare_access_expires_at_secs: 0,
+            device_id: Some("device-1".to_string()),
+        };
+        let split_session = KeyringSession {
+            api_base_url: None,
+            refresh_token: Some("split-refresh".to_string()),
+            access_token: Some("split-access".to_string()),
+        };
+
+        let migrated = hydrate_credentials_from_sessions(
+            &mut credentials,
+            "https://api.statsai.dev",
+            None,
+            None,
+            Some(split_session),
+        );
+
+        assert!(migrated);
+        assert_eq!(
+            credentials.cloudflare_refresh_token.as_deref(),
+            Some("split-refresh")
+        );
+        assert_eq!(
+            credentials.cloudflare_access_token.as_deref(),
+            Some("split-access")
+        );
+        assert_eq!(
+            legacy_refresh_keyring_account("https://api.statsai.dev"),
+            "cf-refresh-https___api_statsai_dev"
+        );
+        assert_eq!(
+            legacy_access_keyring_account("https://api.statsai.dev"),
+            "cf-access-https___api_statsai_dev"
+        );
+        assert_eq!(
+            legacy_refresh_keyring_account("https://api.statsai.dev/"),
+            "cf-refresh-https___api_statsai_dev_"
+        );
     }
 
     #[test]

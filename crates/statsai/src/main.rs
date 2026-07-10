@@ -16,10 +16,10 @@ use statsai_core::{
     source_id as statsai_source_id, subscription_id, timestamp_in_period, BillingPeriod, EventId,
     IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
     SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
-    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SyncBatch,
-    TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict, TaskVerification,
-    TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport, UsageSummary,
-    UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
+    SyncAuthoritativeSnapshot, SyncBatch, TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict,
+    TaskVerification, TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport,
+    UsageSummary, UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -45,7 +45,7 @@ use statsai_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 
 use statsai::{auth, default_device_id, default_store_path, service, snapshot};
 
@@ -54,6 +54,8 @@ const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
 const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 const HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE: usize = 90;
 const HTTP_ROLLUP_DAILY_ROLLUP_ROWS_PER_QUERY: usize = 7;
+const HTTP_ROLLUP_SNAPSHOT_IDS_PER_BATCH: usize = 200;
+const HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const TASK_SYNC_SQL_MAX_ROWS_PER_CHUNK: usize = 200;
 const TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK: usize = 512 * 1024;
 
@@ -3195,14 +3197,22 @@ fn report(command: ReportCommand, store: &Store) -> Result<()> {
             subscriptions,
         } => (ReportPeriod::AllTime, json, verbose, subscriptions),
     };
+    let now = Utc::now();
+    let (events, summaries) = match period {
+        ReportPeriod::LastDays(days) => (
+            store.events_in_period(now - Duration::days(days), now)?,
+            Vec::new(),
+        ),
+        ReportPeriod::AllTime => (store.events()?, store.summaries()?),
+    };
     let report = build_usage_report(
-        &store.events()?,
-        &store.summaries()?,
+        &events,
+        &summaries,
         &store.list_sources()?,
         &store.list_accounts()?,
         &store.list_subscriptions()?,
         period,
-        Utc::now(),
+        now,
     );
     if json_output {
         print_report_json(&report, verbose, include_subscriptions)?;
@@ -3474,6 +3484,8 @@ fn build_sync_batch(
     device_id: &str,
     target: &str,
 ) -> Result<(SyncBatch, SyncPayloadMode)> {
+    let created_at = Utc::now();
+    let batch_id = format!("batch_{}", created_at.timestamp_millis());
     let sync_preferences = effective_sync_preferences(store, command)?;
     let include_projects = sync_preferences.include_projects;
     let payload_mode = sync_payload_mode(command)?;
@@ -3546,6 +3558,23 @@ fn build_sync_batch(
         .into_iter()
         .map(sanitize_subscription_for_sync)
         .collect();
+    let snapshot_source_ids = all_sources
+        .iter()
+        .map(|source| source.source_id.clone())
+        .collect::<Vec<_>>();
+    let snapshot_provider_account_ids = all_accounts
+        .iter()
+        .map(|account| account.provider_account_id.clone())
+        .collect::<Vec<_>>();
+    let snapshot_assignment_ids = all_source_account_assignments
+        .iter()
+        .map(|assignment| assignment.assignment_id.clone())
+        .collect::<Vec<_>>();
+    let snapshot_subscription_ids = all_subscriptions
+        .iter()
+        .map(|subscription| subscription.subscription_id.clone())
+        .collect::<Vec<_>>();
+    let mut authoritative_snapshot = None;
     let sources = if payload_mode == SyncPayloadMode::Rollups {
         store.pending_sources_for_sync(&command.sink, target, &all_sources)?
     } else {
@@ -3616,32 +3645,37 @@ fn build_sync_batch(
         let failed_without_resume = state.as_ref().is_some_and(|state| {
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()
         });
+        let has_pending_resume = state
+            .as_ref()
+            .and_then(|state| state.pending_resume_batch_id.as_deref())
+            .is_some();
         let force_full_rollup_sync = command.full
             || command.rebuild_rollups
             || state.is_none()
+            || has_pending_resume
             || (!command.since_last && failed_without_resume);
-        let resume_partial_rollup_sync = !force_full_rollup_sync
-            && !command.since_last
-            && !command.rebuild_rollups
-            && state
-                .as_ref()
-                .and_then(|state| state.pending_resume_batch_id.as_deref())
-                .is_some();
-        let full_rollup_sync = force_full_rollup_sync && !resume_partial_rollup_sync;
-        if !command.dry_run
-            && full_rollup_sync
-            && state
-                .as_ref()
-                .and_then(|state| state.pending_resume_batch_id.as_deref())
-                .is_some()
-        {
-            store.clear_pending_sync_resume(&command.sink, target)?;
-        }
+        let full_rollup_sync = force_full_rollup_sync;
         let all_rollups: Vec<_> = store
             .all_sync_rollup_summaries()?
             .into_iter()
             .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
             .collect();
+        if full_rollup_sync {
+            authoritative_snapshot = Some(SyncAuthoritativeSnapshot {
+                snapshot_id: format!("{batch_id}_authoritative"),
+                part_index: 0,
+                part_count: 1,
+                source_ids: snapshot_source_ids,
+                provider_account_ids: snapshot_provider_account_ids,
+                source_account_assignment_ids: snapshot_assignment_ids,
+                subscription_ids: snapshot_subscription_ids,
+                summary_ids: all_passthrough_summaries
+                    .iter()
+                    .chain(all_rollups.iter())
+                    .map(|summary| summary.summary_id.clone())
+                    .collect(),
+            });
+        }
         let rollups = if full_rollup_sync {
             all_rollups
         } else {
@@ -3672,7 +3706,7 @@ fn build_sync_batch(
     Ok((
         SyncBatch {
             schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
-            batch_id: format!("batch_{}", Utc::now().timestamp_millis()),
+            batch_id,
             device_id: device_id.to_string(),
             sources,
             accounts,
@@ -3682,7 +3716,8 @@ fn build_sync_batch(
             summaries,
             task_buckets,
             task_verifications,
-            created_at: Utc::now(),
+            authoritative_snapshot,
+            created_at,
         },
         payload_mode,
     ))
@@ -3696,7 +3731,9 @@ fn record_rollup_sync_success(
     batch: &SyncBatch,
 ) -> Result<()> {
     let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
-    record_rollup_sync_chunk_success(store, sink, target, &logical_batch_id, batch)
+    record_rollup_sync_chunk_success(store, sink, target, &logical_batch_id, batch)?;
+    store.clear_pending_sync_resume(sink, target)?;
+    Ok(())
 }
 
 fn record_rollup_sync_chunk_success(
@@ -3837,22 +3874,29 @@ fn send_http_sync_batch(
         store.clear_pending_sync_resume(request.sink, request.target)?;
     }
     if request.hosted_task_sync_enabled {
-        let pulled_cursor = pull_remote_task_verifications(
+        match pull_remote_task_verifications(
             store,
             request.sink,
             request.target,
             request.endpoint,
             task_sync_auth_token.as_deref(),
-        )?;
-        if let Some(cursor) = pulled_cursor.as_ref() {
-            store.record_sync_success(
-                request.sink,
-                request.target,
-                &batch.batch_id,
-                &[],
-                &[],
-                Some(cursor),
-            )?;
+        ) {
+            Ok(Some(cursor)) => {
+                store.record_sync_success(
+                    request.sink,
+                    request.target,
+                    &batch.batch_id,
+                    &[],
+                    &[],
+                    Some(&cursor),
+                )?;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "warning: sync upload succeeded, but pulling hosted task verifications failed: {error}"
+                );
+            }
         }
     }
     Ok(())
@@ -3871,7 +3915,9 @@ fn pull_remote_task_verifications(
     let Some(feed_url) = http_task_verification_feed_url(endpoint) else {
         return Ok(None);
     };
-    let mut request = ureq::get(&feed_url).set("Authorization", &format!("Bearer {auth_token}"));
+    let mut request = ureq::get(&feed_url)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .set("Authorization", &format!("Bearer {auth_token}"));
     if let Some(cursor) = store.sync_task_verification_cursor(sink, target)? {
         request = request
             .query("updatedAt", &cursor.updated_at.to_rfc3339())
@@ -3999,6 +4045,89 @@ fn parse_http_sync_error(error: &anyhow::Error) -> Option<ParsedHttpSyncError> {
 }
 
 fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch> {
+    let mut data_batch = batch.clone();
+    let authoritative_snapshot = data_batch.authoritative_snapshot.take();
+    let mut chunks = split_http_rollup_sync_batches_without_snapshot(&data_batch);
+    if let Some(authoritative_snapshot) = authoritative_snapshot {
+        for snapshot in split_authoritative_snapshot(
+            authoritative_snapshot,
+            &data_batch.batch_id,
+            HTTP_ROLLUP_SNAPSHOT_IDS_PER_BATCH,
+        ) {
+            let mut snapshot_chunk = empty_http_rollup_chunk(
+                &data_batch,
+                &format!("snapshot_{}", snapshot.part_index + 1),
+            );
+            snapshot_chunk.authoritative_snapshot = Some(snapshot);
+            chunks.push(snapshot_chunk);
+        }
+    }
+    chunks
+}
+
+fn split_authoritative_snapshot(
+    snapshot: SyncAuthoritativeSnapshot,
+    batch_id: &str,
+    max_ids: usize,
+) -> Vec<SyncAuthoritativeSnapshot> {
+    debug_assert!(max_ids > 0);
+    let snapshot_id = if snapshot.snapshot_id.trim().is_empty() {
+        format!("{batch_id}_authoritative")
+    } else {
+        snapshot.snapshot_id
+    };
+    let empty_part = || SyncAuthoritativeSnapshot {
+        snapshot_id: snapshot_id.clone(),
+        part_index: 0,
+        part_count: 1,
+        source_ids: Vec::new(),
+        provider_account_ids: Vec::new(),
+        source_account_assignment_ids: Vec::new(),
+        subscription_ids: Vec::new(),
+        summary_ids: Vec::new(),
+    };
+    let mut parts = Vec::new();
+    let mut current = empty_part();
+
+    macro_rules! append_ids {
+        ($ids:expr, $field:ident) => {
+            for id in $ids {
+                if authoritative_snapshot_id_count(&current) == max_ids {
+                    parts.push(std::mem::replace(&mut current, empty_part()));
+                }
+                current.$field.push(id);
+            }
+        };
+    }
+
+    append_ids!(snapshot.source_ids, source_ids);
+    append_ids!(snapshot.provider_account_ids, provider_account_ids);
+    append_ids!(
+        snapshot.source_account_assignment_ids,
+        source_account_assignment_ids
+    );
+    append_ids!(snapshot.subscription_ids, subscription_ids);
+    append_ids!(snapshot.summary_ids, summary_ids);
+    if authoritative_snapshot_id_count(&current) > 0 || parts.is_empty() {
+        parts.push(current);
+    }
+    let part_count = u32::try_from(parts.len()).expect("snapshot part count fits u32");
+    for (index, part) in parts.iter_mut().enumerate() {
+        part.part_index = u32::try_from(index).expect("snapshot part index fits u32");
+        part.part_count = part_count;
+    }
+    parts
+}
+
+fn authoritative_snapshot_id_count(snapshot: &SyncAuthoritativeSnapshot) -> usize {
+    snapshot.source_ids.len()
+        + snapshot.provider_account_ids.len()
+        + snapshot.source_account_assignment_ids.len()
+        + snapshot.subscription_ids.len()
+        + snapshot.summary_ids.len()
+}
+
+fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<SyncBatch> {
     let task_chunks = split_http_rollup_task_chunks(
         batch,
         HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH,
@@ -4590,6 +4719,7 @@ fn split_http_rollup_summary_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec
             chunk.summaries = summaries.to_vec();
             chunk.task_buckets.clear();
             chunk.task_verifications.clear();
+            chunk.authoritative_snapshot = None;
             chunk
         })
         .collect()
@@ -4606,6 +4736,7 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
     chunk.summaries.clear();
     chunk.task_buckets.clear();
     chunk.task_verifications.clear();
+    chunk.authoritative_snapshot = None;
     chunk
 }
 
@@ -4898,7 +5029,9 @@ struct TaskVerificationFeedResponse {
 
 fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
     let url = http_verify_status_url(endpoint)?;
-    let request = ureq::get(&url).set("Authorization", &format!("Bearer {auth_token}"));
+    let request = ureq::get(&url)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .set("Authorization", &format!("Bearer {auth_token}"));
     match request.call() {
         Ok(response) => http_response_json(response, "verify sync status"),
         Err(error) => Err(http_request_error("verify sync status", error)),
@@ -4907,7 +5040,9 @@ fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
 
 fn http_remote_preflight_status(endpoint: &str, auth_token: &str) -> Result<Value> {
     let url = http_preflight_status_url(endpoint)?;
-    let request = ureq::get(&url).set("Authorization", &format!("Bearer {auth_token}"));
+    let request = ureq::get(&url)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .set("Authorization", &format!("Bearer {auth_token}"));
     match request.call() {
         Ok(response) => http_response_json(response, "load sync preflight status"),
         Err(error) => Err(http_request_error("load sync preflight status", error)),
@@ -4920,6 +5055,7 @@ fn http_remote_reset(endpoint: &str, auth_token: &str) -> Result<Value> {
         "confirm": "reset_synced_data",
     }))?;
     let request = ureq::post(&url)
+        .timeout(HTTP_REQUEST_TIMEOUT)
         .set("Authorization", &format!("Bearer {auth_token}"))
         .set("Content-Type", "application/json");
     match request.send_string(&body) {
@@ -4986,7 +5122,9 @@ fn http_remote_hosted_tasks_enabled(command: &SyncCommand, endpoint: &str) -> Re
     let Some(auth_token) = resolve_http_auth_token(command, false)? else {
         return Ok(true);
     };
-    let request = ureq::get(&preflight_url).set("Authorization", &format!("Bearer {auth_token}"));
+    let request = ureq::get(&preflight_url)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .set("Authorization", &format!("Bearer {auth_token}"));
     let response = match request.call() {
         Ok(response) => response,
         Err(ureq::Error::Status(code, _)) if optional_http_sync_preflight_status(code) => {
@@ -5056,6 +5194,7 @@ fn strip_one_http_rollup_batch_suffix(batch_id: &str) -> String {
         "_subscriptions_",
         "_task_buckets_",
         "_task_verifications_",
+        "_snapshot_",
     ] {
         if let Some(index) = batch_id.rfind(marker) {
             let suffix = &batch_id[(index + marker.len())..];
@@ -5129,12 +5268,12 @@ fn push_remote_metadata_gap(
     local_total: usize,
     local_pending: usize,
 ) {
-    if local_total == 0 || local_pending > 0 {
+    if local_pending > 0 {
         return;
     }
     if let Some(remote_count) = remote_count {
-        if remote_count < local_total as u64 {
-            reasons.push(format!("{label} {remote_count}<{local_total}"));
+        if remote_count != local_total as u64 {
+            reasons.push(format!("{label} {remote_count}!={local_total}"));
         }
     }
 }
@@ -10841,6 +10980,7 @@ mod tests {
             .summaries
             .iter()
             .any(|summary| summary.metadata.summary_format == "grok_build_session_summary"));
+        assert!(local_batch.authoritative_snapshot.is_some());
         record_rollup_sync_success(&store, "http", &local_target, &local_batch)
             .expect("record local sync");
 
@@ -10852,6 +10992,7 @@ mod tests {
             local_repeat_batch.summaries.is_empty(),
             "plain HTTP sync should be incremental after a target was synced"
         );
+        assert!(local_repeat_batch.authoritative_snapshot.is_none());
 
         let local_full_command = SyncCommand {
             endpoint: Some("http://127.0.0.1:8787/api/sync/batches".to_string()),
@@ -10875,6 +11016,7 @@ mod tests {
             .summaries
             .iter()
             .any(|summary| summary.metadata.summary_format == "grok_build_session_summary"));
+        assert!(local_full_batch.authoritative_snapshot.is_some());
 
         let local_incremental_command = SyncCommand {
             endpoint: Some("http://127.0.0.1:8787/api/sync/batches".to_string()),
@@ -10885,6 +11027,7 @@ mod tests {
             build_sync_batch(&local_incremental_command, &store, "device", &local_target)
                 .expect("local incremental batch");
         assert!(local_incremental_batch.summaries.is_empty());
+        assert!(local_incremental_batch.authoritative_snapshot.is_none());
 
         let second = test_event(
             "codex",
@@ -10980,6 +11123,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            authoritative_snapshot: None,
             created_at: now,
         };
 
@@ -10999,6 +11143,105 @@ mod tests {
         assert!(chunks[2].sources.is_empty());
         assert!(chunks[3].sources.is_empty());
         assert!(chunks.iter().all(|chunk| chunk.events.is_empty()));
+    }
+
+    #[test]
+    fn http_rollup_sync_sends_authoritative_snapshot_after_data_chunks() {
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-snapshot"),
+            LocationOrigin::Configured,
+        );
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_snapshot".to_string(),
+            device_id: "device".to_string(),
+            sources: vec![source.clone()],
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: Vec::new(),
+            task_buckets: Vec::new(),
+            task_verifications: Vec::new(),
+            authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
+                source_ids: vec![source.source_id.clone()],
+                ..SyncAuthoritativeSnapshot::default()
+            }),
+            created_at: now,
+        };
+
+        let chunks = split_http_rollup_sync_batches(&batch);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].batch_id, "batch_snapshot");
+        assert_eq!(chunks[0].sources, vec![source.clone()]);
+        assert!(chunks[0].authoritative_snapshot.is_none());
+        assert_eq!(chunks[1].batch_id, "batch_snapshot_snapshot_1");
+        assert!(chunks[1].sources.is_empty());
+        let snapshot = chunks[1]
+            .authoritative_snapshot
+            .as_ref()
+            .expect("snapshot chunk");
+        assert_eq!(snapshot.snapshot_id, "batch_snapshot_authoritative");
+        assert_eq!(snapshot.part_index, 0);
+        assert_eq!(snapshot.part_count, 1);
+        assert_eq!(snapshot.source_ids, vec![source.source_id]);
+        assert_eq!(
+            logical_http_rollup_batch_id(&chunks[1].batch_id),
+            "batch_snapshot"
+        );
+    }
+
+    #[test]
+    fn http_rollup_sync_bounds_authoritative_snapshot_chunks() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let summary_ids = (0..(HTTP_ROLLUP_SNAPSHOT_IDS_PER_BATCH * 2 + 1))
+            .map(|index| statsai_core::SummaryId(format!("summary-{index}")))
+            .collect::<Vec<_>>();
+        let batch = SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_large_snapshot".to_string(),
+            device_id: "device".to_string(),
+            sources: Vec::new(),
+            accounts: Vec::new(),
+            source_account_assignments: Vec::new(),
+            subscriptions: Vec::new(),
+            events: Vec::new(),
+            summaries: Vec::new(),
+            task_buckets: Vec::new(),
+            task_verifications: Vec::new(),
+            authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
+                summary_ids,
+                ..SyncAuthoritativeSnapshot::default()
+            }),
+            created_at: now,
+        };
+
+        let chunks = split_http_rollup_sync_batches(&batch);
+        let snapshot_chunks = chunks
+            .iter()
+            .filter_map(|chunk| chunk.authoritative_snapshot.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(snapshot_chunks.len(), 3);
+        assert!(snapshot_chunks.iter().all(|snapshot| {
+            snapshot.source_ids.len()
+                + snapshot.provider_account_ids.len()
+                + snapshot.source_account_assignment_ids.len()
+                + snapshot.subscription_ids.len()
+                + snapshot.summary_ids.len()
+                <= HTTP_ROLLUP_SNAPSHOT_IDS_PER_BATCH
+        }));
     }
 
     #[test]
@@ -11095,6 +11338,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            authoritative_snapshot: None,
             created_at: now,
         };
 
@@ -11160,6 +11404,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            authoritative_snapshot: None,
             created_at: now,
         };
         let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
@@ -11250,6 +11495,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            authoritative_snapshot: None,
             created_at: now,
         };
         let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
@@ -11287,7 +11533,7 @@ mod tests {
     }
 
     #[test]
-    fn http_rollup_sync_resumes_remaining_chunks_after_partial_failure() {
+    fn http_rollup_sync_restarts_full_snapshot_after_snapshot_failure() {
         let store = Store::in_memory().expect("store");
         let endpoint = "https://api.example.com/api/sync/batches".to_string();
         let source = SourceLocation::local_adapter(
@@ -11329,14 +11575,15 @@ mod tests {
         let observed_for_send = Arc::clone(&observed);
         let mut observed_error = None;
 
-        for (request_index, chunk) in split_http_rollup_sync_batches(&batch).iter().enumerate() {
-            let result = send_http_rollup_chunk_with_retry_using(chunk, &|chunk| {
+        for chunk in split_http_rollup_sync_batches(&batch) {
+            let result = send_http_rollup_chunk_with_retry_using(&chunk, &|chunk| {
                 observed_for_send.lock().expect("observed lock").push((
                     chunk.batch_id.clone(),
                     chunk.sources.len(),
                     chunk.summaries.len(),
+                    chunk.authoritative_snapshot.is_some(),
                 ));
-                if request_index == 2 {
+                if chunk.authoritative_snapshot.is_some() {
                     return Err(anyhow::Error::msg(
                         r#"sync endpoint returned HTTP 429: {"error":"rate_limited","retryAfterSeconds":60}"#,
                     ));
@@ -11348,7 +11595,7 @@ mod tests {
                 break;
             }
         }
-        let error = observed_error.expect("rate limit should stop the third request");
+        let error = observed_error.expect("rate limit should stop the snapshot request");
         assert!(error.to_string().contains("HTTP 429"));
         store
             .record_sync_failure("http", &target)
@@ -11358,9 +11605,10 @@ mod tests {
         assert_eq!(
             observed,
             vec![
-                (format!("{}_sources_1", batch.batch_id), 1, 0),
-                (format!("{}_part_1_of_2", batch.batch_id), 0, 25),
-                (format!("{}_part_2_of_2", batch.batch_id), 0, 1),
+                (format!("{}_sources_1", batch.batch_id), 1, 0, false),
+                (format!("{}_part_1_of_2", batch.batch_id), 0, 25, false),
+                (format!("{}_part_2_of_2", batch.batch_id), 0, 1, false),
+                (format!("{}_snapshot_1", batch.batch_id), 0, 0, true),
             ]
         );
 
@@ -11384,7 +11632,7 @@ mod tests {
         let pending_rollups = store
             .pending_summaries_for_sync("http", &target, &sync_rollups)
             .expect("pending rollups");
-        assert_eq!(pending_rollups.len(), 1);
+        assert!(pending_rollups.is_empty());
         let state = store
             .sync_state("http", &target)
             .expect("sync state")
@@ -11395,7 +11643,27 @@ mod tests {
             build_sync_batch(&command, &store, "device", &target).expect("resume batch");
         assert_eq!(resume_mode, SyncPayloadMode::Rollups);
         assert!(resume_batch.sources.is_empty());
-        assert_eq!(resume_batch.summaries.len(), 1);
+        assert_eq!(resume_batch.summaries.len(), 26);
+        assert!(resume_batch.authoritative_snapshot.is_some());
+        let state_after_build = store
+            .sync_state("http", &target)
+            .expect("sync state")
+            .expect("present");
+        assert_eq!(
+            state_after_build.pending_resume_batch_id, state.pending_resume_batch_id,
+            "building the replacement snapshot must not clear resume state"
+        );
+
+        let since_last_command = SyncCommand {
+            endpoint: Some(endpoint),
+            since_last: true,
+            ..test_sync_command("http")
+        };
+        let (since_last_resume, _) =
+            build_sync_batch(&since_last_command, &store, "device", &target)
+                .expect("since-last resume batch");
+        assert_eq!(since_last_resume.summaries.len(), 26);
+        assert!(since_last_resume.authoritative_snapshot.is_some());
     }
 
     #[test]
@@ -11435,9 +11703,6 @@ mod tests {
         assert_eq!(initial_batch.summaries.len(), 1);
         record_rollup_sync_success(&store, "http", &target, &initial_batch)
             .expect("record initial sync");
-        store
-            .clear_pending_sync_resume("http", &target)
-            .expect("clear pending resume");
 
         store
             .record_sync_failure("http", &target)
@@ -11503,9 +11768,15 @@ mod tests {
         let target = sync_target(&initial_command).expect("target");
         let (initial_batch, _) =
             build_sync_batch(&initial_command, &store, "device", &target).expect("initial batch");
-        record_rollup_sync_success(&store, "http", &target, &initial_batch)
-            .expect("record partial sync state");
         let expected_logical_batch_id = logical_http_rollup_batch_id(&initial_batch.batch_id);
+        record_rollup_sync_chunk_success(
+            &store,
+            "http",
+            &target,
+            &expected_logical_batch_id,
+            &initial_batch,
+        )
+        .expect("record partial sync state");
 
         let state = store
             .sync_state("http", &target)
@@ -11579,6 +11850,7 @@ mod tests {
             summaries: vec![],
             task_buckets: vec![],
             task_verifications: vec![],
+            authoritative_snapshot: None,
             created_at: now,
         };
 
@@ -11734,6 +12006,7 @@ mod tests {
             summaries: vec![],
             task_buckets: test_task_only_sync_batch(now, 1, 0).task_buckets,
             task_verifications: vec![],
+            authoritative_snapshot: None,
             created_at: now,
         };
 
@@ -11816,6 +12089,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            authoritative_snapshot: None,
             created_at: now,
         };
 
@@ -11878,6 +12152,7 @@ mod tests {
             summaries: vec![summary],
             task_buckets: vec![],
             task_verifications: vec![],
+            authoritative_snapshot: None,
             created_at: now,
         };
 
@@ -12021,6 +12296,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets,
             task_verifications,
+            authoritative_snapshot: None,
             created_at: now,
         }
     }
@@ -12153,6 +12429,7 @@ mod tests {
                 spans,
             }],
             task_verifications: Vec::new(),
+            authoritative_snapshot: None,
             created_at: now,
         }
     }
@@ -12305,6 +12582,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets,
             task_verifications: Vec::new(),
+            authoritative_snapshot: None,
             created_at: now,
         }
     }
@@ -12555,7 +12833,9 @@ mod tests {
                 &local_verify
             )
             .as_deref(),
-            Some("sources 0<1, accounts 0<1, source_account_assignments 0<1, subscriptions 0<1")
+            Some(
+                "sources 0!=1, accounts 0!=1, source_account_assignments 0!=1, subscriptions 0!=1"
+            )
         );
 
         store
@@ -14875,6 +15155,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            authoritative_snapshot: None,
             created_at: Utc
                 .with_ymd_and_hms(2026, 6, 14, 13, 0, 0)
                 .single()

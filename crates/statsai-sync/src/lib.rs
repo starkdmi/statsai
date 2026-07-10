@@ -256,6 +256,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            authoritative_snapshot: None,
             created_at: Utc::now(),
         }
     }

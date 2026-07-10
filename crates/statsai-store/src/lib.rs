@@ -144,6 +144,22 @@ pub struct EventInsertBatchResult {
     pub canonical_event_ids: HashMap<EventId, EventId>,
 }
 
+pub struct ScanFileReplacement<'a> {
+    pub source_id: &'a SourceId,
+    pub reconciled_file_hashes: &'a [String],
+    pub events: &'a [UsageEvent],
+    pub summaries: &'a [UsageSummary],
+    pub pending_entries: &'a [ScanFileStateEntry],
+    pub compatible_entries_to_upgrade: &'a [ScanFileStateEntry],
+    pub removed_cache_keys: &'a [String],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanFileReplacementResult {
+    pub inserted_events: u64,
+    pub written_summaries: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct SubscriptionCompat {
     #[serde(default = "default_subscription_schema_version")]
@@ -416,9 +432,12 @@ impl Store {
     /// Returns an error if SQLite cannot open the path or migrations fail.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
+            let parent_existed = parent.exists();
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
-            restrict_dir_permissions(parent)?;
+            if !parent_existed {
+                restrict_dir_permissions(parent)?;
+            }
         }
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         restrict_file_permissions(path)?;
@@ -440,6 +459,9 @@ impl Store {
     }
 
     fn with_immediate_transaction<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return operation();
+        }
         begin_immediate_transaction_with_retry(&self.conn)?;
         let result = operation();
         match result {
@@ -592,8 +614,7 @@ impl Store {
         }
         let synced_at = Utc::now().to_rfc3339();
         let tasks_collected = i64::from(tasks_collected);
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut stmt = self.conn.prepare(
                 r#"
                 INSERT INTO scan_file_state
@@ -619,18 +640,7 @@ impl Store {
                 ])?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn upgrade_scan_file_entries(
@@ -642,8 +652,7 @@ impl Store {
             return Ok(());
         }
         let synced_at = Utc::now().to_rfc3339();
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut stmt = self.conn.prepare(
                 r#"
                 UPDATE scan_file_state
@@ -662,18 +671,7 @@ impl Store {
                 ])?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn scan_file_entries(&self, source_id: &SourceId) -> Result<Vec<ScanFileStateEntry>> {
@@ -700,8 +698,7 @@ impl Store {
         if cache_keys.is_empty() {
             return Ok(0);
         }
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut deleted = 0u64;
             let mut stmt = self
                 .conn
@@ -710,23 +707,11 @@ impl Store {
                 deleted += stmt.execute(params![&source_id.0, cache_key])? as u64;
             }
             Ok(deleted)
-        })();
-
-        match result {
-            Ok(deleted) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(deleted)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn delete_scan_file_entries_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut deleted = 0u64;
             for source_id in source_ids {
                 deleted += self.conn.execute(
@@ -735,18 +720,35 @@ impl Store {
                 )? as u64;
             }
             Ok(deleted)
-        })();
+        })
+    }
 
-        match result {
-            Ok(deleted) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(deleted)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+    pub fn replace_scan_file_records(
+        &self,
+        replacement: ScanFileReplacement<'_>,
+    ) -> Result<ScanFileReplacementResult> {
+        self.with_immediate_transaction(|| {
+            self.delete_events_for_source_file_hashes(
+                replacement.source_id,
+                replacement.reconciled_file_hashes,
+            )?;
+            self.delete_summaries_for_source_file_hashes(
+                replacement.source_id,
+                replacement.reconciled_file_hashes,
+            )?;
+            let inserted_events = self.insert_events(replacement.events)?;
+            let written_summaries = self.upsert_summaries(replacement.summaries)?;
+            self.record_scan_file_entries(replacement.source_id, replacement.pending_entries)?;
+            self.upgrade_scan_file_entries(
+                replacement.source_id,
+                replacement.compatible_entries_to_upgrade,
+            )?;
+            self.delete_scan_file_entries(replacement.source_id, replacement.removed_cache_keys)?;
+            Ok(ScanFileReplacementResult {
+                inserted_events,
+                written_summaries,
+            })
+        })
     }
 
     pub fn source_records_missing_scan_file_hashes(&self, source_id: &SourceId) -> Result<bool> {
@@ -993,8 +995,7 @@ impl Store {
     }
 
     pub fn delete_source(&self, source_id: &SourceId) -> Result<bool> {
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             self.conn.execute(
                 "DELETE FROM source_account_assignments WHERE source_id = ?1",
                 params![&source_id.0],
@@ -1003,18 +1004,7 @@ impl Store {
                 "DELETE FROM sources WHERE source_id = ?1",
                 params![&source_id.0],
             )? > 0)
-        })();
-
-        match result {
-            Ok(deleted) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(deleted)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn upsert_account(&self, account: &ProviderAccount) -> Result<()> {
@@ -1360,45 +1350,49 @@ impl Store {
             .zip(fingerprints.iter())
             .map(|(event, fingerprint)| conflict_lookup_key(event, fingerprint))
             .collect();
-        let mut conflict_map = self.batch_load_conflicts(&conflict_keys)?;
-
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
+            let mut conflict_map = self.batch_load_conflicts(&conflict_keys)?;
             let mut inserted = 0u64;
             let mut canonical_event_ids = HashMap::with_capacity(events.len());
             let mut dirty_keys = BTreeSet::new();
             for (index, event) in events.iter().enumerate() {
                 let incoming_event_id = event.event_id.clone();
-                let matched_event_id =
+                let matched_event =
                     conflict_map
                         .get(&conflict_keys[index])
                         .and_then(|candidates| {
-                            exact_or_semantic_conflict(Some(candidates.as_slice()), event)
-                                .map(|candidate| candidate.event_id.clone())
+                            exact_or_semantic_conflict(Some(candidates.as_slice()), event).map(
+                                |candidate| (candidate.event_id.clone(), candidate.event.clone()),
+                            )
                         });
-                if let Some(existing_id) = matched_event_id {
-                    let existing = conflict_map
-                        .get(&conflict_keys[index])
-                        .and_then(|candidates| {
-                            candidates
-                                .iter()
-                                .find(|candidate| candidate.event_id == existing_id)
-                        })
-                        .expect("matched conflict candidate");
-                    let refreshed = refreshed_duplicate_event(
-                        Some(&existing.event),
-                        event,
-                        existing_id.as_str(),
-                    );
+                let matched_event = if matched_event.is_some() {
+                    matched_event
+                } else if let Some(existing_id) =
+                    self.find_codex_fallback_duplicate_event_id(event)?
+                {
+                    self.event_by_id(&existing_id)?
+                        .map(|existing| (existing_id, existing))
+                } else {
+                    None
+                };
+                if let Some((existing_id, existing)) = matched_event {
+                    let refreshed =
+                        refreshed_duplicate_event(Some(&existing), event, existing_id.as_str());
                     dirty_keys.extend(self.update_event_payload(&refreshed)?);
                     canonical_event_ids.insert(incoming_event_id, EventId(existing_id.clone()));
-                    if let Some(candidates) = conflict_map.get_mut(&conflict_keys[index]) {
-                        if let Some(candidate) = candidates
-                            .iter_mut()
-                            .find(|candidate| candidate.event_id == existing_id)
-                        {
-                            candidate.event = refreshed;
-                        }
+                    let candidates = conflict_map
+                        .entry(conflict_keys[index].clone())
+                        .or_default();
+                    if let Some(candidate) = candidates
+                        .iter_mut()
+                        .find(|candidate| candidate.event_id == existing_id)
+                    {
+                        candidate.event = refreshed;
+                    } else {
+                        candidates.push(ConflictCandidate {
+                            event_id: existing_id,
+                            event: refreshed,
+                        });
                     }
                     continue;
                 }
@@ -1409,24 +1403,20 @@ impl Store {
                 }
                 canonical_event_ids.insert(incoming_event_id, outcome.canonical_event_id.clone());
                 dirty_keys.extend(outcome.dirty_keys);
+                conflict_map
+                    .entry(conflict_keys[index].clone())
+                    .or_default()
+                    .push(ConflictCandidate {
+                        event_id: outcome.canonical_event_id.0,
+                        event: event.clone(),
+                    });
             }
             self.refresh_sync_rollups_for_keys(&dirty_keys)?;
             Ok(EventInsertBatchResult {
                 inserted,
                 canonical_event_ids,
             })
-        })();
-
-        match result {
-            Ok(insert_result) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(insert_result)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     fn update_event_payload(&self, event: &UsageEvent) -> Result<BTreeSet<SyncRollupBucketKey>> {
@@ -1471,17 +1461,6 @@ impl Store {
         event: &UsageEvent,
         fingerprint: &str,
     ) -> Result<EventInsertOutcome> {
-        if let Some(existing_id) = self.find_semantic_duplicate_event_id(event, fingerprint)? {
-            let existing = self.event_by_id(&existing_id)?;
-            let refreshed =
-                refreshed_duplicate_event(existing.as_ref(), event, existing_id.as_str());
-            return Ok(EventInsertOutcome {
-                inserted: false,
-                canonical_event_id: EventId(existing_id),
-                dirty_keys: self.update_event_payload(&refreshed)?,
-            });
-        }
-
         let payload = serde_json::to_string(event)?;
         let changed = self.conn.execute(
             r#"
@@ -1616,10 +1595,13 @@ impl Store {
                 return Ok(Some(event_id));
             }
         }
+        self.find_codex_fallback_duplicate_event_id(event)
+    }
+
+    fn find_codex_fallback_duplicate_event_id(&self, event: &UsageEvent) -> Result<Option<String>> {
         if event.provider != "codex" {
             return Ok(None);
         }
-
         let mut fallback = self.conn.prepare(
             r#"
             SELECT event_id, payload
@@ -1713,6 +1695,28 @@ impl Store {
         Ok(events)
     }
 
+    pub fn events_in_period(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<UsageEvent>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT payload FROM usage_events
+            WHERE started_at >= ?1 AND started_at <= ?2
+            ORDER BY started_at, event_id
+            "#,
+        )?;
+        let rows = stmt.query_map(params![since.to_rfc3339(), until.to_rfc3339()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(serde_json::from_str(&row?)?);
+        }
+        Ok(events)
+    }
+
     pub fn events_for_source(&self, source_id: &SourceId) -> Result<Vec<UsageEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT payload FROM usage_events WHERE source_id = ?1 ORDER BY started_at, event_id",
@@ -1757,8 +1761,7 @@ impl Store {
         if events.is_empty() {
             return Ok(0);
         }
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut changed = 0u64;
             let mut dirty_keys = BTreeSet::new();
             for event in events {
@@ -1767,23 +1770,11 @@ impl Store {
             }
             self.refresh_sync_rollups_for_keys(&dirty_keys)?;
             Ok(changed)
-        })();
-
-        match result {
-            Ok(changed) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(changed)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn delete_events_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut deleted = 0u64;
             for source_id in source_ids {
                 deleted += self.conn.execute(
@@ -1793,18 +1784,7 @@ impl Store {
             }
             self.delete_sync_rollups_for_sources_in_tx(source_ids)?;
             Ok(deleted)
-        })();
-
-        match result {
-            Ok(deleted) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(deleted)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn delete_events_for_source_file_hashes(
@@ -1816,8 +1796,7 @@ impl Store {
             return Ok(0);
         }
 
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut deleted = 0u64;
             let mut dirty_keys = BTreeSet::new();
 
@@ -1854,18 +1833,7 @@ impl Store {
 
             self.refresh_sync_rollups_for_keys(&dirty_keys)?;
             Ok(deleted)
-        })();
-
-        match result {
-            Ok(deleted) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(deleted)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn upsert_summary(&self, summary: &UsageSummary) -> Result<bool> {
@@ -1903,8 +1871,7 @@ impl Store {
     }
 
     pub fn upsert_summaries(&self, summaries: &[UsageSummary]) -> Result<u64> {
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut changed = 0u64;
             for summary in summaries {
                 if self.upsert_summary(summary)? {
@@ -1912,18 +1879,7 @@ impl Store {
                 }
             }
             Ok(changed)
-        })();
-
-        match result {
-            Ok(changed) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(changed)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn delete_summaries_for_source_file_hashes(
@@ -1935,8 +1891,7 @@ impl Store {
             return Ok(0);
         }
 
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut deleted = 0u64;
             for file_hash in file_hashes {
                 deleted += self.conn.execute(
@@ -1949,18 +1904,7 @@ impl Store {
                 )? as u64;
             }
             Ok(deleted)
-        })();
-
-        match result {
-            Ok(deleted) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(deleted)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn summaries(&self) -> Result<Vec<UsageSummary>> {
@@ -5059,6 +5003,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn open_preserves_existing_parent_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let shared_dir = dir.path().join("shared");
+        std::fs::create_dir(&shared_dir).expect("create shared dir");
+        std::fs::set_permissions(&shared_dir, std::fs::Permissions::from_mode(0o750))
+            .expect("set shared dir mode");
+
+        let store = Store::open(&shared_dir.join("statsai.sqlite")).expect("open store");
+        drop(store);
+
+        let mode = std::fs::metadata(&shared_dir)
+            .expect("shared dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o750);
+    }
+
+    #[test]
     fn task_bucket_sync_status_counts_tracked_and_local_bucket_union() {
         let store = Store::in_memory().expect("store");
         store
@@ -5974,9 +5941,12 @@ mod tests {
             )
             .expect("downgrade fingerprint");
 
-        assert!(!store
-            .insert_event(&new_event)
-            .expect("refresh legacy projectless duplicate"));
+        assert_eq!(
+            store
+                .insert_events(std::slice::from_ref(&new_event))
+                .expect("refresh legacy projectless duplicate"),
+            0
+        );
         assert_eq!(store.event_count().expect("count"), 1);
         assert_eq!(
             store.events().expect("events")[0].event_id,
@@ -6513,6 +6483,83 @@ mod tests {
     }
 
     #[test]
+    fn scan_file_replacement_rolls_back_deletions_when_cache_update_fails() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-atomic-replacement"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+        let cache_key = "/tmp/codex-atomic-replacement/session.jsonl".to_string();
+        let file_hash = hash_text(&cache_key);
+        let mut old_event = test_store_event(&source, now, "old-record");
+        old_event.parse_evidence = Some(statsai_core::ParseEvidence {
+            event_key_version: "v1".to_string(),
+            source_file_path_hash: Some(file_hash.clone()),
+            source_line_number: Some(1),
+            source_record_id: Some("old-record".to_string()),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: IdentitySource::Unresolved,
+        });
+        let mut old_summary = test_store_summary(&source, now, 15);
+        old_summary.parse_evidence = old_event.parse_evidence.clone();
+        store.insert_event(&old_event).expect("old event");
+        store.upsert_summary(&old_summary).expect("old summary");
+        store
+            .record_scan_file_entries(
+                &source.source_id,
+                &[ScanFileStateEntry {
+                    cache_key: cache_key.clone(),
+                    cache_signature: "old-signature".to_string(),
+                }],
+            )
+            .expect("old cache entry");
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_scan_cache_update
+                 BEFORE UPDATE ON scan_file_state
+                 WHEN NEW.cache_signature = 'fail-signature'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected scan cache failure');
+                 END;",
+            )
+            .expect("failure trigger");
+
+        let replacement = ScanFileStateEntry {
+            cache_key,
+            cache_signature: "fail-signature".to_string(),
+        };
+        let error = store
+            .replace_scan_file_records(ScanFileReplacement {
+                source_id: &source.source_id,
+                reconciled_file_hashes: &[file_hash],
+                events: &[],
+                summaries: &[],
+                pending_entries: &[replacement],
+                compatible_entries_to_upgrade: &[],
+                removed_cache_keys: &[],
+            })
+            .expect_err("replacement should fail");
+
+        assert!(error.to_string().contains("injected scan cache failure"));
+        assert_eq!(store.event_count().expect("event count"), 1);
+        assert_eq!(store.summary_count().expect("summary count"), 1);
+        assert_eq!(
+            store
+                .scan_file_entries(&source.source_id)
+                .expect("cache entries")[0]
+                .cache_signature,
+            "old-signature"
+        );
+    }
+
+    #[test]
     fn upserts_usage_summaries_idempotently() {
         let store = Store::in_memory().expect("store");
         let source = statsai_core::SourceLocation::local_adapter(
@@ -6817,6 +6864,7 @@ mod tests {
             summaries: summaries.clone(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            authoritative_snapshot: None,
             created_at: now,
         };
 
