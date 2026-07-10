@@ -70,7 +70,7 @@ fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>) -> Result<()>
 
     let s = lock_store(store);
     let payload = match url.as_str() {
-        "/health" => json!({"status": "ok"}),
+        "/health" => health_payload(),
         "/status" => json!({
             "events": s.event_count()?,
             "tokens": s.token_total()?
@@ -93,6 +93,13 @@ fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>) -> Result<()>
     drop(s);
 
     respond_json(request, StatusCode(200), &payload)
+}
+
+fn health_payload() -> serde_json::Value {
+    json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
 pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
@@ -210,14 +217,15 @@ mod watch {
         reconcile_verified_source_state, verified_source_state_hash, ScanFileStateEntry, Store,
     };
     use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use tiny_http::Server;
 
     pub fn watch_and_serve(addr: &str, store: Arc<Mutex<Store>>, device_id: &str) -> Result<()> {
         super::ensure_loopback(addr)?;
+        let startup_executable = current_executable_stamp();
 
         let sources = {
             let s = super::lock_store(&store);
@@ -248,6 +256,13 @@ mod watch {
             .map_err(|err| anyhow::anyhow!("start local API on {addr}: {err}"))?;
 
         loop {
+            if startup_executable
+                .as_ref()
+                .is_some_and(executable_was_replaced)
+            {
+                eprintln!("daemon: executable changed on disk; restarting");
+                return Ok(());
+            }
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(changed) => {
                     let s = super::lock_store(&store);
@@ -263,6 +278,31 @@ mod watch {
         }
 
         Ok(())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ExecutableStamp {
+        path: PathBuf,
+        len: u64,
+        modified: Option<SystemTime>,
+    }
+
+    fn executable_stamp(path: &Path) -> Option<ExecutableStamp> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(ExecutableStamp {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn current_executable_stamp() -> Option<ExecutableStamp> {
+        let path = std::env::current_exe().ok()?;
+        executable_stamp(&path)
+    }
+
+    fn executable_was_replaced(startup: &ExecutableStamp) -> bool {
+        executable_stamp(&startup.path).as_ref() != Some(startup)
     }
 
     fn discover_watch_sources(store: &Store) -> Vec<PathBuf> {
@@ -744,6 +784,18 @@ mod watch {
         };
         use std::sync::{Arc, Mutex};
 
+        #[test]
+        fn executable_stamp_detects_replaced_binary() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let binary = dir.path().join("statsai");
+            std::fs::write(&binary, b"old").expect("old binary");
+            let startup = executable_stamp(&binary).expect("startup stamp");
+
+            assert!(!executable_was_replaced(&startup));
+            std::fs::write(&binary, b"new-binary").expect("new binary");
+            assert!(executable_was_replaced(&startup));
+        }
+
         struct TestAdapter {
             provider: &'static str,
             verified_state: Option<VerifiedSourceState>,
@@ -954,6 +1006,12 @@ mod tests {
 
         let error = ingest_sync_batch(&store, &batch).expect_err("unsupported schema");
         assert!(error.to_string().contains("unsupported sync batch schema"));
+    }
+
+    #[test]
+    fn health_payload_reports_daemon_version() {
+        assert_eq!(health_payload()["status"], "ok");
+        assert_eq!(health_payload()["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

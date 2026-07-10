@@ -444,8 +444,8 @@ fn scan_claude_source(
 
     let projects = root.join("projects");
     let session_projects = load_claude_session_projects(&projects);
-    let cache_namespace = scan_cache_namespace(source, adapter.version());
-    let event_files = claude_jsonl_candidates(&projects, &cache_namespace)?;
+    let cache_namespaces = scan_cache_namespaces(source, adapter.version());
+    let event_files = claude_jsonl_candidates(&projects, &cache_namespaces)?;
     let mut scanned_event_cache_keys = HashSet::new();
     let mut seen = HashSet::new();
     {
@@ -467,7 +467,7 @@ fn scan_claude_source(
         }
     }
 
-    if let Some(candidate) = claude_stats_cache_candidate(&root, &cache_namespace) {
+    if let Some(candidate) = claude_stats_cache_candidate(&root, &cache_namespaces) {
         if options.should_scan(&candidate.cache_key) {
             scan.diagnostics.files_scanned += 1;
             parse_claude_stats_cache(adapter, source, options, &candidate.path, &mut scan)?;
@@ -665,10 +665,14 @@ fn scan_codex_source(
     };
     let source_path = PathBuf::from(path_label);
     let root = codex_source_root(&source_path);
-    let cache_namespace = scan_cache_namespace(source, adapter.version());
-    let thread_titles = load_codex_thread_titles(&root);
+    let cache_namespaces = scan_cache_namespaces(source, adapter.version());
+    let thread_titles = if options.should_collect_tasks() {
+        load_codex_thread_titles(&root)
+    } else {
+        HashMap::new()
+    };
     let mut indexed_candidates = Vec::new();
-    for (index, candidate) in codex_jsonl_candidates(source, &source_path, &cache_namespace)?
+    for (index, candidate) in codex_jsonl_candidates(source, &source_path, &cache_namespaces)?
         .into_iter()
         .enumerate()
     {
@@ -1569,29 +1573,39 @@ fn claude_scan_candidates(
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let cache_namespace = scan_cache_namespace(source, adapter_version);
+    let cache_namespaces = scan_cache_namespaces(source, adapter_version);
 
-    let mut candidates = claude_jsonl_candidates(&root.join("projects"), &cache_namespace)?;
-    if let Some(candidate) = claude_stats_cache_candidate(&root, &cache_namespace) {
+    let mut candidates = claude_jsonl_candidates(&root.join("projects"), &cache_namespaces)?;
+    if let Some(candidate) = claude_stats_cache_candidate(&root, &cache_namespaces) {
         candidates.push(candidate);
     }
     Ok(candidates)
 }
 
-fn claude_jsonl_candidates(root: &Path, cache_namespace: &str) -> Result<Vec<ScanCandidateFile>> {
+fn claude_jsonl_candidates(
+    root: &Path,
+    cache_namespaces: &ScanCacheNamespaces,
+) -> Result<Vec<ScanCandidateFile>> {
     collect_jsonl_files(root)?
         .into_iter()
         .map(|path| {
             let dependency = claude_session_index_dependency(root, &path);
-            Ok(scan_candidate(path, dependency.as_deref(), cache_namespace))
+            Ok(scan_candidate(
+                path,
+                dependency.as_deref(),
+                cache_namespaces,
+            ))
         })
         .collect()
 }
 
-fn claude_stats_cache_candidate(root: &Path, cache_namespace: &str) -> Option<ScanCandidateFile> {
+fn claude_stats_cache_candidate(
+    root: &Path,
+    cache_namespaces: &ScanCacheNamespaces,
+) -> Option<ScanCandidateFile> {
     let path = root.join("stats-cache.json");
     path.is_file()
-        .then(|| scan_candidate(path, None, cache_namespace))
+        .then(|| scan_candidate(path, None, cache_namespaces))
 }
 
 fn claude_session_index_dependency(root: &Path, path: &Path) -> Option<String> {
@@ -1618,14 +1632,14 @@ fn codex_scan_candidates(
         return Ok(Vec::new());
     };
     let source_path = PathBuf::from(path_label);
-    let cache_namespace = scan_cache_namespace(source, adapter_version);
-    codex_jsonl_candidates(source, &source_path, &cache_namespace)
+    let cache_namespaces = scan_cache_namespaces(source, adapter_version);
+    codex_jsonl_candidates(source, &source_path, &cache_namespaces)
 }
 
 fn codex_jsonl_candidates(
     _source: &SourceLocation,
     path: &Path,
-    cache_namespace: &str,
+    cache_namespaces: &ScanCacheNamespaces,
 ) -> Result<Vec<ScanCandidateFile>> {
     let roots = codex_usage_roots(path);
     let legacy_auth_dependencies = vec![codex_legacy_auth_dependency_signature(
@@ -1638,7 +1652,7 @@ fn codex_jsonl_candidates(
                 candidate_path,
                 None,
                 &legacy_auth_dependencies,
-                cache_namespace,
+                cache_namespaces,
             ));
         }
     }
@@ -1656,10 +1670,11 @@ fn opencode_scan_candidates(
     if !db_path.is_file() {
         return Ok(Vec::new());
     }
+    let cache_namespaces = scan_cache_namespaces(source, adapter_version);
     Ok(vec![scan_candidate(
         db_path,
         opencode_sqlite_dependency_signature(&root.join("opencode.db")).as_deref(),
-        &scan_cache_namespace(source, adapter_version),
+        &cache_namespaces,
     )])
 }
 
@@ -1674,7 +1689,7 @@ fn grok_build_scan_candidates(
     if !sessions_root.is_dir() {
         return Ok(Vec::new());
     }
-    let cache_namespace = scan_cache_namespace(source, adapter_version);
+    let cache_namespaces = scan_cache_namespaces(source, adapter_version);
     let unified_log_index = parse_grok_unified_log(&root)?;
     let mut candidates = Vec::new();
     for entry in WalkDir::new(sessions_root).follow_links(false) {
@@ -1693,7 +1708,7 @@ fn grok_build_scan_candidates(
             candidates.push(scan_candidate(
                 entry.path().to_path_buf(),
                 dependency.as_deref(),
-                &cache_namespace,
+                &cache_namespaces,
             ));
         }
     }
@@ -1763,33 +1778,61 @@ fn codex_usage_root_for_file(root: &Path, path: &Path) -> PathBuf {
 fn scan_candidate(
     path: PathBuf,
     dependency_signature: Option<&str>,
-    cache_namespace: &str,
+    cache_namespaces: &ScanCacheNamespaces,
 ) -> ScanCandidateFile {
-    scan_candidate_with_compatible_dependencies(path, dependency_signature, &[], cache_namespace)
+    scan_candidate_with_compatible_dependencies(path, dependency_signature, &[], cache_namespaces)
 }
 
 fn scan_candidate_with_compatible_dependencies(
     path: PathBuf,
     dependency_signature: Option<&str>,
     compatible_dependency_signatures: &[String],
-    cache_namespace: &str,
+    cache_namespaces: &ScanCacheNamespaces,
 ) -> ScanCandidateFile {
     let cache_key = canonical_display(&path);
     let file_signature = file_metadata_signature(&path);
-    let cache_signature =
-        build_scan_cache_signature(cache_namespace, &file_signature, dependency_signature);
-    let compatible_cache_signatures = compatible_dependency_signatures
-        .iter()
-        .map(|dependency| {
-            build_scan_cache_signature(cache_namespace, &file_signature, Some(dependency.as_str()))
-        })
-        .filter(|signature| signature != &cache_signature)
-        .collect();
+    let cache_signature = build_scan_cache_signature(
+        &cache_namespaces.current,
+        &file_signature,
+        dependency_signature,
+    );
+    let mut compatible_cache_signatures = Vec::new();
+    for dependency in compatible_dependency_signatures {
+        push_compatible_cache_signature(
+            &mut compatible_cache_signatures,
+            &cache_signature,
+            build_scan_cache_signature(
+                &cache_namespaces.current,
+                &file_signature,
+                Some(dependency.as_str()),
+            ),
+        );
+    }
+    for namespace in &cache_namespaces.compatible {
+        push_compatible_cache_signature(
+            &mut compatible_cache_signatures,
+            &cache_signature,
+            build_scan_cache_signature(namespace, &file_signature, dependency_signature),
+        );
+        for dependency in compatible_dependency_signatures {
+            push_compatible_cache_signature(
+                &mut compatible_cache_signatures,
+                &cache_signature,
+                build_scan_cache_signature(namespace, &file_signature, Some(dependency.as_str())),
+            );
+        }
+    }
     ScanCandidateFile {
         path,
         cache_key,
         cache_signature,
         compatible_cache_signatures,
+    }
+}
+
+fn push_compatible_cache_signature(compatible: &mut Vec<String>, current: &str, candidate: String) {
+    if candidate != current && !compatible.contains(&candidate) {
+        compatible.push(candidate);
     }
 }
 
@@ -1803,14 +1846,28 @@ fn build_scan_cache_signature(
         .unwrap_or_else(|| hash_text(&format!("{cache_namespace}:{file_signature}")))
 }
 
-fn scan_cache_namespace(source: &SourceLocation, adapter_version: &str) -> String {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanCacheNamespaces {
+    current: String,
+    compatible: Vec<String>,
+}
+
+fn scan_cache_namespaces(source: &SourceLocation, adapter_version: &str) -> ScanCacheNamespaces {
     let adapter_id = source.adapter_id.as_deref().unwrap_or("");
     let path_hash = source.path_hash.as_deref().unwrap_or("");
     let parser_revision = scan_cache_parser_revision(source);
-    hash_text(&format!(
+    let current = hash_text(&format!(
+        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{path_hash}:{parser_revision}",
+        source.provider, source.source_kind,
+    ));
+    let versioned = hash_text(&format!(
         "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{adapter_version}:{path_hash}:{parser_revision}",
-        source.provider, source.source_kind
-    ))
+        source.provider, source.source_kind,
+    ));
+    ScanCacheNamespaces {
+        current,
+        compatible: vec![versioned],
+    }
 }
 
 fn scan_cache_parser_revision(source: &SourceLocation) -> &'static str {
@@ -2156,6 +2213,7 @@ fn parse_codex_file(
     thread_titles: &HashMap<String, String>,
     path: &Path,
 ) -> Result<()> {
+    let collect_tasks = ctx.options.should_collect_tasks();
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
@@ -2190,14 +2248,15 @@ fn parse_codex_file(
         if line_kind == CodexLineKind::ResponseItemMessage {
             let header = codex_line_header(&line);
             let role = codex_json_string_prefix_after_marker(header, "\"role\":\"", 32);
-            let preview_raw_text = (role.as_deref() == Some("user"))
+            let preview_raw_text = (collect_tasks && role.as_deref() == Some("user"))
                 .then(|| {
                     codex_response_item_user_preview_from_line(&line, CODEX_TASK_PREVIEW_RAW_BYTES)
                 })
                 .flatten()
                 .and_then(|text| codex_prompt_preview_input(Some(text.as_str())));
             let needs_full_fallback = role.is_none()
-                || (role.as_deref() == Some("user")
+                || (collect_tasks
+                    && role.as_deref() == Some("user")
                     && preview_raw_text
                         .as_deref()
                         .and_then(|raw| task_preview_from_prompt(Some(raw), 220))
@@ -2283,19 +2342,20 @@ fn parse_codex_file(
                 ctx.scan.diagnostics.model_fallbacks += 1;
             }
             let message_role = parsed.payload.role.as_deref().map(ToOwned::to_owned);
-            let user_message_preview = (parsed.payload.role.as_deref() == Some("user"))
-                .then(|| {
-                    codex_preview_from_response_parts(
-                        parsed.payload.content.as_deref().unwrap_or(&[]),
-                        CODEX_TASK_PREVIEW_RAW_BYTES,
-                    )
-                })
-                .flatten()
-                .and_then(|text| codex_prompt_preview_input(Some(text.as_str())))
-                .map(|raw_text| CodexPromptPreviewCandidate {
-                    raw_text,
-                    source: CodexPromptPreviewSource::ResponseItemUser,
-                });
+            let user_message_preview = (collect_tasks
+                && parsed.payload.role.as_deref() == Some("user"))
+            .then(|| {
+                codex_preview_from_response_parts(
+                    parsed.payload.content.as_deref().unwrap_or(&[]),
+                    CODEX_TASK_PREVIEW_RAW_BYTES,
+                )
+            })
+            .flatten()
+            .and_then(|text| codex_prompt_preview_input(Some(text.as_str())))
+            .map(|raw_text| CodexPromptPreviewCandidate {
+                raw_text,
+                source: CodexPromptPreviewSource::ResponseItemUser,
+            });
             records.push(CodexLineRecord {
                 line_number: index,
                 timestamp,
@@ -2327,6 +2387,9 @@ fn parse_codex_file(
             continue;
         }
         if line_kind == CodexLineKind::EventUserMessage {
+            if !collect_tasks {
+                continue;
+            }
             let header = codex_line_header(&line);
             let (timestamp, timestamp_inferred) = codex_timestamp_from_text(
                 codex_json_string_prefix_after_marker(header, "\"timestamp\":\"", 64).as_deref(),
@@ -2391,24 +2454,26 @@ fn parse_codex_file(
         };
 
         if is_codex_session_meta(&value) {
-            current_thread_id = value
-                .pointer("/payload/id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            let session_id = current_thread_id
-                .clone()
-                .or_else(|| Some(session_raw.clone()));
-            current_title = value
-                .pointer("/payload/thread_name")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| {
-                    session_id
-                        .as_ref()
-                        .and_then(|session_id| thread_titles.get(session_id))
-                        .cloned()
-                })
-                .or_else(|| thread_titles.get(&session_raw).cloned());
+            if collect_tasks {
+                current_thread_id = value
+                    .pointer("/payload/id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let session_id = current_thread_id
+                    .clone()
+                    .or_else(|| Some(session_raw.clone()));
+                current_title = value
+                    .pointer("/payload/thread_name")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        session_id
+                            .as_ref()
+                            .and_then(|session_id| thread_titles.get(session_id))
+                            .cloned()
+                    })
+                    .or_else(|| thread_titles.get(&session_raw).cloned());
+            }
             current_project = codex_project_context_from_value(&value, &mut project_cache);
             continue;
         }
@@ -2451,7 +2516,9 @@ fn parse_codex_file(
             })
             .flatten();
         let message_role = codex_visible_message_role(&value).map(ToOwned::to_owned);
-        let user_message_preview = codex_user_message_preview(&value);
+        let user_message_preview = collect_tasks
+            .then(|| codex_user_message_preview(&value))
+            .flatten();
         let event_session_raw =
             session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
         let usage = if is_token_count_event {
@@ -2616,7 +2683,10 @@ fn parse_codex_file(
                     _ => {}
                 }
             }
-            if let Some(prompt_preview) = record.user_message_preview.as_ref() {
+            if let Some(prompt_preview) = collect_tasks
+                .then_some(record.user_message_preview.as_ref())
+                .flatten()
+            {
                 let already_present = turn.prompt_previews.iter().any(|existing| {
                     existing.source == prompt_preview.source
                         && existing.raw_text == prompt_preview.raw_text
@@ -6472,6 +6542,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_usage_only_scan_skips_task_preview_fallback_parsing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let codex_root = dir.path().join("codex");
+        let sessions = codex_root.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+
+        let session_path = sessions.join("session.jsonl");
+        let mut file = File::create(&session_path).expect("session file");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hi"}}]"#
+        )
+        .expect("write malformed task-only message");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-01T08:00:01Z","usage":{{"input_tokens":3,"output_tokens":4}}}}"#
+        )
+        .expect("write usage");
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            &codex_root,
+            LocationOrigin::Configured,
+        );
+        let scan =
+            scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.diagnostics.invalid_rows, 0);
+        assert!(scan.task_spans.is_empty());
+    }
+
+    #[test]
     fn codex_task_spans_keep_provider_native_user_message_when_wrappers_come_first() {
         let dir = tempfile::tempdir().expect("tempdir");
         let codex_root = dir.path().join("codex");
@@ -7215,18 +7320,17 @@ mod tests {
         let candidates = codex_scan_candidates(&source, "test-adapter").expect("candidates");
         let auth_dependency =
             file_metadata_signature(&codex_source_root(dir.path()).join("auth.json"));
-        let cache_namespace = scan_cache_namespace(&source, "test-adapter");
+        let cache_namespaces = scan_cache_namespaces(&source, "test-adapter");
         let legacy_candidate = scan_candidate(
             session_path.clone(),
             Some(auth_dependency.as_str()),
-            &cache_namespace,
+            &cache_namespaces,
         );
 
         assert_eq!(candidates.len(), 1);
-        assert_eq!(
-            candidates[0].compatible_cache_signatures,
-            vec![legacy_candidate.cache_signature]
-        );
+        assert!(candidates[0]
+            .compatible_cache_signatures
+            .contains(&legacy_candidate.cache_signature));
     }
 
     #[test]
@@ -7251,18 +7355,17 @@ mod tests {
         let candidates = codex_scan_candidates(&source, "test-adapter").expect("candidates");
         let auth_dependency =
             file_metadata_signature(&codex_source_root(dir.path()).join("auth.json"));
-        let cache_namespace = scan_cache_namespace(&source, "test-adapter");
+        let cache_namespaces = scan_cache_namespaces(&source, "test-adapter");
         let legacy_candidate = scan_candidate(
             session_path.clone(),
             Some(auth_dependency.as_str()),
-            &cache_namespace,
+            &cache_namespaces,
         );
 
         assert_eq!(candidates.len(), 1);
-        assert_eq!(
-            candidates[0].compatible_cache_signatures,
-            vec![legacy_candidate.cache_signature]
-        );
+        assert!(candidates[0]
+            .compatible_cache_signatures
+            .contains(&legacy_candidate.cache_signature));
     }
 
     #[test]
@@ -7302,6 +7405,62 @@ mod tests {
     }
 
     #[test]
+    fn codex_scan_candidates_are_stable_across_package_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::write(
+            sessions.join("session.jsonl"),
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("session");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let before = codex_scan_candidates(&source, "0.3.1").expect("before");
+        let after = codex_scan_candidates(&source, "0.3.2").expect("after");
+
+        assert_eq!(before[0].cache_signature, after[0].cache_signature);
+    }
+
+    #[test]
+    fn codex_scan_candidates_accept_same_release_versioned_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let session_path = sessions.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        )
+        .expect("session");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+        let namespaces = scan_cache_namespaces(&source, "0.3.1");
+        let legacy_signature = build_scan_cache_signature(
+            &namespaces.compatible[0],
+            &file_metadata_signature(&session_path),
+            None,
+        );
+
+        let candidates = codex_scan_candidates(&source, "0.3.1").expect("candidates");
+
+        assert!(candidates[0]
+            .compatible_cache_signatures
+            .contains(&legacy_signature));
+    }
+
+    #[test]
     fn codex_scan_candidates_invalidate_legacy_cache_namespace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
@@ -7329,7 +7488,11 @@ mod tests {
                 source.provider, source.source_kind, "test-adapter"
             ))
         };
-        let legacy_candidate = scan_candidate(session_path.clone(), None, &legacy_namespace);
+        let legacy_namespaces = ScanCacheNamespaces {
+            current: legacy_namespace,
+            compatible: Vec::new(),
+        };
+        let legacy_candidate = scan_candidate(session_path.clone(), None, &legacy_namespaces);
         let current = codex_scan_candidates(&source, "test-adapter").expect("current candidates");
 
         assert_eq!(current.len(), 1);
@@ -7484,7 +7647,11 @@ mod tests {
                 source.provider, source.source_kind, "test-adapter", "project-context.v1"
             ))
         };
-        let legacy_candidate = scan_candidate(session_path.clone(), None, &legacy_namespace);
+        let legacy_namespaces = ScanCacheNamespaces {
+            current: legacy_namespace,
+            compatible: Vec::new(),
+        };
+        let legacy_candidate = scan_candidate(session_path.clone(), None, &legacy_namespaces);
         let current = claude_scan_candidates(&source, "test-adapter").expect("current candidates");
 
         assert_eq!(current.len(), 1);

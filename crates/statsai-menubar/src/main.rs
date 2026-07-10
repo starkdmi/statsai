@@ -537,7 +537,9 @@ mod macos {
             let _ = refresh_proxy.send_event(UserEvent::Refresh);
         });
 
-        ensure_background_tracking();
+        if should_auto_install_background_tracking(cfg!(debug_assertions)) {
+            ensure_background_tracking();
+        }
 
         let menu_ui = MenuUi::new();
         let initial = loading_snapshot();
@@ -784,8 +786,14 @@ mod macos {
 
     fn ensure_background_tracking() {
         spawn_menu_action(|| {
-            let _ = run_statsai_capture(&["service", "install"]);
+            if let Err(message) = run_statsai_capture(&["service", "install"]) {
+                eprintln!("statsai menubar could not start background tracking: {message}");
+            }
         });
+    }
+
+    fn should_auto_install_background_tracking(debug_build: bool) -> bool {
+        !debug_build
     }
 
     fn install_menu_tracking_observers(
@@ -1405,6 +1413,12 @@ end try"#;
             ready.sessions_week = 10;
             ready.background_tracking.running = true;
             assert!(!should_run_startup_scan(&ready));
+        }
+
+        #[test]
+        fn debug_build_does_not_auto_install_persistent_tracking() {
+            assert!(!should_auto_install_background_tracking(true));
+            assert!(should_auto_install_background_tracking(false));
         }
     }
 }

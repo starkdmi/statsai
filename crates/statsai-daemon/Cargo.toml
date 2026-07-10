@@ -20,3 +20,6 @@ tiny_http.workspace = true
 
 [features]
 watch = ["dep:notify"]
+
+[dev-dependencies]
+tempfile.workspace = true

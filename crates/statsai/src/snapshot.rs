@@ -250,7 +250,9 @@ struct SourceStatusDraft {
 }
 
 fn background_status(background: service::BackgroundServiceState) -> SnapshotBackgroundStatus {
-    let label = if background.launch_agent_loaded {
+    let label = if background.stale {
+        "Tracking needs restart".to_string()
+    } else if background.launch_agent_loaded {
         "Tracking automatically".to_string()
     } else if background.plist_installed {
         "Tracking installed, starting up".to_string()
@@ -258,8 +260,8 @@ fn background_status(background: service::BackgroundServiceState) -> SnapshotBac
         "Tracking setup needed".to_string()
     };
     SnapshotBackgroundStatus {
-        installed: background.plist_installed,
-        running: background.launch_agent_loaded,
+        installed: background.plist_installed || background.launch_agent_loaded,
+        running: background.launch_agent_loaded && !background.stale,
         label,
     }
 }
@@ -864,6 +866,9 @@ mod tests {
         let running = background_status(service::BackgroundServiceState {
             plist_installed: true,
             launch_agent_loaded: true,
+            daemon_reachable: true,
+            daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            stale: false,
         });
         assert!(running.installed);
         assert!(running.running);
@@ -872,8 +877,22 @@ mod tests {
         let missing = background_status(service::BackgroundServiceState {
             plist_installed: false,
             launch_agent_loaded: false,
+            daemon_reachable: false,
+            daemon_version: None,
+            stale: false,
         });
         assert_eq!(missing.label, "Tracking setup needed");
+
+        let stale = background_status(service::BackgroundServiceState {
+            plist_installed: true,
+            launch_agent_loaded: true,
+            daemon_reachable: true,
+            daemon_version: None,
+            stale: true,
+        });
+        assert!(stale.installed);
+        assert!(!stale.running);
+        assert_eq!(stale.label, "Tracking needs restart");
     }
 
     #[test]

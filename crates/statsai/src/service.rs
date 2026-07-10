@@ -4,6 +4,8 @@ use serde::Serialize;
 #[cfg(target_os = "macos")]
 use anyhow::Context;
 #[cfg(target_os = "macos")]
+use serde::Deserialize;
+#[cfg(target_os = "macos")]
 use statsai_core::home_dir;
 #[cfg(target_os = "macos")]
 use std::fs;
@@ -26,6 +28,9 @@ pub enum ServiceAction {
 pub struct BackgroundServiceState {
     pub plist_installed: bool,
     pub launch_agent_loaded: bool,
+    pub daemon_reachable: bool,
+    pub daemon_version: Option<String>,
+    pub stale: bool,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -33,6 +38,9 @@ pub fn background_service_state() -> Result<BackgroundServiceState> {
     Ok(BackgroundServiceState {
         plist_installed: false,
         launch_agent_loaded: false,
+        daemon_reachable: false,
+        daemon_version: None,
+        stale: false,
     })
 }
 
@@ -40,21 +48,21 @@ pub fn background_service_state() -> Result<BackgroundServiceState> {
 pub fn background_service_state() -> Result<BackgroundServiceState> {
     let plist_path = launch_agent_path()?;
     let plist_installed = plist_path.exists();
-    let launch_agent_loaded = if plist_installed {
-        Command::new("launchctl")
-            .args([
-                "print",
-                &format!("{}/{}", gui_domain()?, LAUNCH_AGENT_LABEL),
-            ])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let domain = gui_domain()?;
+    let launch_agent_loaded = launch_agent_is_loaded(&domain);
+    let daemon_reachable = daemon_reachable("127.0.0.1:8765");
+    let daemon_version = daemon_health("127.0.0.1:8765").and_then(|health| health.version);
+    let stale = daemon_is_stale(
+        launch_agent_loaded,
+        daemon_reachable,
+        daemon_version.as_deref(),
+    );
     Ok(BackgroundServiceState {
         plist_installed,
         launch_agent_loaded,
+        daemon_reachable,
+        daemon_version,
+        stale,
     })
 }
 
@@ -178,6 +186,49 @@ fn gui_domain() -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn launch_agent_target(domain: &str) -> String {
+    format!("{domain}/{LAUNCH_AGENT_LABEL}")
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_is_stale(
+    launch_agent_loaded: bool,
+    daemon_reachable: bool,
+    daemon_version: Option<&str>,
+) -> bool {
+    launch_agent_loaded && daemon_reachable && daemon_version != Some(env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_is_loaded(domain: &str) -> bool {
+    Command::new("launchctl")
+        .args(["print", launch_agent_target(domain).as_str()])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn bootout_launch_agent(domain: &str) -> Result<bool> {
+    if !launch_agent_is_loaded(domain) {
+        return Ok(false);
+    }
+    let target = launch_agent_target(domain);
+    let output = Command::new("launchctl")
+        .args(["bootout", target.as_str()])
+        .output()
+        .context("launchctl bootout")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!("launchctl bootout failed with status {}", output.status);
+        }
+        bail!("launchctl bootout failed: {stderr}");
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
 fn install_launch_agent() -> Result<()> {
     let statsai_binary = resolve_statsai_binary()?;
     let log_dir = daemon_log_dir()?;
@@ -188,14 +239,11 @@ fn install_launch_agent() -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
 
+    let domain = gui_domain()?;
+    bootout_launch_agent(&domain)?;
+
     let plist = launch_agent_plist(&statsai_binary, &stdout, &stderr);
     fs::write(&plist_path, plist).with_context(|| format!("write {}", plist_path.display()))?;
-
-    let domain = gui_domain()?;
-    // Idempotent reinstall: unload any existing agent before bootstrap.
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain, LAUNCH_AGENT_LABEL])
-        .status();
 
     let status = Command::new("launchctl")
         .args(["bootstrap", &domain, plist_path.to_string_lossy().as_ref()])
@@ -203,6 +251,9 @@ fn install_launch_agent() -> Result<()> {
         .context("launchctl bootstrap")?;
     if !status.success() {
         bail!("launchctl bootstrap failed with status {status}");
+    }
+    if !launch_agent_is_loaded(&domain) {
+        bail!("launchctl bootstrap succeeded but {LAUNCH_AGENT_LABEL} is not loaded");
     }
 
     println!("installed LaunchAgent {LAUNCH_AGENT_LABEL}");
@@ -215,9 +266,7 @@ fn install_launch_agent() -> Result<()> {
 fn uninstall_launch_agent() -> Result<()> {
     let plist_path = launch_agent_path()?;
     let domain = gui_domain()?;
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain, LAUNCH_AGENT_LABEL])
-        .status();
+    bootout_launch_agent(&domain)?;
     if plist_path.exists() {
         fs::remove_file(&plist_path).with_context(|| format!("remove {}", plist_path.display()))?;
     }
@@ -228,13 +277,14 @@ fn uninstall_launch_agent() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn status_launch_agent() -> Result<()> {
     let background = background_service_state()?;
-    let daemon_active = daemon_reachable("127.0.0.1:8765");
 
-    if background.launch_agent_loaded && daemon_active {
+    if background.stale {
+        println!("Auto-collect: stale daemon — run `statsai service install` to restart it");
+    } else if background.launch_agent_loaded && background.daemon_reachable {
         println!("Auto-collect: on (watching Claude & Codex logs)");
     } else if background.launch_agent_loaded {
         println!("Auto-collect: installed but paused — check ~/.statsai/logs/");
-    } else if daemon_active {
+    } else if background.daemon_reachable {
         println!("Auto-collect: off (collecting in this terminal session only)");
         println!("Turn on: statsai service install");
     } else if background.plist_installed {
@@ -247,7 +297,26 @@ fn status_launch_agent() -> Result<()> {
 
     let plist_path = launch_agent_path()?;
     println!("LaunchAgent plist: {}", plist_path.display());
+    if let Some(version) = background.daemon_version {
+        println!("Daemon version: {version}");
+    }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+struct DaemonHealth {
+    version: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_health(api: &str) -> Option<DaemonHealth> {
+    ureq::get(&format!("http://{api}/health"))
+        .timeout(std::time::Duration::from_millis(400))
+        .call()
+        .ok()?
+        .into_json()
+        .ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -259,4 +328,25 @@ fn daemon_reachable(api: &str) -> bool {
         return false;
     };
     TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_agent_target_combines_domain_and_label() {
+        assert_eq!(launch_agent_target("gui/501"), "gui/501/dev.statsai.daemon");
+    }
+
+    #[test]
+    fn loaded_legacy_daemon_without_version_is_stale() {
+        assert!(daemon_is_stale(true, true, None));
+        assert!(!daemon_is_stale(
+            true,
+            true,
+            Some(env!("CARGO_PKG_VERSION"))
+        ));
+        assert!(!daemon_is_stale(true, false, None));
+    }
 }

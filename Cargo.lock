@@ -2280,6 +2280,7 @@ dependencies = [
  "statsai-adapters",
  "statsai-core",
  "statsai-store",
+ "tempfile",
  "tiny_http",
 ]
 
