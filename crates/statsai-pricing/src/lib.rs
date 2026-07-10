@@ -45,6 +45,15 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("claude-haiku-3-5") || lower.contains("claude-haiku-3.5") {
         return Some("claude-haiku-3-5");
     }
+    if lower.contains("gpt-5.6-sol") {
+        return Some("gpt-5.6-sol");
+    }
+    if lower.contains("gpt-5.6-terra") {
+        return Some("gpt-5.6-terra");
+    }
+    if lower.contains("gpt-5.6-luna") {
+        return Some("gpt-5.6-luna");
+    }
     if lower.contains("gpt-5.5") {
         return Some("gpt-5.5");
     }
@@ -142,6 +151,9 @@ pub fn normalize_model_name(name: &str) -> String {
         "gpt-5.3-codex" => "gpt-5.3-codex".to_string(),
         "gpt-5.4" => "gpt-5.4".to_string(),
         "gpt-5.4-mini" => "gpt-5.4-mini".to_string(),
+        "gpt-5.6-sol" => "gpt-5.6-sol".to_string(),
+        "gpt-5.6-terra" => "gpt-5.6-terra".to_string(),
+        "gpt-5.6-luna" => "gpt-5.6-luna".to_string(),
         "gpt-5.5" => "gpt-5.5".to_string(),
         "gpt-5-mini" => "gpt-5-mini".to_string(),
         "gpt-5-nano" => "gpt-5-nano".to_string(),
@@ -204,6 +216,10 @@ pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
             Some(pricing_with_cache_creation(3.0, 3.75, 0.3, 15.0))
         }
         "claude-haiku-4-5" => Some(pricing_with_cache_creation(1.0, 1.25, 0.1, 5.0)),
+        // GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount.
+        "gpt-5.6-sol" => Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 30.0)),
+        "gpt-5.6-terra" => Some(pricing_with_cache_creation(2.5, 3.125, 0.25, 15.0)),
+        "gpt-5.6-luna" => Some(pricing_with_cache_creation(1.0, 1.25, 0.1, 6.0)),
         "gpt-5.5" => Some(pricing(5.0, 0.5, 30.0)),
         "gpt-5.4" => Some(pricing(2.5, 0.25, 15.0)),
         "gpt-5.4-mini" => Some(pricing(0.75, 0.075, 4.5)),
@@ -282,7 +298,7 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
         estimated_api_equivalent_usd: Some(cost_cents),
         provider_reported_usd: None,
         pricing_source: Some(pricing_source),
-        pricing_version: Some("static:2026-06".to_string()),
+        pricing_version: Some("static:2026-07".to_string()),
         confidence: Confidence::Medium,
     }
 }
@@ -324,6 +340,17 @@ mod tests {
     fn normalizes_codex_aliases() {
         assert_eq!(normalize_model_name("gpt-5.1-codex"), "gpt-5-codex");
         assert_eq!(normalize_model_name("gpt-5.1-codex-mini"), "gpt-5-mini");
+    }
+
+    #[test]
+    fn normalizes_gpt_5_6_family_and_proxy_wrapped_ids() {
+        assert_eq!(normalize_model_name("gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(normalize_model_name("gpt-5.6-terra"), "gpt-5.6-terra");
+        assert_eq!(normalize_model_name("gpt-5.6-luna"), "gpt-5.6-luna");
+        assert_eq!(
+            normalize_model_name("relay/openai-gpt-5.6-terra"),
+            "gpt-5.6-terra"
+        );
     }
 
     #[test]
@@ -654,5 +681,38 @@ mod tests {
             cost.pricing_source.as_deref(),
             Some("codex_api_pricing:gpt-5")
         );
+    }
+
+    #[test]
+    fn estimates_gpt_5_6_variant_costs_with_their_distinct_rates() {
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_creation_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+
+        for (model_name, expected_cents) in [
+            ("gpt-5.6-sol", 4_175),
+            ("gpt-5.6-terra", 2_088),
+            ("gpt-5.6-luna", 835),
+        ] {
+            let model = statsai_core::ModelInfo {
+                name: Some(model_name.to_string()),
+                normalized_name: Some(model_name.to_string()),
+                provider_model_id: Some(model_name.to_string()),
+                reasoning_level: None,
+                reasoning_level_raw: None,
+            };
+
+            let cost = estimate_cost("codex", Some(&model), &usage);
+            let expected_source = format!("codex_api_pricing:{model_name}");
+            assert_eq!(cost.estimated_api_equivalent_usd, Some(expected_cents));
+            assert_eq!(
+                cost.pricing_source.as_deref(),
+                Some(expected_source.as_str())
+            );
+        }
     }
 }
