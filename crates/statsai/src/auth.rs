@@ -1296,16 +1296,46 @@ fn restrict_file_permissions(path: &Path) -> Result<()> {
 }
 
 mod open {
+    use std::io;
+    #[cfg(not(target_os = "windows"))]
     use std::process::Command;
 
-    pub fn that(url: &str) -> std::io::Result<()> {
+    pub fn that(url: &str) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         {
             Command::new("open").arg(url).status()?;
         }
         #[cfg(target_os = "windows")]
         {
-            Command::new("cmd").args(["/C", "start", url]).status()?;
+            use std::iter;
+            use std::ptr;
+            use windows_sys::Win32::UI::Shell::ShellExecuteW;
+            use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+            if url.contains('\0') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "browser URL contains a null character",
+                ));
+            }
+            let wide_url = url.encode_utf16().chain(iter::once(0)).collect::<Vec<_>>();
+            // SAFETY: `wide_url` is null-terminated and remains alive for the call. All other
+            // pointer arguments are optional according to the ShellExecuteW contract.
+            let result = unsafe {
+                ShellExecuteW(
+                    ptr::null_mut(),
+                    ptr::null(),
+                    wide_url.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    SW_SHOWNORMAL,
+                )
+            };
+            if result as isize <= 32 {
+                return Err(io::Error::other(format!(
+                    "failed to open browser (ShellExecuteW error {result:?})"
+                )));
+            }
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
