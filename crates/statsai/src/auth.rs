@@ -197,6 +197,7 @@ struct HeadlessLoginStart {
 
 pub fn login(no_open: bool, headless: bool, device_name: Option<String>) -> Result<()> {
     let api_base_url = cloudflare_api_url();
+    validate_credential_transport_url(&api_base_url, "authentication API")?;
     let device_name = requested_device_name(device_name);
     let remembered_device_id = preferred_auth_device_id(&auth_base_dir(), &api_base_url);
     if headless {
@@ -212,6 +213,7 @@ pub fn login(no_open: bool, headless: bool, device_name: Option<String>) -> Resu
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let state = generate_random_string(32)?;
     let web_base_url = cloudflare_web_url();
+    validate_credential_transport_url(&web_base_url, "authentication web app")?;
     let auth_url = format!(
         "{}/connect-device?redirect_uri={}&state={}",
         web_base_url.trim_end_matches('/'),
@@ -349,6 +351,7 @@ pub fn logout() -> Result<()> {
 
 pub fn get_or_refresh_token() -> Result<Option<String>> {
     let api_base_url = cloudflare_api_url();
+    validate_credential_transport_url(&api_base_url, "authentication API")?;
     let Some((path, mut credentials)) = auth_record_for_backend(&auth_base_dir(), &api_base_url)?
     else {
         return Ok(None);
@@ -373,6 +376,7 @@ fn refresh_cloudflare_access_token(
     credentials: &mut AuthCredentials,
     api_base_url: &str,
 ) -> Result<String> {
+    validate_credential_transport_url(api_base_url, "authentication API")?;
     let refresh_token = credentials
         .cloudflare_refresh_token
         .clone()
@@ -441,7 +445,27 @@ pub fn cloudflare_web_url() -> String {
 
 pub fn is_local_backend() -> bool {
     let api = cloudflare_api_url();
-    api.contains("127.0.0.1") || api.contains("localhost")
+    url::Url::parse(&api)
+        .ok()
+        .is_some_and(|url| url_has_explicit_loopback_host(&url))
+}
+
+fn validate_credential_transport_url(value: &str, label: &str) -> Result<()> {
+    let parsed = url::Url::parse(value).with_context(|| format!("parse {label} URL"))?;
+    let secure = parsed.scheme() == "https"
+        || (parsed.scheme() == "http" && url_has_explicit_loopback_host(&parsed));
+    if !secure {
+        bail!("{label} must use HTTPS or an explicit loopback IP address");
+    }
+    Ok(())
+}
+
+fn url_has_explicit_loopback_host(url: &url::Url) -> bool {
+    url.host().is_some_and(|host| match host {
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+        url::Host::Domain(_) => false,
+    })
 }
 
 fn exchange_cloudflare_device_code(
@@ -451,6 +475,8 @@ fn exchange_cloudflare_device_code(
     device_id: &str,
     device_name: &str,
 ) -> DeviceSessionRequestResult<AuthCredentials> {
+    validate_credential_transport_url(api_base_url, "authentication API")
+        .map_err(DeviceSessionRequestError::Fatal)?;
     let url = format!(
         "{}/api/devices/exchange",
         api_base_url.trim_end_matches('/')
@@ -495,6 +521,8 @@ fn start_headless_device_login(
     device_id: &str,
     device_name: &str,
 ) -> DeviceSessionRequestResult<HeadlessLoginStart> {
+    validate_credential_transport_url(api_base_url, "authentication API")
+        .map_err(DeviceSessionRequestError::Fatal)?;
     let url = format!("{}/api/devices/start", api_base_url.trim_end_matches('/'));
     let response = ureq::post(&url)
         .timeout(AUTH_HTTP_TIMEOUT)
@@ -531,6 +559,8 @@ fn poll_headless_device_login(
     api_base_url: &str,
     start: &HeadlessLoginStart,
 ) -> DeviceSessionRequestResult<AuthCredentials> {
+    validate_credential_transport_url(api_base_url, "authentication API")
+        .map_err(DeviceSessionRequestError::Fatal)?;
     let url = format!("{}/api/devices/poll", api_base_url.trim_end_matches('/'));
     let mut interval = start.interval.max(1);
 
@@ -1288,6 +1318,30 @@ mod open {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_transport_allows_https_and_explicit_loopback_http_only() {
+        for url in [
+            "https://api.example.com",
+            "http://127.0.0.1:8787",
+            "http://127.42.0.1:8787",
+            "http://[::1]:8787",
+        ] {
+            validate_credential_transport_url(url, "test endpoint").expect("secure transport");
+        }
+
+        for url in [
+            "http://api.example.com",
+            "http://localhost:8787",
+            "http://127.0.0.1.attacker.example",
+            "http://127.0.0.1@attacker.example",
+            "ftp://127.0.0.1",
+        ] {
+            let error = validate_credential_transport_url(url, "test endpoint")
+                .expect_err("unsafe transport");
+            assert!(error.to_string().contains("must use HTTPS"));
+        }
+    }
 
     #[test]
     fn stored_session_requires_cloudflare_refresh_token() {

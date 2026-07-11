@@ -42,11 +42,17 @@ impl HttpSink {
     ///
     /// # Errors
     ///
-    /// Returns an error when `endpoint` is not an `http://` or `https://` URL.
+    /// Returns an error when `endpoint` is not an `http://` or `https://` URL,
+    /// or when a bearer token would be sent over remote plaintext HTTP.
     pub fn new(endpoint: impl AsRef<str>, bearer_token: Option<String>) -> Result<Self> {
         let endpoint = endpoint.as_ref().trim();
-        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-            bail!("http sink supports http:// and https:// endpoints only");
+        let parsed = parse_http_endpoint(endpoint)?;
+        if bearer_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty())
+            && !url_has_secure_credential_transport(&parsed)
+        {
+            bail!("authenticated HTTP sync requires HTTPS or an explicit loopback IP address");
         }
         Ok(Self {
             endpoint: endpoint.to_string(),
@@ -96,6 +102,38 @@ impl HttpSink {
         validate_sync_ack(batch, &ack)?;
         Ok(ack)
     }
+}
+
+/// Validates that bearer credentials can be sent to an HTTP endpoint safely.
+///
+/// # Errors
+///
+/// Returns an error unless the endpoint uses HTTPS or a numeric loopback IP
+/// address over HTTP.
+pub fn validate_authenticated_http_endpoint(endpoint: &str) -> Result<()> {
+    let parsed = parse_http_endpoint(endpoint.trim())?;
+    if !url_has_secure_credential_transport(&parsed) {
+        bail!("authenticated HTTP sync requires HTTPS or an explicit loopback IP address");
+    }
+    Ok(())
+}
+
+fn parse_http_endpoint(endpoint: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(endpoint).context("parse HTTP sync endpoint")?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        bail!("http sink supports http:// and https:// endpoints only");
+    }
+    Ok(parsed)
+}
+
+fn url_has_secure_credential_transport(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        || (url.scheme() == "http"
+            && url.host().is_some_and(|host| match host {
+                url::Host::Ipv4(address) => address.is_loopback(),
+                url::Host::Ipv6(address) => address.is_loopback(),
+                url::Host::Domain(_) => false,
+            }))
 }
 
 impl SyncSink for HttpSink {
@@ -472,6 +510,43 @@ mod tests {
         let error =
             HttpSink::new("ftp://example.com/v1/sync/batches", None).expect_err("bad scheme");
         assert!(error.to_string().contains("http://"));
+    }
+
+    #[test]
+    fn authenticated_http_sink_allows_only_explicit_loopback_plaintext() {
+        for endpoint in [
+            "http://127.0.0.1:8787/v1/sync/batches",
+            "http://127.42.0.1/v1/sync/batches",
+            "http://[::1]:8787/v1/sync/batches",
+        ] {
+            HttpSink::new(endpoint, Some("token".to_string())).expect("loopback HTTP");
+        }
+
+        for endpoint in [
+            "http://example.com/v1/sync/batches",
+            "http://localhost:8787/v1/sync/batches",
+            "http://127.0.0.1.attacker.example/v1/sync/batches",
+            "http://127.0.0.1@attacker.example/v1/sync/batches",
+        ] {
+            let error = HttpSink::new(endpoint, Some("token".to_string()))
+                .expect_err("remote plaintext must fail");
+            assert!(error.to_string().contains("requires HTTPS"));
+        }
+
+        HttpSink::new("http://example.com/v1/sync/batches", None)
+            .expect("unauthenticated remote HTTP remains supported");
+        HttpSink::new(
+            "https://example.com/v1/sync/batches",
+            Some("token".to_string()),
+        )
+        .expect("authenticated HTTPS");
+
+        validate_authenticated_http_endpoint("https://example.com/api/sync/batches")
+            .expect("HTTPS endpoint");
+        validate_authenticated_http_endpoint("http://[::1]:8787/api/sync/batches")
+            .expect("loopback endpoint");
+        validate_authenticated_http_endpoint("http://example.com/api/sync/batches")
+            .expect_err("remote plaintext endpoint");
     }
 
     fn empty_batch_event() -> statsai_core::UsageEvent {

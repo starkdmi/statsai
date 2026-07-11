@@ -40,7 +40,9 @@ use statsai_store::{
     ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
     UpsertProviderAccountInput,
 };
-use statsai_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
+use statsai_sync::{
+    validate_authenticated_http_endpoint, FileSink, HttpSink, StdoutSink, SyncSink,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -3920,6 +3922,7 @@ fn pull_remote_task_verifications(
     let Some(auth_token) = auth_token.filter(|token| !token.is_empty()) else {
         return Ok(None);
     };
+    validate_authenticated_http_endpoint(endpoint)?;
     let Some(feed_url) = http_task_verification_feed_url(endpoint) else {
         return Ok(None);
     };
@@ -5036,6 +5039,7 @@ struct TaskVerificationFeedResponse {
 }
 
 fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
+    validate_authenticated_http_endpoint(endpoint)?;
     let url = http_verify_status_url(endpoint)?;
     let request = ureq::get(&url)
         .timeout(HTTP_REQUEST_TIMEOUT)
@@ -5047,6 +5051,7 @@ fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
 }
 
 fn http_remote_preflight_status(endpoint: &str, auth_token: &str) -> Result<Value> {
+    validate_authenticated_http_endpoint(endpoint)?;
     let url = http_preflight_status_url(endpoint)?;
     let request = ureq::get(&url)
         .timeout(HTTP_REQUEST_TIMEOUT)
@@ -5058,6 +5063,7 @@ fn http_remote_preflight_status(endpoint: &str, auth_token: &str) -> Result<Valu
 }
 
 fn http_remote_reset(endpoint: &str, auth_token: &str) -> Result<Value> {
+    validate_authenticated_http_endpoint(endpoint)?;
     let url = http_reset_url(endpoint)?;
     let body = serde_json::to_string(&json!({
         "confirm": "reset_synced_data",
@@ -5131,6 +5137,7 @@ fn http_remote_hosted_tasks_enabled(command: &SyncCommand, endpoint: &str) -> Re
     let Some(auth_token) = resolve_http_auth_token(command, false)? else {
         return Ok(true);
     };
+    validate_authenticated_http_endpoint(endpoint)?;
     let request = ureq::get(&preflight_url)
         .timeout(HTTP_REQUEST_TIMEOUT)
         .set("Authorization", &format!("Bearer {auth_token}"));
@@ -12917,16 +12924,40 @@ mod tests {
     }
 
     #[test]
+    fn credentialed_http_helpers_reject_remote_plaintext_before_request() {
+        let endpoint = "http://api.example.com/api/sync/batches";
+
+        for result in [
+            http_remote_verify(endpoint, "token"),
+            http_remote_preflight_status(endpoint, "token"),
+            http_remote_reset(endpoint, "token"),
+        ] {
+            let error = result.expect_err("remote plaintext must fail");
+            assert!(error.to_string().contains("requires HTTPS"));
+        }
+
+        let command = SyncCommand {
+            auth_token: Some("token".to_string()),
+            ..test_sync_command("http")
+        };
+        let error = http_remote_hosted_tasks_enabled(&command, endpoint)
+            .expect_err("remote plaintext preflight must fail");
+        assert!(error.to_string().contains("requires HTTPS"));
+    }
+
+    #[test]
     fn device_remote_reset_response_requires_explicit_device_scope() {
         assert!(ensure_device_remote_reset_response(&json!({
             "ok": true,
             "scope": "device_mirror",
             "device_id": "device-1"
-        })).is_ok());
+        }))
+        .is_ok());
         assert!(ensure_device_remote_reset_response(&json!({
             "ok": true,
             "scope": "mirror"
-        })).is_err());
+        }))
+        .is_err());
     }
 
     #[test]

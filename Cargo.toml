@@ -46,6 +46,7 @@ tiny_http = "0.12"
 walkdir = "2"
 notify = "7"
 ureq = { version = "2.9", features = ["json"] }
+url = "2"
 percent-encoding = "2.3"
 getrandom = { version = "0.2", features = ["std"] }
 

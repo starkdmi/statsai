@@ -23,7 +23,20 @@ if [[ -z "$required_rust_version" ]]; then
   exit 1
 fi
 
-active_rust_version=$(rustc --version | awk '{print $2}')
+if command -v rustup >/dev/null 2>&1; then
+  if ! active_rust_version=$(rustup run "$required_rust_version" rustc --version 2>/dev/null | awk '{print $2}'); then
+    cat >&2 <<EOF
+rust-ci: Rust $required_rust_version is not installed in rustup.
+Run: rustup toolchain install $required_rust_version --component rustfmt --component clippy
+EOF
+    exit 1
+  fi
+  cargo_command=(rustup run "$required_rust_version" cargo)
+else
+  active_rust_version=$(rustc --version | awk '{print $2}')
+  cargo_command=(cargo)
+fi
+
 if [[ "$active_rust_version" != "$required_rust_version" ]]; then
   cat >&2 <<EOF
 rust-ci: Rust $required_rust_version is required; found $active_rust_version.
@@ -33,16 +46,16 @@ EOF
 fi
 
 run_fmt() {
-  cargo fmt --all --check
+  "${cargo_command[@]}" fmt --all --check
 }
 
 run_clippy() {
-  cargo clippy --workspace --all-targets -- -D warnings
+  "${cargo_command[@]}" clippy --workspace --all-targets -- -D warnings
 }
 
 run_tests() {
-  cargo test --workspace
-  cargo test -p statsai-daemon --features watch
+  "${cargo_command[@]}" test --workspace
+  "${cargo_command[@]}" test -p statsai-daemon --features watch
 }
 
 case "${1:-full}" in

@@ -271,3 +271,8 @@ export STATSAI_WEB_URL="http://127.0.0.1:3000"
 cargo run -p statsai -- auth login
 cargo run -p statsai -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
 ```
+
+Credential-bearing authentication and sync requests require HTTPS except when
+the URL host is an explicit numeric loopback address such as `127.0.0.1` or
+`[::1]`. Plaintext `localhost` URLs are rejected to avoid hostname-resolution
+ambiguity.

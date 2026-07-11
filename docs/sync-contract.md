@@ -71,6 +71,10 @@ cargo run -p statsai -- sync --sink http --verify
 cargo run -p statsai -- sync --status
 ```
 
+Credential-bearing requests require HTTPS, except for local development using
+an explicit numeric loopback host such as `127.0.0.1` or `[::1]`. Plaintext
+hostnames, including `localhost`, are rejected.
+
 The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
 rejects batches containing `authoritative_snapshot` because it does not stage
 device ownership or reconcile deletions. `/api/sync/batches` is the production
