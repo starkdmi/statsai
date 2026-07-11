@@ -24,14 +24,19 @@ if [[ -z "$required_rust_version" ]]; then
 fi
 
 if command -v rustup >/dev/null 2>&1; then
-  if ! active_rust_version=$(rustup run "$required_rust_version" rustc --version 2>/dev/null | awk '{print $2}'); then
+  if ! toolchain_cargo=$(rustup which --toolchain "$required_rust_version" cargo 2>/dev/null); then
     cat >&2 <<EOF
 rust-ci: Rust $required_rust_version is not installed in rustup.
 Run: rustup toolchain install $required_rust_version --component rustfmt --component clippy
 EOF
     exit 1
   fi
-  cargo_command=(rustup run "$required_rust_version" cargo)
+  toolchain_bin=${toolchain_cargo%/*}
+  export PATH="$toolchain_bin:$PATH"
+  export RUSTC="$toolchain_bin/rustc"
+  export RUSTDOC="$toolchain_bin/rustdoc"
+  active_rust_version=$("$RUSTC" --version | awk '{print $2}')
+  cargo_command=("$toolchain_cargo")
 else
   active_rust_version=$(rustc --version | awk '{print $2}')
   cargo_command=(cargo)
