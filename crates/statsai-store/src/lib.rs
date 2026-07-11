@@ -160,6 +160,17 @@ pub struct ScanFileReplacementResult {
     pub written_summaries: u64,
 }
 
+/// Counts produced while atomically applying an incoming sync batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyncBatchIngestResult {
+    /// New events inserted after deduplication.
+    pub inserted_events: u64,
+    /// Summaries inserted or updated.
+    pub written_summaries: u64,
+    /// Task verifications that superseded the stored state.
+    pub merged_task_verifications: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct SubscriptionCompat {
     #[serde(default = "default_subscription_schema_version")]
@@ -474,6 +485,64 @@ impl Store {
                 Err(error)
             }
         }
+    }
+
+    /// Applies a complete incoming sync batch in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and rolls back every batch component when any write or
+    /// task rebuild fails.
+    pub fn ingest_sync_batch(&self, batch: &SyncBatch) -> Result<SyncBatchIngestResult> {
+        self.with_immediate_transaction(|| {
+            for source in &batch.sources {
+                self.upsert_source(source)?;
+            }
+            for account in &batch.accounts {
+                self.upsert_account(account)?;
+            }
+            for assignment in &batch.source_account_assignments {
+                self.upsert_source_account_assignment(assignment)?;
+            }
+            for subscription in &batch.subscriptions {
+                self.upsert_subscription(subscription)?;
+            }
+            let inserted_events = self.insert_events(&batch.events)?;
+            let written_summaries = self.upsert_summaries(&batch.summaries)?;
+            let mut buckets_needing_rebuild = BTreeSet::new();
+            for snapshot in &batch.task_buckets {
+                let had_newer_local_verifications = self.task_bucket_has_newer_verifications(
+                    &snapshot.project_bucket,
+                    snapshot.applied_verification_cursor.as_ref(),
+                )?;
+                self.replace_task_bucket_snapshot(snapshot)?;
+                let has_newer_local_verifications = had_newer_local_verifications
+                    || self.task_bucket_has_newer_verifications(
+                        &snapshot.project_bucket,
+                        snapshot.applied_verification_cursor.as_ref(),
+                    )?;
+                if has_newer_local_verifications {
+                    buckets_needing_rebuild.insert(snapshot.project_bucket.clone());
+                }
+            }
+            let mut merged_task_verifications = 0u64;
+            for verification in &batch.task_verifications {
+                if self.merge_task_verification(verification)? {
+                    merged_task_verifications += 1;
+                    buckets_needing_rebuild
+                        .extend(self.project_buckets_for_task_verification(verification)?);
+                }
+            }
+            if !buckets_needing_rebuild.is_empty() {
+                self.rebuild_task_work_items_for_project_buckets(&buckets_needing_rebuild)?;
+            }
+
+            Ok(SyncBatchIngestResult {
+                inserted_events,
+                written_summaries,
+                merged_task_verifications,
+            })
+        })
     }
 
     pub fn migrate(&self) -> Result<()> {

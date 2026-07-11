@@ -353,8 +353,7 @@ impl Store {
     }
 
     pub fn replace_task_bucket_snapshot(&self, snapshot: &TaskBucketSnapshot) -> Result<()> {
-        super::begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             self.delete_task_bucket_snapshot_in_tx(&snapshot.project_bucket)?;
             self.upsert_task_spans_in_tx(&snapshot.spans)?;
             self.insert_work_items_in_tx(&snapshot.work_items, &snapshot.members)?;
@@ -362,18 +361,7 @@ impl Store {
             changed_buckets.insert(snapshot.project_bucket.clone());
             self.mark_task_buckets_dirty_in_tx(&changed_buckets)?;
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn task_bucket_has_newer_verifications(
@@ -800,8 +788,7 @@ impl Store {
         let mut verification = verification.clone();
         verification.action_key = verification.action.action_key();
         let payload = serde_json::to_string(&verification)?;
-        super::begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             self.delete_task_verifications_by_ids(
                 &conflicting
                     .iter()
@@ -824,17 +811,8 @@ impl Store {
                 ],
             )?;
             Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(true)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })?;
+        Ok(true)
     }
 
     pub fn project_buckets_for_task_verification(
@@ -978,8 +956,7 @@ impl Store {
         if project_buckets.is_empty() {
             return Ok(TaskRebuildReport::default());
         }
-        super::begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut report = TaskRebuildReport {
                 affected_bucket_count: project_buckets.len() as u64,
                 ..TaskRebuildReport::default()
@@ -1010,18 +987,7 @@ impl Store {
             report.work_items_rebuilt = work_items.len() as u64;
             self.mark_task_buckets_dirty_in_tx(project_buckets)?;
             Ok(report)
-        })();
-
-        match result {
-            Ok(report) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(report)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     fn task_spans_by_sql(

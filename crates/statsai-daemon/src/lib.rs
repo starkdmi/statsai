@@ -7,7 +7,6 @@ use statsai_core::{
     SYNC_ACK_V2_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
 };
 use statsai_store::Store;
-use std::collections::BTreeSet;
 use std::io::Read;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -212,47 +211,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
         bail!("unsupported sync batch schema {}", batch.schema_version);
     }
 
-    for source in &batch.sources {
-        store.upsert_source(source)?;
-    }
-    for account in &batch.accounts {
-        store.upsert_account(account)?;
-    }
-    for assignment in &batch.source_account_assignments {
-        store.upsert_source_account_assignment(assignment)?;
-    }
-    for subscription in &batch.subscriptions {
-        store.upsert_subscription(subscription)?;
-    }
-    let inserted_events = store.insert_events(&batch.events)?;
-    let written_summaries = store.upsert_summaries(&batch.summaries)?;
-    let mut buckets_needing_rebuild = BTreeSet::new();
-    for snapshot in &batch.task_buckets {
-        let had_newer_local_verifications = store.task_bucket_has_newer_verifications(
-            &snapshot.project_bucket,
-            snapshot.applied_verification_cursor.as_ref(),
-        )?;
-        store.replace_task_bucket_snapshot(snapshot)?;
-        let has_newer_local_verifications = had_newer_local_verifications
-            || store.task_bucket_has_newer_verifications(
-                &snapshot.project_bucket,
-                snapshot.applied_verification_cursor.as_ref(),
-            )?;
-        if has_newer_local_verifications {
-            buckets_needing_rebuild.insert(snapshot.project_bucket.clone());
-        }
-    }
-    let mut merged_task_verifications = 0u64;
-    for verification in &batch.task_verifications {
-        if store.merge_task_verification(verification)? {
-            merged_task_verifications += 1;
-            buckets_needing_rebuild
-                .extend(store.project_buckets_for_task_verification(verification)?);
-        }
-    }
-    if !buckets_needing_rebuild.is_empty() {
-        store.rebuild_task_work_items_for_project_buckets(&buckets_needing_rebuild)?;
-    }
+    let result = store.ingest_sync_batch(batch)?;
 
     Ok(SyncAck {
         schema_version: sync_ack_schema_version(&batch.schema_version).to_string(),
@@ -262,21 +221,21 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             accounts: batch.accounts.len() as u64,
             source_account_assignments: batch.source_account_assignments.len() as u64,
             subscriptions: batch.subscriptions.len() as u64,
-            events: inserted_events,
-            summaries: written_summaries,
+            events: result.inserted_events,
+            summaries: result.written_summaries,
             task_buckets: batch.task_buckets.len() as u64,
-            task_verifications: merged_task_verifications,
+            task_verifications: result.merged_task_verifications,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
             accounts: 0,
             source_account_assignments: 0,
             subscriptions: 0,
-            events: (batch.events.len() as u64).saturating_sub(inserted_events),
+            events: (batch.events.len() as u64).saturating_sub(result.inserted_events),
             summaries: 0,
             task_buckets: 0,
             task_verifications: (batch.task_verifications.len() as u64)
-                .saturating_sub(merged_task_verifications),
+                .saturating_sub(result.merged_task_verifications),
         },
         rejected: Vec::<SyncRejectedRecord>::new(),
     })
@@ -1643,6 +1602,27 @@ mod tests {
             .review_reasons
             .iter()
             .any(|reason| reason.starts_with("manual_reject:")));
+    }
+
+    #[test]
+    fn rejected_batch_rolls_back_earlier_task_verifications() {
+        let store = Store::in_memory().expect("store");
+        let first = test_task_verification();
+        let mut duplicate_id = first.clone();
+        duplicate_id.action = TaskVerificationAction::Accept {
+            work_item_id: WorkItemId("work_other".to_string()),
+            anchor_span_id: TaskSpanId("span_other".to_string()),
+        };
+        duplicate_id.action_key = duplicate_id.action.action_key();
+        let mut batch = empty_batch();
+        batch.task_verifications = vec![first, duplicate_id];
+
+        ingest_sync_batch(&store, &batch).expect_err("duplicate verification id");
+
+        assert!(store
+            .task_verifications()
+            .expect("task verifications")
+            .is_empty());
     }
 
     fn test_task_bucket_snapshot() -> TaskBucketSnapshot {
