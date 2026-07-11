@@ -621,7 +621,7 @@ struct SyncCommand {
     verify: bool,
     #[arg(
         long,
-        help = "Delete mirrored hosted sync data for the entire account (all paired devices) and clear local sync tracking (http only)"
+        help = "Delete mirrored hosted sync data for this paired device and clear local sync tracking (http only)"
     )]
     reset_remote: bool,
     #[arg(long, help = "Confirm destructive sync reset actions")]
@@ -3440,6 +3440,7 @@ fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
                 "target": endpoint,
                 "endpoint": endpoint,
                 "would_reset_remote_sync_data": true,
+                "remote_reset_scope": "paired_device",
                 "would_clear_local_sync_tracking": true,
                 "dry_run": true,
             }))?
@@ -3449,17 +3450,18 @@ fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
 
     if !command.yes {
         bail!(
-            "--reset-remote deletes mirrored hosted sync data for your entire account, affecting every paired device; rerun with --yes"
+            "--reset-remote deletes mirrored hosted sync data for this paired device; rerun with --yes"
         );
     }
 
     eprintln!(
-        "warning: --reset-remote deletes mirrored hosted sync data for your entire account, affecting every paired device."
+        "warning: --reset-remote deletes mirrored hosted sync data for this paired device. Other paired devices are not affected."
     );
 
     let auth_token = resolve_http_auth_token(&command, true)?
         .context("device login required; run `statsai auth login` first")?;
     let remote = http_remote_reset(&endpoint, &auth_token)?;
+    ensure_device_remote_reset_response(&remote)?;
     store.clear_sync_tracking()?;
     println!(
         "{}",
@@ -3471,6 +3473,16 @@ fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
             "remote": remote,
         }))?
     );
+    Ok(())
+}
+
+fn ensure_device_remote_reset_response(response: &Value) -> Result<()> {
+    if response.get("ok").and_then(Value::as_bool) != Some(true)
+        || response.get("scope").and_then(Value::as_str) != Some("device_mirror")
+        || response.get("device_id").and_then(Value::as_str).is_none()
+    {
+        bail!("remote reset returned an unexpected scope; local sync tracking was not cleared");
+    }
     Ok(())
 }
 
@@ -5049,6 +5061,7 @@ fn http_remote_reset(endpoint: &str, auth_token: &str) -> Result<Value> {
     let url = http_reset_url(endpoint)?;
     let body = serde_json::to_string(&json!({
         "confirm": "reset_synced_data",
+        "scope": "device_mirror",
     }))?;
     let request = ureq::post(&url)
         .timeout(HTTP_REQUEST_TIMEOUT)
@@ -12900,6 +12913,19 @@ mod tests {
             http_reset_url("https://api.example.com/api/sync/batches").expect("reset"),
             "https://api.example.com/api/sync/reset"
         );
+    }
+
+    #[test]
+    fn device_remote_reset_response_requires_explicit_device_scope() {
+        assert!(ensure_device_remote_reset_response(&json!({
+            "ok": true,
+            "scope": "device_mirror",
+            "device_id": "device-1"
+        })).is_ok());
+        assert!(ensure_device_remote_reset_response(&json!({
+            "ok": true,
+            "scope": "mirror"
+        })).is_err());
     }
 
     #[test]
