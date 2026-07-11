@@ -129,6 +129,9 @@ contract. A compatible backend should:
 
 `sync_batch.v2` returns `sync_ack.v2`, which adds `task_buckets` and
 `task_verifications` counters under both `accepted` and `duplicates`.
+Collectors require the acknowledgement version to match the submitted batch
+version exactly; a v1 acknowledgement cannot successfully acknowledge a v2
+batch.
 
 The current loopback daemon returns this shape and reports duplicate events
 when the existing store already has the semantic event. Source, account,

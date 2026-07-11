@@ -2,8 +2,8 @@
 
 use anyhow::{bail, Context, Result};
 use statsai_core::{
-    SyncAck, SyncBatch, SYNC_ACK_SCHEMA_VERSION, SYNC_ACK_V1_SCHEMA_VERSION,
-    SYNC_ACK_V2_SCHEMA_VERSION,
+    SyncAck, SyncBatch, SYNC_ACK_V1_SCHEMA_VERSION, SYNC_ACK_V2_SCHEMA_VERSION,
+    SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -148,11 +148,18 @@ impl SyncSink for HttpSink {
 }
 
 fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
-    if ack.schema_version != SYNC_ACK_SCHEMA_VERSION
-        && ack.schema_version != SYNC_ACK_V1_SCHEMA_VERSION
-        && ack.schema_version != SYNC_ACK_V2_SCHEMA_VERSION
-    {
-        bail!("unsupported sync ack schema {}", ack.schema_version);
+    let expected_ack_schema = match batch.schema_version.as_str() {
+        SYNC_BATCH_V1_SCHEMA_VERSION => SYNC_ACK_V1_SCHEMA_VERSION,
+        SYNC_BATCH_V2_SCHEMA_VERSION => SYNC_ACK_V2_SCHEMA_VERSION,
+        other => bail!("unsupported sync batch schema {other}"),
+    };
+    if ack.schema_version != expected_ack_schema {
+        bail!(
+            "sync ack schema mismatch: batch {} requires {}, got {}",
+            batch.schema_version,
+            expected_ack_schema,
+            ack.schema_version
+        );
     }
     if ack.batch_id != batch.batch_id {
         bail!(
@@ -506,6 +513,30 @@ mod tests {
     }
 
     #[test]
+    fn sync_ack_schema_must_match_batch_schema() {
+        let mut batch = empty_batch();
+        let mut ack: SyncAck = serde_json::from_str(&test_ack_json_with_schema(
+            SYNC_ACK_V1_SCHEMA_VERSION,
+            "batch_1",
+            0,
+            0,
+            Vec::new(),
+        ))
+        .expect("v1 ack");
+
+        let error = validate_sync_ack(&batch, &ack).expect_err("v2 batch with v1 ack");
+        assert!(error.to_string().contains("requires sync_ack.v2"));
+
+        batch.schema_version = SYNC_BATCH_V1_SCHEMA_VERSION.to_string();
+        ack.schema_version = SYNC_ACK_V2_SCHEMA_VERSION.to_string();
+        let error = validate_sync_ack(&batch, &ack).expect_err("v1 batch with v2 ack");
+        assert!(error.to_string().contains("requires sync_ack.v1"));
+
+        ack.schema_version = SYNC_ACK_V1_SCHEMA_VERSION.to_string();
+        validate_sync_ack(&batch, &ack).expect("matching v1 schemas");
+    }
+
+    #[test]
     fn http_sink_rejects_non_http_url() {
         let error =
             HttpSink::new("ftp://example.com/v1/sync/batches", None).expect_err("bad scheme");
@@ -607,6 +638,22 @@ mod tests {
         duplicate_events: u64,
         rejected: Vec<String>,
     ) -> String {
+        test_ack_json_with_schema(
+            SYNC_ACK_V2_SCHEMA_VERSION,
+            batch_id,
+            accepted_events,
+            duplicate_events,
+            rejected,
+        )
+    }
+
+    fn test_ack_json_with_schema(
+        schema_version: &str,
+        batch_id: &str,
+        accepted_events: u64,
+        duplicate_events: u64,
+        rejected: Vec<String>,
+    ) -> String {
         let rejected = if rejected.is_empty() {
             "[]".to_string()
         } else {
@@ -614,7 +661,7 @@ mod tests {
         };
         format!(
             r#"{{
-              "schema_version":"sync_ack.v1",
+              "schema_version":"{schema_version}",
               "batch_id":"{batch_id}",
               "accepted":{{"sources":0,"accounts":0,"source_account_assignments":0,"subscriptions":0,"events":{accepted_events},"summaries":0}},
               "duplicates":{{"sources":0,"accounts":0,"source_account_assignments":0,"subscriptions":0,"events":{duplicate_events},"summaries":0}},
