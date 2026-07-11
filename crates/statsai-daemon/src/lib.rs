@@ -215,7 +215,6 @@ mod watch {
         SourceKind, SourceLocation, SourceVerificationMode, UsageEvent, UsageSummary,
     };
     use statsai_store::{
-        effective_verified_source_state_is_missing, has_active_verified_source_assignment,
         reconcile_verified_source_state, verified_source_state_hash, ScanFileReplacement,
         ScanFileStateEntry, Store,
     };
@@ -447,15 +446,21 @@ mod watch {
                     };
                 let next_verified_state_hash =
                     if matches!(verification_mode, SourceVerificationMode::Auto) {
-                        match verified_source_state_hash(probed_verified_source_state.as_ref()) {
-                            Ok(hash) => hash,
-                            Err(e) => {
-                                eprintln!(
-                                    "daemon: verified auth hash failed for {}: {e}",
-                                    source.path_label.as_deref().unwrap_or("unknown")
-                                );
-                                continue;
+                        match probed_verified_source_state.as_ref() {
+                            Some(verified_state) => {
+                                match verified_source_state_hash(Some(verified_state)) {
+                                    Ok(hash) => hash,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "daemon: verified auth hash failed for {}: {e}",
+                                            source.path_label.as_deref().unwrap_or("unknown")
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
+                            // A missing local snapshot is not proof of logout or revocation.
+                            None => source.verified_state_hash.clone(),
                         }
                     } else {
                         None
@@ -463,23 +468,6 @@ mod watch {
                 let verified_state_changed =
                     matches!(verification_mode, SourceVerificationMode::Auto)
                         && source.verified_state_hash != next_verified_state_hash;
-                let legacy_verified_state_needs_reconciliation =
-                    matches!(verification_mode, SourceVerificationMode::Auto)
-                        && source.verified_state_hash.is_none()
-                        && next_verified_state_hash.is_none()
-                        && effective_verified_source_state_is_missing(
-                            &probed_verified_source_state,
-                        )
-                        && match has_active_verified_source_assignment(store, &source.source_id) {
-                            Ok(active) => active,
-                            Err(e) => {
-                                eprintln!(
-                                    "daemon: verified assignment lookup failed for {}: {e}",
-                                    source.path_label.as_deref().unwrap_or("unknown")
-                                );
-                                continue;
-                            }
-                        };
                 let rescan_file_entries = if removed_file_entries.is_empty() {
                     &pending_file_entries
                 } else {
@@ -489,7 +477,6 @@ mod watch {
                     && removed_file_entries.is_empty()
                     && !has_cache_entry_upgrades
                     && !verified_state_changed
-                    && !legacy_verified_state_needs_reconciliation
                 {
                     continue;
                 }
@@ -522,11 +509,34 @@ mod watch {
                                     .take()
                                     .or(probed_verified_source_state)
                             };
+                        let effective_verified_state_hash =
+                            if matches!(verification_mode, SourceVerificationMode::Auto) {
+                                match effective_verified_source_state.as_ref() {
+                                    Some(verified_state) => {
+                                        match verified_source_state_hash(Some(verified_state)) {
+                                            Ok(hash) => hash,
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "daemon: verified auth hash failed for {}: {e}",
+                                                    source
+                                                        .path_label
+                                                        .as_deref()
+                                                        .unwrap_or("unknown")
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    None => source.verified_state_hash.clone(),
+                                }
+                            } else {
+                                None
+                            };
                         if let Err(e) = reconcile_verified_source_state(
                             store,
                             &mut source,
                             effective_verified_source_state.as_ref(),
-                            next_verified_state_hash,
+                            effective_verified_state_hash,
                         ) {
                             eprintln!("daemon: verified auth reconciliation failed: {e}");
                             continue;
@@ -1005,6 +1015,33 @@ mod watch {
                 .expect("source")
                 .expect("stored source");
             assert!(stored_source.verified_state_hash.is_some());
+
+            // A watcher can observe auth.json while it is being rewritten. That
+            // transiently produces no local snapshot, which must not end the
+            // account assignment or its verified subscription.
+            let unavailable_adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(TestAdapter {
+                provider: "codex",
+                verified_state: None,
+                scan_calls: Arc::new(Mutex::new(0u64)),
+            })];
+            rescan_changed_sources_with_adapters(
+                &store,
+                "device-test",
+                &[
+                    PathBuf::from(source.path_label.as_deref().expect("path label"))
+                        .join("auth.json"),
+                ],
+                &unavailable_adapters,
+            );
+
+            let assignments = store
+                .list_source_account_assignments_for_source(&source.source_id)
+                .expect("assignments after unavailable auth");
+            assert_eq!(assignments.len(), 1);
+            assert_eq!(assignments[0].ended_at, None);
+            let subscriptions = store.list_subscriptions().expect("subscriptions");
+            assert_eq!(subscriptions.len(), 1);
+            assert_eq!(subscriptions[0].ended_at, None);
 
             let _ = std::fs::remove_dir_all(&root);
         }

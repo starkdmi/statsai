@@ -5811,15 +5811,22 @@ fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
         .as_ref()
         .and_then(|payload| timestamp_at_any(payload, &["auth_time", "iat"]))
         .or_else(|| file_modified_at(&auth_path));
-    let verified_at = auth
-        .and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_last_checked"]))
-        .or(authenticated_at);
+    // An auth-file mtime or a fresh ID token proves a refreshed local session, not
+    // that the embedded subscription claims were refreshed at the same time.
+    let subscription_checked_at =
+        auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_last_checked"]));
+    let verified_at = subscription_checked_at.or(authenticated_at);
     let paid_at =
         auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_active_start"]));
     let current_period_ends_at =
         auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_active_until"]));
     let subscription = plan_type.as_deref().and_then(|plan_type| {
-        codex_verified_subscription(plan_type, paid_at, current_period_ends_at, verified_at)
+        codex_verified_subscription(
+            plan_type,
+            paid_at,
+            current_period_ends_at,
+            subscription_checked_at,
+        )
     });
 
     Some(VerifiedSourceState {
@@ -8507,6 +8514,41 @@ mod tests {
         );
         assert_eq!(subscription.ended_at, None);
         assert_eq!(scan.events[0].provider_account_id, None);
+    }
+
+    #[test]
+    fn codex_auth_refresh_does_not_mark_cached_plan_as_newly_verified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            serde_json::json!({
+                "email": "existing@example.com",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-real",
+                    "chatgpt_plan_type": "plus",
+                    "chatgpt_subscription_active_start": "2026-05-29T10:12:43+00:00",
+                    "chatgpt_subscription_active_until": "2026-06-29T10:12:43+00:00"
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let verified = CodexAdapter
+            .probe_verified_source_state(&source)
+            .expect("probe")
+            .expect("verified source state");
+
+        assert!(verified.verified_at.is_some());
+        let subscription = verified.subscription.expect("subscription");
+        assert_eq!(subscription.verified_at, None);
     }
 
     #[test]

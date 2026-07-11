@@ -3607,43 +3607,19 @@ pub fn reconcile_verified_source_state(
     if !matches!(source.verification_mode, SourceVerificationMode::Auto) {
         return Ok(());
     }
-    let has_legacy_verified_assignment = next_verified_state_hash.is_none()
-        && source.verified_state_hash.is_none()
-        && has_active_verified_source_assignment(store, &source.source_id)?;
-    if source.verified_state_hash == next_verified_state_hash && !has_legacy_verified_assignment {
+    // A local-auth file can be absent or mid-rewrite. That does not prove the
+    // account signed out, nor does it prove its subscription ended.
+    let Some(verified_state) = verified_state else {
+        return Ok(());
+    };
+    if source.verified_state_hash == next_verified_state_hash {
         return Ok(());
     }
 
-    match verified_state {
-        Some(verified_state) => apply_verified_source_state(store, source, Some(verified_state))?,
-        None => close_active_verified_source_linkages(store, &source.source_id, Utc::now())?,
-    }
+    apply_verified_source_state(store, source, Some(verified_state))?;
     source.verified_state_hash = next_verified_state_hash;
     source.updated_at = Utc::now();
     Ok(())
-}
-
-pub fn has_active_verified_source_assignment(store: &Store, source_id: &SourceId) -> Result<bool> {
-    Ok(store
-        .list_source_account_assignments_for_source(source_id)?
-        .into_iter()
-        .any(|assignment| {
-            assignment.ended_at.is_none()
-                && matches!(
-                    assignment.record_source,
-                    IdentitySource::LocalAuth
-                        | IdentitySource::ProviderAuth
-                        | IdentitySource::ProviderApi
-                        | IdentitySource::CookieOauth
-                        | IdentitySource::CliProbe
-                )
-        }))
-}
-
-pub fn effective_verified_source_state_is_missing(
-    verified_state: &Option<VerifiedSourceState>,
-) -> bool {
-    verified_state.is_none()
 }
 
 pub fn apply_source_account_resolution(

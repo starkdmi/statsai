@@ -35,11 +35,10 @@ use statsai_sdk::{
 #[cfg(test)]
 use statsai_store::apply_verified_source_state;
 use statsai_store::{
-    close_active_verified_source_linkages, derive_task_work_items,
-    effective_verified_source_state_is_missing, find_existing_provider_account,
-    has_active_verified_source_assignment, reconcile_verified_source_state,
-    upsert_provider_account, verified_source_state_hash, ScanFileStateEntry, Store,
-    SyncPreferences, SyncState, TaskRebuildReport, UpsertProviderAccountInput,
+    close_active_verified_source_linkages, derive_task_work_items, find_existing_provider_account,
+    reconcile_verified_source_state, upsert_provider_account, verified_source_state_hash,
+    ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
+    UpsertProviderAccountInput,
 };
 use statsai_sync::{FileSink, HttpSink, StdoutSink, SyncSink};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -858,20 +857,6 @@ fn scan_with_adapters(
                 } else {
                     adapter.probe_verified_source_state(&source)?
                 };
-            let next_verified_state_hash =
-                if matches!(verification_mode, SourceVerificationMode::Auto) {
-                    verified_source_state_hash(probed_verified_source_state.as_ref())?
-                } else {
-                    None
-                };
-            let verified_state_changed = matches!(verification_mode, SourceVerificationMode::Auto)
-                && source.verified_state_hash != next_verified_state_hash;
-            let legacy_verified_state_needs_reconciliation =
-                matches!(verification_mode, SourceVerificationMode::Auto)
-                    && source.verified_state_hash.is_none()
-                    && next_verified_state_hash.is_none()
-                    && effective_verified_source_state_is_missing(&probed_verified_source_state)
-                    && has_active_verified_source_assignment(store, &source.source_id)?;
             let mut scan = if should_run_adapter_scan {
                 let started_at = Instant::now();
                 let scan = adapter.scan(&source, &options)?;
@@ -902,6 +887,19 @@ fn scan_with_adapters(
                 } else {
                     probed_verified_source_state
                 };
+            // `None` means the local snapshot yielded no observation. It is not an
+            // explicit sign-out or revocation signal, so preserve the last state.
+            let next_verified_state_hash =
+                if matches!(verification_mode, SourceVerificationMode::Auto) {
+                    match effective_verified_source_state.as_ref() {
+                        Some(verified_state) => verified_source_state_hash(Some(verified_state))?,
+                        None => source.verified_state_hash.clone(),
+                    }
+                } else {
+                    None
+                };
+            let verified_state_changed = matches!(verification_mode, SourceVerificationMode::Auto)
+                && source.verified_state_hash != next_verified_state_hash;
             let log_rows = scan.diagnostics.raw_rows;
             let mut source_usage = UsageTotals::default();
             for event in &scan.events {
@@ -922,8 +920,7 @@ fn scan_with_adapters(
                 || scan.diagnostics.files_scanned > 0
                 || scan.diagnostics.files_skipped_unchanged > 0
                 || log_rows > 0
-                || verified_state_changed
-                || legacy_verified_state_needs_reconciliation;
+                || verified_state_changed;
             let suppress_source_processing = !command.verbose
                 && !command.explain
                 && source_event_count == 0
@@ -931,8 +928,7 @@ fn scan_with_adapters(
                 && source_task_span_count == 0
                 && !touched_files
                 && !has_cache_entry_upgrades
-                && !verified_state_changed
-                && !legacy_verified_state_needs_reconciliation;
+                && !verified_state_changed;
 
             if !has_scan_activity {
                 continue;
@@ -9517,7 +9513,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_closes_verified_assignment_when_auto_source_loses_auth() {
+    fn scan_preserves_verified_assignment_when_auto_source_auth_is_unavailable() {
         let store = Store::in_memory().expect("store");
         let mut source = SourceLocation::local_adapter(
             "codex",
@@ -9609,16 +9605,19 @@ mod tests {
             .list_source_account_assignments_for_source(&source.source_id)
             .expect("assignments");
         assert_eq!(assignments.len(), 1);
-        assert!(assignments[0].ended_at.is_some());
+        assert_eq!(assignments[0].ended_at, None);
         let stored_source = store
             .source(&source.source_id)
             .expect("source row")
             .expect("stored source");
-        assert_eq!(stored_source.verified_state_hash, None);
+        assert_eq!(
+            stored_source.verified_state_hash,
+            source.verified_state_hash
+        );
     }
 
     #[test]
-    fn scan_closes_legacy_verified_assignment_without_state_hash_when_auth_is_missing() {
+    fn scan_preserves_legacy_verified_assignment_when_auth_is_unavailable() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
             "codex",
@@ -9699,7 +9698,7 @@ mod tests {
             .list_source_account_assignments_for_source(&source.source_id)
             .expect("assignments");
         assert_eq!(assignments.len(), 1);
-        assert!(assignments[0].ended_at.is_some());
+        assert_eq!(assignments[0].ended_at, None);
     }
 
     #[test]
