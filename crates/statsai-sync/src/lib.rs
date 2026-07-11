@@ -6,7 +6,7 @@ use statsai_core::{
     SYNC_ACK_V2_SCHEMA_VERSION,
 };
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub trait SyncSink {
@@ -224,15 +224,38 @@ impl SyncSink for FileSink {
     }
 
     fn send(&self, batch: &SyncBatch) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        let file = std::fs::File::create(&self.path)
-            .with_context(|| format!("write {}", self.path.display()))?;
-        serde_json::to_writer_pretty(file, batch)?;
-        Ok(())
+        write_json_atomically(&self.path, batch)
     }
+}
+
+fn write_json_atomically(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+
+    let mut temp = tempfile::Builder::new()
+        .prefix(".statsai-sync-")
+        .tempfile_in(parent)
+        .with_context(|| format!("create temporary sync file in {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    serde_json::to_writer_pretty(temp.as_file_mut(), value)
+        .with_context(|| format!("serialize {}", path.display()))?;
+    temp.as_file_mut().flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace {}", path.display()))?;
+
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -262,15 +285,66 @@ mod tests {
     }
 
     #[test]
-    fn file_sink_writes_json() {
+    fn file_sink_atomically_replaces_json() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("batch.json");
+        std::fs::write(&path, "stale partial data").expect("seed destination");
         let sink = FileSink::new(path.clone());
         sink.send(&empty_batch()).expect("write");
 
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("batch_1"));
         assert!(content.contains("device"));
+        assert!(!content.contains("stale partial data"));
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .expect("read output directory")
+                .count(),
+            1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("sync file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_json_write_preserves_destination_when_serialization_fails() {
+        struct FailingSerialize;
+
+        impl serde::Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("forced serialization failure"))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("batch.json");
+        std::fs::write(&path, "complete previous batch").expect("seed destination");
+
+        write_json_atomically(&path, &FailingSerialize).expect_err("serialization should fail");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read destination"),
+            "complete previous batch"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .expect("read output directory")
+                .count(),
+            1
+        );
     }
 
     #[test]
