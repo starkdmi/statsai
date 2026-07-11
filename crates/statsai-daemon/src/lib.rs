@@ -8,7 +8,7 @@ use statsai_core::{
 };
 use statsai_store::Store;
 use std::io::Read;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -27,9 +27,9 @@ fn sync_ack_schema_version(batch_schema_version: &str) -> &'static str {
 }
 
 pub fn run(addr: &str, store: Arc<Mutex<Store>>, auth_token: &str) -> Result<()> {
-    ensure_loopback(addr)?;
-    let server =
-        Server::http(addr).map_err(|err| anyhow::anyhow!("start local API on {addr}: {err}"))?;
+    let bind_addr = resolve_loopback_addr(addr)?;
+    let server = Server::http(bind_addr)
+        .map_err(|err| anyhow::anyhow!("start local API on {bind_addr}: {err}"))?;
 
     for request in server.incoming_requests() {
         if let Err(error) = handle_request(request, &store, auth_token) {
@@ -294,7 +294,7 @@ mod watch {
         device_id: &str,
         auth_token: &str,
     ) -> Result<()> {
-        super::ensure_loopback(addr)?;
+        let bind_addr = super::resolve_loopback_addr(addr)?;
         let startup_executable = current_executable_stamp();
 
         let sources = {
@@ -329,9 +329,9 @@ mod watch {
             }
         }
 
-        eprintln!("daemon: API listening on http://{addr}");
-        let server = Server::http(addr)
-            .map_err(|err| anyhow::anyhow!("start local API on {addr}: {err}"))?;
+        eprintln!("daemon: API listening on http://{bind_addr}");
+        let server = Server::http(bind_addr)
+            .map_err(|err| anyhow::anyhow!("start local API on {bind_addr}: {err}"))?;
 
         loop {
             if startup_executable
@@ -1400,15 +1400,19 @@ pub fn watch_and_serve(
     watch::watch_and_serve(addr, store, device_id, auth_token)
 }
 
-fn ensure_loopback(addr: &str) -> Result<()> {
-    let mut addrs = addr.to_socket_addrs()?;
-    let Some(addr) = addrs.next() else {
-        anyhow::bail!("local API address did not resolve");
+fn resolve_loopback_addr(addr: &str) -> Result<SocketAddr> {
+    let resolved = addr.to_socket_addrs()?.collect::<Vec<_>>();
+    validated_loopback_addr(&resolved)
+}
+
+fn validated_loopback_addr(resolved: &[SocketAddr]) -> Result<SocketAddr> {
+    let Some(first) = resolved.first().copied() else {
+        bail!("local API address did not resolve");
     };
-    if !addr.ip().is_loopback() {
-        anyhow::bail!("local API must bind to a loopback address");
+    if resolved.iter().any(|addr| !addr.ip().is_loopback()) {
+        bail!("local API address must resolve exclusively to loopback addresses");
     }
-    Ok(())
+    Ok(first)
 }
 
 #[cfg(test)]
@@ -1443,6 +1447,29 @@ mod tests {
 
     fn test_header(name: &str, value: &str) -> Header {
         Header::from_bytes(name, value).expect("valid test header")
+    }
+
+    #[test]
+    fn loopback_resolution_rejects_empty_and_mixed_results() {
+        let loopback_v4 = "127.0.0.1:8765".parse().expect("IPv4 loopback");
+        let loopback_v6 = "[::1]:8765".parse().expect("IPv6 loopback");
+        let non_loopback = "192.0.2.1:8765".parse().expect("non-loopback");
+
+        assert!(validated_loopback_addr(&[]).is_err());
+        assert!(validated_loopback_addr(&[loopback_v4, non_loopback]).is_err());
+        assert_eq!(
+            validated_loopback_addr(&[loopback_v6, loopback_v4]).expect("all loopback"),
+            loopback_v6
+        );
+    }
+
+    #[test]
+    fn loopback_literal_is_resolved_once_to_a_socket_address() {
+        assert_eq!(
+            resolve_loopback_addr("127.0.0.1:8765").expect("loopback address"),
+            "127.0.0.1:8765".parse().expect("expected address")
+        );
+        assert!(resolve_loopback_addr("192.0.2.1:8765").is_err());
     }
 
     #[test]
