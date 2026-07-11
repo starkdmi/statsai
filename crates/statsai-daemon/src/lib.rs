@@ -8,9 +8,12 @@ use statsai_core::{
 };
 use statsai_store::Store;
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+
+const MAX_SYNC_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(|e| e.into_inner())
@@ -24,13 +27,13 @@ fn sync_ack_schema_version(batch_schema_version: &str) -> &'static str {
     }
 }
 
-pub fn run(addr: &str, store: Arc<Mutex<Store>>) -> Result<()> {
+pub fn run(addr: &str, store: Arc<Mutex<Store>>, auth_token: &str) -> Result<()> {
     ensure_loopback(addr)?;
     let server =
         Server::http(addr).map_err(|err| anyhow::anyhow!("start local API on {addr}: {err}"))?;
 
     for request in server.incoming_requests() {
-        if let Err(error) = handle_request(request, &store) {
+        if let Err(error) = handle_request(request, &store, auth_token) {
             eprintln!("daemon: request failed: {error:#}");
         }
     }
@@ -38,17 +41,36 @@ pub fn run(addr: &str, store: Arc<Mutex<Store>>) -> Result<()> {
     Ok(())
 }
 
-fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>) -> Result<()> {
+fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>, auth_token: &str) -> Result<()> {
     let method = request.method().clone();
     let url = request.url().to_string();
 
+    if let Err(rejection) = validate_http_request(
+        &method,
+        &url,
+        request.headers(),
+        request.body_length(),
+        auth_token,
+    ) {
+        return respond_text(request, rejection.status, rejection.message);
+    }
+
     if method == Method::Post && url == "/v1/sync/batches" {
-        let mut body = String::new();
+        let mut body = Vec::with_capacity(
+            request
+                .body_length()
+                .unwrap_or_default()
+                .min(MAX_SYNC_BATCH_BYTES),
+        );
         request
             .as_reader()
-            .read_to_string(&mut body)
+            .take((MAX_SYNC_BATCH_BYTES + 1) as u64)
+            .read_to_end(&mut body)
             .context("read sync batch request")?;
-        let batch: SyncBatch = match serde_json::from_str(&body) {
+        if body.len() > MAX_SYNC_BATCH_BYTES {
+            return respond_text(request, StatusCode(413), "sync batch is too large");
+        }
+        let batch: SyncBatch = match serde_json::from_slice(&body) {
             Ok(batch) => batch,
             Err(error) => {
                 return respond_text(request, StatusCode(400), &format!("invalid batch: {error}"));
@@ -95,6 +117,85 @@ fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>) -> Result<()>
     drop(s);
 
     respond_json(request, StatusCode(200), &payload)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HttpRejection {
+    status: StatusCode,
+    message: &'static str,
+}
+
+fn validate_http_request(
+    method: &Method,
+    url: &str,
+    headers: &[Header],
+    body_length: Option<usize>,
+    auth_token: &str,
+) -> std::result::Result<(), HttpRejection> {
+    if headers.iter().any(|header| header.field.equiv("Origin")) {
+        return Err(HttpRejection {
+            status: StatusCode(403),
+            message: "browser-originated requests are not allowed",
+        });
+    }
+
+    if method == &Method::Get && url == "/health" {
+        return Ok(());
+    }
+
+    let mut authorization_headers = headers
+        .iter()
+        .filter(|header| header.field.equiv("Authorization"));
+    let supplied_token = authorization_headers
+        .next()
+        .and_then(|header| header.value.as_str().strip_prefix("Bearer "));
+    if authorization_headers.next().is_some()
+        || !supplied_token.is_some_and(|token| constant_time_eq(token, auth_token))
+    {
+        return Err(HttpRejection {
+            status: StatusCode(401),
+            message: "missing or invalid bearer token",
+        });
+    }
+
+    if method == &Method::Post && url == "/v1/sync/batches" {
+        let mut content_type_headers = headers
+            .iter()
+            .filter(|header| header.field.equiv("Content-Type"));
+        let is_json = content_type_headers.next().is_some_and(|header| {
+            header
+                .value
+                .as_str()
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+        });
+        if content_type_headers.next().is_some() || !is_json {
+            return Err(HttpRejection {
+                status: StatusCode(415),
+                message: "content-type must be application/json",
+            });
+        }
+        if body_length.is_some_and(|length| length > MAX_SYNC_BATCH_BYTES) {
+            return Err(HttpRejection {
+                status: StatusCode(413),
+                message: "sync batch is too large",
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
 }
 
 fn health_payload() -> serde_json::Value {
@@ -225,7 +326,12 @@ mod watch {
     use std::time::{Duration, SystemTime};
     use tiny_http::Server;
 
-    pub fn watch_and_serve(addr: &str, store: Arc<Mutex<Store>>, device_id: &str) -> Result<()> {
+    pub fn watch_and_serve(
+        addr: &str,
+        store: Arc<Mutex<Store>>,
+        device_id: &str,
+        auth_token: &str,
+    ) -> Result<()> {
         super::ensure_loopback(addr)?;
         let startup_executable = current_executable_stamp();
 
@@ -293,7 +399,7 @@ mod watch {
             }
 
             if let Ok(Some(request)) = server.try_recv() {
-                super::handle_request(request, &store)?;
+                super::handle_request(request, &store, auth_token)?;
             }
         }
 
@@ -1311,15 +1417,25 @@ mod watch {
 }
 
 #[cfg(not(feature = "watch"))]
-pub fn watch_and_serve(_addr: &str, _store: Arc<Mutex<Store>>, _device_id: &str) -> Result<()> {
+pub fn watch_and_serve(
+    _addr: &str,
+    _store: Arc<Mutex<Store>>,
+    _device_id: &str,
+    _auth_token: &str,
+) -> Result<()> {
     anyhow::bail!(
         "daemon --watch requires the `watch` cargo feature (enable with --features watch)"
     )
 }
 
 #[cfg(feature = "watch")]
-pub fn watch_and_serve(addr: &str, store: Arc<Mutex<Store>>, device_id: &str) -> Result<()> {
-    watch::watch_and_serve(addr, store, device_id)
+pub fn watch_and_serve(
+    addr: &str,
+    store: Arc<Mutex<Store>>,
+    device_id: &str,
+    auth_token: &str,
+) -> Result<()> {
+    watch::watch_and_serve(addr, store, device_id, auth_token)
 }
 
 fn ensure_loopback(addr: &str) -> Result<()> {
@@ -1360,6 +1476,89 @@ mod tests {
             authoritative_snapshot: None,
             created_at: Utc::now(),
         }
+    }
+
+    fn test_header(name: &str, value: &str) -> Header {
+        Header::from_bytes(name, value).expect("valid test header")
+    }
+
+    #[test]
+    fn health_is_public_but_rejects_browser_origins() {
+        assert_eq!(
+            validate_http_request(&Method::Get, "/health", &[], None, "secret"),
+            Ok(())
+        );
+        assert_eq!(
+            validate_http_request(
+                &Method::Get,
+                "/health",
+                &[test_header("Origin", "https://attacker.example")],
+                None,
+                "secret",
+            ),
+            Err(HttpRejection {
+                status: StatusCode(403),
+                message: "browser-originated requests are not allowed",
+            })
+        );
+    }
+
+    #[test]
+    fn data_routes_require_the_daemon_bearer_token() {
+        assert_eq!(
+            validate_http_request(&Method::Get, "/accounts", &[], None, "secret"),
+            Err(HttpRejection {
+                status: StatusCode(401),
+                message: "missing or invalid bearer token",
+            })
+        );
+        assert_eq!(
+            validate_http_request(
+                &Method::Get,
+                "/accounts",
+                &[test_header("Authorization", "Bearer secret")],
+                None,
+                "secret",
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn sync_route_requires_json_and_rejects_oversized_declared_bodies() {
+        let authorization = test_header("Authorization", "Bearer secret");
+        assert_eq!(
+            validate_http_request(
+                &Method::Post,
+                "/v1/sync/batches",
+                &[
+                    authorization.clone(),
+                    test_header("Content-Type", "text/plain")
+                ],
+                Some(2),
+                "secret",
+            ),
+            Err(HttpRejection {
+                status: StatusCode(415),
+                message: "content-type must be application/json",
+            })
+        );
+        assert_eq!(
+            validate_http_request(
+                &Method::Post,
+                "/v1/sync/batches",
+                &[
+                    authorization,
+                    test_header("Content-Type", "application/json; charset=utf-8"),
+                ],
+                Some(MAX_SYNC_BATCH_BYTES + 1),
+                "secret",
+            ),
+            Err(HttpRejection {
+                status: StatusCode(413),
+                message: "sync batch is too large",
+            })
+        );
     }
 
     #[test]

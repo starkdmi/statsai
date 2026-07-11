@@ -183,6 +183,22 @@ Estimated cost is API-equivalent, not a subscription invoice. It uses known prov
 
 The backend-facing sync contract starts at `sync_batch.v1`. See `docs/sync-contract.md` for the current ingestion boundary, privacy defaults, and a minimal fixture.
 
+## Loopback Daemon API
+
+The daemon binds to loopback and keeps `/health` available for local service
+checks. Every other route requires `Authorization: Bearer <token>`. The daemon
+creates a cryptographically random per-install token at
+`~/.statsai/daemon-token`; the file is readable only by the current user on
+Unix platforms. Browser-originated requests are rejected, and sync writes must
+use `Content-Type: application/json` with a body no larger than 8 MiB.
+
+For example:
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.statsai/daemon-token)" \
+  http://127.0.0.1:8765/accounts
+```
+
 ## Hosted Sync
 
 The collector now targets a Cloudflare-hosted backend, but that backend and its
