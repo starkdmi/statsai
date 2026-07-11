@@ -72,7 +72,9 @@ cargo run -p statsai -- sync --status
 ```
 
 The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
-`/api/sync/batches` is the production contract. A compatible backend should:
+rejects batches containing `authoritative_snapshot` because it does not stage
+device ownership or reconcile deletions. `/api/sync/batches` is the production
+contract. A compatible backend should:
 
 - require an authenticated device access token
 - accept `Authorization: Bearer <device_access_token>` from stored auth, `--auth-token`, or `STATSAI_SYNC_TOKEN`

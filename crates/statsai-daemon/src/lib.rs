@@ -210,6 +210,9 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     {
         bail!("unsupported sync batch schema {}", batch.schema_version);
     }
+    if batch.authoritative_snapshot.is_some() {
+        bail!("authoritative snapshots are not supported by the loopback daemon");
+    }
 
     let result = store.ingest_sync_batch(batch)?;
 
@@ -1413,10 +1416,11 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use statsai_core::{
-        source_id, Confidence, ProjectInfo, SourceKind, TaskBucketSnapshot, TaskSpan, TaskSpanId,
-        TaskStatus, TaskVerdict, TaskVerification, TaskVerificationAction, TaskVerificationCursor,
-        TaskVerificationId, UsageCounts, WorkItem, WorkItemId, WorkItemMember,
-        TASK_SPAN_SCHEMA_VERSION, TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
+        source_id, Confidence, ProjectInfo, SourceKind, SyncAuthoritativeSnapshot,
+        TaskBucketSnapshot, TaskSpan, TaskSpanId, TaskStatus, TaskVerdict, TaskVerification,
+        TaskVerificationAction, TaskVerificationCursor, TaskVerificationId, UsageCounts, WorkItem,
+        WorkItemId, WorkItemMember, TASK_SPAN_SCHEMA_VERSION, TASK_VERIFICATION_SCHEMA_VERSION,
+        WORK_ITEM_SCHEMA_VERSION,
     };
 
     fn empty_batch() -> SyncBatch {
@@ -1550,6 +1554,29 @@ mod tests {
 
         let error = ingest_sync_batch(&store, &batch).expect_err("unsupported schema");
         assert!(error.to_string().contains("unsupported sync batch schema"));
+    }
+
+    #[test]
+    fn ingest_rejects_authoritative_snapshot_before_persisting_batch() {
+        let store = Store::in_memory().expect("store");
+        let mut batch = empty_batch();
+        batch.task_verifications = vec![test_task_verification()];
+        batch.authoritative_snapshot = Some(SyncAuthoritativeSnapshot {
+            snapshot_id: "snapshot_test".to_string(),
+            part_index: 0,
+            part_count: 1,
+            ..SyncAuthoritativeSnapshot::default()
+        });
+
+        let error = ingest_sync_batch(&store, &batch).expect_err("unsupported snapshot");
+
+        assert!(error
+            .to_string()
+            .contains("authoritative snapshots are not supported"));
+        assert!(store
+            .task_verifications()
+            .expect("task verifications")
+            .is_empty());
     }
 
     #[test]
