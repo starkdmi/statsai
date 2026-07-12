@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/starkdmi/statsai"
@@ -23,14 +23,14 @@ keywords = ["ai", "cli", "usage", "statistics", "llm"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-statsai-adapters = { path = "crates/statsai-adapters", version = "0.3.1" }
-statsai-core = { path = "crates/statsai-core", version = "0.3.1" }
-statsai-pricing = { path = "crates/statsai-pricing", version = "0.3.1" }
-statsai-daemon = { path = "crates/statsai-daemon", version = "0.3.1" }
-statsai-sdk = { path = "crates/statsai-sdk", version = "0.3.1" }
-statsai-store = { path = "crates/statsai-store", version = "0.3.1" }
-statsai-sync = { path = "crates/statsai-sync", version = "0.3.1" }
-statsai = { path = "crates/statsai", version = "0.3.1" }
+statsai-adapters = { path = "crates/statsai-adapters", version = "0.3.2" }
+statsai-core = { path = "crates/statsai-core", version = "0.3.2" }
+statsai-pricing = { path = "crates/statsai-pricing", version = "0.3.2" }
+statsai-daemon = { path = "crates/statsai-daemon", version = "0.3.2" }
+statsai-sdk = { path = "crates/statsai-sdk", version = "0.3.2" }
+statsai-store = { path = "crates/statsai-store", version = "0.3.2" }
+statsai-sync = { path = "crates/statsai-sync", version = "0.3.2" }
+statsai = { path = "crates/statsai", version = "0.3.2" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
