@@ -245,7 +245,7 @@ pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
         "composer-2.5" => Some(pricing(0.5, 0.2, 2.5)),
         "composer-2.5-fast" => Some(pricing(3.0, 0.5, 15.0)),
         "grok-build-0.1" => Some(pricing(1.0, 1.0, 2.0)),
-        "grok-4.3" => Some(pricing(1.25, 1.25, 2.5)),
+        "grok-4.3" => Some(pricing(1.25, 0.2, 2.5)),
         // xAI lists $2/M input, $0.50/M cached input, and $6/M output.
         "grok-4.5" => Some(pricing(2.0, 0.5, 6.0)),
         _ => None,
@@ -289,10 +289,12 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
     let cached = usage.cache_read_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
     let reasoning = usage.reasoning_tokens.unwrap_or(0);
-    let cost = (input as f64 * pricing.input_per_million
+    let (input_multiplier, output_multiplier) = pricing_multipliers(&model_name, usage);
+    let cost = ((input as f64 * pricing.input_per_million
         + cache_creation as f64 * pricing.cache_creation_per_million
-        + cached as f64 * pricing.cached_input_per_million
-        + (output as f64 + reasoning as f64) * pricing.output_per_million)
+        + cached as f64 * pricing.cached_input_per_million)
+        * input_multiplier
+        + (output as f64 + reasoning as f64) * pricing.output_per_million * output_multiplier)
         / 1_000_000.0;
     let cost_cents = (cost * 100.0).round() as i64;
 
@@ -311,6 +313,24 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
         pricing_source: Some(pricing_source),
         pricing_version: Some("static:2026-07".to_string()),
         confidence: Confidence::Medium,
+    }
+}
+
+fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (f64, f64) {
+    const GPT_5_4_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
+
+    let prompt_tokens = usage
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(usage.cache_creation_tokens.unwrap_or(0))
+        .saturating_add(usage.cache_read_tokens.unwrap_or(0));
+    if model_name == "gpt-5.4"
+        && usage.requests == Some(1)
+        && prompt_tokens > GPT_5_4_LONG_CONTEXT_THRESHOLD
+    {
+        (2.0, 1.5)
+    } else {
+        (1.0, 1.0)
     }
 }
 
@@ -523,6 +543,31 @@ mod tests {
     }
 
     #[test]
+    fn estimates_grok_4_3_cost_with_discounted_cached_input() {
+        let model = statsai_core::ModelInfo {
+            name: Some("grok-4.3-latest".to_string()),
+            normalized_name: Some("grok-4.3".to_string()),
+            provider_model_id: Some("grok-4.3".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("grok_build", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(395));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.3")
+        );
+    }
+
+    #[test]
     fn estimates_cost_for_proxy_wrapped_claude_model() {
         let model = statsai_core::ModelInfo {
             name: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
@@ -634,6 +679,45 @@ mod tests {
             cost.pricing_source.as_deref(),
             Some("opencode_api_pricing:gpt-5.4")
         );
+    }
+
+    #[test]
+    fn gpt_5_4_long_context_pricing_requires_one_explicit_request() {
+        let model = statsai_core::ModelInfo {
+            name: Some("gpt-5.4".to_string()),
+            normalized_name: Some("gpt-5.4".to_string()),
+            provider_model_id: Some("gpt-5.4".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let boundary_usage = UsageCounts {
+            input_tokens: Some(272_000),
+            output_tokens: Some(1_000_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let long_cached_usage = UsageCounts {
+            input_tokens: Some(100_000),
+            cache_read_tokens: Some(200_000),
+            output_tokens: Some(1_000_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let aggregate_usage = UsageCounts {
+            input_tokens: Some(100_000),
+            cache_read_tokens: Some(200_000),
+            output_tokens: Some(1_000_000),
+            requests: Some(2),
+            ..UsageCounts::default()
+        };
+
+        let boundary_cost = estimate_cost("codex", Some(&model), &boundary_usage);
+        let long_cached_cost = estimate_cost("codex", Some(&model), &long_cached_usage);
+        let aggregate_cost = estimate_cost("codex", Some(&model), &aggregate_usage);
+
+        assert_eq!(boundary_cost.estimated_api_equivalent_usd, Some(1568));
+        assert_eq!(long_cached_cost.estimated_api_equivalent_usd, Some(2310));
+        assert_eq!(aggregate_cost.estimated_api_equivalent_usd, Some(1530));
     }
 
     #[test]
