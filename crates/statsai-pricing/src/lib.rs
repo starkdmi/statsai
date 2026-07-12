@@ -292,7 +292,7 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
     let cost = (input as f64 * pricing.input_per_million
         + cache_creation as f64 * pricing.cache_creation_per_million
         + cached as f64 * pricing.cached_input_per_million
-        + (output + reasoning) as f64 * pricing.output_per_million)
+        + (output as f64 + reasoning as f64) * pricing.output_per_million)
         / 1_000_000.0;
     let cost_cents = (cost * 100.0).round() as i64;
 
@@ -700,6 +700,28 @@ mod tests {
         };
         let cost = estimate_cost("codex", Some(&model), &usage);
         assert_eq!(cost.estimated_api_equivalent_usd, Some(150));
+    }
+
+    #[test]
+    fn output_and_reasoning_pricing_does_not_overflow() {
+        let model = statsai_core::ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let usage = UsageCounts {
+            output_tokens: Some(u64::MAX),
+            reasoning_tokens: Some(u64::MAX),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("codex", Some(&model), &usage);
+
+        assert!(cost
+            .estimated_api_equivalent_usd
+            .is_some_and(|cost| cost > 0));
     }
 
     #[test]

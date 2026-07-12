@@ -1025,42 +1025,73 @@ pub struct UsageTotals {
 
 impl UsageTotals {
     pub fn add_event(&mut self, event: &UsageEvent) {
-        self.input_tokens += event.usage.input_tokens.unwrap_or(0);
-        self.cache_creation_tokens += event.usage.cache_creation_tokens.unwrap_or(0);
-        self.cached_input_tokens += event.usage.cache_read_tokens.unwrap_or(0);
-        self.output_tokens += event.usage.output_tokens.unwrap_or(0);
-        self.reasoning_tokens += event.usage.reasoning_tokens.unwrap_or(0);
-        self.total_tokens += event.usage.computed_total();
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(event.usage.input_tokens.unwrap_or(0));
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(event.usage.cache_creation_tokens.unwrap_or(0));
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(event.usage.output_tokens.unwrap_or(0));
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(event.usage.computed_total());
         if let Some(cost) = event.cost.estimated_api_equivalent_usd {
-            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0) + cost);
+            self.estimated_cost_usd =
+                Some(self.estimated_cost_usd.unwrap_or(0).saturating_add(cost));
         }
     }
 
     pub fn add_summary(&mut self, summary: &UsageSummary) {
-        self.input_tokens += summary.usage.input_tokens.unwrap_or(0);
-        self.cache_creation_tokens += summary.usage.cache_creation_tokens.unwrap_or(0);
-        self.cached_input_tokens += summary.usage.cache_read_tokens.unwrap_or(0);
-        self.output_tokens += summary.usage.output_tokens.unwrap_or(0);
-        self.reasoning_tokens += summary.usage.reasoning_tokens.unwrap_or(0);
-        self.total_tokens += summary.usage.computed_total();
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(summary.usage.input_tokens.unwrap_or(0));
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(summary.usage.cache_creation_tokens.unwrap_or(0));
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(summary.usage.cache_read_tokens.unwrap_or(0));
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(summary.usage.output_tokens.unwrap_or(0));
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .saturating_add(summary.usage.reasoning_tokens.unwrap_or(0));
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(summary.usage.computed_total());
         if let Some(cost) = summary
             .cost
             .provider_reported_usd
             .or(summary.cost.estimated_api_equivalent_usd)
         {
-            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0) + cost);
+            self.estimated_cost_usd =
+                Some(self.estimated_cost_usd.unwrap_or(0).saturating_add(cost));
         }
     }
 
     pub fn add_totals(&mut self, other: &UsageTotals) {
-        self.input_tokens += other.input_tokens;
-        self.cache_creation_tokens += other.cache_creation_tokens;
-        self.cached_input_tokens += other.cached_input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.reasoning_tokens += other.reasoning_tokens;
-        self.total_tokens += other.total_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(other.cache_creation_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         if let Some(cost) = other.estimated_cost_usd {
-            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0) + cost);
+            self.estimated_cost_usd =
+                Some(self.estimated_cost_usd.unwrap_or(0).saturating_add(cost));
         }
     }
 }
@@ -2221,6 +2252,34 @@ mod tests {
         };
         let total = usage.computed_total();
         assert_eq!(total, u64::MAX);
+    }
+
+    #[test]
+    fn usage_totals_saturate_imported_counters_and_costs() {
+        let now = mk_dt(2026, 5, 25);
+        let source = test_source("codex", "/tmp/codex-overflow");
+        let mut event = test_event("codex", &source, now, u64::MAX, Some(i64::MAX));
+        event.usage = UsageCounts {
+            input_tokens: Some(u64::MAX),
+            cache_creation_tokens: Some(u64::MAX),
+            cache_read_tokens: Some(u64::MAX),
+            output_tokens: Some(u64::MAX),
+            reasoning_tokens: Some(u64::MAX),
+            total_tokens: Some(u64::MAX),
+            ..UsageCounts::default()
+        };
+
+        let mut totals = UsageTotals::default();
+        totals.add_event(&event);
+        totals.add_event(&event);
+
+        assert_eq!(totals.input_tokens, u64::MAX);
+        assert_eq!(totals.cache_creation_tokens, u64::MAX);
+        assert_eq!(totals.cached_input_tokens, u64::MAX);
+        assert_eq!(totals.output_tokens, u64::MAX);
+        assert_eq!(totals.reasoning_tokens, u64::MAX);
+        assert_eq!(totals.total_tokens, u64::MAX);
+        assert_eq!(totals.estimated_cost_usd, Some(i64::MAX));
     }
 
     #[test]

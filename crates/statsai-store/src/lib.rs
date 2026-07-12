@@ -3116,27 +3116,33 @@ impl Store {
 
         for row in rows {
             let event: UsageEvent = serde_json::from_str(&row?)?;
-            total_input += event.usage.input_tokens.unwrap_or(0);
-            total_cache_create += event.usage.cache_creation_tokens.unwrap_or(0);
-            total_cache_read += event.usage.cache_read_tokens.unwrap_or(0);
-            total_output += event.usage.output_tokens.unwrap_or(0);
-            total_reasoning += event.usage.reasoning_tokens.unwrap_or(0);
-            total_tokens += event.usage.computed_total();
-            total_events += 1;
+            total_input = total_input.saturating_add(event.usage.input_tokens.unwrap_or(0));
+            total_cache_create =
+                total_cache_create.saturating_add(event.usage.cache_creation_tokens.unwrap_or(0));
+            total_cache_read =
+                total_cache_read.saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
+            total_output = total_output.saturating_add(event.usage.output_tokens.unwrap_or(0));
+            total_reasoning =
+                total_reasoning.saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
+            total_tokens = total_tokens.saturating_add(event.usage.computed_total());
+            total_events = total_events.saturating_add(1);
             sessions.insert(event.session.session_id.clone());
 
             if let Some(cost) = event.cost.estimated_api_equivalent_usd {
-                estimated_cost = Some(estimated_cost.unwrap_or(0) + cost);
+                estimated_cost = Some(estimated_cost.unwrap_or(0).saturating_add(cost));
             }
 
             let provider_entry = by_provider
                 .entry(event.provider.clone())
                 .or_insert_with(|| serde_json::json!({"tokens": 0, "events": 0}));
-            provider_entry["tokens"] = serde_json::json!(
-                provider_entry["tokens"].as_u64().unwrap_or(0) + event.usage.computed_total()
-            );
-            provider_entry["events"] =
-                serde_json::json!(provider_entry["events"].as_u64().unwrap_or(0) + 1);
+            provider_entry["tokens"] = serde_json::json!(provider_entry["tokens"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(event.usage.computed_total()));
+            provider_entry["events"] = serde_json::json!(provider_entry["events"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(1));
 
             let account_key = event
                 .provider_account_id
@@ -3146,11 +3152,14 @@ impl Store {
             let account_entry = by_account.entry(account_key).or_insert_with(
                 || serde_json::json!({"tokens": 0, "events": 0, "provider": event.provider}),
             );
-            account_entry["tokens"] = serde_json::json!(
-                account_entry["tokens"].as_u64().unwrap_or(0) + event.usage.computed_total()
-            );
-            account_entry["events"] =
-                serde_json::json!(account_entry["events"].as_u64().unwrap_or(0) + 1);
+            account_entry["tokens"] = serde_json::json!(account_entry["tokens"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(event.usage.computed_total()));
+            account_entry["events"] = serde_json::json!(account_entry["events"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(1));
         }
 
         Ok(DailyRollup {
@@ -4374,9 +4383,10 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         total_reasoning = total_reasoning.saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
         total_tokens = total_tokens.saturating_add(event.usage.computed_total());
         total_events = total_events.saturating_add(1);
-        estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0);
+        estimated_cost_usd =
+            estimated_cost_usd.saturating_add(event.cost.estimated_api_equivalent_usd.unwrap_or(0));
         if let Some(cost) = event.cost.provider_reported_usd {
-            provider_reported_usd += cost;
+            provider_reported_usd = provider_reported_usd.saturating_add(cost);
             has_provider_reported_usd = true;
         }
         if event.created_at > observed_at {
@@ -4396,9 +4406,11 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             .is_some();
         if let Some(runtime) = event.runtime.as_ref() {
             let derived_total_messages = runtime.total_messages.or_else(|| {
-                let derived = runtime.user_messages.unwrap_or(0)
-                    + runtime.assistant_messages.unwrap_or(0)
-                    + runtime.developer_messages.unwrap_or(0);
+                let derived = runtime
+                    .user_messages
+                    .unwrap_or(0)
+                    .saturating_add(runtime.assistant_messages.unwrap_or(0))
+                    .saturating_add(runtime.developer_messages.unwrap_or(0));
                 (derived > 0).then_some(derived)
             });
             total_messages = total_messages.saturating_add(derived_total_messages.unwrap_or(0));
@@ -4418,8 +4430,11 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
 
                 if latency_ms > 0 && runtime_latency_supports_distribution_metrics(runtime) {
                     let duration_seconds = latency_ms_f64 / 1000.0;
-                    let generated_tokens = event.usage.output_tokens.unwrap_or(0)
-                        + event.usage.reasoning_tokens.unwrap_or(0);
+                    let generated_tokens = event
+                        .usage
+                        .output_tokens
+                        .unwrap_or(0)
+                        .saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
                     generated_tps_values.push(generated_tokens as f64 / duration_seconds);
                     visible_tps_values
                         .push(event.usage.output_tokens.unwrap_or(0) as f64 / duration_seconds);
@@ -4486,9 +4501,12 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             .total_tokens
             .saturating_add(event.usage.computed_total());
         entry.1.requests = entry.1.requests.saturating_add(1);
-        entry.1.estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0);
+        entry.1.estimated_cost_usd = entry
+            .1
+            .estimated_cost_usd
+            .saturating_add(event.cost.estimated_api_equivalent_usd.unwrap_or(0));
         if let Some(cost) = event.cost.provider_reported_usd {
-            entry.1.provider_reported_usd += cost;
+            entry.1.provider_reported_usd = entry.1.provider_reported_usd.saturating_add(cost);
             entry.1.has_provider_reported_usd = true;
         }
     }
@@ -4537,8 +4555,9 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         time_to_first_token_ms: finalize_metric_stats(ttft_values),
         generated_tps: finalize_metric_stats(generated_tps_values),
         visible_tps: finalize_metric_stats(visible_tps_values),
-        overall_generated_tps: (active_seconds > 0.0)
-            .then_some((tracked_output_tokens + tracked_reasoning_tokens) as f64 / active_seconds),
+        overall_generated_tps: (active_seconds > 0.0).then_some(
+            tracked_output_tokens.saturating_add(tracked_reasoning_tokens) as f64 / active_seconds,
+        ),
         overall_visible_tps: (active_seconds > 0.0)
             .then_some(tracked_output_tokens as f64 / active_seconds),
         cache_hit_ratio: finalize_metric_stats(cache_hit_ratio_values),
@@ -6526,6 +6545,59 @@ mod tests {
         assert_eq!(store.insert_events(&events).expect("batch"), 2);
         assert_eq!(store.insert_events(&events).expect("batch duplicate"), 0);
         assert_eq!(store.event_count().expect("count"), 2);
+    }
+
+    #[test]
+    fn daily_rollup_saturates_imported_usage_and_costs() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-rollup-overflow"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc::now();
+        let mut first = test_store_event(&source, now, "overflow-a");
+        first.usage = UsageCounts {
+            input_tokens: Some(u64::MAX),
+            cache_creation_tokens: Some(u64::MAX),
+            cache_read_tokens: Some(u64::MAX),
+            output_tokens: Some(u64::MAX),
+            reasoning_tokens: Some(u64::MAX),
+            total_tokens: Some(u64::MAX),
+            ..UsageCounts::default()
+        };
+        first.cost.estimated_api_equivalent_usd = Some(i64::MAX);
+        let mut second = first.clone();
+        second.event_id = event_id(
+            "codex",
+            &source.source_id,
+            "overflow-b",
+            None,
+            now + chrono::Duration::seconds(1),
+        );
+        second.session.started_at = now + chrono::Duration::seconds(1);
+        second.source.source_record_id = Some("overflow-b".to_string());
+        store.insert_events(&[first, second]).expect("events");
+
+        let rollup = store
+            .compute_daily_rollup(&now.format("%Y-%m-%d").to_string(), "device")
+            .expect("rollup");
+
+        assert_eq!(rollup.total_input_tokens, u64::MAX);
+        assert_eq!(rollup.total_cache_creation_tokens, u64::MAX);
+        assert_eq!(rollup.total_cache_read_tokens, u64::MAX);
+        assert_eq!(rollup.total_output_tokens, u64::MAX);
+        assert_eq!(rollup.total_reasoning_tokens, u64::MAX);
+        assert_eq!(rollup.total_tokens, u64::MAX);
+        assert_eq!(rollup.total_events, 2);
+        assert_eq!(rollup.estimated_cost_usd, Some(i64::MAX));
+        let by_provider: serde_json::Value =
+            serde_json::from_str(rollup.by_provider.as_deref().expect("provider totals"))
+                .expect("provider JSON");
+        assert_eq!(by_provider["codex"]["tokens"].as_u64(), Some(u64::MAX));
     }
 
     #[test]
