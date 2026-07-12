@@ -487,6 +487,19 @@ impl Store {
         }
     }
 
+    /// Applies all persistence work for one scanner source in one transaction.
+    ///
+    /// Nested store operations join this transaction rather than committing
+    /// independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operation error and rolls back every scanner write, or an
+    /// error if the transaction cannot be started or committed.
+    pub fn apply_scan_update<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.with_immediate_transaction(|| operation(self))
+    }
+
     /// Applies a complete incoming sync batch in one transaction.
     ///
     /// # Errors
@@ -2409,8 +2422,7 @@ impl Store {
     }
 
     pub fn delete_summaries_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut deleted = 0u64;
             for source_id in source_ids {
                 deleted += self.conn.execute(
@@ -2419,18 +2431,7 @@ impl Store {
                 )? as u64;
             }
             Ok(deleted)
-        })();
-
-        match result {
-            Ok(deleted) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(deleted)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn delete_summaries(&self, summary_ids: &[SummaryId]) -> Result<u64> {
@@ -6595,6 +6596,68 @@ mod tests {
         assert!(error.to_string().contains("injected scan cache failure"));
         assert_eq!(store.event_count().expect("event count"), 1);
         assert_eq!(store.summary_count().expect("summary count"), 1);
+        assert_eq!(
+            store
+                .scan_file_entries(&source.source_id)
+                .expect("cache entries")[0]
+                .cache_signature,
+            "old-signature"
+        );
+    }
+
+    #[test]
+    fn scan_update_rolls_back_nested_writes_when_cache_update_fails() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-atomic-scan"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let old_event = test_store_event(&source, Utc::now(), "old-record");
+        store.insert_event(&old_event).expect("old event");
+        let cache_key = "/tmp/codex-atomic-scan/session.jsonl".to_string();
+        store
+            .record_scan_file_entries(
+                &source.source_id,
+                &[ScanFileStateEntry {
+                    cache_key: cache_key.clone(),
+                    cache_signature: "old-signature".to_string(),
+                }],
+            )
+            .expect("old cache entry");
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_atomic_scan_cache_update
+                 BEFORE UPDATE ON scan_file_state
+                 WHEN NEW.cache_signature = 'fail-signature'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected atomic scan cache failure');
+                 END;",
+            )
+            .expect("failure trigger");
+
+        let error = store
+            .apply_scan_update(|store| {
+                store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
+                store.record_scan_file_entries(
+                    &source.source_id,
+                    &[ScanFileStateEntry {
+                        cache_key,
+                        cache_signature: "fail-signature".to_string(),
+                    }],
+                )?;
+                Ok(())
+            })
+            .expect_err("scan update should fail");
+
+        assert!(error
+            .to_string()
+            .contains("injected atomic scan cache failure"));
+        assert_eq!(store.events().expect("events"), vec![old_event]);
         assert_eq!(
             store
                 .scan_file_entries(&source.source_id)

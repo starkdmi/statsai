@@ -788,9 +788,6 @@ fn scan_with_adapters(
     let mut upsert_task_spans_duration_ms = 0u64;
     let mut rebuild_work_items_duration_ms = 0u64;
     let mut rebuild_work_item_report = TaskRebuildReport::default();
-    let mut pending_rebuild_project_buckets = BTreeSet::new();
-    let mut pending_rebuild_span_ids = BTreeSet::new();
-    let mut pending_deleted_task_spans = Vec::new();
 
     let configured_sources = store.list_sources()?;
 
@@ -977,129 +974,143 @@ fn scan_with_adapters(
                 });
                 continue;
             }
-            reconcile_verified_source_state(
-                store,
-                &mut source,
-                effective_verified_source_state.as_ref(),
-                next_verified_state_hash,
-            )?;
-            persist_source_after_preview(store, &source)?;
-            apply_source_account_resolution(store, &source, &mut scan.events, &mut scan.summaries)?;
-            let mut affected_project_buckets = if command.include_tasks {
-                scan.task_spans
-                    .iter()
-                    .map(|span| span.project_bucket.clone())
-                    .collect::<BTreeSet<_>>()
-            } else {
-                BTreeSet::new()
-            };
-            if replace_source_records {
-                let delete_started_at = Instant::now();
-                removed_event_count +=
-                    store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
-                removed_summary_count +=
-                    store.delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
-                if command.include_tasks {
-                    let deleted_task_spans = store
-                        .delete_task_spans_for_sources(std::slice::from_ref(&source.source_id))?;
-                    removed_task_span_count += deleted_task_spans.deleted;
-                    affected_project_buckets
-                        .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
-                    pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
-                }
-                delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
-            } else if touched_files {
-                let delete_started_at = Instant::now();
-                let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
-                    &pending_file_entries,
-                    &removed_file_entries,
-                );
-                removed_event_count += store.delete_events_for_source_file_hashes(
-                    &source.source_id,
-                    &reconciled_file_hashes,
+            let source_rebuild_report = store.apply_scan_update(|store| {
+                reconcile_verified_source_state(
+                    store,
+                    &mut source,
+                    effective_verified_source_state.as_ref(),
+                    next_verified_state_hash,
                 )?;
-                removed_summary_count += store.delete_summaries_for_source_file_hashes(
-                    &source.source_id,
-                    &reconciled_file_hashes,
+                persist_source_after_preview(store, &source)?;
+                apply_source_account_resolution(
+                    store,
+                    &source,
+                    &mut scan.events,
+                    &mut scan.summaries,
                 )?;
-                if command.include_tasks {
-                    let deleted_task_spans = store.delete_task_spans_for_source_file_hashes(
+                let mut affected_project_buckets = if command.include_tasks {
+                    scan.task_spans
+                        .iter()
+                        .map(|span| span.project_bucket.clone())
+                        .collect::<BTreeSet<_>>()
+                } else {
+                    BTreeSet::new()
+                };
+                let mut deleted_task_spans = Vec::new();
+                if replace_source_records {
+                    let delete_started_at = Instant::now();
+                    removed_event_count +=
+                        store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
+                    removed_summary_count += store
+                        .delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
+                    if command.include_tasks {
+                        let deleted = store.delete_task_spans_for_sources(std::slice::from_ref(
+                            &source.source_id,
+                        ))?;
+                        removed_task_span_count += deleted.deleted;
+                        affected_project_buckets
+                            .extend(deleted.affected_project_buckets.iter().cloned());
+                        deleted_task_spans.extend(deleted.deleted_spans);
+                    }
+                    delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
+                } else if touched_files {
+                    let delete_started_at = Instant::now();
+                    let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
+                        &pending_file_entries,
+                        &removed_file_entries,
+                    );
+                    removed_event_count += store.delete_events_for_source_file_hashes(
                         &source.source_id,
                         &reconciled_file_hashes,
                     )?;
-                    removed_task_span_count += deleted_task_spans.deleted;
-                    affected_project_buckets
-                        .extend(deleted_task_spans.affected_project_buckets.iter().cloned());
-                    pending_deleted_task_spans.extend(deleted_task_spans.deleted_spans);
+                    removed_summary_count += store.delete_summaries_for_source_file_hashes(
+                        &source.source_id,
+                        &reconciled_file_hashes,
+                    )?;
+                    if command.include_tasks {
+                        let deleted = store.delete_task_spans_for_source_file_hashes(
+                            &source.source_id,
+                            &reconciled_file_hashes,
+                        )?;
+                        removed_task_span_count += deleted.deleted;
+                        affected_project_buckets
+                            .extend(deleted.affected_project_buckets.iter().cloned());
+                        deleted_task_spans.extend(deleted.deleted_spans);
+                    }
+                    delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
                 }
-                delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
-            }
-            let insert_started_at = Instant::now();
-            let insert_result = store.insert_events_with_resolution(&scan.events)?;
-            inserted_count += insert_result.inserted;
-            insert_events_duration_ms += insert_started_at.elapsed().as_millis() as u64;
-            if command.include_tasks {
-                rewrite_task_span_linked_event_ids(
-                    &mut scan.task_spans,
-                    &insert_result.canonical_event_ids,
-                );
-                populate_task_span_rollups(
-                    &mut scan.task_spans,
-                    &scan.events,
-                    &insert_result.canonical_event_ids,
-                );
-            }
-            let upsert_summaries_started_at = Instant::now();
-            summary_written_count += store.upsert_summaries(&scan.summaries)?;
-            upsert_summaries_duration_ms +=
-                upsert_summaries_started_at.elapsed().as_millis() as u64;
-            if command.include_tasks {
-                let upsert_task_spans_started_at = Instant::now();
-                task_span_written_count += store.upsert_task_spans(&scan.task_spans)?;
-                upsert_task_spans_duration_ms +=
-                    upsert_task_spans_started_at.elapsed().as_millis() as u64;
-                if !scan.task_spans.is_empty() {
-                    pending_rebuild_project_buckets.extend(
+                let insert_started_at = Instant::now();
+                let insert_result = store.insert_events_with_resolution(&scan.events)?;
+                inserted_count += insert_result.inserted;
+                insert_events_duration_ms += insert_started_at.elapsed().as_millis() as u64;
+                if command.include_tasks {
+                    rewrite_task_span_linked_event_ids(
+                        &mut scan.task_spans,
+                        &insert_result.canonical_event_ids,
+                    );
+                    populate_task_span_rollups(
+                        &mut scan.task_spans,
+                        &scan.events,
+                        &insert_result.canonical_event_ids,
+                    );
+                }
+                let upsert_summaries_started_at = Instant::now();
+                summary_written_count += store.upsert_summaries(&scan.summaries)?;
+                upsert_summaries_duration_ms +=
+                    upsert_summaries_started_at.elapsed().as_millis() as u64;
+
+                let mut rebuild_project_buckets = BTreeSet::new();
+                let mut rebuild_span_ids = BTreeSet::new();
+                if command.include_tasks {
+                    let upsert_task_spans_started_at = Instant::now();
+                    task_span_written_count += store.upsert_task_spans(&scan.task_spans)?;
+                    upsert_task_spans_duration_ms +=
+                        upsert_task_spans_started_at.elapsed().as_millis() as u64;
+                    rebuild_project_buckets.extend(
                         scan.task_spans
                             .iter()
                             .map(|span| span.project_bucket.clone()),
                     );
-                    pending_rebuild_span_ids
+                    rebuild_span_ids
                         .extend(scan.task_spans.iter().map(|span| span.span_id.0.clone()));
+                    rebuild_project_buckets.extend(affected_project_buckets);
                 }
-                if !affected_project_buckets.is_empty() {
-                    pending_rebuild_project_buckets.extend(affected_project_buckets);
-                }
-            }
-            let cache_entries_to_record = if replace_source_records || command.no_cache {
-                &file_cache_entries
-            } else {
-                &pending_file_entries
-            };
-            store.record_scan_file_entries_with_tasks_collected(
-                &source.source_id,
-                cache_entries_to_record,
-                command.include_tasks,
-            )?;
-            store.upgrade_scan_file_entries(&source.source_id, &compatible_entries_to_upgrade)?;
-            let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
-            store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
-        }
-    }
 
-    if command.include_tasks
-        && !command.preview
-        && !pending_rebuild_project_buckets.is_empty()
-        && (!pending_rebuild_span_ids.is_empty() || !pending_deleted_task_spans.is_empty())
-    {
-        let rebuild_started_at = Instant::now();
-        rebuild_work_item_report = store.rebuild_task_work_items_for_changes_report(
-            &pending_rebuild_project_buckets,
-            &pending_rebuild_span_ids,
-            &pending_deleted_task_spans,
-        )?;
-        rebuilt_work_item_count += rebuild_work_item_report.work_items_rebuilt;
-        rebuild_work_items_duration_ms += rebuild_started_at.elapsed().as_millis() as u64;
+                let cache_entries_to_record = if replace_source_records || command.no_cache {
+                    &file_cache_entries
+                } else {
+                    &pending_file_entries
+                };
+                store.record_scan_file_entries_with_tasks_collected(
+                    &source.source_id,
+                    cache_entries_to_record,
+                    command.include_tasks,
+                )?;
+                store
+                    .upgrade_scan_file_entries(&source.source_id, &compatible_entries_to_upgrade)?;
+                let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
+                store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
+
+                if command.include_tasks
+                    && !rebuild_project_buckets.is_empty()
+                    && (!rebuild_span_ids.is_empty() || !deleted_task_spans.is_empty())
+                {
+                    let rebuild_started_at = Instant::now();
+                    let report = store.rebuild_task_work_items_for_changes_report(
+                        &rebuild_project_buckets,
+                        &rebuild_span_ids,
+                        &deleted_task_spans,
+                    )?;
+                    rebuild_work_items_duration_ms +=
+                        rebuild_started_at.elapsed().as_millis() as u64;
+                    Ok(report)
+                } else {
+                    Ok(TaskRebuildReport::default())
+                }
+            })?;
+            rebuilt_work_item_count += source_rebuild_report.work_items_rebuilt;
+            add_task_rebuild_report(&mut rebuild_work_item_report, &source_rebuild_report);
+        }
     }
 
     if command.preview {
@@ -1206,6 +1217,48 @@ fn scan_with_adapters(
         print_scan_diagnostics_total(&total_diagnostics);
     }
     Ok(())
+}
+
+fn add_task_rebuild_report(total: &mut TaskRebuildReport, report: &TaskRebuildReport) {
+    total.work_items_rebuilt = total
+        .work_items_rebuilt
+        .saturating_add(report.work_items_rebuilt);
+    total.work_items_deleted = total
+        .work_items_deleted
+        .saturating_add(report.work_items_deleted);
+    total.affected_bucket_count = total
+        .affected_bucket_count
+        .saturating_add(report.affected_bucket_count);
+    total.affected_segment_count = total
+        .affected_segment_count
+        .saturating_add(report.affected_segment_count);
+    total.touched_span_count = total
+        .touched_span_count
+        .saturating_add(report.touched_span_count);
+    total.timings.delete_ms = total
+        .timings
+        .delete_ms
+        .saturating_add(report.timings.delete_ms);
+    total.timings.span_load_ms = total
+        .timings
+        .span_load_ms
+        .saturating_add(report.timings.span_load_ms);
+    total.timings.verification_load_ms = total
+        .timings
+        .verification_load_ms
+        .saturating_add(report.timings.verification_load_ms);
+    total.timings.grouping_ms = total
+        .timings
+        .grouping_ms
+        .saturating_add(report.timings.grouping_ms);
+    total.timings.title_selection_ms = total
+        .timings
+        .title_selection_ms
+        .saturating_add(report.timings.title_selection_ms);
+    total.timings.insert_ms = total
+        .timings
+        .insert_ms
+        .saturating_add(report.timings.insert_ms);
 }
 
 #[derive(Debug, Default)]

@@ -337,19 +337,7 @@ impl Store {
         if spans.is_empty() {
             return Ok(0);
         }
-        super::begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = self.upsert_task_spans_in_tx(spans);
-
-        match result {
-            Ok(changed) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(changed)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        self.with_immediate_transaction(|| self.upsert_task_spans_in_tx(spans))
     }
 
     pub fn replace_task_bucket_snapshot(&self, snapshot: &TaskBucketSnapshot) -> Result<()> {
@@ -385,22 +373,10 @@ impl Store {
         if source_ids.is_empty() {
             return Ok(TaskDeletionImpact::default());
         }
-        super::begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let targets = self.task_span_targets_for_sources(source_ids)?;
             self.delete_task_span_targets_in_tx(&targets)
-        })();
-
-        match result {
-            Ok(impact) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(impact)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn delete_task_spans_for_source_file_hashes(
@@ -411,22 +387,10 @@ impl Store {
         if file_hashes.is_empty() {
             return Ok(TaskDeletionImpact::default());
         }
-        super::begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let targets = self.task_span_targets_for_source_file_hashes(source_id, file_hashes)?;
             self.delete_task_span_targets_in_tx(&targets)
-        })();
-
-        match result {
-            Ok(impact) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(impact)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn task_spans(&self) -> Result<Vec<TaskSpan>> {
@@ -1315,8 +1279,7 @@ impl Store {
         if project_buckets.is_empty() || (changed_span_ids.is_empty() && deleted_spans.is_empty()) {
             return Ok(TaskRebuildReport::default());
         }
-        super::begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut report = TaskRebuildReport {
                 affected_bucket_count: project_buckets.len() as u64,
                 ..TaskRebuildReport::default()
@@ -1377,18 +1340,7 @@ impl Store {
             report.work_items_rebuilt = work_items.len() as u64;
             self.mark_task_buckets_dirty_in_tx(project_buckets)?;
             Ok(report)
-        })();
-
-        match result {
-            Ok(report) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(report)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     fn load_existing_work_item_layouts_for_project_buckets(
