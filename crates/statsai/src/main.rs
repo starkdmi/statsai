@@ -45,6 +45,7 @@ use statsai_sync::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -59,6 +60,7 @@ const HTTP_ROLLUP_SNAPSHOT_IDS_PER_BATCH: usize = 200;
 const HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const TASK_SYNC_SQL_MAX_ROWS_PER_CHUNK: usize = 200;
 const TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK: usize = 512 * 1024;
+const MAX_SUBSCRIPTION_PRICE_CENTS: i64 = 100_000_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -471,6 +473,82 @@ struct SubscriptionCommand {
     command: SubscriptionSubcommand,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubscriptionPrice(i64);
+
+impl SubscriptionPrice {
+    const fn cents(self) -> i64 {
+        self.0
+    }
+}
+
+impl FromStr for SubscriptionPrice {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let value = value.trim();
+        let (whole, fractional) = match value.split_once('.') {
+            Some((whole, fractional)) => (whole, Some(fractional)),
+            None => (value, None),
+        };
+        if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("price must be a non-negative decimal amount".to_string());
+        }
+        if fractional.is_some_and(|fractional| {
+            fractional.is_empty()
+                || fractional.len() > 2
+                || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            return Err("price must use at most two decimal places".to_string());
+        }
+
+        let whole = whole
+            .parse::<u64>()
+            .map_err(|_| "price is too large".to_string())?;
+        let fractional_cents = match fractional {
+            None => 0,
+            Some(fractional) if fractional.len() == 1 => {
+                fractional
+                    .parse::<u64>()
+                    .map_err(|_| "price is invalid".to_string())?
+                    * 10
+            }
+            Some(fractional) => fractional
+                .parse::<u64>()
+                .map_err(|_| "price is invalid".to_string())?,
+        };
+        let cents = whole
+            .checked_mul(100)
+            .and_then(|cents| cents.checked_add(fractional_cents))
+            .ok_or_else(|| "price is too large".to_string())?;
+        if cents > MAX_SUBSCRIPTION_PRICE_CENTS as u64 {
+            return Err("price must not exceed 1000000.00".to_string());
+        }
+        Ok(Self(cents as i64))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CurrencyCode(String);
+
+impl CurrencyCode {
+    fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl FromStr for CurrencyCode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            return Err("currency must be a three-letter code such as USD".to_string());
+        }
+        Ok(Self(value.to_ascii_uppercase()))
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum SubscriptionSubcommand {
     #[command(about = "Register a subscription period")]
@@ -487,10 +565,13 @@ enum SubscriptionSubcommand {
         label: Option<String>,
         #[arg(long, help = "Plan name (e.g. Pro, Max, Team)")]
         plan: String,
-        #[arg(long, help = "Subscription price in the given currency")]
-        price: f64,
-        #[arg(long, default_value = "USD", help = "Currency code")]
-        currency: String,
+        #[arg(
+            long,
+            help = "Non-negative decimal subscription price (maximum 1000000.00)"
+        )]
+        price: SubscriptionPrice,
+        #[arg(long, default_value = "USD", help = "Three-letter currency code")]
+        currency: CurrencyCode,
         #[arg(long, help = "Date the subscription was paid (YYYY-MM-DD or RFC 3339)")]
         paid_at: Option<String>,
         #[arg(long, help = "Subscription period start (YYYY-MM-DD or RFC 3339)")]
@@ -512,10 +593,13 @@ enum SubscriptionSubcommand {
         label: Option<String>,
         #[arg(long, help = "Plan name (e.g. Pro, Max, Team)")]
         plan: String,
-        #[arg(long, help = "Subscription price in the given currency")]
-        price: f64,
-        #[arg(long, default_value = "USD", help = "Currency code")]
-        currency: String,
+        #[arg(
+            long,
+            help = "Non-negative decimal subscription price (maximum 1000000.00)"
+        )]
+        price: SubscriptionPrice,
+        #[arg(long, default_value = "USD", help = "Three-letter currency code")]
+        currency: CurrencyCode,
         #[arg(long, help = "Date the subscription was paid (YYYY-MM-DD or RFC 3339)")]
         paid_at: Option<String>,
         #[arg(long, help = "New subscription period start (YYYY-MM-DD or RFC 3339)")]
@@ -2611,6 +2695,8 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
             ended_at,
         } => {
             let provider = canonical_provider(&provider)?;
+            let price_cents = price.cents();
+            let currency = currency.into_string();
             let account = resolve_or_create_provider_account(
                 store,
                 &provider,
@@ -2635,7 +2721,6 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                 .map(parse_date)
                 .transpose()?
                 .or(Some(started_at));
-            let price_cents = (price * 100.0).round() as i64;
             let subscription = Subscription {
                 schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
                 subscription_id: subscription_id(
@@ -2676,6 +2761,8 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
             started_at,
         } => {
             let provider = canonical_provider(&provider)?;
+            let price_cents = price.cents();
+            let currency = currency.into_string();
             let account = resolve_existing_provider_account(
                 store,
                 &provider,
@@ -2685,6 +2772,11 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                 label,
             )?;
             let started_at = parse_date(&started_at)?;
+            let paid_at = paid_at
+                .as_deref()
+                .map(parse_date)
+                .transpose()?
+                .or(Some(started_at));
             if close_active_subscription(
                 store,
                 &provider,
@@ -2699,12 +2791,6 @@ fn subscription(command: SubscriptionCommand, store: &Store) -> Result<()> {
                     started_at.to_rfc3339()
                 );
             }
-            let paid_at = paid_at
-                .as_deref()
-                .map(parse_date)
-                .transpose()?
-                .or(Some(started_at));
-            let price_cents = (price * 100.0).round() as i64;
             let subscription = Subscription {
                 schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
                 subscription_id: subscription_id(
@@ -8397,8 +8483,8 @@ mod tests {
                     email: Some("personal@example.com".to_string()),
                     label: None,
                     plan: "Pro".to_string(),
-                    price: 20.0,
-                    currency: "USD".to_string(),
+                    price: "20.00".parse().expect("price"),
+                    currency: "USD".parse().expect("currency"),
                     paid_at: Some("2026-05-15".to_string()),
                     started_at: "2026-05-15".to_string(),
                     ended_at: None,
@@ -8416,6 +8502,64 @@ mod tests {
             provider_account_id_from_identity("claude_code", None, Some("personal@example.com"))
                 .expect("account id")
         );
+    }
+
+    #[test]
+    fn subscription_price_parses_exact_decimal_cents() {
+        for (value, expected_cents) in [
+            ("0", 0),
+            ("20", 2_000),
+            ("20.5", 2_050),
+            ("20.05", 2_005),
+            ("1000000.00", MAX_SUBSCRIPTION_PRICE_CENTS),
+        ] {
+            assert_eq!(
+                value
+                    .parse::<SubscriptionPrice>()
+                    .expect("valid price")
+                    .cents(),
+                expected_cents
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_price_rejects_invalid_or_excessive_values() {
+        for value in [
+            "",
+            "-1",
+            "+1",
+            "NaN",
+            "inf",
+            "1e3",
+            ".50",
+            "1.",
+            "1.001",
+            "1000000.01",
+            "999999999999999999999999999999999999999999",
+        ] {
+            assert!(
+                value.parse::<SubscriptionPrice>().is_err(),
+                "price should be rejected: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_currency_normalizes_three_letter_codes() {
+        assert_eq!(
+            "usd"
+                .parse::<CurrencyCode>()
+                .expect("currency")
+                .into_string(),
+            "USD"
+        );
+        for value in ["", "US", "USDD", "U1D", "💵"] {
+            assert!(
+                value.parse::<CurrencyCode>().is_err(),
+                "currency should be rejected: {value}"
+            );
+        }
     }
 
     #[test]
@@ -9169,8 +9313,8 @@ mod tests {
                     email: None,
                     label: None,
                     plan: "Pro".to_string(),
-                    price: 200.0,
-                    currency: "USD".to_string(),
+                    price: "200.00".parse().expect("price"),
+                    currency: "USD".parse().expect("currency"),
                     paid_at: None,
                     started_at: "2026-06-01".to_string(),
                 },
@@ -10146,8 +10290,8 @@ mod tests {
                     email: Some("personal@example.com".to_string()),
                     label: None,
                     plan: "Plus".to_string(),
-                    price: 20.0,
-                    currency: "USD".to_string(),
+                    price: "20.00".parse().expect("price"),
+                    currency: "USD".parse().expect("currency"),
                     paid_at: Some("2026-05-01".to_string()),
                     started_at: "2026-05-01".to_string(),
                     ended_at: None,
@@ -10166,8 +10310,8 @@ mod tests {
                     email: Some("personal@example.com".to_string()),
                     label: None,
                     plan: "Pro".to_string(),
-                    price: 200.0,
-                    currency: "USD".to_string(),
+                    price: "200.00".parse().expect("price"),
+                    currency: "USD".parse().expect("currency"),
                     paid_at: Some("2026-06-01".to_string()),
                     started_at: "2026-06-01".to_string(),
                 },
