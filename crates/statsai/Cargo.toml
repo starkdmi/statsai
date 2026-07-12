@@ -51,9 +51,7 @@ percent-encoding.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service"] }
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
-
-[dev-dependencies]
-tempfile.workspace = true

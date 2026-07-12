@@ -4,6 +4,7 @@ use keyring::{Entry, Error as KeyringError};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
@@ -338,15 +339,78 @@ pub fn status() -> Result<()> {
 
 pub fn logout() -> Result<()> {
     let api_base_url = cloudflare_api_url();
-    if let Some((path, _credentials)) = auth_record_for_backend(&auth_base_dir(), &api_base_url)? {
-        std::fs::remove_file(&path)?;
-        delete_tokens_from_keyring_for_api_base_url(&api_base_url);
+    if logout_backend(&auth_base_dir(), &api_base_url, |api_base_url| {
+        delete_tokens_from_keyring_for_api_base_url(api_base_url)
+    })? {
         println!("Successfully logged out.");
     } else {
-        delete_tokens_from_keyring_for_api_base_url(&api_base_url);
         println!("Already logged out.");
     }
     Ok(())
+}
+
+fn logout_backend(
+    base: &Path,
+    api_base_url: &str,
+    delete_keyring: impl FnOnce(&str) -> Result<()>,
+) -> Result<bool> {
+    let keyring_result = delete_keyring(api_base_url);
+    let metadata_result = remove_auth_metadata_for_backend(base, api_base_url);
+
+    match (keyring_result, metadata_result) {
+        (Ok(()), Ok(removed)) => Ok(removed),
+        (Err(error), Ok(_)) => Err(error).context("delete credentials from OS keyring"),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(keyring_error), Err(metadata_error)) => {
+            bail!("logout cleanup failed: keyring: {keyring_error:#}; metadata: {metadata_error:#}")
+        }
+    }
+}
+
+fn remove_auth_metadata_for_backend(base: &Path, api_base_url: &str) -> Result<bool> {
+    let api_base_url = normalize_url(api_base_url, DEFAULT_CLOUDFLARE_API_URL);
+    let scoped_path = auth_path_for_api_base_url(base, &api_base_url);
+    let mut removed = false;
+    let mut failures = Vec::new();
+    match remove_file_if_present(&scoped_path) {
+        Ok(path_removed) => removed |= path_removed,
+        Err(error) => failures.push(format!("{error:#}")),
+    }
+
+    for path in [
+        legacy_scoped_auth_path(base, &api_base_url),
+        legacy_auth_path(base),
+    ] {
+        if path == scoped_path || !path.exists() {
+            continue;
+        }
+        match load_credentials_from_file(&path)
+            .with_context(|| format!("inspect legacy auth metadata {}", path.display()))
+        {
+            Ok(credentials) if credentials_match_backend(&credentials, &api_base_url) => {
+                match remove_file_if_present(&path) {
+                    Ok(path_removed) => removed |= path_removed,
+                    Err(error) => failures.push(format!("{error:#}")),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => failures.push(format!("{error:#}")),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(removed)
+    } else {
+        bail!("{}", failures.join("; "))
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 pub fn get_or_refresh_token() -> Result<Option<String>> {
@@ -1007,9 +1071,33 @@ fn write_credentials(path: &Path, credentials: &AuthCredentials) -> Result<()> {
         redacted.cloudflare_access_token = None;
         redacted
     };
-    let file = std::fs::File::create(path)?;
-    serde_json::to_writer_pretty(file, &data_to_write)?;
+    write_auth_metadata_atomically(path, &data_to_write)?;
+    Ok(())
+}
+
+fn write_auth_metadata_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create auth directory {}", parent.display()))?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".statsai-auth-")
+        .tempfile_in(parent)
+        .with_context(|| format!("create temporary auth metadata in {}", parent.display()))?;
+    restrict_file_permissions(temp.path())?;
+    serde_json::to_writer_pretty(temp.as_file_mut(), value)
+        .with_context(|| format!("serialize auth metadata {}", path.display()))?;
+    temp.as_file_mut().flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace auth metadata {}", path.display()))?;
     restrict_file_permissions(path)?;
+
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -1134,7 +1222,7 @@ fn delete_tokens_from_keyring(credentials: &AuthCredentials) {
             .api_base_url
             .as_deref()
             .unwrap_or(DEFAULT_CLOUDFLARE_API_URL);
-        delete_tokens_from_keyring_for_api_base_url(api_base);
+        let _ = delete_tokens_from_keyring_for_api_base_url(api_base);
     }
     #[cfg(test)]
     {
@@ -1142,18 +1230,40 @@ fn delete_tokens_from_keyring(credentials: &AuthCredentials) {
     }
 }
 
-fn delete_tokens_from_keyring_for_api_base_url(api_base_url: &str) {
+fn delete_tokens_from_keyring_for_api_base_url(api_base_url: &str) -> Result<()> {
     #[cfg(not(test))]
     {
-        if let Ok(entry) = session_entry(api_base_url) {
-            let _ = entry.delete_credential();
+        let entries = [
+            ("auth session", session_entry(api_base_url)),
+            ("legacy auth session", legacy_session_entry(api_base_url)),
+            (
+                "legacy auth refresh token",
+                legacy_refresh_entry(api_base_url),
+            ),
+            (
+                "legacy auth access token",
+                legacy_access_entry(api_base_url),
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (label, entry) in entries {
+            let result = entry.and_then(|entry| match entry.delete_credential() {
+                Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+                Err(error) => Err(error).with_context(|| format!("delete {label} from OS keyring")),
+            });
+            if let Err(error) = result {
+                failures.push(format!("{error:#}"));
+            }
         }
-        delete_legacy_tokens_from_keyring(api_base_url);
+        if !failures.is_empty() {
+            bail!("{}", failures.join("; "));
+        }
     }
     #[cfg(test)]
     {
         let _ = api_base_url;
     }
+    Ok(())
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -1348,6 +1458,7 @@ mod open {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn credential_transport_allows_https_and_explicit_loopback_http_only() {
@@ -1416,6 +1527,148 @@ mod tests {
                 .map(str::len),
             Some("auth-.json".len() + 64)
         );
+    }
+
+    #[test]
+    fn logout_removes_corrupt_scoped_metadata_and_runs_keyring_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_base_url = "https://api.example.com";
+        let path = auth_path_for_api_base_url(dir.path(), api_base_url);
+        std::fs::write(&path, "{not-json").expect("corrupt auth metadata");
+        let keyring_calls = Cell::new(0);
+
+        let removed = logout_backend(dir.path(), api_base_url, |requested_api_base_url| {
+            assert_eq!(requested_api_base_url, api_base_url);
+            keyring_calls.set(keyring_calls.get() + 1);
+            Ok(())
+        })
+        .expect("logout");
+
+        assert!(removed);
+        assert_eq!(keyring_calls.get(), 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn logout_removes_metadata_even_when_keyring_cleanup_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_base_url = "https://api.example.com";
+        let path = auth_path_for_api_base_url(dir.path(), api_base_url);
+        std::fs::write(&path, "{not-json").expect("corrupt auth metadata");
+
+        let error = logout_backend(dir.path(), api_base_url, |_| {
+            bail!("forced keyring deletion failure")
+        })
+        .expect_err("keyring failure");
+
+        assert!(error.to_string().contains("OS keyring"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn logout_runs_keyring_cleanup_when_legacy_metadata_is_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_base_url = "https://api.example.com";
+        let legacy_path = legacy_auth_path(dir.path());
+        std::fs::write(&legacy_path, "{not-json").expect("corrupt legacy auth metadata");
+        let keyring_calls = Cell::new(0);
+
+        let error = logout_backend(dir.path(), api_base_url, |_| {
+            keyring_calls.set(keyring_calls.get() + 1);
+            Ok(())
+        })
+        .expect_err("legacy metadata parse failure");
+
+        assert!(error.to_string().contains("legacy auth metadata"));
+        assert_eq!(keyring_calls.get(), 1);
+        assert!(legacy_path.exists());
+    }
+
+    #[test]
+    fn logout_preserves_legacy_metadata_for_another_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let requested_backend = "https://api.statsai.dev";
+        let other_backend = "https://api-statsai.dev";
+        let legacy_path = legacy_scoped_auth_path(dir.path(), other_backend);
+        let credentials = AuthCredentials {
+            backend: Some("cloudflare".to_string()),
+            api_base_url: Some(other_backend.to_string()),
+            cloudflare_refresh_token: None,
+            cloudflare_refresh_expires_at_secs: 0,
+            cloudflare_access_token: None,
+            cloudflare_access_expires_at_secs: 0,
+            device_id: Some("other-device".to_string()),
+        };
+        write_credentials(&legacy_path, &credentials).expect("legacy metadata");
+
+        let removed = logout_backend(dir.path(), requested_backend, |_| Ok(())).expect("logout");
+
+        assert!(!removed);
+        assert!(legacy_path.exists());
+    }
+
+    #[test]
+    fn atomic_auth_write_preserves_destination_on_serialization_failure() {
+        struct FailingSerialize;
+
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("forced serialization failure"))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "complete auth metadata").expect("seed destination");
+
+        write_auth_metadata_atomically(&path, &FailingSerialize)
+            .expect_err("serialization should fail");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read destination"),
+            "complete auth metadata"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .expect("read auth directory")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn atomic_auth_write_replaces_destination_privately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "stale auth metadata").expect("seed destination");
+
+        write_auth_metadata_atomically(&path, &serde_json::json!({"deviceId": "device-1"}))
+            .expect("atomic auth write");
+
+        let content = std::fs::read_to_string(&path).expect("read destination");
+        assert!(content.contains("device-1"));
+        assert!(!content.contains("stale auth metadata"));
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .expect("read auth directory")
+                .count(),
+            1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("auth metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
