@@ -285,13 +285,13 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
     };
 
     let input = usage.input_tokens.unwrap_or(0);
-    let cache_creation = usage.cache_creation_tokens.unwrap_or(0);
+    let cache_creation_cost = cache_creation_cost(&model_name, pricing, usage);
     let cached = usage.cache_read_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
     let reasoning = usage.reasoning_tokens.unwrap_or(0);
     let (input_multiplier, output_multiplier) = pricing_multipliers(&model_name, usage);
     let cost = ((input as f64 * pricing.input_per_million
-        + cache_creation as f64 * pricing.cache_creation_per_million
+        + cache_creation_cost
         + cached as f64 * pricing.cached_input_per_million)
         * input_multiplier
         + (output as f64 + reasoning as f64) * pricing.output_per_million * output_multiplier)
@@ -314,6 +314,23 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
         pricing_version: Some("static:2026-07".to_string()),
         confidence: Confidence::Medium,
     }
+}
+
+fn cache_creation_cost(model_name: &str, pricing: ModelPricing, usage: &UsageCounts) -> f64 {
+    let total = usage.cache_creation_tokens.unwrap_or(0);
+    if !model_name.starts_with("claude-") {
+        return total as f64 * pricing.cache_creation_per_million;
+    }
+
+    let one_hour = usage.cache_creation_1h_tokens.unwrap_or(0).min(total);
+    let five_minute = usage
+        .cache_creation_5m_tokens
+        .unwrap_or(0)
+        .min(total.saturating_sub(one_hour));
+    let unclassified = total.saturating_sub(one_hour.saturating_add(five_minute));
+    let default_lifetime = five_minute.saturating_add(unclassified);
+    default_lifetime as f64 * pricing.cache_creation_per_million
+        + one_hour as f64 * pricing.input_per_million * 2.0
 }
 
 fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (f64, f64) {
@@ -830,6 +847,46 @@ mod tests {
             cost.pricing_source.as_deref(),
             Some("codex_api_pricing:gpt-5")
         );
+    }
+
+    #[test]
+    fn claude_one_hour_cache_writes_use_the_extended_ttl_rate() {
+        let model = statsai_core::ModelInfo {
+            name: Some("claude-sonnet-4-6".to_string()),
+            normalized_name: Some("claude-sonnet-4-6".to_string()),
+            provider_model_id: Some("claude-sonnet-4-6".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let usage = UsageCounts {
+            cache_creation_tokens: Some(1_000_000),
+            cache_creation_5m_tokens: Some(400_000),
+            cache_creation_1h_tokens: Some(600_000),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("claude_code", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(510));
+    }
+
+    #[test]
+    fn unclassified_claude_cache_writes_keep_the_legacy_five_minute_rate() {
+        let model = statsai_core::ModelInfo {
+            name: Some("claude-sonnet-4-6".to_string()),
+            normalized_name: Some("claude-sonnet-4-6".to_string()),
+            provider_model_id: Some("claude-sonnet-4-6".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let usage = UsageCounts {
+            cache_creation_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("claude_code", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(375));
     }
 
     #[test]

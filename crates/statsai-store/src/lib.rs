@@ -4348,6 +4348,8 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let mut total_input = 0u64;
     let mut total_output = 0u64;
     let mut total_cache_creation = 0u64;
+    let mut total_cache_creation_5m = 0u64;
+    let mut total_cache_creation_1h = 0u64;
     let mut total_cache_read = 0u64;
     let mut total_reasoning = 0u64;
     let mut total_tokens = 0u64;
@@ -4378,6 +4380,10 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         total_output = total_output.saturating_add(event.usage.output_tokens.unwrap_or(0));
         total_cache_creation =
             total_cache_creation.saturating_add(event.usage.cache_creation_tokens.unwrap_or(0));
+        total_cache_creation_5m = total_cache_creation_5m
+            .saturating_add(event.usage.cache_creation_5m_tokens.unwrap_or(0));
+        total_cache_creation_1h = total_cache_creation_1h
+            .saturating_add(event.usage.cache_creation_1h_tokens.unwrap_or(0));
         total_cache_read =
             total_cache_read.saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
         total_reasoning = total_reasoning.saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
@@ -4488,6 +4494,14 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             .1
             .cache_creation_tokens
             .saturating_add(event.usage.cache_creation_tokens.unwrap_or(0));
+        entry.1.cache_creation_5m_tokens = entry
+            .1
+            .cache_creation_5m_tokens
+            .saturating_add(event.usage.cache_creation_5m_tokens.unwrap_or(0));
+        entry.1.cache_creation_1h_tokens = entry
+            .1
+            .cache_creation_1h_tokens
+            .saturating_add(event.usage.cache_creation_1h_tokens.unwrap_or(0));
         entry.1.cache_read_tokens = entry
             .1
             .cache_read_tokens
@@ -4526,6 +4540,8 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
                 input_tokens: Some(totals.input_tokens),
                 output_tokens: Some(totals.output_tokens),
                 cache_creation_tokens: Some(totals.cache_creation_tokens),
+                cache_creation_5m_tokens: Some(totals.cache_creation_5m_tokens),
+                cache_creation_1h_tokens: Some(totals.cache_creation_1h_tokens),
                 cache_read_tokens: Some(totals.cache_read_tokens),
                 reasoning_tokens: Some(totals.reasoning_tokens),
                 total_tokens: Some(totals.total_tokens),
@@ -4589,6 +4605,8 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             input_tokens: Some(total_input),
             output_tokens: Some(total_output),
             cache_creation_tokens: Some(total_cache_creation),
+            cache_creation_5m_tokens: Some(total_cache_creation_5m),
+            cache_creation_1h_tokens: Some(total_cache_creation_1h),
             cache_read_tokens: Some(total_cache_read),
             reasoning_tokens: Some(total_reasoning),
             total_tokens: Some(total_tokens),
@@ -4688,6 +4706,8 @@ struct SyncRollupModelTotals {
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_tokens: u64,
+    cache_creation_5m_tokens: u64,
+    cache_creation_1h_tokens: u64,
     cache_read_tokens: u64,
     reasoning_tokens: u64,
     total_tokens: u64,
@@ -7003,6 +7023,44 @@ mod tests {
         assert_eq!(dirty[0].models[0].usage.total_tokens, Some(25));
         assert_eq!(dirty[0].models[1].usage.total_tokens, Some(15));
         assert_eq!(dirty[0].metadata.total_sessions, Some(1));
+    }
+
+    #[test]
+    fn sync_rollups_preserve_cache_creation_lifetimes() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-sync-rollup-cache-ttl"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 12, 10, 0, 0)
+            .single()
+            .expect("now");
+        let mut event = test_store_event(&source, now, "record-cache-ttl");
+        event.usage.cache_creation_tokens = Some(30);
+        event.usage.cache_creation_5m_tokens = Some(18);
+        event.usage.cache_creation_1h_tokens = Some(12);
+
+        assert!(store.insert_event(&event).expect("insert event"));
+        let rollups = store.dirty_sync_rollup_summaries().expect("dirty rollups");
+
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].usage.cache_creation_tokens, Some(30));
+        assert_eq!(rollups[0].usage.cache_creation_5m_tokens, Some(18));
+        assert_eq!(rollups[0].usage.cache_creation_1h_tokens, Some(12));
+        assert_eq!(rollups[0].models.len(), 1);
+        assert_eq!(
+            rollups[0].models[0].usage.cache_creation_5m_tokens,
+            Some(18)
+        );
+        assert_eq!(
+            rollups[0].models[0].usage.cache_creation_1h_tokens,
+            Some(12)
+        );
     }
 
     #[test]

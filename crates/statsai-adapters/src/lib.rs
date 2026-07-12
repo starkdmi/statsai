@@ -793,6 +793,8 @@ fn scan_opencode_source(
             reasoning_tokens: sqlite_nonzero_u64(row.get::<_, i64>(6)?),
             cache_read_tokens: sqlite_nonzero_u64(row.get::<_, i64>(7)?),
             cache_creation_tokens: sqlite_nonzero_u64(row.get::<_, i64>(8)?),
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
             total_tokens: None,
             requests: Some(1),
             local_prompt_eval_tokens: None,
@@ -1188,6 +1190,8 @@ fn load_opencode_session_models(
             reasoning_tokens: sqlite_nonzero_u64(row.get::<_, i64>(4)?),
             cache_read_tokens: sqlite_nonzero_u64(row.get::<_, i64>(5)?),
             cache_creation_tokens: sqlite_nonzero_u64(row.get::<_, i64>(6)?),
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
             total_tokens: None,
             requests: None,
             local_prompt_eval_tokens: None,
@@ -3551,6 +3555,8 @@ impl GrokInferenceStats {
             input_tokens: nonzero_u64(self.input_tokens),
             output_tokens: nonzero_u64(self.output_tokens),
             cache_creation_tokens: None,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
             cache_read_tokens: nonzero_u64(self.cache_read_tokens),
             reasoning_tokens: nonzero_u64(self.reasoning_tokens),
             total_tokens: None,
@@ -3868,6 +3874,8 @@ fn parse_grok_summary(
             input_tokens: stats.usage_context_tokens(signal_value),
             output_tokens: None,
             cache_creation_tokens: None,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
             cache_read_tokens: None,
             reasoning_tokens: None,
             total_tokens: stats.usage_context_tokens(signal_value),
@@ -4179,7 +4187,7 @@ fn claude_usage_counts_from_value(value: &Value) -> UsageCounts {
             "output",
         ],
     );
-    let cache_creation = number_at_any(
+    let reported_cache_creation = number_at_any(
         value,
         &[
             "cache_creation_input_tokens",
@@ -4188,6 +4196,29 @@ fn claude_usage_counts_from_value(value: &Value) -> UsageCounts {
             "cache_creation_tokens",
         ],
     );
+    let cache_creation_5m = value
+        .pointer("/cache_creation/ephemeral_5m_input_tokens")
+        .and_then(value_as_u64)
+        .or_else(|| {
+            value
+                .pointer("/cacheCreation/ephemeral5mInputTokens")
+                .and_then(value_as_u64)
+        });
+    let cache_creation_1h = value
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(value_as_u64)
+        .or_else(|| {
+            value
+                .pointer("/cacheCreation/ephemeral1hInputTokens")
+                .and_then(value_as_u64)
+        });
+    let cache_creation = reported_cache_creation.or_else(|| {
+        (cache_creation_5m.is_some() || cache_creation_1h.is_some()).then_some(
+            cache_creation_5m
+                .unwrap_or(0)
+                .saturating_add(cache_creation_1h.unwrap_or(0)),
+        )
+    });
     let cache_read = number_at_any(
         value,
         &[
@@ -4215,6 +4246,8 @@ fn claude_usage_counts_from_value(value: &Value) -> UsageCounts {
         input_tokens: input,
         output_tokens: output,
         cache_creation_tokens: cache_creation,
+        cache_creation_5m_tokens: cache_creation_5m,
+        cache_creation_1h_tokens: cache_creation_1h,
         cache_read_tokens: cache_read,
         reasoning_tokens: reasoning,
         total_tokens: total,
@@ -4286,6 +4319,14 @@ fn sum_usage_counts(left: &UsageCounts, right: &UsageCounts) -> UsageCounts {
         input_tokens: sum_field(left.input_tokens, right.input_tokens),
         output_tokens: sum_field(left.output_tokens, right.output_tokens),
         cache_creation_tokens: sum_field(left.cache_creation_tokens, right.cache_creation_tokens),
+        cache_creation_5m_tokens: sum_field(
+            left.cache_creation_5m_tokens,
+            right.cache_creation_5m_tokens,
+        ),
+        cache_creation_1h_tokens: sum_field(
+            left.cache_creation_1h_tokens,
+            right.cache_creation_1h_tokens,
+        ),
         cache_read_tokens: sum_field(left.cache_read_tokens, right.cache_read_tokens),
         reasoning_tokens: sum_field(left.reasoning_tokens, right.reasoning_tokens),
         total_tokens: sum_field(left.total_tokens, right.total_tokens),
@@ -4349,6 +4390,8 @@ fn normalize_codex_usage_counts(
         input_tokens: input,
         output_tokens: output,
         cache_creation_tokens: cache_creation,
+        cache_creation_5m_tokens: None,
+        cache_creation_1h_tokens: None,
         cache_read_tokens: cache_read,
         reasoning_tokens: reasoning,
         total_tokens: total,
@@ -4375,6 +4418,14 @@ fn subtract_usage_counts(current: &UsageCounts, previous: Option<&UsageCounts>) 
         cache_creation_tokens: subtract(
             current.cache_creation_tokens,
             previous.and_then(|usage| usage.cache_creation_tokens),
+        ),
+        cache_creation_5m_tokens: subtract(
+            current.cache_creation_5m_tokens,
+            previous.and_then(|usage| usage.cache_creation_5m_tokens),
+        ),
+        cache_creation_1h_tokens: subtract(
+            current.cache_creation_1h_tokens,
+            previous.and_then(|usage| usage.cache_creation_1h_tokens),
         ),
         cache_read_tokens: subtract(
             current.cache_read_tokens,
@@ -4745,6 +4796,8 @@ fn opencode_message_usage_counts(value: &Value) -> UsageCounts {
         reasoning_tokens: value.pointer("/tokens/reasoning").and_then(value_as_u64),
         cache_read_tokens: value.pointer("/tokens/cache/read").and_then(value_as_u64),
         cache_creation_tokens: value.pointer("/tokens/cache/write").and_then(value_as_u64),
+        cache_creation_5m_tokens: None,
+        cache_creation_1h_tokens: None,
         total_tokens: None,
         requests: Some(1),
         local_prompt_eval_tokens: None,
@@ -8604,6 +8657,64 @@ mod tests {
         assert_eq!(usage.cache_creation_tokens, Some(2));
         assert_eq!(usage.cache_read_tokens, Some(3));
         assert_eq!(usage.computed_total(), 35);
+    }
+
+    #[test]
+    fn claude_usage_counts_preserve_cache_creation_lifetimes() {
+        let value: Value = serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 248,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 148,
+                "ephemeral_1h_input_tokens": 100
+            }
+        });
+
+        let usage = claude_usage_counts_from_value(&value);
+
+        assert_eq!(usage.cache_creation_tokens, Some(248));
+        assert_eq!(usage.cache_creation_5m_tokens, Some(148));
+        assert_eq!(usage.cache_creation_1h_tokens, Some(100));
+        assert_eq!(usage.computed_total(), 278);
+    }
+
+    #[test]
+    fn claude_usage_counts_derive_combined_cache_creation_tokens() {
+        let value: Value = serde_json::json!({
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 8,
+                "ephemeral_1h_input_tokens": 5
+            }
+        });
+
+        let usage = claude_usage_counts_from_value(&value);
+
+        assert_eq!(usage.cache_creation_tokens, Some(13));
+        assert_eq!(usage.cache_creation_5m_tokens, Some(8));
+        assert_eq!(usage.cache_creation_1h_tokens, Some(5));
+    }
+
+    #[test]
+    fn summed_usage_counts_preserve_cache_creation_lifetimes() {
+        let left = UsageCounts {
+            cache_creation_tokens: Some(10),
+            cache_creation_5m_tokens: Some(7),
+            cache_creation_1h_tokens: Some(3),
+            ..UsageCounts::default()
+        };
+        let right = UsageCounts {
+            cache_creation_tokens: Some(20),
+            cache_creation_5m_tokens: Some(11),
+            cache_creation_1h_tokens: Some(9),
+            ..UsageCounts::default()
+        };
+
+        let usage = sum_usage_counts(&left, &right);
+
+        assert_eq!(usage.cache_creation_tokens, Some(30));
+        assert_eq!(usage.cache_creation_5m_tokens, Some(18));
+        assert_eq!(usage.cache_creation_1h_tokens, Some(12));
     }
 
     #[test]

@@ -3938,6 +3938,14 @@ fn sum_usage_counts(left: &UsageCounts, right: &UsageCounts) -> UsageCounts {
         input_tokens: sum_field(left.input_tokens, right.input_tokens),
         output_tokens: sum_field(left.output_tokens, right.output_tokens),
         cache_creation_tokens: sum_field(left.cache_creation_tokens, right.cache_creation_tokens),
+        cache_creation_5m_tokens: sum_field(
+            left.cache_creation_5m_tokens,
+            right.cache_creation_5m_tokens,
+        ),
+        cache_creation_1h_tokens: sum_field(
+            left.cache_creation_1h_tokens,
+            right.cache_creation_1h_tokens,
+        ),
         cache_read_tokens: sum_field(left.cache_read_tokens, right.cache_read_tokens),
         reasoning_tokens: sum_field(left.reasoning_tokens, right.reasoning_tokens),
         total_tokens: sum_field(left.total_tokens, right.total_tokens),

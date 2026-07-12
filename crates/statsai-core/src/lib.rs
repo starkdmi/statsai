@@ -300,6 +300,10 @@ pub struct UsageCounts {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
+    /// Anthropic cache writes using the default five-minute lifetime.
+    pub cache_creation_5m_tokens: Option<u64>,
+    /// Anthropic cache writes using the extended one-hour lifetime.
+    pub cache_creation_1h_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
@@ -1691,6 +1695,20 @@ mod tests {
             ..UsageCounts::default()
         };
         assert_eq!(usage.computed_total(), 17);
+    }
+
+    #[test]
+    fn legacy_usage_counts_without_cache_lifetimes_deserialize() {
+        let usage: UsageCounts = serde_json::from_value(serde_json::json!({
+            "input_tokens": 10,
+            "cache_creation_tokens": 4
+        }))
+        .expect("legacy usage counts");
+
+        assert_eq!(usage.cache_creation_tokens, Some(4));
+        assert_eq!(usage.cache_creation_5m_tokens, None);
+        assert_eq!(usage.cache_creation_1h_tokens, None);
+        assert_eq!(usage.computed_total(), 14);
     }
 
     #[test]

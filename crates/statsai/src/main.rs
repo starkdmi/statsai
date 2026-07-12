@@ -7407,6 +7407,8 @@ struct SyncRollupStatsAccumulator {
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_tokens: u64,
+    cache_creation_5m_tokens: u64,
+    cache_creation_1h_tokens: u64,
     cache_read_tokens: u64,
     reasoning_tokens: u64,
     total_tokens: u64,
@@ -7466,6 +7468,8 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_creation_tokens: 0,
+                cache_creation_5m_tokens: 0,
+                cache_creation_1h_tokens: 0,
                 cache_read_tokens: 0,
                 reasoning_tokens: 0,
                 total_tokens: 0,
@@ -7481,6 +7485,12 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
         entry.cache_creation_tokens = entry
             .cache_creation_tokens
             .saturating_add(event.usage.cache_creation_tokens.unwrap_or(0));
+        entry.cache_creation_5m_tokens = entry
+            .cache_creation_5m_tokens
+            .saturating_add(event.usage.cache_creation_5m_tokens.unwrap_or(0));
+        entry.cache_creation_1h_tokens = entry
+            .cache_creation_1h_tokens
+            .saturating_add(event.usage.cache_creation_1h_tokens.unwrap_or(0));
         entry.cache_read_tokens = entry
             .cache_read_tokens
             .saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
@@ -7520,6 +7530,8 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
                 input_tokens: Some(bucket.input_tokens),
                 output_tokens: Some(bucket.output_tokens),
                 cache_creation_tokens: Some(bucket.cache_creation_tokens),
+                cache_creation_5m_tokens: Some(bucket.cache_creation_5m_tokens),
+                cache_creation_1h_tokens: Some(bucket.cache_creation_1h_tokens),
                 cache_read_tokens: Some(bucket.cache_read_tokens),
                 reasoning_tokens: Some(bucket.reasoning_tokens),
                 total_tokens: Some(bucket.total_tokens),
