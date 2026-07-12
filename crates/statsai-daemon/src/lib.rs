@@ -285,8 +285,10 @@ mod watch {
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
     use tiny_http::Server;
+
+    const WATCH_SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
     pub fn watch_and_serve(
         addr: &str,
@@ -297,9 +299,16 @@ mod watch {
         let bind_addr = super::resolve_loopback_addr(addr)?;
         let startup_executable = current_executable_stamp();
 
-        let sources = {
+        let initial_source_result = {
             let s = super::lock_store(&store);
             discover_watch_sources(&s)
+        };
+        let initial_sources = match initial_source_result {
+            Ok(sources) => sources,
+            Err(error) => {
+                eprintln!("daemon: initial watch source discovery failed: {error:#}");
+                discover_adapter_watch_sources()
+            }
         };
         let (tx, rx) = mpsc::sync_channel(1);
         let pending_changed_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
@@ -321,13 +330,15 @@ mod watch {
         })
         .context("create file watcher")?;
 
-        for path in &sources {
-            if let Err(e) = watcher.watch(path, RecursiveMode::Recursive) {
-                eprintln!("daemon: cannot watch {}: {e}", path.display());
-            } else {
-                eprintln!("daemon: watching {}", path.display());
-            }
-        }
+        let mut watched_sources = HashSet::new();
+        let mut uncertain_watch_sources = HashSet::new();
+        reconcile_watch_sources(
+            &mut watcher,
+            &mut watched_sources,
+            &mut uncertain_watch_sources,
+            initial_sources,
+        );
+        let mut last_watch_source_refresh = Instant::now();
 
         eprintln!("daemon: API listening on http://{bind_addr}");
         let server = Server::http(bind_addr)
@@ -360,8 +371,35 @@ mod watch {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
+            if last_watch_source_refresh.elapsed() >= WATCH_SOURCE_REFRESH_INTERVAL {
+                let desired_sources = {
+                    let s = super::lock_store(&store);
+                    discover_watch_sources(&s)
+                };
+                last_watch_source_refresh = Instant::now();
+                match desired_sources {
+                    Ok(desired_sources) => {
+                        let newly_watched = reconcile_watch_sources(
+                            &mut watcher,
+                            &mut watched_sources,
+                            &mut uncertain_watch_sources,
+                            desired_sources,
+                        );
+                        if !newly_watched.is_empty() {
+                            let s = super::lock_store(&store);
+                            rescan_changed_sources(&s, device_id, &newly_watched);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("daemon: watch source discovery failed: {error:#}");
+                    }
+                }
+            }
+
             if let Ok(Some(request)) = server.try_recv() {
-                super::handle_request(request, &store, auth_token)?;
+                if let Err(error) = super::handle_request(request, &store, auth_token) {
+                    eprintln!("daemon: request failed: {error:#}");
+                }
             }
         }
 
@@ -393,23 +431,27 @@ mod watch {
         executable_stamp(&startup.path).as_ref() != Some(startup)
     }
 
-    fn discover_watch_sources(store: &Store) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
+    fn discover_watch_sources(store: &Store) -> Result<HashSet<PathBuf>> {
+        let mut paths = HashSet::new();
 
-        if let Ok(configured) = store.list_sources() {
-            for source in configured {
-                if source.source_kind != SourceKind::LocalAdapter {
-                    continue;
-                }
-                if let Some(label) = source.path_label.as_deref().filter(|p| !p.is_empty()) {
-                    let path = PathBuf::from(label);
-                    if path.is_dir() && !paths.contains(&path) {
-                        paths.push(path);
-                    }
+        for source in store.list_sources()? {
+            if source.source_kind != SourceKind::LocalAdapter {
+                continue;
+            }
+            if let Some(label) = source.path_label.as_deref().filter(|p| !p.is_empty()) {
+                let path = PathBuf::from(label);
+                if path.is_dir() {
+                    paths.insert(path);
                 }
             }
         }
 
+        paths.extend(discover_adapter_watch_sources());
+        Ok(paths)
+    }
+
+    fn discover_adapter_watch_sources() -> HashSet<PathBuf> {
+        let mut paths = HashSet::new();
         for adapter in default_adapters() {
             for source in adapter.discover() {
                 if source.source_kind != SourceKind::LocalAdapter {
@@ -417,14 +459,53 @@ mod watch {
                 }
                 if let Some(label) = source.path_label.as_deref().filter(|p| !p.is_empty()) {
                     let path = PathBuf::from(label);
-                    if path.is_dir() && !paths.contains(&path) {
-                        paths.push(path);
+                    if path.is_dir() {
+                        paths.insert(path);
                     }
                 }
             }
         }
 
         paths
+    }
+
+    fn reconcile_watch_sources<W: Watcher>(
+        watcher: &mut W,
+        watched: &mut HashSet<PathBuf>,
+        uncertain: &mut HashSet<PathBuf>,
+        desired: HashSet<PathBuf>,
+    ) -> Vec<PathBuf> {
+        let mut removed = watched.difference(&desired).cloned().collect::<Vec<_>>();
+        removed.sort();
+        for path in removed {
+            if let Err(error) = watcher.unwatch(&path) {
+                eprintln!("daemon: cannot stop watching {}: {error}", path.display());
+                uncertain.insert(path);
+            } else {
+                eprintln!("daemon: stopped watching {}", path.display());
+                watched.remove(&path);
+                uncertain.remove(&path);
+            }
+        }
+
+        let mut additions = desired
+            .iter()
+            .filter(|path| !watched.contains(*path) || uncertain.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        additions.sort();
+        let mut newly_watched = Vec::with_capacity(additions.len());
+        for path in additions {
+            if let Err(error) = watcher.watch(&path, RecursiveMode::Recursive) {
+                eprintln!("daemon: cannot watch {}: {error}", path.display());
+            } else {
+                eprintln!("daemon: watching {}", path.display());
+                watched.insert(path.clone());
+                uncertain.remove(&path);
+                newly_watched.push(path);
+            }
+        }
+        newly_watched
     }
 
     fn rescan_changed_sources(store: &Store, device_id: &str, changed: &[PathBuf]) {
@@ -898,11 +979,45 @@ mod watch {
     mod tests {
         use super::*;
         use chrono::TimeZone;
+        use notify::{Config, Error as NotifyError, EventHandler, WatcherKind};
         use statsai_core::{
             BillingPeriod, LocationOrigin, SubscriptionStatus, VerifiedSourceState,
             VerifiedSubscriptionState,
         };
         use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingWatcher {
+            watched: HashSet<PathBuf>,
+            rejected: HashSet<PathBuf>,
+            rejected_unwatch: HashSet<PathBuf>,
+        }
+
+        impl Watcher for RecordingWatcher {
+            fn new<F: EventHandler>(_event_handler: F, _config: Config) -> notify::Result<Self> {
+                Ok(Self::default())
+            }
+
+            fn watch(&mut self, path: &Path, _recursive_mode: RecursiveMode) -> notify::Result<()> {
+                if self.rejected.contains(path) {
+                    return Err(NotifyError::generic("rejected test path"));
+                }
+                self.watched.insert(path.to_path_buf());
+                Ok(())
+            }
+
+            fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+                if self.rejected_unwatch.contains(path) {
+                    return Err(NotifyError::generic("rejected test unwatch path"));
+                }
+                self.watched.remove(path);
+                Ok(())
+            }
+
+            fn kind() -> WatcherKind {
+                WatcherKind::NullWatcher
+            }
+        }
 
         #[test]
         fn executable_stamp_detects_replaced_binary() {
@@ -914,6 +1029,67 @@ mod watch {
             assert!(!executable_was_replaced(&startup));
             std::fs::write(&binary, b"new-binary").expect("new binary");
             assert!(executable_was_replaced(&startup));
+        }
+
+        #[test]
+        fn watch_source_reconciliation_adds_removes_and_retries_sources() {
+            let first = PathBuf::from("/tmp/statsai-watch-first");
+            let second = PathBuf::from("/tmp/statsai-watch-second");
+            let mut watcher = RecordingWatcher::default();
+            let mut watched = HashSet::new();
+            let mut uncertain = HashSet::new();
+
+            let added = reconcile_watch_sources(
+                &mut watcher,
+                &mut watched,
+                &mut uncertain,
+                HashSet::from([first.clone()]),
+            );
+            assert_eq!(added, vec![first.clone()]);
+            assert_eq!(watched, HashSet::from([first.clone()]));
+
+            watcher.rejected_unwatch.insert(first.clone());
+            watcher.rejected.insert(second.clone());
+            let added = reconcile_watch_sources(
+                &mut watcher,
+                &mut watched,
+                &mut uncertain,
+                HashSet::from([second.clone()]),
+            );
+            assert!(added.is_empty());
+            assert_eq!(watched, HashSet::from([first.clone()]));
+            assert_eq!(uncertain, HashSet::from([first.clone()]));
+            assert!(watcher.watched.contains(&first));
+
+            let added = reconcile_watch_sources(
+                &mut watcher,
+                &mut watched,
+                &mut uncertain,
+                HashSet::from([first.clone()]),
+            );
+            assert_eq!(added, vec![first.clone()]);
+            assert!(uncertain.is_empty());
+
+            watcher.rejected_unwatch.remove(&first);
+            let added = reconcile_watch_sources(
+                &mut watcher,
+                &mut watched,
+                &mut uncertain,
+                HashSet::from([second.clone()]),
+            );
+            assert!(added.is_empty());
+            assert!(watched.is_empty());
+            assert!(!watcher.watched.contains(&first));
+
+            watcher.rejected.remove(&second);
+            let added = reconcile_watch_sources(
+                &mut watcher,
+                &mut watched,
+                &mut uncertain,
+                HashSet::from([second.clone()]),
+            );
+            assert_eq!(added, vec![second.clone()]);
+            assert_eq!(watched, HashSet::from([second]));
         }
 
         struct TestAdapter {
