@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_migrations_table(conn)?;
@@ -101,6 +101,10 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         6 => apply_migration_006(conn),
         7 => apply_migration_007(conn),
         8 => apply_migration_008(conn),
+        9 => apply_migration_009(conn),
+        10 => apply_migration_010(conn),
+        11 => apply_migration_011(conn),
+        12 => apply_migration_012(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -299,6 +303,149 @@ fn apply_migration_008(conn: &Connection) -> Result<()> {
     )
 }
 
+fn apply_migration_009(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS archive_conversations (
+          conversation_id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          native_conversation_id TEXT NOT NULL,
+          title TEXT,
+          project_json TEXT,
+          started_at TEXT,
+          updated_at TEXT,
+          completeness TEXT NOT NULL,
+          missing_content_count INTEGER NOT NULL DEFAULT 0,
+          imported_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS archive_conversations_native_idx
+          ON archive_conversations (provider, native_conversation_id);
+        CREATE INDEX IF NOT EXISTS archive_conversations_source_idx
+          ON archive_conversations (source_id, updated_at, conversation_id);
+        CREATE INDEX IF NOT EXISTS archive_conversations_provider_idx
+          ON archive_conversations (provider, updated_at, conversation_id);
+
+        CREATE TABLE IF NOT EXISTS archive_items (
+          item_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL,
+          native_item_id TEXT,
+          source_record_id TEXT,
+          ordinal INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          role TEXT,
+          created_at TEXT,
+          model_json TEXT,
+          tool_name TEXT,
+          tool_call_id TEXT,
+          status TEXT,
+          usage_json TEXT,
+          FOREIGN KEY (conversation_id) REFERENCES archive_conversations(conversation_id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS archive_items_order_idx
+          ON archive_items (conversation_id, ordinal, item_id);
+        CREATE INDEX IF NOT EXISTS archive_items_created_idx
+          ON archive_items (created_at, item_id);
+
+        CREATE TABLE IF NOT EXISTS archive_content_parts (
+          content_id TEXT PRIMARY KEY,
+          item_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          mime_type TEXT,
+          name TEXT,
+          text_content TEXT,
+          binary_content BLOB,
+          external_uri TEXT,
+          content_hash TEXT NOT NULL,
+          original_bytes INTEGER NOT NULL,
+          truncated INTEGER NOT NULL DEFAULT 0,
+          FOREIGN KEY (item_id) REFERENCES archive_items(item_id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS archive_content_parts_order_idx
+          ON archive_content_parts (item_id, ordinal, content_id);
+        CREATE INDEX IF NOT EXISTS archive_content_parts_hash_idx
+          ON archive_content_parts (content_hash);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS archive_content_fts USING fts5(
+          text_content,
+          content='archive_content_parts',
+          content_rowid='rowid',
+          tokenize='unicode61'
+        );
+        CREATE TRIGGER IF NOT EXISTS archive_content_parts_ai AFTER INSERT ON archive_content_parts
+        WHEN new.text_content IS NOT NULL BEGIN
+          INSERT INTO archive_content_fts(rowid, text_content)
+          VALUES (new.rowid, new.text_content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS archive_content_parts_ad AFTER DELETE ON archive_content_parts
+        WHEN old.text_content IS NOT NULL BEGIN
+          INSERT INTO archive_content_fts(archive_content_fts, rowid, text_content)
+          VALUES ('delete', old.rowid, old.text_content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS archive_content_parts_au AFTER UPDATE ON archive_content_parts
+        BEGIN
+          INSERT INTO archive_content_fts(archive_content_fts, rowid, text_content)
+          SELECT 'delete', old.rowid, old.text_content
+          WHERE old.text_content IS NOT NULL;
+          INSERT INTO archive_content_fts(rowid, text_content)
+          SELECT new.rowid, new.text_content
+          WHERE new.text_content IS NOT NULL;
+        END;
+
+        CREATE TABLE IF NOT EXISTS archive_import_state (
+          source_id TEXT NOT NULL,
+          cache_key TEXT NOT NULL,
+          cache_signature TEXT NOT NULL,
+          collected_at TEXT NOT NULL,
+          PRIMARY KEY (source_id, cache_key)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn apply_migration_010(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS archive_missing_content_state (
+          conversation_id TEXT NOT NULL,
+          scope_id TEXT NOT NULL,
+          missing_content_count INTEGER NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (conversation_id, scope_id),
+          FOREIGN KEY (conversation_id) REFERENCES archive_conversations(conversation_id)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn apply_migration_011(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS archive_artifact_dependencies (
+          source_id TEXT NOT NULL,
+          cache_key TEXT NOT NULL,
+          artifact_path TEXT NOT NULL,
+          metadata_signature TEXT NOT NULL,
+          PRIMARY KEY (source_id, cache_key, artifact_path)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn apply_migration_012(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS archive_items_source_record_idx
+          ON archive_items (source_record_id, item_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -445,6 +592,9 @@ mod tests {
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
         assert!(table_exists(&conn, "task_bucket_sync_state"));
         assert!(column_exists(&conn, "scan_file_state", "tasks_collected"));
+        assert!(table_exists(&conn, "archive_missing_content_state"));
+        assert!(table_exists(&conn, "archive_artifact_dependencies"));
+        assert!(index_exists(&conn, "archive_items_source_record_idx"));
     }
 
     #[test]
@@ -460,6 +610,25 @@ mod tests {
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
         assert!(table_exists(&conn, "task_bucket_sync_state"));
         assert!(column_exists(&conn, "scan_file_state", "tasks_collected"));
+    }
+
+    #[test]
+    fn version_eleven_archive_receives_source_record_index() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        ensure_migrations_table(&conn).expect("ensure migrations table");
+        for version in 1..=11 {
+            apply_migration(&conn, version).expect("apply pre-index migration");
+            record_migration(&conn, version).expect("record pre-index migration");
+        }
+        assert!(!index_exists(&conn, "archive_items_source_record_idx"));
+
+        migrate(&conn).expect("migrate version eleven database");
+
+        assert_eq!(
+            schema_version(&conn).expect("read version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert!(index_exists(&conn, "archive_items_source_record_idx"));
     }
 
     #[test]
@@ -529,5 +698,15 @@ mod tests {
             }
         }
         false
+    }
+
+    fn index_exists(conn: &Connection, index_name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [index_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .expect("read sqlite_master")
     }
 }

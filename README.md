@@ -99,6 +99,12 @@ cargo run -p statsai -- task show work_123 --include-evidence
 cargo run -p statsai -- task verify accept work_123
 cargo run -p statsai -- task benchmark
 cargo run -p statsai -- task export --level span --format jsonl
+cargo run -p statsai -- conversation collect --provider codex --verbose
+cargo run -p statsai -- conversation list
+cargo run -p statsai -- conversation search 'database AND migration'
+cargo run -p statsai -- conversation show conv_123
+cargo run -p statsai -- conversation export conv_123 --format json
+cargo run -p statsai -- conversation stats
 cargo run -p statsai -- sync --sink file --output ./statsai-sync-batch.json
 cargo run -p statsai -- sync --sink http --since-last
 cargo run -p statsai -- sync --sink http --endpoint http://127.0.0.1:8787/api/sync/batches
@@ -172,6 +178,33 @@ See:
 
 - `docs/task-collection.md`
 - `docs/task-benchmarking.md`
+
+## Local Conversation Archive
+
+`conversation collect` imports durable, provider-independent conversations into
+the local SQLite store. Collection is additive: removing or compacting a source
+record does not delete a conversation that StatsAI already archived. Repeated
+collection uses a separate file-signature cache and only parses changed source
+files unless `--no-cache` is supplied. Referenced local artifact metadata is
+also tracked, so creating or modifying an artifact recollects its source file.
+Candidates are streamed and committed independently, keeping large JSONL files
+memory-bounded and allowing an interrupted collection to resume from the last
+completed file.
+
+The archive keeps complete visible user and assistant messages, readable
+reasoning text and summaries, and embedded binary artifacts such as images.
+Opaque encrypted reasoning is ignored. Large tool arguments and results are
+bounded while retaining their original byte count and content hash. External
+artifacts that cannot be read locally leave an explicit partial-archive marker.
+Embedded and explicit local artifacts are limited to 64 MiB each; local paths
+must resolve to regular files.
+
+Conversation content is local-only and is not included in `sync` payloads.
+JSON exports include binary artifacts as base64; SQLite stores their decoded
+bytes as BLOBs.
+
+See `docs/conversation-archive.md` for the archive model, retention guarantees,
+and completeness behavior.
 
 ## Design Notes
 

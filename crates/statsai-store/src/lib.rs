@@ -1,5 +1,6 @@
 //! Local SQLite storage for `statsai`.
 
+mod archive;
 mod migrations;
 mod tasks;
 
@@ -26,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
+pub use archive::{ArchiveConversationSummary, ArchiveSearchHit, ArchiveStats, ArchiveWriteResult};
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,

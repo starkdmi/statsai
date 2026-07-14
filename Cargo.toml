@@ -32,6 +32,7 @@ statsai-store = { path = "crates/statsai-store", version = "0.3.2" }
 statsai-sync = { path = "crates/statsai-sync", version = "0.3.2" }
 statsai = { path = "crates/statsai", version = "0.3.2" }
 anyhow = "1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"

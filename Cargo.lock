@@ -2249,6 +2249,7 @@ name = "statsai-adapters"
 version = "0.3.2"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "rusqlite",
  "serde",
@@ -2256,6 +2257,7 @@ dependencies = [
  "statsai-core",
  "statsai-pricing",
  "tempfile",
+ "url",
  "walkdir",
 ]
 
@@ -2263,6 +2265,7 @@ dependencies = [
 name = "statsai-core"
 version = "0.3.2"
 dependencies = [
+ "base64",
  "chrono",
  "hex",
  "schemars",
@@ -2333,6 +2336,7 @@ name = "statsai-store"
 version = "0.3.2"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "rusqlite",
  "serde",

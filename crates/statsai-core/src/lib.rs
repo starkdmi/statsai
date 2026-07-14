@@ -1,5 +1,6 @@
 //! Core schemas and ID helpers for `statsai`.
 
+mod archive;
 mod tasks;
 
 use chrono::{DateTime, Utc};
@@ -8,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+pub use archive::*;
 pub use tasks::*;
 
 pub const USAGE_EVENT_SCHEMA_VERSION: &str = "usage_event.v1";

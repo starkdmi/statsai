@@ -13,13 +13,14 @@ use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
     normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
     project_contains_file_paths, project_has_stable_identity, source_account_assignment_id,
-    source_id as statsai_source_id, subscription_id, timestamp_in_period, BillingPeriod, EventId,
-    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
-    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
-    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
-    SyncAuthoritativeSnapshot, SyncBatch, TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict,
-    TaskVerification, TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport,
-    UsageSummary, UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    source_id as statsai_source_id, subscription_id, timestamp_in_period, ArchiveContentKind,
+    ArchiveConversation, BillingPeriod, EventId, IdentitySource, LocationOrigin, ProjectInfo,
+    ProviderAccount, ProviderAccountId, ReportPeriod, SourceAccountAssignment,
+    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
+    Subscription, SubscriptionId, SubscriptionStatus, SyncAuthoritativeSnapshot, SyncBatch,
+    TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict, TaskVerification,
+    TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport, UsageSummary,
+    UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -95,6 +96,8 @@ enum Command {
     Export(ExportCommand),
     #[command(about = "Review and rebuild local work items")]
     Task(TaskCommand),
+    #[command(about = "Collect and explore durable local conversation archives")]
+    Conversation(ConversationCommand),
     #[command(about = "Export a sync batch to a sink")]
     Sync(SyncCommand),
     #[command(about = "Print JSON schemas for backend-facing contracts")]
@@ -189,6 +192,62 @@ struct ReportCommand {
 struct TaskCommand {
     #[command(subcommand)]
     command: TaskSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct ConversationCommand {
+    #[command(subcommand)]
+    command: ConversationSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConversationSubcommand {
+    #[command(about = "Collect new or changed conversations from local provider sources")]
+    Collect {
+        #[arg(long, help = "Collect only this provider")]
+        provider: Option<String>,
+        #[arg(long, help = "Ignore the archive collection cache")]
+        no_cache: bool,
+        #[arg(long, help = "Show per-source collection diagnostics")]
+        verbose: bool,
+    },
+    #[command(about = "List archived conversations")]
+    List {
+        #[arg(long, help = "Optional provider filter")]
+        provider: Option<String>,
+        #[arg(long, default_value_t = 50, help = "Maximum conversations to return")]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Read one archived conversation")]
+    Show {
+        #[arg(help = "Canonical conversation identifier")]
+        conversation_id: String,
+        #[arg(long, help = "Output complete JSON, including base64 artifacts")]
+        json: bool,
+    },
+    #[command(about = "Search archived conversation text using SQLite FTS5")]
+    Search {
+        #[arg(help = "FTS5 search expression")]
+        query: String,
+        #[arg(long, default_value_t = 50, help = "Maximum matches to return")]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Show local archive coverage and storage statistics")]
+    Stats {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Export one conversation with complete artifact payloads")]
+    Export {
+        #[arg(help = "Canonical conversation identifier")]
+        conversation_id: String,
+        #[arg(long, default_value = "json", help = "Export format: json or markdown")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -791,6 +850,7 @@ fn main() -> Result<()> {
                 Command::Import(command) => import(command, &store, &device_id),
                 Command::Export(command) => export(command, &store),
                 Command::Task(command) => task(command, &store),
+                Command::Conversation(command) => conversation(command, &store),
                 Command::Sync(command) => sync(command, &store, &device_id),
                 Command::Daemon(command) => daemon(command, store, &device_id),
                 Command::Status => status(&store),
@@ -5482,10 +5542,408 @@ fn daemon(command: DaemonCommand, store: Store, device_id: &str) -> Result<()> {
     }
 }
 
+fn conversation(command: ConversationCommand, store: &Store) -> Result<()> {
+    match command.command {
+        ConversationSubcommand::Collect {
+            provider,
+            no_cache,
+            verbose,
+        } => collect_conversations(store, provider.as_deref(), no_cache, verbose),
+        ConversationSubcommand::List {
+            provider,
+            limit,
+            json,
+        } => {
+            let provider = canonical_conversation_provider_filter(provider.as_deref())?;
+            let conversations =
+                store.list_archive_conversations(provider, limit.clamp(1, 10_000))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&conversations)?);
+            } else if conversations.is_empty() {
+                println!("no archived conversations");
+            } else {
+                println!(
+                    "{:<29} {:<13} {:>8} {:>10}  title",
+                    "conversation", "provider", "items", "bytes"
+                );
+                for conversation in conversations {
+                    println!(
+                        "{:<29} {:<13} {:>8} {:>10}  {}{}",
+                        conversation.conversation_id,
+                        conversation.provider,
+                        format_u64(conversation.item_count),
+                        format_u64(conversation.content_bytes),
+                        conversation.title.as_deref().unwrap_or("(untitled)"),
+                        if conversation.missing_content_count > 0 {
+                            " [partial]"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
+        ConversationSubcommand::Show {
+            conversation_id,
+            json,
+        } => {
+            let conversation = store
+                .archive_conversation(&conversation_id)?
+                .with_context(|| format!("archived conversation not found: {conversation_id}"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&conversation)?);
+            } else {
+                print_archive_conversation(&conversation);
+            }
+            Ok(())
+        }
+        ConversationSubcommand::Search { query, limit, json } => {
+            let hits = store.search_archive(&query, limit.clamp(1, 10_000))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hits)?);
+            } else if hits.is_empty() {
+                println!("no archive matches");
+            } else {
+                for hit in hits {
+                    let preview = compact_archive_preview(&hit.text, 220);
+                    println!(
+                        "{}  {}  {}\n  {}",
+                        hit.conversation_id,
+                        hit.role.as_deref().unwrap_or("unknown"),
+                        hit.title.as_deref().unwrap_or("(untitled)"),
+                        preview
+                    );
+                }
+            }
+            Ok(())
+        }
+        ConversationSubcommand::Stats { json } => {
+            let stats = store.archive_stats()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                println!(
+                    "archived conversations: {}",
+                    format_u64(stats.conversations)
+                );
+                println!("archived items: {}", format_u64(stats.items));
+                println!("text parts: {}", format_u64(stats.text_parts));
+                println!("binary parts: {}", format_u64(stats.binary_parts));
+                println!("text bytes: {}", format_u64(stats.text_bytes));
+                println!("binary bytes: {}", format_u64(stats.binary_bytes));
+                println!(
+                    "missing artifacts/content: {}",
+                    format_u64(stats.missing_content)
+                );
+            }
+            Ok(())
+        }
+        ConversationSubcommand::Export {
+            conversation_id,
+            format,
+        } => {
+            let conversation = store
+                .archive_conversation(&conversation_id)?
+                .with_context(|| format!("archived conversation not found: {conversation_id}"))?;
+            match format.as_str() {
+                "json" => println!("{}", serde_json::to_string_pretty(&conversation)?),
+                "markdown" | "md" => print_archive_markdown(&conversation),
+                _ => bail!("unsupported conversation export format: {format}"),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn collect_conversations(
+    store: &Store,
+    provider_filter: Option<&str>,
+    no_cache: bool,
+    verbose: bool,
+) -> Result<()> {
+    let canonical_provider_filter = canonical_conversation_provider_filter(provider_filter)?;
+    let configured_sources = store.list_sources()?;
+    let mut sources_collected = 0u64;
+    let mut total_conversations = 0u64;
+    let mut total_items = 0u64;
+    let mut total_parts = 0u64;
+    let mut total_binary_bytes = 0u64;
+    let mut total_missing = 0u64;
+
+    for adapter in default_adapters() {
+        if canonical_provider_filter.is_some_and(|provider| provider != adapter.provider()) {
+            continue;
+        }
+        for source in scan_sources_for_adapter(adapter.as_ref(), &configured_sources) {
+            let candidates = adapter.archive_scan_candidates(&source)?;
+            let entries = scan_file_state_entries(&candidates);
+            let pending = if no_cache {
+                entries
+            } else {
+                store.pending_archive_import_entries(&source.source_id, &entries)?
+            };
+            if pending.is_empty() {
+                if verbose && !candidates.is_empty() {
+                    println!(
+                        "{} {}: archive unchanged ({} files)",
+                        adapter.provider(),
+                        preview_path_label(&source),
+                        candidates.len()
+                    );
+                }
+                continue;
+            }
+            let collected = collect_archive_source_entries(
+                store,
+                adapter.as_ref(),
+                &source,
+                &candidates,
+                &pending,
+                verbose,
+            )?;
+            sources_collected += 1;
+            total_conversations += collected.conversations;
+            total_items += collected.items;
+            total_parts += collected.parts;
+            total_binary_bytes += collected.binary_bytes;
+            total_missing += collected.missing;
+            if verbose {
+                println!(
+                    "{} {}: files={} conversations={} items={} parts={} binary_bytes={} missing={} invalid_records={}",
+                    adapter.provider(),
+                    preview_path_label(&source),
+                    collected.files,
+                    collected.conversations,
+                    collected.items,
+                    collected.parts,
+                    collected.binary_bytes,
+                    collected.missing,
+                    collected.invalid_records,
+                );
+            }
+        }
+    }
+    println!(
+        "archive collection: sources={} conversations={} items={} parts={} binary_bytes={} missing={}",
+        sources_collected,
+        total_conversations,
+        total_items,
+        total_parts,
+        total_binary_bytes,
+        total_missing,
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ArchiveSourceCollection {
+    files: u64,
+    conversations: u64,
+    items: u64,
+    parts: u64,
+    binary_bytes: u64,
+    missing: u64,
+    invalid_records: u64,
+}
+
+fn collect_archive_source_entries(
+    store: &Store,
+    adapter: &dyn ProviderAdapter,
+    source: &SourceLocation,
+    candidates: &[ScanCandidateFile],
+    pending: &[ScanFileStateEntry],
+    verbose: bool,
+) -> Result<ArchiveSourceCollection> {
+    let candidates_by_key = candidates
+        .iter()
+        .map(|candidate| (candidate.cache_key.as_str(), candidate))
+        .collect::<HashMap<_, _>>();
+    let mut collected = ArchiveSourceCollection::default();
+    for (index, entry) in pending.iter().enumerate() {
+        let candidate = candidates_by_key.get(entry.cache_key.as_str()).copied();
+        let candidate_bytes = candidate
+            .and_then(|candidate| std::fs::metadata(&candidate.path).ok())
+            .map_or(0, |metadata| metadata.len());
+        let report_candidate =
+            verbose && (index == 0 || (index + 1) % 25 == 0 || candidate_bytes >= 16 * 1024 * 1024);
+        if report_candidate {
+            println!(
+                "{} {}: collecting file {}/{} ({} bytes) {}",
+                adapter.provider(),
+                preview_path_label(source),
+                index + 1,
+                pending.len(),
+                candidate_bytes,
+                candidate
+                    .and_then(|candidate| candidate.path.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(entry.cache_key.as_str()),
+            );
+        }
+
+        let collect_started = Instant::now();
+        let selected = HashSet::from([entry.cache_key.clone()]);
+        let scan = adapter.collect_archive(source, Some(&selected))?;
+        let collect_elapsed = collect_started.elapsed();
+        let store_started = Instant::now();
+        let write = store.store_archive_scan(
+            &source.source_id,
+            &scan.conversations,
+            std::slice::from_ref(entry),
+            &scan.artifact_dependencies,
+        )?;
+        let store_elapsed = store_started.elapsed();
+        collected.files += scan.diagnostics.files_scanned;
+        collected.conversations += write.conversations;
+        collected.items += write.items;
+        collected.parts += write.content_parts;
+        collected.binary_bytes += write.binary_bytes;
+        collected.missing += scan.diagnostics.missing_content;
+        collected.invalid_records += scan.diagnostics.invalid_records;
+        if report_candidate {
+            println!(
+                "{} {}: completed file {}/{} collect={:.1}s store={:.1}s",
+                adapter.provider(),
+                preview_path_label(source),
+                index + 1,
+                pending.len(),
+                collect_elapsed.as_secs_f64(),
+                store_elapsed.as_secs_f64(),
+            );
+        }
+    }
+    Ok(collected)
+}
+
+fn canonical_conversation_provider_filter(provider: Option<&str>) -> Result<Option<&'static str>> {
+    provider
+        .map(|provider| {
+            canonical_provider_name(provider).with_context(|| {
+                format!(
+                    "unknown provider {provider}; available providers: {}",
+                    default_adapters()
+                        .into_iter()
+                        .map(|adapter| adapter.provider())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+        })
+        .transpose()
+}
+
+fn print_archive_conversation(conversation: &ArchiveConversation) {
+    println!(
+        "{} ({})",
+        conversation
+            .title
+            .as_deref()
+            .unwrap_or("Untitled conversation"),
+        conversation.conversation_id
+    );
+    println!(
+        "provider={} items={} completeness={:?} missing={}",
+        conversation.provider,
+        conversation.items.len(),
+        conversation.completeness,
+        conversation.missing_content_count
+    );
+    for item in &conversation.items {
+        println!();
+        println!(
+            "[{}{}]{}",
+            item.role
+                .map(|role| format!("{role:?}").to_ascii_lowercase())
+                .unwrap_or_else(|| format!("{:?}", item.kind).to_ascii_lowercase()),
+            item.created_at
+                .map(|value| format!(" {}", value.to_rfc3339()))
+                .unwrap_or_default(),
+            item.tool_name
+                .as_deref()
+                .map(|name| format!(" {name}"))
+                .unwrap_or_default()
+        );
+        for part in &item.parts {
+            if let Some(text) = part.text.as_deref() {
+                println!("{text}");
+            } else if part.data_base64.is_some() {
+                println!(
+                    "[{} {} {} bytes sha256={}]",
+                    part.kind.as_str(),
+                    part.mime_type
+                        .as_deref()
+                        .unwrap_or("application/octet-stream"),
+                    part.original_bytes,
+                    part.content_hash
+                );
+            } else if let Some(uri) = part.external_uri.as_deref() {
+                println!("[missing {} artifact: {uri}]", part.kind.as_str());
+            }
+        }
+    }
+}
+
+fn print_archive_markdown(conversation: &ArchiveConversation) {
+    println!(
+        "# {}\n",
+        conversation
+            .title
+            .as_deref()
+            .unwrap_or("Untitled conversation")
+    );
+    println!("- Provider: `{}`", conversation.provider);
+    println!("- Conversation: `{}`", conversation.conversation_id);
+    println!("- Completeness: `{:?}`\n", conversation.completeness);
+    for item in &conversation.items {
+        let label = item
+            .role
+            .map(|role| format!("{role:?}"))
+            .unwrap_or_else(|| format!("{:?}", item.kind));
+        println!("## {label}\n");
+        for part in &item.parts {
+            if let Some(text) = part.text.as_deref() {
+                println!("{text}\n");
+            } else if let Some(data) = part.data_base64.as_deref() {
+                let mime = part
+                    .mime_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream");
+                if part.kind == ArchiveContentKind::Image {
+                    println!(
+                        "![{}](data:{};base64,{})\n",
+                        part.name.as_deref().unwrap_or("archived image"),
+                        mime,
+                        data
+                    );
+                } else {
+                    println!(
+                        "[Embedded {}: {} bytes, sha256 `{}`]\n",
+                        mime, part.original_bytes, part.content_hash
+                    );
+                }
+            } else if let Some(uri) = part.external_uri.as_deref() {
+                println!("[Unavailable external artifact]({uri})\n");
+            }
+        }
+    }
+}
+
+fn compact_archive_preview(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    compact.chars().take(max_chars).collect::<String>() + "..."
+}
+
 fn status(store: &Store) -> Result<()> {
     println!("stored all-time events: {}", store.event_count()?);
     println!("stored all-time tokens: {}", store.token_total()?);
     println!("stored usage summaries: {}", store.summary_count()?);
+    let archive = store.archive_stats()?;
+    println!("archived conversations: {}", archive.conversations);
+    println!("archived conversation items: {}", archive.items);
     Ok(())
 }
 
@@ -7217,28 +7675,64 @@ fn scan_sources_for_adapter(
     adapter: &dyn ProviderAdapter,
     configured_sources: &[SourceLocation],
 ) -> Vec<SourceLocation> {
+    let configured_sources = configured_sources
+        .iter()
+        .filter(|source| {
+            provider_matches(&source.provider, adapter.provider())
+                && source.source_kind == SourceKind::LocalAdapter
+        })
+        .cloned()
+        .map(|mut source| {
+            if source.path_label.is_none() {
+                source.path_label = path_label_from_hashless_source(&source);
+            }
+            source
+        })
+        .collect::<Vec<_>>();
     let mut sources = BTreeMap::new();
     for mut source in adapter.discover() {
         if source.path_label.is_none() {
             source.path_label = path_label_from_hashless_source(&source);
         }
-        sources.insert(source.source_id.0.clone(), source);
-    }
-    for mut source in configured_sources
-        .iter()
-        .filter(|source| {
-            source.enabled
-                && provider_matches(&source.provider, adapter.provider())
-                && source.source_kind == SourceKind::LocalAdapter
-        })
-        .cloned()
-    {
-        if source.path_label.is_none() {
-            source.path_label = path_label_from_hashless_source(&source);
+        if configured_sources
+            .iter()
+            .any(|configured| sources_refer_to_same_location(&source, configured))
+        {
+            continue;
         }
         sources.insert(source.source_id.0.clone(), source);
     }
-    dedupe_overlapping_sources(sources.into_values().collect())
+    for source in configured_sources
+        .into_iter()
+        .filter(|source| source.enabled)
+    {
+        sources.insert(source.source_id.0.clone(), source);
+    }
+    dedupe_overlapping_sources(
+        sources
+            .into_values()
+            .filter(|source| source.enabled)
+            .collect(),
+    )
+}
+
+fn sources_refer_to_same_location(left: &SourceLocation, right: &SourceLocation) -> bool {
+    if left.source_kind != right.source_kind || !provider_matches(&left.provider, &right.provider) {
+        return false;
+    }
+    if left.source_id == right.source_id
+        || left
+            .path_hash
+            .as_deref()
+            .zip(right.path_hash.as_deref())
+            .is_some_and(|(left, right)| left == right)
+    {
+        return true;
+    }
+    match (comparable_source_path(left), comparable_source_path(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn dedupe_overlapping_sources(sources: Vec<SourceLocation>) -> Vec<SourceLocation> {
@@ -7815,6 +8309,96 @@ mod tests {
         }
     }
 
+    struct InterruptingArchiveAdapter;
+
+    impl ProviderAdapter for InterruptingArchiveAdapter {
+        fn id(&self) -> &'static str {
+            "interrupting-archive-test"
+        }
+
+        fn version(&self) -> &'static str {
+            "0"
+        }
+
+        fn provider(&self) -> &'static str {
+            "archive_test"
+        }
+
+        fn discover(&self) -> Vec<SourceLocation> {
+            Vec::new()
+        }
+
+        fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+            Ok(Vec::new())
+        }
+
+        fn scan(
+            &self,
+            _source: &SourceLocation,
+            _options: &ScanOptions,
+        ) -> Result<statsai_adapters::AdapterScan> {
+            Ok(statsai_adapters::AdapterScan::default())
+        }
+
+        fn collect_archive(
+            &self,
+            _source: &SourceLocation,
+            selected_cache_keys: Option<&HashSet<String>>,
+        ) -> Result<statsai_adapters::ArchiveScan> {
+            let selected = selected_cache_keys
+                .and_then(|keys| keys.iter().next())
+                .context("selected archive cache key")?;
+            if selected == "second" {
+                bail!("synthetic archive interruption");
+            }
+            let mut scan = statsai_adapters::ArchiveScan::default();
+            scan.diagnostics.files_scanned = 1;
+            Ok(scan)
+        }
+    }
+
+    #[test]
+    fn archive_collection_commits_each_candidate_before_the_next() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "archive_test",
+            "interrupting-archive-test",
+            "0",
+            Path::new("/tmp/archive-test"),
+            LocationOrigin::Configured,
+        );
+        let candidates = [
+            ScanCandidateFile {
+                path: PathBuf::from("first"),
+                cache_key: "first".to_string(),
+                cache_signature: "signature-first".to_string(),
+                compatible_cache_signatures: Vec::new(),
+            },
+            ScanCandidateFile {
+                path: PathBuf::from("second"),
+                cache_key: "second".to_string(),
+                cache_signature: "signature-second".to_string(),
+                compatible_cache_signatures: Vec::new(),
+            },
+        ];
+        let entries = scan_file_state_entries(&candidates);
+
+        let result = collect_archive_source_entries(
+            &store,
+            &InterruptingArchiveAdapter,
+            &source,
+            &candidates,
+            &entries,
+            false,
+        );
+        assert!(result.is_err());
+
+        let pending = store
+            .pending_archive_import_entries(&source.source_id, &entries)
+            .expect("pending archive entries");
+        assert_eq!(pending, vec![entries[1].clone()]);
+    }
+
     #[test]
     fn provider_aliases_match_canonical_provider() {
         assert!(provider_matches("claude_code", "claude"));
@@ -7824,6 +8408,22 @@ mod tests {
             canonical_provider("claude").expect("provider"),
             "claude_code"
         );
+        assert_eq!(canonical_provider_name("claude-code"), Some("claude_code"));
+        assert_eq!(canonical_provider_name("grok"), Some("grok_build"));
+        assert_eq!(canonical_provider_name("open-code"), Some("opencode"));
+        assert_eq!(
+            canonical_conversation_provider_filter(Some("claude")).expect("archive provider"),
+            Some("claude_code")
+        );
+        assert_eq!(
+            canonical_conversation_provider_filter(Some("grok")).expect("archive provider"),
+            Some("grok_build")
+        );
+        assert_eq!(
+            canonical_conversation_provider_filter(Some("open-code")).expect("archive provider"),
+            Some("opencode")
+        );
+        assert!(canonical_conversation_provider_filter(Some("unknown")).is_err());
     }
 
     #[test]
@@ -8607,6 +9207,44 @@ mod tests {
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].location_origin, LocationOrigin::Configured);
+    }
+
+    #[test]
+    fn disabled_configured_source_suppresses_matching_discovered_source() {
+        let matching = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-disabled"),
+            LocationOrigin::Default,
+        );
+        let unrelated = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-enabled"),
+            LocationOrigin::Default,
+        );
+        let mut disabled = SourceLocation::local_adapter(
+            "claude",
+            "test",
+            "0",
+            Path::new("/tmp/claude-disabled"),
+            LocationOrigin::Configured,
+        );
+        disabled.enabled = false;
+        let adapter = TestAdapter {
+            provider: "claude_code",
+            discovered: vec![matching, unrelated.clone()],
+            candidates: Vec::new(),
+            scan_result: statsai_adapters::AdapterScan::default(),
+            probe_result: None,
+            scan_calls: None,
+        };
+
+        let sources = scan_sources_for_adapter(&adapter, &[disabled]);
+
+        assert_eq!(sources, vec![unrelated]);
     }
 
     #[test]

@@ -11,10 +11,12 @@ authors.workspace = true
 statsai-core.workspace = true
 statsai-pricing.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+url.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]

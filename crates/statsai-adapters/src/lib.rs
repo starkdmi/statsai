@@ -41,6 +41,7 @@ const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v14";
 const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v16";
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
 
+pub use archive::{ArchiveScan, ArchiveScanDiagnostics};
 pub use statsai_core::{VerifiedSourceState, VerifiedSubscriptionState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +106,9 @@ pub trait ProviderAdapter {
     fn provider(&self) -> &'static str;
     fn discover(&self) -> Vec<SourceLocation>;
     fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>>;
+    fn archive_scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+        self.scan_candidates(source)
+    }
     fn probe_verified_source_state(
         &self,
         _source: &SourceLocation,
@@ -112,6 +116,14 @@ pub trait ProviderAdapter {
         Ok(None)
     }
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan>;
+
+    fn collect_archive(
+        &self,
+        source: &SourceLocation,
+        selected_cache_keys: Option<&HashSet<String>>,
+    ) -> Result<ArchiveScan> {
+        archive::collect_provider_archive(self.provider(), source, selected_cache_keys)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -161,6 +173,16 @@ impl ProviderAdapter for ClaudeCodeAdapter {
 
     fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
         claude_scan_candidates(source, self.version())
+    }
+
+    fn archive_scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+        let mut candidates = claude_scan_candidates(source, self.version())?;
+        for candidate in &mut candidates {
+            candidate.cache_signature =
+                hash_text(&format!("claude-archive.v4:{}", candidate.cache_signature));
+            candidate.compatible_cache_signatures.clear();
+        }
+        Ok(candidates)
     }
 
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
@@ -287,6 +309,10 @@ impl ProviderAdapter for GrokBuildAdapter {
 
     fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
         grok_build_scan_candidates(source, self.version())
+    }
+
+    fn archive_scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+        grok_archive_scan_candidates(source, self.version())
     }
 
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
@@ -1693,6 +1719,38 @@ fn grok_build_scan_candidates(
     };
     let unified_log_index = parse_grok_unified_log(&root)?;
     grok_build_scan_candidates_with_unified_log(source, adapter_version, &unified_log_index)
+}
+
+fn grok_archive_scan_candidates(
+    source: &SourceLocation,
+    adapter_version: &str,
+) -> Result<Vec<ScanCandidateFile>> {
+    let Some(root) = source_root_path(source) else {
+        return Ok(Vec::new());
+    };
+    let sessions_root = grok_sessions_root(&root);
+    if !sessions_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let cache_namespaces = scan_cache_namespaces(source, adapter_version);
+    let mut candidates = Vec::new();
+    for entry in WalkDir::new(sessions_root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() || entry.file_name() != "chat_history.jsonl" {
+            continue;
+        }
+        let summary_signature = entry
+            .path()
+            .parent()
+            .map(|parent| file_metadata_signature(&parent.join("summary.json")));
+        candidates.push(scan_candidate(
+            entry.path().to_path_buf(),
+            summary_signature.as_deref(),
+            &cache_namespaces,
+        ));
+    }
+    candidates.sort_by_cached_key(|candidate| candidate.path.to_string_lossy().into_owned());
+    Ok(candidates)
 }
 
 fn grok_build_scan_candidates_with_unified_log(
@@ -7733,6 +7791,38 @@ mod tests {
     }
 
     #[test]
+    fn claude_archive_candidates_use_a_scoped_parser_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_store = dir.path().join("projects").join("example-workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        let session_path = project_store.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"sessionId\":\"session-1\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+        )
+        .expect("session");
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+        let adapter = ClaudeCodeAdapter;
+
+        let usage = adapter.scan_candidates(&source).expect("usage candidates");
+        let archive = adapter
+            .archive_scan_candidates(&source)
+            .expect("archive candidates");
+
+        assert_eq!(usage.len(), 1);
+        assert_eq!(archive.len(), 1);
+        assert_eq!(archive[0].cache_key, usage[0].cache_key);
+        assert_ne!(archive[0].cache_signature, usage[0].cache_signature);
+        assert!(archive[0].compatible_cache_signatures.is_empty());
+    }
+
+    #[test]
     fn codex_dedupes_copied_branch_history_and_keeps_branch_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
@@ -11275,3 +11365,4 @@ mod tests {
         assert_ne!(before_b.cache_signature, after_b.cache_signature);
     }
 }
+mod archive;
