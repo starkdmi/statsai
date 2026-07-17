@@ -1,0 +1,26 @@
+diff --git a/crates/kingfisher-scanner/src/scanner.rs b/crates/kingfisher-scanner/src/scanner.rs
+index 35e752f..78d2904 100644
+--- a/crates/kingfisher-scanner/src/scanner.rs
++++ b/crates/kingfisher-scanner/src/scanner.rs
+@@ -117,0 +118,8 @@ impl Scanner {
++        self.try_scan_bytes(bytes).unwrap_or_default()
++    }
++
++    /// Scans a byte slice for secrets and reports scanner engine failures.
++    ///
++    /// This is the fallible counterpart to [`Self::scan_bytes`] for callers
++    /// that must fail closed when Vectorscan cannot complete a scan.
++    pub fn try_scan_bytes(&self, bytes: &[u8]) -> Result<Vec<Finding>> {
+@@ -119 +127 @@ impl Scanner {
+-        self.scan_blob(&blob).unwrap_or_default()
++        self.scan_blob(&blob)
+@@ -154,2 +162,2 @@ impl Scanner {
+-        self.scanner_pool.with(|scanner| {
+-            let _ = scanner.scan(bytes, |rule_id, from, to, _flags| {
++        self.scanner_pool
++            .with(|scanner| scanner.scan(bytes, |rule_id, from, to, _flags| {
+@@ -158,2 +166,2 @@ impl Scanner {
+-            });
+-        });
++            }))
++            .map_err(|error| anyhow::anyhow!("Vectorscan scan failed: {error}"))?;

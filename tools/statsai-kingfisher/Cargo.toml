@@ -1,0 +1,11 @@
+[package]
+name = "statsai-kingfisher"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+kingfisher-rules = { path = "../kingfisher-rules" }
+kingfisher-scanner = { path = "../kingfisher-scanner", default-features = false }

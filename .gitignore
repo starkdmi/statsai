@@ -25,6 +25,7 @@ target
 temp/
 apps/
 ui/
+mlx_privacy_filter/
 functions/lib/
 functions/node_modules/
 functions/.runtimeconfig.json

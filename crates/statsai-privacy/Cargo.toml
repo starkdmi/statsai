@@ -1,0 +1,17 @@
+[package]
+name = "statsai-privacy"
+description = "Local privacy detector interfaces and sidecar clients for statsai."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nix.workspace = true
+opf-mlx.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
