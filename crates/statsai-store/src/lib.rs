@@ -2,6 +2,7 @@
 
 mod archive;
 mod migrations;
+mod privacy;
 mod tasks;
 
 use anyhow::{bail, Context, Result};
@@ -28,6 +29,10 @@ use std::path::Path;
 use std::time::Duration;
 
 pub use archive::{ArchiveConversationSummary, ArchiveSearchHit, ArchiveStats, ArchiveWriteResult};
+pub use privacy::{
+    FilteredConversationMetadata, FilteredConversationRecord, PrivacyDatasetStatus,
+    PrivacyFailureRecord, PrivacyFindingRecord,
+};
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
@@ -482,6 +487,31 @@ impl Store {
                 self.conn.execute_batch("COMMIT")?;
                 Ok(value)
             }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads a coherent point-in-time view across multiple store operations.
+    ///
+    /// Nested calls join the caller's existing transaction. The callback must
+    /// not perform writes when it is used as a read snapshot.
+    pub fn with_read_snapshot<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return operation(self);
+        }
+        self.conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+        let result = operation(self);
+        match result {
+            Ok(value) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    rollback(&self.conn);
+                    Err(error.into())
+                }
+            },
             Err(error) => {
                 rollback(&self.conn);
                 Err(error)

@@ -98,6 +98,8 @@ enum Command {
     Task(TaskCommand),
     #[command(about = "Collect and explore durable local conversation archives")]
     Conversation(ConversationCommand),
+    #[command(about = "Build and inspect the local privacy-filtered dataset")]
+    Privacy(statsai::privacy_cli::PrivacyCommand),
     #[command(about = "Export a sync batch to a sink")]
     Sync(SyncCommand),
     #[command(about = "Print JSON schemas for backend-facing contracts")]
@@ -851,6 +853,9 @@ fn main() -> Result<()> {
                 Command::Export(command) => export(command, &store),
                 Command::Task(command) => task(command, &store),
                 Command::Conversation(command) => conversation(command, &store),
+                Command::Privacy(command) => {
+                    statsai::privacy_cli::run(command, &store, &store_path)
+                }
                 Command::Sync(command) => sync(command, &store, &device_id),
                 Command::Daemon(command) => daemon(command, store, &device_id),
                 Command::Status => status(&store),
@@ -8254,6 +8259,13 @@ mod tests {
         USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
     };
     use std::path::Path;
+
+    #[test]
+    fn privacy_filter_preview_is_exposed_by_the_cli() {
+        let cli = Cli::try_parse_from(["statsai", "privacy", "filter", "--preview"])
+            .expect("parse privacy preview");
+        assert!(matches!(cli.command, Command::Privacy(_)));
+    }
 
     #[derive(Clone)]
     struct TestAdapter {

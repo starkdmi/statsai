@@ -88,3 +88,43 @@ Use `statsai conversation stats` to inspect archived text and binary sizes and
 the number of missing content parts. Use `statsai conversation show <id> --json`
 or `conversation export <id> --format json` when exact artifact payloads are
 required.
+
+## Privacy-Filtered Dataset
+
+The exact archive remains canonical and unchanged. `statsai privacy filter`
+creates a separate, versioned local dataset containing pseudonymized text and
+selected conversation metadata. It is derived data that can be rebuilt after a
+policy or archive change.
+
+The filter runs OpenAI Privacy Filter and Kingfisher locally, then applies
+structural rules for paths, credential-bearing URLs, hosts, IP addresses, and
+known project labels. Non-secret entities receive stable installation-local
+pseudonyms; every secret becomes `[SECRET]`. Completed output is scanned again
+before it can be stored. A partial archive, detector failure, residual finding,
+stale input, or missing pseudonym key makes the conversation non-exportable.
+
+Filtered payloads retain provider, model, role, item kind, usage, ordering,
+UTC day-level dates, attachment names and external URIs, and filtered text.
+They omit binary bytes, binary hashes, source/native IDs, raw archive IDs, and
+exact timestamps. The result is pseudonymized, not anonymous: conversational
+content can still identify a person or project through context.
+
+Filtering is explicit and never runs during collection or in the daemon:
+
+```text
+statsai privacy setup --mlx-server <path> --mlx-model <path> --kingfisher-helper <path>
+statsai privacy status [--json]
+statsai privacy filter [--provider <provider>] [--conversation <id>] [--preview]
+statsai privacy show <conversation-id> [--json]
+statsai privacy export --format jsonl --output <path> [--provider <provider>]
+```
+
+StatsAI runs MLX through one exported `4 x 1024` fixed trace and splits long
+fields into overlapping 1024-token chunks. This prevents a persistent helper
+from accumulating active graphs for several trace shapes. Setup defaults to a
+4096 padded-token budget, a 4 GiB MLX allocator limit, and a 256 MiB allocator
+cache limit; allocator limits are not hard process-memory caps.
+
+`--preview` writes no key, pseudonym mapping, finding, or filtered payload.
+JSONL export writes a manifest followed by conversations ordered by UTC day and
+pseudonymous dataset key. This feature performs no backup, sync, or upload.

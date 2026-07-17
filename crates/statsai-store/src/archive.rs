@@ -565,7 +565,8 @@ impl Store {
             LIMIT ?2
             "#,
         )?;
-        let rows = statement.query_map(params![provider, limit as u64], |row| {
+        let sqlite_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![provider, sqlite_limit], |row| {
             Ok(ArchiveConversationSummary {
                 conversation_id: row.get(0)?,
                 provider: row.get(1)?,
@@ -587,6 +588,21 @@ impl Store {
     pub fn archive_conversation(
         &self,
         conversation_id: &str,
+    ) -> Result<Option<ArchiveConversation>> {
+        self.archive_conversation_with_binary(conversation_id, true)
+    }
+
+    pub fn archive_conversation_for_privacy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ArchiveConversation>> {
+        self.archive_conversation_with_binary(conversation_id, false)
+    }
+
+    fn archive_conversation_with_binary(
+        &self,
+        conversation_id: &str,
+        include_binary: bool,
     ) -> Result<Option<ArchiveConversation>> {
         let conversation = self
             .conn
@@ -632,7 +648,7 @@ impl Store {
             .transpose()?;
         let mut items = self.archive_items(conversation_id)?;
         for item in &mut items {
-            item.parts = self.archive_content_parts(&item.item_id)?;
+            item.parts = self.archive_content_parts(&item.item_id, include_binary)?;
         }
         Ok(Some(ArchiveConversation {
             schema_version: ARCHIVE_CONVERSATION_SCHEMA_VERSION.to_string(),
@@ -846,17 +862,22 @@ impl Store {
         Ok(items)
     }
 
-    fn archive_content_parts(&self, item_id: &str) -> Result<Vec<ArchiveContentPart>> {
+    fn archive_content_parts(
+        &self,
+        item_id: &str,
+        include_binary: bool,
+    ) -> Result<Vec<ArchiveContentPart>> {
         let mut statement = self.conn.prepare(
             r#"
             SELECT content_id, ordinal, kind, mime_type, name, text_content,
-                   binary_content, external_uri, content_hash, original_bytes, truncated
+                   CASE WHEN ?2 THEN binary_content ELSE NULL END,
+                   external_uri, content_hash, original_bytes, truncated
             FROM archive_content_parts
             WHERE item_id = ?1
             ORDER BY ordinal, content_id
             "#,
         )?;
-        let rows = statement.query_map(params![item_id], |row| {
+        let rows = statement.query_map(params![item_id, include_binary], |row| {
             let binary: Option<Vec<u8>> = row.get(6)?;
             Ok(ArchiveContentPart {
                 content_id: row.get(0)?,
@@ -1049,6 +1070,15 @@ mod tests {
             .expect("read")
             .expect("conversation");
         assert_eq!(restored, conversation);
+        let privacy_view = store
+            .archive_conversation_for_privacy(&conversation.conversation_id)
+            .expect("read privacy view")
+            .expect("privacy conversation");
+        assert_eq!(
+            privacy_view.items[0].parts[0].text.as_deref(),
+            Some("hello searchable archive")
+        );
+        assert!(privacy_view.items[0].parts[1].data_base64.is_none());
         let hits = store.search_archive("searchable", 10).expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].conversation_id, conversation.conversation_id);
@@ -1200,6 +1230,22 @@ mod tests {
         assert_eq!(stats.text_bytes, text.len() as u64);
         assert_eq!(stats.binary_bytes, 4);
         assert_eq!(summary.content_bytes, text.len() as u64 + 4);
+    }
+
+    #[test]
+    fn archive_list_accepts_an_unbounded_host_limit() {
+        let store = Store::in_memory().expect("store");
+        let conversation = sample_conversation();
+        store
+            .upsert_archive_conversations(std::slice::from_ref(&conversation))
+            .expect("upsert");
+
+        let summaries = store
+            .list_archive_conversations(None, usize::MAX)
+            .expect("list without a practical limit");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].conversation_id, conversation.conversation_id);
     }
 
     #[test]

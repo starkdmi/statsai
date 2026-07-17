@@ -8,10 +8,19 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+chrono.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+statsai-core.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
 nix.workspace = true
 opf-mlx.workspace = true
-serde.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

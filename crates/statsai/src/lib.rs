@@ -1,4 +1,6 @@
 pub mod auth;
+pub mod privacy;
+pub mod privacy_cli;
 pub mod service;
 pub mod snapshot;
 

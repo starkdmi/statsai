@@ -21,6 +21,7 @@ const OP_PING: u8 = 2;
 const OP_SHUTDOWN: u8 = 3;
 const MAX_SEQUENCES: usize = 128;
 const MAX_SEQUENCE_BYTES: usize = 4 * 1024 * 1024;
+const SEQUENCE_OVERLAP_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESPONSE_SPANS: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -55,6 +56,16 @@ pub struct KingfisherDetector {
 }
 
 impl KingfisherDetector {
+    #[must_use]
+    pub fn qualified_metadata() -> DetectorMetadata {
+        DetectorMetadata {
+            kind: DetectorKind::Kingfisher,
+            implementation_version: kingfisher_implementation_version(),
+            model_revision: Some(KINGFISHER_REVISION.to_string()),
+            offline: true,
+        }
+    }
+
     pub fn spawn(
         helper_executable: impl AsRef<Path>,
         options: KingfisherOptions,
@@ -210,31 +221,42 @@ impl KingfisherDetector {
 
 impl PrivacyDetector for KingfisherDetector {
     fn metadata(&self) -> DetectorMetadata {
-        DetectorMetadata {
-            kind: DetectorKind::Kingfisher,
-            implementation_version: kingfisher_implementation_version(),
-            model_revision: Some(KINGFISHER_REVISION.to_string()),
-            offline: true,
-        }
+        Self::qualified_metadata()
     }
 
     fn detect_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<DetectedSpan>>, PrivacyError> {
         if !self.available {
             return Err(PrivacyError::Unavailable);
         }
-        let mut results = Vec::with_capacity(texts.len());
-        let lengths = texts.iter().map(|text| text.len()).collect::<Vec<_>>();
+        let chunks = sequence_chunks(texts)?;
+        let lengths = chunks
+            .iter()
+            .map(|chunk| chunk.range.len())
+            .collect::<Vec<_>>();
+        let mut results = vec![Vec::new(); texts.len()];
         for range in request_ranges(&lengths)? {
-            let chunk = &texts[range];
-            let request = prepare_request(chunk)?;
-            match self.exchange_request(chunk, &request) {
-                Ok(chunk_results) => results.extend(chunk_results),
+            let request_chunks = &chunks[range];
+            let request_texts = request_chunks
+                .iter()
+                .map(|chunk| &texts[chunk.text_index][chunk.range.clone()])
+                .collect::<Vec<_>>();
+            let request = prepare_request(&request_texts)?;
+            match self.exchange_request(&request_texts, &request) {
+                Ok(chunk_results) => {
+                    if let Err(error) =
+                        append_chunk_results(texts, request_chunks, chunk_results, &mut results)
+                    {
+                        self.terminate();
+                        return Err(error);
+                    }
+                }
                 Err(error) => {
                     self.terminate();
                     return Err(error);
                 }
             }
         }
+        normalize_chunk_results(&mut results);
         Ok(results)
     }
 }
@@ -308,6 +330,117 @@ fn deadline_after(timeout: Duration) -> Instant {
 
 struct PreparedRequest {
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SequenceChunk {
+    text_index: usize,
+    range: Range<usize>,
+}
+
+fn sequence_chunks(texts: &[&str]) -> Result<Vec<SequenceChunk>, PrivacyError> {
+    let mut chunks = Vec::new();
+    for (text_index, text) in texts.iter().enumerate() {
+        chunks.extend(
+            chunk_ranges(text, MAX_SEQUENCE_BYTES, SEQUENCE_OVERLAP_BYTES)?
+                .into_iter()
+                .map(|range| SequenceChunk { text_index, range }),
+        );
+    }
+    Ok(chunks)
+}
+
+fn chunk_ranges(
+    text: &str,
+    max_bytes: usize,
+    overlap_bytes: usize,
+) -> Result<Vec<Range<usize>>, PrivacyError> {
+    if max_bytes == 0 || overlap_bytes >= max_bytes {
+        return Err(PrivacyError::Protocol(
+            "invalid Kingfisher chunk configuration",
+        ));
+    }
+    if text.len() <= max_bytes {
+        return Ok(std::iter::once(0..text.len()).collect());
+    }
+
+    let mut ranges = Vec::with_capacity(text.len().div_ceil(max_bytes - overlap_bytes));
+    let mut start = 0usize;
+    loop {
+        let mut end = start.saturating_add(max_bytes).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            return Err(PrivacyError::Protocol(
+                "Kingfisher chunk has no UTF-8 boundary",
+            ));
+        }
+        ranges.push(start..end);
+        if end == text.len() {
+            break;
+        }
+        let mut next = end.saturating_sub(overlap_bytes);
+        while next > start && !text.is_char_boundary(next) {
+            next -= 1;
+        }
+        if next <= start {
+            return Err(PrivacyError::Protocol("Kingfisher chunk does not advance"));
+        }
+        start = next;
+    }
+    Ok(ranges)
+}
+
+fn append_chunk_results(
+    texts: &[&str],
+    chunks: &[SequenceChunk],
+    chunk_results: Vec<Vec<DetectedSpan>>,
+    combined: &mut [Vec<DetectedSpan>],
+) -> Result<(), PrivacyError> {
+    if chunks.len() != chunk_results.len() || combined.len() != texts.len() {
+        return Err(PrivacyError::Protocol(
+            "Kingfisher chunk result count differs from input",
+        ));
+    }
+    for (chunk, spans) in chunks.iter().zip(chunk_results) {
+        let text = texts
+            .get(chunk.text_index)
+            .ok_or(PrivacyError::Protocol("invalid Kingfisher chunk source"))?;
+        let output = combined
+            .get_mut(chunk.text_index)
+            .ok_or(PrivacyError::Protocol("invalid Kingfisher output source"))?;
+        for mut span in spans {
+            span.start = chunk
+                .range
+                .start
+                .checked_add(span.start)
+                .ok_or(PrivacyError::Protocol("Kingfisher span offset overflow"))?;
+            span.end = chunk
+                .range
+                .start
+                .checked_add(span.end)
+                .ok_or(PrivacyError::Protocol("Kingfisher span offset overflow"))?;
+            span.validate_for(text)?;
+            output.push(span);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_chunk_results(results: &mut [Vec<DetectedSpan>]) {
+    for spans in results {
+        spans.sort_by_key(|span| {
+            (
+                span.start,
+                span.end,
+                span.category,
+                span.detector,
+                span.confidence,
+            )
+        });
+        spans.dedup();
+    }
 }
 
 fn request_ranges(lengths: &[usize]) -> Result<Vec<Range<usize>>, PrivacyError> {
@@ -527,6 +660,72 @@ mod tests {
     }
 
     #[test]
+    fn oversized_utf8_fields_are_split_with_bounded_overlap() {
+        let text = "é".repeat(MAX_SEQUENCE_BYTES / 2 + 8);
+        let chunks = sequence_chunks(&[&text]).expect("chunk oversized UTF-8 field");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].range.start, 0);
+        assert_eq!(chunks.last().map(|chunk| chunk.range.end), Some(text.len()));
+        for chunk in &chunks {
+            assert!(chunk.range.len() <= MAX_SEQUENCE_BYTES);
+            assert!(text.is_char_boundary(chunk.range.start));
+            assert!(text.is_char_boundary(chunk.range.end));
+        }
+        assert!(chunks[1].range.start < chunks[0].range.end);
+        assert!(chunks[0].range.end - chunks[1].range.start >= SEQUENCE_OVERLAP_BYTES);
+    }
+
+    #[test]
+    fn chunk_findings_map_to_global_offsets_and_deduplicate_exact_overlap() {
+        let text = "0123456789abcdefghij";
+        let chunks = vec![
+            SequenceChunk {
+                text_index: 0,
+                range: 0..14,
+            },
+            SequenceChunk {
+                text_index: 0,
+                range: 6..text.len(),
+            },
+        ];
+        let finding = |start, end, confidence| DetectedSpan {
+            start,
+            end,
+            category: PrivacyCategory::Secret,
+            detector: DetectorKind::Kingfisher,
+            confidence: Some(confidence),
+        };
+        let mut combined = vec![Vec::new()];
+
+        append_chunk_results(
+            &[text],
+            &chunks,
+            vec![
+                vec![finding(8, 12, DetectionConfidence::High)],
+                vec![
+                    finding(2, 6, DetectionConfidence::High),
+                    finding(2, 6, DetectionConfidence::Medium),
+                ],
+            ],
+            &mut combined,
+        )
+        .expect("map chunk findings");
+        normalize_chunk_results(&mut combined);
+
+        assert_eq!(combined[0].len(), 2);
+        assert!(combined[0]
+            .iter()
+            .all(|span| (span.start, span.end) == (8, 12)));
+        assert!(combined[0]
+            .iter()
+            .any(|span| span.confidence == Some(DetectionConfidence::High)));
+        assert!(combined[0]
+            .iter()
+            .any(|span| span.confidence == Some(DetectionConfidence::Medium)));
+    }
+
+    #[test]
     fn response_span_limit_is_independent_of_request_bytes() {
         assert!(validate_response_dimensions(1, 1, 2).is_ok());
         assert!(validate_response_dimensions(1, 1, MAX_RESPONSE_SPANS).is_ok());
@@ -609,17 +808,12 @@ mod tests {
             );
         }
 
-        let oversized = "x".repeat(MAX_SEQUENCE_BYTES + 1);
-        assert!(matches!(
-            detector.detect(&oversized),
-            Err(PrivacyError::Protocol(_))
-        ));
-        assert_eq!(detector.detect("ordinary text").unwrap(), Vec::new());
-
-        let large = "x".repeat(MAX_SEQUENCE_BYTES);
-        let large_batch = [large.as_str(); 5];
-        let detections = detector.detect_batch(&large_batch).unwrap();
-        assert_eq!(detections.len(), large_batch.len());
-        assert!(detections.iter().all(Vec::is_empty));
+        let secret = "EZopZDMWeildfoFzyH0KnWyQ5Yy3vy";
+        let full_token = format!("{secret}0Y2SU6");
+        let prefix = "x".repeat(MAX_SEQUENCE_BYTES - 20);
+        let oversized = format!("{prefix}\ntoken = ghp_{full_token}");
+        let detections = detector.detect(&oversized).unwrap();
+        assert_eq!(detections.len(), 1);
+        assert_eq!(&oversized[detections[0].start..detections[0].end], secret);
     }
 }

@@ -4,14 +4,33 @@
 //! conversation archive remains unchanged; merging, pseudonymization, and
 //! filtered-dataset storage are separate layers.
 
+mod dataset;
+#[cfg(unix)]
 mod kingfisher;
+#[cfg(not(unix))]
+#[path = "kingfisher_unsupported.rs"]
+mod kingfisher;
+#[cfg(unix)]
 mod mlx;
+#[cfg(not(unix))]
+#[path = "mlx_unsupported.rs"]
+mod mlx;
+mod policy;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use dataset::{
+    archive_privacy_input_fingerprint, filter_archive_conversation, privacy_policy_fingerprint,
+    FilteredConversation, FilteredDatasetManifest, FilteredFieldFinding,
+    FILTERED_CONVERSATION_SCHEMA_VERSION, FILTERED_DATASET_SCHEMA_VERSION,
+};
 pub use kingfisher::{KingfisherDetector, KingfisherOptions};
-pub use mlx::MlxDetector;
+pub use mlx::{MlxDetector, MlxServerOptions, MLX_FIXED_TRACE_PADDED_TOKENS};
+pub use policy::{
+    filter_text, normalize_private_value, DeterministicDetector, FilteredText, KnownPrivateValue,
+    PrivacyReplacement,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +51,28 @@ pub enum PrivacyCategory {
     Branch,
 }
 
+impl PrivacyCategory {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AccountNumber => "account_number",
+            Self::Address => "address",
+            Self::Date => "date",
+            Self::Email => "email",
+            Self::Person => "person",
+            Self::Phone => "phone",
+            Self::Url => "url",
+            Self::Secret => "secret",
+            Self::Path => "path",
+            Self::Host => "host",
+            Self::IpAddress => "ip_address",
+            Self::Project => "project",
+            Self::Repository => "repository",
+            Self::Branch => "branch",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectorKind {
@@ -40,12 +81,34 @@ pub enum DetectorKind {
     Deterministic,
 }
 
+impl DetectorKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiPrivacyFilter => "openai_privacy_filter",
+            Self::Kingfisher => "kingfisher",
+            Self::Deterministic => "deterministic",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectionConfidence {
     Low,
     Medium,
     High,
+}
+
+impl DetectionConfidence {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -173,8 +236,15 @@ pub enum PrivacyError {
     Timeout,
     #[error("privacy detector process is unavailable")]
     Unavailable,
+    #[error("privacy detector is unsupported on this platform")]
+    UnsupportedPlatform,
     #[error("privacy detector returned an invalid UTF-8 span")]
     InvalidSpan,
+    #[error("privacy pseudonym storage failed")]
+    PseudonymStore,
+    #[error("filtered output still contains a privacy finding")]
+    ResidualFinding,
+    #[cfg(unix)]
     #[error("OpenAI Privacy Filter failed")]
     OpenAiPrivacyFilter(#[source] opf_mlx::Error),
 }
@@ -186,7 +256,11 @@ impl PrivacyError {
             Self::Protocol(_) => "detector_protocol",
             Self::Timeout => "detector_timeout",
             Self::Unavailable => "detector_unavailable",
+            Self::UnsupportedPlatform => "unsupported_platform",
             Self::InvalidSpan => "invalid_span",
+            Self::PseudonymStore => "pseudonym_store",
+            Self::ResidualFinding => "residual_finding",
+            #[cfg(unix)]
             Self::OpenAiPrivacyFilter(_) => "openai_privacy_filter",
         }
     }

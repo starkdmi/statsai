@@ -37,6 +37,7 @@ statsai-daemon = { workspace = true, features = ["watch"] }
 statsai-sdk.workspace = true
 statsai-store.workspace = true
 statsai-sync.workspace = true
+statsai-privacy.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -50,6 +51,7 @@ tiny_http.workspace = true
 percent-encoding.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+hmac.workspace = true
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service"] }
 tempfile.workspace = true
 

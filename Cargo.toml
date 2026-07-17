@@ -53,11 +53,14 @@ tiny_http = "0.12"
 walkdir = "2"
 notify = "7"
 nix = { version = "0.30", features = ["fs", "poll"] }
-opf-mlx = "0.1.1"
+opf-mlx = "0.1.2"
 ureq = { version = "2.9", features = ["json"] }
 url = "2"
 percent-encoding = "2.3"
 getrandom = { version = "0.2", features = ["std"] }
+hmac = "0.12"
+regex = "1"
+unicode-normalization = "0.1"
 
 
 [profile.release]

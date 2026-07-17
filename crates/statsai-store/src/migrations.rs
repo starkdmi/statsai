@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_migrations_table(conn)?;
@@ -105,6 +105,8 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         10 => apply_migration_010(conn),
         11 => apply_migration_011(conn),
         12 => apply_migration_012(conn),
+        13 => apply_migration_013(conn),
+        14 => apply_migration_014(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -446,6 +448,85 @@ fn apply_migration_012(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn apply_migration_013(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS filtered_conversations (
+          conversation_id TEXT PRIMARY KEY,
+          dataset_key TEXT NOT NULL UNIQUE,
+          input_fingerprint TEXT NOT NULL,
+          policy_fingerprint TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          finding_count INTEGER NOT NULL,
+          succeeded_at TEXT NOT NULL,
+          FOREIGN KEY (conversation_id) REFERENCES archive_conversations(conversation_id)
+            ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS filtered_conversations_policy_idx
+          ON filtered_conversations (policy_fingerprint, succeeded_at, dataset_key);
+
+        CREATE TABLE IF NOT EXISTS privacy_findings (
+          conversation_id TEXT NOT NULL,
+          field_path TEXT NOT NULL,
+          start_offset INTEGER NOT NULL,
+          end_offset INTEGER NOT NULL,
+          category TEXT NOT NULL,
+          detector TEXT NOT NULL,
+          confidence TEXT,
+          replacement TEXT NOT NULL,
+          PRIMARY KEY (conversation_id, field_path, start_offset, end_offset, category, detector),
+          FOREIGN KEY (conversation_id) REFERENCES filtered_conversations(conversation_id)
+            ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS privacy_pseudonyms (
+          category TEXT NOT NULL,
+          value_hmac TEXT NOT NULL,
+          alias INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (category, value_hmac),
+          UNIQUE (category, alias)
+        );
+
+        CREATE TABLE IF NOT EXISTS privacy_filter_failures (
+          failure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          conversation_id TEXT NOT NULL,
+          input_fingerprint TEXT NOT NULL,
+          policy_fingerprint TEXT NOT NULL,
+          failed_stage TEXT NOT NULL,
+          error_code TEXT NOT NULL,
+          attempted_at TEXT NOT NULL,
+          FOREIGN KEY (conversation_id) REFERENCES archive_conversations(conversation_id)
+            ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS privacy_filter_failures_conversation_idx
+          ON privacy_filter_failures (conversation_id, attempted_at DESC);
+
+        CREATE TRIGGER IF NOT EXISTS archive_conversations_privacy_delete
+        AFTER DELETE ON archive_conversations
+        BEGIN
+          DELETE FROM privacy_filter_failures WHERE conversation_id = OLD.conversation_id;
+          DELETE FROM privacy_findings WHERE conversation_id = OLD.conversation_id;
+          DELETE FROM filtered_conversations WHERE conversation_id = OLD.conversation_id;
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn apply_migration_014(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS privacy_dataset_identity (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          key_verifier TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -595,6 +676,11 @@ mod tests {
         assert!(table_exists(&conn, "archive_missing_content_state"));
         assert!(table_exists(&conn, "archive_artifact_dependencies"));
         assert!(index_exists(&conn, "archive_items_source_record_idx"));
+        assert!(table_exists(&conn, "filtered_conversations"));
+        assert!(table_exists(&conn, "privacy_findings"));
+        assert!(table_exists(&conn, "privacy_pseudonyms"));
+        assert!(table_exists(&conn, "privacy_filter_failures"));
+        assert!(table_exists(&conn, "privacy_dataset_identity"));
     }
 
     #[test]
@@ -629,6 +715,48 @@ mod tests {
             CURRENT_SCHEMA_VERSION
         );
         assert!(index_exists(&conn, "archive_items_source_record_idx"));
+    }
+
+    #[test]
+    fn version_twelve_archive_receives_privacy_dataset_tables() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        ensure_migrations_table(&conn).expect("ensure migrations table");
+        for version in 1..=12 {
+            apply_migration(&conn, version).expect("apply pre-privacy migration");
+            record_migration(&conn, version).expect("record pre-privacy migration");
+        }
+        assert!(!table_exists(&conn, "filtered_conversations"));
+
+        migrate(&conn).expect("migrate version twelve database");
+
+        assert_eq!(
+            schema_version(&conn).expect("read version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert!(table_exists(&conn, "filtered_conversations"));
+        assert!(table_exists(&conn, "privacy_findings"));
+        assert!(table_exists(&conn, "privacy_pseudonyms"));
+        assert!(table_exists(&conn, "privacy_filter_failures"));
+        assert!(table_exists(&conn, "privacy_dataset_identity"));
+    }
+
+    #[test]
+    fn version_thirteen_privacy_schema_receives_dataset_identity() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        ensure_migrations_table(&conn).expect("ensure migrations table");
+        for version in 1..=13 {
+            apply_migration(&conn, version).expect("apply pre-identity migration");
+            record_migration(&conn, version).expect("record pre-identity migration");
+        }
+        assert!(!table_exists(&conn, "privacy_dataset_identity"));
+
+        migrate(&conn).expect("migrate version thirteen database");
+
+        assert_eq!(
+            schema_version(&conn).expect("read version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert!(table_exists(&conn, "privacy_dataset_identity"));
     }
 
     #[test]
