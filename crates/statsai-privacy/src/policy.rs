@@ -11,7 +11,7 @@ use crate::{
     PrivacyDetector, PrivacyError,
 };
 
-const DETERMINISTIC_VERSION: &str = "structural-v4";
+const DETERMINISTIC_VERSION: &str = "structural-v5";
 
 static WINDOWS_HOME_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b[A-Z]:\\Users\\[^\s\\,;]+(?:\\[^\s\]\[(){}<>"',;]+)*"#)
@@ -28,6 +28,12 @@ static IP_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
 static PRIVATE_HOST: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b[a-z0-9][a-z0-9.-]*\.(?:local|internal|lan)\b")
         .expect("valid private host regex")
+});
+static PROVIDER_CALL_ID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:call-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?:-[0-9]+)?|call_[a-z0-9]{8,}|toolu_[a-z0-9]{8,})\b",
+    )
+    .expect("valid provider call ID regex")
 });
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,7 +75,22 @@ impl DeterministicDetector {
     }
 
     #[must_use]
-    pub fn new(known_values: Vec<KnownPrivateValue>) -> Self {
+    pub fn new(mut known_values: Vec<KnownPrivateValue>) -> Self {
+        let repository_owners = known_values
+            .iter()
+            .filter(|known| known.category == PrivacyCategory::Repository)
+            .filter_map(|known| repository_owner(&known.value))
+            .filter(|owner| {
+                !known_values.iter().any(|known| {
+                    known.category == PrivacyCategory::Repository && known.value == *owner
+                })
+            })
+            .map(|owner| KnownPrivateValue {
+                category: PrivacyCategory::Repository,
+                value: owner.to_string(),
+            })
+            .collect::<Vec<_>>();
+        known_values.extend(repository_owners);
         Self { known_values }
     }
 }
@@ -140,10 +161,32 @@ impl DeterministicDetector {
                 PrivacyCategory::Host,
             ));
         }
+        for found in PROVIDER_CALL_ID.find_iter(text) {
+            spans.push(deterministic_span(
+                found.start(),
+                found.end(),
+                PrivacyCategory::Secret,
+            ));
+        }
         spans.sort_by_key(|span| (span.start, span.end, span.category));
         spans.dedup_by_key(|span| (span.start, span.end, span.category));
         spans
     }
+}
+
+fn repository_owner(value: &str) -> Option<&str> {
+    let mut segments = value.trim().trim_matches('/').split('/');
+    let owner = segments.next()?;
+    let repository = segments.next()?;
+    if owner.is_empty()
+        || repository.is_empty()
+        || segments.next().is_some()
+        || owner.contains(':')
+        || owner.contains('@')
+    {
+        return None;
+    }
+    Some(owner)
 }
 
 fn uri_contains_credentials(value: &str) -> bool {
@@ -486,6 +529,41 @@ mod tests {
         assert!(findings.iter().all(|finding| {
             &text[finding.start..finding.end] != "123e4567-e89b-12d3-a456-426614174000"
         }));
+    }
+
+    #[test]
+    fn deterministic_detection_derives_repository_owner_aliases() {
+        let text = "related starkdmi/statsai repository, not starkdmitest/example";
+        let mut detector = DeterministicDetector::new(vec![KnownPrivateValue {
+            category: PrivacyCategory::Repository,
+            value: "starkdmi/statsai-api".to_string(),
+        }]);
+
+        let findings = detector.detect(text).expect("detect repository owner");
+        let values = findings
+            .iter()
+            .map(|finding| &text[finding.start..finding.end])
+            .collect::<Vec<_>>();
+
+        assert!(values.contains(&"starkdmi"));
+        assert!(!values.contains(&"starkdmitest"));
+    }
+
+    #[test]
+    fn deterministic_detection_removes_provider_call_ids_but_keeps_bare_uuids() {
+        let call_id = "call-47adef28-2702-46fa-bb37-e71d87169a58-2";
+        let bare_uuid = "123e4567-e89b-12d3-a456-426614174000";
+        let text = format!("tool_call_id={call_id} correlation={bare_uuid}");
+        let mut detector = DeterministicDetector::default();
+
+        let findings = detector.detect(&text).expect("detect provider call ID");
+        let values = findings
+            .iter()
+            .map(|finding| &text[finding.start..finding.end])
+            .collect::<Vec<_>>();
+
+        assert!(values.contains(&call_id));
+        assert!(!values.contains(&bare_uuid));
     }
 
     #[test]
