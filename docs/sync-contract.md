@@ -196,6 +196,103 @@ stable IDs.
 The dashboard reads compact API responses backed by D1 rollups instead of
 scanning all synced records in the browser.
 
+### Canonical identity and chunk invariants
+
+HTTP chunking is a transport concern and must not change canonical hosted
+state. Account aliases are persisted per user and device in
+`sync_entity_owners`. Every later assignment, subscription, and summary chunk
+resolves its device-local account ID through that mapping, even when the chunk
+contains no account records. When a newly observed alias matches historical
+rows from that device, the backend repairs their indexed account ID and JSON
+payload in the same D1 transaction. The repair first discovers affected daily
+months and period rows, then rebuilds their monthly rollups and the all-time
+dashboard snapshot in that transaction. Targeted month rebuilds switch to one
+bulk rebuild for wide histories, and all lookup/materialization statements are
+included in the sync D1 query budget. The preliminary budget check includes
+only work known before reconciliation; actual alias-repair and impact-analysis
+queries are added to the exact estimate after aliases have been resolved.
+
+Provider user IDs are stronger identity evidence than email addresses. Email
+may connect records only when it does not bridge two different non-empty
+provider user IDs. Ambiguous email-only identities remain separate.
+
+Each accepted batch stores a SHA-256 digest of its normalized payload. Retrying
+the same batch ID and payload returns the duplicate acknowledgement; reusing
+the ID with different content returns `batch_id_payload_conflict`. The receipt
+insert is the first statement in the same atomic D1 batch as all mutations, so
+a competing request cannot change mirrored rows before losing the receipt
+claim. Historical receipts created before digest support retain their previous
+retry behavior.
+
+`GET /api/sync/status` returns mirror counts for the authenticated device,
+computed from active ownership records. User-wide canonical counts remain in
+the consistency diagnostics and are not compared with a single device's local
+store.
+
+Subscription rows are retained as evidence. Subscription API and dashboard
+context reads project that evidence into entitlements: verified provider or
+local-auth evidence wins over manual evidence for each canonical account's
+connected billing-window cluster, while disconnected periods remain distinct.
+Different provider subscription IDs are never merged. Interval observations
+are parsed once and clustered with sorted sweeps, keeping projection work
+O(n log n) even when stored evidence spans many sync batches.
+
+### Referential-integrity rollout
+
+`SYNC_REQUIRE_CANONICAL_ACCOUNTS=1` rejects any non-null child account
+reference that cannot be resolved to an account already stored or included in
+the same batch. It is disabled by default for the additive deployment. Enable
+it only after:
+
+1. applying all D1 migrations and recording a Time Travel bookmark;
+2. completing a full sync from every active device so historical aliases are
+   repaired;
+3. verifying that no non-null account references are absent from
+   `provider_accounts` across assignments, subscriptions, daily rollups, and
+   period summaries;
+4. confirming shadow dashboard totals and per-device mirror counts;
+5. changing the production variable to `1` and deploying the Worker.
+
+The preflight orphan query must return zero for every row:
+
+```sql
+SELECT 'source_account_assignments' AS relation, COUNT(*) AS orphan_count
+FROM source_account_assignments child
+LEFT JOIN provider_accounts parent
+  ON parent.user_id = child.user_id
+ AND parent.provider_account_id = child.provider_account_id
+WHERE child.provider_account_id IS NOT NULL
+  AND parent.provider_account_id IS NULL
+UNION ALL
+SELECT 'subscriptions', COUNT(*)
+FROM subscriptions child
+LEFT JOIN provider_accounts parent
+  ON parent.user_id = child.user_id
+ AND parent.provider_account_id = child.provider_account_id
+WHERE child.provider_account_id IS NOT NULL
+  AND parent.provider_account_id IS NULL
+UNION ALL
+SELECT 'daily_rollups', COUNT(*)
+FROM daily_rollups child
+LEFT JOIN provider_accounts parent
+  ON parent.user_id = child.user_id
+ AND parent.provider_account_id = child.provider_account_id
+WHERE child.provider_account_id IS NOT NULL
+  AND parent.provider_account_id IS NULL
+UNION ALL
+SELECT 'period_summaries', COUNT(*)
+FROM period_summaries child
+LEFT JOIN provider_accounts parent
+  ON parent.user_id = child.user_id
+ AND parent.provider_account_id = child.provider_account_id
+WHERE child.provider_account_id IS NOT NULL
+  AND parent.provider_account_id IS NULL;
+```
+
+Once enabled, a child chunk that arrives before its account metadata is
+rejected without storing partial data. The client may send the account chunk
+and safely retry the original child batch ID.
+
 ## Open Decisions
 
 - Whether the first backend stores sanitized event payloads as JSON blobs first,
