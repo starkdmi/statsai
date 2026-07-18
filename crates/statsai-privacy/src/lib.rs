@@ -242,8 +242,16 @@ pub enum PrivacyError {
     InvalidSpan,
     #[error("privacy pseudonym storage failed")]
     PseudonymStore,
-    #[error("filtered output still contains a privacy finding")]
-    ResidualFinding,
+    #[error(
+        "filtered output still contains a privacy finding in {field_path} at {start}..{end} ({detector:?}/{category:?})"
+    )]
+    ResidualFinding {
+        field_path: String,
+        start: usize,
+        end: usize,
+        detector: DetectorKind,
+        category: PrivacyCategory,
+    },
     #[cfg(unix)]
     #[error("OpenAI Privacy Filter failed")]
     OpenAiPrivacyFilter(#[source] opf_mlx::Error),
@@ -259,7 +267,7 @@ impl PrivacyError {
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::InvalidSpan => "invalid_span",
             Self::PseudonymStore => "pseudonym_store",
-            Self::ResidualFinding => "residual_finding",
+            Self::ResidualFinding { .. } => "residual_finding",
             #[cfg(unix)]
             Self::OpenAiPrivacyFilter(_) => "openai_privacy_filter",
         }

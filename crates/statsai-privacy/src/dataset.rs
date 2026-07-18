@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use chrono::Datelike;
@@ -16,7 +17,8 @@ use crate::{
 
 pub const FILTERED_CONVERSATION_SCHEMA_VERSION: &str = "filtered_conversation.v1";
 pub const FILTERED_DATASET_SCHEMA_VERSION: &str = "filtered_dataset.v1";
-const FILTER_POLICY_VERSION: &str = "privacy_policy.v1";
+const FILTER_POLICY_VERSION: &str = "privacy_policy.v2";
+const MAX_FILTER_PASSES: usize = 4;
 static GENERATED_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\[(?:SECRET|(?:ACCOUNT|ADDRESS|DATE|EMAIL|PERSON|PHONE|URL|PATH|HOST|IP|PROJECT|REPOSITORY|BRANCH)_\d{6})\]",
@@ -90,9 +92,7 @@ pub fn filter_archive_conversation(
     for (spans, additions) in detected.iter_mut().zip(structural_findings) {
         spans.extend(additions);
     }
-    let mut filtered_values = BTreeMap::new();
-    let mut findings = Vec::new();
-    for ((path, text), mut spans) in fields.iter().zip(detected) {
+    for ((path, text), spans) in fields.iter().zip(&mut detected) {
         if let Some(category) = authoritative_project_field(path, text) {
             spans.push(DetectedSpan {
                 start: 0,
@@ -102,7 +102,66 @@ pub fn filter_archive_conversation(
                 confidence: Some(DetectionConfidence::High),
             });
         }
-        let filtered = filter_text(text, spans, &mut alias)?;
+    }
+    drop(texts);
+
+    let mut converged = None;
+    for pass in 0..MAX_FILTER_PASSES {
+        let mut filtered_fields = Vec::with_capacity(fields.len());
+        for ((_, text), spans) in fields.iter().zip(&detected) {
+            filtered_fields.push(filter_text(text, spans.clone(), &mut alias)?);
+        }
+        let masked_residuals = filtered_fields
+            .iter()
+            .map(|filtered| mask_generated_placeholders(&filtered.text))
+            .collect::<Vec<_>>();
+        let residual_texts = masked_residuals
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let residual_model = detectors.detect_batch(&residual_texts)?;
+        let residual_structural = structural.detect_batch(&residual_texts)?;
+        let mut first_residual = None;
+        let mut additions = 0usize;
+        for (index, (model, structural_spans)) in residual_model
+            .into_iter()
+            .zip(residual_structural)
+            .enumerate()
+        {
+            for span in model.into_iter().chain(structural_spans) {
+                first_residual.get_or_insert_with(|| (fields[index].0.clone(), span.clone()));
+                let mapped =
+                    map_filtered_span_to_input(fields[index].1, &filtered_fields[index], &span)?;
+                if detected[index]
+                    .iter()
+                    .any(|existing| mapped.start >= existing.start && mapped.end <= existing.end)
+                {
+                    continue;
+                }
+                detected[index].push(DetectedSpan {
+                    start: mapped.start,
+                    end: mapped.end,
+                    category: span.category,
+                    detector: span.detector,
+                    confidence: span.confidence,
+                });
+                additions += 1;
+            }
+        }
+        let Some((path, span)) = first_residual else {
+            converged = Some(filtered_fields);
+            break;
+        };
+        if additions == 0 || pass + 1 == MAX_FILTER_PASSES {
+            return Err(residual_error(path, span));
+        }
+    }
+    let filtered_fields = converged.ok_or(PrivacyError::Protocol(
+        "privacy filtering did not produce a converged result",
+    ))?;
+    let mut filtered_values = BTreeMap::new();
+    let mut findings = Vec::new();
+    for ((path, _), filtered) in fields.iter().zip(filtered_fields) {
         findings.extend(
             filtered
                 .replacements
@@ -111,30 +170,76 @@ pub fn filter_archive_conversation(
         );
         filtered_values.insert(path.clone(), filtered.text);
     }
-    drop(texts);
     drop(fields);
     let filtered_projection = replace_string_fields(input, "", &filtered_values);
-    let mut residual_fields = Vec::new();
-    collect_string_fields(&filtered_projection, "", &mut residual_fields);
-    let masked_residuals = residual_fields
-        .iter()
-        .map(|(_, value)| mask_generated_placeholders(value))
-        .collect::<Vec<_>>();
-    let residual_texts = masked_residuals
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let residual_model = detectors.detect_batch(&residual_texts)?;
-    let residual_structural = structural.detect_batch(&residual_texts)?;
-    if residual_model
-        .iter()
-        .zip(residual_structural)
-        .any(|(model, structural)| !model.is_empty() || !structural.is_empty())
-    {
-        return Err(PrivacyError::ResidualFinding);
-    }
     let filtered = filtered_from_projection(filtered_projection, dataset_key)?;
     Ok((filtered, findings, input_fingerprint))
+}
+
+fn residual_error(field_path: String, span: DetectedSpan) -> PrivacyError {
+    PrivacyError::ResidualFinding {
+        field_path,
+        start: span.start,
+        end: span.end,
+        detector: span.detector,
+        category: span.category,
+    }
+}
+
+fn map_filtered_span_to_input(
+    input: &str,
+    filtered: &crate::FilteredText,
+    span: &DetectedSpan,
+) -> Result<Range<usize>, PrivacyError> {
+    span.validate_for(&filtered.text)?;
+    let start = map_filtered_boundary(&filtered.replacements, input.len(), span.start, false)
+        .ok_or(PrivacyError::Protocol(
+            "map residual start to privacy input",
+        ))?;
+    let end = map_filtered_boundary(&filtered.replacements, input.len(), span.end, true)
+        .ok_or(PrivacyError::Protocol("map residual end to privacy input"))?;
+    if start >= end
+        || end > input.len()
+        || !input.is_char_boundary(start)
+        || !input.is_char_boundary(end)
+    {
+        return Err(PrivacyError::InvalidSpan);
+    }
+    Ok(start..end)
+}
+
+fn map_filtered_boundary(
+    replacements: &[PrivacyReplacement],
+    input_len: usize,
+    offset: usize,
+    end_boundary: bool,
+) -> Option<usize> {
+    let mut input_cursor = 0usize;
+    let mut output_cursor = 0usize;
+    for replacement in replacements {
+        let unchanged = replacement.start.checked_sub(input_cursor)?;
+        let unchanged_end = output_cursor.checked_add(unchanged)?;
+        if offset <= unchanged_end {
+            return input_cursor.checked_add(offset.checked_sub(output_cursor)?);
+        }
+        output_cursor = unchanged_end;
+        let replacement_end = output_cursor.checked_add(replacement.replacement.len())?;
+        if offset < replacement_end {
+            return Some(if end_boundary {
+                replacement.end
+            } else {
+                replacement.start
+            });
+        }
+        if offset == replacement_end {
+            return Some(replacement.end);
+        }
+        input_cursor = replacement.end;
+        output_cursor = replacement_end;
+    }
+    let trailing = input_len.checked_sub(input_cursor)?;
+    let output_end = output_cursor.checked_add(trailing)?;
+    (offset <= output_end).then(|| input_cursor + (offset - output_cursor))
 }
 
 fn authoritative_project_field(path: &str, value: &str) -> Option<PrivacyCategory> {
@@ -369,6 +474,80 @@ mod tests {
         }
     }
 
+    struct CascadingDetector {
+        calls: usize,
+    }
+
+    impl PrivacyDetector for CascadingDetector {
+        fn metadata(&self) -> DetectorMetadata {
+            DetectorMetadata {
+                kind: DetectorKind::OpenAiPrivacyFilter,
+                implementation_version: "test".to_string(),
+                model_revision: Some("test".to_string()),
+                offline: true,
+            }
+        }
+
+        fn detect_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<DetectedSpan>>, PrivacyError> {
+            self.calls += 1;
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    let (needle, category) = match self.calls {
+                        1 => ("Alice", PrivacyCategory::Person),
+                        2 => ("https://example.test", PrivacyCategory::Url),
+                        _ => return Vec::new(),
+                    };
+                    text.find(needle)
+                        .map(|start| {
+                            vec![DetectedSpan {
+                                start,
+                                end: start + needle.len(),
+                                category,
+                                detector: DetectorKind::OpenAiPrivacyFilter,
+                                confidence: None,
+                            }]
+                        })
+                        .unwrap_or_default()
+                })
+                .collect())
+        }
+    }
+
+    struct StubbornResidualDetector {
+        calls: usize,
+    }
+
+    impl PrivacyDetector for StubbornResidualDetector {
+        fn metadata(&self) -> DetectorMetadata {
+            DetectorMetadata {
+                kind: DetectorKind::OpenAiPrivacyFilter,
+                implementation_version: "test".to_string(),
+                model_revision: Some("test".to_string()),
+                offline: true,
+            }
+        }
+
+        fn detect_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<DetectedSpan>>, PrivacyError> {
+            self.calls += 1;
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if self.calls == 1 || text.len() < 7 {
+                        return Vec::new();
+                    }
+                    vec![DetectedSpan {
+                        start: 0,
+                        end: 7,
+                        category: PrivacyCategory::Person,
+                        detector: DetectorKind::OpenAiPrivacyFilter,
+                        confidence: None,
+                    }]
+                })
+                .collect())
+        }
+    }
+
     #[test]
     fn archive_filter_omits_raw_ids_binaries_and_exact_timestamps() {
         let conversation = ArchiveConversation {
@@ -470,6 +649,100 @@ mod tests {
         assert!(!masked.contains("[PERSON_000123]"));
         assert!(!masked.contains("[SECRET]"));
         assert!(masked.contains("[NOT_A_PLACEHOLDER]"));
+    }
+
+    #[test]
+    fn second_pass_finding_converges_with_original_offsets() {
+        let conversation = ArchiveConversation {
+            schema_version: ARCHIVE_CONVERSATION_SCHEMA_VERSION.to_string(),
+            conversation_id: "conversation".to_string(),
+            provider: "codex".to_string(),
+            source_id: SourceId("source".to_string()),
+            native_conversation_id: "native".to_string(),
+            title: Some("Alice visits https://example.test".to_string()),
+            project: None,
+            started_at: None,
+            updated_at: None,
+            completeness: ArchiveCompleteness::Complete,
+            missing_content_count: 0,
+            missing_content_scope_id: None,
+            discarded_source_record_ids: Vec::new(),
+            superseded_conversation_ids: Vec::new(),
+            items: Vec::new(),
+        };
+        let mut detectors = PrivacyDetectorSet::new(vec![Box::new(CascadingDetector { calls: 0 })]);
+        let mut structural = DeterministicDetector::default();
+
+        let (filtered, findings, _) = filter_archive_conversation(
+            &conversation,
+            "dataset-key".to_string(),
+            &mut detectors,
+            &mut structural,
+            |_, _| Ok(1),
+        )
+        .expect("second-pass finding should converge");
+
+        assert_eq!(
+            filtered.title.as_deref(),
+            Some("[PERSON_000001] visits [URL_000001]")
+        );
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().any(|finding| {
+            finding.field_path == "title"
+                && finding.start == 0
+                && finding.end == 5
+                && finding.category == PrivacyCategory::Person
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.field_path == "title"
+                && finding.start == 13
+                && finding.end == 33
+                && finding.category == PrivacyCategory::Url
+        }));
+    }
+
+    #[test]
+    fn residual_failure_reports_only_safe_location_metadata_when_no_progress_is_possible() {
+        let conversation = ArchiveConversation {
+            schema_version: ARCHIVE_CONVERSATION_SCHEMA_VERSION.to_string(),
+            conversation_id: "conversation".to_string(),
+            provider: "codex".to_string(),
+            source_id: SourceId("source".to_string()),
+            native_conversation_id: "native".to_string(),
+            title: Some("private".to_string()),
+            project: None,
+            started_at: None,
+            updated_at: None,
+            completeness: ArchiveCompleteness::Complete,
+            missing_content_count: 0,
+            missing_content_scope_id: None,
+            discarded_source_record_ids: Vec::new(),
+            superseded_conversation_ids: Vec::new(),
+            items: Vec::new(),
+        };
+        let mut detectors =
+            PrivacyDetectorSet::new(vec![Box::new(StubbornResidualDetector { calls: 0 })]);
+        let mut structural = DeterministicDetector::default();
+
+        let error = filter_archive_conversation(
+            &conversation,
+            "dataset-key".to_string(),
+            &mut detectors,
+            &mut structural,
+            |_, _| Ok(1),
+        )
+        .expect_err("repeated finding over an existing replacement must fail closed");
+
+        assert!(matches!(
+            error,
+            PrivacyError::ResidualFinding {
+                ref field_path,
+                start: 0,
+                end: 7,
+                detector: DetectorKind::OpenAiPrivacyFilter,
+                category: PrivacyCategory::Person,
+            } if field_path == "title"
+        ));
     }
 
     #[test]
