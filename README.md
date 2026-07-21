@@ -204,11 +204,12 @@ JSON exports include binary artifacts as base64; SQLite stores their decoded
 bytes as BLOBs.
 
 `privacy filter` can build a separate local pseudonymized dataset from complete
-archive conversations. It combines the local OpenAI Privacy Filter runtime,
-Kingfisher secret scanning, and structural rules; binary payloads and raw
-archive identifiers are excluded. This derived data is not anonymous and is
-not uploaded. Filtering runs only when explicitly requested with `privacy
-filter`; inspect it with `privacy status`, `privacy show`, and `privacy export`.
+archive conversations. OpenAI Privacy Filter and Kingfisher scan free text;
+typed project metadata is pseudonymized directly, while binary payloads and raw
+archive identifiers are excluded. Statistical detectors can miss sensitive
+content, so this derived data is pseudonymized rather than anonymous. It is not
+uploaded. Filtering runs only when explicitly requested with `privacy filter`;
+inspect it with `privacy status`, `privacy show`, and `privacy export`.
 
 See `docs/conversation-archive.md` for the archive model, retention guarantees,
 and completeness behavior.

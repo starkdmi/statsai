@@ -16,7 +16,6 @@ sha2.workspace = true
 statsai-core.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
-url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true

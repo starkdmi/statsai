@@ -96,12 +96,18 @@ creates a separate, versioned local dataset containing pseudonymized text and
 selected conversation metadata. It is derived data that can be rebuilt after a
 policy or archive change.
 
-The filter runs OpenAI Privacy Filter and Kingfisher locally, then applies
-structural rules for paths, credential-bearing URLs, hosts, IP addresses, and
-known project labels. Non-secret entities receive stable installation-local
-pseudonyms; every secret becomes `[SECRET]`. Completed output is scanned again
-before it can be stored. A partial archive, detector failure, residual finding,
-stale input, or missing pseudonym key makes the conversation non-exportable.
+The filter uses OpenAI Privacy Filter and Kingfisher locally for free-text
+detection. Typed project, repository, branch, and path metadata is pseudonymized
+directly; raw archive and tool transport identifiers are omitted by schema.
+Non-secret entities receive stable installation-local pseudonyms, and every
+detected secret becomes `[SECRET]`. Completed output is scanned again before it
+can be stored. A partial archive, detector failure, residual finding, stale
+input, or missing pseudonym key makes the conversation non-exportable.
+
+A successful scan means the configured detectors reported no remaining
+findings. It does not prove that free text contains no missed sensitive content;
+the dataset remains pseudonymized rather than anonymous and must be reviewed
+against representative data before external use.
 
 Filtered payloads retain provider, model, role, item kind, usage, ordering,
 UTC day-level dates, attachment names and external URIs, and filtered text.

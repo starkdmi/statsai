@@ -8,13 +8,12 @@ use chrono::{Datelike, Utc};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use statsai_adapters::{adapter_for_provider, default_adapters};
-use statsai_core::{ArchiveCompleteness, ArchiveConversation};
+use statsai_core::ArchiveCompleteness;
 use statsai_privacy::{
     archive_privacy_input_fingerprint, filter_archive_conversation, normalize_private_value,
-    privacy_policy_fingerprint, DeterministicDetector, FilteredDatasetManifest, KingfisherDetector,
-    KingfisherOptions, KnownPrivateValue, MlxDetector, MlxServerOptions, PrivacyCategory,
-    PrivacyDetector, PrivacyDetectorSet, PrivacyError, FILTERED_CONVERSATION_SCHEMA_VERSION,
-    FILTERED_DATASET_SCHEMA_VERSION,
+    privacy_policy_fingerprint, FilteredDatasetManifest, KingfisherDetector, KingfisherOptions,
+    MlxDetector, MlxServerOptions, PrivacyCategory, PrivacyDetector, PrivacyDetectorSet,
+    PrivacyError, FILTERED_CONVERSATION_SCHEMA_VERSION, FILTERED_DATASET_SCHEMA_VERSION,
 };
 use statsai_store::{
     FilteredConversationMetadata, FilteredConversationRecord, PrivacyFailureRecord,
@@ -99,6 +98,9 @@ struct FilterSummary {
     unprocessed: u64,
     findings: u64,
     replacements: BTreeMap<String, u64>,
+    detector_findings: BTreeMap<String, u64>,
+    cross_detector_overlaps: u64,
+    detection_passes: u64,
     preview: bool,
 }
 
@@ -297,6 +299,9 @@ fn filter(
         unprocessed: 0,
         findings: 0,
         replacements: BTreeMap::new(),
+        detector_findings: BTreeMap::new(),
+        cross_detector_overlaps: 0,
+        detection_passes: 0,
         preview,
     };
     if summaries.is_empty() {
@@ -412,13 +417,11 @@ fn filter(
             continue;
         }
         let input_fingerprint = archive_privacy_input_fingerprint(&conversation)?;
-        let mut structural = structural_detector(&conversation);
         let result = if preview {
             filter_archive_conversation(
                 &conversation,
                 dataset_key(&key, conversation_id),
                 &mut detectors,
-                &mut structural,
                 |category, value| {
                     let normalized = normalize_private_value(category, value);
                     let digest = hmac_digest(&key, category.as_str(), &normalized);
@@ -437,7 +440,6 @@ fn filter(
                 &conversation,
                 dataset_key(&key, conversation_id),
                 &mut detectors,
-                &mut structural,
                 |category, value| {
                     let normalized = normalize_private_value(category, value);
                     let digest = hmac_digest(&key, category.as_str(), &normalized);
@@ -448,18 +450,28 @@ fn filter(
             )
         };
         match result {
-            Ok((filtered, findings, input_fingerprint)) => {
+            Ok(result) => {
                 summary.filtered += 1;
-                summary.findings += findings.len() as u64;
-                for finding in &findings {
+                summary.findings += result.findings.len() as u64;
+                summary.cross_detector_overlaps +=
+                    result.detector_observations.cross_detector_overlaps;
+                summary.detection_passes += result.detector_observations.detection_passes;
+                for (detector, count) in result.detector_observations.findings_by_detector {
+                    *summary
+                        .detector_findings
+                        .entry(detector.as_str().to_string())
+                        .or_default() += count;
+                }
+                for finding in &result.findings {
                     *summary
                         .replacements
                         .entry(finding.category.as_str().to_string())
                         .or_default() += 1;
                 }
                 if !preview {
-                    let payload = serde_json::to_string(&filtered)?;
-                    let records = findings
+                    let payload = serde_json::to_string(&result.conversation)?;
+                    let records = result
+                        .findings
                         .into_iter()
                         .map(|finding| PrivacyFindingRecord {
                             field_path: finding.field_path,
@@ -476,8 +488,8 @@ fn filter(
                     store.write_filtered_conversation(
                         &FilteredConversationRecord {
                             conversation_id: conversation_id.clone(),
-                            dataset_key: filtered.dataset_key,
-                            input_fingerprint,
+                            dataset_key: result.conversation.dataset_key,
+                            input_fingerprint: result.input_fingerprint,
                             policy_fingerprint: policy_fingerprint.clone(),
                             payload,
                             finding_count: records.len() as u64,
@@ -622,6 +634,19 @@ fn print_filter_summary(summary: &FilterSummary, json_output: bool) -> Result<()
                     .map(|(category, count)| format!("{category}={count}"))
                     .collect::<Vec<_>>()
                     .join(" ")
+            );
+        }
+        if !summary.detector_findings.is_empty() {
+            println!(
+                "detector findings before merge: {} overlaps={} passes={}",
+                summary
+                    .detector_findings
+                    .iter()
+                    .map(|(detector, count)| format!("{detector}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                summary.cross_detector_overlaps,
+                summary.detection_passes,
             );
         }
     }
@@ -778,7 +803,6 @@ fn policy_metadata(config: &PrivacyRuntimeConfig) -> Vec<statsai_privacy::Detect
     vec![
         MlxDetector::metadata_for_revision(config.model_revision()),
         kingfisher,
-        DeterministicDetector::policy_metadata(),
     ]
 }
 
@@ -790,26 +814,6 @@ fn mlx_server_options(config: &PrivacyRuntimeConfig, log_memory_stats: bool) -> 
         log_memory_stats,
         ..MlxServerOptions::default()
     }
-}
-
-fn structural_detector(conversation: &ArchiveConversation) -> DeterministicDetector {
-    let mut values = Vec::new();
-    if let Some(project) = &conversation.project {
-        for (category, value) in [
-            (PrivacyCategory::Project, project.project_label.as_ref()),
-            (PrivacyCategory::Repository, project.repo_label.as_ref()),
-            (PrivacyCategory::Branch, project.branch_label.as_ref()),
-            (PrivacyCategory::Path, project.path_label.as_ref()),
-        ] {
-            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-                values.push(KnownPrivateValue {
-                    category,
-                    value: value.clone(),
-                });
-            }
-        }
-    }
-    DeterministicDetector::new(values)
 }
 
 fn canonical_provider(provider: Option<&str>) -> Result<Option<&'static str>> {

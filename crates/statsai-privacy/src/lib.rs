@@ -22,15 +22,12 @@ use thiserror::Error;
 
 pub use dataset::{
     archive_privacy_input_fingerprint, filter_archive_conversation, privacy_policy_fingerprint,
-    FilteredConversation, FilteredDatasetManifest, FilteredFieldFinding,
-    FILTERED_CONVERSATION_SCHEMA_VERSION, FILTERED_DATASET_SCHEMA_VERSION,
+    DetectorObservationSummary, FilterArchiveResult, FilteredConversation, FilteredDatasetManifest,
+    FilteredFieldFinding, FILTERED_CONVERSATION_SCHEMA_VERSION, FILTERED_DATASET_SCHEMA_VERSION,
 };
 pub use kingfisher::{KingfisherDetector, KingfisherOptions};
 pub use mlx::{MlxDetector, MlxServerOptions, MLX_FIXED_TRACE_PADDED_TOKENS};
-pub use policy::{
-    filter_text, normalize_private_value, DeterministicDetector, FilteredText, KnownPrivateValue,
-    PrivacyReplacement,
-};
+pub use policy::{filter_text, normalize_private_value, FilteredText, PrivacyReplacement};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,7 +75,7 @@ impl PrivacyCategory {
 pub enum DetectorKind {
     OpenAiPrivacyFilter,
     Kingfisher,
-    Deterministic,
+    Structured,
 }
 
 impl DetectorKind {
@@ -87,7 +84,7 @@ impl DetectorKind {
         match self {
             Self::OpenAiPrivacyFilter => "openai_privacy_filter",
             Self::Kingfisher => "kingfisher",
-            Self::Deterministic => "deterministic",
+            Self::Structured => "structured",
         }
     }
 }
@@ -303,7 +300,7 @@ mod tests {
     impl PrivacyDetector for ExtraResultDetector {
         fn metadata(&self) -> DetectorMetadata {
             DetectorMetadata {
-                kind: DetectorKind::Deterministic,
+                kind: DetectorKind::Structured,
                 implementation_version: "test".to_string(),
                 model_revision: None,
                 offline: true,

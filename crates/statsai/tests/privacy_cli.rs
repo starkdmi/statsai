@@ -9,9 +9,8 @@ use statsai_core::{
     ArchiveItemKind, ArchiveRole, SourceId, ARCHIVE_CONVERSATION_SCHEMA_VERSION,
 };
 use statsai_privacy::{
-    archive_privacy_input_fingerprint, privacy_policy_fingerprint, DeterministicDetector,
-    FilteredConversation, KingfisherDetector, MlxDetector, PrivacyDetector,
-    FILTERED_CONVERSATION_SCHEMA_VERSION,
+    archive_privacy_input_fingerprint, privacy_policy_fingerprint, FilteredConversation,
+    KingfisherDetector, MlxDetector, FILTERED_CONVERSATION_SCHEMA_VERSION,
 };
 use statsai_store::{FilteredConversationRecord, Store};
 
@@ -122,7 +121,6 @@ fn privacy_cli_exports_current_rows_deterministically_and_fails_closed_when_stal
     let metadata = vec![
         MlxDetector::metadata_for_revision(config.model_revision()),
         kingfisher_metadata,
-        DeterministicDetector::default().metadata(),
     ];
     let policy_fingerprint = privacy_policy_fingerprint(&metadata);
 
