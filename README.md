@@ -205,11 +205,13 @@ bytes as BLOBs.
 
 `privacy filter` can build a separate local pseudonymized dataset from complete
 archive conversations. OpenAI Privacy Filter and Kingfisher scan free text;
-typed project metadata is pseudonymized directly, while binary payloads and raw
-archive identifiers are excluded. Statistical detectors can miss sensitive
-content, so this derived data is pseudonymized rather than anonymous. It is not
-uploaded. Filtering runs only when explicitly requested with `privacy filter`;
-inspect it with `privacy status`, `privacy show`, and `privacy export`.
+typed project metadata and tool-call identifiers are pseudonymized directly,
+while binary payloads and raw archive identifiers are excluded. Matching tool
+calls and results retain a shared pseudonymous identifier. Statistical detectors
+can miss sensitive content, so this derived data is pseudonymized rather than
+anonymous. It is not uploaded. Filtering runs only when explicitly requested
+with `privacy filter`; inspect it with `privacy status`, `privacy show`, and
+`privacy export`.
 
 See `docs/conversation-archive.md` for the archive model, retention guarantees,
 and completeness behavior.

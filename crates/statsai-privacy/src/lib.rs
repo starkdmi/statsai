@@ -46,6 +46,7 @@ pub enum PrivacyCategory {
     Project,
     Repository,
     Branch,
+    ToolCallId,
 }
 
 impl PrivacyCategory {
@@ -66,6 +67,7 @@ impl PrivacyCategory {
             Self::Project => "project",
             Self::Repository => "repository",
             Self::Branch => "branch",
+            Self::ToolCallId => "tool_call_id",
         }
     }
 }

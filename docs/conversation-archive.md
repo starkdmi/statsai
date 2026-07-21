@@ -97,8 +97,10 @@ selected conversation metadata. It is derived data that can be rebuilt after a
 policy or archive change.
 
 The filter uses OpenAI Privacy Filter and Kingfisher locally for free-text
-detection. Typed project, repository, branch, and path metadata is pseudonymized
-directly; raw archive and tool transport identifiers are omitted by schema.
+detection. Typed project, repository, branch, path, and tool-call identifiers
+are pseudonymized directly. Matching tool calls and results retain the same
+pseudonymous identifier, including inside provider JSON, without removing or
+renaming payload fields. Raw archive identifiers are omitted by schema.
 Non-secret entities receive stable installation-local pseudonyms, and every
 detected secret becomes `[SECRET]`. Completed output is scanned again before it
 can be stored. A partial archive, detector failure, residual finding, stale

@@ -89,7 +89,8 @@ fn span_priority(span: &DetectedSpan) -> (u8, u8) {
         | PrivacyCategory::IpAddress
         | PrivacyCategory::Project
         | PrivacyCategory::Repository
-        | PrivacyCategory::Branch => 2,
+        | PrivacyCategory::Branch
+        | PrivacyCategory::ToolCallId => 2,
         _ => 1,
     };
     let detector = match span.detector {
@@ -102,6 +103,9 @@ fn span_priority(span: &DetectedSpan) -> (u8, u8) {
 
 #[must_use]
 pub fn normalize_private_value(category: PrivacyCategory, value: &str) -> String {
+    if category == PrivacyCategory::ToolCallId {
+        return value.to_string();
+    }
     let normalized = value.nfkc().collect::<String>();
     let folded = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     match category {
@@ -131,6 +135,7 @@ const fn category_name(category: PrivacyCategory) -> &'static str {
         PrivacyCategory::Project => "PROJECT",
         PrivacyCategory::Repository => "REPOSITORY",
         PrivacyCategory::Branch => "BRANCH",
+        PrivacyCategory::ToolCallId => "TOOL_CALL",
     }
 }
 
@@ -187,6 +192,10 @@ mod tests {
         assert_eq!(
             normalize_private_value(PrivacyCategory::Person, "Ａｌｉｃｅ"),
             "Alice"
+        );
+        assert_eq!(
+            normalize_private_value(PrivacyCategory::ToolCallId, "call  Ａ"),
+            "call  Ａ"
         );
     }
 }
