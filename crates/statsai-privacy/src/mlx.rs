@@ -65,7 +65,7 @@ impl PrivacyDetector for MlxDetector {
     fn detect_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<DetectedSpan>>, PrivacyError> {
         let detections = self
             .filter
-            .detect_chunked_batch(texts, MLX_CHUNK_TOKENS, MLX_CHUNK_OVERLAP_TOKENS)
+            .detect_chunked_batch_approximate(texts, MLX_CHUNK_TOKENS, MLX_CHUNK_OVERLAP_TOKENS)
             .map_err(map_mlx_error)?;
         if detections.len() != texts.len() {
             return Err(PrivacyError::Protocol(

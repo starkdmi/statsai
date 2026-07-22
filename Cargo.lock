@@ -1796,9 +1796,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opf-mlx"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76de8bc39abcacbe5458d082df3f43ea2b656fdafbea508680d16c0bd17f9cf8"
+checksum = "2df0f50b10cb6c597c7d740b7c7c9bbdde5f2b29d00c740cf7e6568d0def0ae9"
 dependencies = [
  "nix",
  "serde",
