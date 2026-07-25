@@ -35,6 +35,18 @@ imported/manual gaps without double-counting.
 - `crates/statsai`: `statsai` binary
 - `crates/statsai-menubar`: macOS menu bar app (`StatsAI.app`)
 
+## Hosted Deployment
+
+The hosted API and web UI are independent Git repositories, and both deploy to
+Cloudflare. Before any deployment, follow their repository-specific runbooks:
+
+- API Worker and D1 migrations: [`apps/api/DEPLOY.md`](apps/api/DEPLOY.md)
+- Web UI on Cloudflare Pages: [`ui/DEPLOY.md`](ui/DEPLOY.md)
+
+Deploy the API first when an update spans both repositories. Do not infer a
+Vercel workflow from the UI's use of Next.js. See [`DEPLOY.md`](DEPLOY.md) for
+the workspace-level overview and production URLs.
+
 ## Install (macOS)
 
 ```sh
