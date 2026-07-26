@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::{DetectedSpan, DetectorKind, DetectorMetadata, PrivacyDetector, PrivacyError};
 
-const OPF_MLX_CLIENT_VERSION: &str = "0.1.2";
+const OPF_MLX_CLIENT_VERSION: &str = "0.2.1";
 const CHUNKING_VERSION: &str = "statsai-fixed-b4-t1024-c1024-o256-v5";
 pub const MLX_FIXED_TRACE_PADDED_TOKENS: usize = 4 * 1_024;
 
