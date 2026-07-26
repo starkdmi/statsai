@@ -25,8 +25,8 @@ use statsai_core::{
 };
 #[cfg(test)]
 use statsai_core::{
-    provider_account_id, provider_account_id_from_identity, summary_id, Confidence, CostInfo,
-    EventSource, PrivacyInfo, PrivacyMode, SummaryMetadata, UsageCounts,
+    micro_usd_to_cents_rounded, provider_account_id, provider_account_id_from_identity, summary_id,
+    Confidence, CostInfo, EventSource, PrivacyInfo, PrivacyMode, SummaryMetadata, UsageCounts,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_sdk::{
@@ -7998,7 +7998,7 @@ struct SyncRollupStatsAccumulator {
     reasoning_tokens: u64,
     total_tokens: u64,
     events: u64,
-    estimated_cost_usd: i64, // cents USD
+    estimated_cost_micro_usd: i64,
 }
 
 #[cfg(test)]
@@ -8059,7 +8059,7 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
                 reasoning_tokens: 0,
                 total_tokens: 0,
                 events: 0,
-                estimated_cost_usd: 0,
+                estimated_cost_micro_usd: 0,
             });
         entry.input_tokens = entry
             .input_tokens
@@ -8086,7 +8086,9 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
             .total_tokens
             .saturating_add(event.usage.computed_total());
         entry.events = entry.events.saturating_add(1);
-        entry.estimated_cost_usd += event.cost.estimated_api_equivalent_usd.unwrap_or(0);
+        entry.estimated_cost_micro_usd = entry
+            .estimated_cost_micro_usd
+            .saturating_add(event.cost.estimated_micro_usd().unwrap_or(0));
         if event.session.started_at > entry.observed_at {
             entry.observed_at = event.session.started_at;
         }
@@ -8126,8 +8128,12 @@ fn build_sync_rollup_stats_summaries(events: &[UsageEvent], device_id: &str) -> 
             },
             cost: CostInfo {
                 currency: "USD".to_string(),
-                estimated_api_equivalent_usd: Some(bucket.estimated_cost_usd),
+                estimated_api_equivalent_usd: Some(micro_usd_to_cents_rounded(
+                    bucket.estimated_cost_micro_usd,
+                )),
                 provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: Some(bucket.estimated_cost_micro_usd),
+                provider_reported_micro_usd: None,
                 pricing_source: Some("local_rollup".to_string()),
                 pricing_version: None,
                 confidence: Confidence::Medium,
@@ -13083,6 +13089,7 @@ mod tests {
                         total_reasoning_tokens: 0,
                         total_tokens: 15,
                         estimated_cost_usd: Some(25),
+                        estimated_cost_micro_usd: Some(250_000),
                         providers: vec!["codex".to_string()],
                         issue_keys: Vec::new(),
                         repo_label: Some("statsai/repo".to_string()),
@@ -13129,6 +13136,7 @@ mod tests {
                             ..UsageCounts::default()
                         },
                         estimated_cost_usd: Some(25),
+                        estimated_cost_micro_usd: Some(250_000),
                         event_count: 1,
                         has_usage_evidence: true,
                         total_messages: 2,
@@ -13230,6 +13238,7 @@ mod tests {
                         ..UsageCounts::default()
                     },
                     estimated_cost_usd: Some(25),
+                    estimated_cost_micro_usd: Some(250_000),
                     event_count: 1,
                     has_usage_evidence: true,
                     total_messages: 2,
@@ -13292,6 +13301,7 @@ mod tests {
                     total_reasoning_tokens: 0,
                     total_tokens: (span_count as u64).saturating_mul(15),
                     estimated_cost_usd: Some((span_count as i64).saturating_mul(25)),
+                    estimated_cost_micro_usd: Some((span_count as i64).saturating_mul(250_000)),
                     providers: vec!["codex".to_string()],
                     issue_keys: Vec::new(),
                     repo_label: Some("statsai/dense".to_string()),
@@ -13379,6 +13389,7 @@ mod tests {
                                 ..UsageCounts::default()
                             },
                             estimated_cost_usd: Some(25),
+                            estimated_cost_micro_usd: Some(250_000),
                             event_count: 1,
                             has_usage_evidence: true,
                             total_messages: 2,
@@ -13431,6 +13442,9 @@ mod tests {
                         total_reasoning_tokens: 0,
                         total_tokens: (span_count_per_bucket as u64).saturating_mul(15),
                         estimated_cost_usd: Some((span_count_per_bucket as i64).saturating_mul(25)),
+                        estimated_cost_micro_usd: Some(
+                            (span_count_per_bucket as i64).saturating_mul(250_000),
+                        ),
                         providers: vec!["codex".to_string()],
                         issue_keys: Vec::new(),
                         repo_label: Some(format!("statsai/dense-{bucket_index}")),
@@ -15914,6 +15928,7 @@ mod tests {
             total_reasoning_tokens: 0,
             total_tokens: 0,
             estimated_cost_usd: None,
+            estimated_cost_micro_usd: None,
             providers: vec!["claude_code".to_string()],
             issue_keys: Vec::new(),
             repo_label: None,
@@ -17421,6 +17436,8 @@ mod tests {
                 currency: "USD".to_string(),
                 estimated_api_equivalent_usd: tokens.cost,
                 provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: None,
+                provider_reported_micro_usd: None,
                 pricing_source: Some("unknown".to_string()),
                 pricing_version: None,
                 confidence: Confidence::Low,
@@ -17480,6 +17497,8 @@ mod tests {
                 currency: "USD".to_string(),
                 estimated_api_equivalent_usd: None,
                 provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: None,
+                provider_reported_micro_usd: None,
                 pricing_source: Some("unknown".to_string()),
                 pricing_version: None,
                 confidence: Confidence::Low,
@@ -17598,6 +17617,7 @@ mod tests {
             git: None,
             usage: event.usage.clone(),
             estimated_cost_usd: event.cost.estimated_api_equivalent_usd,
+            estimated_cost_micro_usd: event.cost.estimated_api_equivalent_micro_usd,
             event_count: 1,
             has_usage_evidence: true,
             total_messages: event

@@ -10,14 +10,16 @@ use statsai_core::{
     hash_text, home_dir, normalize_task_title, path_hash, project_bucket_key, semantic_event_id,
     summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
     task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
-    task_title_signal_score, title_topic_tokens, BillingPeriod, Confidence, EventId, EventSource,
-    IdentitySource, LatencySource, LocationOrigin, MetricStats, ModelInfo, ParseEvidence,
-    PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo, SessionInfo, SourceKind,
-    SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics, TaskSpan, UsageCounts,
-    UsageEvent, UsageSummary, TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
+    task_title_signal_score, title_topic_tokens, BillingPeriod, Confidence, CostAccumulator,
+    EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats, ModelInfo,
+    ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo, SessionInfo,
+    SourceKind, SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics, TaskSpan,
+    UsageCounts, UsageEvent, UsageSummary, TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
-use statsai_pricing::{estimate_cost, normalize_model_name};
+use statsai_pricing::{
+    estimate_cost_at, normalize_model_name, pricing_changes_between, unknown_cost,
+};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -35,11 +37,89 @@ const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v4";
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever Codex parsing semantics change,
 // so historical sessions get rescanned for both runtime and project context.
-const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v25";
-const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
-const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v14";
-const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v16";
+const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v26";
+const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v17";
+const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
+const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v17";
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
+pub(crate) const MAX_JSONL_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundedLineRead {
+    Eof,
+    Complete,
+    Oversized,
+}
+
+pub(crate) fn read_bounded_jsonl_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<BoundedLineRead> {
+    line.clear();
+    let mut oversized = false;
+    let mut saw_bytes = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if !saw_bytes {
+                return Ok(BoundedLineRead::Eof);
+            }
+            if oversized || line.len() > max_bytes {
+                line.clear();
+                return Ok(BoundedLineRead::Oversized);
+            }
+            return Ok(BoundedLineRead::Complete);
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let ended = available.get(consumed.saturating_sub(1)) == Some(&b'\n');
+        saw_bytes = true;
+        if !oversized {
+            let delimiter_bytes = if ended {
+                let preceding_byte = if consumed >= 2 {
+                    available.get(consumed - 2)
+                } else {
+                    line.last()
+                };
+                1 + usize::from(preceding_byte == Some(&b'\r'))
+            } else {
+                0
+            };
+            let record_bytes = line
+                .len()
+                .saturating_add(consumed)
+                .saturating_sub(delimiter_bytes);
+            let deferred_cr = !ended
+                && record_bytes == max_bytes.saturating_add(1)
+                && available.get(consumed - 1) == Some(&b'\r');
+            if record_bytes <= max_bytes || deferred_cr {
+                line.extend_from_slice(&available[..consumed]);
+            } else {
+                line.clear();
+                oversized = true;
+            }
+        }
+        reader.consume(consumed);
+        if ended {
+            return Ok(if oversized {
+                BoundedLineRead::Oversized
+            } else {
+                BoundedLineRead::Complete
+            });
+        }
+    }
+}
+
+fn usd_to_micro_usd(usd: f64) -> Option<i64> {
+    let micro_usd = usd * 1_000_000.0;
+    usd.is_finite()
+        .then_some(micro_usd)
+        .filter(|value| *value >= 0.0 && *value <= i64::MAX as f64)
+        .map(|value| value.round() as i64)
+}
 
 pub use archive::{ArchiveScan, ArchiveScanDiagnostics};
 pub use statsai_core::{VerifiedSourceState, VerifiedSubscriptionState};
@@ -566,7 +646,8 @@ fn scan_claude_source(
                 usage: event_rollup
                     .map(|rollup| rollup.usage.clone())
                     .unwrap_or_default(),
-                estimated_cost_usd: event_rollup.and_then(|rollup| rollup.estimated_cost_usd),
+                estimated_cost_usd: event_rollup.and_then(|rollup| rollup.cost.cents_rounded()),
+                estimated_cost_micro_usd: event_rollup.and_then(|rollup| rollup.cost.micro_usd()),
                 event_count: event_rollup
                     .map(|rollup| rollup.event_ids.len() as u64)
                     .unwrap_or(0),
@@ -892,6 +973,9 @@ fn scan_opencode_source(
             usage: usage.clone(),
             estimated_cost_usd: (provider_cost > 0.0)
                 .then_some((provider_cost * 100.0).round() as i64),
+            estimated_cost_micro_usd: (provider_cost > 0.0)
+                .then(|| usd_to_micro_usd(provider_cost))
+                .flatten(),
         });
         if reconstructed_session_ids.contains(&session_id) {
             reconstructed_session_rows.insert(
@@ -952,7 +1036,11 @@ fn scan_opencode_source(
         );
         event.session.title = title.filter(|title| !title.trim().is_empty());
         if provider_cost > 0.0 {
-            event.cost.provider_reported_usd = Some((provider_cost * 100.0).round() as i64);
+            if let Some(provider_cost_micro_usd) = usd_to_micro_usd(provider_cost) {
+                event
+                    .cost
+                    .set_provider_reported_micro_usd(provider_cost_micro_usd);
+            }
             event.cost.pricing_source = Some("opencode.session.cost".to_string());
             event.cost.confidence = Confidence::High;
         }
@@ -1044,14 +1132,18 @@ fn scan_opencode_source(
                 },
             );
             event.session.title = aggregate.title.filter(|title| !title.trim().is_empty());
-            let aggregate_provider_cost_usd = (aggregate.provider_cost * 100.0).round() as i64;
-            let residual_provider_cost_usd = aggregate_provider_cost_usd.saturating_sub(
-                reconstructed
-                    .map(|value| value.provider_reported_usd)
-                    .unwrap_or(0),
-            );
-            if residual_provider_cost_usd > 0 {
-                event.cost.provider_reported_usd = Some(residual_provider_cost_usd);
+            let aggregate_provider_cost_micro_usd =
+                usd_to_micro_usd(aggregate.provider_cost).unwrap_or(0);
+            let residual_provider_cost_micro_usd = aggregate_provider_cost_micro_usd
+                .saturating_sub(
+                    reconstructed
+                        .map(|value| value.provider_reported_micro_usd)
+                        .unwrap_or(0),
+                );
+            if residual_provider_cost_micro_usd > 0 {
+                event
+                    .cost
+                    .set_provider_reported_micro_usd(residual_provider_cost_micro_usd);
                 event.cost.pricing_source = Some("opencode.session.cost".to_string());
                 event.cost.confidence = Confidence::High;
             }
@@ -1114,8 +1206,11 @@ fn scan_opencode_source(
                     .filter(|usage| usage.computed_total() > 0)
                     .unwrap_or_else(|| seed.usage.clone()),
                 estimated_cost_usd: event_rollup
-                    .and_then(|rollup| rollup.estimated_cost_usd)
+                    .and_then(|rollup| rollup.cost.cents_rounded())
                     .or(seed.estimated_cost_usd),
+                estimated_cost_micro_usd: event_rollup
+                    .and_then(|rollup| rollup.cost.micro_usd())
+                    .or(seed.estimated_cost_micro_usd),
                 event_count: event_rollup
                     .map(|rollup| rollup.event_ids.len() as u64)
                     .unwrap_or(0),
@@ -1326,6 +1421,7 @@ struct OpenCodeTaskSeed {
     duration_seconds: Option<u64>,
     usage: UsageCounts,
     estimated_cost_usd: Option<i64>,
+    estimated_cost_micro_usd: Option<i64>,
 }
 
 struct OpenCodeMessageEventContext<'a> {
@@ -1448,7 +1544,11 @@ fn emit_opencode_message_events(
             .and_then(Value::as_f64)
             .filter(|cost| *cost > 0.0)
         {
-            event.cost.provider_reported_usd = Some((provider_cost * 100.0).round() as i64);
+            if let Some(provider_cost_micro_usd) = usd_to_micro_usd(provider_cost) {
+                event
+                    .cost
+                    .set_provider_reported_micro_usd(provider_cost_micro_usd);
+            }
             event.cost.pricing_source = Some("opencode.message.cost".to_string());
             event.cost.confidence = Confidence::High;
         }
@@ -1456,11 +1556,16 @@ fn emit_opencode_message_events(
             .entry(session_id)
             .and_modify(|current| {
                 current.usage = sum_usage_counts(&current.usage, &event.usage);
-                current.provider_reported_usd += event.cost.provider_reported_usd.unwrap_or(0);
+                current.provider_reported_micro_usd = current
+                    .provider_reported_micro_usd
+                    .saturating_add(event.cost.provider_reported_micro_usd_value().unwrap_or(0));
             })
             .or_insert_with(|| OpenCodeReconstructedUsage {
                 usage: event.usage.clone(),
-                provider_reported_usd: event.cost.provider_reported_usd.unwrap_or(0),
+                provider_reported_micro_usd: event
+                    .cost
+                    .provider_reported_micro_usd_value()
+                    .unwrap_or(0),
             });
         push_deduped(ctx.scan, ctx.seen, event);
     }
@@ -1470,14 +1575,14 @@ fn emit_opencode_message_events(
 #[derive(Debug, Clone, Default)]
 struct OpenCodeReconstructedUsage {
     usage: UsageCounts,
-    provider_reported_usd: i64,
+    provider_reported_micro_usd: i64,
 }
 
 #[derive(Debug, Clone, Default)]
 struct SessionEventRollup {
     event_ids: Vec<EventId>,
     usage: UsageCounts,
-    estimated_cost_usd: Option<i64>,
+    cost: CostAccumulator,
 }
 
 fn session_event_rollups(events: &[UsageEvent]) -> HashMap<String, SessionEventRollup> {
@@ -1489,14 +1594,7 @@ fn session_event_rollups(events: &[UsageEvent]) -> HashMap<String, SessionEventR
         let rollup = rollups.entry(session_hash.clone()).or_default();
         rollup.event_ids.push(event.event_id.clone());
         rollup.usage = sum_usage_counts(&rollup.usage, &event.usage);
-        rollup.estimated_cost_usd = match (
-            rollup.estimated_cost_usd,
-            event.cost.estimated_api_equivalent_usd,
-        ) {
-            (Some(left), Some(right)) => Some(left.saturating_add(right)),
-            (Some(left), None) => Some(left),
-            (None, right) => right,
-        };
+        rollup.cost.add_estimated(&event.cost);
     }
     rollups
 }
@@ -2059,18 +2157,35 @@ fn parse_claude_file(
     path: &Path,
 ) -> Result<()> {
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
     let project = claude_project_context_for_file(session_projects, projects, path);
     let mut current_reasoning = ModelReasoningState::default();
 
-    for (index, line) in reader.lines().enumerate() {
-        let line = line?;
+    let mut line_bytes = Vec::new();
+    let mut index = 0usize;
+    loop {
+        let line_status =
+            read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
+        if line_status == BoundedLineRead::Eof {
+            break;
+        }
+        index = index.saturating_add(1);
+        if line_status == BoundedLineRead::Oversized {
+            ctx.scan.diagnostics.raw_rows += 1;
+            ctx.scan.diagnostics.invalid_rows += 1;
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+            ctx.scan.diagnostics.raw_rows += 1;
+            ctx.scan.diagnostics.invalid_rows += 1;
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
         ctx.scan.diagnostics.raw_rows += 1;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             ctx.scan.diagnostics.invalid_rows += 1;
             continue;
         };
@@ -2123,7 +2238,7 @@ fn parse_claude_file(
                 project: project.clone(),
                 event_kind: "claude_message_usage",
                 source_file: path,
-                source_line_number: Some(index + 1),
+                source_line_number: Some(index),
                 source_type: "jsonl",
                 model_inferred,
                 timestamp_inferred,
@@ -2227,13 +2342,32 @@ fn parse_claude_stats_cache(
             usage.output_tokens.unwrap_or(0),
             usage.computed_total(),
         );
-        let mut cost = estimate_cost(adapter.provider(), Some(&model), &usage);
+        let pricing_date = period_end.unwrap_or(observed_at);
+        let crosses_pricing_boundary = period_start
+            .zip(period_end)
+            .and_then(|(start, end)| {
+                model
+                    .normalized_name
+                    .as_deref()
+                    .or(model.name.as_deref())
+                    .map(|model_name| {
+                        pricing_changes_between(model_name, start.date_naive(), end.date_naive())
+                    })
+            })
+            .unwrap_or(false);
+        let mut cost = if crosses_pricing_boundary {
+            unknown_cost()
+        } else {
+            estimate_cost_at(adapter.provider(), Some(&model), &usage, &pricing_date)
+        };
         if let Some(provider_cost) = usage_value
             .get("costUSD")
             .and_then(Value::as_f64)
             .filter(|cost| *cost > 0.0)
         {
-            cost.provider_reported_usd = Some((provider_cost * 100.0).round() as i64);
+            if let Some(provider_cost_micro_usd) = usd_to_micro_usd(provider_cost) {
+                cost.set_provider_reported_micro_usd(provider_cost_micro_usd);
+            }
             cost.pricing_source = Some("claude_stats_cache:costUSD".to_string());
             cost.confidence = Confidence::Medium;
         }
@@ -2303,29 +2437,40 @@ fn parse_codex_file(
     let session_raw = codex_session_id(usage_root, path);
     let mut records = Vec::new();
     let mut project_cache = ProjectContextCache::new();
-    let mut line = String::new();
+    let mut line_bytes = Vec::new();
     let mut index = 0usize;
 
     loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let line_status =
+            read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
+        if line_status == BoundedLineRead::Eof {
             break;
         }
         index = index.saturating_add(1);
+        if line_status == BoundedLineRead::Oversized {
+            ctx.scan.diagnostics.raw_rows += 1;
+            ctx.scan.diagnostics.invalid_rows += 1;
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+            ctx.scan.diagnostics.raw_rows += 1;
+            ctx.scan.diagnostics.invalid_rows += 1;
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
         ctx.scan.diagnostics.raw_rows += 1;
-        let line_kind = codex_line_kind(&line);
+        let line_kind = codex_line_kind(line);
         if line_kind == CodexLineKind::Irrelevant {
             continue;
         }
         if line_kind == CodexLineKind::ResponseItemMessage {
-            let header = codex_line_header(&line);
+            let header = codex_line_header(line);
             let role = codex_json_string_prefix_after_marker(header, "\"role\":\"", 32);
             let preview_raw_text = (collect_tasks && role.as_deref() == Some("user"))
                 .then(|| {
-                    codex_response_item_user_preview_from_line(&line, CODEX_TASK_PREVIEW_RAW_BYTES)
+                    codex_response_item_user_preview_from_line(line, CODEX_TASK_PREVIEW_RAW_BYTES)
                 })
                 .flatten()
                 .and_then(|text| codex_prompt_preview_input(Some(text.as_str())));
@@ -2396,7 +2541,7 @@ fn parse_codex_file(
                 });
                 continue;
             }
-            let Ok(parsed) = serde_json::from_str::<CodexFastResponseMessageLine<'_>>(&line) else {
+            let Ok(parsed) = serde_json::from_str::<CodexFastResponseMessageLine<'_>>(line) else {
                 ctx.scan.diagnostics.invalid_rows += 1;
                 continue;
             };
@@ -2465,7 +2610,7 @@ fn parse_codex_file(
             if !collect_tasks {
                 continue;
             }
-            let header = codex_line_header(&line);
+            let header = codex_line_header(line);
             let (timestamp, timestamp_inferred) = codex_timestamp_from_text(
                 codex_json_string_prefix_after_marker(header, "\"timestamp\":\"", 64).as_deref(),
                 fallback_timestamp,
@@ -2485,7 +2630,7 @@ fn parse_codex_file(
                 ctx.scan.diagnostics.model_fallbacks += 1;
             }
             let user_message_preview =
-                codex_event_user_message_preview_from_line(&line, CODEX_TASK_PREVIEW_RAW_BYTES)
+                codex_event_user_message_preview_from_line(line, CODEX_TASK_PREVIEW_RAW_BYTES)
                     .and_then(|text| codex_prompt_preview_input(Some(text.as_str())))
                     .map(|raw_text| CodexPromptPreviewCandidate {
                         raw_text,
@@ -2523,7 +2668,7 @@ fn parse_codex_file(
             });
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             ctx.scan.diagnostics.invalid_rows += 1;
             continue;
         };
@@ -2885,6 +3030,7 @@ fn parse_codex_file(
             let task_span = if ctx.options.should_collect_tasks() {
                 let event_id = event.event_id.clone();
                 let event_cost = event.cost.estimated_api_equivalent_usd;
+                let event_cost_micro_usd = event.cost.estimated_api_equivalent_micro_usd;
                 let prompt_previews = materialize_codex_task_previews(&turn.prompt_previews);
                 let prompt_preview = choose_best_task_preview(&prompt_previews);
                 let has_prompt_preview = prompt_preview.is_some();
@@ -2947,6 +3093,7 @@ fn parse_codex_file(
                     git: None,
                     usage: usage_snapshot,
                     estimated_cost_usd: event_cost,
+                    estimated_cost_micro_usd: event_cost_micro_usd,
                     event_count: 1,
                     has_usage_evidence: true,
                     total_messages: turn.message_counts.total,
@@ -3034,6 +3181,7 @@ fn parse_codex_file(
                 git: None,
                 usage: turn.accumulated_usage.unwrap_or_default(),
                 estimated_cost_usd: None,
+                estimated_cost_micro_usd: None,
                 event_count: 0,
                 has_usage_evidence: false,
                 total_messages: turn.message_counts.total,
@@ -3382,7 +3530,12 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
     let event_id = semantic_event_id(adapter.provider(), &source.source_id, &semantic_key);
     let file_path_hash = hash_text(&canonical_display(parts.source_file));
     let source_record_id = format!("usage_key_{}", &hash_text(&semantic_key)[..32]);
-    let cost = estimate_cost(adapter.provider(), parts.model.as_ref(), &parts.usage);
+    let cost = estimate_cost_at(
+        adapter.provider(),
+        parts.model.as_ref(),
+        &parts.usage,
+        &parts.timestamp,
+    );
 
     UsageEvent {
         schema_version: USAGE_EVENT_SCHEMA_VERSION.to_string(),
@@ -3477,7 +3630,12 @@ fn metadata_summary<A: ProviderAdapter + ?Sized>(
         model: parts.model.clone(),
         models: Vec::new(),
         usage: usage.clone(),
-        cost: estimate_cost(adapter.provider(), parts.model.as_ref(), &usage),
+        cost: estimate_cost_at(
+            adapter.provider(),
+            parts.model.as_ref(),
+            &usage,
+            &parts.observed_at,
+        ),
         parse_evidence: Some(ParseEvidence {
             event_key_version: "metadata_summary.v1".to_string(),
             source_file_path_hash: Some(file_path_hash),
@@ -3815,10 +3973,26 @@ fn for_grok_jsonl_record(
         return Ok(GrokJsonlParseStats::default());
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut parse_stats = GrokJsonlParseStats::default();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("read {} line {}", path.display(), index + 1))?;
+    let mut line_bytes = Vec::new();
+    let mut index = 0usize;
+    loop {
+        let line_status =
+            read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)
+                .with_context(|| format!("read {} line {}", path.display(), index + 1))?;
+        if line_status == BoundedLineRead::Eof {
+            break;
+        }
+        index = index.saturating_add(1);
+        if line_status == BoundedLineRead::Oversized {
+            parse_stats.invalid_rows += 1;
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+            parse_stats.invalid_rows += 1;
+            continue;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -4033,7 +4207,12 @@ fn parse_grok_summary(
         },
     );
     summary.usage = usage;
-    summary.cost = estimate_cost(adapter.provider(), summary.model.as_ref(), &summary.usage);
+    summary.cost = estimate_cost_at(
+        adapter.provider(),
+        summary.model.as_ref(),
+        &summary.usage,
+        &summary.observed_at,
+    );
     if summary.cost.estimated_api_equivalent_usd.is_some() {
         if inference_stats.has_usage() {
             summary.cost.confidence = Confidence::Medium;
@@ -4177,6 +4356,7 @@ fn parse_grok_summary(
             git: None,
             usage: summary.usage.clone(),
             estimated_cost_usd: summary.cost.estimated_api_equivalent_usd,
+            estimated_cost_micro_usd: summary.cost.estimated_api_equivalent_micro_usd,
             event_count: 0,
             has_usage_evidence: false,
             total_messages: summary
@@ -4963,18 +5143,20 @@ fn load_codex_thread_titles(root: &Path) -> HashMap<String, String> {
     };
     let mut reader = BufReader::new(file);
     let mut titles = HashMap::new();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader
-            .read_line(&mut line)
-            .ok()
-            .filter(|bytes| *bytes > 0)
-            .is_none()
-        {
+    let mut line_bytes = Vec::new();
+    while let Ok(line_status) =
+        read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)
+    {
+        if line_status == BoundedLineRead::Eof {
             break;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        if line_status == BoundedLineRead::Oversized {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let Some(session_id) = value.get("id").and_then(Value::as_str) else {
@@ -6132,7 +6314,61 @@ fn metadata_only_privacy() -> PrivacyInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{BufReader, Cursor, Write};
+
+    #[test]
+    fn bounded_jsonl_reader_discards_an_oversized_record_and_recovers_next_line() {
+        let input = format!("{}\n{{\"ok\":true}}\n", "x".repeat(9));
+        let mut reader = BufReader::new(Cursor::new(input.into_bytes()));
+        let mut line = Vec::new();
+
+        assert_eq!(
+            read_bounded_jsonl_line(&mut reader, &mut line, 8).expect("oversized line"),
+            BoundedLineRead::Oversized
+        );
+        assert!(line.is_empty());
+        assert_eq!(
+            read_bounded_jsonl_line(&mut reader, &mut line, 32).expect("next line"),
+            BoundedLineRead::Complete
+        );
+        assert_eq!(line, b"{\"ok\":true}\n");
+    }
+
+    #[test]
+    fn bounded_jsonl_reader_excludes_eof_lf_and_crlf_delimiters_from_the_limit() {
+        for input in [b"12345678".as_slice(), b"12345678\n", b"12345678\r\n"] {
+            let mut reader = BufReader::new(Cursor::new(input));
+            let mut line = Vec::new();
+
+            assert_eq!(
+                read_bounded_jsonl_line(&mut reader, &mut line, 8).expect("boundary line"),
+                BoundedLineRead::Complete,
+                "input {input:?}"
+            );
+            assert_eq!(line, input, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_jsonl_reader_handles_crlf_split_across_buffers_at_the_limit() {
+        let input = b"12345678\r\n";
+        let mut reader = BufReader::with_capacity(9, Cursor::new(input));
+        let mut line = Vec::new();
+
+        assert_eq!(
+            read_bounded_jsonl_line(&mut reader, &mut line, 8).expect("split CRLF line"),
+            BoundedLineRead::Complete
+        );
+        assert_eq!(line, input);
+
+        let mut unterminated_reader = BufReader::new(Cursor::new(b"12345678\r"));
+        assert_eq!(
+            read_bounded_jsonl_line(&mut unterminated_reader, &mut line, 8)
+                .expect("unterminated trailing CR"),
+            BoundedLineRead::Oversized
+        );
+        assert!(line.is_empty());
+    }
 
     fn options() -> ScanOptions {
         ScanOptions {
@@ -7047,6 +7283,51 @@ mod tests {
     }
 
     #[test]
+    fn claude_stats_cache_does_not_estimate_aggregate_across_pricing_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("projects")).expect("projects");
+        std::fs::write(
+            dir.path().join("stats-cache.json"),
+            r#"{
+              "version": 2,
+              "lastComputedDate": "2026-09-01",
+              "firstSessionDate": "2026-08-31T00:00:00Z",
+              "totalSessions": 2,
+              "totalMessages": 4,
+              "modelUsage": {
+                "claude-sonnet-5": {
+                  "inputTokens": 1000000,
+                  "outputTokens": 1000000,
+                  "cacheReadInputTokens": 0,
+                  "cacheCreationInputTokens": 0
+                }
+              }
+            }"#,
+        )
+        .expect("stats cache");
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        assert_eq!(
+            scan.summaries[0].cost.estimated_api_equivalent_micro_usd,
+            None
+        );
+        assert_eq!(scan.summaries[0].cost.estimated_api_equivalent_usd, None);
+        assert_eq!(
+            scan.summaries[0].cost.pricing_source.as_deref(),
+            Some("unknown")
+        );
+    }
+
+    #[test]
     fn claude_scan_respects_selected_cache_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
         let projects = dir.path().join("projects");
@@ -7557,6 +7838,31 @@ mod tests {
         let after = codex_scan_candidates(&source, "0.3.2").expect("after");
 
         assert_eq!(before[0].cache_signature, after[0].cache_signature);
+    }
+
+    #[test]
+    fn exact_cost_payload_upgrade_advances_every_provider_parser_revision() {
+        fn revision_number(revision: &str) -> u32 {
+            revision
+                .rsplit_once(".v")
+                .and_then(|(_, value)| value.parse().ok())
+                .expect("task-span parser revision")
+        }
+
+        assert!(revision_number(CODEX_SCAN_CACHE_PARSER_REVISION) > 25);
+        assert!(revision_number(CLAUDE_SCAN_CACHE_PARSER_REVISION) > 15);
+        assert!(revision_number(OPENCODE_SCAN_CACHE_PARSER_REVISION) > 14);
+        assert!(revision_number(GROK_BUILD_SCAN_CACHE_PARSER_REVISION) > 16);
+    }
+
+    #[test]
+    fn aggregate_pricing_boundary_upgrade_advances_claude_parser_revision() {
+        let revision = CLAUDE_SCAN_CACHE_PARSER_REVISION
+            .rsplit_once(".v")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .expect("Claude parser revision");
+
+        assert!(revision > 16);
     }
 
     #[test]

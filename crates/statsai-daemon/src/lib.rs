@@ -91,9 +91,12 @@ fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>, auth_token: &
         return respond_text(request, StatusCode(405), "method not allowed");
     }
 
+    if url == "/health" {
+        return respond_json(request, StatusCode(200), &health_payload());
+    }
+
     let s = lock_store(store);
     let payload = match url.as_str() {
-        "/health" => health_payload(),
         "/status" => json!({
             "events": s.event_count()?,
             "tokens": s.token_total()?
@@ -289,6 +292,16 @@ mod watch {
     use tiny_http::Server;
 
     const WATCH_SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+    const WATCH_SCAN_INITIAL_RETRY_DELAY: Duration = if cfg!(test) {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(250)
+    };
+    const WATCH_SCAN_MAX_RETRY_DELAY: Duration = if cfg!(test) {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(5)
+    };
 
     pub fn watch_and_serve(
         addr: &str,
@@ -310,7 +323,7 @@ mod watch {
                 discover_adapter_watch_sources()
             }
         };
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (watcher_signal_tx, watcher_signal_rx) = mpsc::sync_channel(1);
         let pending_changed_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
         let callback_pending_paths = Arc::clone(&pending_changed_paths);
 
@@ -324,11 +337,77 @@ mod watch {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .extend(event.paths);
-                    let _ = tx.try_send(());
+                    let _ = watcher_signal_tx.try_send(());
                 }
             }
         })
         .context("create file watcher")?;
+
+        let background_store = {
+            let store = super::lock_store(&store);
+            store.reopen()
+        };
+        let (scan_signal_tx, scan_signal_rx) = mpsc::sync_channel(1);
+        let worker_scan_signal_tx = scan_signal_tx.clone();
+        let pending_scan_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
+        let worker_pending_scan_paths = Arc::clone(&pending_scan_paths);
+        let worker_shared_store = Arc::clone(&store);
+        let worker_device_id = device_id.to_string();
+        let _scan_worker = std::thread::Builder::new()
+            .name("statsai-watch-scan".to_string())
+            .spawn(move || {
+                let mut retry_delay = WATCH_SCAN_INITIAL_RETRY_DELAY;
+                while scan_signal_rx.recv().is_ok() {
+                    let changed = worker_pending_scan_paths
+                        .lock()
+                        .map(|mut paths| {
+                            std::mem::take(&mut *paths).into_iter().collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|error| {
+                            std::mem::take(&mut *error.into_inner())
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                        });
+                    if changed.is_empty() {
+                        continue;
+                    }
+                    let scan_succeeded = process_background_scan(
+                        &worker_pending_scan_paths,
+                        &worker_scan_signal_tx,
+                        changed,
+                        retry_delay,
+                        |changed| match background_store.as_ref() {
+                            Ok(store) => rescan_changed_sources(
+                                store,
+                                &worker_shared_store,
+                                &worker_device_id,
+                                changed,
+                            ),
+                            Err(error) => {
+                                eprintln!(
+                                    "daemon: dedicated scan connection unavailable ({error:#}); using shared store"
+                                );
+                                let store = super::lock_store(&worker_shared_store);
+                                let adapters: Vec<Box<dyn ProviderAdapter>> = default_adapters();
+                                rescan_changed_sources_with_adapters(
+                                    &store,
+                                    &worker_device_id,
+                                    changed,
+                                    &adapters,
+                                )
+                            }
+                        },
+                    );
+                    retry_delay = if scan_succeeded {
+                        WATCH_SCAN_INITIAL_RETRY_DELAY
+                    } else {
+                        retry_delay
+                            .saturating_mul(2)
+                            .min(WATCH_SCAN_MAX_RETRY_DELAY)
+                    };
+                }
+            })
+            .context("start background scan worker")?;
 
         let mut watched_sources = HashSet::new();
         let mut uncertain_watch_sources = HashSet::new();
@@ -352,7 +431,7 @@ mod watch {
                 eprintln!("daemon: executable changed on disk; restarting");
                 return Ok(());
             }
-            match rx.recv_timeout(Duration::from_millis(250)) {
+            match watcher_signal_rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(()) => {
                     let changed = pending_changed_paths
                         .lock()
@@ -364,8 +443,7 @@ mod watch {
                                 .into_iter()
                                 .collect::<Vec<_>>()
                         });
-                    let s = super::lock_store(&store);
-                    rescan_changed_sources(&s, device_id, &changed);
+                    enqueue_background_scan(&pending_scan_paths, &scan_signal_tx, changed);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -386,8 +464,11 @@ mod watch {
                             desired_sources,
                         );
                         if !newly_watched.is_empty() {
-                            let s = super::lock_store(&store);
-                            rescan_changed_sources(&s, device_id, &newly_watched);
+                            enqueue_background_scan(
+                                &pending_scan_paths,
+                                &scan_signal_tx,
+                                newly_watched,
+                            );
                         }
                     }
                     Err(error) => {
@@ -404,6 +485,34 @@ mod watch {
         }
 
         Ok(())
+    }
+
+    fn enqueue_background_scan(
+        pending: &Arc<Mutex<HashSet<PathBuf>>>,
+        signal: &mpsc::SyncSender<()>,
+        changed: Vec<PathBuf>,
+    ) {
+        pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .extend(changed);
+        let _ = signal.try_send(());
+    }
+
+    fn process_background_scan(
+        pending: &Arc<Mutex<HashSet<PathBuf>>>,
+        signal: &mpsc::SyncSender<()>,
+        changed: Vec<PathBuf>,
+        retry_delay: Duration,
+        scan: impl FnOnce(&[PathBuf]) -> Result<()>,
+    ) -> bool {
+        if let Err(error) = scan(&changed) {
+            eprintln!("daemon: background scan failed and will be retried: {error:#}");
+            std::thread::sleep(retry_delay);
+            enqueue_background_scan(pending, signal, changed);
+            return false;
+        }
+        true
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,9 +617,20 @@ mod watch {
         newly_watched
     }
 
-    fn rescan_changed_sources(store: &Store, device_id: &str, changed: &[PathBuf]) {
+    fn rescan_changed_sources(
+        scan_store: &Store,
+        commit_store: &Arc<Mutex<Store>>,
+        device_id: &str,
+        changed: &[PathBuf],
+    ) -> Result<()> {
         let adapters: Vec<Box<dyn ProviderAdapter>> = default_adapters();
-        rescan_changed_sources_with_adapters(store, device_id, changed, &adapters);
+        rescan_changed_sources_with_adapters_and_commit_store(
+            scan_store,
+            Some(commit_store),
+            device_id,
+            changed,
+            &adapters,
+        )
     }
 
     fn rescan_changed_sources_with_adapters(
@@ -518,18 +638,35 @@ mod watch {
         device_id: &str,
         changed: &[PathBuf],
         adapters: &[Box<dyn ProviderAdapter>],
-    ) {
-        let configured = match store.list_sources() {
-            Ok(sources) => sources,
-            Err(e) => {
-                eprintln!("daemon: failed to list sources: {e}");
-                return;
-            }
-        };
+    ) -> Result<()> {
+        rescan_changed_sources_with_adapters_and_commit_store(
+            store, None, device_id, changed, adapters,
+        )
+    }
+
+    fn rescan_changed_sources_with_adapters_and_commit_store(
+        scan_store: &Store,
+        commit_store: Option<&Arc<Mutex<Store>>>,
+        device_id: &str,
+        changed: &[PathBuf],
+        adapters: &[Box<dyn ProviderAdapter>],
+    ) -> Result<()> {
+        let configured = scan_store
+            .list_sources()
+            .context("list sources for changed-source rescan")?;
+        let mut failed = false;
 
         for adapter in adapters {
             let sources = scan_sources_for_paths(adapter.as_ref(), &configured, changed);
             for mut source in sources {
+                let expected_data_version = commit_store
+                    .map(|_| scan_store.data_version())
+                    .transpose()
+                    .context("capture database generation for changed-source rescan")?;
+                let expected_source = configured
+                    .iter()
+                    .find(|configured_source| configured_source.source_id == source.source_id)
+                    .cloned();
                 let cache_candidates = match adapter.scan_candidates(&source) {
                     Ok(candidates) => candidates,
                     Err(e) => {
@@ -537,13 +674,14 @@ mod watch {
                             "daemon: scan candidate discovery failed for {}: {e}",
                             source.path_label.as_deref().unwrap_or("unknown")
                         );
+                        failed = true;
                         continue;
                     }
                 };
                 let compatible_scan_signatures =
                     scan_candidate_compatible_signatures(&cache_candidates);
                 let file_cache_entries = scan_file_state_entries(&cache_candidates);
-                let selection = match store
+                let selection = match scan_store
                     .select_scan_file_state_entries_with_task_requirement_and_compatibility(
                         &source.source_id,
                         &file_cache_entries,
@@ -556,15 +694,17 @@ mod watch {
                             "daemon: scan cache lookup failed for {}: {e}",
                             source.path_label.as_deref().unwrap_or("unknown")
                         );
+                        failed = true;
                         continue;
                     }
                 };
                 let pending_file_entries = selection.pending_entries;
                 let compatible_entries_to_upgrade = selection.compatible_entries_to_upgrade;
-                let tracked_file_entries = match store.scan_file_entries(&source.source_id) {
+                let tracked_file_entries = match scan_store.scan_file_entries(&source.source_id) {
                     Ok(entries) => entries,
                     Err(e) => {
                         eprintln!("daemon: scan cache listing failed: {e}");
+                        failed = true;
                         continue;
                     }
                 };
@@ -589,6 +729,7 @@ mod watch {
                                     "daemon: verified auth probe failed for {}: {e}",
                                     source.path_label.as_deref().unwrap_or("unknown")
                                 );
+                                failed = true;
                                 continue;
                             }
                         }
@@ -604,6 +745,7 @@ mod watch {
                                             "daemon: verified auth hash failed for {}: {e}",
                                             source.path_label.as_deref().unwrap_or("unknown")
                                         );
+                                        failed = true;
                                         continue;
                                     }
                                 }
@@ -672,6 +814,7 @@ mod watch {
                                                         .as_deref()
                                                         .unwrap_or("unknown")
                                                 );
+                                                failed = true;
                                                 continue;
                                             }
                                         }
@@ -681,43 +824,6 @@ mod watch {
                             } else {
                                 None
                             };
-                        if let Err(e) = reconcile_verified_source_state(
-                            store,
-                            &mut source,
-                            effective_verified_source_state.as_ref(),
-                            effective_verified_state_hash,
-                        ) {
-                            eprintln!("daemon: verified auth reconciliation failed: {e}");
-                            continue;
-                        }
-                        if let Err(e) = store.upsert_source(&source) {
-                            eprintln!("daemon: update source verified auth state failed: {e}");
-                            continue;
-                        }
-                        if pending_file_entries.is_empty() && removed_file_entries.is_empty() {
-                            if let Err(e) = store.upgrade_scan_file_entries(
-                                &source.source_id,
-                                &compatible_entries_to_upgrade,
-                            ) {
-                                eprintln!("daemon: upgrade scan cache failed: {e}");
-                                continue;
-                            }
-                            eprintln!(
-                                "daemon: reconciled auth/cache state for {} ({})",
-                                source.provider,
-                                source.path_label.as_deref().unwrap_or("unknown")
-                            );
-                            continue;
-                        }
-                        if let Err(e) = apply_source_account_resolution(
-                            store,
-                            &source,
-                            &mut scan.events,
-                            &mut scan.summaries,
-                        ) {
-                            eprintln!("daemon: account resolution failed: {e}");
-                            continue;
-                        }
                         let reconciled_file_hashes = rescan_file_entries
                             .iter()
                             .chain(removed_file_entries.iter())
@@ -729,43 +835,143 @@ mod watch {
                             .iter()
                             .map(|entry| entry.cache_key.clone())
                             .collect::<Vec<_>>();
-                        let replacement =
-                            match store.replace_scan_file_records(ScanFileReplacement {
-                                source_id: &source.source_id,
-                                reconciled_file_hashes: &reconciled_file_hashes,
-                                events: &scan.events,
-                                summaries: &scan.summaries,
-                                pending_entries: &pending_file_entries,
-                                compatible_entries_to_upgrade: &compatible_entries_to_upgrade,
-                                removed_cache_keys: &removed_cache_keys,
-                            }) {
-                                Ok(replacement) => replacement,
-                                Err(e) => {
-                                    eprintln!("daemon: atomic file reconciliation failed: {e}");
-                                    continue;
+                        let commit_result = commit_source_scan_if_current(
+                            scan_store,
+                            commit_store,
+                            expected_data_version,
+                            expected_source.as_ref(),
+                            &mut source,
+                            |store, source| {
+                                reconcile_verified_source_state(
+                                    store,
+                                    source,
+                                    effective_verified_source_state.as_ref(),
+                                    effective_verified_state_hash,
+                                )
+                                .context("reconcile verified auth state")?;
+                                store
+                                    .upsert_source(source)
+                                    .context("update source verified auth state")?;
+                                if pending_file_entries.is_empty()
+                                    && removed_file_entries.is_empty()
+                                {
+                                    store
+                                        .upgrade_scan_file_entries(
+                                            &source.source_id,
+                                            &compatible_entries_to_upgrade,
+                                        )
+                                        .context("upgrade scan cache")?;
+                                    return Ok(None);
                                 }
-                            };
-                        eprintln!(
-                            "daemon: rescanned {} ({}) — files={}, cached={}, parsed_events={}, inserted_events={}, parsed_summaries={}, summaries_written={}",
-                            source.provider,
-                            source.path_label.as_deref().unwrap_or("unknown"),
-                            scan.diagnostics.files_scanned,
-                            scan.diagnostics.files_skipped_unchanged,
-                            parsed_events,
-                            replacement.inserted_events,
-                            parsed_summaries,
-                            replacement.written_summaries
+                                apply_source_account_resolution(
+                                    store,
+                                    source,
+                                    &mut scan.events,
+                                    &mut scan.summaries,
+                                )
+                                .context("resolve source accounts")?;
+                                let replacement = store
+                                    .replace_scan_file_records(ScanFileReplacement {
+                                        source_id: &source.source_id,
+                                        reconciled_file_hashes: &reconciled_file_hashes,
+                                        events: &scan.events,
+                                        summaries: &scan.summaries,
+                                        pending_entries: &pending_file_entries,
+                                        compatible_entries_to_upgrade:
+                                            &compatible_entries_to_upgrade,
+                                        removed_cache_keys: &removed_cache_keys,
+                                    })
+                                    .context("atomically reconcile scan files")?;
+                                Ok(Some(replacement))
+                            },
                         );
+                        match commit_result {
+                            Ok(Some(replacement)) => {
+                                eprintln!(
+                                    "daemon: rescanned {} ({}) — files={}, cached={}, parsed_events={}, inserted_events={}, parsed_summaries={}, summaries_written={}",
+                                    source.provider,
+                                    source.path_label.as_deref().unwrap_or("unknown"),
+                                    scan.diagnostics.files_scanned,
+                                    scan.diagnostics.files_skipped_unchanged,
+                                    parsed_events,
+                                    replacement.inserted_events,
+                                    parsed_summaries,
+                                    replacement.written_summaries
+                                );
+                            }
+                            Ok(None) => {
+                                eprintln!(
+                                    "daemon: reconciled auth/cache state for {} ({})",
+                                    source.provider,
+                                    source.path_label.as_deref().unwrap_or("unknown")
+                                );
+                            }
+                            Err(error) => {
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "commit changed-source scan for {}",
+                                        source.path_label.as_deref().unwrap_or("unknown")
+                                    )
+                                });
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!(
                             "daemon: scan failed for {}: {e}",
                             source.path_label.as_deref().unwrap_or("unknown")
                         );
+                        failed = true;
                     }
                 }
             }
         }
+
+        if failed {
+            anyhow::bail!("one or more changed sources could not be rescanned");
+        }
+        Ok(())
+    }
+
+    fn commit_source_scan_if_current<T>(
+        scan_store: &Store,
+        commit_store: Option<&Arc<Mutex<Store>>>,
+        expected_data_version: Option<i64>,
+        expected_source: Option<&SourceLocation>,
+        source: &mut SourceLocation,
+        commit: impl FnOnce(&Store, &mut SourceLocation) -> Result<T>,
+    ) -> Result<T> {
+        let Some(commit_store) = commit_store else {
+            return commit(scan_store, source);
+        };
+
+        let store = super::lock_store(commit_store);
+        let expected_data_version = expected_data_version
+            .context("missing database generation for independent scan connection")?;
+        store.apply_scan_update(|store| {
+            let current_data_version = scan_store
+                .data_version()
+                .context("verify database generation before scan commit")?;
+            if current_data_version != expected_data_version {
+                anyhow::bail!(
+                    "database changed while scanning (expected generation {}, found {})",
+                    expected_data_version,
+                    current_data_version
+                );
+            }
+
+            let current_source = store
+                .source(&source.source_id)
+                .context("re-read source before scan commit")?;
+            if current_source.as_ref() != expected_source {
+                anyhow::bail!("source changed while scanning");
+            }
+            if let Some(current_source) = current_source {
+                *source = current_source;
+            }
+
+            commit(store, source)
+        })
     }
 
     fn scan_sources_for_paths(
@@ -1092,6 +1298,46 @@ mod watch {
             assert_eq!(watched, HashSet::from([second]));
         }
 
+        #[test]
+        fn background_scan_queue_coalesces_paths_without_dropping_them() {
+            let pending = Arc::new(Mutex::new(HashSet::new()));
+            let (signal_tx, signal_rx) = mpsc::sync_channel(1);
+            let first = PathBuf::from("/tmp/statsai-scan-first");
+            let second = PathBuf::from("/tmp/statsai-scan-second");
+
+            enqueue_background_scan(&pending, &signal_tx, vec![first.clone()]);
+            enqueue_background_scan(&pending, &signal_tx, vec![second.clone()]);
+
+            signal_rx.try_recv().expect("one coalesced wakeup");
+            assert!(signal_rx.try_recv().is_err());
+            assert_eq!(
+                *pending.lock().expect("pending scan paths"),
+                HashSet::from([first, second])
+            );
+        }
+
+        #[test]
+        fn failed_background_scan_is_requeued_for_retry() {
+            let pending = Arc::new(Mutex::new(HashSet::new()));
+            let (signal_tx, signal_rx) = mpsc::sync_channel(1);
+            let changed = PathBuf::from("/tmp/statsai-scan-retry");
+
+            let scan_succeeded = process_background_scan(
+                &pending,
+                &signal_tx,
+                vec![changed.clone()],
+                Duration::ZERO,
+                |_| anyhow::bail!("database is locked"),
+            );
+
+            assert!(!scan_succeeded);
+            signal_rx.try_recv().expect("retry wakeup");
+            assert_eq!(
+                *pending.lock().expect("pending scan paths"),
+                HashSet::from([changed])
+            );
+        }
+
         struct TestAdapter {
             provider: &'static str,
             verified_state: Option<VerifiedSourceState>,
@@ -1180,6 +1426,237 @@ mod watch {
             }
         }
 
+        struct FailingScanAdapter {
+            candidate: ScanCandidateFile,
+        }
+
+        impl ProviderAdapter for FailingScanAdapter {
+            fn id(&self) -> &'static str {
+                "test-failing-scan-adapter"
+            }
+
+            fn version(&self) -> &'static str {
+                "0.0.0"
+            }
+
+            fn provider(&self) -> &'static str {
+                "codex"
+            }
+
+            fn discover(&self) -> Vec<SourceLocation> {
+                Vec::new()
+            }
+
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(vec![self.candidate.clone()])
+            }
+
+            fn scan(
+                &self,
+                _source: &SourceLocation,
+                _options: &ScanOptions,
+            ) -> Result<statsai_adapters::AdapterScan> {
+                anyhow::bail!("injected transient scan failure")
+            }
+        }
+
+        struct ConcurrentSourceUpdateAdapter {
+            candidate: ScanCandidateFile,
+            store: Arc<Mutex<Store>>,
+        }
+
+        impl ProviderAdapter for ConcurrentSourceUpdateAdapter {
+            fn id(&self) -> &'static str {
+                "test-concurrent-source-update-adapter"
+            }
+
+            fn version(&self) -> &'static str {
+                "0.0.0"
+            }
+
+            fn provider(&self) -> &'static str {
+                "codex"
+            }
+
+            fn discover(&self) -> Vec<SourceLocation> {
+                Vec::new()
+            }
+
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(vec![self.candidate.clone()])
+            }
+
+            fn scan(
+                &self,
+                source: &SourceLocation,
+                _options: &ScanOptions,
+            ) -> Result<statsai_adapters::AdapterScan> {
+                let store = self.store.lock().expect("primary store");
+                let mut current = store
+                    .source(&source.source_id)?
+                    .context("source exists during concurrent update")?;
+                current.enabled = false;
+                current.updated_at = Utc::now();
+                store.upsert_source(&current)?;
+                Ok(statsai_adapters::AdapterScan::default())
+            }
+        }
+
+        #[test]
+        fn rescan_changed_sources_reports_adapter_failure() {
+            let store = Store::in_memory().expect("store");
+            let root = tempfile::tempdir().expect("source root");
+            let changed = root.path().join("session.jsonl");
+            std::fs::write(&changed, "{}\n").expect("changed file");
+            let source = SourceLocation::local_adapter(
+                "codex",
+                "test",
+                "0",
+                root.path(),
+                LocationOrigin::Configured,
+            );
+            store.upsert_source(&source).expect("source");
+            let adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(FailingScanAdapter {
+                candidate: ScanCandidateFile {
+                    path: changed.clone(),
+                    cache_key: changed.to_string_lossy().into_owned(),
+                    cache_signature: "changed-signature".to_string(),
+                    compatible_cache_signatures: Vec::new(),
+                },
+            })];
+
+            let result = rescan_changed_sources_with_adapters(
+                &store,
+                "device-test",
+                std::slice::from_ref(&changed),
+                &adapters,
+            );
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn background_scan_does_not_overwrite_a_concurrent_source_update() {
+            let root = tempfile::tempdir().expect("store root");
+            let source_root = root.path().join("source");
+            std::fs::create_dir_all(&source_root).expect("source root");
+            let changed = source_root.join("session.jsonl");
+            std::fs::write(&changed, "{}\n").expect("changed file");
+            let primary = Store::open(&root.path().join("statsai.db")).expect("primary store");
+            let source = SourceLocation::local_adapter(
+                "codex",
+                "test",
+                "0",
+                &source_root,
+                LocationOrigin::Configured,
+            );
+            primary.upsert_source(&source).expect("source");
+            let scan_store = primary.reopen().expect("scan store");
+            let shared_store = Arc::new(Mutex::new(primary));
+            let adapters: Vec<Box<dyn ProviderAdapter>> =
+                vec![Box::new(ConcurrentSourceUpdateAdapter {
+                    candidate: ScanCandidateFile {
+                        path: changed.clone(),
+                        cache_key: changed.to_string_lossy().into_owned(),
+                        cache_signature: "changed-signature".to_string(),
+                        compatible_cache_signatures: Vec::new(),
+                    },
+                    store: Arc::clone(&shared_store),
+                })];
+
+            let result = rescan_changed_sources_with_adapters_and_commit_store(
+                &scan_store,
+                Some(&shared_store),
+                "device-test",
+                std::slice::from_ref(&changed),
+                &adapters,
+            );
+
+            let error = result.expect_err("concurrent update invalidates scan");
+            assert!(error.to_string().contains("commit changed-source scan"));
+            assert!(format!("{error:#}").contains("database changed while scanning"));
+            let store = shared_store.lock().expect("primary store");
+            let stored_source = store
+                .source(&source.source_id)
+                .expect("source query")
+                .expect("stored source");
+            assert!(!stored_source.enabled);
+            assert!(store
+                .scan_file_entries(&source.source_id)
+                .expect("scan cache entries")
+                .is_empty());
+        }
+
+        #[test]
+        fn scan_commit_transaction_blocks_external_writer_after_freshness_check() {
+            let root = tempfile::tempdir().expect("store root");
+            let primary = Store::open(&root.path().join("statsai.db")).expect("primary store");
+            let source = SourceLocation::local_adapter(
+                "codex",
+                "test",
+                "0",
+                root.path(),
+                LocationOrigin::Configured,
+            );
+            primary.upsert_source(&source).expect("source");
+            let scan_store = primary.reopen().expect("scan store");
+            let external_store = primary.reopen().expect("external store");
+            let shared_store = Arc::new(Mutex::new(primary));
+            let expected_data_version = Some(scan_store.data_version().expect("data version"));
+            let mut stale_source = source.clone();
+            let (start_writer_tx, start_writer_rx) = mpsc::channel();
+            let (writer_committed_tx, writer_committed_rx) = mpsc::channel();
+            let writer_source_id = source.source_id.clone();
+            let writer = std::thread::spawn(move || -> Result<()> {
+                start_writer_rx.recv().context("start external writer")?;
+                loop {
+                    let mut current = external_store
+                        .source(&writer_source_id)?
+                        .context("source exists for external writer")?;
+                    current.enabled = false;
+                    current.updated_at = Utc::now();
+                    match external_store.upsert_source(&current) {
+                        Ok(()) => break,
+                        Err(error) if error.to_string().contains("database is locked") => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                writer_committed_tx
+                    .send(())
+                    .context("report external writer commit")?;
+                Ok(())
+            });
+
+            let writer_committed_before_reconcile = commit_source_scan_if_current(
+                &scan_store,
+                Some(&shared_store),
+                expected_data_version,
+                Some(&source),
+                &mut stale_source,
+                |store, source| {
+                    start_writer_tx.send(()).context("start external writer")?;
+                    let committed = writer_committed_rx
+                        .recv_timeout(Duration::from_millis(100))
+                        .is_ok();
+                    store.upsert_source(source)?;
+                    Ok(committed)
+                },
+            )
+            .expect("commit scan update");
+            writer
+                .join()
+                .expect("external writer thread")
+                .expect("external writer");
+
+            assert!(!writer_committed_before_reconcile);
+            let store = shared_store.lock().expect("primary store");
+            let stored_source = store
+                .source(&source.source_id)
+                .expect("source query")
+                .expect("stored source");
+            assert!(!stored_source.enabled);
+        }
+
         #[test]
         fn rescan_changed_sources_reconciles_verified_auth_without_pending_usage_files() {
             let store = Store::in_memory().expect("store");
@@ -1242,7 +1719,8 @@ mod watch {
                         .join("auth.json"),
                 ],
                 &adapters,
-            );
+            )
+            .expect("rescan auth state");
 
             assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
             assert_eq!(store.list_accounts().expect("accounts").len(), 1);
@@ -1276,7 +1754,8 @@ mod watch {
                         .join("auth.json"),
                 ],
                 &unavailable_adapters,
-            );
+            )
+            .expect("rescan unavailable auth state");
 
             let assignments = store
                 .list_source_account_assignments_for_source(&source.source_id)
@@ -1398,7 +1877,8 @@ mod watch {
                 "device-test",
                 std::slice::from_ref(&deleted_file),
                 &adapters,
-            );
+            )
+            .expect("rescan deleted file");
 
             assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
             assert_eq!(store.event_count().expect("event count"), 0);
@@ -1537,7 +2017,8 @@ mod watch {
                 "device-test",
                 std::slice::from_ref(&active_file),
                 &adapters,
-            );
+            )
+            .expect("rescan duplicate file");
 
             assert_eq!(*scan_calls.lock().expect("scan calls"), 1);
             let events = store.events().expect("events");
@@ -1896,6 +2377,7 @@ mod tests {
                 total_reasoning_tokens: 0,
                 total_tokens: 15,
                 estimated_cost_usd: Some(25),
+                estimated_cost_micro_usd: Some(250_000),
                 providers: vec!["codex".to_string()],
                 issue_keys: Vec::new(),
                 repo_label: Some("statsai/repo".to_string()),
@@ -1951,6 +2433,7 @@ mod tests {
                     ..UsageCounts::default()
                 },
                 estimated_cost_usd: Some(25),
+                estimated_cost_micro_usd: Some(250_000),
                 event_count: 1,
                 has_usage_evidence: true,
                 total_messages: 2,

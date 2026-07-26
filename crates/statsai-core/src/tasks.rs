@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 pub const TASK_SPAN_SCHEMA_VERSION: &str = "task_span.v1";
 pub const WORK_ITEM_SCHEMA_VERSION: &str = "work_item.v1";
@@ -559,6 +560,8 @@ pub struct TaskSpan {
     pub git: Option<GitInfo>,
     pub usage: UsageCounts,
     pub estimated_cost_usd: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_micro_usd: Option<i64>,
     #[serde(default)]
     pub event_count: u64,
     #[serde(default)]
@@ -713,6 +716,8 @@ pub struct WorkItem {
     pub total_reasoning_tokens: u64,
     pub total_tokens: u64,
     pub estimated_cost_usd: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_micro_usd: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -769,16 +774,26 @@ pub fn task_verification_id(action_kind: &str, action_key: &str) -> TaskVerifica
 
 #[must_use]
 pub fn normalize_task_title(value: &str) -> String {
-    let cleaned = clean_task_text(value).unwrap_or_else(|| value.trim().to_string());
+    let canonical = value.nfc().collect::<String>();
+    let cleaned = clean_task_text(&canonical).unwrap_or_else(|| canonical.trim().to_string());
     let cleaned = polish_task_title_candidate(&cleaned);
-    let mut normalized = String::with_capacity(value.len());
+    let mut normalized = String::with_capacity(cleaned.len());
     let mut previous_was_space = false;
+    let mut can_append_mark = false;
     for character in cleaned.chars() {
-        if character.is_ascii_alphanumeric() {
-            normalized.push(character.to_ascii_lowercase());
-            previous_was_space = false;
+        if is_combining_mark(character) {
+            if can_append_mark {
+                normalized.push(character);
+            }
             continue;
         }
+        if character.is_alphanumeric() {
+            normalized.extend(character.to_lowercase());
+            previous_was_space = false;
+            can_append_mark = true;
+            continue;
+        }
+        can_append_mark = false;
         if character.is_whitespace() || matches!(character, '-' | '_' | '/' | ':' | '.') {
             if !previous_was_space && !normalized.is_empty() {
                 normalized.push(' ');
@@ -3014,6 +3029,30 @@ mod tests {
             summarize_task_text(Some("éééé"), 3),
             Some("...".to_string())
         );
+    }
+
+    #[test]
+    fn normalize_task_title_preserves_unicode_letters_and_numbers() {
+        assert_eq!(
+            normalize_task_title("Исправить API / 修复错误 １２３"),
+            "исправить api 修复错误 １２３"
+        );
+    }
+
+    #[test]
+    fn normalize_task_title_preserves_combining_marks_attached_to_letters() {
+        assert_eq!(normalize_task_title("नमस्ते दुनिया"), "नमस्ते दुनिया");
+        assert_eq!(normalize_task_title("বাংলা ভাষা"), "বাংলা ভাষা");
+        assert_eq!(normalize_task_title("\u{301}abc"), "abc");
+    }
+
+    #[test]
+    fn normalize_task_title_canonicalizes_equivalent_unicode_sequences() {
+        let precomposed = normalize_task_title("Café");
+        let decomposed = normalize_task_title("Cafe\u{301}");
+
+        assert_eq!(precomposed, "café");
+        assert_eq!(decomposed, precomposed);
     }
 
     #[test]

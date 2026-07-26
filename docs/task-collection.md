@@ -159,3 +159,7 @@ excerpts, and workspace anchors. It does not duplicate full transcripts. Hosted
 sync can upload those bounded task snapshots and hosted verification actions to
 your private dashboard. Prompts, model responses, raw provider log lines, parse
 line numbers, and other full-transcript evidence stay local.
+
+Task spans and work items carry `estimated_cost_micro_usd` when exact pricing
+is available. The legacy `estimated_cost_usd` field remains rounded cents for
+compatibility; derived work items sum micro-USD across spans before rounding.

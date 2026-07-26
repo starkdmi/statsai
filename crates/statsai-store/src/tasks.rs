@@ -174,6 +174,10 @@ impl SpanContext {
         self.span.estimated_cost_usd
     }
 
+    fn estimated_cost_micro_usd(&self) -> Option<i64> {
+        self.span.estimated_cost_micro_usd
+    }
+
     fn event_count(&self) -> u64 {
         self.span.effective_event_count()
     }
@@ -2381,7 +2385,7 @@ fn build_work_item(
     let mut unique_event_ids = BTreeSet::<String>::new();
     let mut event_count = 0u64;
     let mut usage = UsageCounts::default();
-    let mut estimated_cost_usd: Option<i64> = None;
+    let mut estimated_cost = CostAccumulator::default();
     let mut no_git = true;
 
     for context in &spans {
@@ -2421,11 +2425,10 @@ fn build_work_item(
             no_git = false;
         }
         usage = sum_usage_counts(&usage, &context.usage());
-        estimated_cost_usd = match (estimated_cost_usd, context.estimated_cost_usd()) {
-            (Some(left), Some(right)) => Some(left.saturating_add(right)),
-            (Some(left), None) => Some(left),
-            (None, right) => right,
-        };
+        estimated_cost.add_values(
+            context.estimated_cost_micro_usd(),
+            context.estimated_cost_usd(),
+        );
         let linked_event_count = context.span.linked_event_ids.len() as u64;
         let extra_event_count = context.event_count().saturating_sub(linked_event_count);
         event_count = event_count.saturating_add(extra_event_count);
@@ -2591,7 +2594,8 @@ fn build_work_item(
         total_output_tokens: usage.output_tokens.unwrap_or(0),
         total_reasoning_tokens: usage.reasoning_tokens.unwrap_or(0),
         total_tokens,
-        estimated_cost_usd,
+        estimated_cost_usd: estimated_cost.cents_rounded(),
+        estimated_cost_micro_usd: estimated_cost.micro_usd(),
         providers: providers.into_iter().collect(),
         issue_keys: issue_keys.into_iter().collect(),
         repo_label,
@@ -4030,6 +4034,7 @@ mod tests {
             git: None,
             usage: UsageCounts::default(),
             estimated_cost_usd: None,
+            estimated_cost_micro_usd: None,
             event_count: 0,
             has_usage_evidence: false,
             total_messages: 0,
@@ -4077,6 +4082,7 @@ mod tests {
             git: None,
             usage: UsageCounts::default(),
             estimated_cost_usd: None,
+            estimated_cost_micro_usd: None,
             event_count: 0,
             has_usage_evidence: false,
             total_messages: 0,
@@ -4122,6 +4128,7 @@ mod tests {
             total_reasoning_tokens: 0,
             total_tokens,
             estimated_cost_usd: None,
+            estimated_cost_micro_usd: None,
             providers: vec!["codex".to_string()],
             issue_keys: Vec::new(),
             repo_label: None,
@@ -4175,6 +4182,36 @@ mod tests {
             members,
             spans,
         }
+    }
+
+    #[test]
+    fn derived_work_item_rounds_cost_after_aggregating_exact_micro_usd() {
+        let started_at = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0).unwrap();
+        let spans = (0..3)
+            .map(|index| {
+                let mut span = test_span_with_options(
+                    &format!("span-cost-{index}"),
+                    "codex",
+                    Some("session-cost"),
+                    "bucket-cost",
+                    started_at + chrono::Duration::minutes(index),
+                    "Implement exact task pricing",
+                    Some("Implement exact task pricing"),
+                )
+                .span;
+                span.estimated_cost_usd = Some(0);
+                span.estimated_cost_micro_usd = Some(2_250);
+                span.event_count = 1;
+                span.has_usage_evidence = true;
+                span
+            })
+            .collect::<Vec<_>>();
+
+        let (work_items, _) = derive_task_work_items(spans, &[]);
+
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(work_items[0].estimated_cost_micro_usd, Some(6_750));
+        assert_eq!(work_items[0].estimated_cost_usd, Some(1));
     }
 
     #[test]

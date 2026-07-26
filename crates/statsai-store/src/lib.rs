@@ -10,17 +10,18 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use statsai_core::{
-    hash_text, normalize_email, normalize_provider_user_id, periods_overlap, project_bucket_key,
-    project_contains_file_paths, project_has_stable_identity, provider_account_id,
-    provider_account_id_from_identity, sanitize_summary_for_sync, semantic_event_fingerprint,
-    source_account_assignment_id, subscription_id, summary_id, timestamp_in_period, BillingPeriod,
-    Confidence, CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource,
-    MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
-    SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
-    SourceKind, SourceLocation, SourceVerificationMode, Subscription, SubscriptionId,
-    SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetrics, SummaryModelUsage, SyncBatch,
-    TaskVerificationCursor, TaskVerificationId, UsageCounts, UsageEvent, UsageSummary,
-    VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    hash_text, micro_usd_to_cents_rounded, normalize_email, normalize_provider_user_id,
+    periods_overlap, project_bucket_key, project_contains_file_paths, project_has_stable_identity,
+    provider_account_id, provider_account_id_from_identity, sanitize_summary_for_sync,
+    semantic_event_fingerprint, source_account_assignment_id, subscription_id, summary_id,
+    timestamp_in_period, BillingPeriod, Confidence, CostAccumulator, CostInfo, DailyRollup,
+    EventId, EventSource, IdentitySource, LatencySource, MetricStats, ModelInfo, PrivacyInfo,
+    PrivacyMode, ProviderAccount, ProviderAccountId, SemanticFingerprintInput,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
+    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SummaryId,
+    SummaryMetadata, SummaryMetrics, SummaryModelUsage, SyncBatch, TaskVerificationCursor,
+    TaskVerificationId, UsageCounts, UsageEvent, UsageSummary, VerifiedSourceState,
+    VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
     SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
@@ -38,7 +39,7 @@ pub use tasks::{
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
 };
 
-const SYNC_ROLLUP_SUMMARY_VERSION: &str = "10";
+const SYNC_ROLLUP_SUMMARY_VERSION: &str = "11";
 const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
 const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
 const SQLITE_BUSY_TIMEOUT: Duration = if cfg!(test) {
@@ -464,6 +465,39 @@ impl Store {
         store.migrate()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
+    }
+
+    /// Opens an independent connection to the same file-backed store.
+    ///
+    /// This is useful for background readers that must inspect cache state
+    /// without holding an application-wide mutex during parsing. Reconciliation
+    /// writes should still be serialized through the primary connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for in-memory stores or when the file cannot be opened.
+    pub fn reopen(&self) -> Result<Self> {
+        let path = self
+            .conn
+            .path()
+            .filter(|path| !path.trim().is_empty())
+            .context("cannot reopen an in-memory statsai store")?;
+        Self::open(Path::new(path))
+    }
+
+    /// Returns SQLite's connection-local database generation.
+    ///
+    /// The value changes when another connection commits, which lets a
+    /// background reader detect that the state it parsed from has gone stale
+    /// before reconciling through the primary connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite cannot read the generation counter.
+    pub fn data_version(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .context("read SQLite data version")
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -958,8 +992,10 @@ impl Store {
               COALESCE(SUM(CAST(json_extract(payload, '$.usage.requests') AS INTEGER)), 0),
               COALESCE(SUM(CAST(json_extract(payload, '$.usage.total_tokens') AS INTEGER)), 0),
               SUM(COALESCE(
-                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER),
-                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER)
+                CAST(json_extract(payload, '$.cost.provider_reported_micro_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER) * 10000,
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_micro_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER) * 10000
               ))
             FROM sync_rollups
             GROUP BY source_id
@@ -971,7 +1007,9 @@ impl Store {
                 SourceUsageTotals {
                     events: row.get::<_, i64>(1)?.max(0) as u64,
                     tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                    estimated_cost_cents: row.get::<_, Option<i64>>(3)?,
+                    estimated_cost_cents: row
+                        .get::<_, Option<i64>>(3)?
+                        .map(micro_usd_to_cents_rounded),
                 },
             ))
         })?;
@@ -987,8 +1025,10 @@ impl Store {
               COALESCE(SUM(COALESCE(CAST(json_extract(payload, '$.usage.requests') AS INTEGER), 1)), 0),
               COALESCE(SUM(total_tokens), 0),
               SUM(COALESCE(
-                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER),
-                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER)
+                CAST(json_extract(payload, '$.cost.provider_reported_micro_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER) * 10000,
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_micro_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER) * 10000
               ))
             FROM usage_summaries
             GROUP BY source_id
@@ -1000,7 +1040,9 @@ impl Store {
                 SourceUsageTotals {
                     events: row.get::<_, i64>(1)?.max(0) as u64,
                     tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                    estimated_cost_cents: row.get::<_, Option<i64>>(3)?,
+                    estimated_cost_cents: row
+                        .get::<_, Option<i64>>(3)?
+                        .map(micro_usd_to_cents_rounded),
                 },
             ))
         })?;
@@ -1025,8 +1067,10 @@ impl Store {
               COALESCE(SUM(CAST(json_extract(payload, '$.usage.requests') AS INTEGER)), 0),
               COALESCE(SUM(CAST(json_extract(payload, '$.usage.total_tokens') AS INTEGER)), 0),
               SUM(COALESCE(
-                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER),
-                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER)
+                CAST(json_extract(payload, '$.cost.provider_reported_micro_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER) * 10000,
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_micro_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER) * 10000
               ))
             FROM sync_rollups
             GROUP BY provider
@@ -1038,7 +1082,9 @@ impl Store {
                 SourceUsageTotals {
                     events: row.get::<_, i64>(1)?.max(0) as u64,
                     tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                    estimated_cost_cents: row.get::<_, Option<i64>>(3)?,
+                    estimated_cost_cents: row
+                        .get::<_, Option<i64>>(3)?
+                        .map(micro_usd_to_cents_rounded),
                 },
             ))
         })?;
@@ -1054,8 +1100,10 @@ impl Store {
               COALESCE(SUM(COALESCE(CAST(json_extract(payload, '$.usage.requests') AS INTEGER), 1)), 0),
               COALESCE(SUM(total_tokens), 0),
               SUM(COALESCE(
-                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER),
-                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER)
+                CAST(json_extract(payload, '$.cost.provider_reported_micro_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.provider_reported_usd') AS INTEGER) * 10000,
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_micro_usd') AS INTEGER),
+                CAST(json_extract(payload, '$.cost.estimated_api_equivalent_usd') AS INTEGER) * 10000
               ))
             FROM usage_summaries
             WHERE COALESCE(json_extract(payload, '$.metadata.summary_format'), '') != 'daily_rollup.v1'
@@ -1070,7 +1118,9 @@ impl Store {
                 SourceUsageTotals {
                     events: row.get::<_, i64>(1)?.max(0) as u64,
                     tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                    estimated_cost_cents: row.get::<_, Option<i64>>(3)?,
+                    estimated_cost_cents: row
+                        .get::<_, Option<i64>>(3)?
+                        .map(micro_usd_to_cents_rounded),
                 },
             ))
         })?;
@@ -3140,7 +3190,7 @@ impl Store {
         let mut total_tokens = 0u64;
         let mut total_events = 0u64;
         let mut sessions = std::collections::BTreeSet::new();
-        let mut estimated_cost = None::<i64>; // cents USD
+        let mut estimated_cost = CostAccumulator::default();
         let mut by_provider: std::collections::BTreeMap<String, serde_json::Value> =
             std::collections::BTreeMap::new();
         let mut by_account: std::collections::BTreeMap<String, serde_json::Value> =
@@ -3160,9 +3210,7 @@ impl Store {
             total_events = total_events.saturating_add(1);
             sessions.insert(event.session.session_id.clone());
 
-            if let Some(cost) = event.cost.estimated_api_equivalent_usd {
-                estimated_cost = Some(estimated_cost.unwrap_or(0).saturating_add(cost));
-            }
+            estimated_cost.add_estimated(&event.cost);
 
             let provider_entry = by_provider
                 .entry(event.provider.clone())
@@ -3206,7 +3254,8 @@ impl Store {
             total_tokens,
             total_events,
             total_sessions: sessions.len() as u64,
-            estimated_cost_usd: estimated_cost,
+            estimated_cost_usd: estimated_cost.cents_rounded(),
+            estimated_cost_micro_usd: estimated_cost.micro_usd(),
             by_provider: Some(serde_json::to_string(&by_provider)?),
             by_account: Some(serde_json::to_string(&by_account)?),
             updated_at: chrono::Utc::now(),
@@ -4386,8 +4435,8 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let mut total_reasoning = 0u64;
     let mut total_tokens = 0u64;
     let mut total_events = 0u64;
-    let mut estimated_cost_usd = 0i64; // cents
-    let mut provider_reported_usd = 0i64; // cents
+    let mut estimated_cost = CostAccumulator::default();
+    let mut provider_reported_cost = CostAccumulator::default();
     let mut has_provider_reported_usd = false;
     let mut observed_at = first.created_at;
     let mut model_buckets: BTreeMap<String, (ModelInfo, SyncRollupModelTotals)> = BTreeMap::new();
@@ -4421,10 +4470,14 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         total_reasoning = total_reasoning.saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
         total_tokens = total_tokens.saturating_add(event.usage.computed_total());
         total_events = total_events.saturating_add(1);
-        estimated_cost_usd =
-            estimated_cost_usd.saturating_add(event.cost.estimated_api_equivalent_usd.unwrap_or(0));
-        if let Some(cost) = event.cost.provider_reported_usd {
-            provider_reported_usd = provider_reported_usd.saturating_add(cost);
+        estimated_cost.add_estimated(&event.cost);
+        if event.cost.provider_reported_micro_usd.is_some()
+            || event.cost.provider_reported_usd.is_some()
+        {
+            provider_reported_cost.add_values(
+                event.cost.provider_reported_micro_usd,
+                event.cost.provider_reported_usd,
+            );
             has_provider_reported_usd = true;
         }
         if event.created_at > observed_at {
@@ -4547,12 +4600,14 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             .total_tokens
             .saturating_add(event.usage.computed_total());
         entry.1.requests = entry.1.requests.saturating_add(1);
-        entry.1.estimated_cost_usd = entry
-            .1
-            .estimated_cost_usd
-            .saturating_add(event.cost.estimated_api_equivalent_usd.unwrap_or(0));
-        if let Some(cost) = event.cost.provider_reported_usd {
-            entry.1.provider_reported_usd = entry.1.provider_reported_usd.saturating_add(cost);
+        entry.1.estimated_cost.add_estimated(&event.cost);
+        if event.cost.provider_reported_micro_usd.is_some()
+            || event.cost.provider_reported_usd.is_some()
+        {
+            entry.1.provider_reported_cost.add_values(
+                event.cost.provider_reported_micro_usd,
+                event.cost.provider_reported_usd,
+            );
             entry.1.has_provider_reported_usd = true;
         }
     }
@@ -4583,10 +4638,16 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             },
             cost: CostInfo {
                 currency: "USD".to_string(),
-                estimated_api_equivalent_usd: Some(totals.estimated_cost_usd),
+                estimated_api_equivalent_usd: totals.estimated_cost.cents_rounded(),
                 provider_reported_usd: totals
                     .has_provider_reported_usd
-                    .then_some(totals.provider_reported_usd),
+                    .then(|| totals.provider_reported_cost.cents_rounded())
+                    .flatten(),
+                estimated_api_equivalent_micro_usd: totals.estimated_cost.micro_usd(),
+                provider_reported_micro_usd: totals
+                    .has_provider_reported_usd
+                    .then(|| totals.provider_reported_cost.micro_usd())
+                    .flatten(),
                 pricing_source: Some("local_rollup".to_string()),
                 pricing_version: None,
                 confidence: Confidence::Medium,
@@ -4648,8 +4709,14 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         },
         cost: CostInfo {
             currency: "USD".to_string(),
-            estimated_api_equivalent_usd: Some(estimated_cost_usd),
-            provider_reported_usd: has_provider_reported_usd.then_some(provider_reported_usd),
+            estimated_api_equivalent_usd: estimated_cost.cents_rounded(),
+            provider_reported_usd: has_provider_reported_usd
+                .then(|| provider_reported_cost.cents_rounded())
+                .flatten(),
+            estimated_api_equivalent_micro_usd: estimated_cost.micro_usd(),
+            provider_reported_micro_usd: has_provider_reported_usd
+                .then(|| provider_reported_cost.micro_usd())
+                .flatten(),
             pricing_source: Some("local_rollup".to_string()),
             pricing_version: None,
             confidence: Confidence::Medium,
@@ -4744,8 +4811,8 @@ struct SyncRollupModelTotals {
     reasoning_tokens: u64,
     total_tokens: u64,
     requests: u64,
-    estimated_cost_usd: i64,    // cents
-    provider_reported_usd: i64, // cents
+    estimated_cost: CostAccumulator,
+    provider_reported_cost: CostAccumulator,
     has_provider_reported_usd: bool,
 }
 
@@ -5143,6 +5210,45 @@ mod tests {
     }
 
     #[test]
+    fn reopen_uses_an_independent_connection_to_the_same_file_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("statsai.sqlite");
+        let store = Store::open(&db_path).expect("open store");
+        store
+            .conn
+            .execute(
+                "INSERT INTO local_metadata (key, value, updated_at)
+                 VALUES ('reopen-test', 'visible', '2026-07-25T00:00:00Z')",
+                [],
+            )
+            .expect("insert metadata");
+
+        let reopened = store.reopen().expect("reopen file store");
+        let value = reopened
+            .conn
+            .query_row(
+                "SELECT value FROM local_metadata WHERE key = 'reopen-test'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read metadata from independent connection");
+
+        assert_eq!(value, "visible");
+    }
+
+    #[test]
+    fn reopen_rejects_an_in_memory_store() {
+        let store = Store::in_memory().expect("store");
+
+        let error = store
+            .reopen()
+            .err()
+            .expect("in-memory store cannot be reopened");
+
+        assert!(error.to_string().contains("in-memory"));
+    }
+
+    #[test]
     fn task_bucket_sync_status_counts_tracked_and_local_bucket_union() {
         let store = Store::in_memory().expect("store");
         store
@@ -5288,6 +5394,8 @@ mod tests {
                 currency: "USD".to_string(),
                 estimated_api_equivalent_usd: None,
                 provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: None,
+                provider_reported_micro_usd: None,
                 pricing_source: Some("unknown".to_string()),
                 pricing_version: None,
                 confidence: Confidence::Low,
@@ -6968,6 +7076,32 @@ mod tests {
     }
 
     #[test]
+    fn sync_rollup_sums_micro_usd_before_rounding_to_cents() {
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-micro-usd-rollup"),
+            LocationOrigin::Configured,
+        );
+        let day = Utc
+            .with_ymd_and_hms(2026, 5, 28, 9, 0, 0)
+            .single()
+            .expect("day");
+        let mut event = test_store_event(&source, day, "record-a");
+        event.cost.set_estimated_micro_usd(2_250);
+        let events = vec![event; 1_000];
+
+        let summary = build_sync_rollup_summary(&events);
+
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(2_250_000)
+        );
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(225));
+    }
+
+    #[test]
     fn sync_rollups_track_dirty_daily_buckets() {
         let store = Store::in_memory().expect("store");
         let source = statsai_core::SourceLocation::local_adapter(
@@ -8386,6 +8520,8 @@ mod tests {
                 currency: "USD".to_string(),
                 estimated_api_equivalent_usd: None,
                 provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: None,
+                provider_reported_micro_usd: None,
                 pricing_source: Some("unknown".to_string()),
                 pricing_version: None,
                 confidence: Confidence::Low,
@@ -8443,6 +8579,8 @@ mod tests {
                 currency: "USD".to_string(),
                 estimated_api_equivalent_usd: None,
                 provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: None,
+                provider_reported_micro_usd: None,
                 pricing_source: Some("unknown".to_string()),
                 pricing_version: None,
                 confidence: Confidence::Low,

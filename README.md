@@ -147,6 +147,9 @@ codex account=work path=~/.codex-work usage_events=123 input=1,000,000 cached=80
 
 `scan` persists normalized events idempotently. Re-running it refreshes existing rows when adapter metadata improves, so new token split or estimated cost fields can be backfilled without duplicating events.
 Normal scans now keep a lightweight per-source file signature cache in SQLite and skip unchanged JSONL/stat summary files, so repeat scans usually only parse the currently active log files. The diagnostics line includes `cached=` for files skipped as unchanged.
+JSONL is read incrementally with a 16 MiB per-record ceiling. An oversized or
+invalid record is counted as invalid and discarded through its newline, after
+which parsing resumes at the next record without retaining the oversized body.
 Use `scan --no-cache` for a one-off forced reread without deleting existing data first, or `scan --replace` for a destructive source rebuild.
 
 Default local discovery currently checks:
@@ -234,7 +237,7 @@ Trusted direct reads use `source_kind = local_adapter`. Default, configured, env
 
 Local paths are hashed in source identity fields. Source and parse-evidence path labels are stripped from sync payloads, while project location path labels are retained for owner-facing dashboard display and manual project linking.
 
-Estimated cost is API-equivalent, not a subscription invoice. It uses known provider pricing for recognized models and remains `unknown` when a local log does not prove the billable model.
+Estimated cost is API-equivalent, not a subscription invoice. It uses known provider pricing for recognized models and remains `unknown` when a local log does not prove the billable model. Cost records retain integer micro-USD and expose rounded legacy cents for compatibility; aggregation happens before rounding. Pricing that changes on a published effective date is selected from the usage timestamp, and documented long-context multipliers are applied only when one request's context size is known.
 
 The backend-facing sync contract starts at `sync_batch.v1`. See `docs/sync-contract.md` for the current ingestion boundary, privacy defaults, and a minimal fixture.
 
@@ -246,6 +249,9 @@ creates a cryptographically random per-install token at
 `~/.statsai/daemon-token`; the file is readable only by the current user on
 Unix platforms. Browser-originated requests are rejected, and sync writes must
 use `Content-Type: application/json` with a body no larger than 8 MiB.
+In watch mode, changed paths are coalesced into a background scanner with its
+own SQLite WAL connection, so parsing does not block the loopback API. The
+public `/health` route never waits for the store.
 
 For example:
 

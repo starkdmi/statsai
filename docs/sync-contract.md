@@ -50,6 +50,10 @@ Canonical provider account identity may now sync through
 snapshots can also include bounded task titles, summary previews, todo excerpts,
 repo labels, branch labels, path labels, and task verification actions. The
 backend uses identity plus project metadata to route those hosted task records.
+Cost payloads may include `provider_reported_micro_usd`,
+`estimated_api_equivalent_micro_usd`, or task-level
+`estimated_cost_micro_usd`. Receivers prefer these integer micro-USD values and
+fall back to legacy rounded-cent fields when they are absent.
 
 User-defined aliases are still retained in `ProviderAccount.account_label` for
 display, but they are no longer the primary account key.
@@ -154,6 +158,13 @@ The backend tracks ownership per authenticated device and keeps device-local IDs
 separate from server-canonical IDs so account alias reconciliation cannot delete
 the canonical row. Incremental and legacy batches omit the marker and never
 prune absent records.
+
+When a device completes its first authoritative snapshot against a database that
+predates ownership tracking, the backend also reconciles legacy summary rows
+whose stored `device_id` matches that device. Rows represented by the completed
+snapshot are retained through their active ownership mapping; omitted unowned
+rows are pruned. Legacy rows from other devices, and canonical rows still owned
+by any device, are preserved.
 
 The HTTP sink parses `sync_ack.v1` and `sync_ack.v2` before updating local
 state. File and stdout sinks update state after their local write succeeds.

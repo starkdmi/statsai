@@ -3,9 +3,27 @@
 //! Provides static model pricing lookup and cost estimation
 //! decoupled from any specific adapter.
 
-use statsai_core::{Confidence, CostInfo, ModelInfo, UsageCounts};
+use chrono::{DateTime, Datelike, Utc};
+use statsai_core::{micro_usd_to_cents_rounded, Confidence, CostInfo, ModelInfo, UsageCounts};
+
+const PRICING_CATALOG_VERSION: &str = "official:2026-07-25";
+const MICRO_USD_PER_USD: i128 = 1_000_000;
+const TOKENS_PER_MILLION: i128 = 1_000_000;
+const MULTIPLIER_SCALE: i128 = 10_000;
 
 fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
+    if lower.contains("claude-fable-5") {
+        return Some("claude-fable-5");
+    }
+    if lower.contains("claude-mythos-5") {
+        return Some("claude-mythos-5");
+    }
+    if lower.contains("claude-opus-5") {
+        return Some("claude-opus-5");
+    }
+    if lower.contains("claude-sonnet-5") {
+        return Some("claude-sonnet-5");
+    }
     if lower.contains("claude-opus-4-8") || lower.contains("claude-opus-4.8") {
         return Some("claude-opus-4-8");
     }
@@ -111,6 +129,15 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("grok-4.3-latest") || lower.contains("grok-4.3") {
         return Some("grok-4.3");
     }
+    if lower.contains("grok-4.20-multi-agent-0309") {
+        return Some("grok-4.20-multi-agent-0309");
+    }
+    if lower.contains("grok-4.20-0309-reasoning") {
+        return Some("grok-4.20-0309-reasoning");
+    }
+    if lower.contains("grok-4.20-0309-non-reasoning") {
+        return Some("grok-4.20-0309-non-reasoning");
+    }
     None
 }
 
@@ -125,6 +152,10 @@ pub fn normalize_model_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
 
     match lower.as_str() {
+        "claude-fable-5" => "claude-fable-5".to_string(),
+        "claude-mythos-5" => "claude-mythos-5".to_string(),
+        "claude-opus-5" | "claude-opus-5-thinking" => "claude-opus-5".to_string(),
+        "claude-sonnet-5" | "claude-sonnet-5-thinking" => "claude-sonnet-5".to_string(),
         "claude-3-5-sonnet-20241022" | "claude-sonnet-3-5" => "claude-sonnet-3-5".to_string(),
         "claude-3-7-sonnet" | "claude-sonnet-3-7" => "claude-sonnet-3-7".to_string(),
         "claude-opus-4" => "claude-opus-4".to_string(),
@@ -168,6 +199,9 @@ pub fn normalize_model_name(name: &str) -> String {
         "grok-build" | "grok-build-0.1" => "grok-build-0.1".to_string(),
         "grok-4.5" | "grok-4.5-latest" | "grok-build-latest" => "grok-4.5".to_string(),
         "grok-4.3" | "grok-4.3-latest" => "grok-4.3".to_string(),
+        "grok-4.20-multi-agent-0309" => "grok-4.20-multi-agent-0309".to_string(),
+        "grok-4.20-0309-reasoning" => "grok-4.20-0309-reasoning".to_string(),
+        "grok-4.20-0309-non-reasoning" => "grok-4.20-0309-non-reasoning".to_string(),
         _ => normalize_proxy_wrapped_model_name(&lower)
             .map(ToString::to_string)
             .unwrap_or_else(|| name.to_ascii_lowercase()),
@@ -181,6 +215,8 @@ pub struct ModelPricing {
     pub cached_input_per_million: f64,
     pub output_per_million: f64,
 }
+
+const CLAUDE_SONNET_5_STANDARD_PRICING_START: (i32, u32, u32) = (2026, 9, 1);
 
 fn pricing(
     input_per_million: f64,
@@ -211,8 +247,24 @@ fn pricing_with_cache_creation(
 
 #[must_use]
 pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
+    pricing_for_model_on(model_name, Utc::now().date_naive())
+}
+
+fn pricing_for_model_on(model_name: &str, usage_date: chrono::NaiveDate) -> Option<ModelPricing> {
     let normalized = model_name.to_ascii_lowercase();
     match normalized.as_str() {
+        "claude-fable-5" | "claude-mythos-5" => {
+            Some(pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0))
+        }
+        "claude-opus-5" => Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 25.0)),
+        "claude-sonnet-5" => {
+            let date = (usage_date.year(), usage_date.month(), usage_date.day());
+            if date >= CLAUDE_SONNET_5_STANDARD_PRICING_START {
+                Some(pricing_with_cache_creation(3.0, 3.75, 0.3, 15.0))
+            } else {
+                Some(pricing_with_cache_creation(2.0, 2.5, 0.2, 10.0))
+            }
+        }
         "claude-opus-4" | "claude-opus-4-1" => {
             Some(pricing_with_cache_creation(15.0, 18.75, 1.5, 75.0))
         }
@@ -244,15 +296,48 @@ pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
         "gpt-5-nano" => Some(pricing(0.05, 0.005, 0.4)),
         "composer-2.5" => Some(pricing(0.5, 0.2, 2.5)),
         "composer-2.5-fast" => Some(pricing(3.0, 0.5, 15.0)),
-        "grok-build-0.1" => Some(pricing(1.0, 1.0, 2.0)),
-        "grok-4.3" => Some(pricing(1.25, 0.2, 2.5)),
-        // xAI lists $2/M input, $0.50/M cached input, and $6/M output.
-        "grok-4.5" => Some(pricing(2.0, 0.5, 6.0)),
+        "grok-build-0.1" => Some(pricing(1.0, 0.2, 2.0)),
+        "grok-4.3"
+        | "grok-4.20-multi-agent-0309"
+        | "grok-4.20-0309-reasoning"
+        | "grok-4.20-0309-non-reasoning" => Some(pricing(1.25, 0.2, 2.5)),
+        "grok-4.5" => Some(pricing(2.0, 0.3, 6.0)),
         _ => None,
     }
 }
 
-fn priced_model_name(model: &ModelInfo) -> Option<String> {
+/// Reports whether an aggregate usage period spans a known model-price change.
+///
+/// Aggregates without daily token allocation cannot be priced accurately across
+/// these boundaries because the token share on each side is unknown.
+#[must_use]
+pub fn pricing_changes_between(
+    model_name: &str,
+    period_start: chrono::NaiveDate,
+    period_end: chrono::NaiveDate,
+) -> bool {
+    let (period_start, period_end) = if period_start <= period_end {
+        (period_start, period_end)
+    } else {
+        (period_end, period_start)
+    };
+    let start = (
+        period_start.year(),
+        period_start.month(),
+        period_start.day(),
+    );
+    let end = (period_end.year(), period_end.month(), period_end.day());
+
+    match normalize_model_name(model_name).as_str() {
+        "claude-sonnet-5" => {
+            start < CLAUDE_SONNET_5_STANDARD_PRICING_START
+                && end >= CLAUDE_SONNET_5_STANDARD_PRICING_START
+        }
+        _ => false,
+    }
+}
+
+fn priced_model_name(model: &ModelInfo, usage_date: chrono::NaiveDate) -> Option<String> {
     let candidates = [
         model.normalized_name.as_deref(),
         model.name.as_deref(),
@@ -261,12 +346,12 @@ fn priced_model_name(model: &ModelInfo) -> Option<String> {
 
     for candidate in candidates.into_iter().flatten() {
         let normalized = normalize_model_name(candidate);
-        if pricing_for_model(&normalized).is_some() {
+        if pricing_for_model_on(&normalized, usage_date).is_some() {
             return Some(normalized);
         }
         if let Some((_, suffix)) = normalized.rsplit_once('/') {
             let suffix = normalize_model_name(suffix);
-            if pricing_for_model(&suffix).is_some() {
+            if pricing_for_model_on(&suffix, usage_date).is_some() {
                 return Some(suffix);
             }
         }
@@ -277,30 +362,61 @@ fn priced_model_name(model: &ModelInfo) -> Option<String> {
 
 #[must_use]
 pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCounts) -> CostInfo {
-    let Some(model_name) = model.and_then(priced_model_name) else {
+    let now = Utc::now();
+    estimate_cost_at(provider, model, usage, &now)
+}
+
+#[must_use]
+pub fn estimate_cost_at(
+    provider: &str,
+    model: Option<&ModelInfo>,
+    usage: &UsageCounts,
+    occurred_at: &DateTime<Utc>,
+) -> CostInfo {
+    let usage_date = occurred_at.date_naive();
+    let Some(model_name) = model.and_then(|model| priced_model_name(model, usage_date)) else {
         return unknown_cost();
     };
-    let Some(pricing) = pricing_for_model(&model_name) else {
+    let Some(pricing) = pricing_for_model_on(&model_name, usage_date) else {
         return unknown_cost();
     };
 
-    let input = usage.input_tokens.unwrap_or(0);
-    let cache_creation_cost = cache_creation_cost(&model_name, pricing, usage);
-    let cached = usage.cache_read_tokens.unwrap_or(0);
-    let output = usage.output_tokens.unwrap_or(0);
-    let reasoning = usage.reasoning_tokens.unwrap_or(0);
     let (input_multiplier, output_multiplier) = pricing_multipliers(&model_name, usage);
-    let cost = ((input as f64 * pricing.input_per_million
-        + cache_creation_cost
-        + cached as f64 * pricing.cached_input_per_million)
-        * input_multiplier
-        + (output as f64 + reasoning as f64) * pricing.output_per_million * output_multiplier)
-        / 1_000_000.0;
-    let cost_cents = (cost * 100.0).round() as i64;
+    let mut numerator = component_cost_numerator(
+        i128::from(usage.input_tokens.unwrap_or(0)),
+        pricing.input_per_million,
+        input_multiplier,
+    );
+    numerator = numerator.saturating_add(cache_creation_cost_numerator(
+        &model_name,
+        pricing,
+        usage,
+        input_multiplier,
+    ));
+    numerator = numerator.saturating_add(component_cost_numerator(
+        i128::from(usage.cache_read_tokens.unwrap_or(0)),
+        pricing.cached_input_per_million,
+        input_multiplier,
+    ));
+    let generated_tokens = i128::from(usage.output_tokens.unwrap_or(0))
+        .saturating_add(i128::from(usage.reasoning_tokens.unwrap_or(0)));
+    numerator = numerator.saturating_add(component_cost_numerator(
+        generated_tokens,
+        pricing.output_per_million,
+        output_multiplier,
+    ));
+    let denominator = TOKENS_PER_MILLION.saturating_mul(MULTIPLIER_SCALE);
+    let cost_micro_usd = rounded_i128_to_i64(numerator, denominator);
+    let cost_cents = micro_usd_to_cents_rounded(cost_micro_usd);
 
     let pricing_source = match model_name.as_str() {
         "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{model_name}"),
-        "grok-build-0.1" | "grok-4.3" | "grok-4.5" => {
+        "grok-build-0.1"
+        | "grok-4.3"
+        | "grok-4.5"
+        | "grok-4.20-multi-agent-0309"
+        | "grok-4.20-0309-reasoning"
+        | "grok-4.20-0309-non-reasoning" => {
             format!("xai_api_pricing:{model_name}")
         }
         _ => format!("{provider}_api_pricing:{model_name}"),
@@ -310,16 +426,42 @@ pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCou
         currency: "USD".to_string(),
         estimated_api_equivalent_usd: Some(cost_cents),
         provider_reported_usd: None,
+        estimated_api_equivalent_micro_usd: Some(cost_micro_usd),
+        provider_reported_micro_usd: None,
         pricing_source: Some(pricing_source),
-        pricing_version: Some("static:2026-07".to_string()),
+        pricing_version: Some(PRICING_CATALOG_VERSION.to_string()),
         confidence: Confidence::Medium,
     }
 }
 
-fn cache_creation_cost(model_name: &str, pricing: ModelPricing, usage: &UsageCounts) -> f64 {
+fn dollars_per_million_to_micro_usd(rate: f64) -> i128 {
+    (rate * MICRO_USD_PER_USD as f64).round() as i128
+}
+
+fn component_cost_numerator(tokens: i128, rate: f64, multiplier: i128) -> i128 {
+    tokens
+        .saturating_mul(dollars_per_million_to_micro_usd(rate))
+        .saturating_mul(multiplier)
+}
+
+fn rounded_i128_to_i64(numerator: i128, denominator: i128) -> i64 {
+    let rounded = numerator.saturating_add(denominator / 2) / denominator;
+    i64::try_from(rounded).unwrap_or(i64::MAX)
+}
+
+fn cache_creation_cost_numerator(
+    model_name: &str,
+    pricing: ModelPricing,
+    usage: &UsageCounts,
+    multiplier: i128,
+) -> i128 {
     let total = usage.cache_creation_tokens.unwrap_or(0);
     if !model_name.starts_with("claude-") {
-        return total as f64 * pricing.cache_creation_per_million;
+        return component_cost_numerator(
+            i128::from(total),
+            pricing.cache_creation_per_million,
+            multiplier,
+        );
     }
 
     let one_hour = usage.cache_creation_1h_tokens.unwrap_or(0).min(total);
@@ -329,25 +471,52 @@ fn cache_creation_cost(model_name: &str, pricing: ModelPricing, usage: &UsageCou
         .min(total.saturating_sub(one_hour));
     let unclassified = total.saturating_sub(one_hour.saturating_add(five_minute));
     let default_lifetime = five_minute.saturating_add(unclassified);
-    default_lifetime as f64 * pricing.cache_creation_per_million
-        + one_hour as f64 * pricing.input_per_million * 2.0
+    component_cost_numerator(
+        i128::from(default_lifetime),
+        pricing.cache_creation_per_million,
+        multiplier,
+    )
+    .saturating_add(component_cost_numerator(
+        i128::from(one_hour),
+        pricing.input_per_million * 2.0,
+        multiplier,
+    ))
 }
 
-fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (f64, f64) {
-    const GPT_5_4_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
+fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (i128, i128) {
+    const OPENAI_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
+    const XAI_LONG_CONTEXT_THRESHOLD: u64 = 200_000;
 
     let prompt_tokens = usage
         .input_tokens
         .unwrap_or(0)
         .saturating_add(usage.cache_creation_tokens.unwrap_or(0))
         .saturating_add(usage.cache_read_tokens.unwrap_or(0));
-    if model_name == "gpt-5.4"
+    let is_openai_long_context_model = matches!(
+        model_name,
+        "gpt-5.4" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    );
+    let is_xai_long_context_model = matches!(
+        model_name,
+        "grok-build-0.1"
+            | "grok-4.3"
+            | "grok-4.5"
+            | "grok-4.20-multi-agent-0309"
+            | "grok-4.20-0309-reasoning"
+            | "grok-4.20-0309-non-reasoning"
+    );
+    if is_openai_long_context_model
         && usage.requests == Some(1)
-        && prompt_tokens > GPT_5_4_LONG_CONTEXT_THRESHOLD
+        && prompt_tokens > OPENAI_LONG_CONTEXT_THRESHOLD
     {
-        (2.0, 1.5)
+        (20_000, 15_000)
+    } else if is_xai_long_context_model
+        && usage.requests == Some(1)
+        && prompt_tokens >= XAI_LONG_CONTEXT_THRESHOLD
+    {
+        (20_000, 20_000)
     } else {
-        (1.0, 1.0)
+        (MULTIPLIER_SCALE, MULTIPLIER_SCALE)
     }
 }
 
@@ -357,6 +526,8 @@ pub fn unknown_cost() -> CostInfo {
         currency: "USD".to_string(),
         estimated_api_equivalent_usd: None,
         provider_reported_usd: None,
+        estimated_api_equivalent_micro_usd: None,
+        provider_reported_micro_usd: None,
         pricing_source: Some("unknown".to_string()),
         pricing_version: None,
         confidence: Confidence::Low,
@@ -552,7 +723,7 @@ mod tests {
 
         let cost = estimate_cost("grok_build", Some(&model), &usage);
 
-        assert_eq!(cost.estimated_api_equivalent_usd, Some(850));
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(830));
         assert_eq!(
             cost.pricing_source.as_deref(),
             Some("xai_api_pricing:grok-4.5")
@@ -920,5 +1091,124 @@ mod tests {
                 Some(expected_source.as_str())
             );
         }
+    }
+
+    #[test]
+    fn preserves_sub_cent_cost_in_micro_usd() {
+        let model = statsai_core::ModelInfo {
+            name: Some("gpt-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000),
+            output_tokens: Some(100),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("codex", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(2_250));
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(0));
+    }
+
+    #[test]
+    fn applies_verified_xai_cached_and_long_context_rates() {
+        let model = statsai_core::ModelInfo {
+            name: Some("grok-4.5".to_string()),
+            normalized_name: Some("grok-4.5".to_string()),
+            provider_model_id: Some("grok-4.5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let cached_usage = UsageCounts {
+            cache_read_tokens: Some(100_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let long_context_usage = UsageCounts {
+            input_tokens: Some(200_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+
+        let cached_cost = estimate_cost("grok_build", Some(&model), &cached_usage);
+        let long_context_cost = estimate_cost("grok_build", Some(&model), &long_context_usage);
+
+        assert_eq!(cached_cost.estimated_api_equivalent_micro_usd, Some(30_000));
+        assert_eq!(
+            long_context_cost.estimated_api_equivalent_micro_usd,
+            Some(920_000)
+        );
+    }
+
+    #[test]
+    fn applies_gpt_5_6_long_context_rates() {
+        let model = statsai_core::ModelInfo {
+            name: Some("gpt-5.6-terra".to_string()),
+            normalized_name: Some("gpt-5.6-terra".to_string()),
+            provider_model_id: Some("gpt-5.6-terra".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(300_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("codex", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(1_725_000));
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(173));
+    }
+
+    #[test]
+    fn sonnet_5_pricing_uses_usage_date() {
+        let model = statsai_core::ModelInfo {
+            name: Some("claude-sonnet-5".to_string()),
+            normalized_name: Some("claude-sonnet-5".to_string()),
+            provider_model_id: Some("claude-sonnet-5".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+        let introductory_date = chrono::DateTime::parse_from_rfc3339("2026-08-31T23:59:59Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        let standard_date = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+
+        let introductory =
+            estimate_cost_at("claude_code", Some(&model), &usage, &introductory_date);
+        let standard = estimate_cost_at("claude_code", Some(&model), &usage, &standard_date);
+
+        assert_eq!(introductory.estimated_api_equivalent_usd, Some(1_200));
+        assert_eq!(standard.estimated_api_equivalent_usd, Some(1_800));
+    }
+
+    #[test]
+    fn sonnet_5_reports_aggregate_periods_that_cross_its_price_change() {
+        let before = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).expect("before boundary");
+        let boundary = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).expect("boundary");
+        let after = chrono::NaiveDate::from_ymd_opt(2026, 9, 2).expect("after boundary");
+
+        assert!(pricing_changes_between("claude-sonnet-5", before, boundary));
+        assert!(pricing_changes_between(
+            "anthropic/claude-sonnet-5",
+            after,
+            before
+        ));
+        assert!(!pricing_changes_between("claude-sonnet-5", boundary, after));
+        assert!(!pricing_changes_between("claude-opus-5", before, after));
     }
 }

@@ -64,6 +64,9 @@ the archived conversation without `--no-cache`.
 Collection parses Codex JSONL records incrementally and commits each source
 candidate in its own transaction. Interrupting a long first import therefore
 retains completed files, and a later run resumes from the remaining candidates.
+Every provider JSONL reader enforces a 16 MiB record ceiling. Oversized records
+are marked missing/invalid, drained through the next newline, and do not stop
+later records in the same file from being collected.
 Parser or security-policy revisions invalidate the archive import cache when an
 authoritative rescan is required to reconcile previously stored content.
 

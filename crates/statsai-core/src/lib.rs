@@ -380,9 +380,122 @@ pub struct CostInfo {
     pub currency: String,
     pub estimated_api_equivalent_usd: Option<i64>, // cents USD
     pub provider_reported_usd: Option<i64>,        // cents USD
+    /// Exact estimated cost in millionths of a USD. New producers populate this
+    /// alongside the legacy cent field so older consumers remain compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_api_equivalent_micro_usd: Option<i64>,
+    /// Exact provider-reported cost in millionths of a USD, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_reported_micro_usd: Option<i64>,
     pub pricing_source: Option<String>,
     pub pricing_version: Option<String>,
     pub confidence: Confidence,
+}
+
+pub const MICRO_USD_PER_CENT: i64 = 10_000;
+
+#[must_use]
+pub fn micro_usd_to_cents_rounded(micro_usd: i64) -> i64 {
+    let half_cent = MICRO_USD_PER_CENT / 2;
+    if micro_usd >= 0 {
+        micro_usd.saturating_add(half_cent) / MICRO_USD_PER_CENT
+    } else {
+        micro_usd.saturating_sub(half_cent) / MICRO_USD_PER_CENT
+    }
+}
+
+impl CostInfo {
+    /// Returns the exact estimated cost when present, or converts a legacy
+    /// whole-cent value for payloads created before micro-USD support.
+    #[must_use]
+    pub fn estimated_micro_usd(&self) -> Option<i64> {
+        self.estimated_api_equivalent_micro_usd.or_else(|| {
+            self.estimated_api_equivalent_usd
+                .map(|cents| cents.saturating_mul(MICRO_USD_PER_CENT))
+        })
+    }
+
+    /// Returns the exact provider cost when present, or converts a legacy
+    /// whole-cent value for payloads created before micro-USD support.
+    #[must_use]
+    pub fn provider_reported_micro_usd_value(&self) -> Option<i64> {
+        self.provider_reported_micro_usd.or_else(|| {
+            self.provider_reported_usd
+                .map(|cents| cents.saturating_mul(MICRO_USD_PER_CENT))
+        })
+    }
+
+    pub fn set_estimated_micro_usd(&mut self, micro_usd: i64) {
+        self.estimated_api_equivalent_micro_usd = Some(micro_usd);
+        self.estimated_api_equivalent_usd = Some(micro_usd_to_cents_rounded(micro_usd));
+    }
+
+    pub fn set_provider_reported_micro_usd(&mut self, micro_usd: i64) {
+        self.provider_reported_micro_usd = Some(micro_usd);
+        self.provider_reported_usd = Some(micro_usd_to_cents_rounded(micro_usd));
+    }
+}
+
+/// Accumulates exact micro-USD values and rounds only when a cent value is
+/// requested. Legacy cent-only inputs remain supported, including values too
+/// large to represent as micro-USD.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CostAccumulator {
+    has_value: bool,
+    micro_usd: Option<i64>,
+    fallback_cents: i64,
+}
+
+impl CostAccumulator {
+    pub fn add_values(&mut self, exact_micro_usd: Option<i64>, legacy_cents: Option<i64>) {
+        let Some(fallback_cents) = exact_micro_usd
+            .map(micro_usd_to_cents_rounded)
+            .or(legacy_cents)
+        else {
+            return;
+        };
+        let converted_micro_usd = exact_micro_usd
+            .or_else(|| legacy_cents.and_then(|cents| cents.checked_mul(MICRO_USD_PER_CENT)));
+
+        if self.has_value {
+            self.micro_usd = self
+                .micro_usd
+                .zip(converted_micro_usd)
+                .and_then(|(current, next)| current.checked_add(next));
+        } else {
+            self.micro_usd = converted_micro_usd;
+            self.has_value = true;
+        }
+        self.fallback_cents = self.fallback_cents.saturating_add(fallback_cents);
+    }
+
+    pub fn add_estimated(&mut self, cost: &CostInfo) {
+        self.add_values(
+            cost.estimated_api_equivalent_micro_usd,
+            cost.estimated_api_equivalent_usd,
+        );
+    }
+
+    pub fn add_effective(&mut self, cost: &CostInfo) {
+        if cost.provider_reported_micro_usd.is_some() || cost.provider_reported_usd.is_some() {
+            self.add_values(cost.provider_reported_micro_usd, cost.provider_reported_usd);
+        } else {
+            self.add_estimated(cost);
+        }
+    }
+
+    #[must_use]
+    pub fn micro_usd(&self) -> Option<i64> {
+        self.has_value.then_some(self.micro_usd).flatten()
+    }
+
+    #[must_use]
+    pub fn cents_rounded(&self) -> Option<i64> {
+        self.has_value.then(|| {
+            self.micro_usd
+                .map_or(self.fallback_cents, micro_usd_to_cents_rounded)
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -647,6 +760,8 @@ pub struct DailyRollup {
     pub total_events: u64,
     pub total_sessions: u64,
     pub estimated_cost_usd: Option<i64>, // cents USD
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_micro_usd: Option<i64>,
     pub by_provider: Option<String>,
     pub by_account: Option<String>,
     pub updated_at: DateTime<Utc>,
@@ -1027,9 +1142,21 @@ pub struct UsageTotals {
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub estimated_cost_usd: Option<i64>, // cents USD
+    pub estimated_cost_micro_usd: Option<i64>,
 }
 
 impl UsageTotals {
+    fn cost_accumulator(&self) -> CostAccumulator {
+        let mut accumulator = CostAccumulator::default();
+        accumulator.add_values(self.estimated_cost_micro_usd, self.estimated_cost_usd);
+        accumulator
+    }
+
+    fn set_cost_from_accumulator(&mut self, accumulator: CostAccumulator) {
+        self.estimated_cost_micro_usd = accumulator.micro_usd();
+        self.estimated_cost_usd = accumulator.cents_rounded();
+    }
+
     pub fn add_event(&mut self, event: &UsageEvent) {
         self.input_tokens = self
             .input_tokens
@@ -1049,10 +1176,9 @@ impl UsageTotals {
         self.total_tokens = self
             .total_tokens
             .saturating_add(event.usage.computed_total());
-        if let Some(cost) = event.cost.estimated_api_equivalent_usd {
-            self.estimated_cost_usd =
-                Some(self.estimated_cost_usd.unwrap_or(0).saturating_add(cost));
-        }
+        let mut cost = self.cost_accumulator();
+        cost.add_estimated(&event.cost);
+        self.set_cost_from_accumulator(cost);
     }
 
     pub fn add_summary(&mut self, summary: &UsageSummary) {
@@ -1074,14 +1200,9 @@ impl UsageTotals {
         self.total_tokens = self
             .total_tokens
             .saturating_add(summary.usage.computed_total());
-        if let Some(cost) = summary
-            .cost
-            .provider_reported_usd
-            .or(summary.cost.estimated_api_equivalent_usd)
-        {
-            self.estimated_cost_usd =
-                Some(self.estimated_cost_usd.unwrap_or(0).saturating_add(cost));
-        }
+        let mut cost = self.cost_accumulator();
+        cost.add_effective(&summary.cost);
+        self.set_cost_from_accumulator(cost);
     }
 
     pub fn add_totals(&mut self, other: &UsageTotals) {
@@ -1095,10 +1216,9 @@ impl UsageTotals {
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
-        if let Some(cost) = other.estimated_cost_usd {
-            self.estimated_cost_usd =
-                Some(self.estimated_cost_usd.unwrap_or(0).saturating_add(cost));
-        }
+        let mut cost = self.cost_accumulator();
+        cost.add_values(other.estimated_cost_micro_usd, other.estimated_cost_usd);
+        self.set_cost_from_accumulator(cost);
     }
 }
 
@@ -1169,7 +1289,7 @@ impl UsagePrefix {
     fn add_event(&mut self, event: &UsageEvent) {
         self.usage.add_event(event);
         self.events += 1;
-        if event.cost.estimated_api_equivalent_usd.is_some() {
+        if event.cost.estimated_micro_usd().is_some() {
             self.estimated_cost_samples += 1;
         }
     }
@@ -1178,6 +1298,30 @@ impl UsagePrefix {
         let estimated_cost_samples = self
             .estimated_cost_samples
             .saturating_sub(earlier.estimated_cost_samples);
+        let exact_cost_micro_usd = if estimated_cost_samples == 0 {
+            None
+        } else {
+            let earlier_micro_usd = if earlier.estimated_cost_samples == 0 {
+                Some(0)
+            } else {
+                earlier.usage.estimated_cost_micro_usd
+            };
+            self.usage
+                .estimated_cost_micro_usd
+                .zip(earlier_micro_usd)
+                .map(|(current, earlier)| current.saturating_sub(earlier))
+        };
+        let estimated_cost_usd = (estimated_cost_samples > 0).then(|| {
+            exact_cost_micro_usd.map_or_else(
+                || {
+                    self.usage
+                        .estimated_cost_usd
+                        .unwrap_or(0)
+                        .saturating_sub(earlier.usage.estimated_cost_usd.unwrap_or(0))
+                },
+                micro_usd_to_cents_rounded,
+            )
+        });
         (
             self.events.saturating_sub(earlier.events),
             UsageTotals {
@@ -1205,12 +1349,8 @@ impl UsagePrefix {
                     .usage
                     .total_tokens
                     .saturating_sub(earlier.usage.total_tokens),
-                estimated_cost_usd: (estimated_cost_samples > 0).then(|| {
-                    self.usage
-                        .estimated_cost_usd
-                        .unwrap_or(0)
-                        .saturating_sub(earlier.usage.estimated_cost_usd.unwrap_or(0))
-                }),
+                estimated_cost_usd,
+                estimated_cost_micro_usd: exact_cost_micro_usd,
             },
         )
     }
@@ -1863,6 +2003,8 @@ mod tests {
                 currency: "USD".to_string(),
                 estimated_api_equivalent_usd: cost_cents,
                 provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: None,
+                provider_reported_micro_usd: None,
                 pricing_source: None,
                 pricing_version: None,
                 confidence: Confidence::Low,
@@ -1917,6 +2059,8 @@ mod tests {
                 currency: "USD".to_string(),
                 estimated_api_equivalent_usd: None,
                 provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: None,
+                provider_reported_micro_usd: None,
                 pricing_source: None,
                 pricing_version: None,
                 confidence: Confidence::Low,
@@ -2048,6 +2192,37 @@ mod tests {
         assert_eq!(report.summary_rows.len(), 1);
         // Direct event usage within summary period
         assert_eq!(report.summary_rows[0].direct_event_usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn event_usage_series_preserves_legacy_cent_fallback_in_range_differences() {
+        let source = test_source("codex", "/tmp/codex");
+        let before_range_at = mk_dt(2026, 5, 1);
+        let inside_range_at = mk_dt(2026, 5, 2);
+        let legacy_cents = i64::MAX / MICRO_USD_PER_CENT + 1;
+        let before_range = test_event(
+            "codex",
+            &source,
+            before_range_at,
+            100,
+            Some(legacy_cents + 7),
+        );
+        let inside_range = test_event(
+            "codex",
+            &source,
+            inside_range_at,
+            200,
+            Some(legacy_cents + 11),
+        );
+        let series = EventUsageSeries::from_events(vec![&before_range, &inside_range]);
+
+        let (events, usage) =
+            series.usage_between(inside_range_at, inside_range_at + Duration::days(1), false);
+
+        assert_eq!(events, 1);
+        assert_eq!(usage.total_tokens, 200);
+        assert_eq!(usage.estimated_cost_usd, Some(legacy_cents + 11));
+        assert_eq!(usage.estimated_cost_micro_usd, None);
     }
 
     #[test]

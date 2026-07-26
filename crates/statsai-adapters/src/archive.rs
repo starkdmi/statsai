@@ -1,8 +1,9 @@
 use super::{
     canonical_display, codex_project_context_from_value, codex_usage_roots, collect_jsonl_files,
     expand_home_path, grok_sessions_root, model_from_nested_value, open_sqlite_readonly,
-    resolve_project_context, source_root_path, timestamp_from_nested_value, ProjectContextCache,
-    CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, GROK_BUILD_PROVIDER, OPENCODE_PROVIDER,
+    read_bounded_jsonl_line, resolve_project_context, source_root_path,
+    timestamp_from_nested_value, BoundedLineRead, ProjectContextCache, CLAUDE_CODE_PROVIDER,
+    CODEX_PROVIDER, GROK_BUILD_PROVIDER, MAX_JSONL_RECORD_BYTES, OPENCODE_PROVIDER,
 };
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -18,7 +19,7 @@ use statsai_core::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -189,14 +190,32 @@ fn collect_codex_file(
     let mut fallback_user_items = Vec::new();
 
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
+    let mut reader = BufReader::new(file);
+    let mut line_bytes = Vec::new();
+    let mut line_number = 0usize;
+    loop {
+        let status = read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
+        if status == BoundedLineRead::Eof {
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        if status == BoundedLineRead::Oversized {
+            diagnostics.records_scanned += 1;
+            diagnostics.invalid_records += 1;
+            builder.missing_content += 1;
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+            diagnostics.records_scanned += 1;
+            diagnostics.invalid_records += 1;
+            builder.missing_content += 1;
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let line_number = index + 1;
         diagnostics.records_scanned += 1;
-        let value = match serde_json::from_str::<Value>(&line) {
+        let value = match serde_json::from_str::<Value>(line) {
             Ok(value) => value,
             Err(_) => {
                 diagnostics.invalid_records += 1;
@@ -383,12 +402,23 @@ fn codex_archive_header(
 ) -> Result<(String, Option<String>, Option<ProjectInfo>)> {
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut project_cache = ProjectContextCache::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
+    let mut reader = BufReader::new(file);
+    let mut line_bytes = Vec::new();
+    loop {
+        let status = read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
+        if status == BoundedLineRead::Eof {
+            break;
+        }
+        if status == BoundedLineRead::Oversized {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+            continue;
+        };
         if !line.contains("session_meta") {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if value.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -462,13 +492,32 @@ fn collect_claude_file(
         .to_string();
     let mut builder =
         ConversationBuilder::new(CLAUDE_CODE_PROVIDER, source, fallback_id.clone(), path);
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
+    let mut reader = BufReader::new(file);
+    let mut line_bytes = Vec::new();
+    let mut line_number = 0usize;
+    loop {
+        let status = read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
+        if status == BoundedLineRead::Eof {
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        if status == BoundedLineRead::Oversized {
+            diagnostics.records_scanned += 1;
+            diagnostics.invalid_records += 1;
+            builder.missing_content += 1;
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+            diagnostics.records_scanned += 1;
+            diagnostics.invalid_records += 1;
+            builder.missing_content += 1;
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
         diagnostics.records_scanned += 1;
-        let value = match serde_json::from_str::<Value>(&line) {
+        let value = match serde_json::from_str::<Value>(line) {
             Ok(value) => value,
             Err(_) => {
                 diagnostics.invalid_records += 1;
@@ -516,7 +565,7 @@ fn collect_claude_file(
         };
         let native_item_id = native_id_from_value(&value)
             .or_else(|| native_id_from_value(message))
-            .unwrap_or_else(|| format!("line:{}", index + 1));
+            .unwrap_or_else(|| format!("line:{line_number}"));
         let created_at = timestamp_from_nested_value(&value);
         let model = model_from_nested_value(&value, None);
         let usage = message
@@ -527,7 +576,7 @@ fn collect_claude_file(
             .map_or_else(|| vec![content], |blocks| blocks.iter().collect());
         for (part_index, block) in content_blocks.into_iter().enumerate() {
             let content_type = block.get("type").and_then(Value::as_str).unwrap_or("");
-            let source_record_id = format!("{}:{}:{part_index}", path.display(), index + 1);
+            let source_record_id = format!("{}:{line_number}:{part_index}", path.display());
             if claude_block_is_opaque_reasoning(block, content_type) {
                 builder.discarded_source_record_ids.push(source_record_id);
                 continue;
@@ -568,7 +617,7 @@ fn collect_claude_file(
                 conversation_native_id: &builder.native_id,
                 native_item_id: &block_native_item_id,
                 source_record_id: &source_record_id,
-                ordinal: ((index + 1) as u64) << 32 | part_index as u64,
+                ordinal: (line_number as u64) << 32 | part_index as u64,
                 kind,
                 role: item_role,
                 created_at,
@@ -684,13 +733,33 @@ fn collect_grok(
             }
         }
         let file = File::open(&chat_path)?;
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            let line = line?;
+        let mut reader = BufReader::new(file);
+        let mut line_bytes = Vec::new();
+        let mut line_number = 0usize;
+        loop {
+            let status =
+                read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
+            if status == BoundedLineRead::Eof {
+                break;
+            }
+            line_number = line_number.saturating_add(1);
+            if status == BoundedLineRead::Oversized {
+                scan.diagnostics.records_scanned += 1;
+                scan.diagnostics.invalid_records += 1;
+                builder.missing_content += 1;
+                continue;
+            }
+            let Ok(line) = std::str::from_utf8(&line_bytes) else {
+                scan.diagnostics.records_scanned += 1;
+                scan.diagnostics.invalid_records += 1;
+                builder.missing_content += 1;
+                continue;
+            };
             if line.trim().is_empty() {
                 continue;
             }
             scan.diagnostics.records_scanned += 1;
-            let value = match serde_json::from_str::<Value>(&line) {
+            let value = match serde_json::from_str::<Value>(line) {
                 Ok(value) => value,
                 Err(_) => {
                     scan.diagnostics.invalid_records += 1;
@@ -724,14 +793,14 @@ fn collect_grok(
                 collect_artifact_dependencies(content, &chat_path, &mut artifact_dependencies);
             }
             let native_item_id =
-                native_id_from_value(&value).unwrap_or_else(|| format!("line:{}", index + 1));
-            let source_record_id = format!("{}:{}", chat_path.display(), index + 1);
+                native_id_from_value(&value).unwrap_or_else(|| format!("line:{line_number}"));
+            let source_record_id = format!("{}:{line_number}", chat_path.display());
             let (item, missing) = item_from_value(ItemInput {
                 provider: GROK_BUILD_PROVIDER,
                 conversation_native_id: &native_id,
                 native_item_id: &native_item_id,
                 source_record_id: &source_record_id,
-                ordinal: (index + 1) as u64,
+                ordinal: line_number as u64,
                 kind,
                 role: Some(role),
                 created_at: timestamp_from_nested_value(&value),

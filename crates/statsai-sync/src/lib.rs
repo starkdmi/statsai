@@ -614,6 +614,8 @@ mod tests {
                 currency: "USD".to_string(),
                 estimated_api_equivalent_usd: None,
                 provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: None,
+                provider_reported_micro_usd: None,
                 pricing_source: None,
                 pricing_version: None,
                 confidence: statsai_core::Confidence::Low,

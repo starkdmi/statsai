@@ -53,9 +53,32 @@ pub struct ReportedUsageSummaryRecord {
 }
 
 fn reported_summary_cost_key(cost: &CostInfo) -> Option<String> {
-    cost.provider_reported_usd
-        .or(cost.estimated_api_equivalent_usd)
-        .map(|cost_cents| format!("{:.4}", cost_cents as f64 / 100.0))
+    cost.provider_reported_micro_usd
+        .map(micro_usd_reported_summary_cost_key)
+        .or_else(|| {
+            cost.provider_reported_usd
+                .map(legacy_reported_summary_cost_key)
+        })
+        .or_else(|| {
+            cost.estimated_api_equivalent_micro_usd
+                .map(micro_usd_reported_summary_cost_key)
+        })
+        .or_else(|| {
+            cost.estimated_api_equivalent_usd
+                .map(legacy_reported_summary_cost_key)
+        })
+}
+
+fn micro_usd_reported_summary_cost_key(micro_usd: i64) -> String {
+    if micro_usd % 10_000 == 0 {
+        legacy_reported_summary_cost_key(micro_usd / 10_000)
+    } else {
+        format!("micro_usd:{micro_usd}")
+    }
+}
+
+fn legacy_reported_summary_cost_key(cost_cents: i64) -> String {
+    format!("{:.4}", cost_cents as f64 / 100.0)
 }
 
 fn canonical_report_format(value: &str) -> &str {
@@ -165,6 +188,8 @@ pub fn build_reported_usage_summary(
         currency: "USD".to_string(),
         estimated_api_equivalent_usd: None,
         provider_reported_usd: None,
+        estimated_api_equivalent_micro_usd: None,
+        provider_reported_micro_usd: None,
         pricing_source: Some("manual".to_string()),
         pricing_version: None,
         confidence: Confidence::Low,
@@ -459,12 +484,101 @@ mod tests {
             currency: "USD".to_string(),
             estimated_api_equivalent_usd: Some(35),
             provider_reported_usd: None,
+            estimated_api_equivalent_micro_usd: None,
+            provider_reported_micro_usd: None,
             pricing_source: Some("manual".to_string()),
             pricing_version: None,
             confidence: Confidence::Low,
         };
 
         assert_eq!(reported_summary_cost_key(&cost).as_deref(), Some("0.3500"));
+    }
+
+    #[test]
+    fn reported_summary_cost_key_preserves_legacy_id_for_cent_exact_micro_usd() {
+        let mut legacy_cost = CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: Some(35),
+            provider_reported_usd: None,
+            estimated_api_equivalent_micro_usd: None,
+            provider_reported_micro_usd: None,
+            pricing_source: Some("manual".to_string()),
+            pricing_version: None,
+            confidence: Confidence::Low,
+        };
+        let legacy_key = reported_summary_cost_key(&legacy_cost);
+
+        legacy_cost.estimated_api_equivalent_micro_usd = Some(350_000);
+        let enriched_key = reported_summary_cost_key(&legacy_cost);
+
+        assert_eq!(enriched_key, legacy_key);
+        legacy_cost.estimated_api_equivalent_micro_usd = Some(350_001);
+        assert_eq!(
+            reported_summary_cost_key(&legacy_cost).as_deref(),
+            Some("micro_usd:350001")
+        );
+
+        legacy_cost.provider_reported_usd = Some(35);
+        assert_eq!(
+            reported_summary_cost_key(&legacy_cost).as_deref(),
+            Some("0.3500")
+        );
+    }
+
+    #[test]
+    fn estimated_precision_enrichment_preserves_provider_reported_summary_id() {
+        let legacy_cost = CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: None,
+            provider_reported_usd: Some(35),
+            estimated_api_equivalent_micro_usd: None,
+            provider_reported_micro_usd: None,
+            pricing_source: Some("manual".to_string()),
+            pricing_version: None,
+            confidence: Confidence::Low,
+        };
+        let input = ReportedUsageSummaryInput {
+            schema_version: REPORTED_USAGE_SUMMARY_INPUT_SCHEMA_VERSION.to_string(),
+            provider: "claude_code".to_string(),
+            provider_account_id: None,
+            provider_user_id: None,
+            email: Some("personal@example.com".to_string()),
+            account_label: Some("personal".to_string()),
+            source_kind: SourceKind::Manual,
+            source_name: "user_reported_usage".to_string(),
+            evidence_id: Some("cost-enrichment".to_string()),
+            evidence_path: None,
+            report_format: "manual_daily".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(
+                Utc.with_ymd_and_hms(2025, 7, 11, 23, 59, 59)
+                    .single()
+                    .expect("end"),
+            ),
+            observed_at: None,
+            model: None,
+            usage: UsageCounts {
+                total_tokens: Some(100),
+                ..UsageCounts::default()
+            },
+            cost: Some(legacy_cost),
+            confidence: Some(Confidence::Medium),
+        };
+        let legacy = build_reported_usage_summary(input.clone(), "device").expect("legacy");
+        let mut enriched_input = input;
+        enriched_input
+            .cost
+            .as_mut()
+            .expect("cost")
+            .estimated_api_equivalent_micro_usd = Some(350_001);
+        let enriched = build_reported_usage_summary(enriched_input, "device").expect("enriched");
+
+        assert_eq!(legacy.summary.summary_id, enriched.summary.summary_id);
     }
 
     #[test]
