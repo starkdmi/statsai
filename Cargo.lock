@@ -1796,9 +1796,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opf-mlx"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2df0f50b10cb6c597c7d740b7c7c9bbdde5f2b29d00c740cf7e6568d0def0ae9"
+checksum = "5d168d0f010cf1d86abab9fbf68f6abbaa01b4c6a59c8c0d21f02a3f72321ef7"
 dependencies = [
  "nix",
  "serde",
@@ -2455,6 +2455,7 @@ dependencies = [
 name = "statsai-pricing"
 version = "0.3.2"
 dependencies = [
+ "chrono",
  "statsai-core",
 ]
 
