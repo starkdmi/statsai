@@ -503,6 +503,20 @@ pub struct SummaryModelUsage {
     pub model: ModelInfo,
     pub usage: UsageCounts,
     pub cost: CostInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<SummaryModelMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SummaryMetricTotals {
+    pub samples: u64,
+    pub sum: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SummaryModelMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_tps: Option<SummaryMetricTotals>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

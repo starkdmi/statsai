@@ -19,9 +19,9 @@ use statsai_core::{
     PrivacyMode, ProviderAccount, ProviderAccountId, SemanticFingerprintInput,
     SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
     SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SummaryId,
-    SummaryMetadata, SummaryMetrics, SummaryModelUsage, SyncBatch, TaskVerificationCursor,
-    TaskVerificationId, UsageCounts, UsageEvent, UsageSummary, VerifiedSourceState,
-    VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    SummaryMetadata, SummaryMetricTotals, SummaryMetrics, SummaryModelMetrics, SummaryModelUsage,
+    SyncBatch, TaskVerificationCursor, TaskVerificationId, UsageCounts, UsageEvent, UsageSummary,
+    VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
     SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
@@ -39,7 +39,7 @@ pub use tasks::{
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
 };
 
-const SYNC_ROLLUP_SUMMARY_VERSION: &str = "11";
+const SYNC_ROLLUP_SUMMARY_VERSION: &str = "12";
 const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
 const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
 const SQLITE_BUSY_TIMEOUT: Duration = if cfg!(test) {
@@ -4457,6 +4457,7 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let mut tracked_reasoning_tokens = 0u64;
 
     for event in events {
+        let mut event_generated_tps = None;
         total_input = total_input.saturating_add(event.usage.input_tokens.unwrap_or(0));
         total_output = total_output.saturating_add(event.usage.output_tokens.unwrap_or(0));
         total_cache_creation =
@@ -4526,7 +4527,9 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
                         .output_tokens
                         .unwrap_or(0)
                         .saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
-                    generated_tps_values.push(generated_tokens as f64 / duration_seconds);
+                    let generated_tps = generated_tokens as f64 / duration_seconds;
+                    event_generated_tps = Some(generated_tps);
+                    generated_tps_values.push(generated_tps);
                     visible_tps_values
                         .push(event.usage.output_tokens.unwrap_or(0) as f64 / duration_seconds);
                 }
@@ -4567,6 +4570,10 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         let entry = model_buckets
             .entry(sync_rollup_model_key(&model))
             .or_insert_with(|| (model.clone(), SyncRollupModelTotals::default()));
+        if let Some(generated_tps) = event_generated_tps {
+            entry.1.generated_tps_samples = entry.1.generated_tps_samples.saturating_add(1);
+            entry.1.generated_tps_sum += generated_tps;
+        }
         entry.1.input_tokens = entry
             .1
             .input_tokens
@@ -4652,6 +4659,12 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
                 pricing_version: None,
                 confidence: Confidence::Medium,
             },
+            metrics: (totals.generated_tps_samples > 0).then_some(SummaryModelMetrics {
+                generated_tps: Some(SummaryMetricTotals {
+                    samples: totals.generated_tps_samples,
+                    sum: totals.generated_tps_sum,
+                }),
+            }),
         })
         .collect();
     let summary_metrics = summary_metrics_or_none(SummaryMetrics {
@@ -4811,6 +4824,8 @@ struct SyncRollupModelTotals {
     reasoning_tokens: u64,
     total_tokens: u64,
     requests: u64,
+    generated_tps_samples: u64,
+    generated_tps_sum: f64,
     estimated_cost: CostAccumulator,
     provider_reported_cost: CostAccumulator,
     has_provider_reported_usd: bool,
@@ -7599,6 +7614,13 @@ mod tests {
         let mut first = test_store_event(&source, day, "metrics-a");
         first.session.session_id = "session-a".to_string();
         first.session.local_session_id_hash = Some("session-a".to_string());
+        first.model = Some(ModelInfo {
+            name: Some("gpt-5.6-sol".to_string()),
+            normalized_name: Some("gpt-5.6-sol".to_string()),
+            provider_model_id: Some("gpt-5.6-sol".to_string()),
+            reasoning_level: Some(ReasoningLevel::High),
+            reasoning_level_raw: Some("high".to_string()),
+        });
         first.usage = UsageCounts {
             input_tokens: Some(60),
             output_tokens: Some(30),
@@ -7625,6 +7647,13 @@ mod tests {
         let mut second = test_store_event(&source, day + chrono::Duration::minutes(2), "metrics-b");
         second.session.session_id = "session-b".to_string();
         second.session.local_session_id_hash = Some("session-b".to_string());
+        second.model = Some(ModelInfo {
+            name: Some("codex-auto-review".to_string()),
+            normalized_name: Some("codex-auto-review".to_string()),
+            provider_model_id: Some("codex-auto-review".to_string()),
+            reasoning_level: Some(ReasoningLevel::Low),
+            reasoning_level_raw: Some("low".to_string()),
+        });
         second.usage = UsageCounts {
             input_tokens: Some(40),
             output_tokens: Some(20),
@@ -7694,6 +7723,37 @@ mod tests {
         );
         assert_eq!(metrics.overall_generated_tps, Some(7.5));
         assert_eq!(metrics.overall_visible_tps, Some(6.25));
+        assert_eq!(dirty[0].models.len(), 2);
+        let primary = dirty[0]
+            .models
+            .iter()
+            .find(|entry| entry.model.normalized_name.as_deref() == Some("gpt-5.6-sol"))
+            .expect("primary model metrics");
+        assert_eq!(
+            primary
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.generated_tps.as_ref()),
+            Some(&SummaryMetricTotals {
+                samples: 1,
+                sum: 8.0,
+            })
+        );
+        let reviewer = dirty[0]
+            .models
+            .iter()
+            .find(|entry| entry.model.normalized_name.as_deref() == Some("codex-auto-review"))
+            .expect("review model metrics");
+        assert_eq!(
+            reviewer
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics.generated_tps.as_ref()),
+            Some(&SummaryMetricTotals {
+                samples: 1,
+                sum: 20.0 / 3.0,
+            })
+        );
     }
 
     #[test]
