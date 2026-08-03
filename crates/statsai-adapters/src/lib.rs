@@ -35,10 +35,10 @@ pub const GROK_BUILD_PROVIDER: &str = "grok_build";
 const SESSION_SCOPED_EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
 const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v4";
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
-// Invalidate unchanged-file scan cache entries whenever Codex parsing semantics change,
-// so historical sessions get rescanned for both runtime and project context.
+// Invalidate unchanged-file scan cache entries whenever provider parsing semantics change,
+// so historical sessions get rescanned for runtime, pricing, and project context updates.
 const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v26";
-const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v19";
+const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v22";
 const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
 const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v17";
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
@@ -593,6 +593,10 @@ fn scan_claude_source(
             ) {
                 continue;
             }
+            let project = event_rollup
+                .and_then(SessionEventRollup::consistent_project)
+                .cloned()
+                .or_else(|| entry.project.clone());
             let title = entry
                 .title
                 .clone()
@@ -600,8 +604,7 @@ fn scan_claude_source(
             let issue_keys = extract_issue_keys(&[
                 title.as_str(),
                 entry.summary_preview.as_deref().unwrap_or(""),
-                entry
-                    .project
+                project
                     .as_ref()
                     .and_then(|project| project.branch_label.as_deref())
                     .unwrap_or(""),
@@ -635,13 +638,12 @@ fn scan_claude_source(
                 todo_excerpt: None,
                 issue_keys,
                 branch_family: branch_family(
-                    entry
-                        .project
+                    project
                         .as_ref()
                         .and_then(|project| project.branch_label.as_deref()),
                 ),
-                project_bucket: project_bucket_key(entry.project.as_ref()),
-                project: entry.project.clone(),
+                project_bucket: project_bucket_key(project.as_ref()),
+                project,
                 git: None,
                 usage: event_rollup
                     .map(|rollup| rollup.usage.clone())
@@ -1583,6 +1585,16 @@ struct SessionEventRollup {
     event_ids: Vec<EventId>,
     usage: UsageCounts,
     cost: CostAccumulator,
+    project: Option<ProjectInfo>,
+    project_conflict: bool,
+}
+
+impl SessionEventRollup {
+    fn consistent_project(&self) -> Option<&ProjectInfo> {
+        (!self.project_conflict)
+            .then_some(self.project.as_ref())
+            .flatten()
+    }
 }
 
 fn session_event_rollups(events: &[UsageEvent]) -> HashMap<String, SessionEventRollup> {
@@ -1595,6 +1607,15 @@ fn session_event_rollups(events: &[UsageEvent]) -> HashMap<String, SessionEventR
         rollup.event_ids.push(event.event_id.clone());
         rollup.usage = sum_usage_counts(&rollup.usage, &event.usage);
         rollup.cost.add_estimated(&event.cost);
+        if let Some(project) = event.project.as_ref() {
+            if rollup.project.as_ref().is_some_and(|existing| {
+                project_bucket_key(Some(existing)) != project_bucket_key(Some(project))
+            }) {
+                rollup.project_conflict = true;
+            } else if rollup.project.is_none() {
+                rollup.project = Some(project.clone());
+            }
+        }
     }
     rollups
 }
@@ -2159,7 +2180,9 @@ fn parse_claude_file(
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
-    let project = claude_project_context_for_file(session_projects, projects, path);
+    let indexed_project_metadata = claude_session_metadata_for_file(session_projects, path);
+    let fallback_project = claude_project_context_for_file(session_projects, projects, path);
+    let mut project_cache = ProjectContextCache::new();
     let mut current_reasoning = ModelReasoningState::default();
 
     let mut line_bytes = Vec::new();
@@ -2220,6 +2243,9 @@ fn parse_claude_file(
         if model_inferred {
             ctx.scan.diagnostics.model_fallbacks += 1;
         }
+        let project =
+            claude_project_context_from_value(&value, indexed_project_metadata, &mut project_cache)
+                .or_else(|| fallback_project.clone());
         let session_raw = value
             .get("sessionId")
             .or_else(|| value.get("session_id"))
@@ -2239,7 +2265,7 @@ fn parse_claude_file(
                 usage,
                 runtime: None,
                 session_raw,
-                project: project.clone(),
+                project,
                 event_kind: "claude_message_usage",
                 source_file: path,
                 source_line_number: Some(index),
@@ -2254,6 +2280,43 @@ fn parse_claude_file(
     }
 
     Ok(())
+}
+
+fn claude_project_context_from_value(
+    value: &Value,
+    indexed_metadata: Option<&ClaudeSessionProjectMetadata>,
+    cache: &mut ProjectContextCache,
+) -> Option<ProjectInfo> {
+    let project_path = value
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .or_else(|| {
+            value
+                .get("projectPath")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+        })
+        .map(expand_home_path)?;
+    let branch = value
+        .get("gitBranch")
+        .and_then(Value::as_str)
+        .filter(|branch| !branch.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            indexed_metadata
+                .filter(|metadata| {
+                    metadata
+                        .project_path
+                        .as_deref()
+                        .is_some_and(|indexed_path| {
+                            canonical_display(indexed_path) == canonical_display(&project_path)
+                        })
+                })
+                .and_then(|metadata| metadata.git_branch.clone())
+        });
+
+    resolve_project_context_cached(Some(project_path), None, branch, cache)
 }
 
 fn claude_project_context_for_file(
@@ -6653,6 +6716,159 @@ mod tests {
     }
 
     #[test]
+    fn claude_extracts_project_context_from_jsonl_when_session_index_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_store = root
+            .join("projects")
+            .join("-home-example-src-ExampleWorkspace");
+        let workspace = root.join("workspace").join("ExampleWorkspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_git_fixture(
+            &workspace,
+            "https://github.com/example-org/example-workspace.git",
+            "main",
+        );
+
+        let session_path = project_store.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            format!(
+                "{{\"timestamp\":\"2026-05-01T00:00:00Z\",\"cwd\":\"{}\",\"gitBranch\":\"feature/jsonl-project\",\"message\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":2}}}}}}\n",
+                workspace.display()
+            ),
+        )
+        .expect("session");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let project = scan.events[0].project.as_ref().expect("project");
+        assert_eq!(
+            project.path_label.as_deref(),
+            Some(workspace.to_string_lossy().as_ref())
+        );
+        assert_eq!(project.project_label.as_deref(), Some("ExampleWorkspace"));
+        assert_eq!(
+            project.repo_label.as_deref(),
+            Some("example-org/example-workspace")
+        );
+        assert_eq!(
+            project.branch_label.as_deref(),
+            Some("feature/jsonl-project")
+        );
+    }
+
+    #[test]
+    fn claude_falls_back_to_valid_project_path_when_cwd_is_invalid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace").join("ExampleWorkspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_git_fixture(
+            &workspace,
+            "https://github.com/example-org/example-workspace.git",
+            "main",
+        );
+
+        for invalid_cwd in [Value::Null, serde_json::json!(42), serde_json::json!("   ")] {
+            let value = serde_json::json!({
+                "cwd": invalid_cwd,
+                "projectPath": workspace.to_string_lossy(),
+                "gitBranch": "main"
+            });
+            let mut cache = ProjectContextCache::new();
+            let project = claude_project_context_from_value(&value, None, &mut cache)
+                .expect("projectPath fallback");
+
+            assert_eq!(
+                project.path_label.as_deref(),
+                Some(workspace.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                project.repo_label.as_deref(),
+                Some("example-org/example-workspace")
+            );
+        }
+    }
+
+    #[test]
+    fn claude_jsonl_project_context_overrides_stale_session_index_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let project_store = root.join("projects").join("example-workspace");
+        let stale_workspace = root.join("workspace").join("OldWorkspace");
+        let current_workspace = root.join("workspace").join("CurrentWorkspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(&stale_workspace).expect("stale workspace");
+        std::fs::create_dir_all(&current_workspace).expect("current workspace");
+        write_git_fixture(
+            &stale_workspace,
+            "https://github.com/example-org/old-workspace.git",
+            "old-branch",
+        );
+        write_git_fixture(
+            &current_workspace,
+            "https://github.com/example-org/current-workspace.git",
+            "main",
+        );
+
+        let session_path = project_store.join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            format!(
+                "{{\"timestamp\":\"2026-05-01T00:00:00Z\",\"sessionId\":\"abc\",\"cwd\":\"{}\",\"message\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":2}}}}}}\n",
+                current_workspace.display()
+            ),
+        )
+        .expect("session");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            format!(
+                "{{\"version\":1,\"entries\":[{{\"sessionId\":\"abc\",\"fullPath\":\"{}\",\"gitBranch\":\"old-branch\",\"projectPath\":\"{}\"}}]}}",
+                session_path.display(),
+                stale_workspace.display()
+            ),
+        )
+        .expect("session index");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            root,
+            LocationOrigin::Configured,
+        );
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let project = scan.events[0].project.as_ref().expect("project");
+        assert_eq!(
+            project.path_label.as_deref(),
+            Some(current_workspace.to_string_lossy().as_ref())
+        );
+        assert_eq!(project.project_label.as_deref(), Some("CurrentWorkspace"));
+        assert_eq!(
+            project.repo_label.as_deref(),
+            Some("example-org/current-workspace")
+        );
+        assert_eq!(project.branch_label.as_deref(), Some("main"));
+
+        assert_eq!(scan.task_spans.len(), 1);
+        let task = &scan.task_spans[0];
+        assert_eq!(task.project.as_ref(), Some(project));
+        assert_eq!(task.project_bucket, project_bucket_key(Some(project)));
+        assert_eq!(task.linked_event_ids, vec![scan.events[0].event_id.clone()]);
+    }
+
+    #[test]
     fn codex_extracts_cwd_and_git_metadata_from_session_meta() {
         let dir = tempfile::tempdir().expect("tempdir");
         let codex_root = dir.path().join("codex");
@@ -7916,6 +8132,16 @@ mod tests {
             .expect("Claude parser revision");
 
         assert!(revision > 18);
+    }
+
+    #[test]
+    fn jsonl_project_context_upgrade_advances_claude_parser_revision() {
+        let revision = CLAUDE_SCAN_CACHE_PARSER_REVISION
+            .rsplit_once(".v")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .expect("Claude parser revision");
+
+        assert!(revision > 21);
     }
 
     #[test]
