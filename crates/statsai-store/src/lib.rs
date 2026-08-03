@@ -4833,10 +4833,11 @@ struct SyncRollupModelTotals {
 
 fn sync_rollup_model_key(model: &ModelInfo) -> String {
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
         model.normalized_name.as_deref().unwrap_or(""),
         model.provider_model_id.as_deref().unwrap_or(""),
         model.name.as_deref().unwrap_or(""),
+        model.speed.as_deref().unwrap_or(""),
         model
             .reasoning_level
             .as_ref()
@@ -4979,6 +4980,13 @@ fn semantically_same_event(left: &UsageEvent, right: &UsageEvent) -> bool {
         && session_matches
         && project_matches
         && model_key(left) == model_key(right)
+        && optional_value_matches(
+            left.model.as_ref().and_then(|model| model.speed.as_deref()),
+            right
+                .model
+                .as_ref()
+                .and_then(|model| model.speed.as_deref()),
+        )
         && reasoning_matches_for_dedupe(left.model.as_ref(), right.model.as_ref())
         && usage_counts_equivalent(&left.provider, &left.usage, &right.usage)
         && left.usage.computed_total() == right.usage.computed_total()
@@ -5131,6 +5139,9 @@ fn refreshed_duplicate_event(
     }
     if refreshed_model.reasoning_level_raw.is_none() {
         refreshed_model.reasoning_level_raw = existing_model.reasoning_level_raw.clone();
+    }
+    if refreshed_model.speed.is_none() {
+        refreshed_model.speed = existing_model.speed.clone();
     }
 
     refreshed
@@ -5607,6 +5618,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -5618,6 +5630,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::Low),
             reasoning_level_raw: Some("low".to_string()),
         });
@@ -5664,6 +5677,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::Low),
             reasoning_level_raw: Some("low".to_string()),
         });
@@ -5675,6 +5689,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -5720,6 +5735,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::Medium),
             reasoning_level_raw: Some("medium".to_string()),
         });
@@ -5729,6 +5745,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -5774,6 +5791,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::Low),
             reasoning_level_raw: Some("low".to_string()),
         });
@@ -5785,6 +5803,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::High),
             reasoning_level_raw: Some("high".to_string()),
         });
@@ -5822,6 +5841,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::Low),
             reasoning_level_raw: Some("low".to_string()),
         });
@@ -5834,6 +5854,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::High),
             reasoning_level_raw: Some("high".to_string()),
         });
@@ -5863,6 +5884,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::High),
             reasoning_level_raw: Some("high".to_string()),
         });
@@ -5875,6 +5897,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -5954,6 +5977,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -5966,6 +5990,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::Low),
             reasoning_level_raw: Some("low".to_string()),
         });
@@ -5977,6 +6002,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::High),
             reasoning_level_raw: Some("high".to_string()),
         });
@@ -6020,6 +6046,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -6117,6 +6144,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -6240,6 +6268,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -6342,6 +6371,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -6448,6 +6478,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -6578,6 +6609,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -6661,6 +6693,7 @@ mod tests {
             name: Some("gpt-5-codex".to_string()),
             normalized_name: Some("gpt-5-codex".to_string()),
             provider_model_id: Some("gpt-5-codex".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -7140,6 +7173,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -7187,6 +7221,7 @@ mod tests {
             name: Some("gpt-4.1".to_string()),
             normalized_name: Some("gpt-4.1".to_string()),
             provider_model_id: Some("gpt-4.1".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -7348,6 +7383,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::Low),
             reasoning_level_raw: Some("low".to_string()),
         });
@@ -7358,6 +7394,7 @@ mod tests {
             name: Some("gpt-5.5".to_string()),
             normalized_name: Some("gpt-5.5".to_string()),
             provider_model_id: Some("gpt-5.5".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::High),
             reasoning_level_raw: Some("high".to_string()),
         });
@@ -7376,6 +7413,58 @@ mod tests {
         assert!(dirty[0].models.iter().any(|entry| {
             entry.model.reasoning_level == Some(ReasoningLevel::High)
                 && entry.usage.total_tokens == Some(25)
+        }));
+    }
+
+    #[test]
+    fn sync_rollups_split_same_model_by_speed() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-sync-rollups-speed"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let day = Utc
+            .with_ymd_and_hms(2026, 8, 1, 9, 0, 0)
+            .single()
+            .expect("day");
+        let mut standard = test_store_event(&source, day, "record-standard");
+        standard.model = Some(ModelInfo {
+            name: Some("claude-opus-5".to_string()),
+            normalized_name: Some("claude-opus-5".to_string()),
+            provider_model_id: Some("claude-opus-5".to_string()),
+            speed: Some("standard".to_string()),
+            reasoning_level: Some(ReasoningLevel::Medium),
+            reasoning_level_raw: Some("medium".to_string()),
+        });
+        standard.usage.total_tokens = Some(15);
+
+        let mut fast = test_store_event(&source, day + chrono::Duration::hours(1), "record-fast");
+        fast.model = Some(ModelInfo {
+            name: Some("claude-opus-5".to_string()),
+            normalized_name: Some("claude-opus-5".to_string()),
+            provider_model_id: Some("claude-opus-5".to_string()),
+            speed: Some("fast".to_string()),
+            reasoning_level: Some(ReasoningLevel::Medium),
+            reasoning_level_raw: Some("medium".to_string()),
+        });
+        fast.usage.total_tokens = Some(25);
+
+        assert!(store.insert_event(&standard).expect("insert standard"));
+        assert!(store.insert_event(&fast).expect("insert fast"));
+
+        let dirty = store.dirty_sync_rollup_summaries().expect("dirty rollups");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].models.len(), 2);
+        assert!(dirty[0].models.iter().any(|entry| {
+            entry.model.speed.as_deref() == Some("standard") && entry.usage.total_tokens == Some(15)
+        }));
+        assert!(dirty[0].models.iter().any(|entry| {
+            entry.model.speed.as_deref() == Some("fast") && entry.usage.total_tokens == Some(25)
         }));
     }
 
@@ -7550,6 +7639,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         });
@@ -7618,6 +7708,7 @@ mod tests {
             name: Some("gpt-5.6-sol".to_string()),
             normalized_name: Some("gpt-5.6-sol".to_string()),
             provider_model_id: Some("gpt-5.6-sol".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::High),
             reasoning_level_raw: Some("high".to_string()),
         });
@@ -7651,6 +7742,7 @@ mod tests {
             name: Some("codex-auto-review".to_string()),
             normalized_name: Some("codex-auto-review".to_string()),
             provider_model_id: Some("codex-auto-review".to_string()),
+            speed: None,
             reasoning_level: Some(ReasoningLevel::Low),
             reasoning_level_raw: Some("low".to_string()),
         });
@@ -8626,6 +8718,7 @@ mod tests {
                 name: Some("claude-test".to_string()),
                 normalized_name: Some("claude-test".to_string()),
                 provider_model_id: Some("claude-test".to_string()),
+                speed: None,
                 reasoning_level: None,
                 reasoning_level_raw: None,
             }),

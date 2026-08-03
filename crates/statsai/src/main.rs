@@ -17484,6 +17484,7 @@ mod tests {
                 name: Some("claude-test".to_string()),
                 normalized_name: Some("claude-test".to_string()),
                 provider_model_id: Some("claude-test".to_string()),
+                speed: None,
                 reasoning_level: None,
                 reasoning_level_raw: None,
             }),

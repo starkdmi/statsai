@@ -261,6 +261,7 @@ pub enum ReasoningLevel {
     High,
     Xhigh,
     Max,
+    Ultracode,
 }
 
 impl ReasoningLevel {
@@ -272,6 +273,7 @@ impl ReasoningLevel {
             "high" => Some(Self::High),
             "xhigh" => Some(Self::Xhigh),
             "max" => Some(Self::Max),
+            "ultracode" => Some(Self::Ultracode),
             _ => None,
         }
     }
@@ -284,6 +286,7 @@ impl ReasoningLevel {
             Self::High => "high",
             Self::Xhigh => "xhigh",
             Self::Max => "max",
+            Self::Ultracode => "ultracode",
         }
     }
 }
@@ -293,6 +296,8 @@ pub struct ModelInfo {
     pub name: Option<String>,
     pub normalized_name: Option<String>,
     pub provider_model_id: Option<String>,
+    /// Provider-reported inference speed, such as Claude's `standard` or `fast`.
+    pub speed: Option<String>,
     pub reasoning_level: Option<ReasoningLevel>,
     pub reasoning_level_raw: Option<String>,
 }
@@ -1840,6 +1845,15 @@ mod tests {
         let codex = source_id("codex", SourceKind::LocalAdapter, "abc");
         let claude = source_id("claude_code", SourceKind::LocalAdapter, "abc");
         assert_ne!(codex, claude);
+    }
+
+    #[test]
+    fn reasoning_level_supports_ultracode() {
+        assert_eq!(
+            ReasoningLevel::parse("ultracode"),
+            Some(ReasoningLevel::Ultracode)
+        );
+        assert_eq!(ReasoningLevel::Ultracode.as_str(), "ultracode");
     }
 
     #[test]

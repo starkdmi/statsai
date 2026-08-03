@@ -6,7 +6,7 @@
 use chrono::{DateTime, Datelike, Utc};
 use statsai_core::{micro_usd_to_cents_rounded, Confidence, CostInfo, ModelInfo, UsageCounts};
 
-const PRICING_CATALOG_VERSION: &str = "official:2026-07-25";
+const PRICING_CATALOG_VERSION: &str = "official:2026-08-03";
 const MICRO_USD_PER_USD: i128 = 1_000_000;
 const TOKENS_PER_MILLION: i128 = 1_000_000;
 const MULTIPLIER_SCALE: i128 = 10_000;
@@ -245,6 +245,28 @@ fn pricing_with_cache_creation(
     }
 }
 
+fn pricing_for_effective_speed(
+    model_name: &str,
+    speed: Option<&str>,
+    standard: ModelPricing,
+) -> (ModelPricing, bool) {
+    let is_fast = speed.is_some_and(|speed| speed.trim().eq_ignore_ascii_case("fast"));
+    if !is_fast {
+        return (standard, false);
+    }
+
+    let fast = match model_name {
+        "claude-opus-5" | "claude-opus-4-8" => pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0),
+        // Historical fast-mode rates. Effective `usage.speed` is authoritative:
+        // unsupported requests either failed or reported `standard` after fallback.
+        "claude-opus-4-6" | "claude-opus-4-7" => {
+            pricing_with_cache_creation(30.0, 37.5, 3.0, 150.0)
+        }
+        _ => return (standard, false),
+    };
+    (fast, true)
+}
+
 #[must_use]
 pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
     pricing_for_model_on(model_name, Utc::now().date_naive())
@@ -374,12 +396,17 @@ pub fn estimate_cost_at(
     occurred_at: &DateTime<Utc>,
 ) -> CostInfo {
     let usage_date = occurred_at.date_naive();
-    let Some(model_name) = model.and_then(|model| priced_model_name(model, usage_date)) else {
+    let Some(model) = model else {
         return unknown_cost();
     };
-    let Some(pricing) = pricing_for_model_on(&model_name, usage_date) else {
+    let Some(model_name) = priced_model_name(model, usage_date) else {
         return unknown_cost();
     };
+    let Some(standard_pricing) = pricing_for_model_on(&model_name, usage_date) else {
+        return unknown_cost();
+    };
+    let (pricing, uses_fast_mode_pricing) =
+        pricing_for_effective_speed(&model_name, model.speed.as_deref(), standard_pricing);
 
     let (input_multiplier, output_multiplier) = pricing_multipliers(&model_name, usage);
     let mut numerator = component_cost_numerator(
@@ -409,7 +436,7 @@ pub fn estimate_cost_at(
     let cost_micro_usd = rounded_i128_to_i64(numerator, denominator);
     let cost_cents = micro_usd_to_cents_rounded(cost_micro_usd);
 
-    let pricing_source = match model_name.as_str() {
+    let mut pricing_source = match model_name.as_str() {
         "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{model_name}"),
         "grok-build-0.1"
         | "grok-4.3"
@@ -421,6 +448,9 @@ pub fn estimate_cost_at(
         }
         _ => format!("{provider}_api_pricing:{model_name}"),
     };
+    if uses_fast_mode_pricing {
+        pricing_source.push_str(":fast");
+    }
 
     CostInfo {
         currency: "USD".to_string(),
@@ -664,6 +694,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -687,6 +718,7 @@ mod tests {
             name: Some("xai/grok-build-0.1".to_string()),
             normalized_name: Some("xai/grok-build-0.1".to_string()),
             provider_model_id: Some("xai/grok-build-0.1".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -711,6 +743,7 @@ mod tests {
             name: Some("grok-4.5-latest".to_string()),
             normalized_name: Some("grok-4.5".to_string()),
             provider_model_id: Some("grok-4.5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -736,6 +769,7 @@ mod tests {
             name: Some("grok-4.3-latest".to_string()),
             normalized_name: Some("grok-4.3".to_string()),
             provider_model_id: Some("grok-4.3".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -761,6 +795,7 @@ mod tests {
             name: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
             normalized_name: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
             provider_model_id: Some("google/antigravity-claude-opus-4-5-thinking".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -786,6 +821,7 @@ mod tests {
             name: Some("claude-opus-4-6-thinking".to_string()),
             normalized_name: Some("claude-opus-4-6".to_string()),
             provider_model_id: Some("claude-opus-4-6-thinking".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -806,11 +842,83 @@ mod tests {
     }
 
     #[test]
+    fn claude_fast_mode_prices_all_token_categories_at_premium_rates() {
+        let standard_model = statsai_core::ModelInfo {
+            name: Some("claude-opus-5".to_string()),
+            normalized_name: Some("claude-opus-5".to_string()),
+            provider_model_id: Some("claude-opus-5".to_string()),
+            speed: Some("standard".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let fast_model = statsai_core::ModelInfo {
+            speed: Some("fast".to_string()),
+            ..standard_model.clone()
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_creation_tokens: Some(2_000_000),
+            cache_creation_5m_tokens: Some(1_000_000),
+            cache_creation_1h_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+
+        let standard = estimate_cost("claude_code", Some(&standard_model), &usage);
+        let fast = estimate_cost("claude_code", Some(&fast_model), &usage);
+
+        assert_eq!(standard.estimated_api_equivalent_usd, Some(4_675));
+        assert_eq!(
+            standard.estimated_api_equivalent_micro_usd,
+            Some(46_750_000)
+        );
+        assert_eq!(fast.estimated_api_equivalent_usd, Some(9_350));
+        assert_eq!(fast.estimated_api_equivalent_micro_usd, Some(93_500_000));
+        assert_eq!(
+            fast.pricing_source.as_deref(),
+            Some("claude_code_api_pricing:claude-opus-5:fast")
+        );
+    }
+
+    #[test]
+    fn historical_claude_fast_mode_uses_the_six_times_opus_rate() {
+        let standard_model = statsai_core::ModelInfo {
+            name: Some("claude-opus-4-7".to_string()),
+            normalized_name: Some("claude-opus-4-7".to_string()),
+            provider_model_id: Some("claude-opus-4-7".to_string()),
+            speed: Some("standard".to_string()),
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+        let fast_model = statsai_core::ModelInfo {
+            speed: Some("fast".to_string()),
+            ..standard_model.clone()
+        };
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+
+        let standard = estimate_cost("claude_code", Some(&standard_model), &usage);
+        let fast = estimate_cost("claude_code", Some(&fast_model), &usage);
+
+        assert_eq!(standard.estimated_api_equivalent_usd, Some(3_000));
+        assert_eq!(fast.estimated_api_equivalent_usd, Some(18_000));
+        assert_eq!(
+            fast.pricing_source.as_deref(),
+            Some("claude_code_api_pricing:claude-opus-4-7:fast")
+        );
+    }
+
+    #[test]
     fn estimates_cost_for_legacy_claude_opus_4() {
         let model = statsai_core::ModelInfo {
             name: Some("claude-opus-4".to_string()),
             normalized_name: Some("claude-opus-4".to_string()),
             provider_model_id: Some("claude-opus-4".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -836,6 +944,7 @@ mod tests {
             name: Some("openai/gpt-5.2-codex".to_string()),
             normalized_name: Some("openai/gpt-5.2-codex".to_string()),
             provider_model_id: Some("openai/gpt-5.2-codex".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -857,6 +966,7 @@ mod tests {
             name: Some("openai/gpt-5.4".to_string()),
             normalized_name: Some("openai/gpt-5.4".to_string()),
             provider_model_id: Some("openai/gpt-5.4".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -875,6 +985,7 @@ mod tests {
             name: Some("gpt-5.4".to_string()),
             normalized_name: Some("gpt-5.4".to_string()),
             provider_model_id: Some("gpt-5.4".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -914,6 +1025,7 @@ mod tests {
             name: Some("unknown-model".to_string()),
             normalized_name: Some("unknown-model".to_string()),
             provider_model_id: Some("unknown-model".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -942,6 +1054,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -962,6 +1075,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -980,6 +1094,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -1002,6 +1117,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -1026,6 +1142,7 @@ mod tests {
             name: Some("claude-sonnet-4-6".to_string()),
             normalized_name: Some("claude-sonnet-4-6".to_string()),
             provider_model_id: Some("claude-sonnet-4-6".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -1047,6 +1164,7 @@ mod tests {
             name: Some("claude-sonnet-4-6".to_string()),
             normalized_name: Some("claude-sonnet-4-6".to_string()),
             provider_model_id: Some("claude-sonnet-4-6".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -1079,6 +1197,7 @@ mod tests {
                 name: Some(model_name.to_string()),
                 normalized_name: Some(model_name.to_string()),
                 provider_model_id: Some(model_name.to_string()),
+                speed: None,
                 reasoning_level: None,
                 reasoning_level_raw: None,
             };
@@ -1099,6 +1218,7 @@ mod tests {
             name: Some("gpt-5".to_string()),
             normalized_name: Some("gpt-5".to_string()),
             provider_model_id: Some("gpt-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -1120,6 +1240,7 @@ mod tests {
             name: Some("grok-4.5".to_string()),
             normalized_name: Some("grok-4.5".to_string()),
             provider_model_id: Some("grok-4.5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -1151,6 +1272,7 @@ mod tests {
             name: Some("gpt-5.6-terra".to_string()),
             normalized_name: Some("gpt-5.6-terra".to_string()),
             provider_model_id: Some("gpt-5.6-terra".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };
@@ -1173,6 +1295,7 @@ mod tests {
             name: Some("claude-sonnet-5".to_string()),
             normalized_name: Some("claude-sonnet-5".to_string()),
             provider_model_id: Some("claude-sonnet-5".to_string()),
+            speed: None,
             reasoning_level: None,
             reasoning_level_raw: None,
         };

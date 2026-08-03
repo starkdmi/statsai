@@ -38,7 +38,7 @@ const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever Codex parsing semantics change,
 // so historical sessions get rescanned for both runtime and project context.
 const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v26";
-const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v17";
+const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v19";
 const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
 const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v17";
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
@@ -2211,7 +2211,11 @@ fn parse_claude_file(
         if timestamp_inferred {
             ctx.scan.diagnostics.timestamp_fallbacks += 1;
         }
-        let model = with_reasoning_state(model_from_nested_value(&value, None), &current_reasoning);
+        let model = with_model_metadata(
+            model_from_nested_value(&value, None),
+            &current_reasoning,
+            claude_speed_from_usage(usage_value),
+        );
         let model_inferred = model.is_none();
         if model_inferred {
             ctx.scan.diagnostics.model_fallbacks += 1;
@@ -4822,6 +4826,14 @@ fn model_from_nested_value(value: &Value, fallback: Option<&str>) -> Option<Mode
 }
 
 fn claude_reasoning_state_from_value(value: &Value) -> ModelReasoningState {
+    let effort = value
+        .get("effort")
+        .or_else(|| value.pointer("/message/effort"))
+        .and_then(Value::as_str);
+    if effort.is_some() {
+        return ModelReasoningState::from_raw(effort);
+    }
+
     let max_thinking_tokens = [
         value.pointer("/thinkingMetadata/maxThinkingTokens"),
         value.pointer("/thinking_metadata/maxThinkingTokens"),
@@ -4838,6 +4850,14 @@ fn claude_reasoning_state_from_value(value: &Value) -> ModelReasoningState {
         level: None,
         raw: max_thinking_tokens.map(|value| value.to_string()),
     }
+}
+
+fn claude_speed_from_usage(usage: &Value) -> Option<&str> {
+    usage
+        .get("speed")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|speed| !speed.is_empty())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4884,6 +4904,17 @@ fn with_reasoning_state(
     })
 }
 
+fn with_model_metadata(
+    model: Option<ModelInfo>,
+    reasoning: &ModelReasoningState,
+    speed: Option<&str>,
+) -> Option<ModelInfo> {
+    with_reasoning_state(model, reasoning).map(|mut model| {
+        model.speed = speed.map(ToOwned::to_owned);
+        model
+    })
+}
+
 fn reasoning_state_from_model(model: &ModelInfo) -> ModelReasoningState {
     ModelReasoningState {
         level: model.reasoning_level,
@@ -4901,6 +4932,7 @@ fn model_info(model: &str) -> ModelInfo {
         name: Some(model.to_string()),
         normalized_name: Some(normalized),
         provider_model_id: Some(model.to_string()),
+        speed: None,
         reasoning_level: None,
         reasoning_level_raw: None,
     }
@@ -4943,6 +4975,7 @@ fn opencode_named_model_info(label: &str, reasoning: &ModelReasoningState) -> Mo
         name: Some(label.to_string()),
         normalized_name: Some(normalize_provider_qualified_model_name(label)),
         provider_model_id: Some(label.to_string()),
+        speed: None,
         reasoning_level: reasoning.level,
         reasoning_level_raw: reasoning.raw.clone(),
     }
@@ -7866,6 +7899,26 @@ mod tests {
     }
 
     #[test]
+    fn model_metadata_upgrade_advances_claude_parser_revision() {
+        let revision = CLAUDE_SCAN_CACHE_PARSER_REVISION
+            .rsplit_once(".v")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .expect("Claude parser revision");
+
+        assert!(revision > 17);
+    }
+
+    #[test]
+    fn fast_mode_pricing_upgrade_advances_claude_parser_revision() {
+        let revision = CLAUDE_SCAN_CACHE_PARSER_REVISION
+            .rsplit_once(".v")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .expect("Claude parser revision");
+
+        assert!(revision > 18);
+    }
+
+    #[test]
     fn codex_scan_candidates_accept_same_release_versioned_namespace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = dir.path().join("sessions");
@@ -9532,6 +9585,63 @@ mod tests {
         assert_eq!(model.name.as_deref(), Some("claude-opus-4-5-thinking"));
         assert_eq!(model.reasoning_level, None);
         assert_eq!(model.reasoning_level_raw, None);
+    }
+
+    #[test]
+    fn claude_collects_effort_and_effective_speed_but_ignores_service_tier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let projects = dir.path().join("projects/workspace");
+        std::fs::create_dir_all(&projects).expect("projects");
+        std::fs::write(
+            projects.join("session.jsonl"),
+            serde_json::json!({
+                "timestamp": "2026-08-01T00:00:00Z",
+                "sessionId": "session-fast",
+                "type": "assistant",
+                "effort": "medium",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-5",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "speed": "fast",
+                        "service_tier": "priority"
+                    }
+                }
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write session");
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        let model = scan.events[0].model.as_ref().expect("model");
+        assert_eq!(model.speed.as_deref(), Some("fast"));
+        assert_eq!(model.reasoning_level, Some(ReasoningLevel::Medium));
+        assert_eq!(model.reasoning_level_raw.as_deref(), Some("medium"));
+        assert_eq!(
+            scan.events[0].cost.estimated_api_equivalent_micro_usd,
+            Some(2_000)
+        );
+        assert_eq!(
+            scan.events[0].cost.pricing_source.as_deref(),
+            Some("claude_code_api_pricing:claude-opus-5:fast")
+        );
+        assert!(!serde_json::to_value(model)
+            .expect("serialize model")
+            .to_string()
+            .contains("service_tier"));
+        assert!(scan.events[0].runtime.is_none());
     }
 
     #[test]
