@@ -20,10 +20,10 @@ use statsai_core::{
     SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
     SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SummaryId,
     SummaryMetadata, SummaryMetricTotals, SummaryMetrics, SummaryModelMetrics, SummaryModelUsage,
-    SyncBatch, TaskVerificationCursor, TaskVerificationId, UsageCounts, UsageEvent, UsageSummary,
-    VerifiedSourceState, VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
-    SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
-    USAGE_SUMMARY_SCHEMA_VERSION,
+    SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, TaskVerificationId, UsageCounts,
+    UsageEvent, UsageSummary, VerifiedSourceState, VerifiedSubscriptionState,
+    PROVIDER_ACCOUNT_SCHEMA_VERSION, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    SUBSCRIPTION_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -90,6 +90,7 @@ pub struct SnapshotRollupView {
 pub struct PendingSyncSummaryCounts {
     pub rollups: u64,
     pub passthrough_summaries: u64,
+    pub retired_entities: u64,
     pub total: u64,
     pub days: u64,
 }
@@ -2731,6 +2732,115 @@ impl Store {
         Ok(changed)
     }
 
+    pub fn sync_target_has_retired_entities(
+        &self,
+        sink: &str,
+        target: &str,
+        snapshot: &SyncAuthoritativeSnapshot,
+    ) -> Result<bool> {
+        Ok(!self
+            .retired_sync_entity_ids(sink, target, snapshot)?
+            .is_empty())
+    }
+
+    pub fn reconcile_sync_tracking_to_authoritative_snapshot(
+        &self,
+        sink: &str,
+        target: &str,
+        snapshot: &SyncAuthoritativeSnapshot,
+    ) -> Result<u64> {
+        let retired = self.retired_sync_entity_ids(sink, target, snapshot)?;
+        if retired.is_empty() {
+            return Ok(0);
+        }
+        self.with_immediate_transaction(|| {
+            let mut deleted = 0u64;
+            for (entity_kind, entity_id) in &retired {
+                deleted += self.conn.execute(
+                    r#"
+                    DELETE FROM entity_sync_state
+                    WHERE sink = ?1 AND target = ?2 AND entity_kind = ?3 AND entity_id = ?4
+                    "#,
+                    params![sink, target, entity_kind, entity_id],
+                )? as u64;
+            }
+            Ok(deleted)
+        })
+    }
+
+    fn retired_sync_entity_ids(
+        &self,
+        sink: &str,
+        target: &str,
+        snapshot: &SyncAuthoritativeSnapshot,
+    ) -> Result<Vec<(String, String)>> {
+        let current_ids = BTreeMap::from([
+            (
+                "source",
+                snapshot
+                    .source_ids
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                "account",
+                snapshot
+                    .provider_account_ids
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                "source_account_assignment",
+                snapshot
+                    .source_account_assignment_ids
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                "subscription",
+                snapshot
+                    .subscription_ids
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                "summary",
+                snapshot
+                    .summary_ids
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+        ]);
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT entity_kind, entity_id
+            FROM entity_sync_state
+            WHERE sink = ?1 AND target = ?2
+              AND entity_kind IN (
+                'source', 'account', 'source_account_assignment', 'subscription', 'summary'
+              )
+            "#,
+        )?;
+        let tracked = statement
+            .query_map(params![sink, target], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tracked
+            .into_iter()
+            .filter(|(entity_kind, entity_id)| {
+                current_ids
+                    .get(entity_kind.as_str())
+                    .is_some_and(|ids| !ids.contains(entity_id.as_str()))
+            })
+            .collect())
+    }
+
     pub fn pending_http_sync_rollup_summaries(&self, target: &str) -> Result<Vec<UsageSummary>> {
         self.pending_http_sync_rollup_summaries_with_projects(target, false)
     }
@@ -2760,32 +2870,76 @@ impl Store {
         target: &str,
         include_projects: bool,
     ) -> Result<PendingSyncSummaryCounts> {
-        let rollups =
-            self.pending_http_sync_rollup_summaries_with_projects(target, include_projects)?;
-        let passthrough_summaries =
-            self.pending_http_passthrough_summaries_with_projects(target, include_projects)?;
-        let mut days = collect_pending_summary_days(rollups.iter());
-        days.extend(collect_pending_summary_days(passthrough_summaries.iter()));
-        Ok(PendingSyncSummaryCounts {
-            rollups: rollups.len() as u64,
-            passthrough_summaries: passthrough_summaries.len() as u64,
-            total: rollups.len().saturating_add(passthrough_summaries.len()) as u64,
-            days: days.len() as u64,
-        })
-    }
-
-    fn pending_http_passthrough_summaries_with_projects(
-        &self,
-        target: &str,
-        include_projects: bool,
-    ) -> Result<Vec<UsageSummary>> {
-        let summaries = self
+        let current_rollups = self
+            .all_sync_rollup_summaries()?
+            .into_iter()
+            .map(|summary| sanitize_summary_for_http_sync(summary, include_projects))
+            .collect::<Vec<_>>();
+        let rollups = self.pending_summaries_for_sync("http", target, &current_rollups)?;
+        let current_passthrough_summaries = self
             .summaries()?
             .into_iter()
             .filter(is_http_rollup_passthrough_summary)
             .map(|summary| sanitize_summary_for_http_sync(summary, include_projects))
             .collect::<Vec<_>>();
-        self.pending_summaries_for_sync("http", target, &summaries)
+        let passthrough_summaries =
+            self.pending_summaries_for_sync("http", target, &current_passthrough_summaries)?;
+        let current_snapshot = self.current_http_sync_authoritative_snapshot(
+            &current_rollups,
+            &current_passthrough_summaries,
+        )?;
+        let retired_entities = self
+            .retired_sync_entity_ids("http", target, &current_snapshot)?
+            .len();
+        let mut days = collect_pending_summary_days(rollups.iter());
+        days.extend(collect_pending_summary_days(passthrough_summaries.iter()));
+        Ok(PendingSyncSummaryCounts {
+            rollups: rollups.len() as u64,
+            passthrough_summaries: passthrough_summaries.len() as u64,
+            retired_entities: retired_entities as u64,
+            total: rollups
+                .len()
+                .saturating_add(passthrough_summaries.len())
+                .saturating_add(retired_entities) as u64,
+            days: days.len() as u64,
+        })
+    }
+
+    fn current_http_sync_authoritative_snapshot(
+        &self,
+        rollups: &[UsageSummary],
+        passthrough_summaries: &[UsageSummary],
+    ) -> Result<SyncAuthoritativeSnapshot> {
+        Ok(SyncAuthoritativeSnapshot {
+            snapshot_id: String::new(),
+            part_index: 0,
+            part_count: 1,
+            source_ids: self
+                .list_sources()?
+                .into_iter()
+                .map(|source| source.source_id)
+                .collect(),
+            provider_account_ids: self
+                .list_accounts()?
+                .into_iter()
+                .map(|account| account.provider_account_id)
+                .collect(),
+            source_account_assignment_ids: self
+                .list_source_account_assignments()?
+                .into_iter()
+                .map(|assignment| assignment.assignment_id)
+                .collect(),
+            subscription_ids: self
+                .list_subscriptions()?
+                .into_iter()
+                .map(|subscription| subscription.subscription_id)
+                .collect(),
+            summary_ids: rollups
+                .iter()
+                .chain(passthrough_summaries)
+                .map(|summary| summary.summary_id.clone())
+                .collect(),
+        })
     }
 
     pub fn sync_rollup_period_stats(&self, cutoff_day: NaiveDate) -> Result<RollupPeriodStats> {
@@ -8434,6 +8588,7 @@ mod tests {
             PendingSyncSummaryCounts {
                 rollups: 0,
                 passthrough_summaries: 2,
+                retired_entities: 0,
                 total: 2,
                 days: 5,
             }
@@ -8494,9 +8649,57 @@ mod tests {
             PendingSyncSummaryCounts {
                 rollups: 0,
                 passthrough_summaries: 1,
+                retired_entities: 0,
                 total: 1,
                 days: 1,
             }
+        );
+    }
+
+    #[test]
+    fn pending_http_sync_summary_counts_include_retirement_only_reconciliation() {
+        let store = Store::in_memory().expect("store");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-retirement-only-pending-sync"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let target = "https://api.example.com/api/sync/batches";
+        let event = test_store_event(&source, Utc::now(), "retired-event");
+        store.insert_event(&event).expect("event");
+        let rollups = store.all_sync_rollup_summaries().expect("initial rollups");
+        assert_eq!(rollups.len(), 1);
+
+        store
+            .record_sources_synced("http", target, std::slice::from_ref(&source))
+            .expect("record source synced");
+        store
+            .record_summaries_synced("http", target, &rollups)
+            .expect("record rollup synced");
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts(target)
+                .expect("settled counts")
+                .total,
+            0
+        );
+
+        store
+            .delete_events_for_sources(std::slice::from_ref(&source.source_id))
+            .expect("retire source events");
+        let counts = store
+            .pending_http_sync_summary_counts(target)
+            .expect("retirement counts");
+
+        assert_eq!(counts.rollups, 0);
+        assert_eq!(counts.passthrough_summaries, 0);
+        assert_eq!(counts.retired_entities, 1);
+        assert_eq!(
+            counts.total, 1,
+            "retirement-only reconciliation must surface as pending upload work"
         );
     }
 

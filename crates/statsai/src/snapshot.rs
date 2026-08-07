@@ -611,18 +611,6 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
         };
     }
 
-    if week.requests == 0 {
-        return UiCopy {
-            menu_summary: "No usage found yet".to_string(),
-            menu_stat_1: "Last 7 days · no requests yet".to_string(),
-            menu_stat_2: "Today · no requests yet".to_string(),
-            menu_stat_3: dashboard_line_synced(last_sync_at, has_synced, false),
-            primary_action: PrimaryAction::None,
-            tooltip: "StatsAI".to_string(),
-            menu_layout: "no_data".to_string(),
-        };
-    }
-
     if pending_upload {
         let menu_summary = if pending_days > 1 {
             format!("Dashboard sync {pending_days} days behind")
@@ -639,6 +627,18 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
             primary_action: PrimaryAction::UploadNow,
             tooltip: "StatsAI — ready to upload".to_string(),
             menu_layout: "pending_upload".to_string(),
+        };
+    }
+
+    if week.requests == 0 {
+        return UiCopy {
+            menu_summary: "No usage found yet".to_string(),
+            menu_stat_1: "Last 7 days · no requests yet".to_string(),
+            menu_stat_2: "Today · no requests yet".to_string(),
+            menu_stat_3: dashboard_line_synced(last_sync_at, has_synced, false),
+            primary_action: PrimaryAction::None,
+            tooltip: "StatsAI".to_string(),
+            menu_layout: "no_data".to_string(),
         };
     }
 
@@ -859,6 +859,32 @@ mod tests {
         });
 
         assert_eq!(ui.menu_summary, "Dashboard sync available");
+    }
+
+    #[test]
+    fn retirement_only_pending_upload_precedes_no_usage_state() {
+        let ui = build_ui(SnapshotUiInput {
+            logged_in: true,
+            first_run: false,
+            has_synced: true,
+            sync_failures: 0,
+            pending_upload: true,
+            pending_days: 0,
+            week: PeriodStats {
+                tokens: 0,
+                requests: 0,
+                cost_cents: None,
+            },
+            today: PeriodStats {
+                tokens: 0,
+                requests: 0,
+                cost_cents: None,
+            },
+            last_sync_at: Some(Utc::now() - Duration::minutes(30)),
+        });
+
+        assert_eq!(ui.primary_action, PrimaryAction::UploadNow);
+        assert_eq!(ui.menu_layout, "pending_upload");
     }
 
     #[test]

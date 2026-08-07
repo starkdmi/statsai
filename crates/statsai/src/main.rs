@@ -3856,6 +3856,25 @@ fn build_sync_batch(
             );
         }
 
+        let all_rollups: Vec<_> = store
+            .all_sync_rollup_summaries()?
+            .into_iter()
+            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
+            .collect();
+        let current_authoritative_snapshot = SyncAuthoritativeSnapshot {
+            snapshot_id: format!("{batch_id}_authoritative"),
+            part_index: 0,
+            part_count: 1,
+            source_ids: snapshot_source_ids,
+            provider_account_ids: snapshot_provider_account_ids,
+            source_account_assignment_ids: snapshot_assignment_ids,
+            subscription_ids: snapshot_subscription_ids,
+            summary_ids: all_passthrough_summaries
+                .iter()
+                .chain(all_rollups.iter())
+                .map(|summary| summary.summary_id.clone())
+                .collect(),
+        };
         let failed_without_resume = state.as_ref().is_some_and(|state| {
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()
         });
@@ -3863,39 +3882,25 @@ fn build_sync_batch(
             .as_ref()
             .and_then(|state| state.pending_resume_batch_id.as_deref())
             .is_some();
-        let force_full_rollup_sync = command.full
+        let has_retired_entities = store.sync_target_has_retired_entities(
+            &command.sink,
+            target,
+            &current_authoritative_snapshot,
+        )?;
+        let full_history_sync = command.full
             || command.rebuild_rollups
             || state.is_none()
             || has_pending_resume
             || (!command.since_last && failed_without_resume);
-        let full_rollup_sync = force_full_rollup_sync;
-        let all_rollups: Vec<_> = store
-            .all_sync_rollup_summaries()?
-            .into_iter()
-            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
-            .collect();
-        if full_rollup_sync {
-            authoritative_snapshot = Some(SyncAuthoritativeSnapshot {
-                snapshot_id: format!("{batch_id}_authoritative"),
-                part_index: 0,
-                part_count: 1,
-                source_ids: snapshot_source_ids,
-                provider_account_ids: snapshot_provider_account_ids,
-                source_account_assignment_ids: snapshot_assignment_ids,
-                subscription_ids: snapshot_subscription_ids,
-                summary_ids: all_passthrough_summaries
-                    .iter()
-                    .chain(all_rollups.iter())
-                    .map(|summary| summary.summary_id.clone())
-                    .collect(),
-            });
+        if full_history_sync || has_retired_entities {
+            authoritative_snapshot = Some(current_authoritative_snapshot);
         }
-        let rollups = if full_rollup_sync {
+        let rollups = if full_history_sync {
             all_rollups
         } else {
             store.pending_summaries_for_sync(&command.sink, target, &all_rollups)?
         };
-        let passthrough_summaries = if full_rollup_sync {
+        let passthrough_summaries = if full_history_sync {
             all_passthrough_summaries
         } else {
             store.pending_summaries_for_sync(&command.sink, target, &all_passthrough_summaries)?
@@ -3903,7 +3908,7 @@ fn build_sync_batch(
         eprintln!(
             "{label}: prepared {} local daily summaries for {} sync",
             rollups.len(),
-            if full_rollup_sync {
+            if full_history_sync {
                 "full-history"
             } else {
                 "incremental"
@@ -3946,6 +3951,9 @@ fn record_rollup_sync_success(
 ) -> Result<()> {
     let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
     record_rollup_sync_chunk_success(store, sink, target, &logical_batch_id, batch)?;
+    if let Some(snapshot) = batch.authoritative_snapshot.as_ref() {
+        store.reconcile_sync_tracking_to_authoritative_snapshot(sink, target, snapshot)?;
+    }
     store.clear_pending_sync_resume(sink, target)?;
     Ok(())
 }
@@ -4085,6 +4093,13 @@ fn send_http_sync_batch(
         }
     }
     if request.payload_mode == SyncPayloadMode::Rollups {
+        if let Some(snapshot) = batch.authoritative_snapshot.as_ref() {
+            store.reconcile_sync_tracking_to_authoritative_snapshot(
+                request.sink,
+                request.target,
+                snapshot,
+            )?;
+        }
         store.clear_pending_sync_resume(request.sink, request.target)?;
     }
     if request.hosted_task_sync_enabled {
@@ -11967,6 +11982,110 @@ mod tests {
         assert_eq!(
             local_catchup_batch.summaries[0].usage.total_tokens,
             Some(40)
+        );
+    }
+
+    #[test]
+    fn http_incremental_sync_sends_authoritative_snapshot_after_local_rollup_retirement() {
+        let store = Store::in_memory().expect("store");
+        let retired_source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-retired-rollup"),
+            LocationOrigin::Configured,
+        );
+        let retained_source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-retained-rollup"),
+            LocationOrigin::Configured,
+        );
+        store
+            .upsert_source(&retired_source)
+            .expect("retired source");
+        store
+            .upsert_source(&retained_source)
+            .expect("retained source");
+
+        let retired_event = test_event(
+            "claude_code",
+            &retired_source,
+            Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 0)
+                .single()
+                .expect("started_at"),
+            Some(provider_account_id("claude_code", "personal")),
+            TokenParts {
+                input: 10,
+                output: 5,
+                cached_input: 100,
+                reasoning: 0,
+                total: 115,
+                cost: Some(10),
+            },
+        );
+        let retained_event = test_event(
+            "claude_code",
+            &retained_source,
+            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0)
+                .single()
+                .expect("retained started_at"),
+            Some(provider_account_id("claude_code", "personal")),
+            TokenParts {
+                input: 20,
+                output: 10,
+                cached_input: 200,
+                reasoning: 0,
+                total: 230,
+                cost: Some(20),
+            },
+        );
+        store.insert_event(&retired_event).expect("retired event");
+        store.insert_event(&retained_event).expect("retained event");
+
+        let command = SyncCommand {
+            endpoint: Some("http://127.0.0.1:8787/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (initial_batch, _) =
+            build_sync_batch(&command, &store, "device", &target).expect("initial batch");
+        assert_eq!(initial_batch.summaries.len(), 2);
+        assert!(initial_batch.authoritative_snapshot.is_some());
+        record_rollup_sync_success(&store, "http", &target, &initial_batch)
+            .expect("record initial sync");
+
+        store
+            .delete_events_for_sources(std::slice::from_ref(&retired_source.source_id))
+            .expect("retire source events");
+        assert_eq!(
+            store
+                .all_sync_rollup_summaries()
+                .expect("remaining rollups")
+                .len(),
+            1
+        );
+
+        let (retirement_batch, _) =
+            build_sync_batch(&command, &store, "device", &target).expect("retirement batch");
+        assert!(
+            retirement_batch.summaries.is_empty(),
+            "retirement-only reconciliation must not resend unchanged historical rollups"
+        );
+        assert!(
+            retirement_batch.authoritative_snapshot.is_some(),
+            "removing a previously synced rollup must send a server deletion signal"
+        );
+        record_rollup_sync_success(&store, "http", &target, &retirement_batch)
+            .expect("record retirement sync");
+
+        let (settled_batch, _) =
+            build_sync_batch(&command, &store, "device", &target).expect("settled batch");
+        assert!(settled_batch.summaries.is_empty());
+        assert!(
+            settled_batch.authoritative_snapshot.is_none(),
+            "successful reconciliation must clear retired local sync tracking"
         );
     }
 

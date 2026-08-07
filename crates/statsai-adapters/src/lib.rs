@@ -34,11 +34,12 @@ pub const OPENCODE_PROVIDER: &str = "opencode";
 pub const GROK_BUILD_PROVIDER: &str = "grok_build";
 const SESSION_SCOPED_EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
 const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v4";
+const PROVIDER_RECORD_EVENT_KEY_VERSION: &str = "provider_record_usage_event.v1";
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever provider parsing semantics change,
 // so historical sessions get rescanned for runtime, pricing, and project context updates.
 const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v26";
-const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v22";
+const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v23";
 const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
 const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v17";
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
@@ -124,10 +125,11 @@ fn usd_to_micro_usd(usd: f64) -> Option<i64> {
 pub use archive::{ArchiveScan, ArchiveScanDiagnostics};
 pub use statsai_core::{VerifiedSourceState, VerifiedSubscriptionState};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EventDeduplication {
     SessionScoped,
     PathIndependent,
+    ProviderRecord(String),
 }
 
 #[derive(Debug, Clone)]
@@ -2252,6 +2254,10 @@ fn parse_claude_file(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| fallback_session_id(path));
+        let deduplication = claude_provider_record_id(&value).map_or(
+            EventDeduplication::SessionScoped,
+            EventDeduplication::ProviderRecord,
+        );
         let event = usage_event(
             ctx.adapter,
             ctx.source,
@@ -2272,7 +2278,7 @@ fn parse_claude_file(
                 source_type: "jsonl",
                 model_inferred,
                 timestamp_inferred,
-                deduplication: EventDeduplication::SessionScoped,
+                deduplication,
                 dedupe_salt: None,
             },
         );
@@ -2280,6 +2286,19 @@ fn parse_claude_file(
     }
 
     Ok(())
+}
+
+fn claude_provider_record_id(value: &Value) -> Option<String> {
+    let message_id = value
+        .pointer("/message/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let request_id = value
+        .get("requestId")
+        .or_else(|| value.get("request_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    Some(format!("{message_id}\0{request_id}"))
 }
 
 fn claude_project_context_from_value(
@@ -3531,6 +3550,13 @@ fn usage_event<A: ProviderAdapter + ?Sized>(
         .map(|salt| format!("{}:{salt}", parts.event_kind))
         .unwrap_or_else(|| parts.event_kind.to_string());
     let (event_key_version, semantic_key) = match parts.deduplication {
+        EventDeduplication::ProviderRecord(provider_record_id) => (
+            PROVIDER_RECORD_EVENT_KEY_VERSION,
+            format!(
+                "{PROVIDER_RECORD_EVENT_KEY_VERSION}:{event_kind_key}:{}",
+                hash_text(&provider_record_id)
+            ),
+        ),
         EventDeduplication::SessionScoped => (
             SESSION_SCOPED_EVENT_KEY_VERSION,
             if parts.session_started_at.is_some() || parts.session_ended_at.is_some() {
@@ -7421,6 +7447,51 @@ mod tests {
     }
 
     #[test]
+    fn claude_deduplicates_repeated_usage_by_message_and_request_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let projects = dir.path().join("projects");
+        std::fs::create_dir_all(&projects).expect("projects");
+        let mut file = File::create(projects.join("session.jsonl")).expect("session");
+
+        for (timestamp, uuid) in [
+            ("2026-08-05T14:51:09.702Z", "record-1"),
+            ("2026-08-05T14:51:09.710Z", "record-2"),
+            ("2026-08-05T14:51:11.102Z", "record-3"),
+        ] {
+            writeln!(
+                file,
+                r#"{{"timestamp":"{timestamp}","sessionId":"session-1","uuid":"{uuid}","requestId":"request-1","message":{{"id":"message-1","model":"claude-opus-5","usage":{{"input_tokens":2,"cache_creation_input_tokens":746016,"cache_read_input_tokens":16038,"output_tokens":1479}}}}}}"#
+            )
+            .expect("repeated request");
+        }
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-08-05T14:51:14.209Z","sessionId":"session-1","uuid":"record-4","requestId":"request-2","message":{{"id":"message-1","model":"claude-opus-5","usage":{{"input_tokens":2,"cache_creation_input_tokens":746016,"cache_read_input_tokens":16038,"output_tokens":1479}}}}}}"#
+        )
+        .expect("distinct request");
+
+        let source = SourceLocation::local_adapter(
+            CLAUDE_CODE_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(scan.diagnostics.duplicate_events, 2);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.computed_total())
+                .sum::<u64>(),
+            1_527_070
+        );
+    }
+
+    #[test]
     fn claude_stats_cache_is_parsed_as_summary_not_events() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("projects")).expect("projects");
@@ -8142,6 +8213,16 @@ mod tests {
             .expect("Claude parser revision");
 
         assert!(revision > 21);
+    }
+
+    #[test]
+    fn provider_request_deduplication_upgrade_advances_claude_parser_revision() {
+        let revision = CLAUDE_SCAN_CACHE_PARSER_REVISION
+            .rsplit_once(".v")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .expect("Claude parser revision");
+
+        assert!(revision > 22);
     }
 
     #[test]
