@@ -10482,8 +10482,10 @@ mod tests {
             ),
             subscription: None,
         };
-        source.verified_state_hash =
-            verified_source_state_hash(Some(&verified_state)).expect("verified state hash");
+        source.verified_state_hash = verified_source_observation_hash(
+            &VerifiedSourceObservation::Verified(Box::new(verified_state.clone())),
+        )
+        .expect("verified state hash");
         store.upsert_source(&source).expect("source");
 
         let scan_calls = Arc::new(Mutex::new(0u64));
@@ -13906,6 +13908,84 @@ mod tests {
             logical_http_rollup_batch_id("batch_1_part_final"),
             "batch_1_part_final"
         );
+    }
+
+    #[test]
+    fn incremental_http_sync_sends_late_claude_assignment_without_full() {
+        let endpoint = "https://api.example.com/api/sync/batches".to_string();
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-http-late-assignment"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let authenticated_at = Utc
+            .with_ymd_and_hms(2026, 8, 7, 12, 0, 0)
+            .single()
+            .expect("authenticated_at");
+        let event_at = authenticated_at + Duration::hours(1);
+        store
+            .insert_event(&test_event(
+                "claude_code",
+                &source,
+                event_at,
+                None,
+                TokenParts::total(15),
+            ))
+            .expect("unassigned event");
+        store.rebuild_sync_rollups().expect("initial rollups");
+
+        let command = SyncCommand {
+            endpoint: Some(endpoint),
+            ..test_sync_command("http")
+        };
+        assert!(!command.full);
+        let target = sync_target(&command).expect("target");
+        let (initial_batch, initial_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("initial batch");
+        assert_eq!(initial_mode, SyncPayloadMode::Rollups);
+        assert!(initial_batch.accounts.is_empty());
+        assert!(initial_batch.source_account_assignments.is_empty());
+        assert_eq!(initial_batch.summaries.len(), 1);
+        let unassigned_summary_id = initial_batch.summaries[0].summary_id.clone();
+        record_rollup_sync_success(&store, "http", &target, &initial_batch)
+            .expect("record initial sync");
+
+        apply_verified_source_state(
+            &store,
+            &source,
+            Some(&VerifiedSourceState {
+                provider_user_id: Some("claude-account".to_string()),
+                email: Some("claude@example.com".to_string()),
+                account_label: None,
+                plan_name: None,
+                authenticated_at: Some(authenticated_at),
+                verified_at: Some(authenticated_at),
+                subscription: None,
+            }),
+        )
+        .expect("verified Claude state");
+        store.rebuild_sync_rollups().expect("reattributed rollups");
+
+        let (incremental_batch, incremental_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("incremental batch");
+        assert_eq!(incremental_mode, SyncPayloadMode::Rollups);
+        assert_eq!(incremental_batch.accounts.len(), 1);
+        assert_eq!(incremental_batch.source_account_assignments.len(), 1);
+        assert_eq!(incremental_batch.summaries.len(), 1);
+        assert!(incremental_batch.summaries[0].provider_account_id.is_some());
+        let snapshot = incremental_batch
+            .authoritative_snapshot
+            .as_ref()
+            .expect("retired unassigned rollup requires an authoritative snapshot");
+        assert!(!snapshot.summary_ids.contains(&unassigned_summary_id));
+        assert!(snapshot
+            .summary_ids
+            .contains(&incremental_batch.summaries[0].summary_id));
     }
 
     #[test]

@@ -6236,22 +6236,6 @@ fn codex_headless_usage_value(value: &Value) -> Option<&Value> {
     .next()
 }
 
-#[derive(Deserialize)]
-struct ClaudeProfile {
-    #[serde(rename = "oauthAccount")]
-    oauth_account: Option<ClaudeOauthAccount>,
-}
-
-#[derive(Deserialize)]
-struct ClaudeOauthAccount {
-    #[serde(rename = "accountUuid")]
-    account_uuid: Option<String>,
-    #[serde(rename = "emailAddress")]
-    email_address: Option<String>,
-    #[serde(rename = "profileFetchedAt")]
-    profile_fetched_at: Option<Value>,
-}
-
 fn claude_auth_snapshot(
     root: &Path,
     location_origin: &LocationOrigin,
@@ -6267,8 +6251,7 @@ fn claude_auth_dependency_paths(root: &Path, location_origin: &LocationOrigin) -
     } else {
         root
     };
-    let mut paths = claude_profile_dependency_paths(root, location_origin, default_root.as_deref());
-    paths.extend(claude_settings_paths(settings_root));
+    let mut paths = claude_settings_paths(settings_root).to_vec();
     if let Some(managed_settings_root) = claude_managed_settings_root() {
         paths.push(managed_settings_root);
     }
@@ -6308,34 +6291,6 @@ fn claude_verification_dependency_topology_changed(root: &Path, changed: &[PathB
     })
 }
 
-fn claude_profile_dependency_paths(
-    root: &Path,
-    location_origin: &LocationOrigin,
-    default_root: Option<&Path>,
-) -> Vec<PathBuf> {
-    let nested_profile = root.join(".claude.json");
-    let sibling_profile = root.parent().map(|parent| parent.join(".claude.json"));
-    if matches!(location_origin, LocationOrigin::Default) {
-        return vec![default_root
-            .and_then(Path::parent)
-            .map(|parent| parent.join(".claude.json"))
-            .unwrap_or(nested_profile)];
-    }
-    if matches!(location_origin, LocationOrigin::Env) {
-        return vec![nested_profile];
-    }
-    if default_root == Some(root) {
-        return vec![sibling_profile.unwrap_or(nested_profile)];
-    }
-    if root.file_name().is_none_or(|name| name != ".claude") {
-        return vec![nested_profile];
-    }
-    match sibling_profile {
-        Some(sibling_profile) => vec![nested_profile, sibling_profile],
-        None => vec![nested_profile],
-    }
-}
-
 fn claude_auth_snapshot_with_probe_context(
     root: &Path,
     location_origin: &LocationOrigin,
@@ -6370,80 +6325,14 @@ fn claude_auth_snapshot_with_probe_context(
     if let Some(block) = settings_block {
         return claude_attribution_blocked(block.blocked_since);
     }
-    match claude_cached_profile_observation(root, location_origin, default_root.as_deref()) {
-        // Claude transcripts do not record which credential authenticated the session. A
-        // cached OAuth profile proves only that an account logged in at some point; a
-        // one-shot launch environment may still have selected another credential. Keep the
-        // candidate unassigned until durable per-session provenance exists.
-        VerifiedSourceObservation::Verified(_) => claude_attribution_blocked(None),
-        observation => observation,
-    }
+    // Claude transcripts do not record per-session credential provenance. Clean durable
+    // settings cannot rule out one-shot environment credentials or an override removed before
+    // this scan, so a cached OAuth profile is not sufficient for automatic attribution.
+    claude_attribution_blocked(None)
 }
 
 fn claude_attribution_blocked(blocked_since: Option<DateTime<Utc>>) -> VerifiedSourceObservation {
     VerifiedSourceObservation::AttributionBlocked { blocked_since }
-}
-
-#[cfg(test)]
-fn claude_cached_profile_snapshot(
-    root: &Path,
-    location_origin: &LocationOrigin,
-    default_root: Option<&Path>,
-) -> Option<VerifiedSourceState> {
-    match claude_cached_profile_observation(root, location_origin, default_root) {
-        VerifiedSourceObservation::Verified(state) => Some(*state),
-        VerifiedSourceObservation::Unavailable
-        | VerifiedSourceObservation::AttributionBlocked { .. } => None,
-    }
-}
-
-fn claude_cached_profile_observation(
-    root: &Path,
-    location_origin: &LocationOrigin,
-    default_root: Option<&Path>,
-) -> VerifiedSourceObservation {
-    let profile_path = match claude_profile_resolution(root, location_origin, default_root) {
-        ClaudeProfileResolution::Path(path) => path,
-        ClaudeProfileResolution::Missing => return VerifiedSourceObservation::Unavailable,
-        ClaudeProfileResolution::Ambiguous => {
-            return VerifiedSourceObservation::AttributionBlocked {
-                blocked_since: None,
-            };
-        }
-    };
-    claude_profile_snapshot(&profile_path)
-        .map(Box::new)
-        .map(VerifiedSourceObservation::Verified)
-        .unwrap_or(VerifiedSourceObservation::Unavailable)
-}
-
-fn claude_profile_snapshot(profile_path: &Path) -> Option<VerifiedSourceState> {
-    let file = File::open(profile_path).ok()?;
-    let profile: ClaudeProfile = serde_json::from_reader(BufReader::new(file)).ok()?;
-    let oauth_account = profile.oauth_account?;
-
-    let provider_user_id = normalized_optional_string(oauth_account.account_uuid.as_deref());
-    let email = normalized_optional_string(oauth_account.email_address.as_deref())
-        .map(|email| email.to_ascii_lowercase());
-    if provider_user_id.is_none() && email.is_none() {
-        return None;
-    }
-
-    let profile_fetched_at = oauth_account
-        .profile_fetched_at
-        .as_ref()
-        .and_then(claude_profile_timestamp);
-    let verified_at = profile_fetched_at.or_else(|| file_modified_at(profile_path));
-
-    Some(VerifiedSourceState {
-        provider_user_id,
-        email,
-        account_label: None,
-        plan_name: None,
-        authenticated_at: verified_at,
-        verified_at,
-        subscription: None,
-    })
 }
 
 #[cfg(test)]
@@ -6844,87 +6733,6 @@ fn claude_base_url_is_non_default(value: &Value) -> bool {
         || url.fragment().is_some()
 }
 
-fn normalized_optional_string(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-enum ClaudeProfileResolution {
-    Path(PathBuf),
-    Missing,
-    Ambiguous,
-}
-
-fn claude_profile_resolution(
-    root: &Path,
-    location_origin: &LocationOrigin,
-    default_root: Option<&Path>,
-) -> ClaudeProfileResolution {
-    let nested_profile = root.join(".claude.json");
-    // Auto-discovered histories share Claude's standard home profile, including the XDG
-    // history root. Only an environment-origin source proves Claude used CLAUDE_CONFIG_DIR
-    // and therefore stores its profile inside the source root.
-    if matches!(location_origin, LocationOrigin::Default) {
-        return ClaudeProfileResolution::Path(
-            default_root
-                .and_then(Path::parent)
-                .map(|parent| parent.join(".claude.json"))
-                .unwrap_or(nested_profile),
-        );
-    }
-    if matches!(location_origin, LocationOrigin::Env) {
-        return ClaudeProfileResolution::Path(nested_profile);
-    }
-    if default_root == Some(root) {
-        return ClaudeProfileResolution::Path(
-            root.parent()
-                .map(|parent| parent.join(".claude.json"))
-                .unwrap_or(nested_profile),
-        );
-    }
-    if root.file_name().is_none_or(|name| name != ".claude") {
-        return if nested_profile.is_file() {
-            ClaudeProfileResolution::Path(nested_profile)
-        } else {
-            ClaudeProfileResolution::Missing
-        };
-    }
-
-    let Some(parent) = root.parent() else {
-        return ClaudeProfileResolution::Missing;
-    };
-    let sibling_profile = parent.join(".claude.json");
-    match (nested_profile.is_file(), sibling_profile.is_file()) {
-        (true, false) => ClaudeProfileResolution::Path(nested_profile),
-        (false, true) => ClaudeProfileResolution::Path(sibling_profile),
-        (true, true) => ClaudeProfileResolution::Ambiguous,
-        (false, false) => ClaudeProfileResolution::Missing,
-    }
-}
-
-#[cfg(test)]
-fn claude_profile_path(
-    root: &Path,
-    location_origin: &LocationOrigin,
-    default_root: Option<&Path>,
-) -> Option<PathBuf> {
-    match claude_profile_resolution(root, location_origin, default_root) {
-        ClaudeProfileResolution::Path(path) => Some(path),
-        ClaudeProfileResolution::Missing | ClaudeProfileResolution::Ambiguous => None,
-    }
-}
-
-fn claude_profile_timestamp(value: &Value) -> Option<DateTime<Utc>> {
-    match value {
-        Value::Number(number) => number
-            .as_i64()
-            .and_then(|milliseconds| Utc.timestamp_millis_opt(milliseconds).single()),
-        _ => parse_timestamp_value(value),
-    }
-}
-
 fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
     let auth_path = root.join("auth.json");
     let value = std::fs::read_to_string(&auth_path).ok()?;
@@ -7297,7 +7105,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_cached_profile_without_session_auth_evidence_blocks_attribution() {
+    fn claude_cached_profile_does_not_verify_sessions_without_credential_provenance() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("claude-config");
         std::fs::create_dir_all(&root).expect("config root");
@@ -7325,79 +7133,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_default_source_ignores_stale_nested_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join(".claude");
-        std::fs::create_dir_all(root.join("projects")).expect("projects");
-        let profile_fetched_at = Utc
-            .with_ymd_and_hms(2026, 8, 1, 12, 34, 56)
-            .single()
-            .expect("profile timestamp");
-        std::fs::write(
-            dir.path().join(".claude.json"),
-            serde_json::json!({
-                "oauthAccount": {
-                    "accountUuid": "claude-account-uuid",
-                    "emailAddress": "Person@Example.COM",
-                    "organizationUuid": "claude-organization-uuid",
-                    "profileFetchedAt": profile_fetched_at.timestamp_millis()
-                }
-            })
-            .to_string(),
-        )
-        .expect("claude profile");
-        std::fs::write(
-            root.join(".claude.json"),
-            serde_json::json!({
-                "oauthAccount": {
-                    "accountUuid": "stale-nested-account",
-                    "emailAddress": "stale@example.com",
-                    "profileFetchedAt": profile_fetched_at.timestamp_millis()
-                }
-            })
-            .to_string(),
-        )
-        .expect("stale nested claude profile");
-        let verified =
-            claude_cached_profile_snapshot(&root, &LocationOrigin::Default, Some(root.as_path()))
-                .expect("verified source state");
-
-        assert_eq!(
-            verified.provider_user_id.as_deref(),
-            Some("claude-account-uuid")
-        );
-        assert_eq!(verified.email.as_deref(), Some("person@example.com"));
-        assert_eq!(verified.authenticated_at, Some(profile_fetched_at));
-        assert_eq!(verified.verified_at, Some(profile_fetched_at));
-        assert_eq!(verified.account_label, None);
-        assert_eq!(verified.plan_name, None);
-        assert_eq!(verified.subscription, None);
-    }
-
-    #[test]
-    fn claude_xdg_default_source_uses_home_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let default_root = dir.path().join("home").join(".claude");
-        let xdg_root = dir.path().join("xdg").join("claude");
-        let home_profile = default_root
-            .parent()
-            .expect("home directory")
-            .join(".claude.json");
-
-        let profile_path =
-            claude_profile_path(&xdg_root, &LocationOrigin::Default, Some(&default_root));
-        let profile_dependencies = claude_profile_dependency_paths(
-            &xdg_root,
-            &LocationOrigin::Default,
-            Some(&default_root),
-        );
-
-        assert_eq!(profile_path, Some(home_profile.clone()));
-        assert_eq!(profile_dependencies, vec![home_profile]);
-    }
-
-    #[test]
-    fn claude_auth_dependencies_include_profile_user_and_project_settings() {
+    fn claude_auth_dependencies_include_user_and_project_settings() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("claude-config");
         let project_store = root.join("projects").join("workspace");
@@ -7418,7 +7154,6 @@ mod tests {
 
         let dependencies = claude_auth_dependency_paths(&root, &LocationOrigin::Configured);
 
-        assert!(dependencies.contains(&root.join(".claude.json")));
         assert!(dependencies.contains(&root.join("settings.json")));
         assert!(dependencies.contains(&root.join("settings.local.json")));
         assert!(dependencies.contains(&project_settings_root));
@@ -7557,7 +7292,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_explicit_default_base_url_does_not_block_attribution() {
+    fn claude_default_base_url_still_lacks_session_credential_provenance() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("claude-config");
         std::fs::create_dir_all(&root).expect("config root");
@@ -7573,7 +7308,12 @@ mod tests {
         let observation =
             claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
 
-        assert_eq!(observation, VerifiedSourceObservation::Unavailable);
+        assert_eq!(
+            observation,
+            VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: None,
+            }
+        );
     }
 
     #[test]
@@ -8123,221 +7863,6 @@ mod tests {
                 blocked_since: None,
             }
         );
-    }
-
-    #[test]
-    fn claude_env_source_prefers_nested_profile_for_dot_claude_root() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join(".claude");
-        std::fs::create_dir_all(root.join("projects")).expect("projects");
-        std::fs::write(
-            dir.path().join(".claude.json"),
-            serde_json::json!({
-                "oauthAccount": {
-                    "accountUuid": "default-layout-account",
-                    "emailAddress": "default@example.com"
-                }
-            })
-            .to_string(),
-        )
-        .expect("default claude profile");
-        std::fs::write(
-            root.join(".claude.json"),
-            serde_json::json!({
-                "oauthAccount": {
-                    "accountUuid": "env-layout-account",
-                    "emailAddress": "env@example.com"
-                }
-            })
-            .to_string(),
-        )
-        .expect("environment claude profile");
-        let verified = claude_cached_profile_snapshot(&root, &LocationOrigin::Env, None)
-            .expect("verified source state");
-
-        assert_eq!(
-            verified.provider_user_id.as_deref(),
-            Some("env-layout-account")
-        );
-        assert_eq!(verified.email.as_deref(), Some("env@example.com"));
-    }
-
-    #[test]
-    fn claude_configured_dot_claude_root_uses_unambiguous_nested_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join("profile").join(".claude");
-        std::fs::create_dir_all(root.join("projects")).expect("projects");
-        std::fs::write(
-            root.join(".claude.json"),
-            serde_json::json!({
-                "oauthAccount": {
-                    "accountUuid": "configured-layout-account",
-                    "emailAddress": "configured@example.com"
-                }
-            })
-            .to_string(),
-        )
-        .expect("configured claude profile");
-        let verified = claude_cached_profile_snapshot(&root, &LocationOrigin::Configured, None)
-            .expect("verified source state");
-
-        assert_eq!(
-            verified.provider_user_id.as_deref(),
-            Some("configured-layout-account")
-        );
-        assert_eq!(verified.email.as_deref(), Some("configured@example.com"));
-    }
-
-    #[test]
-    fn claude_configured_default_root_uses_sibling_when_nested_is_absent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join(".claude");
-        let nested_profile = root.join(".claude.json");
-        let sibling_profile = dir.path().join(".claude.json");
-        std::fs::create_dir_all(&root).expect("config root");
-        std::fs::write(&sibling_profile, "{}").expect("sibling claude profile");
-        assert!(!nested_profile.exists());
-
-        let profile_path =
-            claude_profile_path(&root, &LocationOrigin::Configured, Some(root.as_path()));
-
-        assert_eq!(profile_path, Some(sibling_profile));
-    }
-
-    #[test]
-    fn claude_configured_default_root_ignores_existing_nested_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join(".claude");
-        let nested_profile = root.join(".claude.json");
-        let sibling_profile = dir.path().join(".claude.json");
-        std::fs::create_dir_all(&root).expect("config root");
-        std::fs::write(&sibling_profile, "{}").expect("sibling claude profile");
-        std::fs::write(&nested_profile, "{}").expect("nested claude profile");
-
-        let profile_path =
-            claude_profile_path(&root, &LocationOrigin::Configured, Some(root.as_path()));
-
-        assert_eq!(profile_path, Some(sibling_profile));
-    }
-
-    #[test]
-    fn claude_env_default_root_prefers_existing_nested_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join(".claude");
-        let nested_profile = root.join(".claude.json");
-        std::fs::create_dir_all(&root).expect("config root");
-        std::fs::write(dir.path().join(".claude.json"), "{}").expect("sibling claude profile");
-        std::fs::write(&nested_profile, "{}").expect("nested claude profile");
-
-        let profile_path = claude_profile_path(&root, &LocationOrigin::Env, Some(root.as_path()));
-
-        assert_eq!(profile_path, Some(nested_profile));
-    }
-
-    #[test]
-    fn claude_configured_custom_dot_claude_root_uses_unambiguous_sibling_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let default_root = dir.path().join(".claude");
-        let root = dir.path().join("profile").join(".claude");
-        let sibling_profile = root
-            .parent()
-            .expect("profile directory")
-            .join(".claude.json");
-        std::fs::create_dir_all(&root).expect("config root");
-        std::fs::write(&sibling_profile, "{}").expect("sibling claude profile");
-
-        let profile_path = claude_profile_path(
-            &root,
-            &LocationOrigin::Configured,
-            Some(default_root.as_path()),
-        );
-
-        assert_eq!(profile_path, Some(sibling_profile));
-    }
-
-    #[test]
-    fn claude_configured_custom_dot_claude_root_rejects_conflicting_profile_layouts() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let default_root = dir.path().join("home").join(".claude");
-        let root = dir.path().join("mounted-home").join(".claude");
-        let sibling_profile = root
-            .parent()
-            .expect("mounted home directory")
-            .join(".claude.json");
-        std::fs::create_dir_all(&root).expect("config root");
-        std::fs::write(
-            root.join(".claude.json"),
-            serde_json::json!({
-                "oauthAccount": {"accountUuid": "nested-account"}
-            })
-            .to_string(),
-        )
-        .expect("nested claude profile");
-        std::fs::write(
-            sibling_profile,
-            serde_json::json!({
-                "oauthAccount": {"accountUuid": "sibling-account"}
-            })
-            .to_string(),
-        )
-        .expect("sibling claude profile");
-
-        let verified = claude_cached_profile_snapshot(
-            &root,
-            &LocationOrigin::Configured,
-            Some(default_root.as_path()),
-        );
-
-        assert_eq!(verified, None);
-    }
-
-    #[test]
-    fn claude_probe_reads_identity_from_custom_config_root_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join("claude-config");
-        std::fs::create_dir_all(root.join("projects")).expect("projects");
-        std::fs::write(
-            root.join(".claude.json"),
-            serde_json::json!({
-                "oauthAccount": {
-                    "accountUuid": "custom-config-account",
-                    "emailAddress": "custom@example.com",
-                    "profileFetchedAt": 1_786_104_000_000_i64
-                }
-            })
-            .to_string(),
-        )
-        .expect("claude profile");
-        let verified = claude_cached_profile_snapshot(&root, &LocationOrigin::Configured, None)
-            .expect("verified source state");
-
-        assert_eq!(
-            verified.provider_user_id.as_deref(),
-            Some("custom-config-account")
-        );
-        assert_eq!(verified.email.as_deref(), Some("custom@example.com"));
-    }
-
-    #[test]
-    fn claude_probe_does_not_treat_organization_as_account_identity() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join(".claude");
-        std::fs::create_dir_all(root.join("projects")).expect("projects");
-        std::fs::write(
-            dir.path().join(".claude.json"),
-            serde_json::json!({
-                "oauthAccount": {
-                    "organizationUuid": "shared-organization-uuid",
-                    "profileFetchedAt": 1_786_104_000_000_i64
-                }
-            })
-            .to_string(),
-        )
-        .expect("claude profile");
-        let verified =
-            claude_cached_profile_snapshot(&root, &LocationOrigin::Default, Some(root.as_path()));
-
-        assert_eq!(verified, None);
     }
 
     #[test]

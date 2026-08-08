@@ -30,6 +30,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
+const ATTRIBUTION_BLOCKED_OBSERVATION_HASH_PREFIX: &str = "attribution_blocked.v2:";
+const VERIFIED_SOURCE_OBSERVATION_HASH_PREFIX: &str = "verified_source.v2:";
+
 pub use archive::{ArchiveConversationSummary, ArchiveSearchHit, ArchiveStats, ArchiveWriteResult};
 pub use privacy::{
     FilteredConversationMetadata, FilteredConversationRecord, PrivacyDatasetStatus,
@@ -3707,15 +3710,28 @@ pub fn verified_source_observation_hash(
 ) -> Result<Option<String>> {
     match observation {
         VerifiedSourceObservation::Unavailable => Ok(None),
-        VerifiedSourceObservation::Verified(state) => verified_source_state_hash(Some(state)),
+        VerifiedSourceObservation::Verified(state) => Ok(verified_source_state_hash(Some(state))?
+            .map(|hash| format!("{VERIFIED_SOURCE_OBSERVATION_HASH_PREFIX}{hash}"))),
         VerifiedSourceObservation::AttributionBlocked { blocked_since } => {
             let payload = serde_json::to_string(&(
                 "verified_source_observation.attribution_blocked.v2",
                 blocked_since,
             ))?;
-            Ok(Some(hash_text(&payload)))
+            Ok(Some(format!(
+                "{ATTRIBUTION_BLOCKED_OBSERVATION_HASH_PREFIX}{}",
+                hash_text(&payload)
+            )))
         }
     }
+}
+
+fn requires_conservative_verified_recovery(hash: &str) -> bool {
+    hash.starts_with(ATTRIBUTION_BLOCKED_OBSERVATION_HASH_PREFIX)
+        // Before observation hashes were typed, both verified profiles and
+        // blocked states (with or without timestamps) were stored as bare
+        // digests. A digest cannot reveal which payload produced it, so only
+        // an active matching assignment can prove uninterrupted continuity.
+        || !hash.starts_with(VERIFIED_SOURCE_OBSERVATION_HASH_PREFIX)
 }
 
 pub fn find_existing_provider_account(
@@ -3888,6 +3904,15 @@ pub fn apply_verified_source_state(
     source: &SourceLocation,
     verified_state: Option<&VerifiedSourceState>,
 ) -> Result<()> {
+    apply_verified_source_state_with_recovery_boundary(store, source, verified_state, None)
+}
+
+fn apply_verified_source_state_with_recovery_boundary(
+    store: &Store,
+    source: &SourceLocation,
+    verified_state: Option<&VerifiedSourceState>,
+    recovery: Option<VerifiedAssignmentRecoveryBoundary>,
+) -> Result<()> {
     let Some(verified_state) = verified_state else {
         return Ok(());
     };
@@ -3916,6 +3941,7 @@ pub fn apply_verified_source_state(
             &account.provider_account_id,
             started_at,
             verified_state.verified_at,
+            recovery,
         )?;
     }
     if let Some(subscription) = verified_state.subscription.as_ref() {
@@ -3950,7 +3976,20 @@ pub fn reconcile_verified_source_state(
     match observation {
         VerifiedSourceObservation::Unavailable => {}
         VerifiedSourceObservation::Verified(verified_state) => {
-            apply_verified_source_state(store, source, Some(verified_state))?;
+            let recovery = source.verified_state_hash.as_deref().map(|previous_hash| {
+                VerifiedAssignmentRecoveryBoundary {
+                    observed_at: Utc::now(),
+                    must_start_at_observed_at: requires_conservative_verified_recovery(
+                        previous_hash,
+                    ),
+                }
+            });
+            apply_verified_source_state_with_recovery_boundary(
+                store,
+                source,
+                Some(verified_state),
+                recovery,
+            )?;
         }
         VerifiedSourceObservation::AttributionBlocked { blocked_since } => {
             if let Some(blocked_since) = blocked_since {
@@ -3989,10 +4028,18 @@ fn upsert_verified_source_assignment(
     store: &Store,
     source: &SourceLocation,
     provider_account_id: &ProviderAccountId,
-    started_at: DateTime<Utc>,
+    authenticated_at: DateTime<Utc>,
     verified_at: Option<DateTime<Utc>>,
+    recovery: Option<VerifiedAssignmentRecoveryBoundary>,
 ) -> Result<()> {
     let assignments = store.list_source_account_assignments_for_source(&source.source_id)?;
+    let started_at = verified_assignment_started_at(
+        &assignments,
+        provider_account_id,
+        authenticated_at,
+        verified_at,
+        recovery,
+    );
     let overlaps: Vec<_> = assignments
         .iter()
         .filter(|assignment| {
@@ -4084,6 +4131,57 @@ fn upsert_verified_source_assignment(
     store.upsert_source_account_assignment(&assignment)?;
     reattribute_source_records(store, &source.source_id)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifiedAssignmentRecoveryBoundary {
+    observed_at: DateTime<Utc>,
+    must_start_at_observed_at: bool,
+}
+
+fn verified_assignment_started_at(
+    assignments: &[SourceAccountAssignment],
+    provider_account_id: &ProviderAccountId,
+    authenticated_at: DateTime<Utc>,
+    verified_at: Option<DateTime<Utc>>,
+    recovery: Option<VerifiedAssignmentRecoveryBoundary>,
+) -> DateTime<Utc> {
+    let Some(recovery) = recovery else {
+        return authenticated_at;
+    };
+    if let Some(active_started_at) = assignments
+        .iter()
+        .filter(|assignment| {
+            assignment.provider_account_id == *provider_account_id
+                && is_active_verified_source_assignment(assignment)
+        })
+        .map(|assignment| assignment.started_at)
+        .max()
+    {
+        return authenticated_at.max(active_started_at);
+    }
+    if recovery.must_start_at_observed_at {
+        return recovery.observed_at;
+    }
+    let latest_closed_at = assignments
+        .iter()
+        .filter(|assignment| {
+            assignment.provider_account_id == *provider_account_id
+                && is_verified_source_assignment(assignment)
+        })
+        .filter_map(|assignment| assignment.ended_at)
+        .max();
+    let Some(latest_closed_at) = latest_closed_at else {
+        return authenticated_at;
+    };
+    if authenticated_at > latest_closed_at {
+        return authenticated_at.min(recovery.observed_at);
+    }
+    verified_at
+        .filter(|verified_at| *verified_at > latest_closed_at)
+        .map_or(recovery.observed_at, |verified_at| {
+            verified_at.min(recovery.observed_at)
+        })
 }
 
 fn close_verified_source_assignments_at_boundary_inner(
@@ -5578,6 +5676,283 @@ mod tests {
             .expect("reattributed events");
         assert!(events[0].provider_account_id.is_some());
         assert_eq!(events[1].provider_account_id, None);
+    }
+
+    #[test]
+    fn clearing_auth_override_and_later_profile_changes_preserve_the_blocked_interval() {
+        let store = Store::in_memory().expect("store");
+        let mut source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-auth-override-recovery"),
+            LocationOrigin::Configured,
+        );
+        let recovery_probe_at = Utc::now();
+        let authenticated_at = recovery_probe_at - chrono::Duration::days(30);
+        let blocked_since = recovery_probe_at - chrono::Duration::days(20);
+        let override_usage_at = recovery_probe_at - chrono::Duration::days(10);
+        store.upsert_source(&source).expect("source");
+
+        let verified_state = VerifiedSourceState {
+            provider_user_id: Some("oauth-account".to_string()),
+            email: Some("oauth@example.com".to_string()),
+            account_label: None,
+            plan_name: None,
+            authenticated_at: Some(authenticated_at),
+            verified_at: Some(authenticated_at),
+            subscription: None,
+        };
+        let initial_observation =
+            VerifiedSourceObservation::Verified(Box::new(verified_state.clone()));
+        let initial_hash =
+            verified_source_observation_hash(&initial_observation).expect("initial hash");
+        reconcile_verified_source_state(&store, &mut source, &initial_observation, initial_hash)
+            .expect("initial OAuth reconciliation");
+
+        let mut events = vec![test_store_event(
+            &source,
+            override_usage_at,
+            "override-usage",
+        )];
+        apply_source_account_resolution(&store, &source, &mut events, &mut [])
+            .expect("initial account resolution");
+        assert!(events[0].provider_account_id.is_some());
+        store.insert_events(&events).expect("usage event");
+
+        let blocked_observation = VerifiedSourceObservation::AttributionBlocked {
+            blocked_since: Some(blocked_since),
+        };
+        let blocked_hash =
+            verified_source_observation_hash(&blocked_observation).expect("blocked hash");
+        reconcile_verified_source_state(&store, &mut source, &blocked_observation, blocked_hash)
+            .expect("blocked auth reconciliation");
+
+        let refreshed_during_block = blocked_since + chrono::Duration::days(5);
+        let refreshed_state = VerifiedSourceState {
+            authenticated_at: Some(refreshed_during_block),
+            verified_at: Some(refreshed_during_block),
+            ..verified_state
+        };
+        let clear_observation =
+            VerifiedSourceObservation::Verified(Box::new(refreshed_state.clone()));
+        let clear_hash = verified_source_observation_hash(&clear_observation).expect("clear hash");
+        let recovery_not_before = Utc::now();
+        reconcile_verified_source_state(&store, &mut source, &clear_observation, clear_hash)
+            .expect("cleared auth reconciliation");
+        let recovery_not_after = Utc::now();
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].started_at, authenticated_at);
+        assert_eq!(assignments[0].ended_at, Some(blocked_since));
+        assert!(assignments[1].started_at >= recovery_not_before);
+        assert!(assignments[1].started_at <= recovery_not_after);
+        assert_eq!(assignments[1].ended_at, None);
+        let recovered_at = assignments[1].started_at;
+
+        let events = store
+            .events_for_source(&source.source_id)
+            .expect("reattributed events");
+        assert_eq!(events[0].provider_account_id, None);
+
+        let changed_profile_observation =
+            VerifiedSourceObservation::Verified(Box::new(VerifiedSourceState {
+                account_label: Some("Personal".to_string()),
+                ..refreshed_state
+            }));
+        let changed_profile_hash = verified_source_observation_hash(&changed_profile_observation)
+            .expect("changed profile hash");
+        reconcile_verified_source_state(
+            &store,
+            &mut source,
+            &changed_profile_observation,
+            changed_profile_hash,
+        )
+        .expect("changed profile reconciliation");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments after profile change");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].ended_at, Some(blocked_since));
+        assert_eq!(assignments[1].started_at, recovered_at);
+        assert_eq!(assignments[1].ended_at, None);
+        let events = store
+            .events_for_source(&source.source_id)
+            .expect("events after profile change");
+        assert_eq!(events[0].provider_account_id, None);
+    }
+
+    #[test]
+    fn clearing_current_and_legacy_unknown_auth_blocks_preserves_invalidated_history() {
+        for use_legacy_hash in [false, true] {
+            let store = Store::in_memory().expect("store");
+            let source_path = format!("/tmp/claude-unknown-auth-recovery-{use_legacy_hash}");
+            let mut source = SourceLocation::local_adapter(
+                "claude_code",
+                "test",
+                "0",
+                Path::new(&source_path),
+                LocationOrigin::Configured,
+            );
+            let recovery_probe_at = Utc::now();
+            let authenticated_at = recovery_probe_at - chrono::Duration::days(30);
+            let usage_at = recovery_probe_at - chrono::Duration::days(10);
+            store.upsert_source(&source).expect("source");
+
+            let verified_state = VerifiedSourceState {
+                provider_user_id: Some("oauth-account".to_string()),
+                email: Some("oauth@example.com".to_string()),
+                account_label: None,
+                plan_name: None,
+                authenticated_at: Some(authenticated_at),
+                verified_at: Some(authenticated_at),
+                subscription: None,
+            };
+            let initial_observation =
+                VerifiedSourceObservation::Verified(Box::new(verified_state.clone()));
+            let initial_hash =
+                verified_source_observation_hash(&initial_observation).expect("initial hash");
+            reconcile_verified_source_state(
+                &store,
+                &mut source,
+                &initial_observation,
+                initial_hash,
+            )
+            .expect("initial OAuth reconciliation");
+            let mut events = vec![test_store_event(&source, usage_at, "uncertain-usage")];
+            apply_source_account_resolution(&store, &source, &mut events, &mut [])
+                .expect("initial account resolution");
+            store.insert_events(&events).expect("usage event");
+
+            let blocked_observation = VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: None,
+            };
+            let blocked_hash = if use_legacy_hash {
+                let legacy_payload = serde_json::to_string(&(
+                    "verified_source_observation.attribution_blocked.v2",
+                    Option::<DateTime<Utc>>::None,
+                ))
+                .expect("legacy blocked payload");
+                Some(hash_text(&legacy_payload))
+            } else {
+                verified_source_observation_hash(&blocked_observation).expect("blocked hash")
+            };
+            reconcile_verified_source_state(
+                &store,
+                &mut source,
+                &blocked_observation,
+                blocked_hash,
+            )
+            .expect("unknown auth block reconciliation");
+            assert!(store
+                .list_source_account_assignments_for_source(&source.source_id)
+                .expect("blocked assignments")
+                .is_empty());
+
+            let clear_observation = VerifiedSourceObservation::Verified(Box::new(verified_state));
+            let clear_hash =
+                verified_source_observation_hash(&clear_observation).expect("clear hash");
+            let recovery_not_before = Utc::now();
+            reconcile_verified_source_state(&store, &mut source, &clear_observation, clear_hash)
+                .expect("cleared auth reconciliation");
+
+            let assignments = store
+                .list_source_account_assignments_for_source(&source.source_id)
+                .expect("recovered assignments");
+            assert_eq!(assignments.len(), 1);
+            assert!(assignments[0].started_at >= recovery_not_before);
+            let events = store
+                .events_for_source(&source.source_id)
+                .expect("reattributed events");
+            assert_eq!(events[0].provider_account_id, None);
+        }
+    }
+
+    #[test]
+    fn clearing_legacy_timestamped_auth_block_without_history_starts_at_recovery() {
+        let store = Store::in_memory().expect("store");
+        let mut source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-legacy-timestamped-auth-recovery"),
+            LocationOrigin::Configured,
+        );
+        let authenticated_at = Utc::now() - chrono::Duration::days(30);
+        let blocked_since = authenticated_at + chrono::Duration::days(10);
+        let legacy_payload = serde_json::to_string(&(
+            "verified_source_observation.attribution_blocked.v2",
+            Some(blocked_since),
+        ))
+        .expect("legacy blocked payload");
+        source.verified_state_hash = Some(hash_text(&legacy_payload));
+        store.upsert_source(&source).expect("source");
+
+        let clear_observation =
+            VerifiedSourceObservation::Verified(Box::new(VerifiedSourceState {
+                provider_user_id: Some("oauth-account".to_string()),
+                email: Some("oauth@example.com".to_string()),
+                account_label: None,
+                plan_name: None,
+                authenticated_at: Some(authenticated_at),
+                verified_at: Some(authenticated_at),
+                subscription: None,
+            }));
+        let clear_hash = verified_source_observation_hash(&clear_observation).expect("clear hash");
+        let recovery_not_before = Utc::now();
+
+        reconcile_verified_source_state(&store, &mut source, &clear_observation, clear_hash)
+            .expect("cleared auth reconciliation");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("recovered assignments");
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].started_at >= recovery_not_before);
+    }
+
+    #[test]
+    fn migrating_legacy_verified_hash_preserves_active_assignment_continuity() {
+        let store = Store::in_memory().expect("store");
+        let mut source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-legacy-verified-hash-migration"),
+            LocationOrigin::Configured,
+        );
+        let authenticated_at = Utc::now() - chrono::Duration::days(30);
+        let verified_state = VerifiedSourceState {
+            provider_user_id: Some("oauth-account".to_string()),
+            email: Some("oauth@example.com".to_string()),
+            account_label: None,
+            plan_name: None,
+            authenticated_at: Some(authenticated_at),
+            verified_at: Some(authenticated_at),
+            subscription: None,
+        };
+        source.verified_state_hash =
+            verified_source_state_hash(Some(&verified_state)).expect("legacy verified hash");
+        store.upsert_source(&source).expect("source");
+        apply_verified_source_state(&store, &source, Some(&verified_state))
+            .expect("legacy verified assignment");
+
+        let observation = VerifiedSourceObservation::Verified(Box::new(verified_state));
+        let typed_hash = verified_source_observation_hash(&observation).expect("typed hash");
+        reconcile_verified_source_state(&store, &mut source, &observation, typed_hash.clone())
+            .expect("verified hash migration");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].started_at, authenticated_at);
+        assert_eq!(assignments[0].ended_at, None);
+        assert_eq!(source.verified_state_hash, typed_hash);
     }
 
     #[test]
