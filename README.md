@@ -236,6 +236,19 @@ Canonical accounts are created when an identity such as `--email`,
 `--provider-user-id`, or `--provider-account-id` is first used. Labels such as
 `work` and `personal` are display metadata, not account identity.
 
+For Claude Code sources in `auto` verification mode, StatsAI reads only
+`oauthAccount.accountUuid`, `oauthAccount.emailAddress`, and
+`oauthAccount.profileFetchedAt` from the local `.claude.json` profile. It does
+not invoke the Claude CLI or contact a service. This is reported as an
+`inferred` identity because Claude transcripts do not record per-session
+credential provenance. Durable API-key, token, cloud-provider, gateway, and
+credential-helper settings in managed, user, and project scopes suppress the
+inference. Missing session indexes are recovered from bounded transcript
+metadata when possible; otherwise attribution fails closed. One-shot environment
+overrides cannot be reconstructed by file-only collection, so `auto` is a
+best-effort source-wide policy. Use `manual_only` plus explicit source connections
+for mixed-credential history.
+
 ### Understand the work behind the usage
 
 Ask a scan to extract local task spans and rebuild derived work items:

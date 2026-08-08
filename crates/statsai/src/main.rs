@@ -4,13 +4,13 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
-use statsai_adapters::VerifiedSourceState;
-#[cfg(test)]
 use statsai_adapters::VerifiedSubscriptionState;
 use statsai_adapters::{
     adapter_for_provider, default_adapters, ProviderAdapter, ScanCandidateFile, ScanDiagnostics,
     ScanOptions, VerifiedSourceObservation,
 };
+#[cfg(test)]
+use statsai_adapters::{SourceIdentityInference, VerifiedSourceState};
 use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
     normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
@@ -8368,6 +8368,53 @@ mod tests {
         blocked_since: Option<DateTime<Utc>>,
     }
 
+    #[derive(Clone)]
+    struct ClaudeProfileTestAdapter {
+        source: SourceLocation,
+        verified_state: VerifiedSourceState,
+    }
+
+    impl ProviderAdapter for ClaudeProfileTestAdapter {
+        fn id(&self) -> &'static str {
+            "claude-code-local-jsonl"
+        }
+
+        fn version(&self) -> &'static str {
+            "0.3.3"
+        }
+
+        fn provider(&self) -> &'static str {
+            "claude_code"
+        }
+
+        fn discover(&self) -> Vec<SourceLocation> {
+            vec![self.source.clone()]
+        }
+
+        fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+            Ok(Vec::new())
+        }
+
+        fn probe_verified_source_state(
+            &self,
+            _source: &SourceLocation,
+        ) -> Result<VerifiedSourceObservation> {
+            Ok(VerifiedSourceObservation::Inferred {
+                identity: Box::new(self.verified_state.clone()),
+                basis: SourceIdentityInference::CachedLocalProfile,
+                settings_modified_at: None,
+            })
+        }
+
+        fn scan(
+            &self,
+            _source: &SourceLocation,
+            _options: &ScanOptions,
+        ) -> Result<statsai_adapters::AdapterScan> {
+            Ok(statsai_adapters::AdapterScan::default())
+        }
+    }
+
     impl ProviderAdapter for AttributionBlockedTestAdapter {
         fn id(&self) -> &'static str {
             "attribution-blocked-test"
@@ -10207,7 +10254,7 @@ mod tests {
     }
 
     #[test]
-    fn source_explain_distinguishes_blocked_auth_from_unavailable_auth() {
+    fn source_explain_distinguishes_inferred_blocked_and_unavailable_auth() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
             "claude_code",
@@ -10232,6 +10279,24 @@ mod tests {
             Some(&VerifiedSourceObservation::Unavailable),
         )
         .expect("unavailable explanation");
+        let inferred = explain_source_with_observation(
+            &store,
+            &source,
+            Some(&VerifiedSourceObservation::Inferred {
+                identity: Box::new(VerifiedSourceState {
+                    provider_user_id: Some("cached-account".to_string()),
+                    email: Some("cached@example.com".to_string()),
+                    account_label: None,
+                    plan_name: None,
+                    authenticated_at: None,
+                    verified_at: None,
+                    subscription: None,
+                }),
+                basis: SourceIdentityInference::CachedLocalProfile,
+                settings_modified_at: None,
+            }),
+        )
+        .expect("inferred explanation");
 
         assert_eq!(
             blocked.pointer("/detected_auth_state/status"),
@@ -10241,6 +10306,92 @@ mod tests {
             unavailable.pointer("/detected_auth_state/status"),
             Some(&json!("unavailable"))
         );
+        assert_eq!(
+            inferred.pointer("/detected_auth_state/status"),
+            Some(&json!("inferred"))
+        );
+        assert_eq!(
+            inferred.pointer("/detected_auth_state/state/basis"),
+            Some(&json!("cached_local_profile"))
+        );
+    }
+
+    #[test]
+    fn scan_backfills_claude_profile_inference_without_changed_usage_files() {
+        let store = Store::in_memory().expect("store");
+        let authenticated_at = Utc
+            .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
+            .single()
+            .expect("authenticated at");
+        let usage_at = authenticated_at + Duration::hours(1);
+        let mut source = SourceLocation::local_adapter(
+            "claude_code",
+            "claude-code-local-jsonl",
+            "0.3.3",
+            Path::new("/tmp/claude-broken-profile-scan-migration"),
+            LocationOrigin::Default,
+        );
+        source.verified_state_hash =
+            verified_source_observation_hash(&VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: None,
+            })
+            .expect("blocked observation hash");
+        store.upsert_source(&source).expect("source");
+        store
+            .insert_event(&test_event(
+                "claude_code",
+                &source,
+                usage_at,
+                None,
+                TokenParts::total(15),
+            ))
+            .expect("unassigned event");
+        let adapter = ClaudeProfileTestAdapter {
+            source: source.clone(),
+            verified_state: VerifiedSourceState {
+                provider_user_id: Some("claude-account".to_string()),
+                email: Some("claude@example.com".to_string()),
+                account_label: None,
+                plan_name: None,
+                authenticated_at: Some(authenticated_at),
+                verified_at: Some(authenticated_at),
+                subscription: None,
+            },
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        let events = store
+            .events_for_source(&source.source_id)
+            .expect("reattributed events");
+        assert!(events[0].provider_account_id.is_some());
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].started_at, authenticated_at);
+        let stored_source = store
+            .source(&source.source_id)
+            .expect("source row")
+            .expect("stored source");
+        assert!(stored_source
+            .verified_state_hash
+            .as_deref()
+            .is_some_and(|hash| hash.starts_with("inferred_source.v1:")));
     }
 
     #[test]
@@ -13914,13 +14065,18 @@ mod tests {
     fn incremental_http_sync_sends_late_claude_assignment_without_full() {
         let endpoint = "https://api.example.com/api/sync/batches".to_string();
         let store = Store::in_memory().expect("store");
-        let source = SourceLocation::local_adapter(
+        let mut source = SourceLocation::local_adapter(
             "claude_code",
-            "test",
-            "0",
+            "claude-code-local-jsonl",
+            "0.3.3",
             Path::new("/tmp/claude-http-late-assignment"),
             LocationOrigin::Configured,
         );
+        source.verified_state_hash =
+            verified_source_observation_hash(&VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: None,
+            })
+            .expect("blocked observation hash");
         store.upsert_source(&source).expect("source");
 
         let authenticated_at = Utc
@@ -13955,10 +14111,8 @@ mod tests {
         record_rollup_sync_success(&store, "http", &target, &initial_batch)
             .expect("record initial sync");
 
-        apply_verified_source_state(
-            &store,
-            &source,
-            Some(&VerifiedSourceState {
+        let inferred_observation = VerifiedSourceObservation::Inferred {
+            identity: Box::new(VerifiedSourceState {
                 provider_user_id: Some("claude-account".to_string()),
                 email: Some("claude@example.com".to_string()),
                 account_label: None,
@@ -13967,8 +14121,13 @@ mod tests {
                 verified_at: Some(authenticated_at),
                 subscription: None,
             }),
-        )
-        .expect("verified Claude state");
+            basis: SourceIdentityInference::CachedLocalProfile,
+            settings_modified_at: None,
+        };
+        let inferred_hash = verified_source_observation_hash(&inferred_observation)
+            .expect("inferred observation hash");
+        reconcile_verified_source_state(&store, &mut source, &inferred_observation, inferred_hash)
+            .expect("inferred Claude state");
         store.rebuild_sync_rollups().expect("reattributed rollups");
 
         let (incremental_batch, incremental_mode) =

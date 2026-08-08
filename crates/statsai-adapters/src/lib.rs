@@ -138,7 +138,10 @@ fn usd_to_micro_usd(usd: f64) -> Option<i64> {
 }
 
 pub use archive::{ArchiveScan, ArchiveScanDiagnostics};
-pub use statsai_core::{VerifiedSourceObservation, VerifiedSourceState, VerifiedSubscriptionState};
+pub use statsai_core::{
+    SourceIdentityInference, VerifiedSourceObservation, VerifiedSourceState,
+    VerifiedSubscriptionState,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EventDeduplication {
@@ -6222,6 +6225,22 @@ fn project_label_from_path(path: &Path) -> Option<String> {
         })
 }
 
+#[derive(Deserialize)]
+struct ClaudeProfile {
+    #[serde(rename = "oauthAccount")]
+    oauth_account: Option<ClaudeOauthAccount>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeOauthAccount {
+    #[serde(rename = "accountUuid")]
+    account_uuid: Option<String>,
+    #[serde(rename = "emailAddress")]
+    email_address: Option<String>,
+    #[serde(rename = "profileFetchedAt")]
+    profile_fetched_at: Option<Value>,
+}
+
 fn codex_headless_usage_value(value: &Value) -> Option<&Value> {
     [
         value.get("usage"),
@@ -6251,7 +6270,8 @@ fn claude_auth_dependency_paths(root: &Path, location_origin: &LocationOrigin) -
     } else {
         root
     };
-    let mut paths = claude_settings_paths(settings_root).to_vec();
+    let mut paths = claude_profile_dependency_paths(root, location_origin, default_root.as_deref());
+    paths.extend(claude_settings_paths(settings_root));
     if let Some(managed_settings_root) = claude_managed_settings_root() {
         paths.push(managed_settings_root);
     }
@@ -6271,6 +6291,34 @@ fn claude_auth_dependency_paths(root: &Path, location_origin: &LocationOrigin) -
     paths
 }
 
+fn claude_profile_dependency_paths(
+    root: &Path,
+    location_origin: &LocationOrigin,
+    default_root: Option<&Path>,
+) -> Vec<PathBuf> {
+    let nested_profile = root.join(".claude.json");
+    let sibling_profile = root.parent().map(|parent| parent.join(".claude.json"));
+    if matches!(location_origin, LocationOrigin::Default) {
+        return vec![default_root
+            .and_then(Path::parent)
+            .map(|parent| parent.join(".claude.json"))
+            .unwrap_or(nested_profile)];
+    }
+    if matches!(location_origin, LocationOrigin::Env) {
+        return vec![nested_profile];
+    }
+    if default_root == Some(root) {
+        return vec![sibling_profile.unwrap_or(nested_profile)];
+    }
+    if root.file_name().is_none_or(|name| name != ".claude") {
+        return vec![nested_profile];
+    }
+    match sibling_profile {
+        Some(sibling_profile) => vec![nested_profile, sibling_profile],
+        None => vec![nested_profile],
+    }
+}
+
 fn claude_verification_dependency_topology_changed(root: &Path, changed: &[PathBuf]) -> bool {
     let projects_root = root.join("projects");
     changed.iter().any(|path| {
@@ -6281,13 +6329,18 @@ fn claude_verification_dependency_topology_changed(root: &Path, changed: &[PathB
             return false;
         };
         let mut components = relative.components();
-        let Some(_) = components.next() else {
+        let Some(project_store_name) = components.next() else {
             return true;
         };
+        let project_store = projects_root.join(project_store_name.as_os_str());
         let Some(child) = components.next() else {
             return true;
         };
-        components.next().is_none() && child.as_os_str() == "sessions-index.json"
+        if components.next().is_none() && child.as_os_str() == "sessions-index.json" {
+            return true;
+        }
+        path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+            && !project_store.join("sessions-index.json").is_file()
     })
 }
 
@@ -6325,14 +6378,96 @@ fn claude_auth_snapshot_with_probe_context(
     if let Some(block) = settings_block {
         return claude_attribution_blocked(block.blocked_since);
     }
-    // Claude transcripts do not record per-session credential provenance. Clean durable
-    // settings cannot rule out one-shot environment credentials or an override removed before
-    // this scan, so a cached OAuth profile is not sufficient for automatic attribution.
-    claude_attribution_blocked(None)
+    let settings_modified_at =
+        claude_settings_modified_at(root, settings_root, managed_settings_root);
+    claude_cached_profile_observation(
+        root,
+        location_origin,
+        default_root.as_deref(),
+        settings_modified_at,
+    )
 }
 
 fn claude_attribution_blocked(blocked_since: Option<DateTime<Utc>>) -> VerifiedSourceObservation {
     VerifiedSourceObservation::AttributionBlocked { blocked_since }
+}
+
+fn claude_cached_profile_observation(
+    root: &Path,
+    location_origin: &LocationOrigin,
+    default_root: Option<&Path>,
+    settings_modified_at: Option<DateTime<Utc>>,
+) -> VerifiedSourceObservation {
+    let profile_path = match claude_profile_resolution(root, location_origin, default_root) {
+        ClaudeProfileResolution::Path(path) => path,
+        ClaudeProfileResolution::Missing => return VerifiedSourceObservation::Unavailable,
+        ClaudeProfileResolution::Ambiguous => return claude_attribution_blocked(None),
+    };
+    claude_profile_snapshot(&profile_path)
+        .map(Box::new)
+        .map(|identity| VerifiedSourceObservation::Inferred {
+            identity,
+            basis: SourceIdentityInference::CachedLocalProfile,
+            settings_modified_at,
+        })
+        .unwrap_or(VerifiedSourceObservation::Unavailable)
+}
+
+fn claude_settings_modified_at(
+    root: &Path,
+    settings_root: &Path,
+    managed_settings_root: Option<&Path>,
+) -> Option<DateTime<Utc>> {
+    let mut paths = claude_settings_paths(settings_root).to_vec();
+    if let Some(managed_root) = managed_settings_root {
+        paths.push(managed_root.join("managed-settings.json"));
+        let drop_ins = managed_root.join("managed-settings.d");
+        paths.push(drop_ins.clone());
+        if let Ok(entries) = std::fs::read_dir(drop_ins) {
+            paths.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+        }
+    }
+    if let Some(project_paths) = claude_project_paths_from_session_indexes(&root.join("projects")) {
+        for project_path in project_paths {
+            for settings_root in claude_project_settings_roots(&project_path) {
+                paths.push(settings_root.clone());
+                paths.extend(claude_settings_paths(&settings_root));
+            }
+        }
+    }
+    paths
+        .into_iter()
+        .filter_map(|path| file_modified_at(&path))
+        .max()
+}
+
+fn claude_profile_snapshot(profile_path: &Path) -> Option<VerifiedSourceState> {
+    let file = File::open(profile_path).ok()?;
+    let profile: ClaudeProfile = serde_json::from_reader(BufReader::new(file)).ok()?;
+    let oauth_account = profile.oauth_account?;
+
+    let provider_user_id = normalized_optional_string(oauth_account.account_uuid.as_deref());
+    let email = normalized_optional_string(oauth_account.email_address.as_deref())
+        .map(|email| email.to_ascii_lowercase());
+    if provider_user_id.is_none() && email.is_none() {
+        return None;
+    }
+
+    let profile_fetched_at = oauth_account
+        .profile_fetched_at
+        .as_ref()
+        .and_then(claude_profile_timestamp);
+    let verified_at = profile_fetched_at.or_else(|| file_modified_at(profile_path));
+
+    Some(VerifiedSourceState {
+        provider_user_id,
+        email,
+        account_label: None,
+        plan_name: None,
+        authenticated_at: verified_at,
+        verified_at,
+        subscription: None,
+    })
 }
 
 #[cfg(test)]
@@ -6452,8 +6587,21 @@ fn claude_project_paths_from_session_indexes(projects_root: &Path) -> Option<Vec
         if !entry.metadata().ok()?.is_dir() {
             continue;
         }
-        let index_path = entry.path().join("sessions-index.json");
-        let file = File::open(index_path).ok()?;
+        let project_store = entry.path();
+        let index_path = project_store.join("sessions-index.json");
+        let file = match File::open(index_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                for project_path in claude_project_paths_from_transcripts(&project_store)? {
+                    insert_claude_project_path(
+                        &mut project_paths,
+                        project_path.to_string_lossy().as_ref(),
+                    );
+                }
+                continue;
+            }
+            Err(_) => return None,
+        };
         let index: Value = serde_json::from_reader(BufReader::new(file)).ok()?;
         let indexed_entries = index.get("entries").and_then(Value::as_array);
         let store_project_path = index
@@ -6482,6 +6630,82 @@ fn claude_project_paths_from_session_indexes(projects_root: &Path) -> Option<Vec
     }
 
     Some(project_paths.into_values().collect())
+}
+
+const CLAUDE_PROJECT_METADATA_SCAN_LINES: usize = 64;
+
+fn claude_project_paths_from_transcripts(project_store: &Path) -> Option<Vec<PathBuf>> {
+    let transcripts = collect_jsonl_files(project_store).ok()?;
+    if transcripts.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut paths_by_transcript = HashMap::<PathBuf, Vec<String>>::new();
+    for transcript in transcripts {
+        let file = File::open(&transcript).ok()?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut transcript_project_paths = Vec::new();
+        for _ in 0..CLAUDE_PROJECT_METADATA_SCAN_LINES {
+            match read_bounded_jsonl_line(&mut reader, &mut line, MAX_JSONL_RECORD_BYTES).ok()? {
+                BoundedLineRead::Eof => break,
+                BoundedLineRead::Oversized => continue,
+                BoundedLineRead::Complete => {}
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if let Some(project_path) = value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .or_else(|| {
+                    value
+                        .get("projectPath")
+                        .and_then(Value::as_str)
+                        .filter(|path| !path.trim().is_empty())
+                })
+            {
+                transcript_project_paths.push(project_path.to_string());
+            }
+        }
+        paths_by_transcript.insert(transcript, transcript_project_paths);
+    }
+
+    let mut project_paths = HashMap::new();
+    for (transcript, transcript_project_paths) in &paths_by_transcript {
+        let resolved_paths = if transcript_project_paths.is_empty() {
+            let parent_transcript =
+                claude_parent_transcript_for_subagent(project_store, transcript)?;
+            paths_by_transcript.get(&parent_transcript)?
+        } else {
+            transcript_project_paths
+        };
+        if resolved_paths.is_empty() {
+            return None;
+        }
+        for project_path in resolved_paths {
+            insert_claude_project_path(&mut project_paths, project_path);
+        }
+    }
+
+    Some(project_paths.into_values().collect())
+}
+
+fn claude_parent_transcript_for_subagent(
+    project_store: &Path,
+    transcript: &Path,
+) -> Option<PathBuf> {
+    let relative = transcript.strip_prefix(project_store).ok()?;
+    let mut components = relative.components();
+    let session_id = components.next()?;
+    if components.next()?.as_os_str() != "subagents" {
+        return None;
+    }
+    Some(
+        project_store
+            .join(session_id.as_os_str())
+            .with_extension("jsonl"),
+    )
 }
 
 fn insert_claude_project_path(project_paths: &mut HashMap<String, PathBuf>, value: &str) {
@@ -6731,6 +6955,74 @@ fn claude_base_url_is_non_default(value: &Value) -> bool {
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
+}
+
+fn normalized_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+enum ClaudeProfileResolution {
+    Path(PathBuf),
+    Missing,
+    Ambiguous,
+}
+
+fn claude_profile_resolution(
+    root: &Path,
+    location_origin: &LocationOrigin,
+    default_root: Option<&Path>,
+) -> ClaudeProfileResolution {
+    let nested_profile = root.join(".claude.json");
+    // Auto-discovered histories share Claude's standard home profile, including an XDG
+    // history root. Only an environment-origin source proves CLAUDE_CONFIG_DIR layout.
+    if matches!(location_origin, LocationOrigin::Default) {
+        return ClaudeProfileResolution::Path(
+            default_root
+                .and_then(Path::parent)
+                .map(|parent| parent.join(".claude.json"))
+                .unwrap_or(nested_profile),
+        );
+    }
+    if matches!(location_origin, LocationOrigin::Env) {
+        return ClaudeProfileResolution::Path(nested_profile);
+    }
+    if default_root == Some(root) {
+        return ClaudeProfileResolution::Path(
+            root.parent()
+                .map(|parent| parent.join(".claude.json"))
+                .unwrap_or(nested_profile),
+        );
+    }
+    if root.file_name().is_none_or(|name| name != ".claude") {
+        return if nested_profile.is_file() {
+            ClaudeProfileResolution::Path(nested_profile)
+        } else {
+            ClaudeProfileResolution::Missing
+        };
+    }
+
+    let Some(parent) = root.parent() else {
+        return ClaudeProfileResolution::Missing;
+    };
+    let sibling_profile = parent.join(".claude.json");
+    match (nested_profile.is_file(), sibling_profile.is_file()) {
+        (true, false) => ClaudeProfileResolution::Path(nested_profile),
+        (false, true) => ClaudeProfileResolution::Path(sibling_profile),
+        (true, true) => ClaudeProfileResolution::Ambiguous,
+        (false, false) => ClaudeProfileResolution::Missing,
+    }
+}
+
+fn claude_profile_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .and_then(|milliseconds| Utc.timestamp_millis_opt(milliseconds).single()),
+        _ => parse_timestamp_value(value),
+    }
 }
 
 fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
@@ -7105,7 +7397,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_cached_profile_does_not_verify_sessions_without_credential_provenance() {
+    fn claude_cached_profile_infers_account_when_durable_settings_are_clear() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("claude-config");
         std::fs::create_dir_all(&root).expect("config root");
@@ -7121,11 +7413,142 @@ mod tests {
             .to_string(),
         )
         .expect("claude profile");
+        let settings_path = root.join("settings.json");
+        std::fs::write(&settings_path, r#"{"theme":"dark"}"#).expect("harmless settings");
         let observation =
             claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
 
+        let VerifiedSourceObservation::Inferred {
+            identity: state,
+            basis,
+            settings_modified_at,
+        } = observation
+        else {
+            panic!("clean cached Claude profile must infer the account");
+        };
+        assert_eq!(basis, SourceIdentityInference::CachedLocalProfile);
+        assert_eq!(settings_modified_at, file_modified_at(&settings_path));
+        assert_eq!(state.provider_user_id.as_deref(), Some("file-only-account"));
+        assert_eq!(state.email.as_deref(), Some("file-only@example.com"));
         assert_eq!(
-            observation,
+            state.authenticated_at,
+            Utc.timestamp_millis_opt(1_786_104_000_000_i64).single()
+        );
+    }
+
+    #[test]
+    fn claude_default_profile_resolution_uses_home_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join(".claude");
+        std::fs::create_dir_all(&root).expect("config root");
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "active-home-account",
+                    "emailAddress": "home@example.com"
+                }
+            })
+            .to_string(),
+        )
+        .expect("home profile");
+        std::fs::write(
+            root.join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "stale-nested-account",
+                    "emailAddress": "stale@example.com"
+                }
+            })
+            .to_string(),
+        )
+        .expect("stale nested profile");
+
+        let observation =
+            claude_cached_profile_observation(&root, &LocationOrigin::Default, Some(&root), None);
+
+        let VerifiedSourceObservation::Inferred {
+            identity: state, ..
+        } = observation
+        else {
+            panic!("default Claude source must use the home profile");
+        };
+        assert_eq!(
+            state.provider_user_id.as_deref(),
+            Some("active-home-account")
+        );
+    }
+
+    #[test]
+    fn claude_environment_profile_resolution_uses_nested_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("custom").join(".claude");
+        std::fs::create_dir_all(&root).expect("config root");
+        std::fs::write(
+            root.join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "environment-account",
+                    "emailAddress": "environment@example.com"
+                }
+            })
+            .to_string(),
+        )
+        .expect("nested profile");
+        std::fs::write(
+            root.parent().expect("custom parent").join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "unrelated-sibling-account",
+                    "emailAddress": "unrelated@example.com"
+                }
+            })
+            .to_string(),
+        )
+        .expect("sibling profile");
+
+        let observation =
+            claude_cached_profile_observation(&root, &LocationOrigin::Env, None, None);
+
+        let VerifiedSourceObservation::Inferred {
+            identity: state, ..
+        } = observation
+        else {
+            panic!("CLAUDE_CONFIG_DIR source must use its nested profile");
+        };
+        assert_eq!(
+            state.provider_user_id.as_deref(),
+            Some("environment-account")
+        );
+    }
+
+    #[test]
+    fn claude_configured_source_with_conflicting_profiles_is_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("mounted").join(".claude");
+        std::fs::create_dir_all(&root).expect("config root");
+        for (path, account) in [
+            (root.join(".claude.json"), "nested-account"),
+            (
+                root.parent().expect("mounted parent").join(".claude.json"),
+                "sibling-account",
+            ),
+        ] {
+            std::fs::write(
+                path,
+                serde_json::json!({
+                    "oauthAccount": {
+                        "accountUuid": account,
+                        "emailAddress": format!("{account}@example.com")
+                    }
+                })
+                .to_string(),
+            )
+            .expect("profile");
+        }
+
+        assert_eq!(
+            claude_cached_profile_observation(&root, &LocationOrigin::Configured, None, None),
             VerifiedSourceObservation::AttributionBlocked {
                 blocked_since: None,
             }
@@ -7154,6 +7577,7 @@ mod tests {
 
         let dependencies = claude_auth_dependency_paths(&root, &LocationOrigin::Configured);
 
+        assert!(dependencies.contains(&root.join(".claude.json")));
         assert!(dependencies.contains(&root.join("settings.json")));
         assert!(dependencies.contains(&root.join("settings.local.json")));
         assert!(dependencies.contains(&project_settings_root));
@@ -7161,9 +7585,11 @@ mod tests {
 
     #[test]
     fn claude_dependency_topology_changes_only_for_project_indexes_and_directories() {
-        let root = PathBuf::from("/tmp/statsai-claude-dependency-cache");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("claude-config");
         let projects = root.join("projects");
         let project_store = projects.join("workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
 
         assert!(claude_verification_dependency_topology_changed(
             &root,
@@ -7177,6 +7603,15 @@ mod tests {
             &root,
             std::slice::from_ref(&project_store.join("sessions-index.json"))
         ));
+        assert!(claude_verification_dependency_topology_changed(
+            &root,
+            std::slice::from_ref(&project_store.join("session.jsonl"))
+        ));
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            r#"{"entries":[]}"#,
+        )
+        .expect("session index");
         assert!(!claude_verification_dependency_topology_changed(
             &root,
             std::slice::from_ref(&project_store.join("session.jsonl"))
@@ -7292,7 +7727,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_default_base_url_still_lacks_session_credential_provenance() {
+    fn claude_default_base_url_without_cached_profile_is_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("claude-config");
         std::fs::create_dir_all(&root).expect("config root");
@@ -7308,12 +7743,7 @@ mod tests {
         let observation =
             claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
 
-        assert_eq!(
-            observation,
-            VerifiedSourceObservation::AttributionBlocked {
-                blocked_since: None,
-            }
-        );
+        assert_eq!(observation, VerifiedSourceObservation::Unavailable);
     }
 
     #[test]
@@ -7422,7 +7852,90 @@ mod tests {
     }
 
     #[test]
-    fn claude_unknown_transcript_project_blocks_cached_profile_attribution() {
+    fn claude_project_without_session_index_still_uses_cached_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("claude-config");
+        let project_store = root.join("projects").join("unknown-workspace");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            project_store.join("session.jsonl"),
+            format!("{}\n", serde_json::json!({"cwd": workspace})),
+        )
+        .expect("transcript");
+        std::fs::write(
+            root.join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "cached-account",
+                    "emailAddress": "cached@example.com"
+                }
+            })
+            .to_string(),
+        )
+        .expect("claude profile");
+        let observation =
+            claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+        let VerifiedSourceObservation::Inferred {
+            identity: state, ..
+        } = observation
+        else {
+            panic!("missing optional session index must not disable account detection");
+        };
+        assert_eq!(state.provider_user_id.as_deref(), Some("cached-account"));
+        assert_eq!(state.email.as_deref(), Some("cached@example.com"));
+    }
+
+    #[test]
+    fn claude_project_without_session_index_checks_recovered_project_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("claude-config");
+        let project_store = root.join("projects").join("unknown-workspace");
+        let workspace = dir.path().join("workspace");
+        let settings_path = workspace.join(".claude").join("settings.json");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(settings_path.parent().expect("settings parent"))
+            .expect("project settings directory");
+        std::fs::write(
+            project_store.join("session.jsonl"),
+            format!("{}\n", serde_json::json!({"cwd": workspace})),
+        )
+        .expect("transcript");
+        std::fs::write(
+            root.join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "cached-account",
+                    "emailAddress": "cached@example.com"
+                }
+            })
+            .to_string(),
+        )
+        .expect("claude profile");
+        std::fs::write(
+            &settings_path,
+            serde_json::json!({
+                "env": {"ANTHROPIC_API_KEY": "project-api-key"}
+            })
+            .to_string(),
+        )
+        .expect("project settings");
+
+        let observation =
+            claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+        assert_eq!(
+            observation,
+            VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: file_modified_at(&settings_path),
+            }
+        );
+    }
+
+    #[test]
+    fn claude_project_without_index_or_project_metadata_blocks_attribution() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("claude-config");
         let project_store = root.join("projects").join("unknown-workspace");
@@ -7439,6 +7952,7 @@ mod tests {
             .to_string(),
         )
         .expect("claude profile");
+
         let observation =
             claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
 
@@ -7446,6 +7960,62 @@ mod tests {
             observation,
             VerifiedSourceObservation::AttributionBlocked {
                 blocked_since: None,
+            }
+        );
+    }
+
+    #[test]
+    fn claude_missing_index_checks_every_nested_transcript_project_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("claude-config");
+        let project_store = root.join("projects").join("mixed-workspaces");
+        let oauth_workspace = dir.path().join("oauth-workspace");
+        let api_workspace = dir.path().join("api-workspace");
+        let api_settings = api_workspace.join(".claude").join("settings.json");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(api_settings.parent().expect("settings parent"))
+            .expect("api project settings");
+        std::fs::write(
+            project_store.join("a-oauth-session.jsonl"),
+            format!("{}\n", serde_json::json!({"cwd": oauth_workspace})),
+        )
+        .expect("oauth transcript");
+        std::fs::write(
+            project_store.join("z-api-session.jsonl"),
+            format!("{}\n", serde_json::json!({"cwd": api_workspace})),
+        )
+        .expect("api parent transcript");
+        let subagent = project_store
+            .join("z-api-session")
+            .join("subagents")
+            .join("agent-a.jsonl");
+        std::fs::create_dir_all(subagent.parent().expect("subagent parent"))
+            .expect("subagent directory");
+        std::fs::write(&subagent, "{}\n").expect("api subagent transcript");
+        std::fs::write(
+            &api_settings,
+            serde_json::json!({"env": {"ANTHROPIC_API_KEY": "project-api-key"}}).to_string(),
+        )
+        .expect("api project settings");
+        std::fs::write(
+            root.join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "cached-account",
+                    "emailAddress": "cached@example.com"
+                }
+            })
+            .to_string(),
+        )
+        .expect("cached profile");
+
+        let observation =
+            claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+        assert_eq!(
+            observation,
+            VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: file_modified_at(&api_settings),
             }
         );
     }

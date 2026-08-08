@@ -30,7 +30,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(test)]
+use statsai_core::SourceIdentityInference;
+
 const ATTRIBUTION_BLOCKED_OBSERVATION_HASH_PREFIX: &str = "attribution_blocked.v2:";
+const INFERRED_SOURCE_OBSERVATION_HASH_PREFIX: &str = "inferred_source.v1:";
 const VERIFIED_SOURCE_OBSERVATION_HASH_PREFIX: &str = "verified_source.v2:";
 
 pub use archive::{ArchiveConversationSummary, ArchiveSearchHit, ArchiveStats, ArchiveWriteResult};
@@ -3712,6 +3716,22 @@ pub fn verified_source_observation_hash(
         VerifiedSourceObservation::Unavailable => Ok(None),
         VerifiedSourceObservation::Verified(state) => Ok(verified_source_state_hash(Some(state))?
             .map(|hash| format!("{VERIFIED_SOURCE_OBSERVATION_HASH_PREFIX}{hash}"))),
+        VerifiedSourceObservation::Inferred {
+            identity,
+            basis,
+            settings_modified_at,
+        } => {
+            let payload = serde_json::to_string(&(
+                "verified_source_observation.inferred.v1",
+                basis,
+                identity,
+                settings_modified_at,
+            ))?;
+            Ok(Some(format!(
+                "{INFERRED_SOURCE_OBSERVATION_HASH_PREFIX}{}",
+                hash_text(&payload)
+            )))
+        }
         VerifiedSourceObservation::AttributionBlocked { blocked_since } => {
             let payload = serde_json::to_string(&(
                 "verified_source_observation.attribution_blocked.v2",
@@ -3904,7 +3924,13 @@ pub fn apply_verified_source_state(
     source: &SourceLocation,
     verified_state: Option<&VerifiedSourceState>,
 ) -> Result<()> {
-    apply_verified_source_state_with_recovery_boundary(store, source, verified_state, None)
+    apply_verified_source_state_with_recovery_boundary(
+        store,
+        source,
+        verified_state,
+        None,
+        IdentitySource::LocalAuth,
+    )
 }
 
 fn apply_verified_source_state_with_recovery_boundary(
@@ -3912,11 +3938,12 @@ fn apply_verified_source_state_with_recovery_boundary(
     source: &SourceLocation,
     verified_state: Option<&VerifiedSourceState>,
     recovery: Option<VerifiedAssignmentRecoveryBoundary>,
+    record_source: IdentitySource,
 ) -> Result<()> {
     let Some(verified_state) = verified_state else {
         return Ok(());
     };
-    let account = upsert_provider_account(
+    let mut account = upsert_provider_account(
         store,
         UpsertProviderAccountInput {
             provider: &source.provider,
@@ -3924,10 +3951,16 @@ fn apply_verified_source_state_with_recovery_boundary(
             email: verified_state.email.as_deref(),
             label: verified_state.account_label.clone(),
             plan_name: verified_state.plan_name.clone(),
-            identity_source: Some(IdentitySource::LocalAuth),
+            identity_source: Some(record_source.clone()),
             verified_at: verified_state.verified_at,
         },
     )?;
+    if matches!(record_source, IdentitySource::SourceConfig)
+        && matches!(account.identity_source, IdentitySource::SourceConfig)
+    {
+        account.confidence = Confidence::Medium;
+        store.upsert_account(&account)?;
+    }
     let assignment_started_at = verified_state.authenticated_at.or_else(|| {
         verified_state
             .subscription
@@ -3942,6 +3975,7 @@ fn apply_verified_source_state_with_recovery_boundary(
             started_at,
             verified_state.verified_at,
             recovery,
+            record_source.clone(),
         )?;
     }
     if let Some(subscription) = verified_state.subscription.as_ref() {
@@ -3982,6 +4016,7 @@ pub fn reconcile_verified_source_state(
                     must_start_at_observed_at: requires_conservative_verified_recovery(
                         previous_hash,
                     ),
+                    minimum_started_at: None,
                 }
             });
             apply_verified_source_state_with_recovery_boundary(
@@ -3989,6 +4024,36 @@ pub fn reconcile_verified_source_state(
                 source,
                 Some(verified_state),
                 recovery,
+                IdentitySource::LocalAuth,
+            )?;
+        }
+        VerifiedSourceObservation::Inferred {
+            identity,
+            settings_modified_at,
+            ..
+        } => {
+            let has_assignment_history = !store
+                .list_source_account_assignments_for_source(&source.source_id)?
+                .is_empty();
+            let repaired_settings_boundary =
+                settings_modified_at.filter(|modified_at| *modified_at > source.updated_at);
+            let recovery = source.verified_state_hash.as_deref().map(|previous_hash| {
+                VerifiedAssignmentRecoveryBoundary {
+                    observed_at: Utc::now(),
+                    // A current cached-profile inference explicitly enables best-effort
+                    // historical attribution when no assignment history exists. Once an
+                    // interval exists, blocked/legacy transitions keep their conservative gap.
+                    must_start_at_observed_at: has_assignment_history
+                        && requires_conservative_verified_recovery(previous_hash),
+                    minimum_started_at: repaired_settings_boundary,
+                }
+            });
+            apply_verified_source_state_with_recovery_boundary(
+                store,
+                source,
+                Some(identity),
+                recovery,
+                IdentitySource::SourceConfig,
             )?;
         }
         VerifiedSourceObservation::AttributionBlocked { blocked_since } => {
@@ -4031,6 +4096,7 @@ fn upsert_verified_source_assignment(
     authenticated_at: DateTime<Utc>,
     verified_at: Option<DateTime<Utc>>,
     recovery: Option<VerifiedAssignmentRecoveryBoundary>,
+    record_source: IdentitySource,
 ) -> Result<()> {
     let assignments = store.list_source_account_assignments_for_source(&source.source_id)?;
     let started_at = verified_assignment_started_at(
@@ -4065,10 +4131,7 @@ fn upsert_verified_source_assignment(
             provider_account_id: provider_account_id.clone(),
             started_at: merged_started_at,
             ended_at: None,
-            record_source: merge_identity_source(
-                &existing.record_source,
-                IdentitySource::LocalAuth,
-            ),
+            record_source: merge_identity_source(&existing.record_source, record_source.clone()),
             verified_at: max_datetime(existing.verified_at, verified_at),
             created_at: existing.created_at,
             updated_at: Utc::now(),
@@ -4115,7 +4178,7 @@ fn upsert_verified_source_assignment(
         provider_account_id: provider_account_id.clone(),
         started_at,
         ended_at: None,
-        record_source: IdentitySource::LocalAuth,
+        record_source,
         verified_at,
         created_at: now,
         updated_at: now,
@@ -4137,6 +4200,7 @@ fn upsert_verified_source_assignment(
 struct VerifiedAssignmentRecoveryBoundary {
     observed_at: DateTime<Utc>,
     must_start_at_observed_at: bool,
+    minimum_started_at: Option<DateTime<Utc>>,
 }
 
 fn verified_assignment_started_at(
@@ -4149,6 +4213,11 @@ fn verified_assignment_started_at(
     let Some(recovery) = recovery else {
         return authenticated_at;
     };
+    let clamp_to_evidence = |started_at: DateTime<Utc>| {
+        recovery
+            .minimum_started_at
+            .map_or(started_at, |minimum| started_at.max(minimum))
+    };
     if let Some(active_started_at) = assignments
         .iter()
         .filter(|assignment| {
@@ -4158,10 +4227,10 @@ fn verified_assignment_started_at(
         .map(|assignment| assignment.started_at)
         .max()
     {
-        return authenticated_at.max(active_started_at);
+        return clamp_to_evidence(authenticated_at.max(active_started_at));
     }
     if recovery.must_start_at_observed_at {
-        return recovery.observed_at;
+        return clamp_to_evidence(recovery.observed_at);
     }
     let latest_closed_at = assignments
         .iter()
@@ -4172,16 +4241,18 @@ fn verified_assignment_started_at(
         .filter_map(|assignment| assignment.ended_at)
         .max();
     let Some(latest_closed_at) = latest_closed_at else {
-        return authenticated_at;
+        return clamp_to_evidence(authenticated_at);
     };
     if authenticated_at > latest_closed_at {
-        return authenticated_at.min(recovery.observed_at);
+        return clamp_to_evidence(authenticated_at.min(recovery.observed_at));
     }
-    verified_at
-        .filter(|verified_at| *verified_at > latest_closed_at)
-        .map_or(recovery.observed_at, |verified_at| {
-            verified_at.min(recovery.observed_at)
-        })
+    clamp_to_evidence(
+        verified_at
+            .filter(|verified_at| *verified_at > latest_closed_at)
+            .map_or(recovery.observed_at, |verified_at| {
+                verified_at.min(recovery.observed_at)
+            }),
+    )
 }
 
 fn close_verified_source_assignments_at_boundary_inner(
@@ -4241,6 +4312,7 @@ fn is_verified_source_assignment(assignment: &SourceAccountAssignment) -> bool {
     matches!(
         assignment.record_source,
         IdentitySource::LocalAuth
+            | IdentitySource::SourceConfig
             | IdentitySource::ProviderAuth
             | IdentitySource::ProviderApi
             | IdentitySource::CookieOauth
@@ -5676,6 +5748,144 @@ mod tests {
             .expect("reattributed events");
         assert!(events[0].provider_account_id.is_some());
         assert_eq!(events[1].provider_account_id, None);
+    }
+
+    #[test]
+    fn cached_profile_inference_backfills_without_interpreting_the_previous_block_hash() {
+        let store = Store::in_memory().expect("store");
+        let authenticated_at = Utc
+            .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
+            .single()
+            .expect("authenticated at");
+        let usage_at = authenticated_at + chrono::Duration::days(1);
+        let mut source = SourceLocation::local_adapter(
+            "claude_code",
+            "claude-code-local-jsonl",
+            "0.3.3",
+            Path::new("/tmp/claude-broken-profile-block-migration"),
+            LocationOrigin::Default,
+        );
+        source.verified_state_hash =
+            verified_source_observation_hash(&VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: None,
+            })
+            .expect("blocked observation hash");
+        assert_eq!(
+            source.verified_state_hash.as_deref(),
+            Some(
+                "attribution_blocked.v2:8fee6869306fd2707a21c0aa54affa2d1b1c726dd6dd23a20e61edbf7891e860"
+            )
+        );
+        store.upsert_source(&source).expect("source");
+        store
+            .insert_event(&test_store_event(
+                &source,
+                usage_at,
+                "unassigned-claude-usage",
+            ))
+            .expect("unassigned usage");
+
+        let inferred_observation = VerifiedSourceObservation::Inferred {
+            identity: Box::new(VerifiedSourceState {
+                provider_user_id: Some("claude-account".to_string()),
+                email: Some("claude@example.com".to_string()),
+                account_label: None,
+                plan_name: None,
+                authenticated_at: Some(authenticated_at),
+                verified_at: Some(authenticated_at),
+                subscription: None,
+            }),
+            basis: SourceIdentityInference::CachedLocalProfile,
+            settings_modified_at: None,
+        };
+        let inferred_hash = verified_source_observation_hash(&inferred_observation)
+            .expect("inferred observation hash");
+
+        reconcile_verified_source_state(&store, &mut source, &inferred_observation, inferred_hash)
+            .expect("inferred profile reconciliation");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].started_at, authenticated_at);
+        assert_eq!(assignments[0].record_source, IdentitySource::SourceConfig);
+        let accounts = store.list_accounts().expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].identity_source, IdentitySource::SourceConfig);
+        assert_eq!(accounts[0].confidence, Confidence::Medium);
+        let events = store
+            .events_for_source(&source.source_id)
+            .expect("reattributed events");
+        assert!(events[0].provider_account_id.is_some());
+    }
+
+    #[test]
+    fn repaired_settings_bound_cached_profile_inference_after_legacy_block() {
+        let store = Store::in_memory().expect("store");
+        let blocked_observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 5, 0, 0, 0)
+            .single()
+            .expect("blocked observation");
+        let settings_repaired_at = blocked_observed_at + chrono::Duration::days(1);
+        let authenticated_at = blocked_observed_at - chrono::Duration::days(10);
+        let mut source = SourceLocation::local_adapter(
+            "claude_code",
+            "claude-code-local-jsonl",
+            "0.3.3",
+            Path::new("/tmp/claude-repaired-settings-inference"),
+            LocationOrigin::Default,
+        );
+        source.updated_at = blocked_observed_at;
+        source.verified_state_hash =
+            verified_source_observation_hash(&VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: None,
+            })
+            .expect("blocked observation hash");
+        store.upsert_source(&source).expect("source");
+        store
+            .insert_events(&[
+                test_store_event(
+                    &source,
+                    settings_repaired_at - chrono::Duration::hours(1),
+                    "before-settings-repair",
+                ),
+                test_store_event(
+                    &source,
+                    settings_repaired_at + chrono::Duration::hours(1),
+                    "after-settings-repair",
+                ),
+            ])
+            .expect("unassigned usage");
+        let observation = VerifiedSourceObservation::Inferred {
+            identity: Box::new(VerifiedSourceState {
+                provider_user_id: Some("claude-account".to_string()),
+                email: Some("claude@example.com".to_string()),
+                account_label: None,
+                plan_name: None,
+                authenticated_at: Some(authenticated_at),
+                verified_at: Some(authenticated_at),
+                subscription: None,
+            }),
+            basis: SourceIdentityInference::CachedLocalProfile,
+            settings_modified_at: Some(settings_repaired_at),
+        };
+        let next_hash =
+            verified_source_observation_hash(&observation).expect("inferred observation hash");
+
+        reconcile_verified_source_state(&store, &mut source, &observation, next_hash)
+            .expect("inferred profile reconciliation");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].started_at, settings_repaired_at);
+        let events = store
+            .events_for_source(&source.source_id)
+            .expect("reattributed events");
+        assert_eq!(events[0].provider_account_id, None);
+        assert!(events[1].provider_account_id.is_some());
     }
 
     #[test]
