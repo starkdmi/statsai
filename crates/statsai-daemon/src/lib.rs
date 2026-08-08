@@ -275,19 +275,22 @@ mod watch {
     use anyhow::{Context, Result};
     use chrono::{DateTime, Utc};
     use notify::{Event, EventKind, RecursiveMode, Watcher};
-    use statsai_adapters::{default_adapters, ProviderAdapter, ScanCandidateFile, ScanOptions};
+    use statsai_adapters::{
+        adapter_for_provider, default_adapters, ProviderAdapter, ScanCandidateFile, ScanOptions,
+        VerifiedSourceObservation,
+    };
     use statsai_core::{
         hash_text, timestamp_in_period, IdentitySource, ProviderAccountId, SourceAccountAssignment,
-        SourceKind, SourceLocation, SourceVerificationMode, UsageEvent, UsageSummary,
+        SourceId, SourceKind, SourceLocation, SourceVerificationMode, UsageEvent, UsageSummary,
     };
     use statsai_store::{
-        reconcile_verified_source_state, verified_source_state_hash, ScanFileReplacement,
+        reconcile_verified_source_state, verified_source_observation_hash, ScanFileReplacement,
         ScanFileStateEntry, Store,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::{Duration, Instant, SystemTime};
     use tiny_http::Server;
 
@@ -303,6 +306,99 @@ mod watch {
         Duration::from_secs(5)
     };
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WatchScope {
+        Direct,
+        Recursive,
+    }
+
+    impl WatchScope {
+        fn notify_mode(self) -> RecursiveMode {
+            match self {
+                Self::Direct => RecursiveMode::NonRecursive,
+                Self::Recursive => RecursiveMode::Recursive,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct VerificationDependencySnapshot {
+        paths_by_source: HashMap<SourceId, Vec<PathBuf>>,
+    }
+
+    impl VerificationDependencySnapshot {
+        fn paths_for(&self, source: &SourceLocation) -> &[PathBuf] {
+            self.paths_by_source
+                .get(&source.source_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct CachedVerificationDependencies {
+        source: SourceLocation,
+        paths: Vec<PathBuf>,
+    }
+
+    #[derive(Debug, Default)]
+    struct VerificationDependencyCache {
+        entries: HashMap<SourceId, CachedVerificationDependencies>,
+    }
+
+    impl VerificationDependencyCache {
+        fn paths_for(
+            &mut self,
+            adapter: &dyn ProviderAdapter,
+            source: &SourceLocation,
+        ) -> Vec<PathBuf> {
+            if let Some(cached) = self
+                .entries
+                .get(&source.source_id)
+                .filter(|cached| verification_dependency_source_matches(&cached.source, source))
+            {
+                return cached.paths.clone();
+            }
+
+            let paths = adapter.verification_dependency_paths(source);
+            self.entries.insert(
+                source.source_id.clone(),
+                CachedVerificationDependencies {
+                    source: source.clone(),
+                    paths: paths.clone(),
+                },
+            );
+            paths
+        }
+
+        fn invalidate_changed(
+            &mut self,
+            adapters: &[Box<dyn ProviderAdapter>],
+            changed: &[PathBuf],
+        ) {
+            self.entries.retain(|_, cached| {
+                let Some(adapter) = adapters
+                    .iter()
+                    .find(|adapter| source_matches_adapter(&cached.source, adapter.as_ref()))
+                else {
+                    return false;
+                };
+                !adapter.verification_dependency_paths_changed(&cached.source, changed)
+            });
+        }
+
+        fn retain_snapshot(&mut self, snapshot: &VerificationDependencySnapshot) {
+            self.entries
+                .retain(|source_id, _| snapshot.paths_by_source.contains_key(source_id));
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct WatchPlan {
+        paths: HashMap<PathBuf, WatchScope>,
+        verification_dependencies: VerificationDependencySnapshot,
+    }
+
     pub fn watch_and_serve(
         addr: &str,
         store: Arc<Mutex<Store>>,
@@ -312,17 +408,28 @@ mod watch {
         let bind_addr = super::resolve_loopback_addr(addr)?;
         let startup_executable = current_executable_stamp();
 
-        let initial_source_result = {
+        let watch_adapters = default_adapters();
+        let mut verification_dependency_cache = VerificationDependencyCache::default();
+        let initial_configured_result = {
             let s = super::lock_store(&store);
-            discover_watch_sources(&s)
+            s.list_sources()
         };
-        let initial_sources = match initial_source_result {
-            Ok(sources) => sources,
+        let initial_plan = match initial_configured_result {
+            Ok(configured) => discover_watch_plan(
+                &configured,
+                &watch_adapters,
+                &mut verification_dependency_cache,
+            ),
             Err(error) => {
                 eprintln!("daemon: initial watch source discovery failed: {error:#}");
-                discover_adapter_watch_sources()
+                discover_watch_plan(&[], &watch_adapters, &mut verification_dependency_cache)
             }
         };
+        let WatchPlan {
+            paths: initial_sources,
+            verification_dependencies: initial_verification_dependencies,
+        } = initial_plan;
+        let verification_dependencies = Arc::new(RwLock::new(initial_verification_dependencies));
         let (watcher_signal_tx, watcher_signal_rx) = mpsc::sync_channel(1);
         let pending_changed_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
         let callback_pending_paths = Arc::clone(&pending_changed_paths);
@@ -352,6 +459,7 @@ mod watch {
         let pending_scan_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
         let worker_pending_scan_paths = Arc::clone(&pending_scan_paths);
         let worker_shared_store = Arc::clone(&store);
+        let worker_verification_dependencies = Arc::clone(&verification_dependencies);
         let worker_device_id = device_id.to_string();
         let _scan_worker = std::thread::Builder::new()
             .name("statsai-watch-scan".to_string())
@@ -371,6 +479,10 @@ mod watch {
                     if changed.is_empty() {
                         continue;
                     }
+                    let dependency_snapshot = worker_verification_dependencies
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone();
                     let scan_succeeded = process_background_scan(
                         &worker_pending_scan_paths,
                         &worker_scan_signal_tx,
@@ -382,6 +494,7 @@ mod watch {
                                 &worker_shared_store,
                                 &worker_device_id,
                                 changed,
+                                &dependency_snapshot,
                             ),
                             Err(error) => {
                                 eprintln!(
@@ -389,11 +502,12 @@ mod watch {
                                 );
                                 let store = super::lock_store(&worker_shared_store);
                                 let adapters: Vec<Box<dyn ProviderAdapter>> = default_adapters();
-                                rescan_changed_sources_with_adapters(
+                                rescan_changed_sources_with_adapters_and_dependencies(
                                     &store,
                                     &worker_device_id,
                                     changed,
                                     &adapters,
+                                    &dependency_snapshot,
                                 )
                             }
                         },
@@ -409,14 +523,15 @@ mod watch {
             })
             .context("start background scan worker")?;
 
-        let mut watched_sources = HashSet::new();
+        let mut watched_sources = HashMap::new();
         let mut uncertain_watch_sources = HashSet::new();
-        reconcile_watch_sources(
+        let initially_watched = reconcile_watch_sources(
             &mut watcher,
             &mut watched_sources,
             &mut uncertain_watch_sources,
             initial_sources,
         );
+        enqueue_background_scan(&pending_scan_paths, &scan_signal_tx, initially_watched);
         let mut last_watch_source_refresh = Instant::now();
 
         eprintln!("daemon: API listening on http://{bind_addr}");
@@ -443,6 +558,7 @@ mod watch {
                                 .into_iter()
                                 .collect::<Vec<_>>()
                         });
+                    verification_dependency_cache.invalidate_changed(&watch_adapters, &changed);
                     enqueue_background_scan(&pending_scan_paths, &scan_signal_tx, changed);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -450,18 +566,27 @@ mod watch {
             }
 
             if last_watch_source_refresh.elapsed() >= WATCH_SOURCE_REFRESH_INTERVAL {
-                let desired_sources = {
+                let configured_result = {
                     let s = super::lock_store(&store);
-                    discover_watch_sources(&s)
+                    s.list_sources()
                 };
                 last_watch_source_refresh = Instant::now();
-                match desired_sources {
-                    Ok(desired_sources) => {
+                match configured_result {
+                    Ok(configured) => {
+                        let desired_plan = discover_watch_plan(
+                            &configured,
+                            &watch_adapters,
+                            &mut verification_dependency_cache,
+                        );
+                        *verification_dependencies
+                            .write()
+                            .unwrap_or_else(|error| error.into_inner()) =
+                            desired_plan.verification_dependencies;
                         let newly_watched = reconcile_watch_sources(
                             &mut watcher,
                             &mut watched_sources,
                             &mut uncertain_watch_sources,
-                            desired_sources,
+                            desired_plan.paths,
                         );
                         if !newly_watched.is_empty() {
                             enqueue_background_scan(
@@ -540,51 +665,177 @@ mod watch {
         executable_stamp(&startup.path).as_ref() != Some(startup)
     }
 
-    fn discover_watch_sources(store: &Store) -> Result<HashSet<PathBuf>> {
-        let mut paths = HashSet::new();
-
-        for source in store.list_sources()? {
-            if source.source_kind != SourceKind::LocalAdapter {
-                continue;
-            }
-            if let Some(label) = source.path_label.as_deref().filter(|p| !p.is_empty()) {
-                let path = PathBuf::from(label);
-                if path.is_dir() {
-                    paths.insert(path);
-                }
+    fn discover_watch_plan(
+        configured: &[SourceLocation],
+        adapters: &[Box<dyn ProviderAdapter>],
+        dependency_cache: &mut VerificationDependencyCache,
+    ) -> WatchPlan {
+        let mut plan = WatchPlan::default();
+        for adapter in adapters {
+            for source in watch_sources_for_adapter(adapter.as_ref(), configured) {
+                let dependencies = dependency_cache.paths_for(adapter.as_ref(), &source);
+                extend_source_watch_paths(&mut plan.paths, &source, &dependencies);
+                plan.verification_dependencies
+                    .paths_by_source
+                    .insert(source.source_id.clone(), dependencies);
             }
         }
 
-        paths.extend(discover_adapter_watch_sources());
-        Ok(paths)
+        for source in configured.iter().filter(|source| {
+            source.enabled
+                && source.source_kind == SourceKind::LocalAdapter
+                && !adapters
+                    .iter()
+                    .any(|adapter| source_matches_adapter(source, adapter.as_ref()))
+        }) {
+            extend_source_root_watch_path(&mut plan.paths, source);
+        }
+
+        dependency_cache.retain_snapshot(&plan.verification_dependencies);
+        plan
     }
 
-    fn discover_adapter_watch_sources() -> HashSet<PathBuf> {
-        let mut paths = HashSet::new();
-        for adapter in default_adapters() {
-            for source in adapter.discover() {
-                if source.source_kind != SourceKind::LocalAdapter {
-                    continue;
-                }
-                if let Some(label) = source.path_label.as_deref().filter(|p| !p.is_empty()) {
-                    let path = PathBuf::from(label);
-                    if path.is_dir() {
-                        paths.insert(path);
-                    }
-                }
+    fn watch_sources_for_adapter(
+        adapter: &dyn ProviderAdapter,
+        configured: &[SourceLocation],
+    ) -> Vec<SourceLocation> {
+        let configured = configured
+            .iter()
+            .filter(|source| {
+                source.source_kind == SourceKind::LocalAdapter
+                    && source_matches_adapter(source, adapter)
+            })
+            .collect::<Vec<_>>();
+        let mut sources = adapter
+            .discover()
+            .into_iter()
+            .filter(|source| {
+                source.enabled
+                    && source.source_kind == SourceKind::LocalAdapter
+                    && source.path_label.is_some()
+                    && !configured
+                        .iter()
+                        .any(|configured| sources_refer_to_same_location(source, configured))
+            })
+            .collect::<Vec<_>>();
+        for source in configured
+            .into_iter()
+            .filter(|source| source.enabled)
+            .cloned()
+        {
+            if !sources
+                .iter()
+                .any(|existing| existing.source_id == source.source_id)
+            {
+                sources.push(source);
             }
         }
+        sources
+    }
 
+    fn source_matches_adapter(source: &SourceLocation, adapter: &dyn ProviderAdapter) -> bool {
+        adapter_for_provider(&source.provider)
+            .is_some_and(|canonical| canonical.provider() == adapter.provider())
+    }
+
+    fn sources_refer_to_same_location(left: &SourceLocation, right: &SourceLocation) -> bool {
+        if left.source_kind != right.source_kind
+            || adapter_for_provider(&left.provider)
+                .zip(adapter_for_provider(&right.provider))
+                .is_none_or(|(left, right)| left.provider() != right.provider())
+        {
+            return false;
+        }
+        if left.source_id == right.source_id
+            || left
+                .path_hash
+                .as_deref()
+                .zip(right.path_hash.as_deref())
+                .is_some_and(|(left, right)| left == right)
+        {
+            return true;
+        }
+        left.path_label
+            .as_deref()
+            .zip(right.path_label.as_deref())
+            .is_some_and(|(left, right)| {
+                let left = PathBuf::from(left);
+                let right = PathBuf::from(right);
+                std::fs::canonicalize(&left).unwrap_or(left)
+                    == std::fs::canonicalize(&right).unwrap_or(right)
+            })
+    }
+
+    fn verification_dependency_source_matches(
+        left: &SourceLocation,
+        right: &SourceLocation,
+    ) -> bool {
+        left.provider == right.provider
+            && left.source_kind == right.source_kind
+            && left.location_origin == right.location_origin
+            && left.path_hash == right.path_hash
+            && left.path_label == right.path_label
+    }
+
+    fn extend_source_root_watch_path(
+        paths: &mut HashMap<PathBuf, WatchScope>,
+        source: &SourceLocation,
+    ) {
+        if let Some(label) = source.path_label.as_deref().filter(|path| !path.is_empty()) {
+            let path = PathBuf::from(label);
+            if path.is_dir() {
+                insert_watch_path(paths, path, WatchScope::Recursive);
+            }
+        }
+    }
+
+    fn extend_source_watch_paths(
+        paths: &mut HashMap<PathBuf, WatchScope>,
+        source: &SourceLocation,
+        dependencies: &[PathBuf],
+    ) {
+        extend_source_root_watch_path(paths, source);
+        for dependency in dependencies {
+            if dependency.is_dir() {
+                insert_watch_path(paths, dependency.clone(), WatchScope::Recursive);
+                continue;
+            }
+            if let Some(parent) = dependency
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| ancestor.is_dir())
+            {
+                insert_watch_path(paths, parent.to_path_buf(), WatchScope::Direct);
+            }
+        }
+    }
+
+    fn insert_watch_path(
+        paths: &mut HashMap<PathBuf, WatchScope>,
+        path: PathBuf,
+        scope: WatchScope,
+    ) {
         paths
+            .entry(path)
+            .and_modify(|current| {
+                if matches!(scope, WatchScope::Recursive) {
+                    *current = WatchScope::Recursive;
+                }
+            })
+            .or_insert(scope);
     }
 
     fn reconcile_watch_sources<W: Watcher>(
         watcher: &mut W,
-        watched: &mut HashSet<PathBuf>,
+        watched: &mut HashMap<PathBuf, WatchScope>,
         uncertain: &mut HashSet<PathBuf>,
-        desired: HashSet<PathBuf>,
+        desired: HashMap<PathBuf, WatchScope>,
     ) -> Vec<PathBuf> {
-        let mut removed = watched.difference(&desired).cloned().collect::<Vec<_>>();
+        let mut removed = watched
+            .iter()
+            .filter(|(path, scope)| desired.get(*path) != Some(*scope))
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
         removed.sort();
         for path in removed {
             if let Err(error) = watcher.unwatch(&path) {
@@ -599,17 +850,17 @@ mod watch {
 
         let mut additions = desired
             .iter()
-            .filter(|path| !watched.contains(*path) || uncertain.contains(*path))
-            .cloned()
+            .filter(|(path, scope)| watched.get(*path) != Some(*scope) || uncertain.contains(*path))
+            .map(|(path, scope)| (path.clone(), *scope))
             .collect::<Vec<_>>();
-        additions.sort();
+        additions.sort_by(|left, right| left.0.cmp(&right.0));
         let mut newly_watched = Vec::with_capacity(additions.len());
-        for path in additions {
-            if let Err(error) = watcher.watch(&path, RecursiveMode::Recursive) {
+        for (path, scope) in additions {
+            if let Err(error) = watcher.watch(&path, scope.notify_mode()) {
                 eprintln!("daemon: cannot watch {}: {error}", path.display());
             } else {
                 eprintln!("daemon: watching {}", path.display());
-                watched.insert(path.clone());
+                watched.insert(path.clone(), scope);
                 uncertain.remove(&path);
                 newly_watched.push(path);
             }
@@ -622,28 +873,53 @@ mod watch {
         commit_store: &Arc<Mutex<Store>>,
         device_id: &str,
         changed: &[PathBuf],
+        verification_dependencies: &VerificationDependencySnapshot,
     ) -> Result<()> {
         let adapters: Vec<Box<dyn ProviderAdapter>> = default_adapters();
-        rescan_changed_sources_with_adapters_and_commit_store(
+        rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
             scan_store,
             Some(commit_store),
             device_id,
             changed,
             &adapters,
+            verification_dependencies,
         )
     }
 
+    #[cfg(test)]
     fn rescan_changed_sources_with_adapters(
         store: &Store,
         device_id: &str,
         changed: &[PathBuf],
         adapters: &[Box<dyn ProviderAdapter>],
     ) -> Result<()> {
-        rescan_changed_sources_with_adapters_and_commit_store(
-            store, None, device_id, changed, adapters,
+        rescan_changed_sources_with_adapters_and_dependencies(
+            store,
+            device_id,
+            changed,
+            adapters,
+            &VerificationDependencySnapshot::default(),
         )
     }
 
+    fn rescan_changed_sources_with_adapters_and_dependencies(
+        store: &Store,
+        device_id: &str,
+        changed: &[PathBuf],
+        adapters: &[Box<dyn ProviderAdapter>],
+        verification_dependencies: &VerificationDependencySnapshot,
+    ) -> Result<()> {
+        rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
+            store,
+            None,
+            device_id,
+            changed,
+            adapters,
+            verification_dependencies,
+        )
+    }
+
+    #[cfg(test)]
     fn rescan_changed_sources_with_adapters_and_commit_store(
         scan_store: &Store,
         commit_store: Option<&Arc<Mutex<Store>>>,
@@ -651,13 +927,36 @@ mod watch {
         changed: &[PathBuf],
         adapters: &[Box<dyn ProviderAdapter>],
     ) -> Result<()> {
+        rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
+            scan_store,
+            commit_store,
+            device_id,
+            changed,
+            adapters,
+            &VerificationDependencySnapshot::default(),
+        )
+    }
+
+    fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
+        scan_store: &Store,
+        commit_store: Option<&Arc<Mutex<Store>>>,
+        device_id: &str,
+        changed: &[PathBuf],
+        adapters: &[Box<dyn ProviderAdapter>],
+        verification_dependencies: &VerificationDependencySnapshot,
+    ) -> Result<()> {
         let configured = scan_store
             .list_sources()
             .context("list sources for changed-source rescan")?;
         let mut failed = false;
 
         for adapter in adapters {
-            let sources = scan_sources_for_paths(adapter.as_ref(), &configured, changed);
+            let sources = scan_sources_for_paths(
+                adapter.as_ref(),
+                &configured,
+                changed,
+                verification_dependencies,
+            );
             for mut source in sources {
                 let expected_data_version = commit_store
                     .map(|_| scan_store.data_version())
@@ -720,7 +1019,7 @@ mod watch {
                 let verification_mode = source.verification_mode.clone();
                 let probed_verified_source_state =
                     if matches!(verification_mode, SourceVerificationMode::Disabled) {
-                        None
+                        VerifiedSourceObservation::Unavailable
                     } else {
                         match adapter.probe_verified_source_state(&source) {
                             Ok(state) => state,
@@ -736,22 +1035,21 @@ mod watch {
                     };
                 let next_verified_state_hash =
                     if matches!(verification_mode, SourceVerificationMode::Auto) {
-                        match probed_verified_source_state.as_ref() {
-                            Some(verified_state) => {
-                                match verified_source_state_hash(Some(verified_state)) {
-                                    Ok(hash) => hash,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "daemon: verified auth hash failed for {}: {e}",
-                                            source.path_label.as_deref().unwrap_or("unknown")
-                                        );
-                                        failed = true;
-                                        continue;
-                                    }
-                                }
+                        match &probed_verified_source_state {
+                            VerifiedSourceObservation::Unavailable => {
+                                source.verified_state_hash.clone()
                             }
-                            // A missing local snapshot is not proof of logout or revocation.
-                            None => source.verified_state_hash.clone(),
+                            observation => match verified_source_observation_hash(observation) {
+                                Ok(hash) => hash,
+                                Err(e) => {
+                                    eprintln!(
+                                        "daemon: verified auth hash failed for {}: {e}",
+                                        source.path_label.as_deref().unwrap_or("unknown")
+                                    );
+                                    failed = true;
+                                    continue;
+                                }
+                            },
                         }
                     } else {
                         None
@@ -792,19 +1090,24 @@ mod watch {
                         let parsed_summaries = scan.summaries.len();
                         let effective_verified_source_state =
                             if matches!(verification_mode, SourceVerificationMode::Disabled) {
-                                None
+                                VerifiedSourceObservation::Unavailable
                             } else if rescan_file_entries.is_empty() {
                                 probed_verified_source_state
                             } else {
                                 scan.verified_source_state
                                     .take()
-                                    .or(probed_verified_source_state)
+                                    .map(Box::new)
+                                    .map(VerifiedSourceObservation::Verified)
+                                    .unwrap_or(probed_verified_source_state)
                             };
                         let effective_verified_state_hash =
                             if matches!(verification_mode, SourceVerificationMode::Auto) {
-                                match effective_verified_source_state.as_ref() {
-                                    Some(verified_state) => {
-                                        match verified_source_state_hash(Some(verified_state)) {
+                                match &effective_verified_source_state {
+                                    VerifiedSourceObservation::Unavailable => {
+                                        source.verified_state_hash.clone()
+                                    }
+                                    observation => {
+                                        match verified_source_observation_hash(observation) {
                                             Ok(hash) => hash,
                                             Err(e) => {
                                                 eprintln!(
@@ -819,7 +1122,6 @@ mod watch {
                                             }
                                         }
                                     }
-                                    None => source.verified_state_hash.clone(),
                                 }
                             } else {
                                 None
@@ -845,7 +1147,7 @@ mod watch {
                                 reconcile_verified_source_state(
                                     store,
                                     source,
-                                    effective_verified_source_state.as_ref(),
+                                    &effective_verified_source_state,
                                     effective_verified_state_hash,
                                 )
                                 .context("reconcile verified auth state")?;
@@ -978,42 +1280,35 @@ mod watch {
         adapter: &dyn ProviderAdapter,
         configured: &[SourceLocation],
         changed: &[PathBuf],
+        verification_dependencies: &VerificationDependencySnapshot,
     ) -> Vec<SourceLocation> {
-        let mut sources = Vec::new();
-        for source in configured
-            .iter()
-            .filter(|s| {
-                s.enabled
-                    && s.source_kind == SourceKind::LocalAdapter
-                    && s.provider == adapter.provider()
+        watch_sources_for_adapter(adapter, configured)
+            .into_iter()
+            .filter(|source| {
+                source_in_changed_paths(
+                    source,
+                    changed,
+                    verification_dependencies.paths_for(source),
+                )
             })
-            .cloned()
-        {
-            if source.path_label.is_some() && source_in_changed_paths(&source, changed) {
-                sources.push(source);
-            }
-        }
-        for source in adapter.discover() {
-            if source.source_kind != SourceKind::LocalAdapter || source.path_label.is_none() {
-                continue;
-            }
-            if source_in_changed_paths(&source, changed)
-                && !sources.iter().any(|s| s.source_id == source.source_id)
-            {
-                sources.push(source);
-            }
-        }
-        sources
+            .collect()
     }
 
-    fn source_in_changed_paths(source: &SourceLocation, changed: &[PathBuf]) -> bool {
+    fn source_in_changed_paths(
+        source: &SourceLocation,
+        changed: &[PathBuf],
+        verification_dependencies: &[PathBuf],
+    ) -> bool {
         let Some(label) = source.path_label.as_deref() else {
             return false;
         };
-        let source_path = PathBuf::from(label);
-        changed.iter().any(|changed_path| {
-            changed_path.starts_with(&source_path) || source_path.starts_with(changed_path)
-        })
+        std::iter::once(PathBuf::from(label))
+            .chain(verification_dependencies.iter().cloned())
+            .any(|dependency| {
+                changed.iter().any(|changed_path| {
+                    changed_path.starts_with(&dependency) || dependency.starts_with(changed_path)
+                })
+            })
     }
 
     fn scan_file_state_entries(candidates: &[ScanCandidateFile]) -> Vec<ScanFileStateEntry> {
@@ -1190,11 +1485,13 @@ mod watch {
             BillingPeriod, LocationOrigin, SubscriptionStatus, VerifiedSourceState,
             VerifiedSubscriptionState,
         };
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Mutex};
 
         #[derive(Default)]
         struct RecordingWatcher {
             watched: HashSet<PathBuf>,
+            recursive: HashMap<PathBuf, bool>,
             rejected: HashSet<PathBuf>,
             rejected_unwatch: HashSet<PathBuf>,
         }
@@ -1204,11 +1501,15 @@ mod watch {
                 Ok(Self::default())
             }
 
-            fn watch(&mut self, path: &Path, _recursive_mode: RecursiveMode) -> notify::Result<()> {
+            fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
                 if self.rejected.contains(path) {
                     return Err(NotifyError::generic("rejected test path"));
                 }
                 self.watched.insert(path.to_path_buf());
+                self.recursive.insert(
+                    path.to_path_buf(),
+                    matches!(recursive_mode, RecursiveMode::Recursive),
+                );
                 Ok(())
             }
 
@@ -1217,11 +1518,65 @@ mod watch {
                     return Err(NotifyError::generic("rejected test unwatch path"));
                 }
                 self.watched.remove(path);
+                self.recursive.remove(path);
                 Ok(())
             }
 
             fn kind() -> WatcherKind {
                 WatcherKind::NullWatcher
+            }
+        }
+
+        struct RoutingTestAdapter {
+            provider: &'static str,
+            discovered: Vec<SourceLocation>,
+            verification_dependencies: Vec<PathBuf>,
+            dependency_topology_change: Option<PathBuf>,
+            dependency_calls: Arc<AtomicU64>,
+        }
+
+        impl ProviderAdapter for RoutingTestAdapter {
+            fn id(&self) -> &'static str {
+                "test-routing-adapter"
+            }
+
+            fn version(&self) -> &'static str {
+                "0.0.0"
+            }
+
+            fn provider(&self) -> &'static str {
+                self.provider
+            }
+
+            fn discover(&self) -> Vec<SourceLocation> {
+                self.discovered.clone()
+            }
+
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(Vec::new())
+            }
+
+            fn verification_dependency_paths(&self, _source: &SourceLocation) -> Vec<PathBuf> {
+                self.dependency_calls.fetch_add(1, Ordering::Relaxed);
+                self.verification_dependencies.clone()
+            }
+
+            fn verification_dependency_paths_changed(
+                &self,
+                _source: &SourceLocation,
+                changed: &[PathBuf],
+            ) -> bool {
+                self.dependency_topology_change
+                    .as_ref()
+                    .is_some_and(|topology_change| changed.contains(topology_change))
+            }
+
+            fn scan(
+                &self,
+                _source: &SourceLocation,
+                _options: &ScanOptions,
+            ) -> Result<statsai_adapters::AdapterScan> {
+                Ok(statsai_adapters::AdapterScan::default())
             }
         }
 
@@ -1242,17 +1597,20 @@ mod watch {
             let first = PathBuf::from("/tmp/statsai-watch-first");
             let second = PathBuf::from("/tmp/statsai-watch-second");
             let mut watcher = RecordingWatcher::default();
-            let mut watched = HashSet::new();
+            let mut watched = HashMap::new();
             let mut uncertain = HashSet::new();
 
             let added = reconcile_watch_sources(
                 &mut watcher,
                 &mut watched,
                 &mut uncertain,
-                HashSet::from([first.clone()]),
+                HashMap::from([(first.clone(), WatchScope::Recursive)]),
             );
             assert_eq!(added, vec![first.clone()]);
-            assert_eq!(watched, HashSet::from([first.clone()]));
+            assert_eq!(
+                watched,
+                HashMap::from([(first.clone(), WatchScope::Recursive)])
+            );
 
             watcher.rejected_unwatch.insert(first.clone());
             watcher.rejected.insert(second.clone());
@@ -1260,10 +1618,13 @@ mod watch {
                 &mut watcher,
                 &mut watched,
                 &mut uncertain,
-                HashSet::from([second.clone()]),
+                HashMap::from([(second.clone(), WatchScope::Recursive)]),
             );
             assert!(added.is_empty());
-            assert_eq!(watched, HashSet::from([first.clone()]));
+            assert_eq!(
+                watched,
+                HashMap::from([(first.clone(), WatchScope::Recursive)])
+            );
             assert_eq!(uncertain, HashSet::from([first.clone()]));
             assert!(watcher.watched.contains(&first));
 
@@ -1271,7 +1632,7 @@ mod watch {
                 &mut watcher,
                 &mut watched,
                 &mut uncertain,
-                HashSet::from([first.clone()]),
+                HashMap::from([(first.clone(), WatchScope::Recursive)]),
             );
             assert_eq!(added, vec![first.clone()]);
             assert!(uncertain.is_empty());
@@ -1281,7 +1642,7 @@ mod watch {
                 &mut watcher,
                 &mut watched,
                 &mut uncertain,
-                HashSet::from([second.clone()]),
+                HashMap::from([(second.clone(), WatchScope::Recursive)]),
             );
             assert!(added.is_empty());
             assert!(watched.is_empty());
@@ -1292,10 +1653,168 @@ mod watch {
                 &mut watcher,
                 &mut watched,
                 &mut uncertain,
-                HashSet::from([second.clone()]),
+                HashMap::from([(second.clone(), WatchScope::Recursive)]),
             );
             assert_eq!(added, vec![second.clone()]);
-            assert_eq!(watched, HashSet::from([second]));
+            assert_eq!(watched, HashMap::from([(second, WatchScope::Recursive)]));
+        }
+
+        #[test]
+        fn disabled_configured_source_suppresses_matching_discovered_watch_scan() {
+            let root = tempfile::tempdir().expect("source root");
+            let discovered = SourceLocation::local_adapter(
+                "claude_code",
+                "test",
+                "0",
+                root.path(),
+                LocationOrigin::Default,
+            );
+            let mut disabled = SourceLocation::local_adapter(
+                "claude_code",
+                "test",
+                "0",
+                root.path(),
+                LocationOrigin::Configured,
+            );
+            disabled.enabled = false;
+            let adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(RoutingTestAdapter {
+                provider: "claude_code",
+                discovered: vec![discovered],
+                verification_dependencies: Vec::new(),
+                dependency_topology_change: None,
+                dependency_calls: Arc::new(AtomicU64::new(0)),
+            })];
+            let mut dependency_cache = VerificationDependencyCache::default();
+            let watch_plan = discover_watch_plan(
+                std::slice::from_ref(&disabled),
+                &adapters,
+                &mut dependency_cache,
+            );
+
+            let sources = scan_sources_for_paths(
+                adapters[0].as_ref(),
+                &[disabled],
+                std::slice::from_ref(&root.path().to_path_buf()),
+                &watch_plan.verification_dependencies,
+            );
+
+            assert!(watch_plan.paths.is_empty());
+            assert!(sources.is_empty());
+        }
+
+        #[test]
+        fn watch_path_build_and_event_routing_probe_dependencies_once() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source_root = dir.path().join("source");
+            let external_root = dir.path().join("external");
+            let external_profile = external_root.join(".claude.json");
+            std::fs::create_dir_all(&source_root).expect("source root");
+            std::fs::create_dir_all(&external_root).expect("external root");
+            std::fs::write(&external_profile, "{}").expect("external profile");
+            let source = SourceLocation::local_adapter(
+                "claude_code",
+                "test",
+                "0",
+                &source_root,
+                LocationOrigin::Configured,
+            );
+            let dependency_calls = Arc::new(AtomicU64::new(0));
+            let session_index = source_root
+                .join("projects")
+                .join("workspace")
+                .join("sessions-index.json");
+            let adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(RoutingTestAdapter {
+                provider: "claude_code",
+                discovered: Vec::new(),
+                verification_dependencies: vec![external_profile.clone()],
+                dependency_topology_change: Some(session_index.clone()),
+                dependency_calls: Arc::clone(&dependency_calls),
+            })];
+
+            let mut dependency_cache = VerificationDependencyCache::default();
+            let initial_watch_plan = discover_watch_plan(
+                std::slice::from_ref(&source),
+                &adapters,
+                &mut dependency_cache,
+            );
+            let refreshed_watch_plan = discover_watch_plan(
+                std::slice::from_ref(&source),
+                &adapters,
+                &mut dependency_cache,
+            );
+            let matching_sources = scan_sources_for_paths(
+                adapters[0].as_ref(),
+                std::slice::from_ref(&source),
+                std::slice::from_ref(&external_profile),
+                &refreshed_watch_plan.verification_dependencies,
+            );
+
+            assert_eq!(
+                initial_watch_plan.paths.get(&source_root),
+                Some(&WatchScope::Recursive)
+            );
+            assert_eq!(
+                refreshed_watch_plan.paths.get(&external_root),
+                Some(&WatchScope::Direct)
+            );
+            assert_eq!(matching_sources, vec![source.clone()]);
+            assert_eq!(dependency_calls.load(Ordering::Relaxed), 1);
+
+            dependency_cache.invalidate_changed(&adapters, std::slice::from_ref(&session_index));
+            let _ = discover_watch_plan(
+                std::slice::from_ref(&source),
+                &adapters,
+                &mut dependency_cache,
+            );
+            assert_eq!(dependency_calls.load(Ordering::Relaxed), 2);
+        }
+
+        #[test]
+        fn external_verification_dependency_is_watched_and_routes_to_its_source() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source_root = dir.path().join("source");
+            let external_root = dir.path().join("external");
+            let external_profile = external_root.join(".claude.json");
+            std::fs::create_dir_all(&source_root).expect("source root");
+            std::fs::create_dir_all(&external_root).expect("external root");
+            std::fs::write(&external_profile, "{}").expect("external profile");
+            let source = SourceLocation::local_adapter(
+                "claude_code",
+                "test",
+                "0",
+                &source_root,
+                LocationOrigin::Configured,
+            );
+            let adapter = TestAdapter {
+                provider: "claude_code",
+                verified_observation: VerifiedSourceObservation::Unavailable,
+                verification_dependencies: vec![external_profile.clone()],
+                scan_calls: Arc::new(Mutex::new(0)),
+            };
+
+            let dependencies = adapter.verification_dependency_paths(&source);
+            let verification_dependencies = VerificationDependencySnapshot {
+                paths_by_source: HashMap::from([(source.source_id.clone(), dependencies.clone())]),
+            };
+            let mut watch_paths = HashMap::new();
+            extend_source_watch_paths(&mut watch_paths, &source, &dependencies);
+            let matching_sources = scan_sources_for_paths(
+                &adapter,
+                std::slice::from_ref(&source),
+                std::slice::from_ref(&external_profile),
+                &verification_dependencies,
+            );
+
+            assert_eq!(watch_paths.get(&source_root), Some(&WatchScope::Recursive));
+            assert_eq!(watch_paths.get(&external_root), Some(&WatchScope::Direct));
+            assert_eq!(matching_sources, vec![source]);
+
+            let mut watcher = RecordingWatcher::default();
+            let mut watched = HashMap::new();
+            let mut uncertain = HashSet::new();
+            reconcile_watch_sources(&mut watcher, &mut watched, &mut uncertain, watch_paths);
+            assert_eq!(watcher.recursive.get(&source_root), Some(&true));
+            assert_eq!(watcher.recursive.get(&external_root), Some(&false));
         }
 
         #[test]
@@ -1340,7 +1859,8 @@ mod watch {
 
         struct TestAdapter {
             provider: &'static str,
-            verified_state: Option<VerifiedSourceState>,
+            verified_observation: VerifiedSourceObservation,
+            verification_dependencies: Vec<PathBuf>,
             scan_calls: Arc<Mutex<u64>>,
         }
 
@@ -1368,8 +1888,12 @@ mod watch {
             fn probe_verified_source_state(
                 &self,
                 _source: &SourceLocation,
-            ) -> Result<Option<VerifiedSourceState>> {
-                Ok(self.verified_state.clone())
+            ) -> Result<VerifiedSourceObservation> {
+                Ok(self.verified_observation.clone())
+            }
+
+            fn verification_dependency_paths(&self, _source: &SourceLocation) -> Vec<PathBuf> {
+                self.verification_dependencies.clone()
             }
 
             fn scan(
@@ -1685,29 +2209,36 @@ mod watch {
                 .with_ymd_and_hms(2026, 6, 29, 10, 12, 43)
                 .single()
                 .expect("current_period_ends_at");
+            let blocked_since = Utc
+                .with_ymd_and_hms(2026, 6, 1, 9, 30, 0)
+                .single()
+                .expect("blocked_since");
             let scan_calls = Arc::new(Mutex::new(0u64));
             let adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(TestAdapter {
                 provider: "codex",
-                verified_state: Some(VerifiedSourceState {
-                    provider_user_id: Some("acct-watch".to_string()),
-                    email: Some("watch@example.com".to_string()),
-                    account_label: None,
-                    plan_name: Some("Plus".to_string()),
-                    authenticated_at: Some(authenticated_at),
-                    verified_at: Some(verified_at),
-                    subscription: Some(VerifiedSubscriptionState {
-                        plan_name: "Plus".to_string(),
-                        price: 2000,
-                        currency: "USD".to_string(),
-                        billing_period: BillingPeriod::Monthly,
-                        paid_at: Some(authenticated_at),
-                        started_at: authenticated_at,
-                        ended_at: Some(current_period_ends_at),
-                        current_period_ends_at: Some(current_period_ends_at),
-                        status: SubscriptionStatus::Active,
+                verified_observation: VerifiedSourceObservation::Verified(Box::new(
+                    VerifiedSourceState {
+                        provider_user_id: Some("acct-watch".to_string()),
+                        email: Some("watch@example.com".to_string()),
+                        account_label: None,
+                        plan_name: Some("Plus".to_string()),
+                        authenticated_at: Some(authenticated_at),
                         verified_at: Some(verified_at),
-                    }),
-                }),
+                        subscription: Some(VerifiedSubscriptionState {
+                            plan_name: "Plus".to_string(),
+                            price: 2000,
+                            currency: "USD".to_string(),
+                            billing_period: BillingPeriod::Monthly,
+                            paid_at: Some(authenticated_at),
+                            started_at: authenticated_at,
+                            ended_at: Some(current_period_ends_at),
+                            current_period_ends_at: Some(current_period_ends_at),
+                            status: SubscriptionStatus::Active,
+                            verified_at: Some(verified_at),
+                        }),
+                    },
+                )),
+                verification_dependencies: Vec::new(),
                 scan_calls: scan_calls.clone(),
             })];
 
@@ -1743,7 +2274,8 @@ mod watch {
             // account assignment or its verified subscription.
             let unavailable_adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(TestAdapter {
                 provider: "codex",
-                verified_state: None,
+                verified_observation: VerifiedSourceObservation::Unavailable,
+                verification_dependencies: Vec::new(),
                 scan_calls: Arc::new(Mutex::new(0u64)),
             })];
             rescan_changed_sources_with_adapters(
@@ -1762,6 +2294,34 @@ mod watch {
                 .expect("assignments after unavailable auth");
             assert_eq!(assignments.len(), 1);
             assert_eq!(assignments[0].ended_at, None);
+            let subscriptions = store.list_subscriptions().expect("subscriptions");
+            assert_eq!(subscriptions.len(), 1);
+            assert_eq!(subscriptions[0].ended_at, None);
+
+            let blocked_adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(TestAdapter {
+                provider: "codex",
+                verified_observation: VerifiedSourceObservation::AttributionBlocked {
+                    blocked_since: Some(blocked_since),
+                },
+                verification_dependencies: Vec::new(),
+                scan_calls: Arc::new(Mutex::new(0u64)),
+            })];
+            rescan_changed_sources_with_adapters(
+                &store,
+                "device-test",
+                &[
+                    PathBuf::from(source.path_label.as_deref().expect("path label"))
+                        .join("auth.json"),
+                ],
+                &blocked_adapters,
+            )
+            .expect("rescan explicitly blocked auth state");
+
+            let assignments = store
+                .list_source_account_assignments_for_source(&source.source_id)
+                .expect("assignments after blocked auth");
+            assert_eq!(assignments.len(), 1);
+            assert_eq!(assignments[0].ended_at, Some(blocked_since));
             let subscriptions = store.list_subscriptions().expect("subscriptions");
             assert_eq!(subscriptions.len(), 1);
             assert_eq!(subscriptions[0].ended_at, None);
@@ -1869,7 +2429,8 @@ mod watch {
             let scan_calls = Arc::new(Mutex::new(0u64));
             let adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(TestAdapter {
                 provider: "codex",
-                verified_state: None,
+                verified_observation: VerifiedSourceObservation::Unavailable,
+                verification_dependencies: Vec::new(),
                 scan_calls: Arc::clone(&scan_calls),
             })];
             rescan_changed_sources_with_adapters(

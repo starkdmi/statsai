@@ -4,10 +4,12 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
+use statsai_adapters::VerifiedSourceState;
+#[cfg(test)]
 use statsai_adapters::VerifiedSubscriptionState;
 use statsai_adapters::{
     adapter_for_provider, default_adapters, ProviderAdapter, ScanCandidateFile, ScanDiagnostics,
-    ScanOptions, VerifiedSourceState,
+    ScanOptions, VerifiedSourceObservation,
 };
 use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
@@ -34,10 +36,10 @@ use statsai_sdk::{
     REPORTED_USAGE_IMPORT_ADAPTER_ID,
 };
 #[cfg(test)]
-use statsai_store::apply_verified_source_state;
+use statsai_store::{apply_verified_source_state, verified_source_state_hash};
 use statsai_store::{
     close_active_verified_source_linkages, derive_task_work_items, find_existing_provider_account,
-    reconcile_verified_source_state, upsert_provider_account, verified_source_state_hash,
+    reconcile_verified_source_state, upsert_provider_account, verified_source_observation_hash,
     ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
     UpsertProviderAccountInput,
 };
@@ -1001,7 +1003,7 @@ fn scan_with_adapters(
             let verification_mode = source_verification_mode(&source);
             let probed_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
-                    None
+                    VerifiedSourceObservation::Unavailable
                 } else {
                     adapter.probe_verified_source_state(&source)?
                 };
@@ -1027,21 +1029,26 @@ fn scan_with_adapters(
             }
             let effective_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
-                    None
+                    VerifiedSourceObservation::Unavailable
                 } else if should_run_adapter_scan {
                     scan.verified_source_state
                         .take()
-                        .or(probed_verified_source_state)
+                        .map(Box::new)
+                        .map(VerifiedSourceObservation::Verified)
+                        .unwrap_or(probed_verified_source_state)
                 } else {
                     probed_verified_source_state
                 };
-            // `None` means the local snapshot yielded no observation. It is not an
-            // explicit sign-out or revocation signal, so preserve the last state.
+            // `Unavailable` means the local snapshot yielded no conclusive observation,
+            // so preserve the last state. `AttributionBlocked` is an explicit signal
+            // that the cached account must no longer own this source.
             let next_verified_state_hash =
                 if matches!(verification_mode, SourceVerificationMode::Auto) {
-                    match effective_verified_source_state.as_ref() {
-                        Some(verified_state) => verified_source_state_hash(Some(verified_state))?,
-                        None => source.verified_state_hash.clone(),
+                    match &effective_verified_source_state {
+                        VerifiedSourceObservation::Unavailable => {
+                            source.verified_state_hash.clone()
+                        }
+                        observation => verified_source_observation_hash(observation)?,
                     }
                 } else {
                     None
@@ -1127,7 +1134,7 @@ fn scan_with_adapters(
                 reconcile_verified_source_state(
                     store,
                     &mut source,
-                    effective_verified_source_state.as_ref(),
+                    &effective_verified_source_state,
                     next_verified_state_hash,
                 )?;
                 persist_source_after_preview(store, &source)?;
@@ -6621,31 +6628,40 @@ fn source_verification_mode(source: &SourceLocation) -> SourceVerificationMode {
     source.verification_mode.clone()
 }
 
-fn probe_source_verified_state(source: &SourceLocation) -> Result<Option<VerifiedSourceState>> {
+fn probe_source_verified_observation(source: &SourceLocation) -> Result<VerifiedSourceObservation> {
     if matches!(
         source_verification_mode(source),
         SourceVerificationMode::Disabled
     ) {
-        return Ok(None);
+        return Ok(VerifiedSourceObservation::Unavailable);
     }
     let Some(adapter) = adapter_for_provider(&source.provider) else {
-        return Ok(None);
+        return Ok(VerifiedSourceObservation::Unavailable);
     };
     adapter.probe_verified_source_state(source)
 }
 
 fn explain_source(store: &Store, source: &SourceLocation) -> Result<Value> {
-    let assignments = store.list_source_account_assignments_for_source(&source.source_id)?;
-    let detected_auth_state = if matches!(
+    let detected_auth_observation = if matches!(
         source_verification_mode(source),
         SourceVerificationMode::Disabled
     ) {
         None
     } else {
-        probe_source_verified_state(source)?
-            .map(serde_json::to_value)
-            .transpose()?
+        Some(probe_source_verified_observation(source)?)
     };
+    explain_source_with_observation(store, source, detected_auth_observation.as_ref())
+}
+
+fn explain_source_with_observation(
+    store: &Store,
+    source: &SourceLocation,
+    detected_auth_observation: Option<&VerifiedSourceObservation>,
+) -> Result<Value> {
+    let assignments = store.list_source_account_assignments_for_source(&source.source_id)?;
+    let detected_auth_state = detected_auth_observation
+        .map(serde_json::to_value)
+        .transpose()?;
     let now = Utc::now();
     let current_assignment = assignment_for_timestamp(&assignments, now).cloned();
     let current_subscription = current_assignment
@@ -8322,11 +8338,14 @@ mod tests {
         fn probe_verified_source_state(
             &self,
             _source: &SourceLocation,
-        ) -> Result<Option<VerifiedSourceState>> {
+        ) -> Result<VerifiedSourceObservation> {
             Ok(self
                 .probe_result
                 .clone()
-                .or_else(|| self.scan_result.verified_source_state.clone()))
+                .or_else(|| self.scan_result.verified_source_state.clone())
+                .map(Box::new)
+                .map(VerifiedSourceObservation::Verified)
+                .unwrap_or(VerifiedSourceObservation::Unavailable))
         }
 
         fn scan(
@@ -8339,6 +8358,52 @@ mod tests {
                 *calls += 1;
             }
             Ok(self.scan_result.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct AttributionBlockedTestAdapter {
+        provider: &'static str,
+        discovered: Vec<SourceLocation>,
+        blocked_since: Option<DateTime<Utc>>,
+    }
+
+    impl ProviderAdapter for AttributionBlockedTestAdapter {
+        fn id(&self) -> &'static str {
+            "attribution-blocked-test"
+        }
+
+        fn version(&self) -> &'static str {
+            "0"
+        }
+
+        fn provider(&self) -> &'static str {
+            self.provider
+        }
+
+        fn discover(&self) -> Vec<SourceLocation> {
+            self.discovered.clone()
+        }
+
+        fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+            Ok(Vec::new())
+        }
+
+        fn probe_verified_source_state(
+            &self,
+            _source: &SourceLocation,
+        ) -> Result<VerifiedSourceObservation> {
+            Ok(VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: self.blocked_since,
+            })
+        }
+
+        fn scan(
+            &self,
+            _source: &SourceLocation,
+            _options: &ScanOptions,
+        ) -> Result<statsai_adapters::AdapterScan> {
+            Ok(statsai_adapters::AdapterScan::default())
         }
     }
 
@@ -10142,6 +10207,43 @@ mod tests {
     }
 
     #[test]
+    fn source_explain_distinguishes_blocked_auth_from_unavailable_auth() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-source-explain-auth"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let blocked = explain_source_with_observation(
+            &store,
+            &source,
+            Some(&VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: None,
+            }),
+        )
+        .expect("blocked explanation");
+        let unavailable = explain_source_with_observation(
+            &store,
+            &source,
+            Some(&VerifiedSourceObservation::Unavailable),
+        )
+        .expect("unavailable explanation");
+
+        assert_eq!(
+            blocked.pointer("/detected_auth_state/status"),
+            Some(&json!("attribution_blocked"))
+        );
+        assert_eq!(
+            unavailable.pointer("/detected_auth_state/status"),
+            Some(&json!("unavailable"))
+        );
+    }
+
+    #[test]
     fn scan_skips_files_when_legacy_codex_auth_signature_is_cached() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
@@ -10515,6 +10617,98 @@ mod tests {
             stored_source.verified_state_hash,
             source.verified_state_hash
         );
+    }
+
+    #[test]
+    fn scan_closes_verified_assignment_when_source_auth_is_explicitly_blocked() {
+        let store = Store::in_memory().expect("store");
+        let mut source = SourceLocation::local_adapter(
+            "claude_code",
+            "test",
+            "0",
+            Path::new("/tmp/claude-explicit-auth-override"),
+            LocationOrigin::Configured,
+        );
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("started_at");
+        let blocked_since = Utc
+            .with_ymd_and_hms(2026, 5, 30, 8, 45, 0)
+            .single()
+            .expect("blocked_since");
+        let verified_state = VerifiedSourceState {
+            provider_user_id: Some("oauth-account".to_string()),
+            email: Some("oauth@example.com".to_string()),
+            account_label: None,
+            plan_name: None,
+            authenticated_at: Some(started_at),
+            verified_at: Some(started_at),
+            subscription: None,
+        };
+        source.verified_state_hash =
+            verified_source_state_hash(Some(&verified_state)).expect("verified state hash");
+        store.upsert_source(&source).expect("source");
+        let account = upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "claude_code",
+                provider_user_id: verified_state.provider_user_id.as_deref(),
+                email: verified_state.email.as_deref(),
+                label: None,
+                plan_name: None,
+                identity_source: Some(IdentitySource::LocalAuth),
+                verified_at: verified_state.verified_at,
+            },
+        )
+        .expect("account");
+        store
+            .upsert_source_account_assignment(&SourceAccountAssignment {
+                schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                assignment_id: source_account_assignment_id(
+                    &source.source_id,
+                    &account.provider_account_id,
+                    started_at,
+                ),
+                source_id: source.source_id.clone(),
+                provider: source.provider.clone(),
+                provider_account_id: account.provider_account_id,
+                started_at,
+                ended_at: None,
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(started_at),
+                created_at: started_at,
+                updated_at: started_at,
+            })
+            .expect("assignment");
+
+        let adapter = AttributionBlockedTestAdapter {
+            provider: "claude_code",
+            discovered: vec![source.clone()],
+            blocked_since: Some(blocked_since),
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].ended_at, Some(blocked_since));
     }
 
     #[test]

@@ -217,6 +217,18 @@ pub struct VerifiedSourceState {
     pub subscription: Option<VerifiedSubscriptionState>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", content = "state", rename_all = "snake_case")]
+pub enum VerifiedSourceObservation {
+    #[default]
+    Unavailable,
+    Verified(Box<VerifiedSourceState>),
+    AttributionBlocked {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked_since: Option<DateTime<Utc>>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct VerifiedSubscriptionState {
     pub plan_name: String,
