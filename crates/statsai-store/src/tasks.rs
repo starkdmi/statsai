@@ -552,7 +552,7 @@ impl Store {
         })();
         match result {
             Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
+                commit_transaction(&self.conn)?;
             }
             Err(error) => {
                 rollback(&self.conn);

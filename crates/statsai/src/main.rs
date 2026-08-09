@@ -14,15 +14,15 @@ use statsai_adapters::{SourceIdentityInference, VerifiedSourceState};
 use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
     normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
-    project_contains_file_paths, project_has_stable_identity, source_account_assignment_id,
-    source_id as statsai_source_id, subscription_id, timestamp_in_period, ArchiveContentKind,
-    ArchiveConversation, BillingPeriod, EventId, IdentitySource, LocationOrigin, ProjectInfo,
-    ProviderAccount, ProviderAccountId, ReportPeriod, SourceAccountAssignment,
-    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
-    Subscription, SubscriptionId, SubscriptionStatus, SyncAuthoritativeSnapshot, SyncBatch,
-    TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict, TaskVerification,
-    TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport, UsageSummary,
-    UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    project_contains_file_paths, project_has_stable_identity, sanitize_task_bucket_for_sync,
+    source_account_assignment_id, source_id as statsai_source_id, subscription_id,
+    timestamp_in_period, ArchiveContentKind, ArchiveConversation, BillingPeriod, EventId,
+    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
+    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
+    SyncAuthoritativeSnapshot, SyncBatch, TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict,
+    TaskVerification, TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport,
+    UsageSummary, UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
 };
 #[cfg(test)]
@@ -3827,13 +3827,17 @@ fn build_sync_batch(
             None
         };
         let full_task_sync = command.full || state.is_none();
-        let task_buckets = store.pending_task_bucket_snapshots_for_sync(
-            &command.sink,
-            target,
-            device_id,
-            full_task_sync,
-            task_verification_cursor.clone(),
-        )?;
+        let task_buckets = store
+            .pending_task_bucket_snapshots_for_sync(
+                &command.sink,
+                target,
+                device_id,
+                full_task_sync,
+                task_verification_cursor.clone(),
+            )?
+            .into_iter()
+            .map(sanitize_task_bucket_for_sync)
+            .collect();
         let task_verifications = if full_task_sync {
             store.task_verifications()?
         } else {
@@ -17090,7 +17094,9 @@ mod tests {
         summary.project = event.project.clone();
         store.upsert_summary(&summary).expect("summary");
 
-        let task_batch = test_task_only_sync_batch(now, 1, 1);
+        let mut task_batch = test_task_only_sync_batch(now, 1, 1);
+        task_batch.task_buckets[0].spans[0].source_record_id =
+            Some("codex_task_span.v1:raw-session:42".to_string());
         for bucket in &task_batch.task_buckets {
             store
                 .replace_task_bucket_snapshot(bucket)
@@ -17164,6 +17170,10 @@ mod tests {
         assert!(task_opt_in_batch.summaries[0].project.is_some());
         assert_eq!(task_opt_in_batch.task_buckets.len(), 1);
         assert_eq!(task_opt_in_batch.task_verifications.len(), 1);
+        let synced_span = &task_opt_in_batch.task_buckets[0].spans[0];
+        assert!(synced_span.source_record_id.is_none());
+        assert!(synced_span.session_id.is_none());
+        assert!(synced_span.thread_id.is_none());
     }
 
     #[test]

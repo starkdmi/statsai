@@ -38,6 +38,9 @@ The current production sync path strips record-level local evidence before sendi
 - `UsageSummary.source.source_record_id`
 - `UsageSummary.parse_evidence.source_line_number`
 - `UsageSummary.parse_evidence.source_record_id`
+- `TaskSpan.source_record_id`
+- `TaskSpan.session_id`
+- `TaskSpan.thread_id`
 - `Subscription.notes`
 
 `ProjectInfo.path_label` is retained for owner-facing project location displays,

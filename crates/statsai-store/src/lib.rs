@@ -527,7 +527,7 @@ impl Store {
         let result = operation();
         match result {
             Ok(value) => {
-                self.conn.execute_batch("COMMIT")?;
+                commit_transaction(&self.conn)?;
                 Ok(value)
             }
             Err(error) => {
@@ -548,13 +548,10 @@ impl Store {
         self.conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
         let result = operation(self);
         match result {
-            Ok(value) => match self.conn.execute_batch("COMMIT") {
-                Ok(()) => Ok(value),
-                Err(error) => {
-                    rollback(&self.conn);
-                    Err(error.into())
-                }
-            },
+            Ok(value) => {
+                commit_transaction(&self.conn)?;
+                Ok(value)
+            }
             Err(error) => {
                 rollback(&self.conn);
                 Err(error)
@@ -2121,7 +2118,7 @@ impl Store {
 
         match result {
             Ok(changed) => {
-                self.conn.execute_batch("COMMIT")?;
+                commit_transaction(&self.conn)?;
                 Ok(changed)
             }
             Err(error) => {
@@ -2211,7 +2208,7 @@ impl Store {
 
         match result {
             Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
+                commit_transaction(&self.conn)?;
                 Ok(())
             }
             Err(error) => {
@@ -2241,7 +2238,7 @@ impl Store {
 
         match result {
             Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
+                commit_transaction(&self.conn)?;
                 Ok(())
             }
             Err(error) => {
@@ -2540,7 +2537,7 @@ impl Store {
 
         match result {
             Ok(deleted) => {
-                self.conn.execute_batch("COMMIT")?;
+                commit_transaction(&self.conn)?;
                 Ok(deleted)
             }
             Err(error) => {
@@ -5261,8 +5258,21 @@ fn safe_u64_to_i64(value: u64) -> i64 {
 }
 
 fn rollback(conn: &Connection) {
+    if conn.is_autocommit() {
+        return;
+    }
     if let Err(e) = conn.execute_batch("ROLLBACK") {
         eprintln!("store: ROLLBACK failed: {e}");
+    }
+}
+
+fn commit_transaction(conn: &Connection) -> Result<()> {
+    match conn.execute_batch("COMMIT") {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            rollback(conn);
+            Err(error.into())
+        }
     }
 }
 
@@ -8443,6 +8453,65 @@ mod tests {
         assert_eq!(
             state.pending_resume_batch_id.as_deref(),
             Some("batch_retry_chunk")
+        );
+    }
+
+    #[test]
+    fn failed_commit_restores_autocommit_before_the_next_transaction() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("statsai.sqlite");
+        let store = Store::open(&db_path).expect("open store");
+        store
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;")
+            .expect("switch test database to rollback journal mode");
+        store
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(1))
+            .expect("short writer timeout");
+
+        let reader = Connection::open(&db_path).expect("open reader");
+        reader
+            .execute_batch("BEGIN DEFERRED TRANSACTION")
+            .expect("begin reader transaction");
+        let mut statement = reader
+            .prepare("SELECT COUNT(*) FROM local_metadata")
+            .expect("prepare reader");
+        let mut rows = statement.query([]).expect("query reader");
+        assert!(rows.next().expect("read first row").is_some());
+
+        let error = store
+            .with_immediate_transaction(|| {
+                store.set_metadata_value("commit-test", "pending")?;
+                Ok(())
+            })
+            .expect_err("reader must block commit");
+        assert!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .is_some_and(is_sqlite_busy_or_locked),
+            "expected busy commit error, got {error:#}"
+        );
+        assert!(
+            store.conn.is_autocommit(),
+            "failed commit must not leave the connection inside a transaction"
+        );
+
+        drop(rows);
+        drop(statement);
+        reader.execute_batch("ROLLBACK").expect("release reader");
+
+        store
+            .with_immediate_transaction(|| {
+                store.set_metadata_value("commit-test", "committed")?;
+                Ok(())
+            })
+            .expect("next transaction commits independently");
+        assert_eq!(
+            store.metadata_value("commit-test").expect("metadata"),
+            Some("committed".to_string())
         );
     }
 

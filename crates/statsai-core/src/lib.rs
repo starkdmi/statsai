@@ -754,6 +754,17 @@ pub struct TaskBucketSnapshot {
     pub spans: Vec<TaskSpan>,
 }
 
+/// Removes provider-local task locators before a snapshot leaves the device.
+#[must_use]
+pub fn sanitize_task_bucket_for_sync(mut snapshot: TaskBucketSnapshot) -> TaskBucketSnapshot {
+    for span in &mut snapshot.spans {
+        span.source_record_id = None;
+        span.session_id = None;
+        span.thread_id = None;
+    }
+    snapshot
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncEntityCounts {
     pub sources: u64,
