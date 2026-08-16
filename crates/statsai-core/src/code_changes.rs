@@ -559,7 +559,7 @@ pub fn parse_unified_patch(context: &TraceEditContext<'_>, patch: &str) -> Parse
         };
         // Some agents emit absolute paths in patch headers. Attribution and
         // classification both expect repository-relative paths.
-        let path = repository_relative_patch_path(context.repository_path, path);
+        let path = repository_relative_path(context.repository_path, path);
         let Some(category) = classify_code_path(&path) else {
             *observed = observed.saturating_add(1);
             *section = Section::default();
@@ -906,7 +906,13 @@ fn clean_patch_path(value: &str, style: PatchPathStyle) -> Option<PathBuf> {
     Some(PathBuf::from(value))
 }
 
-fn repository_relative_patch_path(repository_path: Option<&Path>, path: PathBuf) -> PathBuf {
+/// Rebases an edited file's path onto the repository that contains it.
+///
+/// Paths are only ever made shorter, never reinterpreted: an already-relative
+/// path is returned untouched, because it is relative to the repository
+/// already and stripping a prefix from it a second time would silently drop a
+/// directory level and point the edit at the wrong file.
+pub fn repository_relative_path(repository_path: Option<&Path>, path: PathBuf) -> PathBuf {
     if path.is_relative() {
         return path;
     }
@@ -1822,6 +1828,34 @@ mod tests {
             project: None,
             repository_path: None,
         }
+    }
+
+    #[test]
+    fn an_already_relative_edit_path_is_never_rebased_a_second_time() {
+        // Providers record a project path as a display label, which is not
+        // guaranteed to be absolute. When both it and the edited path are
+        // relative, stripping the prefix would drop a directory level and
+        // attribute the edit to a file that was never touched.
+        assert_eq!(
+            repository_relative_path(
+                Some(Path::new("crates/statsai-core")),
+                PathBuf::from("crates/statsai-core/src/lib.rs")
+            ),
+            PathBuf::from("crates/statsai-core/src/lib.rs")
+        );
+        // An absolute path is still rebased onto the repository holding it.
+        assert_eq!(
+            repository_relative_path(Some(Path::new("/repo")), PathBuf::from("/repo/src/lib.rs")),
+            PathBuf::from("src/lib.rs")
+        );
+        // One that lies outside the repository keeps its own path.
+        assert_eq!(
+            repository_relative_path(
+                Some(Path::new("/repo")),
+                PathBuf::from("/elsewhere/src/lib.rs")
+            ),
+            PathBuf::from("/elsewhere/src/lib.rs")
+        );
     }
 
     #[test]

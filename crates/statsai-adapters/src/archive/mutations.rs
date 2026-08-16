@@ -15,8 +15,8 @@ use super::ArchiveScanDiagnostics;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use statsai_core::{
-    parse_full_file_write, parse_structured_edit, parse_unified_patch, CoverageStatus,
-    ParsedMutation, ProjectInfo, SourceLocation, TraceEdit, TraceEditContext,
+    parse_full_file_write, parse_structured_edit, parse_unified_patch, repository_relative_path,
+    CoverageStatus, ParsedMutation, ProjectInfo, SourceLocation, TraceEdit, TraceEditContext,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -156,7 +156,7 @@ fn parse_original_mutation(
     }
     if normalized_name == "multiedit" {
         let path = path_argument(arguments)?;
-        let relative_path = repository_relative_path(context.repository_path, &path);
+        let relative_path = repository_relative_path(context.repository_path, path);
         let replacements = arguments.get("edits")?.as_array()?;
         if replacements.is_empty() {
             return Some(ParsedMutation {
@@ -199,7 +199,7 @@ fn parse_original_mutation(
         let path = path_argument(arguments)?;
         return parse_structured_replacement(
             context,
-            &repository_relative_path(context.repository_path, &path),
+            &repository_relative_path(context.repository_path, path),
             arguments,
             0,
         );
@@ -222,7 +222,7 @@ fn parse_original_mutation(
             || result_reports_file_creation(result_text);
         return Some(parse_full_file_write(
             context,
-            &repository_relative_path(context.repository_path, &path),
+            &repository_relative_path(context.repository_path, path),
             content,
             creation_known,
         ));
@@ -620,13 +620,6 @@ fn string_argument<'a>(arguments: &'a Value, keys: &[&str]) -> Option<&'a str> {
 
 fn path_argument(arguments: &Value) -> Option<PathBuf> {
     string_argument(arguments, &["file_path", "path", "file", "filename"]).map(PathBuf::from)
-}
-
-fn repository_relative_path(repository_path: Option<&Path>, path: &Path) -> PathBuf {
-    repository_path
-        .and_then(|root| path.strip_prefix(root).ok())
-        .unwrap_or(path)
-        .to_path_buf()
 }
 
 pub(super) fn mark_unresolved_mutations(
