@@ -7,13 +7,20 @@ use serde::Serialize;
 use statsai_core::{
     archive_artifact_metadata_signature, ArchiveArtifactDependency, ArchiveCompleteness,
     ArchiveContentKind, ArchiveContentPart, ArchiveConversation, ArchiveItem, ArchiveItemKind,
-    ArchiveRole, ModelInfo, ProjectInfo, SourceId, UsageCounts,
+    ArchiveRole, CoverageStatus, ModelInfo, ProjectInfo, SourceId, TraceEdit, UsageCounts,
     ARCHIVE_CONVERSATION_SCHEMA_VERSION,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-const ARCHIVE_IMPORT_REVISION: &str = "archive.v3";
+// Bumped whenever reconstruction changes what a re-import would produce, so
+// already-imported files are read again instead of keeping stale results. v4
+// backfilled local code-change fingerprints from original provider records; v6
+// reclassified read-only shell calls and stopped treating echoed file content
+// as a failed mutation; v7 reads whole-file creation from the tool result, so
+// files a `Write` created become counted additions with matchable fingerprints
+// instead of unclassified lines.
+const ARCHIVE_IMPORT_REVISION: &str = "archive.v7";
 const UNSCOPED_MISSING_CONTENT_SCOPE: &str = "unscoped";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -76,15 +83,23 @@ struct RetainedContentPart {
 }
 
 impl Store {
-    pub fn store_archive_scan(
+    pub fn store_archive_scan_with_code_changes(
         &self,
         source_id: &SourceId,
         conversations: &[ArchiveConversation],
         imported_entries: &[ScanFileStateEntry],
         artifact_dependencies: &[ArchiveArtifactDependency],
+        trace_edits: &[TraceEdit],
+        trace_coverage: CoverageStatus,
     ) -> Result<ArchiveWriteResult> {
         self.with_immediate_transaction(|| {
             let result = self.upsert_archive_conversations(conversations)?;
+            self.replace_archive_trace_edits_inner(
+                source_id,
+                imported_entries,
+                trace_edits,
+                trace_coverage,
+            )?;
             self.record_archive_import_entries(source_id, imported_entries)?;
             self.replace_archive_artifact_dependencies(
                 source_id,
@@ -135,6 +150,51 @@ impl Store {
             }
         }
         Ok(pending)
+    }
+
+    /// Number of archive files already imported from a source.
+    pub fn archive_import_entry_count(&self, source_id: &SourceId) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM archive_import_state WHERE source_id = ?1",
+            [&source_id.0],
+            |row| row.get::<_, u64>(0),
+        )?)
+    }
+
+    pub fn reconcile_archive_import_entries(
+        &self,
+        source_id: &SourceId,
+        entries: &[ScanFileStateEntry],
+    ) -> Result<u64> {
+        let current_cache_keys = entries
+            .iter()
+            .map(|entry| entry.cache_key.as_str())
+            .collect::<HashSet<_>>();
+        self.with_immediate_transaction(|| {
+            let mut statement = self.conn.prepare(
+                "SELECT cache_key FROM archive_import_state WHERE source_id = ?1",
+            )?;
+            let stored_cache_keys = statement
+                .query_map([&source_id.0], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let removed_cache_keys = stored_cache_keys
+                .into_iter()
+                .filter(|cache_key| !current_cache_keys.contains(cache_key.as_str()))
+                .collect::<Vec<_>>();
+            for cache_key in &removed_cache_keys {
+                self.delete_archive_trace_entry_inner(source_id, cache_key)?;
+                self.conn.execute(
+                    "DELETE FROM archive_artifact_dependencies WHERE source_id = ?1 AND cache_key = ?2",
+                    params![&source_id.0, cache_key],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM archive_import_state WHERE source_id = ?1 AND cache_key = ?2",
+                    params![&source_id.0, cache_key],
+                )?;
+            }
+            Ok(removed_cache_keys.len() as u64)
+        })
     }
 
     pub fn upsert_archive_conversations(
@@ -1264,11 +1324,13 @@ mod tests {
             metadata_signature: archive_artifact_metadata_signature(&artifact),
         };
         store
-            .store_archive_scan(
+            .store_archive_scan_with_code_changes(
                 &conversation.source_id,
                 std::slice::from_ref(&conversation),
                 std::slice::from_ref(&entry),
                 std::slice::from_ref(&dependency),
+                &[],
+                CoverageStatus::Unavailable,
             )
             .expect("store archive scan");
         assert!(store

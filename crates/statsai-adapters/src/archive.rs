@@ -13,9 +13,11 @@ use serde::Serialize;
 use serde_json::Value;
 use statsai_core::{
     archive_artifact_metadata_signature, archive_content_id, archive_conversation_id,
-    archive_item_id, hash_text, ArchiveArtifactDependency, ArchiveCompleteness, ArchiveContentKind,
-    ArchiveContentPart, ArchiveConversation, ArchiveItem, ArchiveItemKind, ArchiveRole, ModelInfo,
-    ProjectInfo, SourceLocation, UsageCounts, ARCHIVE_CONVERSATION_SCHEMA_VERSION,
+    archive_item_id, hash_text, parse_full_file_write, parse_structured_edit, parse_unified_patch,
+    ArchiveArtifactDependency, ArchiveCompleteness, ArchiveContentKind, ArchiveContentPart,
+    ArchiveConversation, ArchiveItem, ArchiveItemKind, ArchiveRole, CoverageStatus, ModelInfo,
+    ParsedMutation, ProjectInfo, SourceLocation, TraceEdit, TraceEditContext, UsageCounts,
+    ARCHIVE_CONVERSATION_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -38,13 +40,58 @@ pub struct ArchiveScanDiagnostics {
     pub binary_bytes: u64,
     pub missing_content: u64,
     pub invalid_records: u64,
+    pub mutation_calls: u64,
+    pub applied_mutations: u64,
+    pub failed_mutations: u64,
+    pub unsupported_mutations: u64,
+    pub truncated_mutations: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ArchiveScan {
     pub conversations: Vec<ArchiveConversation>,
     pub artifact_dependencies: Vec<ArchiveArtifactDependency>,
+    pub trace_edits: Vec<TraceEdit>,
+    pub trace_coverage: CoverageStatus,
     pub diagnostics: ArchiveScanDiagnostics,
+}
+
+impl Default for ArchiveScan {
+    fn default() -> Self {
+        Self {
+            conversations: Vec::new(),
+            artifact_dependencies: Vec::new(),
+            trace_edits: Vec::new(),
+            // A scan that reconstructed nothing has measured nothing. Only a
+            // provider whose mutations this module actually parses may claim
+            // complete trace coverage, so that a new adapter cannot silently
+            // over-report by inheriting the default.
+            trace_coverage: CoverageStatus::Unavailable,
+            diagnostics: ArchiveScanDiagnostics::default(),
+        }
+    }
+}
+
+impl ArchiveScan {
+    /// Empty scan for a provider whose tool mutations this module parses.
+    ///
+    /// Coverage starts complete and degrades as unmeasurable mutations are
+    /// observed, so an archive with no edits at all reads as "nothing to
+    /// measure" rather than "not measured".
+    fn measured() -> Self {
+        Self {
+            trace_coverage: CoverageStatus::Complete,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingMutation {
+    tool_name: String,
+    arguments: Value,
+    source_record_id: String,
+    occurred_at: Option<DateTime<Utc>>,
 }
 
 type ArtifactDependencyMap = BTreeMap<(String, PathBuf), String>;
@@ -140,6 +187,620 @@ pub(super) fn collect_provider_archive(
     }
 }
 
+/// Records that some mutation was observed but cannot be measured.
+///
+/// Failed, rejected, truncated, and unsupported mutations must never inflate
+/// applied-edit totals, but they do mean the trace no longer fully describes
+/// the edits of that period.
+fn record_unmeasurable_mutation(counter: &mut u64, trace_coverage: &mut CoverageStatus) {
+    *counter = counter.saturating_add(1);
+    *trace_coverage = trace_coverage.combine(CoverageStatus::Partial);
+}
+
+struct MutationInvocation<'a> {
+    call_key: String,
+    tool_name: Option<&'a str>,
+    arguments: &'a Value,
+    source_record_id: &'a str,
+    occurred_at: Option<DateTime<Utc>>,
+}
+
+fn remember_original_mutation(
+    pending: &mut HashMap<String, PendingMutation>,
+    diagnostics: &mut ArchiveScanDiagnostics,
+    trace_coverage: &mut CoverageStatus,
+    invocation: MutationInvocation<'_>,
+) {
+    let Some(tool_name) = invocation.tool_name else {
+        return;
+    };
+    if is_supported_mutation_tool(tool_name) {
+        diagnostics.mutation_calls = diagnostics.mutation_calls.saturating_add(1);
+        pending.insert(
+            invocation.call_key,
+            PendingMutation {
+                tool_name: tool_name.to_string(),
+                arguments: invocation.arguments.clone(),
+                source_record_id: invocation.source_record_id.to_string(),
+                occurred_at: invocation.occurred_at,
+            },
+        );
+    } else if is_potentially_mutating_shell(tool_name)
+        && !shell_invocation_is_read_only(invocation.arguments)
+    {
+        record_unmeasurable_mutation(&mut diagnostics.unsupported_mutations, trace_coverage);
+    }
+}
+
+struct MutationCompletion<'a> {
+    call_key: &'a str,
+    cache_key: &'a str,
+    result: &'a Value,
+    status: Option<&'a str>,
+    provider: &'a str,
+    source: &'a SourceLocation,
+    conversation_id: &'a str,
+    project: Option<&'a ProjectInfo>,
+}
+
+fn finish_original_mutation(
+    pending: &mut HashMap<String, PendingMutation>,
+    diagnostics: &mut ArchiveScanDiagnostics,
+    trace_edits: &mut Vec<TraceEdit>,
+    trace_coverage: &mut CoverageStatus,
+    completion: MutationCompletion<'_>,
+) {
+    let Some(call) = pending.remove(completion.call_key) else {
+        return;
+    };
+    if mutation_result_failed(completion.result, completion.status, &call.tool_name) {
+        record_unmeasurable_mutation(&mut diagnostics.failed_mutations, trace_coverage);
+        return;
+    }
+    let repository_path = completion
+        .project
+        .and_then(|project| project.path_label.as_deref())
+        .map(Path::new);
+    let context = TraceEditContext {
+        provider: completion.provider,
+        source_id: &completion.source.source_id,
+        cache_key: completion.cache_key,
+        conversation_id: completion.conversation_id,
+        source_record_id: &call.source_record_id,
+        occurred_at: call.occurred_at,
+        project: completion.project,
+        repository_path,
+    };
+    // Whether a whole-file write created the file is reported in the outcome,
+    // not in the call, so the result text is read before parsing.
+    let decoded_result = decoded_result_payload(completion.result);
+    let outcome = result_text(completion.result, decoded_result.as_ref());
+    match parse_original_mutation(
+        &context,
+        &call.tool_name,
+        &call.arguments,
+        outcome.as_deref(),
+    ) {
+        Some(parsed) => {
+            *trace_coverage = trace_coverage.combine(parsed.coverage);
+            if !parsed.edits.is_empty() {
+                diagnostics.applied_mutations = diagnostics.applied_mutations.saturating_add(1);
+            }
+            diagnostics.unsupported_mutations = diagnostics
+                .unsupported_mutations
+                .saturating_add(parsed.unsupported_sections);
+            trace_edits.extend(parsed.edits);
+        }
+        None => {
+            record_unmeasurable_mutation(&mut diagnostics.unsupported_mutations, trace_coverage);
+        }
+    }
+}
+
+fn parse_original_mutation(
+    context: &TraceEditContext<'_>,
+    tool_name: &str,
+    arguments: &Value,
+    result_text: Option<&str>,
+) -> Option<ParsedMutation> {
+    let normalized_name = normalized_tool_name(tool_name);
+    let decoded = decoded_tool_arguments(arguments);
+    let arguments = decoded.as_ref().unwrap_or(arguments);
+    if normalized_name == "apply_patch" || normalized_name == "patch" {
+        let patch = arguments
+            .as_str()
+            .or_else(|| string_argument(arguments, &["patch", "input", "diff"]))?;
+        return Some(parse_unified_patch(context, patch));
+    }
+    if normalized_name == "multiedit" {
+        let path = path_argument(arguments)?;
+        let relative_path = repository_relative_path(context.repository_path, &path);
+        let replacements = arguments.get("edits")?.as_array()?;
+        if replacements.is_empty() {
+            return Some(ParsedMutation {
+                coverage: CoverageStatus::Unavailable,
+                edits: Vec::new(),
+                unsupported_sections: 1,
+            });
+        }
+        let mut coverage = None;
+        let mut edits = Vec::new();
+        let mut unsupported_sections = 0_u64;
+        for (section_index, replacement) in replacements.iter().enumerate() {
+            let Some(parsed) =
+                parse_structured_replacement(context, &relative_path, replacement, section_index)
+            else {
+                coverage = Some(
+                    coverage.map_or(CoverageStatus::Partial, |current: CoverageStatus| {
+                        current.combine(CoverageStatus::Partial)
+                    }),
+                );
+                unsupported_sections = unsupported_sections.saturating_add(1);
+                continue;
+            };
+            coverage = Some(coverage.map_or(parsed.coverage, |current: CoverageStatus| {
+                current.combine(parsed.coverage)
+            }));
+            unsupported_sections = unsupported_sections.saturating_add(parsed.unsupported_sections);
+            edits.extend(parsed.edits);
+        }
+        return Some(ParsedMutation {
+            coverage: coverage.unwrap_or(CoverageStatus::Unavailable),
+            edits,
+            unsupported_sections,
+        });
+    }
+    if matches!(
+        normalized_name.as_str(),
+        "edit" | "str_replace" | "replace" | "str_replace_editor"
+    ) {
+        let path = path_argument(arguments)?;
+        return parse_structured_replacement(
+            context,
+            &repository_relative_path(context.repository_path, &path),
+            arguments,
+            0,
+        );
+    }
+    if matches!(
+        normalized_name.as_str(),
+        "write" | "write_file" | "create_file"
+    ) {
+        let path = path_argument(arguments)?;
+        let content = string_argument(arguments, &["content", "text", "file_text"])?;
+        let creation_known = normalized_name == "create_file"
+            || arguments
+                .get("create")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            || arguments
+                .get("is_new_file")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            || result_reports_file_creation(result_text);
+        return Some(parse_full_file_write(
+            context,
+            &repository_relative_path(context.repository_path, &path),
+            content,
+            creation_known,
+        ));
+    }
+    None
+}
+
+/// Whether a whole-file write's outcome says it created the file.
+///
+/// A creation makes every written line an addition; an overwrite mixes new and
+/// replaced lines with no way to tell them apart, so those lines stay
+/// unclassified and unmatchable. Tools that never declare this in their
+/// arguments — Claude Code's `Write` among them — do say it in the result, so
+/// reading the outcome is what keeps a created file out of the unclassified
+/// bucket.
+fn result_reports_file_creation(result_text: Option<&str>) -> bool {
+    result_text.is_some_and(|text| {
+        let opening = text.trim_start().to_ascii_lowercase();
+        opening.starts_with("file created")
+            || opening.starts_with("created file")
+            || opening.starts_with("successfully created")
+    })
+}
+
+fn parse_structured_replacement(
+    context: &TraceEditContext<'_>,
+    path: &Path,
+    arguments: &Value,
+    section_index: usize,
+) -> Option<ParsedMutation> {
+    let old_string = string_argument(arguments, &["old_string", "old_str", "old_text", "oldText"])?;
+    let new_string = string_argument(arguments, &["new_string", "new_str", "new_text", "newText"])?;
+    let mut parsed = parse_structured_edit(context, path, old_string, new_string, section_index);
+    if arguments
+        .get("replace_all")
+        .or_else(|| arguments.get("replaceAll"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        parsed.coverage = CoverageStatus::Partial;
+        parsed.unsupported_sections = parsed.unsupported_sections.saturating_add(1);
+    }
+    Some(parsed)
+}
+
+fn decoded_tool_arguments(arguments: &Value) -> Option<Value> {
+    arguments
+        .as_str()
+        .and_then(|value| serde_json::from_str(value).ok())
+}
+
+fn normalized_tool_name(tool_name: &str) -> String {
+    tool_name
+        .rsplit(['.', ':'])
+        .next()
+        .unwrap_or(tool_name)
+        .to_ascii_lowercase()
+}
+
+fn is_supported_mutation_tool(tool_name: &str) -> bool {
+    matches!(
+        normalized_tool_name(tool_name).as_str(),
+        "apply_patch"
+            | "patch"
+            | "edit"
+            | "multiedit"
+            | "str_replace"
+            | "replace"
+            | "str_replace_editor"
+            | "write"
+            | "write_file"
+            | "create_file"
+    )
+}
+
+fn is_potentially_mutating_shell(tool_name: &str) -> bool {
+    matches!(
+        normalized_tool_name(tool_name).as_str(),
+        "exec"
+            | "exec_command"
+            | "shell"
+            | "shell_command"
+            | "local_shell"
+            | "write_stdin"
+            | "bash"
+            | "terminal"
+            | "run_command"
+    )
+}
+
+/// Programs that read the working tree without being able to rewrite it.
+///
+/// Membership is deliberately narrow: claiming a command is read-only when it
+/// is not would overstate trace coverage, while leaving one out only repeats
+/// the conservative "some edit went unmeasured" answer. Interpreters are
+/// excluded on principle. `sed`, `awk`, and `perl` all write files from inside
+/// their own program text — `sed -n 'w out.rs'`, `awk '{ system("...") }'` —
+/// so no flag inspection can prove one of them read-only, and `xxd` takes an
+/// output file as a bare positional argument.
+const READ_ONLY_SHELL_PROGRAMS: &[&str] = &[
+    "basename", "cat", "cd", "cksum", "cmp", "column", "comm", "cut", "date", "diff", "dirname",
+    "du", "echo", "false", "fd", "file", "grep", "head", "hostname", "id", "jq", "ls", "md5",
+    "md5sum", "nl", "od", "printenv", "printf", "ps", "pwd", "readlink", "realpath", "rg",
+    "shasum", "sleep", "stat", "tail", "tr", "tree", "true", "type", "uname", "uniq", "wc",
+    "which", "whoami",
+];
+
+/// `find` actions that write, delete, or run an arbitrary program.
+const WRITING_FIND_ACTIONS: &[&str] = &[
+    "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprint0", "-fprintf", "-ok", "-okdir",
+];
+
+/// `git` subcommands that only read the object database and working tree.
+const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
+    "blame",
+    "cat-file",
+    "describe",
+    "diff",
+    "diff-tree",
+    "grep",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "name-rev",
+    "reflog",
+    "rev-list",
+    "rev-parse",
+    "shortlog",
+    "show",
+    "status",
+    "whatchanged",
+];
+
+/// `cargo` subcommands that write only to the build directory.
+///
+/// Build artifacts live under `target/`, which code classification already
+/// excludes, so they cannot change a measured line count.
+const READ_ONLY_CARGO_SUBCOMMANDS: &[&str] = &[
+    "bench", "build", "check", "clippy", "metadata", "test", "tree",
+];
+
+/// Whether a shell tool call is confidently incapable of editing source files.
+///
+/// Read-only inspection is by far the most common use of a shell tool. Marking
+/// every one of them as an unmeasurable mutation would leave trace coverage
+/// permanently partial for any session that ran `ls` once, which says nothing
+/// about how completely the agent's edits were reconstructed.
+fn shell_invocation_is_read_only(arguments: &Value) -> bool {
+    let decoded = decoded_tool_arguments(arguments);
+    let arguments = decoded.as_ref().unwrap_or(arguments);
+    shell_command_script(arguments).is_some_and(|script| is_read_only_shell_script(&script))
+}
+
+/// Flattens the argument shapes providers record for a shell tool into a script.
+fn shell_command_script(arguments: &Value) -> Option<String> {
+    if let Some(script) = arguments.as_str() {
+        return Some(script.to_string());
+    }
+    let command = ["command", "cmd", "script", "shell_command", "input"]
+        .into_iter()
+        .find_map(|key| arguments.get(key))?;
+    if let Some(script) = command.as_str() {
+        return Some(script.to_string());
+    }
+    let argv = command
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    // `["bash", "-lc", "<script>"]` is the shape Codex records; anything else
+    // is already a tokenized command whose program is its first element.
+    let (program, rest) = argv.split_first()?;
+    if matches!(
+        shell_program_name(program).as_str(),
+        "bash" | "sh" | "zsh" | "dash"
+    ) {
+        if let Some(index) = rest
+            .iter()
+            .position(|argument| matches!(*argument, "-c" | "-lc" | "-ic" | "-lic"))
+        {
+            return rest.get(index + 1).map(|script| (*script).to_string());
+        }
+    }
+    Some(argv.join(" "))
+}
+
+fn is_read_only_shell_script(script: &str) -> bool {
+    // Stderr redirection carries no filename; every other redirection, command
+    // substitution, or privilege escalation can reach a file this module never
+    // sees, so the command is treated as potentially mutating.
+    let script = script.replace("2>&1", "").replace("1>&2", "");
+    if script.trim().is_empty()
+        || script.contains('>')
+        || script.contains('<')
+        || script.contains("$(")
+        || script.contains('`')
+    {
+        return false;
+    }
+    let mut segments = script
+        .split(['\n', ';', '|', '&'])
+        .map(|segment| segment.trim().trim_matches(['(', ')']).trim())
+        .filter(|segment| !segment.is_empty())
+        .peekable();
+    if segments.peek().is_none() {
+        return false;
+    }
+    segments.all(is_read_only_shell_segment)
+}
+
+fn is_read_only_shell_segment(segment: &str) -> bool {
+    let mut tokens = segment
+        .split_whitespace()
+        // A leading `NAME=value` sets the environment for the command itself.
+        .skip_while(|token| !token.starts_with('-') && token.contains('='))
+        .collect::<Vec<_>>();
+    // `env` only prepares the environment for the program that follows it, so
+    // that program is what decides whether anything can be written.
+    let mut stripped_env_prefix = false;
+    while tokens
+        .first()
+        .is_some_and(|token| shell_program_name(token) == "env")
+    {
+        stripped_env_prefix = true;
+        tokens = tokens
+            .split_off(1)
+            .into_iter()
+            .skip_while(|token| !token.starts_with('-') && token.contains('='))
+            .collect();
+    }
+    let Some((program, arguments)) = tokens.split_first() else {
+        // A bare `env` names no program and only prints the environment.
+        return stripped_env_prefix;
+    };
+    let program = shell_program_name(program);
+    let subcommand = arguments
+        .iter()
+        .find(|token| !token.starts_with('-'))
+        .map(|token| token.to_ascii_lowercase());
+    let has_flag = |flags: &[&str]| {
+        arguments
+            .iter()
+            .any(|token| flags.contains(&token.to_ascii_lowercase().as_str()))
+    };
+    match program.as_str() {
+        "git" => subcommand
+            .is_some_and(|subcommand| READ_ONLY_GIT_SUBCOMMANDS.contains(&subcommand.as_str())),
+        "cargo" => subcommand
+            .is_some_and(|subcommand| READ_ONLY_CARGO_SUBCOMMANDS.contains(&subcommand.as_str())),
+        // `find` walks read-only until given an action that writes or executes.
+        "find" => !arguments
+            .iter()
+            .any(|token| WRITING_FIND_ACTIONS.contains(&token.to_ascii_lowercase().as_str())),
+        // `fd` likewise only reaches a file through an exec action.
+        "fd" => !has_flag(&["-x", "--exec", "--exec-batch"]),
+        // `sort` writes only through an explicit output file.
+        "sort" => {
+            !has_flag(&["-o", "--output"])
+                && !arguments.iter().any(|token| token.starts_with("--output="))
+        }
+        program => READ_ONLY_SHELL_PROGRAMS.contains(&program),
+    }
+}
+
+/// Reduces an invoked program to the executable name it dispatches on.
+fn shell_program_name(program: &str) -> String {
+    program
+        .trim_matches('"')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase()
+}
+
+fn mutation_result_failed(result: &Value, status: Option<&str>, tool_name: &str) -> bool {
+    if status.is_some_and(|status| {
+        matches!(
+            status.to_ascii_lowercase().as_str(),
+            "failed" | "error" | "rejected" | "cancelled" | "canceled"
+        )
+    }) {
+        return true;
+    }
+    if result
+        .get("is_error")
+        .or_else(|| result.get("isError"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if result
+        .get("success")
+        .and_then(Value::as_bool)
+        .is_some_and(|success| !success)
+    {
+        return true;
+    }
+    // Codex wraps tool output in a JSON-encoded object whose exit code is
+    // authoritative; text heuristics only apply when no exit code is recorded.
+    let decoded = decoded_result_payload(result);
+    if let Some(exit_code) = decoded
+        .as_ref()
+        .and_then(|payload| payload.pointer("/metadata/exit_code"))
+        .and_then(Value::as_i64)
+    {
+        return exit_code != 0;
+    }
+    is_supported_mutation_tool(tool_name)
+        && result_text(result, decoded.as_ref())
+            .is_some_and(|text| mutation_result_text_reports_failure(&text))
+}
+
+/// Generic markers that only mean failure when a result opens with them.
+const MUTATION_FAILURE_PREFIXES: &[&str] =
+    &["<tool_use_error>", "error:", "failed", "invalid context"];
+
+/// Phrases specific enough to mean failure anywhere in a result's first line.
+const MUTATION_FAILURE_PHRASES: &[&str] = &[
+    "failed to apply",
+    "invalid patch",
+    "patch rejected",
+    "permission denied",
+    "verification failed",
+];
+
+/// Whether a tool result's text reports that the mutation did not apply.
+///
+/// Only the opening line is inspected, because providers put their outcome
+/// there. A successful structured edit then echoes the edited region back, so
+/// the file's own contents routinely contain phrases like `permission denied`;
+/// searching the whole body would discard the very edits to error handling and
+/// permission checks that the result is describing.
+fn mutation_result_text_reports_failure(text: &str) -> bool {
+    let Some(first_line) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return false;
+    };
+    let first_line = first_line.to_ascii_lowercase();
+    MUTATION_FAILURE_PREFIXES
+        .iter()
+        .any(|marker| first_line.starts_with(marker))
+        || MUTATION_FAILURE_PHRASES
+            .iter()
+            .any(|phrase| first_line.contains(phrase))
+}
+
+/// Decodes the JSON-encoded object Codex stores as a tool output string.
+fn decoded_result_payload(result: &Value) -> Option<Value> {
+    let raw = result
+        .get("output")
+        .or_else(|| result.get("content"))?
+        .as_str()?;
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .filter(Value::is_object)
+}
+
+/// Extracts human-readable result text from the shapes providers record:
+/// a bare string, a keyed string, a JSON-encoded payload, or text blocks.
+fn result_text(result: &Value, decoded: Option<&Value>) -> Option<String> {
+    if let Some(text) = decoded
+        .and_then(|payload| payload.get("output"))
+        .and_then(Value::as_str)
+    {
+        return Some(text.to_string());
+    }
+    if let Some(text) = result.as_str() {
+        return Some(text.to_string());
+    }
+    for key in ["output", "content", "error", "message"] {
+        let Some(value) = result.get(key) else {
+            continue;
+        };
+        if let Some(text) = value.as_str() {
+            return Some(text.to_string());
+        }
+        if let Some(blocks) = value.as_array() {
+            let joined = blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !joined.is_empty() {
+                return Some(joined);
+            }
+        }
+    }
+    None
+}
+
+fn string_argument<'a>(arguments: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+}
+
+fn path_argument(arguments: &Value) -> Option<PathBuf> {
+    string_argument(arguments, &["file_path", "path", "file", "filename"]).map(PathBuf::from)
+}
+
+fn repository_relative_path(repository_path: Option<&Path>, path: &Path) -> PathBuf {
+    repository_path
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path)
+        .to_path_buf()
+}
+
+fn mark_unresolved_mutations(
+    pending: &HashMap<String, PendingMutation>,
+    diagnostics: &mut ArchiveScanDiagnostics,
+    trace_coverage: &mut CoverageStatus,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    diagnostics.truncated_mutations = diagnostics
+        .truncated_mutations
+        .saturating_add(pending.len() as u64);
+    *trace_coverage = trace_coverage.combine(CoverageStatus::Partial);
+}
+
 fn collect_codex(
     source: &SourceLocation,
     selected_cache_keys: Option<&HashSet<String>>,
@@ -154,7 +815,7 @@ fn collect_codex(
             .flat_map(|path| collect_jsonl_files(&path).unwrap_or_default())
             .collect()
     });
-    let mut scan = ArchiveScan::default();
+    let mut scan = ArchiveScan::measured();
     let mut artifact_dependencies = ArtifactDependencyMap::new();
     for path in paths {
         scan.diagnostics.files_scanned += 1;
@@ -163,6 +824,8 @@ fn collect_codex(
             &path,
             &mut scan.diagnostics,
             &mut artifact_dependencies,
+            &mut scan.trace_edits,
+            &mut scan.trace_coverage,
         )?);
     }
     scan.artifact_dependencies = finish_artifact_dependencies(artifact_dependencies);
@@ -175,6 +838,8 @@ fn collect_codex_file(
     path: &Path,
     diagnostics: &mut ArchiveScanDiagnostics,
     artifact_dependencies: &mut ArtifactDependencyMap,
+    trace_edits: &mut Vec<TraceEdit>,
+    trace_coverage: &mut CoverageStatus,
 ) -> Result<ArchiveConversation> {
     let fallback_id = path
         .file_stem()
@@ -184,10 +849,12 @@ fn collect_codex_file(
     let (native_id, title, project) = codex_archive_header(path, fallback_id)?;
     let mut builder = ConversationBuilder::new(CODEX_PROVIDER, source, native_id.clone(), path);
     builder.title = title;
-    builder.project = project;
+    builder.project = project.clone();
     let mut current_model = None::<ModelInfo>;
     let mut structured_user_fingerprints = HashSet::new();
     let mut fallback_user_items = Vec::new();
+    let mut pending_mutations = HashMap::new();
+    let source_record_path = canonical_display(path);
 
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -202,6 +869,7 @@ fn collect_codex_file(
         if status == BoundedLineRead::Oversized {
             diagnostics.records_scanned += 1;
             diagnostics.invalid_records += 1;
+            record_unmeasurable_mutation(&mut diagnostics.truncated_mutations, trace_coverage);
             builder.missing_content += 1;
             continue;
         }
@@ -228,7 +896,7 @@ fn collect_codex_file(
             continue;
         }
         let timestamp = timestamp_from_nested_value(&value);
-        let record_id = format!("{}:{line_number}", path.display());
+        let record_id = format!("{source_record_path}:{line_number}");
         let top_type = value.get("type").and_then(Value::as_str);
         if top_type == Some("response_item") {
             let payload = value.get("payload").unwrap_or(&Value::Null);
@@ -292,7 +960,7 @@ fn collect_codex_file(
                         builder.push(item);
                     }
                 }
-                "function_call" | "tool_call" => {
+                "function_call" | "tool_call" | "custom_tool_call" => {
                     let native_item_id = native_id_from_value(payload)
                         .or_else(|| {
                             payload
@@ -305,6 +973,24 @@ fn collect_codex_file(
                         .get("arguments")
                         .or_else(|| payload.get("input"))
                         .unwrap_or(&Value::Null);
+                    let call_key = payload
+                        .get("call_id")
+                        .or_else(|| payload.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&native_item_id)
+                        .to_string();
+                    remember_original_mutation(
+                        &mut pending_mutations,
+                        diagnostics,
+                        trace_coverage,
+                        MutationInvocation {
+                            call_key,
+                            tool_name: payload.get("name").and_then(Value::as_str),
+                            arguments: content,
+                            source_record_id: &record_id,
+                            occurred_at: timestamp,
+                        },
+                    );
                     let (item, missing) = item_from_value(ItemInput {
                         provider: CODEX_PROVIDER,
                         conversation_native_id: &native_id,
@@ -324,7 +1010,7 @@ fn collect_codex_file(
                     builder.missing_content += missing;
                     builder.push(item);
                 }
-                "function_call_output" | "tool_result" => {
+                "function_call_output" | "tool_result" | "custom_tool_call_output" => {
                     let native_item_id = native_id_from_value(payload)
                         .or_else(|| {
                             payload
@@ -337,6 +1023,28 @@ fn collect_codex_file(
                         .get("output")
                         .or_else(|| payload.get("content"))
                         .unwrap_or(&Value::Null);
+                    let call_key = payload
+                        .get("call_id")
+                        .or_else(|| payload.get("tool_use_id"))
+                        .or_else(|| payload.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&native_item_id);
+                    finish_original_mutation(
+                        &mut pending_mutations,
+                        diagnostics,
+                        trace_edits,
+                        trace_coverage,
+                        MutationCompletion {
+                            call_key,
+                            cache_key: &source_record_path,
+                            result: payload,
+                            status: payload.get("status").and_then(Value::as_str),
+                            provider: CODEX_PROVIDER,
+                            source,
+                            conversation_id: &archive_conversation_id(CODEX_PROVIDER, &native_id),
+                            project: project.as_ref(),
+                        },
+                    );
                     let (item, missing) = item_from_value(ItemInput {
                         provider: CODEX_PROVIDER,
                         conversation_native_id: &native_id,
@@ -393,6 +1101,7 @@ fn collect_codex_file(
             builder.push(item);
         }
     }
+    mark_unresolved_mutations(&pending_mutations, diagnostics, trace_coverage);
     Ok(builder.finish())
 }
 
@@ -450,7 +1159,7 @@ fn collect_claude(
     let paths = selected_jsonl_paths(selected_cache_keys, || {
         collect_jsonl_files(&projects).unwrap_or_default()
     });
-    let mut scan = ArchiveScan::default();
+    let mut scan = ArchiveScan::measured();
     let mut artifact_dependencies = ArtifactDependencyMap::new();
     for path in paths {
         if path.file_name().and_then(|name| name.to_str()) == Some("sessions-index.json") {
@@ -462,6 +1171,8 @@ fn collect_claude(
             &path,
             &mut scan.diagnostics,
             &mut artifact_dependencies,
+            &mut scan.trace_edits,
+            &mut scan.trace_coverage,
         )?);
     }
     scan.artifact_dependencies = finish_artifact_dependencies(artifact_dependencies);
@@ -474,6 +1185,8 @@ fn collect_claude_file(
     path: &Path,
     diagnostics: &mut ArchiveScanDiagnostics,
     artifact_dependencies: &mut ArtifactDependencyMap,
+    trace_edits: &mut Vec<TraceEdit>,
+    trace_coverage: &mut CoverageStatus,
 ) -> Result<ArchiveConversation> {
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let fallback_id = path
@@ -495,6 +1208,8 @@ fn collect_claude_file(
     let mut reader = BufReader::new(file);
     let mut line_bytes = Vec::new();
     let mut line_number = 0usize;
+    let mut pending_mutations = HashMap::new();
+    let source_record_path = canonical_display(path);
     loop {
         let status = read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
         if status == BoundedLineRead::Eof {
@@ -504,6 +1219,7 @@ fn collect_claude_file(
         if status == BoundedLineRead::Oversized {
             diagnostics.records_scanned += 1;
             diagnostics.invalid_records += 1;
+            record_unmeasurable_mutation(&mut diagnostics.truncated_mutations, trace_coverage);
             builder.missing_content += 1;
             continue;
         }
@@ -576,7 +1292,7 @@ fn collect_claude_file(
             .map_or_else(|| vec![content], |blocks| blocks.iter().collect());
         for (part_index, block) in content_blocks.into_iter().enumerate() {
             let content_type = block.get("type").and_then(Value::as_str).unwrap_or("");
-            let source_record_id = format!("{}:{line_number}:{part_index}", path.display());
+            let source_record_id = format!("{source_record_path}:{line_number}:{part_index}");
             if claude_block_is_opaque_reasoning(block, content_type) {
                 builder.discarded_source_record_ids.push(source_record_id);
                 continue;
@@ -609,6 +1325,43 @@ fn collect_claude_file(
                 | ArchiveItemKind::ReasoningSummary
                 | ArchiveItemKind::Artifact => block,
             };
+            if kind == ArchiveItemKind::ToolCall {
+                remember_original_mutation(
+                    &mut pending_mutations,
+                    diagnostics,
+                    trace_coverage,
+                    MutationInvocation {
+                        call_key: tool_call_id.unwrap_or(&block_native_item_id).to_string(),
+                        tool_name: block
+                            .get("name")
+                            .or_else(|| block.get("tool_name"))
+                            .and_then(Value::as_str),
+                        arguments: archive_content,
+                        source_record_id: &source_record_id,
+                        occurred_at: created_at,
+                    },
+                );
+            } else if kind == ArchiveItemKind::ToolResult {
+                finish_original_mutation(
+                    &mut pending_mutations,
+                    diagnostics,
+                    trace_edits,
+                    trace_coverage,
+                    MutationCompletion {
+                        call_key: tool_call_id.unwrap_or(&block_native_item_id),
+                        cache_key: &source_record_path,
+                        result: block,
+                        status: block.get("status").and_then(Value::as_str),
+                        provider: CLAUDE_CODE_PROVIDER,
+                        source,
+                        conversation_id: &archive_conversation_id(
+                            CLAUDE_CODE_PROVIDER,
+                            &builder.native_id,
+                        ),
+                        project: builder.project.as_ref(),
+                    },
+                );
+            }
             if local_artifacts_allowed(kind, item_role) {
                 collect_artifact_dependencies(archive_content, path, artifact_dependencies);
             }
@@ -635,6 +1388,7 @@ fn collect_claude_file(
             builder.push(item);
         }
     }
+    mark_unresolved_mutations(&pending_mutations, diagnostics, trace_coverage);
     Ok(builder.finish())
 }
 
@@ -680,8 +1434,10 @@ fn collect_grok(
     source: &SourceLocation,
     selected_cache_keys: Option<&HashSet<String>>,
 ) -> Result<ArchiveScan> {
+    // Grok sessions record no tool mutations this module can reconstruct.
+    let mut scan = ArchiveScan::default();
     let Some(root) = source_root_path(source) else {
-        return Ok(ArchiveScan::default());
+        return Ok(scan);
     };
     let mut session_dirs = Vec::new();
     if let Some(selected) = selected_cache_keys {
@@ -703,7 +1459,6 @@ fn collect_grok(
     }
     session_dirs.sort();
     session_dirs.dedup();
-    let mut scan = ArchiveScan::default();
     let mut artifact_dependencies = ArtifactDependencyMap::new();
     for session_dir in session_dirs {
         let chat_path = session_dir.join("chat_history.jsonl");
@@ -746,6 +1501,8 @@ fn collect_grok(
             if status == BoundedLineRead::Oversized {
                 scan.diagnostics.records_scanned += 1;
                 scan.diagnostics.invalid_records += 1;
+                scan.diagnostics.truncated_mutations =
+                    scan.diagnostics.truncated_mutations.saturating_add(1);
                 builder.missing_content += 1;
                 continue;
             }
@@ -1118,6 +1875,8 @@ fn collect_opencode(
             .map(ConversationBuilder::finish)
             .collect(),
         artifact_dependencies: finish_artifact_dependencies(artifact_dependencies),
+        trace_edits: Vec::new(),
+        trace_coverage: CoverageStatus::Unavailable,
         diagnostics: ArchiveScanDiagnostics {
             files_scanned: 1,
             records_scanned,
@@ -1917,6 +2676,18 @@ where
 }
 
 fn finish_diagnostics(scan: &mut ArchiveScan) {
+    if scan.trace_coverage != CoverageStatus::Unavailable {
+        let diagnostic_coverage = if scan.diagnostics.failed_mutations > 0
+            || scan.diagnostics.unsupported_mutations > 0
+            || scan.diagnostics.truncated_mutations > 0
+            || scan.diagnostics.invalid_records > 0
+        {
+            CoverageStatus::Partial
+        } else {
+            CoverageStatus::Complete
+        };
+        scan.trace_coverage = scan.trace_coverage.combine(diagnostic_coverage);
+    }
     scan.diagnostics.conversations = scan.conversations.len() as u64;
     for conversation in &scan.conversations {
         scan.diagnostics.items += conversation.items.len() as u64;
@@ -1943,6 +2714,56 @@ mod tests {
 
     fn source(provider: &str, path: &Path) -> SourceLocation {
         SourceLocation::local_adapter(provider, "test", "1", path, LocationOrigin::Configured)
+    }
+
+    #[test]
+    fn codex_apply_patch_failures_are_detected_in_every_recorded_output_shape() {
+        // Plain-text output, as written for `custom_tool_call_output`.
+        assert!(mutation_result_failed(
+            &serde_json::json!({
+                "output": "apply_patch verification failed: Failed to read file to update \
+                           /workspace/src/generate.py: No such file or directory (os error 2)"
+            }),
+            None,
+            "apply_patch"
+        ));
+        // JSON-encoded output carrying an exit code.
+        assert!(mutation_result_failed(
+            &serde_json::json!({
+                "output": "{\"output\":\"apply_patch: cannot apply\",\
+                            \"metadata\":{\"exit_code\":1,\"duration_seconds\":0.1}}"
+            }),
+            None,
+            "apply_patch"
+        ));
+        // Claude records failures on the tool_result block itself.
+        assert!(mutation_result_failed(
+            &serde_json::json!({"is_error": true, "content": [{"type": "text", "text": "no match"}]}),
+            None,
+            "edit"
+        ));
+    }
+
+    #[test]
+    fn codex_apply_patch_successes_are_not_treated_as_failures() {
+        // A successful patch lists the files it touched; those paths must not
+        // trip the failure heuristics.
+        assert!(!mutation_result_failed(
+            &serde_json::json!({
+                "output": "{\"output\":\"Success. Updated the following files:\\n\
+                            A tests/failed_login_case.rs\\n\",\
+                            \"metadata\":{\"exit_code\":0,\"duration_seconds\":0.1}}"
+            }),
+            None,
+            "apply_patch"
+        ));
+        assert!(!mutation_result_failed(
+            &serde_json::json!({
+                "output": "Success. Updated the following files:\nM src/lib.rs\n"
+            }),
+            None,
+            "apply_patch"
+        ));
     }
 
     #[test]
@@ -2059,6 +2880,674 @@ mod tests {
         assert!(items
             .iter()
             .any(|item| item.kind == ArchiveItemKind::ToolResult));
+    }
+
+    #[test]
+    fn codex_malformed_json_record_makes_trace_coverage_partial() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"id":"thread-1"}}}}"#
+        )
+        .unwrap();
+        writeln!(file, "{{malformed json").unwrap();
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+
+        assert_eq!(scan.diagnostics.invalid_records, 1);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn claude_invalid_utf8_record_makes_trace_coverage_partial() {
+        let dir = tempdir().unwrap();
+        let projects = dir.path().join("projects/example");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("session.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "sessionId":"session-1",
+                "message":{"role":"user","content":"hello"}
+            })
+        )
+        .unwrap();
+        file.write_all(&[0xff, b'\n']).unwrap();
+
+        let scan = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+
+        assert_eq!(scan.diagnostics.invalid_records, 1);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn codex_counts_original_patch_before_archive_tool_argument_truncation() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-08-01T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "thread-1", "cwd": dir.path()}
+            })
+        )
+        .unwrap();
+        let mut patch = "*** Begin Patch\n*** Add File: src/generated.rs\n".to_string();
+        for index in 0..5_000 {
+            patch.push_str(&format!("+line {index}\n"));
+        }
+        patch.push_str("*** End Patch\n");
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-08-01T10:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "apply_patch",
+                    "arguments": patch,
+                }
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-08-01T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "Done!",
+                }
+            })
+        )
+        .unwrap();
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert_eq!(scan.trace_coverage, CoverageStatus::Complete);
+        assert_eq!(scan.trace_edits.len(), 1);
+        assert_eq!(scan.trace_edits[0].counts.source_additions, 5_000);
+        let call = scan.conversations[0]
+            .items
+            .iter()
+            .find(|item| item.kind == ArchiveItemKind::ToolCall)
+            .unwrap();
+        assert!(call.parts.iter().any(|part| part.truncated));
+    }
+
+    #[test]
+    fn codex_custom_tool_records_collect_successful_apply_patch_edits() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({
+                "timestamp":"2026-08-01T10:00:00Z",
+                "type":"session_meta",
+                "payload":{"id":"thread-1","cwd":dir.path()}
+            }),
+            serde_json::json!({
+                "timestamp":"2026-08-01T10:00:01Z",
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "input":"*** Begin Patch\n*** Add File: src/lib.rs\n+pub fn added() {}\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "timestamp":"2026-08-01T10:00:02Z",
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"call-1",
+                    "output":"Done!"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+
+        assert_eq!(scan.trace_coverage, CoverageStatus::Complete);
+        assert_eq!(scan.trace_edits.len(), 1);
+        assert_eq!(scan.trace_edits[0].counts.source_additions, 1);
+        assert_eq!(scan.diagnostics.applied_mutations, 1);
+        let items = &scan.conversations[0].items;
+        assert!(items
+            .iter()
+            .any(|item| item.kind == ArchiveItemKind::ToolCall));
+        assert!(items
+            .iter()
+            .any(|item| item.kind == ArchiveItemKind::ToolResult));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_trace_record_ids_use_the_canonical_archive_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        let sessions = real_root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}}),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "arguments":"*** Begin Patch\n*** Add File: src/lib.rs\n+line\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-1",
+                    "output":"Done!"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let linked_root = dir.path().join("linked");
+        symlink(&real_root, &linked_root).unwrap();
+        let scan = collect_codex(&source(CODEX_PROVIDER, &linked_root), None).unwrap();
+
+        assert_eq!(scan.trace_edits.len(), 1);
+        assert!(scan.trace_edits[0]
+            .source_record_id
+            .starts_with(&format!("{}:", canonical_display(&path))));
+    }
+
+    #[test]
+    fn failed_mutations_reduce_coverage_without_counting_lines() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}}),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "arguments":"*** Begin Patch\n*** Add File: src/lib.rs\n+line\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-1",
+                    "output":"patch rejected"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert!(scan.trace_edits.is_empty());
+        assert_eq!(scan.diagnostics.failed_mutations, 1);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn unparseable_successful_mutation_is_not_applied_or_complete() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}}),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "arguments":"*** Begin Patch\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-1",
+                    "output":"Done!"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+
+        assert!(scan.trace_edits.is_empty());
+        assert_eq!(scan.diagnostics.applied_mutations, 0);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn codex_invalid_context_patch_is_not_counted_as_applied() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}}),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "arguments":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-1",
+                    "output":"Invalid Context 0:\nold"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert!(scan.trace_edits.is_empty());
+        assert_eq!(scan.diagnostics.failed_mutations, 1);
+        assert_eq!(scan.diagnostics.applied_mutations, 0);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn codex_shell_execution_makes_trace_coverage_partial() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}})
+        )
+        .unwrap();
+        for (index, command) in [
+            "git apply changes.patch",
+            "python -c \"from pathlib import Path; Path('x').write_text('x')\"",
+            "truncate -s 0 generated.txt",
+            "printf x>generated.txt",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type":"response_item",
+                    "payload":{
+                        "type":"function_call",
+                        "call_id":format!("call-{index}"),
+                        "name":"exec_command",
+                        "arguments":{"cmd":command}
+                    }
+                })
+            )
+            .unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert_eq!(scan.diagnostics.unsupported_mutations, 4);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn read_only_shell_execution_keeps_trace_coverage_complete() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}})
+        )
+        .unwrap();
+        for (index, arguments) in [
+            serde_json::json!({"cmd": "ls -la src"}),
+            serde_json::json!({"cmd": "git status --short && git diff --stat"}),
+            serde_json::json!({"cmd": "cargo test -p statsai-core 2>&1 | tail -20"}),
+            serde_json::json!({"cmd": "RUST_LOG=debug cargo clippy --all-targets"}),
+            serde_json::json!({"command": ["bash", "-lc", "rg --files-with-matches TODO crates"]}),
+            serde_json::json!({"command": ["ls", "-la"]}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type":"response_item",
+                    "payload":{
+                        "type":"function_call",
+                        "call_id":format!("call-{index}"),
+                        "name":"exec_command",
+                        "arguments":arguments
+                    }
+                })
+            )
+            .unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert_eq!(scan.diagnostics.unsupported_mutations, 0);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Complete);
+    }
+
+    #[test]
+    fn read_only_programs_with_writing_flags_stay_unmeasurable() {
+        // `find`, `sort`, `fd`, and `env` read by default but each has a
+        // writing form, and `env` merely prepares the environment for the real
+        // program.
+        for command in [
+            "find . -name '*.rs' -delete",
+            "find . -type f -exec touch {} +",
+            "sort -o sorted.txt input.txt",
+            "sort --output=sorted.txt input.txt",
+            "env cargo fmt",
+            "env FOO=bar cargo fmt",
+            "fd -e rs -x touch",
+        ] {
+            assert!(
+                !shell_invocation_is_read_only(&serde_json::json!({ "cmd": command })),
+                "{command} must stay unmeasurable"
+            );
+        }
+        // Their read-only forms still keep coverage intact.
+        for command in [
+            "find . -name '*.rs'",
+            "sort input.txt",
+            "env FOO=bar cargo test",
+            "env",
+        ] {
+            assert!(
+                shell_invocation_is_read_only(&serde_json::json!({ "cmd": command })),
+                "{command} reads only"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreters_are_never_classified_read_only() {
+        // These reach the filesystem from inside their own program text, with
+        // no flag a classifier could key on: `sed` has the `w` command, `awk`
+        // has output redirection and `system()`, `perl` is a general-purpose
+        // language, and `xxd` takes its output file as a bare positional
+        // argument. Even their innocent-looking invocations stay unmeasurable,
+        // because proving one safe would mean interpreting the program.
+        for command in [
+            "sed -n 'w src/copied.rs' README.md",
+            "sed -n '1,5p' src/lib.rs",
+            "sed -i '' 's/a/b/' src/lib.rs",
+            "perl -pe 's/a/b/' src/lib.rs",
+            "perl -I lib -e 'print 1'",
+            "awk '{ system(\"touch src/lib.rs\") }' input",
+            "awk '{print $1}' input",
+            "xxd -r dump.txt src/lib.rs",
+            "python3 -c 'print(1)'",
+            "ruby -e 'puts 1'",
+            "node -e 'console.log(1)'",
+        ] {
+            assert!(
+                !shell_invocation_is_read_only(&serde_json::json!({ "cmd": command })),
+                "{command} cannot be proven read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_commands_that_can_reach_a_file_stay_unmeasurable() {
+        for arguments in [
+            serde_json::json!({"cmd": "cat template.rs > src/lib.rs"}),
+            serde_json::json!({"cmd": "ls && cargo fmt"}),
+            serde_json::json!({"cmd": "sed -i '' 's/a/b/' src/lib.rs"}),
+            serde_json::json!({"cmd": "eval $(cat script.sh)"}),
+            serde_json::json!({"cmd": "git checkout -- src/lib.rs"}),
+            serde_json::json!({"command": ["bash", "-lc", "npm run build"]}),
+            serde_json::json!({"description": "no command recorded"}),
+        ] {
+            assert!(
+                !shell_invocation_is_read_only(&arguments),
+                "{arguments} must stay unmeasurable"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_edits_echoing_error_text_are_not_discarded() {
+        // A structured edit echoes the edited region back. Source lines that
+        // happen to mention a failure must not retire the edit that wrote them.
+        let echoed = "The file /workspace/src/auth.rs has been updated.\n\
+             Here's the result of running `cat -n` on a snippet:\n\
+                12\tbail!(\"permission denied\");\n\
+                13\treturn Err(Error::VerificationFailed);\n";
+        assert!(!mutation_result_failed(
+            &serde_json::json!({"content": echoed}),
+            None,
+            "edit"
+        ));
+        // The same phrase in the opening line is still a failure report.
+        assert!(mutation_result_failed(
+            &serde_json::json!({"content": "permission denied: /workspace/src/auth.rs"}),
+            None,
+            "edit"
+        ));
+        assert!(mutation_result_failed(
+            &serde_json::json!({"content": "<tool_use_error>String to replace not found</tool_use_error>"}),
+            None,
+            "edit"
+        ));
+    }
+
+    #[test]
+    fn providers_without_mutation_parsing_report_unavailable_trace_coverage() {
+        let dir = tempdir().unwrap();
+        let scan =
+            collect_provider_archive("unwired-provider", &source("unwired", dir.path()), None)
+                .unwrap();
+        assert_eq!(scan.trace_coverage, CoverageStatus::Unavailable);
+    }
+
+    #[test]
+    fn claude_structured_edit_is_counted_after_successful_tool_result() {
+        let dir = tempdir().unwrap();
+        let projects = dir.path().join("projects/example");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("session.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({
+                "sessionId":"session-1",
+                "cwd":dir.path(),
+                "message":{"role":"assistant","content":[{
+                    "type":"tool_use",
+                    "id":"tool-1",
+                    "name":"Edit",
+                    "input":{"file_path":dir.path().join("src/lib.rs"),"old_string":"old","new_string":"new"}
+                }]}
+            }),
+            serde_json::json!({
+                "sessionId":"session-1",
+                "message":{"role":"user","content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"tool-1",
+                    "content":"updated"
+                }]}
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+        assert_eq!(scan.trace_edits.len(), 1);
+        assert_eq!(
+            scan.trace_edits[0].relative_path,
+            PathBuf::from("src/lib.rs")
+        );
+        assert_eq!(scan.trace_edits[0].counts.source_additions, 1);
+        assert_eq!(scan.trace_edits[0].counts.source_deletions, 1);
+    }
+
+    #[test]
+    fn claude_write_is_counted_as_a_creation_when_the_result_says_so() {
+        let write_session = |result: &str| {
+            let dir = tempdir().unwrap();
+            let projects = dir.path().join("projects/example");
+            std::fs::create_dir_all(&projects).unwrap();
+            let mut file = File::create(projects.join("session.jsonl")).unwrap();
+            for value in [
+                serde_json::json!({
+                    "sessionId":"session-1",
+                    "cwd":dir.path(),
+                    "message":{"role":"assistant","content":[{
+                        "type":"tool_use",
+                        "id":"tool-1",
+                        "name":"Write",
+                        "input":{
+                            "file_path":dir.path().join("src/lib.rs"),
+                            "content":"one\ntwo\nthree\n"
+                        }
+                    }]}
+                }),
+                serde_json::json!({
+                    "sessionId":"session-1",
+                    "message":{"role":"user","content":[{
+                        "type":"tool_result",
+                        "tool_use_id":"tool-1",
+                        "content":result
+                    }]}
+                }),
+            ] {
+                writeln!(file, "{value}").unwrap();
+            }
+            let scan = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+            scan.trace_edits.into_iter().next().expect("one trace edit")
+        };
+
+        // The Write tool never declares creation in its arguments, so a created
+        // file is only distinguishable from an overwrite through the outcome.
+        let created = write_session("File created successfully at: /workspace/src/lib.rs");
+        assert_eq!(
+            created.mutation_kind,
+            statsai_core::MutationKind::FileCreation
+        );
+        assert_eq!(created.counts.source_additions, 3);
+        assert_eq!(created.counts.unclassified_lines_written, 0);
+        assert_eq!(
+            created.added_line_fingerprints.len(),
+            3,
+            "a creation carries fingerprints, so it can be trace-matched"
+        );
+
+        // An overwrite mixes new and replaced lines, which stays unclassified.
+        let overwritten = write_session("The file /workspace/src/lib.rs has been updated.");
+        assert_eq!(
+            overwritten.mutation_kind,
+            statsai_core::MutationKind::FileWrite
+        );
+        assert_eq!(overwritten.counts.source_additions, 0);
+        assert_eq!(overwritten.counts.unclassified_lines_written, 3);
+    }
+
+    #[test]
+    fn claude_multiedit_collects_each_nested_edit_after_successful_result() {
+        let dir = tempdir().unwrap();
+        let projects = dir.path().join("projects/example");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("session.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({
+                "sessionId":"session-1",
+                "cwd":dir.path(),
+                "message":{"role":"assistant","content":[{
+                    "type":"tool_use",
+                    "id":"tool-1",
+                    "name":"MultiEdit",
+                    "input":{
+                        "file_path":dir.path().join("src/lib.rs"),
+                        "edits":[
+                            {"old_string":"old","new_string":"new"},
+                            {"old_string":"old","new_string":"new"}
+                        ]
+                    }
+                }]}
+            }),
+            serde_json::json!({
+                "sessionId":"session-1",
+                "message":{"role":"user","content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"tool-1",
+                    "content":"updated"
+                }]}
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+
+        assert_eq!(scan.trace_coverage, CoverageStatus::Complete);
+        assert_eq!(scan.trace_edits.len(), 2);
+        assert_eq!(scan.diagnostics.applied_mutations, 1);
+        assert_ne!(
+            scan.trace_edits[0].trace_edit_id,
+            scan.trace_edits[1].trace_edit_id
+        );
+        assert!(scan.trace_edits.iter().all(|edit| {
+            edit.relative_path == Path::new("src/lib.rs")
+                && edit.counts.source_additions == 1
+                && edit.counts.source_deletions == 1
+        }));
     }
 
     #[test]
@@ -2684,6 +4173,7 @@ mod tests {
         assert_eq!(reasoning.parts.len(), 1);
         assert_eq!(reasoning.parts[0].text.as_deref(), Some("thinking"));
         assert_eq!(conversation.completeness, ArchiveCompleteness::Complete);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Unavailable);
     }
 
     #[test]
@@ -2826,5 +4316,6 @@ mod tests {
         assert!(retained_output.contains("[... truncated ...]"));
         assert!(retained_output.ends_with("-output-tail"));
         assert!(retained_output.len() <= MAX_TOOL_RESULT_TEXT_BYTES);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Unavailable);
     }
 }

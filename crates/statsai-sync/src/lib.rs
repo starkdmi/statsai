@@ -3,7 +3,8 @@
 use anyhow::{bail, Context, Result};
 use statsai_core::{
     SyncAck, SyncBatch, SYNC_ACK_V1_SCHEMA_VERSION, SYNC_ACK_V2_SCHEMA_VERSION,
-    SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
+    SYNC_ACK_V3_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
+    SYNC_BATCH_V3_SCHEMA_VERSION,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -151,6 +152,7 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
     let expected_ack_schema = match batch.schema_version.as_str() {
         SYNC_BATCH_V1_SCHEMA_VERSION => SYNC_ACK_V1_SCHEMA_VERSION,
         SYNC_BATCH_V2_SCHEMA_VERSION => SYNC_ACK_V2_SCHEMA_VERSION,
+        SYNC_BATCH_V3_SCHEMA_VERSION => SYNC_ACK_V3_SCHEMA_VERSION,
         other => bail!("unsupported sync batch schema {other}"),
     };
     if ack.schema_version != expected_ack_schema {
@@ -226,6 +228,12 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         batch.task_verifications.len() as u64,
         ack.accepted.task_verifications,
         ack.duplicates.task_verifications,
+    )?;
+    validate_sync_ack_counts(
+        "code_change_metrics",
+        batch.code_change_metrics.len() as u64,
+        ack.accepted.code_change_metrics,
+        ack.duplicates.code_change_metrics,
     )?;
     Ok(())
 }
@@ -307,13 +315,13 @@ fn write_json_atomically(path: &Path, value: &impl serde::Serialize) -> Result<(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use statsai_core::SyncBatch;
+    use statsai_core::{SyncBatch, SYNC_ACK_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION};
     use std::sync::mpsc;
     use tiny_http::{Header, Method, Response, Server};
 
     fn empty_batch() -> SyncBatch {
         SyncBatch {
-            schema_version: "sync_batch.v2".to_string(),
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
             batch_id: "batch_1".to_string(),
             device_id: "device".to_string(),
             sources: Vec::new(),
@@ -324,6 +332,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            code_change_metrics: Vec::new(),
             authoritative_snapshot: None,
             created_at: Utc::now(),
         }
@@ -425,7 +434,7 @@ mod tests {
         let (auth, content_type, body) = rx.recv().expect("request body");
         assert_eq!(auth.as_deref(), Some("Bearer token_123"));
         assert_eq!(content_type.as_deref(), Some("application/json"));
-        assert!(body.contains("\"schema_version\":\"sync_batch.v2\""));
+        assert!(body.contains("\"schema_version\":\"sync_batch.v3\""));
         assert!(body.contains("\"batch_id\":\"batch_1\""));
     }
 
@@ -524,8 +533,8 @@ mod tests {
         ))
         .expect("v1 ack");
 
-        let error = validate_sync_ack(&batch, &ack).expect_err("v2 batch with v1 ack");
-        assert!(error.to_string().contains("requires sync_ack.v2"));
+        let error = validate_sync_ack(&batch, &ack).expect_err("v3 batch with v1 ack");
+        assert!(error.to_string().contains("requires sync_ack.v3"));
 
         batch.schema_version = SYNC_BATCH_V1_SCHEMA_VERSION.to_string();
         ack.schema_version = SYNC_ACK_V2_SCHEMA_VERSION.to_string();
@@ -534,6 +543,10 @@ mod tests {
 
         ack.schema_version = SYNC_ACK_V1_SCHEMA_VERSION.to_string();
         validate_sync_ack(&batch, &ack).expect("matching v1 schemas");
+
+        batch.schema_version = SYNC_BATCH_V3_SCHEMA_VERSION.to_string();
+        ack.schema_version = SYNC_ACK_V3_SCHEMA_VERSION.to_string();
+        validate_sync_ack(&batch, &ack).expect("matching v3 schemas");
     }
 
     #[test]
@@ -641,7 +654,7 @@ mod tests {
         rejected: Vec<String>,
     ) -> String {
         test_ack_json_with_schema(
-            SYNC_ACK_V2_SCHEMA_VERSION,
+            SYNC_ACK_SCHEMA_VERSION,
             batch_id,
             accepted_events,
             duplicate_events,

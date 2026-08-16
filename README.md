@@ -153,14 +153,15 @@ dashboard.
 | Complete prompts, model responses, and archived conversations | Daily token and request rollups |
 | Raw provider log lines | Provider, model, and account metadata |
 | Parse evidence and local source paths | Project labels and repository anchors |
+| Source text, diffs, file paths, and commit messages | Privacy-safe numeric code-change metrics |
 | — | Opt-in private task snapshots and verifications, including bounded task titles, summary previews, and todo excerpts |
 
 Raw usage events and complete archived conversation records stay local and are
 never included in hosted sync. StatsAI does not upload full prompts, full
 responses, or raw provider logs. When hosted task sync is explicitly enabled
-with `statsai sync --include-tasks`, `sync_batch.v2` may include bounded
-conversation-derived task titles, summary previews, and todo excerpts. You can
-inspect the exact sync contract in
+with `statsai sync --include-tasks`, the current `sync_batch.v3` payload may
+include bounded conversation-derived task titles, summary previews, and todo
+excerpts. You can inspect the exact sync contract in
 [`docs/sync-contract.md`](docs/sync-contract.md) and verify the resolved sync
 target with:
 

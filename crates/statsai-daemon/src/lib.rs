@@ -4,7 +4,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::json;
 use statsai_core::{
     SyncAck, SyncBatch, SyncEntityCounts, SyncRejectedRecord, SYNC_ACK_V1_SCHEMA_VERSION,
-    SYNC_ACK_V2_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
+    SYNC_ACK_V2_SCHEMA_VERSION, SYNC_ACK_V3_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION,
+    SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION,
 };
 use statsai_store::Store;
 use std::io::Read;
@@ -18,11 +19,18 @@ fn lock_store(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn sync_ack_schema_version(batch_schema_version: &str) -> &'static str {
-    if batch_schema_version == SYNC_BATCH_V1_SCHEMA_VERSION {
-        SYNC_ACK_V1_SCHEMA_VERSION
-    } else {
-        SYNC_ACK_V2_SCHEMA_VERSION
+/// Acknowledgement schema owed to a batch schema.
+///
+/// Every arm is spelled out so that adding a batch version without deciding its
+/// acknowledgement fails to compile, rather than silently claiming v3. Callers
+/// reject unknown schemas before reaching this, so the error is unreachable
+/// today; it exists to keep that true.
+fn sync_ack_schema_version(batch_schema_version: &str) -> Result<&'static str> {
+    match batch_schema_version {
+        SYNC_BATCH_V1_SCHEMA_VERSION => Ok(SYNC_ACK_V1_SCHEMA_VERSION),
+        SYNC_BATCH_V2_SCHEMA_VERSION => Ok(SYNC_ACK_V2_SCHEMA_VERSION),
+        SYNC_BATCH_V3_SCHEMA_VERSION => Ok(SYNC_ACK_V3_SCHEMA_VERSION),
+        other => bail!("unsupported sync batch schema {other}"),
     }
 }
 
@@ -210,8 +218,20 @@ fn health_payload() -> serde_json::Value {
 pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     if batch.schema_version != SYNC_BATCH_V1_SCHEMA_VERSION
         && batch.schema_version != SYNC_BATCH_V2_SCHEMA_VERSION
+        && batch.schema_version != SYNC_BATCH_V3_SCHEMA_VERSION
     {
         bail!("unsupported sync batch schema {}", batch.schema_version);
+    }
+    if batch.schema_version != SYNC_BATCH_V3_SCHEMA_VERSION && !batch.code_change_metrics.is_empty()
+    {
+        bail!("code-change metrics require sync_batch.v3");
+    }
+    if batch
+        .code_change_metrics
+        .iter()
+        .any(|metric| metric.device_id != batch.device_id)
+    {
+        bail!("code-change metric device_id must match batch device_id");
     }
     if batch.authoritative_snapshot.is_some() {
         bail!("authoritative snapshots are not supported by the loopback daemon");
@@ -220,7 +240,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     let result = store.ingest_sync_batch(batch)?;
 
     Ok(SyncAck {
-        schema_version: sync_ack_schema_version(&batch.schema_version).to_string(),
+        schema_version: sync_ack_schema_version(&batch.schema_version)?.to_string(),
         batch_id: batch.batch_id.clone(),
         accepted: SyncEntityCounts {
             sources: batch.sources.len() as u64,
@@ -231,6 +251,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             summaries: result.written_summaries,
             task_buckets: batch.task_buckets.len() as u64,
             task_verifications: result.merged_task_verifications,
+            code_change_metrics: batch.code_change_metrics.len() as u64,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -242,6 +263,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             task_buckets: 0,
             task_verifications: (batch.task_verifications.len() as u64)
                 .saturating_sub(result.merged_task_verifications),
+            code_change_metrics: 0,
         },
         rejected: Vec::<SyncRejectedRecord>::new(),
     })
@@ -2638,16 +2660,17 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use statsai_core::{
-        source_id, Confidence, ProjectInfo, SourceKind, SyncAuthoritativeSnapshot,
-        TaskBucketSnapshot, TaskSpan, TaskSpanId, TaskStatus, TaskVerdict, TaskVerification,
-        TaskVerificationAction, TaskVerificationCursor, TaskVerificationId, UsageCounts, WorkItem,
-        WorkItemId, WorkItemMember, TASK_SPAN_SCHEMA_VERSION, TASK_VERIFICATION_SCHEMA_VERSION,
-        WORK_ITEM_SCHEMA_VERSION,
+        source_id, CodeChangeMetric, CodeChangeMetricKind, CodeLineCounts, Confidence,
+        CoverageStatus, ProjectInfo, SourceKind, SyncAuthoritativeSnapshot, TaskBucketSnapshot,
+        TaskSpan, TaskSpanId, TaskStatus, TaskVerdict, TaskVerification, TaskVerificationAction,
+        TaskVerificationCursor, TaskVerificationId, UsageCounts, WorkItem, WorkItemId,
+        WorkItemMember, CODE_CHANGE_METRIC_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION,
+        TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
     };
 
     fn empty_batch() -> SyncBatch {
         SyncBatch {
-            schema_version: SYNC_BATCH_V2_SCHEMA_VERSION.to_string(),
+            schema_version: SYNC_BATCH_V3_SCHEMA_VERSION.to_string(),
             batch_id: "batch_test".to_string(),
             device_id: "device_test".to_string(),
             sources: Vec::new(),
@@ -2658,6 +2681,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            code_change_metrics: Vec::new(),
             authoritative_snapshot: None,
             created_at: Utc::now(),
         }
@@ -2774,7 +2798,7 @@ mod tests {
         let store = Store::in_memory().expect("store");
         let ack = ingest_sync_batch(&store, &empty_batch()).expect("ack");
 
-        assert_eq!(ack.schema_version, SYNC_ACK_V2_SCHEMA_VERSION);
+        assert_eq!(ack.schema_version, SYNC_ACK_V3_SCHEMA_VERSION);
         assert_eq!(ack.batch_id, "batch_test");
         assert_eq!(ack.accepted.events, 0);
         assert_eq!(ack.duplicates.events, 0);
@@ -2789,6 +2813,68 @@ mod tests {
 
         let ack = ingest_sync_batch(&store, &batch).expect("ack");
         assert_eq!(ack.schema_version, SYNC_ACK_V1_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn ingest_v2_batch_rejects_code_change_metrics() {
+        let store = Store::in_memory().expect("store");
+        let mut batch = empty_batch();
+        batch.schema_version = SYNC_BATCH_V2_SCHEMA_VERSION.to_string();
+        batch.code_change_metrics.push(CodeChangeMetric {
+            schema_version: CODE_CHANGE_METRIC_SCHEMA_VERSION.to_string(),
+            metric_id: "metric-v2".to_string(),
+            device_id: "device_test".to_string(),
+            day: Utc::now().date_naive(),
+            project_id: None,
+            repository_hash: None,
+            commit_hash: None,
+            kind: CodeChangeMetricKind::AgentEdit,
+            counts: CodeLineCounts::default(),
+            attribution_confidence: None,
+            trace_coverage: CoverageStatus::Complete,
+            git_coverage: CoverageStatus::Unavailable,
+        });
+
+        let error = ingest_sync_batch(&store, &batch).expect_err("v2 metric payload");
+        assert!(error
+            .to_string()
+            .contains("code-change metrics require sync_batch.v3"));
+    }
+
+    #[test]
+    fn ingest_v3_batch_rejects_metric_owned_by_another_device_before_persisting() {
+        let store = Store::in_memory().expect("store");
+        let mut batch = empty_batch();
+        let metric = CodeChangeMetric {
+            schema_version: CODE_CHANGE_METRIC_SCHEMA_VERSION.to_string(),
+            metric_id: "metric-other-device".to_string(),
+            device_id: batch.device_id.clone(),
+            day: Utc::now().date_naive(),
+            project_id: None,
+            repository_hash: None,
+            commit_hash: None,
+            kind: CodeChangeMetricKind::AgentEdit,
+            counts: CodeLineCounts::default(),
+            attribution_confidence: None,
+            trace_coverage: CoverageStatus::Complete,
+            git_coverage: CoverageStatus::Unavailable,
+        };
+        batch.code_change_metrics.push(metric.clone());
+        ingest_sync_batch(&store, &batch).expect("matching metric owner");
+        batch.batch_id = "batch_mismatched_owner".to_string();
+        batch.code_change_metrics[0].device_id = "other_device".to_string();
+
+        let error = ingest_sync_batch(&store, &batch).expect_err("mismatched metric owner");
+
+        assert!(error
+            .to_string()
+            .contains("code-change metric device_id must match batch device_id"));
+        assert_eq!(
+            store
+                .list_code_change_metrics(false)
+                .expect("stored metrics"),
+            vec![metric]
+        );
     }
 
     #[test]

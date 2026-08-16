@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub const CURRENT_SCHEMA_VERSION: i64 = 16;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_migrations_table(conn)?;
@@ -107,6 +107,8 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         12 => apply_migration_012(conn),
         13 => apply_migration_013(conn),
         14 => apply_migration_014(conn),
+        15 => apply_migration_015(conn),
+        16 => apply_migration_016(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -527,6 +529,122 @@ fn apply_migration_014(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn apply_migration_015(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS code_trace_edits (
+          trace_edit_id TEXT PRIMARY KEY,
+          source_id TEXT NOT NULL,
+          conversation_id TEXT NOT NULL,
+          source_record_id TEXT NOT NULL,
+          occurred_at TEXT,
+          project_id TEXT,
+          repository_path TEXT,
+          relative_path TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          FOREIGN KEY (conversation_id) REFERENCES archive_conversations(conversation_id)
+            ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS code_trace_edits_source_record_idx
+          ON code_trace_edits (source_id, source_record_id, trace_edit_id);
+        CREATE INDEX IF NOT EXISTS code_trace_edits_repository_idx
+          ON code_trace_edits (repository_path, occurred_at, trace_edit_id);
+
+        CREATE TABLE IF NOT EXISTS code_trace_coverage (
+          source_id TEXT NOT NULL,
+          cache_key TEXT NOT NULL,
+          coverage TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (source_id, cache_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS code_git_scans (
+          repository_hash TEXT PRIMARY KEY,
+          repository_path TEXT NOT NULL,
+          coverage TEXT NOT NULL,
+          scanned_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS code_git_commits (
+          deduplication_id TEXT PRIMARY KEY,
+          repository_hash TEXT NOT NULL,
+          commit_hash TEXT NOT NULL,
+          committed_at TEXT NOT NULL,
+          project_id TEXT,
+          payload TEXT NOT NULL,
+          UNIQUE (repository_hash, commit_hash),
+          FOREIGN KEY (repository_hash) REFERENCES code_git_scans(repository_hash)
+            ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS code_git_commits_day_idx
+          ON code_git_commits (committed_at, repository_hash, commit_hash);
+
+        CREATE TABLE IF NOT EXISTS code_change_matches (
+          match_id TEXT PRIMARY KEY,
+          trace_edit_id TEXT NOT NULL,
+          commit_deduplication_id TEXT NOT NULL,
+          confidence TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          FOREIGN KEY (trace_edit_id) REFERENCES code_trace_edits(trace_edit_id)
+            ON DELETE CASCADE,
+          FOREIGN KEY (commit_deduplication_id) REFERENCES code_git_commits(deduplication_id)
+            ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS code_change_matches_commit_idx
+          ON code_change_matches (commit_deduplication_id, confidence, match_id);
+
+        CREATE TABLE IF NOT EXISTS code_change_metrics (
+          metric_id TEXT PRIMARY KEY,
+          device_id TEXT NOT NULL,
+          day TEXT NOT NULL,
+          project_id TEXT,
+          repository_hash TEXT,
+          commit_hash TEXT,
+          kind TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          dirty INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS code_change_metrics_sync_idx
+          ON code_change_metrics (dirty, day, metric_id);
+        CREATE INDEX IF NOT EXISTS code_change_metrics_dashboard_idx
+          ON code_change_metrics (day, project_id, device_id, kind);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Gives reconstructed edits the scan cache key they belong to.
+///
+/// Reconciliation previously removed an archive file's edits by matching a
+/// `{cache_key}:` prefix on `source_record_id`. That made the record-id shape
+/// an unwritten schema contract, could not use an index, and would silently
+/// stop deleting for any provider that numbered its records differently.
+/// Existing rows are backfilled from the prefix they were written with, which
+/// is correct for every shape recorded up to this version.
+fn apply_migration_016(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE code_trace_edits ADD COLUMN cache_key TEXT;
+        UPDATE code_trace_edits
+        SET cache_key = (
+          SELECT s.cache_key
+          FROM archive_import_state s
+          WHERE s.source_id = code_trace_edits.source_id
+            AND substr(code_trace_edits.source_record_id, 1, length(s.cache_key) + 1)
+                = s.cache_key || ':'
+        )
+        WHERE cache_key IS NULL;
+        -- An edit whose archive file is no longer on record cannot be
+        -- reconciled by any key, so it would linger unreachable and be counted
+        -- again beside its replacement the next time that file is imported.
+        DELETE FROM code_trace_edits WHERE cache_key IS NULL;
+        CREATE INDEX IF NOT EXISTS code_trace_edits_cache_key_idx
+          ON code_trace_edits (source_id, cache_key);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -681,6 +799,11 @@ mod tests {
         assert!(table_exists(&conn, "privacy_pseudonyms"));
         assert!(table_exists(&conn, "privacy_filter_failures"));
         assert!(table_exists(&conn, "privacy_dataset_identity"));
+        assert!(table_exists(&conn, "code_trace_edits"));
+        assert!(table_exists(&conn, "code_git_scans"));
+        assert!(table_exists(&conn, "code_git_commits"));
+        assert!(table_exists(&conn, "code_change_matches"));
+        assert!(table_exists(&conn, "code_change_metrics"));
     }
 
     #[test]

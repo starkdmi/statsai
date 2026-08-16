@@ -87,9 +87,9 @@ pub struct SnapshotSourceStatus {
     pub status: String,
 }
 
-pub fn run(command: SnapshotCommand, store_path: &Path) -> Result<()> {
+pub fn run(command: SnapshotCommand, store_path: &Path, device_id: &str) -> Result<()> {
     let store = Store::open(store_path)?;
-    let snapshot = collect(&store)?;
+    let snapshot = collect_for_device(&store, device_id)?;
 
     if command.json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -104,6 +104,10 @@ pub fn run(command: SnapshotCommand, store_path: &Path) -> Result<()> {
 }
 
 pub fn collect(store: &Store) -> Result<AppSnapshot> {
+    collect_for_device(store, &crate::default_device_id())
+}
+
+pub fn collect_for_device(store: &Store, device_id: &str) -> Result<AppSnapshot> {
     let login = auth::login_snapshot()?;
     let background = service::background_service_state()?;
 
@@ -128,6 +132,7 @@ pub fn collect(store: &Store) -> Result<AppSnapshot> {
 
     let pending_sync = store.pending_http_sync_summary_counts_with_projects(
         &http_target,
+        device_id,
         sync_preferences.include_projects,
     )?;
     let has_pending_upload = pending_sync.total > 0;
