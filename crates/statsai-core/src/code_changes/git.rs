@@ -42,13 +42,13 @@ pub fn scan_local_git_repository_cached(
     let repository_hash = repository_identity_hash(&root)?;
     let configured_email = run_git_allow_missing(&root, &["config", "--get", "user.email"])?;
     let configured_email = configured_email.trim();
+    // Commits are attributed by committer email, so without one this scan
+    // cannot tell whose work the repository holds. That is an unanswerable
+    // question rather than an answer of "no commits": reporting an empty
+    // success would let a caller replace commits it measured while the identity
+    // was still configured, so it is raised like any other unusable scan.
     if configured_email.is_empty() {
-        return Ok(GitScan {
-            repository_root: root,
-            repository_hash,
-            commits: Vec::new(),
-            coverage: CoverageStatus::Unavailable,
-        });
+        return Err(GitScanError::UnknownCommitterIdentity(root));
     }
     let now = Utc::now();
     let observation_start = (now - Duration::days(GIT_COMMIT_OBSERVATION_DAYS)).to_rfc3339();

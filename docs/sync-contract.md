@@ -96,7 +96,16 @@ directories, and those must not degrade Git coverage. Commits and trace records
 dated beyond the sync target's future skew are left unmeasured, so a
 clock-skewed record degrades coverage instead of failing every later sync: a
 skipped commit degrades its repository's Git coverage, and a skipped trace edit
-degrades the trace coverage stamped on every metric that run publishes.
+degrades the trace coverage stamped on every metric that run publishes. A trace
+edit carrying no timestamp at all is skipped the same way, because metrics are
+published per day and an edit belonging to no day cannot be carried by one.
+
+A repository with no configured `user.email` cannot say whose commits it holds,
+so its scan fails rather than reporting zero commits. A repository scanned for
+the first time in that state stays unmeasured, while one that already had
+commits measured keeps them and degrades Git coverage to partial. Reporting an
+empty success instead would delete measured commits from the local store and
+retire them remotely through the authoritative snapshot.
 
 Authenticated HTTP preflight returns a 32-byte, user-scoped code-change identity
 key. The collector uses that key to HMAC the local repository identity and raw

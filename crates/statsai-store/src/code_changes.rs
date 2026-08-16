@@ -1079,6 +1079,64 @@ mod tests {
     }
 
     #[test]
+    fn losing_the_committer_identity_retains_already_measured_commits() {
+        let repository = TempDir::new().expect("temporary repository");
+        run_test_git(repository.path(), &["init", "-q"]);
+        run_test_git(
+            repository.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        run_test_git(repository.path(), &["config", "user.name", "Test"]);
+        fs::write(repository.path().join("main.rs"), "fn main() {}\n").expect("write source");
+        run_test_git(repository.path(), &["add", "main.rs"]);
+        run_test_git(repository.path(), &["commit", "-qm", "initial"]);
+
+        let store = Store::in_memory().expect("open store");
+        let payload = serde_json::json!({
+            "project": {
+                "project_id": "project",
+                "path_label": repository.path().to_string_lossy(),
+            }
+        });
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO usage_summaries
+                  (summary_id, provider, source_id, observed_at, total_tokens, payload)
+                VALUES (?1, 'codex', 'source', '2026-08-01T00:00:00Z', 0, ?2)
+                "#,
+                params!["summary", payload.to_string()],
+            )
+            .expect("insert project evidence");
+
+        let report = store
+            .refresh_code_changes("device")
+            .expect("refresh changes");
+        assert_eq!(report.commits, 1);
+
+        // Losing the configured identity means this scan cannot tell whose
+        // commits these are. That is an unanswerable question, not an answer of
+        // "none": the commits it already measured must survive, exactly as they
+        // do when Git itself cannot be run.
+        // Unsetting the repository value would fall back to the global one, so
+        // the configured identity is emptied outright.
+        run_test_git(repository.path(), &["config", "user.email", ""]);
+        let refreshed = store
+            .refresh_code_changes("device")
+            .expect("refresh without identity");
+        assert_eq!(refreshed.commits, 1);
+        assert_eq!(refreshed.git_coverage, CoverageStatus::Partial);
+        let committed = store
+            .list_code_change_metrics(false)
+            .expect("metrics")
+            .into_iter()
+            .filter(|metric| metric.kind == CodeChangeMetricKind::Committed)
+            .count();
+        assert_eq!(committed, 1);
+    }
+
+    #[test]
     fn refresh_retires_scan_after_repository_loses_all_references() {
         let repository = TempDir::new().expect("temporary repository");
         run_test_git(repository.path(), &["init", "-q"]);

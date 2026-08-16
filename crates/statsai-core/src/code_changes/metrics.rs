@@ -41,7 +41,12 @@ pub fn build_code_change_metrics(
     let mut canonical_paths = CanonicalPathCache::default();
     let mut skipped_edits = 0_u64;
     for edit in trace_edits {
+        // Metrics are published per day, so an edit that belongs to no day
+        // cannot be carried by one. A transcript record without a clock and a
+        // clock-skewed one are the same case: churn the archive observed that
+        // this build cannot place.
         let Some(occurred_at) = edit.occurred_at else {
+            skipped_edits = skipped_edits.saturating_add(1);
             continue;
         };
         let day = occurred_at.date_naive();
@@ -58,7 +63,7 @@ pub fn build_code_change_metrics(
             .or_default()
             .add(edit.counts);
     }
-    // A clock-skewed edit is churn the archive recorded and this build declined
+    // An unplaceable edit is churn the archive recorded and this build declined
     // to publish. Leaving coverage untouched would let the surviving metrics
     // claim they describe the period completely.
     let trace_coverage = if skipped_edits > 0 {
@@ -261,6 +266,38 @@ mod tests {
         assert!(agent_edits
             .iter()
             .all(|metric| metric.metric_id.len() == 64));
+    }
+
+    #[test]
+    fn agent_edits_without_a_timestamp_are_not_published_but_degrade_coverage() {
+        // A transcript record can carry no clock at all. The edit is still
+        // stored and counted as churn the archive observed, but it belongs to
+        // no day, so no daily metric can carry it and matching skips it too.
+        let source = SourceId("source".to_string());
+        let mut context = context(&source);
+        context.occurred_at = None;
+        let edits = parse_full_file_write(&context, Path::new("src/lib.rs"), "one\n", true).edits;
+        assert_eq!(edits.len(), 1);
+
+        let metrics = build_code_change_metrics(
+            DateTime::parse_from_rfc3339("2026-08-03T00:00:00Z")
+                .unwrap()
+                .into(),
+            "device",
+            &edits,
+            &[],
+            &[],
+            &BTreeMap::new(),
+            CoverageStatus::Complete,
+        )
+        .unwrap();
+
+        assert!(metrics.metrics.is_empty());
+        assert_eq!(
+            metrics.trace_coverage,
+            CoverageStatus::Partial,
+            "an edit the build declined to publish is unmeasured churn"
+        );
     }
 
     #[test]

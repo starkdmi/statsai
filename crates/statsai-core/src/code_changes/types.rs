@@ -303,6 +303,8 @@ pub enum CodeChangeMetricBuildError {
 pub enum GitScanError {
     #[error("path is not inside a Git repository: {0}")]
     NotRepository(PathBuf),
+    #[error("no Git committer email is configured for: {0}")]
+    UnknownCommitterIdentity(PathBuf),
     #[error("Git command failed ({command}): {message}")]
     Command { command: String, message: String },
     #[error("invalid Git timestamp `{value}`")]
