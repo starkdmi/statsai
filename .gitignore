@@ -36,3 +36,4 @@ node_modules/
 DEPLOY.md
 PUBLISH.md
 tmp-statsai-*.sqlite*
+.wrangler/
