@@ -61,6 +61,12 @@ const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 const HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE: usize = 90;
 const HTTP_ROLLUP_DAILY_ROLLUP_ROWS_PER_QUERY: usize = 7;
 const HTTP_ROLLUP_SNAPSHOT_IDS_PER_BATCH: usize = 200;
+/// Times a chunk is resent after a transient endpoint failure before the run
+/// gives up. A restarted worker recovers within seconds, so a handful of
+/// attempts covers it without leaving a stalled sync running indefinitely.
+const HTTP_ROLLUP_TRANSIENT_RESEND_ATTEMPTS: u32 = 3;
+/// Delay before the first resend. Each further attempt doubles it.
+const HTTP_ROLLUP_TRANSIENT_RESEND_DELAY: StdDuration = StdDuration::from_secs(1);
 const HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const TASK_SYNC_SQL_MAX_ROWS_PER_CHUNK: usize = 200;
 const TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK: usize = 512 * 1024;
@@ -4315,26 +4321,99 @@ fn send_http_rollup_chunk_with_retry_using<F>(chunk: &SyncBatch, send_chunk: &F)
 where
     F: Fn(&SyncBatch) -> Result<()>,
 {
-    match send_chunk(chunk) {
-        Ok(()) => Ok(()),
-        Err(error) if should_retry_http_rollup_chunk_after_error(chunk, &error) => {
-            let smaller_chunks = split_http_rollup_sync_batch_after_budget_error(chunk);
-            if smaller_chunks.len() <= 1 {
-                return Err(error);
+    send_http_rollup_chunk_with_retry_using_sleep(chunk, send_chunk, &std::thread::sleep)
+}
+
+/// Sends one chunk, resending it through transient failures and splitting it
+/// when the endpoint rejects its size.
+///
+/// The two remedies are deliberately separate. A rejected size is a decision
+/// about this batch and is answered by sending less; a transient failure is the
+/// absence of a decision and is answered by sending the same thing again.
+/// Applying either remedy to the other's failure would be wrong: splitting on a
+/// restarted worker multiplies the requests that just failed, and resending an
+/// oversized batch unchanged can only be rejected again.
+///
+/// `sleep` is injected so tests exercise the backoff without waiting through it.
+fn send_http_rollup_chunk_with_retry_using_sleep<F, S>(
+    chunk: &SyncBatch,
+    send_chunk: &F,
+    sleep: &S,
+) -> Result<()>
+where
+    F: Fn(&SyncBatch) -> Result<()>,
+    S: Fn(StdDuration),
+{
+    let mut resends = 0_u32;
+    loop {
+        match send_chunk(chunk) {
+            Ok(()) => return Ok(()),
+            // The endpoint never reached a decision about this batch, so the
+            // batch was neither accepted nor rejected; only the answer was
+            // lost. Ingest records the batch ID and applies the payload in one
+            // transaction, so resending the identical chunk either applies it
+            // exactly once or is acknowledged as a duplicate. Failing here
+            // instead would strand every batch still queued behind this one,
+            // which is how a single restarted worker used to abort a whole
+            // multi-chunk sync.
+            Err(error)
+                if resends < HTTP_ROLLUP_TRANSIENT_RESEND_ATTEMPTS
+                    && is_transient_http_sync_error(&error) =>
+            {
+                let delay = HTTP_ROLLUP_TRANSIENT_RESEND_DELAY * 2_u32.pow(resends);
+                resends += 1;
+                eprintln!(
+                    "http rollup mode: {} did not complete ({error}); resending in {}s ({resends}/{HTTP_ROLLUP_TRANSIENT_RESEND_ATTEMPTS})",
+                    chunk.batch_id,
+                    delay.as_secs(),
+                );
+                sleep(delay);
             }
-            eprintln!(
-                "http rollup mode: {} rejected {}; retrying as {} smaller batches",
-                http_rollup_retry_error_label(&error),
-                chunk.batch_id,
-                smaller_chunks.len()
-            );
-            for smaller_chunk in &smaller_chunks {
-                send_http_rollup_chunk_with_retry_using(smaller_chunk, send_chunk)?;
+            Err(error) if should_retry_http_rollup_chunk_after_error(chunk, &error) => {
+                let smaller_chunks = split_http_rollup_sync_batch_after_budget_error(chunk);
+                if smaller_chunks.len() <= 1 {
+                    return Err(error);
+                }
+                eprintln!(
+                    "http rollup mode: {} rejected {}; retrying as {} smaller batches",
+                    http_rollup_retry_error_label(&error),
+                    chunk.batch_id,
+                    smaller_chunks.len()
+                );
+                for smaller_chunk in &smaller_chunks {
+                    send_http_rollup_chunk_with_retry_using_sleep(
+                        smaller_chunk,
+                        send_chunk,
+                        sleep,
+                    )?;
+                }
+                return Ok(());
             }
-            Ok(())
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
     }
+}
+
+/// Failures that leave a batch's fate unknown rather than deciding it.
+///
+/// Only server-side infrastructure statuses qualify. 429 is deliberately
+/// excluded: the endpoint advertises its own `Retry-After`, which this backoff
+/// cannot see, so resending on our own schedule would work against the limit it
+/// asked for. 501 is excluded because "not implemented" is a decision that
+/// repeating cannot change.
+fn is_transient_http_sync_error(error: &anyhow::Error) -> bool {
+    http_sync_error_status(error).is_some_and(|status| matches!(status, 500 | 502 | 503 | 504))
+}
+
+/// Reads the status of a sync endpoint failure whatever its body looks like.
+///
+/// `parse_http_sync_error` needs a JSON body to find an error code in. The
+/// failures worth resending come from the infrastructure in front of the
+/// worker and answer in plain text, so the status is read on its own here.
+fn http_sync_error_status(error: &anyhow::Error) -> Option<u16> {
+    let message = error.to_string();
+    let rest = message.strip_prefix("sync endpoint returned HTTP ")?;
+    rest.split(':').next()?.trim().parse().ok()
 }
 
 fn should_retry_http_rollup_chunk_after_error(chunk: &SyncBatch, error: &anyhow::Error) -> bool {
@@ -13612,6 +13691,125 @@ mod tests {
         assert!(chunks.iter().all(|chunk| chunk.events.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.sources.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.accounts.is_empty()));
+    }
+
+    #[test]
+    fn http_rollup_chunk_is_resent_after_a_transient_endpoint_failure() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+        let attempts = std::cell::Cell::new(0_usize);
+        // A restarted worker answers with a plain-text body, so the decision to
+        // resend cannot depend on parsing an error code out of JSON.
+        let send = |_: &SyncBatch| -> Result<()> {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(anyhow::anyhow!(
+                    "sync endpoint returned HTTP 503: Your worker restarted mid-request. \
+                     Please try sending the request again. Only GET or HEAD requests are \
+                     retried automatically."
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let delays = std::cell::RefCell::new(Vec::new());
+        send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|delay| {
+            delays.borrow_mut().push(delay)
+        })
+        .expect("transient failure is resent rather than aborting the run");
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(delays.into_inner(), vec![StdDuration::from_secs(1)]);
+    }
+
+    #[test]
+    fn http_rollup_chunk_stops_resending_a_transient_failure_that_never_clears() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+        let attempts = std::cell::Cell::new(0_usize);
+        let send = |_: &SyncBatch| -> Result<()> {
+            attempts.set(attempts.get() + 1);
+            Err(anyhow::anyhow!(
+                "sync endpoint returned HTTP 502: Bad gateway"
+            ))
+        };
+
+        let delays = std::cell::RefCell::new(Vec::new());
+        let error = send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|delay| {
+            delays.borrow_mut().push(delay)
+        })
+        .expect_err("an endpoint that never recovers still fails the run");
+
+        // The original failure is reported rather than a retry-shaped summary of
+        // it, and the run gives up instead of resending forever.
+        assert!(error.to_string().contains("502"));
+        assert_eq!(attempts.get(), 4);
+        // Each attempt waits twice as long as the one before it.
+        assert_eq!(
+            delays.into_inner(),
+            vec![
+                StdDuration::from_secs(1),
+                StdDuration::from_secs(2),
+                StdDuration::from_secs(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn http_rollup_chunk_does_not_resend_a_decided_rejection() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+        let attempts = std::cell::Cell::new(0_usize);
+        // The endpoint decided about this batch. Sending it again could only be
+        // rejected the same way, and a conflict repeated on a schedule is worse
+        // than one reported immediately.
+        let send = |_: &SyncBatch| -> Result<()> {
+            attempts.set(attempts.get() + 1);
+            Err(anyhow::anyhow!(
+                r#"sync endpoint returned HTTP 409: {{"error":"batch_id_payload_conflict"}}"#
+            ))
+        };
+
+        let error = send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|_| {
+            panic!("a decided rejection must not wait to be resent")
+        })
+        .expect_err("conflict is reported");
+
+        assert!(error.to_string().contains("batch_id_payload_conflict"));
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn http_rollup_rate_limit_is_left_to_the_endpoints_own_retry_after() {
+        // 429 carries a `Retry-After` this backoff cannot read, so resending on
+        // our own schedule would ignore the delay the endpoint asked for.
+        assert!(!is_transient_http_sync_error(&anyhow::anyhow!(
+            r#"sync endpoint returned HTTP 429: {{"error":"sync_write_user"}}"#
+        )));
+        assert!(is_transient_http_sync_error(&anyhow::anyhow!(
+            "sync endpoint returned HTTP 503: Your worker restarted mid-request."
+        )));
+        // A body that is not JSON at all must still yield its status.
+        assert_eq!(
+            http_sync_error_status(&anyhow::anyhow!(
+                "sync endpoint returned HTTP 504: Gateway timeout"
+            )),
+            Some(504)
+        );
+        // Anything that is not a sync endpoint failure has no status to read.
+        assert_eq!(
+            http_sync_error_status(&anyhow::anyhow!("connection reset by peer")),
+            None
+        );
     }
 
     #[test]

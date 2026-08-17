@@ -235,6 +235,23 @@ contract. A compatible backend should:
 - project hosted task verifications onto the latest bucket snapshot when serving task reads
 - return accepted, updated, duplicate, and rejected counts
 
+A chunk that fails is answered by one of two remedies, and never the other's. A
+rejected size (HTTP 413) is a decision about that batch and is answered by
+splitting it into smaller batches. A transient infrastructure failure (HTTP 500,
+502, 503, or 504) is the *absence* of a decision — the batch was neither
+accepted nor rejected, only the answer was lost — and is answered by resending
+the identical chunk after a doubling backoff, three times before the run gives
+up. Resending is safe because ingest records the batch ID in the same
+transaction that applies the payload: a resent chunk either applies exactly once
+or is acknowledged as a duplicate. Statuses are read without requiring a JSON
+body, since these failures come from the infrastructure in front of the worker
+and answer in plain text.
+
+HTTP 429 is deliberately not resent on that schedule: it carries the endpoint's
+own `Retry-After`, and retrying sooner would work against the limit it asked
+for. Any other 4xx is a decision that repeating cannot change, so it fails the
+run immediately.
+
 ## Response Shapes
 
 ```json
