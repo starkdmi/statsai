@@ -1,0 +1,7 @@
+{
+  "oauthAccount": {
+    "accountUuid": "acct_fixture_claude_001",
+    "emailAddress": "fixture-user@example.invalid",
+    "profileFetchedAt": "2026-08-17T09:00:00Z"
+  }
+}

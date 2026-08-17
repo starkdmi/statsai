@@ -1,0 +1,159 @@
+{
+  "files": [
+    {
+      "bytes": 763,
+      "path": "README.md",
+      "sha256": "3f135b24139fed111d3058a3dfc9a946ed70fa74905baf45cfaa343f582ee6b7"
+    },
+    {
+      "bytes": 8855,
+      "path": "claude/basic/projects/-workspace-sample-project/session-basic.jsonl",
+      "sha256": "962ffcc689c71ca993d75b1495ab8a9f84a33f064b7b366f471fea921796567f"
+    },
+    {
+      "bytes": 8855,
+      "path": "claude/cache-write/projects/-workspace-cache-project/session-cache-write.jsonl",
+      "sha256": "962ffcc689c71ca993d75b1495ab8a9f84a33f064b7b366f471fea921796567f"
+    },
+    {
+      "bytes": 8886,
+      "path": "claude/malformed-record/projects/-workspace-malformed-project/session-malformed.jsonl",
+      "sha256": "282dfe0173c45ebb97673eae09da036bd79f88299e9c8a450dccaf969c32a445"
+    },
+    {
+      "bytes": 8855,
+      "path": "claude/multi-project/projects/-workspace-project-1/session-project-1.jsonl",
+      "sha256": "962ffcc689c71ca993d75b1495ab8a9f84a33f064b7b366f471fea921796567f"
+    },
+    {
+      "bytes": 16030,
+      "path": "claude/multi-project/projects/-workspace-project-2/session-project-2.jsonl",
+      "sha256": "1e149c7962c8bbb781ffbf48118ca858b4c9d98fc7afdf94334956a4a5b8c426"
+    },
+    {
+      "bytes": 173,
+      "path": "claude/subscription/.claude.json",
+      "sha256": "0bcac1859dc24fd78dba8294bbc9ccf4170f0b2a5239593cae5c7097108f57ec"
+    },
+    {
+      "bytes": 0,
+      "path": "claude/subscription/projects/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 4718,
+      "path": "claude/subscription/stats-cache.json",
+      "sha256": "45090702eaae5f1b70a22ce238e3d6357bf861a801a81f446ef6c7f88fdaf6b6"
+    },
+    {
+      "bytes": 2505,
+      "path": "codex/basic/sessions/2026/08/17/rollout-fixture-basic.jsonl",
+      "sha256": "bb86399f4fbaeb92c45c6b6833a81e65afc3702bad4591dc71f5481b2667ebe1"
+    },
+    {
+      "bytes": 51294,
+      "path": "codex/compaction/sessions/2026/08/17/rollout-fixture-compaction.jsonl",
+      "sha256": "555326912f653c8ca5fa57c8b731c7c95dedc21fdf5a4fffa8434de9a9aad02a"
+    },
+    {
+      "bytes": 2592,
+      "path": "codex/malformed/sessions/2026/08/17/rollout-fixture-malformed.jsonl",
+      "sha256": "416f641a0ce25fb089de833d543aef6a8b7dcde2692e08c57df5ec061ce9969e"
+    },
+    {
+      "bytes": 2505,
+      "path": "codex/reasoning/sessions/2026/08/17/rollout-fixture-reasoning.jsonl",
+      "sha256": "bb86399f4fbaeb92c45c6b6833a81e65afc3702bad4591dc71f5481b2667ebe1"
+    },
+    {
+      "bytes": 10632,
+      "path": "grok/basic/logs/unified.jsonl",
+      "sha256": "9320110261fa964eb63301091f43c978ff04e46e08b7fb4d388ba5a8b86b6b6c"
+    },
+    {
+      "bytes": 8804,
+      "path": "grok/basic/sessions/ses_fixture_grok_001/chat_history.jsonl",
+      "sha256": "95f9d78bc5d275b2d2b4b03e24bc343c97c58d279225e95b019717350d7ca036"
+    },
+    {
+      "bytes": 3537,
+      "path": "grok/basic/sessions/ses_fixture_grok_001/events.jsonl",
+      "sha256": "983acc7ecd77eaa738601382454f435cd277c86edc703c28f9712bb22a8a5d4f"
+    },
+    {
+      "bytes": 1906,
+      "path": "grok/basic/sessions/ses_fixture_grok_001/signals.json",
+      "sha256": "788fea72d420c1408098c1933e8793125e2cf545245602613a4b19612e7fe015"
+    },
+    {
+      "bytes": 916,
+      "path": "grok/basic/sessions/ses_fixture_grok_001/summary.json",
+      "sha256": "062011f11891f6495f065b595923b1b71a09d68b93dc218b9ef91fb2add0805f"
+    },
+    {
+      "bytes": 29856,
+      "path": "grok/basic/sessions/ses_fixture_grok_001/updates.jsonl",
+      "sha256": "8007a86ce6c9a55cc3882a69e88f4a164d27cc6e945a0abb923242f38a39c7e6"
+    },
+    {
+      "bytes": 12288,
+      "path": "opencode/sqlite-v1/opencode.db",
+      "sha256": "9fde89619b31b2ddebbdf4944ef1a753dc2c91bfdf2e4c935a17001100b7dc7b"
+    },
+    {
+      "bytes": 159744,
+      "path": "opencode/sqlite-v2/opencode.db",
+      "sha256": "67a94ee26ed0ae6c384f08a1f9a5fba86f39f0b685ace16d2211e2500d847a65"
+    }
+  ],
+  "original_sources": {
+    "files_read": 12,
+    "mode": "read-only",
+    "paths_recorded": false
+  },
+  "privacy": "synthetic identities/content; real provider shapes and numeric telemetry",
+  "scenarios": {
+    "claude": {
+      "basic": 17,
+      "cache-write": 17,
+      "malformed-record": 17,
+      "multi-project": [
+        17,
+        22
+      ],
+      "subscription": {
+        "profile": "synthetic",
+        "stats_cache_models": 5
+      }
+    },
+    "codex": {
+      "basic": 10,
+      "compaction": 43,
+      "malformed": 10,
+      "reasoning": 10
+    },
+    "grok": {
+      "basic": {
+        "chat_history.jsonl": 40,
+        "events.jsonl": 40,
+        "signals.json": 1,
+        "summary.json": 1,
+        "unified.jsonl": 40,
+        "updates.jsonl": 40
+      }
+    },
+    "opencode": {
+      "sqlite-v1": {
+        "sessions": 1,
+        "shape": "aggregate"
+      },
+      "sqlite-v2": {
+        "messages": 48,
+        "parts": 219,
+        "sessions": 1,
+        "todos": 3
+      }
+    }
+  },
+  "schema": "statsai-cloud-fixtures.v1"
+}

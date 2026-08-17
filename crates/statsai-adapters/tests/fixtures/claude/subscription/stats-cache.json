@@ -1,0 +1,222 @@
+{
+  "dailyActivity": [
+    {
+      "date": "2026-01-21",
+      "messageCount": 55,
+      "sessionCount": 6,
+      "toolCallCount": 4
+    },
+    {
+      "date": "2026-01-23",
+      "messageCount": 7,
+      "sessionCount": 1,
+      "toolCallCount": 0
+    },
+    {
+      "date": "2026-01-29",
+      "messageCount": 1071,
+      "sessionCount": 6,
+      "toolCallCount": 198
+    },
+    {
+      "date": "2026-01-30",
+      "messageCount": 2073,
+      "sessionCount": 7,
+      "toolCallCount": 527
+    },
+    {
+      "date": "2026-01-31",
+      "messageCount": 1445,
+      "sessionCount": 4,
+      "toolCallCount": 247
+    },
+    {
+      "date": "2026-02-01",
+      "messageCount": 2310,
+      "sessionCount": 8,
+      "toolCallCount": 411
+    },
+    {
+      "date": "2026-02-02",
+      "messageCount": 2486,
+      "sessionCount": 7,
+      "toolCallCount": 443
+    },
+    {
+      "date": "2026-02-03",
+      "messageCount": 1799,
+      "sessionCount": 5,
+      "toolCallCount": 337
+    },
+    {
+      "date": "2026-02-07",
+      "messageCount": 874,
+      "sessionCount": 3,
+      "toolCallCount": 171
+    },
+    {
+      "date": "2026-02-08",
+      "messageCount": 1008,
+      "sessionCount": 3,
+      "toolCallCount": 177
+    },
+    {
+      "date": "2026-02-09",
+      "messageCount": 505,
+      "sessionCount": 1,
+      "toolCallCount": 87
+    },
+    {
+      "date": "2026-02-10",
+      "messageCount": 2046,
+      "sessionCount": 10,
+      "toolCallCount": 313
+    }
+  ],
+  "dailyModelTokens": [
+    {
+      "date": "2026-01-29",
+      "tokensByModel": {
+        "claude-opus-4-5-thinking": 7210994,
+        "claude-sonnet-4-5-thinking": 36622
+      }
+    },
+    {
+      "date": "2026-01-30",
+      "tokensByModel": {
+        "claude-opus-4-5-thinking": 19796785
+      }
+    },
+    {
+      "date": "2026-01-31",
+      "tokensByModel": {
+        "claude-opus-4-5-thinking": 9575171
+      }
+    },
+    {
+      "date": "2026-02-01",
+      "tokensByModel": {
+        "claude-opus-4-5-thinking": 20399355
+      }
+    },
+    {
+      "date": "2026-02-02",
+      "tokensByModel": {
+        "claude-opus-4-5-thinking": 18940991
+      }
+    },
+    {
+      "date": "2026-02-03",
+      "tokensByModel": {
+        "claude-opus-4-5-thinking": 20247816
+      }
+    },
+    {
+      "date": "2026-02-07",
+      "tokensByModel": {
+        "claude-opus-4-5-thinking": 6032092
+      }
+    },
+    {
+      "date": "2026-02-08",
+      "tokensByModel": {
+        "claude-opus-4-5-thinking": 11419439
+      }
+    },
+    {
+      "date": "2026-02-09",
+      "tokensByModel": {
+        "claude-opus-4-6-thinking": 2333375
+      }
+    },
+    {
+      "date": "2026-02-10",
+      "tokensByModel": {
+        "claude-opus-4-6-thinking": 15417449
+      }
+    }
+  ],
+  "firstSessionDate": "2026-01-21T17:21:43.119Z",
+  "hourCounts": {
+    "0": 2,
+    "1": 4,
+    "11": 2,
+    "12": 1,
+    "13": 6,
+    "14": 5,
+    "15": 2,
+    "16": 6,
+    "17": 1,
+    "18": 1,
+    "19": 2,
+    "2": 6,
+    "20": 5,
+    "21": 9,
+    "22": 2,
+    "3": 6,
+    "4": 1
+  },
+  "lastComputedDate": "2026-06-11",
+  "longestSession": {
+    "duration": 302248320,
+    "messageCount": 323,
+    "sessionId": "ses_fixture_003",
+    "timestamp": "2026-02-10T00:21:44.668Z"
+  },
+  "modelUsage": {
+    "claude-opus-4-5-thinking": {
+      "cacheCreationInputTokens": 0,
+      "cacheReadInputTokens": 282480618,
+      "contextWindow": 0,
+      "costUSD": 0,
+      "inputTokens": 113622256,
+      "maxOutputTokens": 0,
+      "outputTokens": 387,
+      "webSearchRequests": 0
+    },
+    "claude-opus-4-6-thinking": {
+      "cacheCreationInputTokens": 0,
+      "cacheReadInputTokens": 25546163,
+      "contextWindow": 0,
+      "costUSD": 0,
+      "inputTokens": 17750824,
+      "maxOutputTokens": 0,
+      "outputTokens": 0,
+      "webSearchRequests": 0
+    },
+    "claude-sonnet-4-5-thinking": {
+      "cacheCreationInputTokens": 0,
+      "cacheReadInputTokens": 0,
+      "contextWindow": 0,
+      "costUSD": 0,
+      "inputTokens": 36622,
+      "maxOutputTokens": 0,
+      "outputTokens": 0,
+      "webSearchRequests": 0
+    },
+    "google/antigravity-claude-opus-4-5-thinking": {
+      "cacheCreationInputTokens": 0,
+      "cacheReadInputTokens": 0,
+      "contextWindow": 0,
+      "costUSD": 0,
+      "inputTokens": 0,
+      "maxOutputTokens": 0,
+      "outputTokens": 0,
+      "webSearchRequests": 0
+    },
+    "google/antigravity-claude-sonnet-4-5": {
+      "cacheCreationInputTokens": 0,
+      "cacheReadInputTokens": 0,
+      "contextWindow": 0,
+      "costUSD": 0,
+      "inputTokens": 0,
+      "maxOutputTokens": 0,
+      "outputTokens": 0,
+      "webSearchRequests": 0
+    }
+  },
+  "totalMessages": 15679,
+  "totalSessions": 61,
+  "totalSpeculationTimeSavedMs": 0,
+  "version": 2
+}

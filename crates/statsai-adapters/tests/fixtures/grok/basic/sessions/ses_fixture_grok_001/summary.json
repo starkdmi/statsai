@@ -1,0 +1,26 @@
+{
+  "agent_name": "agent_name_fixture_001",
+  "chat_format_version": 1,
+  "created_at": "2026-08-16T18:30:19.418868Z",
+  "current_model_id": "grok-4.6",
+  "generated_title": "Implement fixture parser",
+  "git_root_dir": "/workspace/sample-project",
+  "grok_home": "/workspace/.grok",
+  "head_branch": "fixture/main",
+  "head_commit": "0123456789abcdef0123456789abcdef01234567",
+  "info": {
+    "cwd": "/workspace/sample-project",
+    "id": "ses_fixture_grok_001"
+  },
+  "last_active_at": "2026-08-16T18:39:53.103614Z",
+  "last_turn_summary": "last_turn_su_fixture_001",
+  "last_turn_summary_prompt_id": "req_fixture_001",
+  "next_trace_turn": 1,
+  "num_chat_messages": 82,
+  "num_messages": 170,
+  "reasoning_effort": "high",
+  "request_id": "req_fixture_001",
+  "sandbox_profile": "off",
+  "session_summary": "Implement fixture parser and validate cloud ingestion.",
+  "updated_at": "2026-08-16T18:39:58.531781Z"
+}

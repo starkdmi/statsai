@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# Provider trace fixtures are for this repository's tests, not for consumers of
+# the library. They are also derived from real local traces, and a crates.io
+# release cannot be withdrawn once made: a version can be yanked but its files
+# stay downloadable forever. Keeping them out of the package means a sanitizing
+# mistake stays correctable in git instead of becoming permanent.
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 statsai-core.workspace = true
