@@ -4,6 +4,7 @@ use crate::{ProjectInfo, SourceId};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -244,6 +245,16 @@ pub struct GitScan {
     pub repository_hash: String,
     pub commits: Vec<GitCommitChange>,
     pub coverage: CoverageStatus,
+    /// Every committer identity this repository has been scanned under, as
+    /// `committer_identity_hash` of the configured address.
+    ///
+    /// Reconfiguring `user.email` does not rewrite the commits already in the
+    /// object database, so a scan that recognised only the address configured
+    /// right now would report an authoritative zero. Carrying the identities
+    /// forward keeps that history attributable. Absent only in scans recorded
+    /// before this field existed; one refresh repopulates it.
+    #[serde(default)]
+    pub committer_identities: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -303,7 +314,7 @@ pub enum CodeChangeMetricBuildError {
 pub enum GitScanError {
     #[error("path is not inside a Git repository: {0}")]
     NotRepository(PathBuf),
-    #[error("no Git committer email is configured for: {0}")]
+    #[error("no Git committer email has ever been known for: {0}")]
     UnknownCommitterIdentity(PathBuf),
     #[error("Git command failed ({command}): {message}")]
     Command { command: String, message: String },

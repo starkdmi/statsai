@@ -382,15 +382,24 @@ impl Store {
                 }
             }
         }
+        let no_identities = BTreeSet::new();
         for (root, project_id) in project_ids_by_root {
-            let cached_commits = available_scans
+            let cached_scan = available_scans
                 .iter()
                 .filter(|scan| root.starts_with(&scan.repository_root))
-                .max_by_key(|scan| scan.repository_root.components().count())
-                .map_or(&[][..], |scan| scan.commits.as_slice());
-            let Ok(mut scan) =
-                scan_local_git_repository_cached(&root, project_id.as_deref(), cached_commits)
-            else {
+                .max_by_key(|scan| scan.repository_root.components().count());
+            let cached_commits = cached_scan.map_or(&[][..], |scan| scan.commits.as_slice());
+            // Commits already measured stay this user's work after `user.email`
+            // changes, so the scan matches every identity this repository has
+            // been seen under rather than only the one configured now.
+            let known_identities =
+                cached_scan.map_or(&no_identities, |scan| &scan.committer_identities);
+            let Ok(mut scan) = scan_local_git_repository_cached(
+                &root,
+                project_id.as_deref(),
+                cached_commits,
+                known_identities,
+            ) else {
                 failed_roots.insert(root);
                 failed_scans = failed_scans.saturating_add(1);
                 continue;
@@ -679,6 +688,19 @@ impl Store {
                     Utc::now().to_rfc3339(),
                 ],
             )?;
+            // Identities accumulate: the scan carries in everything this
+            // repository was already known by, and a repository whose identity
+            // hash changed above has its set re-homed under the new hash.
+            for identity_hash in &scan.committer_identities {
+                self.conn.execute(
+                    r#"
+                    INSERT OR IGNORE INTO code_git_identities
+                      (repository_hash, identity_hash, first_seen_at)
+                    VALUES (?1, ?2, ?3)
+                    "#,
+                    params![&scan.repository_hash, identity_hash, Utc::now().to_rfc3339()],
+                )?;
+            }
             let incoming = scan
                 .commits
                 .iter()
@@ -726,10 +748,17 @@ impl Store {
                 .query_map([&repository_hash], |row| row.get::<_, String>(0))?
                 .map(|row| serde_json::from_str::<GitCommitChange>(&row?).map_err(Into::into))
                 .collect::<Result<Vec<_>>>()?;
+            let mut identity_statement = self.conn.prepare(
+                "SELECT identity_hash FROM code_git_identities WHERE repository_hash = ?1 ORDER BY identity_hash",
+            )?;
+            let committer_identities = identity_statement
+                .query_map([&repository_hash], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?;
             scans.push(GitScan {
                 repository_root: PathBuf::from(repository_path),
                 repository_hash,
                 commits,
+                committer_identities,
                 coverage: parse_coverage(&coverage),
             });
         }
@@ -758,13 +787,18 @@ impl Store {
         })
     }
 
-    /// Removes a repository scan together with the commit rows it owns.
+    /// Removes a repository scan together with the rows it owns.
     ///
     /// The schema declares `ON DELETE CASCADE`, but the connection never
-    /// enables `PRAGMA foreign_keys`, so the commits are deleted here.
+    /// enables `PRAGMA foreign_keys`, so the commits and remembered committer
+    /// identities are deleted here.
     fn delete_git_scan_rows_inner(&self, repository_hash: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM code_git_commits WHERE repository_hash = ?1",
+            [repository_hash],
+        )?;
+        self.conn.execute(
+            "DELETE FROM code_git_identities WHERE repository_hash = ?1",
             [repository_hash],
         )?;
         self.conn.execute(
@@ -1115,10 +1149,11 @@ mod tests {
             .expect("refresh changes");
         assert_eq!(report.commits, 1);
 
-        // Losing the configured identity means this scan cannot tell whose
-        // commits these are. That is an unanswerable question, not an answer of
-        // "none": the commits it already measured must survive, exactly as they
-        // do when Git itself cannot be run.
+        // The repository is already known by the identity that measured these
+        // commits, so losing the configured one costs nothing: the scan still
+        // recognises them and reports the period as fully measured. Matching
+        // only the currently configured address would instead succeed with zero
+        // commits and delete work it had already measured.
         // Unsetting the repository value would fall back to the global one, so
         // the configured identity is emptied outright.
         run_test_git(repository.path(), &["config", "user.email", ""]);
@@ -1126,7 +1161,67 @@ mod tests {
             .refresh_code_changes("device")
             .expect("refresh without identity");
         assert_eq!(refreshed.commits, 1);
-        assert_eq!(refreshed.git_coverage, CoverageStatus::Partial);
+        assert_eq!(refreshed.git_coverage, CoverageStatus::Complete);
+        let committed = store
+            .list_code_change_metrics(false)
+            .expect("metrics")
+            .into_iter()
+            .filter(|metric| metric.kind == CodeChangeMetricKind::Committed)
+            .count();
+        assert_eq!(committed, 1);
+    }
+
+    #[test]
+    fn changing_the_committer_identity_retains_already_measured_commits() {
+        let repository = TempDir::new().expect("temporary repository");
+        run_test_git(repository.path(), &["init", "-q"]);
+        run_test_git(
+            repository.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        run_test_git(repository.path(), &["config", "user.name", "Test"]);
+        fs::write(repository.path().join("main.rs"), "fn main() {}\n").expect("write source");
+        run_test_git(repository.path(), &["add", "main.rs"]);
+        run_test_git(repository.path(), &["commit", "-qm", "initial"]);
+
+        let store = Store::in_memory().expect("open store");
+        let payload = serde_json::json!({
+            "project": {
+                "project_id": "project",
+                "path_label": repository.path().to_string_lossy(),
+            }
+        });
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO usage_summaries
+                  (summary_id, provider, source_id, observed_at, total_tokens, payload)
+                VALUES (?1, 'codex', 'source', '2026-08-01T00:00:00Z', 0, ?2)
+                "#,
+                params!["summary", payload.to_string()],
+            )
+            .expect("insert project evidence");
+
+        let report = store
+            .refresh_code_changes("device")
+            .expect("refresh changes");
+        assert_eq!(report.commits, 1);
+
+        // Reconfiguring the identity does not rewrite the commits already in
+        // the object database, and the work they hold was still this user's.
+        // Filtering on whichever address is configured right now would report
+        // an authoritative scan of zero commits, deleting measured history from
+        // the store and retiring it remotely.
+        run_test_git(
+            repository.path(),
+            &["config", "user.email", "renamed@example.com"],
+        );
+        let refreshed = store
+            .refresh_code_changes("device")
+            .expect("refresh after rename");
+        assert_eq!(refreshed.commits, 1);
+        assert_eq!(refreshed.git_coverage, CoverageStatus::Complete);
         let committed = store
             .list_code_change_metrics(false)
             .expect("metrics")
@@ -1526,10 +1621,26 @@ mod tests {
                 })
                 .expect("commit count")
         };
+        let identity_count = |store: &Store| -> u64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM code_git_identities", [], |row| {
+                    row.get(0)
+                })
+                .expect("identity count")
+        };
         assert_eq!(
             commit_count(&store),
             1,
             "superseded identity leaves no rows"
+        );
+        // The remembered committer identity moves to the new repository hash
+        // rather than being stranded under the superseded one, so the commits
+        // stay attributable across a repository identity change.
+        assert_eq!(
+            identity_count(&store),
+            1,
+            "superseded identity leaves no committer rows"
         );
 
         store
@@ -1544,6 +1655,11 @@ mod tests {
             commit_count(&store),
             0,
             "retired scan leaves no commit rows"
+        );
+        assert_eq!(
+            identity_count(&store),
+            0,
+            "retired scan leaves no committer rows"
         );
     }
 
@@ -1839,8 +1955,9 @@ mod tests {
         run_test_git(repository.path(), &["commit", "-qm", "initial"]);
 
         let first = Store::in_memory().expect("first store");
-        let legacy_scan = scan_local_git_repository_cached(repository.path(), None, &[])
-            .expect("scan legacy commit");
+        let legacy_scan =
+            scan_local_git_repository_cached(repository.path(), None, &[], &BTreeSet::new())
+                .expect("scan legacy commit");
         let legacy_commit = legacy_scan.commits.first().expect("legacy commit");
         let legacy_metric_id = legacy_commit.deduplication_id.clone();
         first

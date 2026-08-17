@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 16;
+pub const CURRENT_SCHEMA_VERSION: i64 = 17;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_migrations_table(conn)?;
@@ -109,6 +109,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         14 => apply_migration_014(conn),
         15 => apply_migration_015(conn),
         16 => apply_migration_016(conn),
+        17 => apply_migration_017(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -645,6 +646,36 @@ fn apply_migration_016(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Remembers which committer identities a repository has been scanned under.
+///
+/// Scans previously recognised only the address `user.email` held at the moment
+/// they ran, so changing it turned every earlier commit into someone else's
+/// work: the scan succeeded with zero commits, and refresh, treating a
+/// successful scan as authoritative, deleted the commit rows it had already
+/// measured and retired their metrics remotely.
+///
+/// Addresses are stored blinded because equality is all matching needs and an
+/// email identifies a person, matching how commit hashes and repository
+/// identity are already held. The table is local-only and never synced.
+///
+/// Existing stores need no backfill: their next scan runs under the address the
+/// previous filter already matched, which is exactly the identity to remember.
+fn apply_migration_017(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS code_git_identities (
+          repository_hash TEXT NOT NULL,
+          identity_hash TEXT NOT NULL,
+          first_seen_at TEXT NOT NULL,
+          PRIMARY KEY (repository_hash, identity_hash),
+          FOREIGN KEY (repository_hash) REFERENCES code_git_scans(repository_hash)
+            ON DELETE CASCADE
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -802,6 +833,7 @@ mod tests {
         assert!(table_exists(&conn, "code_trace_edits"));
         assert!(table_exists(&conn, "code_git_scans"));
         assert!(table_exists(&conn, "code_git_commits"));
+        assert!(table_exists(&conn, "code_git_identities"));
         assert!(table_exists(&conn, "code_change_matches"));
         assert!(table_exists(&conn, "code_change_metrics"));
     }

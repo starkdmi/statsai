@@ -5,7 +5,7 @@ use crate::{hash_text, SourceId};
 use chrono::{DateTime, Duration, Utc};
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -24,30 +24,55 @@ pub fn scan_local_git_repository(
     path: &Path,
     project_id: Option<&str>,
 ) -> Result<GitScan, GitScanError> {
-    scan_local_git_repository_cached(path, project_id, &[])
+    scan_local_git_repository_cached(path, project_id, &[], &BTreeSet::new())
+}
+
+/// Blinds a committer address into the form scans and the store compare on.
+///
+/// Only equality is ever asked of a committer identity, and an email address
+/// identifies a person, so it is hashed exactly like the repository identity
+/// and commit hashes it sits beside rather than kept in the clear.
+pub fn committer_identity_hash(email: &str) -> String {
+    hash_text(&format!(
+        "git-committer.v1:{}",
+        email.trim().to_ascii_lowercase()
+    ))
 }
 
 /// Inspect recent, locally attributable commits while reusing parsed commits.
 ///
 /// Commit hashes cover their trees and parent relationships, so a cached patch
 /// remains valid even when mutable repository identity metadata changes. The
-/// scan is bounded to the current HEAD and local branches, the configured Git
-/// committer identity, and the longest rolling dashboard window.
+/// scan is bounded to the current HEAD and local branches, the committer
+/// identities this repository is known by, and the longest rolling dashboard
+/// window.
+///
+/// `known_identities` are the blinded addresses earlier scans of this
+/// repository ran under. They are matched in addition to the address configured
+/// now, because reconfiguring `user.email` leaves the existing commits exactly
+/// as they were.
 pub fn scan_local_git_repository_cached(
     path: &Path,
     project_id: Option<&str>,
     cached_commits: &[GitCommitChange],
+    known_identities: &BTreeSet<String>,
 ) -> Result<GitScan, GitScanError> {
     let root = resolve_git_repository_root(path)?;
     let repository_hash = repository_identity_hash(&root)?;
     let configured_email = run_git_allow_missing(&root, &["config", "--get", "user.email"])?;
     let configured_email = configured_email.trim();
-    // Commits are attributed by committer email, so without one this scan
-    // cannot tell whose work the repository holds. That is an unanswerable
-    // question rather than an answer of "no commits": reporting an empty
-    // success would let a caller replace commits it measured while the identity
-    // was still configured, so it is raised like any other unusable scan.
-    if configured_email.is_empty() {
+    let mut committer_identities = known_identities.clone();
+    if !configured_email.is_empty() {
+        committer_identities.insert(committer_identity_hash(configured_email));
+    }
+    // Commits are attributed by committer email, so with no identity ever known
+    // for this repository the scan cannot tell whose work it holds. That is an
+    // unanswerable question rather than an answer of "no commits": reporting an
+    // empty success would let a caller replace commits it measured while an
+    // identity was still known, so it is raised like any other unusable scan.
+    // Once one identity is remembered, a temporarily missing `user.email` no
+    // longer costs any coverage.
+    if committer_identities.is_empty() {
         return Err(GitScanError::UnknownCommitterIdentity(root));
     }
     let now = Utc::now();
@@ -88,8 +113,8 @@ pub fn scan_local_git_repository_cached(
             .unwrap_or_default()
             .split_whitespace()
             .collect::<Vec<_>>();
-        let committer_email = fields.next().unwrap_or_default().trim();
-        if !committer_email.eq_ignore_ascii_case(configured_email) {
+        let committer_email = fields.next().unwrap_or_default();
+        if !committer_identities.contains(&committer_identity_hash(committer_email)) {
             continue;
         }
         // A merge diff replays every line the merged branch already contributed
@@ -165,6 +190,7 @@ pub fn scan_local_git_repository_cached(
         repository_root: root,
         repository_hash,
         commits,
+        committer_identities,
         coverage: if future_dated_commits > 0 {
             CoverageStatus::Partial
         } else {
@@ -400,6 +426,84 @@ mod tests {
     }
 
     #[test]
+    fn git_scan_fails_only_when_no_committer_identity_has_ever_been_known() {
+        let temp = TempDir::new().unwrap();
+        run_test_git(temp.path(), &["init", "-q"]);
+        run_test_git(temp.path(), &["config", "user.email", "test@example.com"]);
+        run_test_git(temp.path(), &["config", "user.name", "Test"]);
+        fs::write(temp.path().join("lib.rs"), "one\n").unwrap();
+        run_test_git(temp.path(), &["add", "lib.rs"]);
+        run_test_git(temp.path(), &["commit", "-qm", "initial"]);
+
+        // Unsetting the repository value would fall back to the global one, so
+        // the configured identity is emptied outright.
+        run_test_git(temp.path(), &["config", "user.email", ""]);
+        // A repository seen for the first time without an identity cannot say
+        // whose commits it holds, which is an unanswerable question rather than
+        // an answer of "none".
+        let unknown = scan_local_git_repository(temp.path(), None);
+        assert!(matches!(
+            unknown,
+            Err(GitScanError::UnknownCommitterIdentity(_))
+        ));
+
+        // One remembered identity answers it, so the same repository scans
+        // cleanly with no address configured at all.
+        let known = BTreeSet::from([committer_identity_hash("test@example.com")]);
+        let scan = scan_local_git_repository_cached(temp.path(), None, &[], &known)
+            .expect("scan under a remembered identity");
+        assert_eq!(scan.commits.len(), 1);
+        assert_eq!(scan.coverage, CoverageStatus::Complete);
+        assert_eq!(scan.committer_identities, known);
+    }
+
+    #[test]
+    fn git_scan_matches_every_identity_the_repository_is_known_by() {
+        let temp = TempDir::new().unwrap();
+        run_test_git(temp.path(), &["init", "-q"]);
+        run_test_git(temp.path(), &["config", "user.name", "Test"]);
+        run_test_git(temp.path(), &["config", "user.email", "first@example.com"]);
+        fs::write(temp.path().join("lib.rs"), "one\n").unwrap();
+        run_test_git(temp.path(), &["add", "lib.rs"]);
+        run_test_git(temp.path(), &["commit", "-qm", "first"]);
+
+        run_test_git(temp.path(), &["config", "user.email", "second@example.com"]);
+        fs::write(temp.path().join("lib.rs"), "one\ntwo\n").unwrap();
+        run_test_git(temp.path(), &["add", "lib.rs"]);
+        run_test_git(temp.path(), &["commit", "-qm", "second"]);
+
+        // Only the address configured now, so the earlier commit is somebody
+        // else's work as far as this scan can tell.
+        let configured_only = scan_local_git_repository(temp.path(), None).unwrap();
+        assert_eq!(configured_only.commits.len(), 1);
+
+        // Carrying the earlier identity forward recovers it, and the scan
+        // reports both identities so the caller can keep remembering them.
+        let known = BTreeSet::from([committer_identity_hash("first@example.com")]);
+        let both = scan_local_git_repository_cached(temp.path(), None, &[], &known).unwrap();
+        assert_eq!(both.commits.len(), 2);
+        assert_eq!(
+            both.committer_identities,
+            BTreeSet::from([
+                committer_identity_hash("first@example.com"),
+                committer_identity_hash("second@example.com"),
+            ])
+        );
+    }
+
+    #[test]
+    fn committer_identity_hash_ignores_case_and_surrounding_space() {
+        assert_eq!(
+            committer_identity_hash("  Test@Example.COM \n"),
+            committer_identity_hash("test@example.com")
+        );
+        assert_ne!(
+            committer_identity_hash("test@example.com"),
+            committer_identity_hash("other@example.com")
+        );
+    }
+
+    #[test]
     fn git_scan_only_counts_recent_local_branch_commits_from_configured_identity() {
         let temp = TempDir::new().unwrap();
         run_test_git(temp.path(), &["init", "-q"]);
@@ -476,7 +580,8 @@ mod tests {
         run_test_git(temp.path(), &["commit", "-qm", "second"]);
 
         let refreshed =
-            scan_local_git_repository_cached(temp.path(), None, &cached.commits).unwrap();
+            scan_local_git_repository_cached(temp.path(), None, &cached.commits, &BTreeSet::new())
+                .unwrap();
         assert_eq!(refreshed.commits.len(), 2);
         let reused = refreshed
             .commits

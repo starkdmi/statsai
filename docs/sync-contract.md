@@ -100,12 +100,26 @@ degrades the trace coverage stamped on every metric that run publishes. A trace
 edit carrying no timestamp at all is skipped the same way, because metrics are
 published per day and an edit belonging to no day cannot be carried by one.
 
-A repository with no configured `user.email` cannot say whose commits it holds,
-so its scan fails rather than reporting zero commits. A repository scanned for
-the first time in that state stays unmeasured, while one that already had
-commits measured keeps them and degrades Git coverage to partial. Reporting an
-empty success instead would delete measured commits from the local store and
-retire them remotely through the authoritative snapshot.
+Commits are attributed by committer email, and a repository remembers every
+identity it has been scanned under rather than only the address `user.email`
+holds right now. Reconfiguring that address does not rewrite the commits already
+in the object database, so matching on the current value alone would report an
+authoritative scan of zero commits, delete measured commits from the local store
+and retire them remotely through the authoritative snapshot. The remembered
+addresses are stored blinded, local to the device, and never synced.
+
+A scan therefore fails only when no identity has ever been known for the
+repository, which is an unanswerable question rather than an answer of "none". A
+repository seen for the first time in that state stays unmeasured; one that
+already knows an identity keeps measuring under it, so a temporarily missing
+`user.email` costs no coverage at all.
+
+Identities are never forgotten while the repository is still on record, so
+configuring a colleague's address once claims it for that repository until the
+repository itself is retired. Over-counting inside a repository the user already
+works in is preferred to deleting history the user did write, and retiring a
+repository once nothing references it drops its remembered identities along with
+its commit rows.
 
 Authenticated HTTP preflight returns a 32-byte, user-scoped code-change identity
 key. The collector uses that key to HMAC the local repository identity and raw

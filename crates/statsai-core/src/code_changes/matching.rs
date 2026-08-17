@@ -349,6 +349,7 @@ mod tests {
                 project_id: None,
                 files: vec![file],
             }],
+            committer_identities: BTreeSet::new(),
             coverage: CoverageStatus::Complete,
         }
     }
