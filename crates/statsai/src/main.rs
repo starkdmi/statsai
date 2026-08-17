@@ -14,12 +14,12 @@ use statsai_adapters::{SourceIdentityInference, VerifiedSourceState};
 use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
     normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
-    project_contains_file_paths, project_has_stable_identity, sanitize_task_bucket_for_sync,
-    source_account_assignment_id, source_id as statsai_source_id, subscription_id,
-    timestamp_in_period, ArchiveContentKind, ArchiveConversation, BillingPeriod, EventId,
-    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
-    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
-    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
+    project_contains_file_paths, project_has_stable_identity, sanitize_code_change_metric_for_sync,
+    sanitize_task_bucket_for_sync, source_account_assignment_id, source_id as statsai_source_id,
+    subscription_id, timestamp_in_period, ArchiveContentKind, ArchiveConversation, BillingPeriod,
+    EventId, IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId,
+    ReportPeriod, SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind,
+    SourceLocation, SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
     SyncAuthoritativeSnapshot, SyncBatch, TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict,
     TaskVerification, TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport,
     UsageSummary, UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
@@ -56,10 +56,17 @@ use statsai::{auth, default_device_id, default_store_path, service, snapshot};
 
 const HTTP_ROLLUP_SUMMARIES_PER_BATCH: usize = 25;
 const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
+const HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH: usize = 1_000;
 const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 const HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE: usize = 90;
 const HTTP_ROLLUP_DAILY_ROLLUP_ROWS_PER_QUERY: usize = 7;
 const HTTP_ROLLUP_SNAPSHOT_IDS_PER_BATCH: usize = 200;
+/// Times a chunk is resent after a transient endpoint failure before the run
+/// gives up. A restarted worker recovers within seconds, so a handful of
+/// attempts covers it without leaving a stalled sync running indefinitely.
+const HTTP_ROLLUP_TRANSIENT_RESEND_ATTEMPTS: u32 = 3;
+/// Delay before the first resend. Each further attempt doubles it.
+const HTTP_ROLLUP_TRANSIENT_RESEND_DELAY: StdDuration = StdDuration::from_secs(1);
 const HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const TASK_SYNC_SQL_MAX_ROWS_PER_CHUNK: usize = 200;
 const TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK: usize = 512 * 1024;
@@ -810,7 +817,7 @@ struct SchemaCommand {
 
 #[derive(Debug, Subcommand)]
 enum SchemaSubcommand {
-    #[command(about = "Print the sync_batch.v2 JSON Schema")]
+    #[command(about = "Print the sync_batch.v3 JSON Schema")]
     SyncBatch,
 }
 
@@ -842,19 +849,19 @@ fn main() -> Result<()> {
         Command::Doctor => doctor(&store_path),
         Command::Auth(command) => auth(command),
         Command::Service(command) => service(command),
-        Command::Snapshot(command) => snapshot::run(command, &store_path),
+        Command::Snapshot(command) => snapshot::run(command, &store_path, &device_id),
         command => {
             let store = Store::open(&store_path)?;
             match command {
                 Command::Scan(command) => scan(command, &store, &device_id),
                 Command::Report(command) => report(command, &store),
-                Command::Source(command) => source(command, &store),
+                Command::Source(command) => source(command, &store, &device_id),
                 Command::Account(command) => account(command, &store),
                 Command::Subscription(command) => subscription(command, &store),
                 Command::Import(command) => import(command, &store, &device_id),
                 Command::Export(command) => export(command, &store),
                 Command::Task(command) => task(command, &store),
-                Command::Conversation(command) => conversation(command, &store),
+                Command::Conversation(command) => conversation(command, &store, &device_id),
                 Command::Privacy(command) => {
                     statsai::privacy_cli::run(command, &store, &store_path)
                 }
@@ -1518,7 +1525,7 @@ impl PreviewTaskRebuild {
     }
 }
 
-fn source(command: SourceCommand, store: &Store) -> Result<()> {
+fn source(command: SourceCommand, store: &Store, device_id: &str) -> Result<()> {
     match command.command {
         SourceSubcommand::Add { provider, path } => {
             let adapter = adapter_for_provider(&provider)
@@ -1577,6 +1584,11 @@ fn source(command: SourceCommand, store: &Store) -> Result<()> {
             } else {
                 Default::default()
             };
+            let deleted_trace_edits = if delete_data {
+                store.delete_archive_import_for_sources(std::slice::from_ref(&source_id))?
+            } else {
+                0
+            };
             let rebuilt_work_items =
                 if delete_data && !deleted_task_spans.affected_project_buckets.is_empty() {
                     store.rebuild_task_work_items_for_project_buckets(
@@ -1586,6 +1598,18 @@ fn source(command: SourceCommand, store: &Store) -> Result<()> {
                     0
                 };
             let deleted = store.delete_source(&source_id)?;
+            // Metrics built from this source's data are already materialized and
+            // the authoritative snapshot keeps republishing them, so they are
+            // rebuilt now rather than left live until the next collect or sync.
+            // Traces are not the only input: committed metrics are discovered
+            // from the project paths carried by usage summaries, so a source that
+            // produced Git-derived churn but no reconstructed edits orphans them
+            // just as surely. Any data deletion therefore rebuilds.
+            let rebuilt_code_change_metrics = if delete_data {
+                store.refresh_code_changes(device_id)?.metrics
+            } else {
+                0
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -1596,7 +1620,9 @@ fn source(command: SourceCommand, store: &Store) -> Result<()> {
                     "deleted_summaries": deleted_summaries,
                     "deleted_scan_cache_entries": deleted_scan_entries,
                     "deleted_task_spans": deleted_task_spans.deleted,
+                    "deleted_code_change_traces": deleted_trace_edits,
                     "work_items_rebuilt": rebuilt_work_items,
+                    "code_change_metrics_rebuilt": rebuilt_code_change_metrics,
                     "source": source
                 }))?
             );
@@ -3514,16 +3540,46 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
     }
 
     let target = sync_target(&command)?;
-    if command.sink == "http" && !command.dry_run {
-        maybe_reset_http_sync_tracking_if_remote_changed(&command, store, &target)?;
-    }
-    let (mut batch, payload_mode) = build_sync_batch(&command, store, device_id, &target)?;
+    let http_preflight = if command.sink == "http" && !command.dry_run {
+        let preflight = load_http_sync_preflight(&command, &target)?;
+        maybe_reset_http_sync_tracking_if_remote_changed(
+            &command,
+            store,
+            &target,
+            preflight.remote.as_ref(),
+        )?;
+        Some(preflight)
+    } else {
+        None
+    };
+    let code_change_identity_key = http_preflight
+        .as_ref()
+        .and_then(|preflight| preflight.remote.as_ref())
+        .map(remote_code_change_identity_key)
+        .transpose()?
+        .flatten();
+    let (mut batch, payload_mode) = build_sync_batch_with_identity_key(
+        &command,
+        store,
+        device_id,
+        &target,
+        code_change_identity_key.as_ref(),
+    )?;
     let hosted_task_sync_enabled = maybe_disable_http_hosted_task_sync_payload(
         &command,
-        &target,
         sync_preferences,
+        http_preflight
+            .as_ref()
+            .and_then(|preflight| preflight.remote.as_ref()),
         &mut batch,
     )?;
+    if let Some(warning) = code_change_dedup_warning(
+        &command.sink,
+        code_change_identity_key.is_some(),
+        &batch.code_change_metrics,
+    ) {
+        eprintln!("{warning}");
+    }
 
     if command.dry_run {
         eprintln!(
@@ -3563,7 +3619,9 @@ fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
             }
             "http" => {
                 let endpoint = http_sync_endpoint(&command)?;
-                let auth_token = resolve_http_auth_token(&command, false)?;
+                let auth_token = http_preflight
+                    .as_ref()
+                    .and_then(|preflight| preflight.auth_token.clone());
                 send_http_sync_batch(
                     store,
                     HttpSyncBatchRequest {
@@ -3595,6 +3653,7 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
     command: &SyncCommand,
     store: &Store,
     target: &str,
+    remote: Option<&Value>,
 ) -> Result<()> {
     let Some(local_state) = store.sync_state("http", target)? else {
         return Ok(());
@@ -3603,10 +3662,10 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
         return Ok(());
     }
 
+    let Some(remote) = remote else {
+        return Ok(());
+    };
     let sync_preferences = effective_sync_preferences(store, command)?;
-    let auth_token = resolve_http_auth_token(command, true)?
-        .context("device login required; run `statsai auth login` first")?;
-    let remote = http_remote_preflight_status(target, &auth_token)?;
     let local_verify = sync_local_verify(
         store,
         "http",
@@ -3614,10 +3673,10 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
         Some(&local_state),
         sync_preferences.include_projects,
     )?;
-    let batch_mismatch = !remote_sync_batch_matches_local_state(&remote, &local_state);
-    let metadata_gap = remote_metadata_gap_reason(&remote, &local_verify);
+    let batch_mismatch = !remote_sync_batch_matches_local_state(remote, &local_state);
+    let metadata_gap = remote_metadata_gap_reason(remote, &local_verify);
     if batch_mismatch || metadata_gap.is_some() {
-        let remote_last_batch = remote_last_sync_batch_id(&remote).unwrap_or("none");
+        let remote_last_batch = remote_last_sync_batch_id(remote).unwrap_or("none");
         let mut reasons = Vec::new();
         if batch_mismatch {
             reasons.push(format!(
@@ -3699,11 +3758,22 @@ fn ensure_device_remote_reset_response(response: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn build_sync_batch(
     command: &SyncCommand,
     store: &Store,
     device_id: &str,
     target: &str,
+) -> Result<(SyncBatch, SyncPayloadMode)> {
+    build_sync_batch_with_identity_key(command, store, device_id, target, None)
+}
+
+fn build_sync_batch_with_identity_key(
+    command: &SyncCommand,
+    store: &Store,
+    device_id: &str,
+    target: &str,
+    code_change_identity_key: Option<&[u8; 32]>,
 ) -> Result<(SyncBatch, SyncPayloadMode)> {
     let created_at = Utc::now();
     let batch_id = format!("batch_{}", created_at.timestamp_millis());
@@ -3847,6 +3917,32 @@ fn build_sync_batch(
     } else {
         (Vec::new(), Vec::new())
     };
+    if !command.dry_run {
+        if let Some(identity_key) = code_change_identity_key {
+            store.refresh_code_changes_with_identity_key(device_id, identity_key)?;
+        } else {
+            store.refresh_code_changes(device_id)?;
+        }
+    }
+    let all_code_change_metrics = store
+        .list_code_change_metrics(false)?
+        .into_iter()
+        .filter(|metric| metric.device_id == device_id)
+        .map(|metric| sanitize_code_change_metric_for_sync(metric, include_projects))
+        .collect::<Vec<_>>();
+    let code_change_metrics = if command.full || state.is_none() {
+        all_code_change_metrics.clone()
+    } else {
+        store.pending_code_change_metrics_for_sync(
+            &command.sink,
+            target,
+            &all_code_change_metrics,
+        )?
+    };
+    let all_code_change_metric_ids = all_code_change_metrics
+        .iter()
+        .map(|metric| metric.metric_id.clone())
+        .collect::<Vec<_>>();
 
     if payload_mode == SyncPayloadMode::Rollups {
         let label = rollup_mode_label(command);
@@ -3885,6 +3981,7 @@ fn build_sync_batch(
                 .chain(all_rollups.iter())
                 .map(|summary| summary.summary_id.clone())
                 .collect(),
+            code_change_metric_ids: all_code_change_metric_ids,
         };
         let failed_without_resume = state.as_ref().is_some_and(|state| {
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()
@@ -3946,6 +4043,7 @@ fn build_sync_batch(
             summaries,
             task_buckets,
             task_verifications,
+            code_change_metrics,
             authoritative_snapshot,
             created_at,
         },
@@ -3977,6 +4075,13 @@ fn record_rollup_sync_chunk_success(
     batch: &SyncBatch,
 ) -> Result<()> {
     store.record_rollup_chunk_sync_success(sink, target, logical_batch_id, batch)?;
+    store.mark_code_change_metrics_synced(
+        &batch
+            .code_change_metrics
+            .iter()
+            .map(|metric| metric.metric_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
 }
@@ -4003,14 +4108,22 @@ fn record_sync_batch_success(
         &batch.task_buckets,
     )?;
     store.record_task_verifications_synced(sink, target, &batch.task_verifications)?;
+    store.record_code_change_metrics_synced(sink, target, &batch.code_change_metrics)?;
+    store.mark_code_change_metrics_synced(
+        &batch
+            .code_change_metrics
+            .iter()
+            .map(|metric| metric.metric_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
 }
 
 fn maybe_disable_http_hosted_task_sync_payload(
     command: &SyncCommand,
-    target: &str,
     sync_preferences: SyncPreferences,
+    remote: Option<&Value>,
     batch: &mut SyncBatch,
 ) -> Result<bool> {
     if command.sink != "http" {
@@ -4019,7 +4132,7 @@ fn maybe_disable_http_hosted_task_sync_payload(
     if !sync_preferences.include_tasks {
         return Ok(false);
     }
-    if http_remote_hosted_tasks_enabled(command, target)? {
+    if remote.is_none_or(remote_hosted_tasks_enabled) {
         return Ok(true);
     }
     if batch.task_buckets.is_empty() && batch.task_verifications.is_empty() {
@@ -4212,26 +4325,99 @@ fn send_http_rollup_chunk_with_retry_using<F>(chunk: &SyncBatch, send_chunk: &F)
 where
     F: Fn(&SyncBatch) -> Result<()>,
 {
-    match send_chunk(chunk) {
-        Ok(()) => Ok(()),
-        Err(error) if should_retry_http_rollup_chunk_after_error(chunk, &error) => {
-            let smaller_chunks = split_http_rollup_sync_batch_after_budget_error(chunk);
-            if smaller_chunks.len() <= 1 {
-                return Err(error);
+    send_http_rollup_chunk_with_retry_using_sleep(chunk, send_chunk, &std::thread::sleep)
+}
+
+/// Sends one chunk, resending it through transient failures and splitting it
+/// when the endpoint rejects its size.
+///
+/// The two remedies are deliberately separate. A rejected size is a decision
+/// about this batch and is answered by sending less; a transient failure is the
+/// absence of a decision and is answered by sending the same thing again.
+/// Applying either remedy to the other's failure would be wrong: splitting on a
+/// restarted worker multiplies the requests that just failed, and resending an
+/// oversized batch unchanged can only be rejected again.
+///
+/// `sleep` is injected so tests exercise the backoff without waiting through it.
+fn send_http_rollup_chunk_with_retry_using_sleep<F, S>(
+    chunk: &SyncBatch,
+    send_chunk: &F,
+    sleep: &S,
+) -> Result<()>
+where
+    F: Fn(&SyncBatch) -> Result<()>,
+    S: Fn(StdDuration),
+{
+    let mut resends = 0_u32;
+    loop {
+        match send_chunk(chunk) {
+            Ok(()) => return Ok(()),
+            // The endpoint never reached a decision about this batch, so the
+            // batch was neither accepted nor rejected; only the answer was
+            // lost. Ingest records the batch ID and applies the payload in one
+            // transaction, so resending the identical chunk either applies it
+            // exactly once or is acknowledged as a duplicate. Failing here
+            // instead would strand every batch still queued behind this one,
+            // which is how a single restarted worker used to abort a whole
+            // multi-chunk sync.
+            Err(error)
+                if resends < HTTP_ROLLUP_TRANSIENT_RESEND_ATTEMPTS
+                    && is_transient_http_sync_error(&error) =>
+            {
+                let delay = HTTP_ROLLUP_TRANSIENT_RESEND_DELAY * 2_u32.pow(resends);
+                resends += 1;
+                eprintln!(
+                    "http rollup mode: {} did not complete ({error}); resending in {}s ({resends}/{HTTP_ROLLUP_TRANSIENT_RESEND_ATTEMPTS})",
+                    chunk.batch_id,
+                    delay.as_secs(),
+                );
+                sleep(delay);
             }
-            eprintln!(
-                "http rollup mode: {} rejected {}; retrying as {} smaller batches",
-                http_rollup_retry_error_label(&error),
-                chunk.batch_id,
-                smaller_chunks.len()
-            );
-            for smaller_chunk in &smaller_chunks {
-                send_http_rollup_chunk_with_retry_using(smaller_chunk, send_chunk)?;
+            Err(error) if should_retry_http_rollup_chunk_after_error(chunk, &error) => {
+                let smaller_chunks = split_http_rollup_sync_batch_after_budget_error(chunk);
+                if smaller_chunks.len() <= 1 {
+                    return Err(error);
+                }
+                eprintln!(
+                    "http rollup mode: {} rejected {}; retrying as {} smaller batches",
+                    http_rollup_retry_error_label(&error),
+                    chunk.batch_id,
+                    smaller_chunks.len()
+                );
+                for smaller_chunk in &smaller_chunks {
+                    send_http_rollup_chunk_with_retry_using_sleep(
+                        smaller_chunk,
+                        send_chunk,
+                        sleep,
+                    )?;
+                }
+                return Ok(());
             }
-            Ok(())
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
     }
+}
+
+/// Failures that leave a batch's fate unknown rather than deciding it.
+///
+/// Only server-side infrastructure statuses qualify. 429 is deliberately
+/// excluded: the endpoint advertises its own `Retry-After`, which this backoff
+/// cannot see, so resending on our own schedule would work against the limit it
+/// asked for. 501 is excluded because "not implemented" is a decision that
+/// repeating cannot change.
+fn is_transient_http_sync_error(error: &anyhow::Error) -> bool {
+    http_sync_error_status(error).is_some_and(|status| matches!(status, 500 | 502 | 503 | 504))
+}
+
+/// Reads the status of a sync endpoint failure whatever its body looks like.
+///
+/// `parse_http_sync_error` needs a JSON body to find an error code in. The
+/// failures worth resending come from the infrastructure in front of the
+/// worker and answer in plain text, so the status is read on its own here.
+fn http_sync_error_status(error: &anyhow::Error) -> Option<u16> {
+    let message = error.to_string();
+    let rest = message.strip_prefix("sync endpoint returned HTTP ")?;
+    rest.split(':').next()?.trim().parse().ok()
 }
 
 fn should_retry_http_rollup_chunk_after_error(chunk: &SyncBatch, error: &anyhow::Error) -> bool {
@@ -4247,8 +4433,10 @@ fn should_retry_http_rollup_chunk_after_error(chunk: &SyncBatch, error: &anyhow:
         || chunk.subscriptions.len() > 1
         || chunk.task_buckets.len() > 1
         || chunk.task_verifications.len() > 1
+        || chunk.code_change_metrics.len() > 1
         || (!chunk.task_buckets.is_empty() && !chunk.task_verifications.is_empty())
         || (http_rollup_metadata_count(chunk) > 0 && !chunk.summaries.is_empty())
+        || (!chunk.code_change_metrics.is_empty() && has_non_code_change_payload(chunk))
 }
 
 fn http_rollup_retry_error_label(error: &anyhow::Error) -> &'static str {
@@ -4326,6 +4514,7 @@ fn split_authoritative_snapshot(
         source_account_assignment_ids: Vec::new(),
         subscription_ids: Vec::new(),
         summary_ids: Vec::new(),
+        code_change_metric_ids: Vec::new(),
     };
     let mut parts = Vec::new();
     let mut current = empty_part();
@@ -4349,6 +4538,7 @@ fn split_authoritative_snapshot(
     );
     append_ids!(snapshot.subscription_ids, subscription_ids);
     append_ids!(snapshot.summary_ids, summary_ids);
+    append_ids!(snapshot.code_change_metric_ids, code_change_metric_ids);
     if authoritative_snapshot_id_count(&current) > 0 || parts.is_empty() {
         parts.push(current);
     }
@@ -4366,6 +4556,7 @@ fn authoritative_snapshot_id_count(snapshot: &SyncAuthoritativeSnapshot) -> usiz
         + snapshot.source_account_assignment_ids.len()
         + snapshot.subscription_ids.len()
         + snapshot.summary_ids.len()
+        + snapshot.code_change_metric_ids.len()
 }
 
 fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<SyncBatch> {
@@ -4376,9 +4567,11 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
     );
     let has_task_payload = !task_chunks.is_empty();
     let metadata_count = http_rollup_metadata_count(batch);
-    let has_rollup_payload = metadata_count > 0 || !batch.summaries.is_empty();
+    let has_rollup_payload =
+        metadata_count > 0 || !batch.summaries.is_empty() || !batch.code_change_metrics.is_empty();
     if !has_task_payload
         && batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
+        && batch.code_change_metrics.len() <= HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH
         && metadata_count <= HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH
     {
         return fit_http_rollup_batches_to_d1_budget(vec![batch.clone()]);
@@ -4392,13 +4585,22 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
         .len()
         .div_ceil(HTTP_ROLLUP_SUMMARIES_PER_BATCH);
     let metadata_chunks = metadata_count.div_ceil(HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH);
-    let mut chunks = Vec::with_capacity(total_chunks + metadata_chunks + task_chunks.len());
+    let code_change_chunks = batch
+        .code_change_metrics
+        .len()
+        .div_ceil(HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH);
+    let mut chunks =
+        Vec::with_capacity(total_chunks + metadata_chunks + code_change_chunks + task_chunks.len());
 
     chunks.extend(split_http_rollup_metadata_chunks(
         batch,
         HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH,
     ));
     chunks.extend(task_chunks);
+    chunks.extend(split_http_code_change_metric_chunks(
+        batch,
+        HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH,
+    ));
     chunks.extend(split_http_rollup_summary_chunks(
         batch,
         HTTP_ROLLUP_SUMMARIES_PER_BATCH,
@@ -4408,6 +4610,23 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
 }
 
 fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<SyncBatch> {
+    if !batch.code_change_metrics.is_empty() && has_non_code_change_payload(batch) {
+        let mut without_code_changes = batch.clone();
+        without_code_changes.code_change_metrics.clear();
+        let mut chunks =
+            split_http_code_change_metric_chunks(batch, batch.code_change_metrics.len());
+        chunks.extend(split_http_rollup_sync_batch_after_budget_error(
+            &without_code_changes,
+        ));
+        return chunks;
+    }
+    if batch.code_change_metrics.len() > 1 {
+        return split_http_code_change_metric_chunks(
+            batch,
+            batch.code_change_metrics.len().div_ceil(2),
+        );
+    }
+
     if !batch.task_buckets.is_empty() || !batch.task_verifications.is_empty() {
         if !batch.task_buckets.is_empty() && !batch.task_verifications.is_empty() {
             return split_http_rollup_task_chunks(
@@ -4461,8 +4680,15 @@ fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<Syn
     if batch.subscriptions.len() > 1 {
         return split_http_rollup_metadata_chunks(batch, batch.subscriptions.len().div_ceil(2));
     }
-
     vec![batch.clone()]
+}
+
+fn has_non_code_change_payload(batch: &SyncBatch) -> bool {
+    http_rollup_metadata_count(batch) > 0
+        || !batch.events.is_empty()
+        || !batch.summaries.is_empty()
+        || !batch.task_buckets.is_empty()
+        || !batch.task_verifications.is_empty()
 }
 
 fn http_rollup_metadata_count(batch: &SyncBatch) -> usize {
@@ -4506,6 +4732,19 @@ fn split_http_rollup_task_chunks(
             }),
     );
     chunks
+}
+
+fn split_http_code_change_metric_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec<SyncBatch> {
+    batch
+        .code_change_metrics
+        .chunks(chunk_size.max(1))
+        .enumerate()
+        .map(|(index, metrics)| {
+            let mut chunk = empty_http_rollup_chunk(batch, &format!("code_changes_{}", index + 1));
+            chunk.code_change_metrics = metrics.to_vec();
+            chunk
+        })
+        .collect()
 }
 
 fn fit_http_rollup_batches_to_d1_budget(chunks: Vec<SyncBatch>) -> Vec<SyncBatch> {
@@ -4578,6 +4817,18 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     );
     let monthly_rollup_queries = http_rollup_summary_month_count(batch);
     let dashboard_snapshot_queries = usize::from(!batch.summaries.is_empty());
+    // The backend batches metrics into one json_each upsert and one ownership
+    // statement regardless of metric count.
+    let code_change_metric_queries = usize::from(!batch.code_change_metrics.is_empty()) * 2;
+    let code_change_owner_metadata_refresh_queries = usize::from(
+        batch.schema_version == SYNC_BATCH_SCHEMA_VERSION
+            && batch
+                .authoritative_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.part_index.saturating_add(1) == snapshot.part_count
+                }),
+    );
 
     authenticated_device_queries
         + existing_batch_lookup_queries
@@ -4590,6 +4841,8 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
         + daily_rollup_write_queries
         + monthly_rollup_queries
         + dashboard_snapshot_queries
+        + code_change_metric_queries
+        + code_change_owner_metadata_refresh_queries
         + estimate_http_rollup_task_queries(batch)
         + final_sync_bookkeeping_queries
 }
@@ -4960,6 +5213,7 @@ fn split_http_rollup_summary_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec
             chunk.summaries = summaries.to_vec();
             chunk.task_buckets.clear();
             chunk.task_verifications.clear();
+            chunk.code_change_metrics.clear();
             chunk.authoritative_snapshot = None;
             chunk
         })
@@ -4977,6 +5231,7 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
     chunk.summaries.clear();
     chunk.task_buckets.clear();
     chunk.task_verifications.clear();
+    chunk.code_change_metrics.clear();
     chunk.authoritative_snapshot = None;
     chunk
 }
@@ -5170,10 +5425,15 @@ fn http_sync_endpoint(command: &SyncCommand) -> Result<String> {
     {
         return Ok(endpoint.to_string());
     }
-    Ok(format!(
+    Ok(hosted_http_sync_endpoint())
+}
+
+/// Batch endpoint of the hosted deployment this build is configured against.
+fn hosted_http_sync_endpoint() -> String {
+    format!(
         "{}/api/sync/batches",
         auth::cloudflare_api_url().trim_end_matches('/')
-    ))
+    )
 }
 
 fn resolve_http_auth_token(command: &SyncCommand, required: bool) -> Result<Option<String>> {
@@ -5268,6 +5528,30 @@ struct TaskVerificationFeedResponse {
     next_cursor: Option<TaskVerificationCursor>,
 }
 
+#[derive(Debug)]
+struct HttpSyncPreflight {
+    auth_token: Option<String>,
+    remote: Option<Value>,
+}
+
+fn load_http_sync_preflight(command: &SyncCommand, endpoint: &str) -> Result<HttpSyncPreflight> {
+    // The hosted endpoint authenticates every route, and its preflight status
+    // is what drives remote-drift detection and committed-metric blinding.
+    // Without a token both would be skipped silently and the run would fail
+    // later on a bare 401, so the missing login is reported here instead. A
+    // self-hosted endpoint may accept unauthenticated batches.
+    let auth_token = resolve_http_auth_token(
+        command,
+        http_endpoint_requires_authentication(endpoint, &hosted_http_sync_endpoint()),
+    )?;
+    let remote = auth_token
+        .as_deref()
+        .map(|token| http_remote_preflight_status(endpoint, token))
+        .transpose()?
+        .flatten();
+    Ok(HttpSyncPreflight { auth_token, remote })
+}
+
 fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
     validate_authenticated_http_endpoint(endpoint)?;
     let url = http_verify_status_url(endpoint)?;
@@ -5280,14 +5564,17 @@ fn http_remote_verify(endpoint: &str, auth_token: &str) -> Result<Value> {
     }
 }
 
-fn http_remote_preflight_status(endpoint: &str, auth_token: &str) -> Result<Value> {
+fn http_remote_preflight_status(endpoint: &str, auth_token: &str) -> Result<Option<Value>> {
     validate_authenticated_http_endpoint(endpoint)?;
-    let url = http_preflight_status_url(endpoint)?;
+    let Some(url) = http_preflight_status_url(endpoint) else {
+        return Ok(None);
+    };
     let request = ureq::get(&url)
         .timeout(HTTP_REQUEST_TIMEOUT)
         .set("Authorization", &format!("Bearer {auth_token}"));
     match request.call() {
-        Ok(response) => http_response_json(response, "load sync preflight status"),
+        Ok(response) => http_response_json(response, "load sync preflight status").map(Some),
+        Err(ureq::Error::Status(code, _)) if optional_http_sync_preflight_status(code) => Ok(None),
         Err(error) => Err(http_request_error("load sync preflight status", error)),
     }
 }
@@ -5320,15 +5607,22 @@ fn http_verify_status_url(endpoint: &str) -> Result<String> {
     )
 }
 
-fn http_preflight_status_url(endpoint: &str) -> Result<String> {
+/// Whether an endpoint is this build's hosted deployment, which authenticates
+/// every route it exposes.
+///
+/// Identity is compared against the configured hosted endpoint rather than
+/// inferred from the route shape: a self-hosted deployment serves the same
+/// `/api/sync/batches` path and may legitimately accept unauthenticated
+/// batches, so requiring a device login from it would break a supported setup.
+fn http_endpoint_requires_authentication(endpoint: &str, hosted_endpoint: &str) -> bool {
+    endpoint.trim().trim_end_matches('/') == hosted_endpoint.trim().trim_end_matches('/')
+}
+
+fn http_preflight_status_url(endpoint: &str) -> Option<String> {
     let endpoint = endpoint.trim_end_matches('/');
-    if let Some(prefix) = endpoint.strip_suffix("/api/sync/batches") {
-        return Ok(format!("{prefix}/api/sync/status?view=preflight"));
-    }
-    bail!(
-        "http preflight expects a Cloudflare sync endpoint ending in /api/sync/batches; got {}",
-        endpoint
-    )
+    endpoint
+        .strip_suffix("/api/sync/batches")
+        .map(|prefix| format!("{prefix}/api/sync/status?view=preflight"))
 }
 
 fn http_reset_url(endpoint: &str) -> Result<String> {
@@ -5360,33 +5654,48 @@ fn http_request_error(action: &str, error: ureq::Error) -> anyhow::Error {
     }
 }
 
-fn http_remote_hosted_tasks_enabled(command: &SyncCommand, endpoint: &str) -> Result<bool> {
-    let Some(preflight_url) = http_preflight_status_url(endpoint).ok() else {
-        return Ok(true);
-    };
-    let Some(auth_token) = resolve_http_auth_token(command, false)? else {
-        return Ok(true);
-    };
-    validate_authenticated_http_endpoint(endpoint)?;
-    let request = ureq::get(&preflight_url)
-        .timeout(HTTP_REQUEST_TIMEOUT)
-        .set("Authorization", &format!("Bearer {auth_token}"));
-    let response = match request.call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(code, _)) if optional_http_sync_preflight_status(code) => {
-            return Ok(true);
-        }
-        Err(error) => return Err(http_request_error("load sync preflight status", error)),
-    };
-    let remote = http_response_json(response, "load sync preflight status")?;
-    Ok(remote_hosted_tasks_enabled(&remote))
-}
-
 fn remote_hosted_tasks_enabled(remote: &Value) -> bool {
     remote
         .pointer("/capabilities/hostedTasks")
         .and_then(Value::as_bool)
         .unwrap_or(true)
+}
+
+/// Warns when committed code-change metrics cannot deduplicate across devices.
+///
+/// Without the user-scoped identity key from the HTTP preflight, each device
+/// mints its own opaque ID for the same commit, so a shared backend would count
+/// that commit once per device.
+fn code_change_dedup_warning(
+    sink: &str,
+    has_identity_key: bool,
+    metrics: &[statsai_core::CodeChangeMetric],
+) -> Option<&'static str> {
+    if sink != "http" || has_identity_key {
+        return None;
+    }
+    metrics
+        .iter()
+        .any(|metric| metric.kind == statsai_core::CodeChangeMetricKind::Committed)
+        .then_some(
+            "warning: this sync endpoint did not provide a code-change identity key; \
+             committed code-change metrics cannot be deduplicated across your devices",
+        )
+}
+
+fn remote_code_change_identity_key(remote: &Value) -> Result<Option<[u8; 32]>> {
+    let Some(value) = remote.pointer("/capabilities/codeChangeIdentityKey") else {
+        return Ok(None);
+    };
+    let encoded = value
+        .as_str()
+        .context("sync preflight returned a non-string code-change identity key")?;
+    let decoded = hex::decode(encoded)
+        .context("sync preflight returned an invalid code-change identity key")?;
+    let key = decoded.try_into().map_err(|_| {
+        anyhow::anyhow!("sync preflight returned a code-change identity key with invalid length")
+    })?;
+    Ok(Some(key))
 }
 
 fn optional_http_sync_preflight_status(status: u16) -> bool {
@@ -5440,6 +5749,7 @@ fn strip_one_http_rollup_batch_suffix(batch_id: &str) -> String {
         "_subscriptions_",
         "_task_buckets_",
         "_task_verifications_",
+        "_code_changes_",
         "_snapshot_",
     ] {
         if let Some(index) = batch_id.rfind(marker) {
@@ -5573,13 +5883,13 @@ fn daemon(command: DaemonCommand, store: Store, device_id: &str) -> Result<()> {
     }
 }
 
-fn conversation(command: ConversationCommand, store: &Store) -> Result<()> {
+fn conversation(command: ConversationCommand, store: &Store, device_id: &str) -> Result<()> {
     match command.command {
         ConversationSubcommand::Collect {
             provider,
             no_cache,
             verbose,
-        } => collect_conversations(store, provider.as_deref(), no_cache, verbose),
+        } => collect_conversations(store, device_id, provider.as_deref(), no_cache, verbose),
         ConversationSubcommand::List {
             provider,
             limit,
@@ -5689,6 +5999,7 @@ fn conversation(command: ConversationCommand, store: &Store) -> Result<()> {
 
 fn collect_conversations(
     store: &Store,
+    device_id: &str,
     provider_filter: Option<&str>,
     no_cache: bool,
     verbose: bool,
@@ -5709,6 +6020,24 @@ fn collect_conversations(
         for source in scan_sources_for_adapter(adapter.as_ref(), &configured_sources) {
             let candidates = adapter.archive_scan_candidates(&source)?;
             let entries = scan_file_state_entries(&candidates);
+            // An empty candidate list from an unreachable root — an unmounted
+            // volume, a renamed home directory, a `--source` pointing somewhere
+            // absent — is not evidence that the archive was emptied.
+            // Reconciling it would delete every imported conversation, trace
+            // edit, and artifact dependency for the source and retire the
+            // derived metrics remotely, so it is reported instead of erased.
+            if entries.is_empty() && !adapter.archive_root_available(&source) {
+                let imported = store.archive_import_entry_count(&source.source_id)?;
+                if imported > 0 {
+                    eprintln!(
+                        "{} {}: archive root is unavailable while {imported} imported file(s) are on record; keeping them and skipping this source",
+                        adapter.provider(),
+                        preview_path_label(&source),
+                    );
+                }
+                continue;
+            }
+            store.reconcile_archive_import_entries(&source.source_id, &entries)?;
             let pending = if no_cache {
                 entries
             } else {
@@ -5764,6 +6093,17 @@ fn collect_conversations(
         total_binary_bytes,
         total_missing,
     );
+    let code_changes = store.refresh_code_changes(device_id)?;
+    println!(
+        "code changes: trace_edits={} repositories={} commits={} trace_matched={} metrics={} trace_coverage={:?} git_coverage={:?}",
+        code_changes.trace_edits,
+        code_changes.repositories,
+        code_changes.commits,
+        code_changes.matches,
+        code_changes.metrics,
+        code_changes.trace_coverage,
+        code_changes.git_coverage,
+    );
     Ok(())
 }
 
@@ -5818,11 +6158,13 @@ fn collect_archive_source_entries(
         let scan = adapter.collect_archive(source, Some(&selected))?;
         let collect_elapsed = collect_started.elapsed();
         let store_started = Instant::now();
-        let write = store.store_archive_scan(
+        let write = store.store_archive_scan_with_code_changes(
             &source.source_id,
             &scan.conversations,
             std::slice::from_ref(entry),
             &scan.artifact_dependencies,
+            &scan.trace_edits,
+            scan.trace_coverage,
         )?;
         let store_elapsed = store_started.elapsed();
         collected.files += scan.diagnostics.files_scanned;
@@ -11110,6 +11452,7 @@ mod tests {
                 },
             },
             &store,
+            "device",
         )
         .expect("disable mode");
 
@@ -11197,6 +11540,95 @@ mod tests {
     }
 
     #[test]
+    fn source_remove_delete_data_retires_committed_metrics_without_any_traces() {
+        let repository = tempfile::TempDir::new().expect("temporary repository");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .status()
+                .expect("run git");
+            assert!(status.success());
+        }
+        std::fs::write(repository.path().join("main.rs"), "fn main() {}\n").expect("write source");
+        for args in [&["add", "main.rs"][..], &["commit", "-qm", "initial"]] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .status()
+                .expect("run git");
+            assert!(status.success());
+        }
+
+        let store = Store::in_memory().expect("store");
+        let committed_source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-committed-only"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&committed_source).expect("source");
+
+        // Usage carries the project path, which is how committed churn is
+        // discovered. This source has no archive and therefore no reconstructed
+        // edits at all.
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 10, 0, 0)
+            .single()
+            .expect("now");
+        let mut summary = test_summary("codex", &committed_source, now, 100, None);
+        summary.project = Some(ProjectInfo {
+            project_id: "project-committed-only".to_string(),
+            project_label: None,
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: None,
+            path_label: Some(repository.path().to_string_lossy().to_string()),
+        });
+        store.upsert_summaries(&[summary]).expect("summary");
+
+        store
+            .refresh_code_changes("device")
+            .expect("measure committed churn");
+        assert!(store.list_trace_edits().expect("traces").is_empty());
+        assert_eq!(
+            store
+                .list_code_change_metrics(false)
+                .expect("metrics before")
+                .len(),
+            1
+        );
+
+        // Removing the source deletes the usage that carried the project path,
+        // so nothing references the repository any more. Rebuilding only when
+        // traces were dropped left these metrics materialized and the
+        // authoritative snapshot republishing them.
+        source(
+            SourceCommand {
+                command: SourceSubcommand::Remove {
+                    source_id: committed_source.source_id.0.clone(),
+                    delete_data: true,
+                },
+            },
+            &store,
+            "device",
+        )
+        .expect("remove source");
+
+        assert!(store
+            .list_code_change_metrics(false)
+            .expect("metrics after")
+            .is_empty());
+    }
+
+    #[test]
     fn source_remove_delete_data_clears_task_spans_and_rebuilds_surviving_work_items() {
         let store = Store::in_memory().expect("store");
         let source_a = SourceLocation::local_adapter(
@@ -11268,6 +11700,82 @@ mod tests {
         assert_eq!(store.task_spans().expect("task spans before").len(), 2);
         assert_eq!(store.work_items().expect("work items before").len(), 2);
 
+        // Distinct days so each source contributes its own daily metric rather
+        // than merging into one aggregate row.
+        for (source_location, path, occurred_at) in [
+            (
+                &source_a,
+                "/tmp/codex-source-remove-a/session.jsonl",
+                started_at_a,
+            ),
+            (
+                &source_b,
+                "/tmp/codex-source-remove-b/session.jsonl",
+                started_at_b,
+            ),
+        ] {
+            let native_id = format!("thread-{}", source_location.source_id.0);
+            let conversation_id = statsai_core::archive_conversation_id("codex", &native_id);
+            let context = statsai_core::TraceEditContext {
+                provider: "codex",
+                source_id: &source_location.source_id,
+                cache_key: path,
+                conversation_id: &conversation_id,
+                source_record_id: &format!("{path}:1"),
+                occurred_at: Some(occurred_at),
+                project: None,
+                repository_path: None,
+            };
+            let edits = statsai_core::parse_full_file_write(
+                &context,
+                Path::new("src/lib.rs"),
+                "one\ntwo\n",
+                true,
+            )
+            .edits;
+            store
+                .store_archive_scan_with_code_changes(
+                    &source_location.source_id,
+                    &[statsai_core::ArchiveConversation {
+                        schema_version: statsai_core::ARCHIVE_CONVERSATION_SCHEMA_VERSION
+                            .to_string(),
+                        conversation_id,
+                        provider: "codex".to_string(),
+                        source_id: source_location.source_id.clone(),
+                        native_conversation_id: native_id,
+                        title: None,
+                        project: None,
+                        started_at: Some(occurred_at),
+                        updated_at: Some(occurred_at),
+                        completeness: statsai_core::ArchiveCompleteness::Complete,
+                        missing_content_count: 0,
+                        missing_content_scope_id: None,
+                        discarded_source_record_ids: Vec::new(),
+                        superseded_conversation_ids: Vec::new(),
+                        items: Vec::new(),
+                    }],
+                    &[statsai_store::ScanFileStateEntry {
+                        cache_key: path.to_string(),
+                        cache_signature: "signature".to_string(),
+                    }],
+                    &[],
+                    &edits,
+                    statsai_core::CoverageStatus::Complete,
+                )
+                .expect("seed trace edits");
+        }
+        store
+            .refresh_code_changes("device")
+            .expect("build code-change metrics");
+        assert_eq!(store.list_trace_edits().expect("traces before").len(), 2);
+        assert_eq!(
+            store
+                .list_code_change_metrics(false)
+                .expect("metrics before")
+                .len(),
+            2
+        );
+
         source(
             SourceCommand {
                 command: SourceSubcommand::Remove {
@@ -11276,6 +11784,7 @@ mod tests {
                 },
             },
             &store,
+            "device",
         )
         .expect("remove source");
 
@@ -11297,6 +11806,40 @@ mod tests {
         assert_eq!(work_items.len(), 1);
         assert_eq!(work_items[0].anchor_span_id, span_b.span_id);
         assert_eq!(work_items[0].total_tokens, 120);
+
+        // The deleted source's reconstructed edits are gone, and the metrics
+        // built from them are rebuilt now so the authoritative snapshot stops
+        // republishing them.
+        let traces = store.list_trace_edits().expect("traces after");
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].source_id, source_b.source_id);
+        // The import state goes with them, so re-adding the source imports
+        // again rather than believing its files were already read.
+        assert_eq!(
+            store
+                .archive_import_entry_count(&source_a.source_id)
+                .expect("retired import state"),
+            0
+        );
+        assert_eq!(
+            store
+                .archive_import_entry_count(&source_b.source_id)
+                .expect("surviving import state"),
+            1
+        );
+        // Deleting a source's data includes the archived copy of it.
+        let conversations = store
+            .list_archive_conversations(None, 10)
+            .expect("remaining conversations");
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].source_id, source_b.source_id.0);
+        assert_eq!(
+            store
+                .list_code_change_metrics(false)
+                .expect("metrics after")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -12478,6 +13021,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            code_change_metrics: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -12525,6 +13069,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            code_change_metrics: Vec::new(),
             authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
                 source_ids: vec![source.source_id.clone()],
                 ..SyncAuthoritativeSnapshot::default()
@@ -12575,6 +13120,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            code_change_metrics: Vec::new(),
             authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
                 summary_ids,
                 ..SyncAuthoritativeSnapshot::default()
@@ -12693,6 +13239,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            code_change_metrics: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -12759,6 +13306,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            code_change_metrics: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -12850,6 +13398,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            code_change_metrics: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -13205,6 +13754,7 @@ mod tests {
             summaries: vec![],
             task_buckets: vec![],
             task_verifications: vec![],
+            code_change_metrics: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -13234,6 +13784,125 @@ mod tests {
         assert!(chunks.iter().all(|chunk| chunk.events.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.sources.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.accounts.is_empty()));
+    }
+
+    #[test]
+    fn http_rollup_chunk_is_resent_after_a_transient_endpoint_failure() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+        let attempts = std::cell::Cell::new(0_usize);
+        // A restarted worker answers with a plain-text body, so the decision to
+        // resend cannot depend on parsing an error code out of JSON.
+        let send = |_: &SyncBatch| -> Result<()> {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(anyhow::anyhow!(
+                    "sync endpoint returned HTTP 503: Your worker restarted mid-request. \
+                     Please try sending the request again. Only GET or HEAD requests are \
+                     retried automatically."
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let delays = std::cell::RefCell::new(Vec::new());
+        send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|delay| {
+            delays.borrow_mut().push(delay)
+        })
+        .expect("transient failure is resent rather than aborting the run");
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(delays.into_inner(), vec![StdDuration::from_secs(1)]);
+    }
+
+    #[test]
+    fn http_rollup_chunk_stops_resending_a_transient_failure_that_never_clears() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+        let attempts = std::cell::Cell::new(0_usize);
+        let send = |_: &SyncBatch| -> Result<()> {
+            attempts.set(attempts.get() + 1);
+            Err(anyhow::anyhow!(
+                "sync endpoint returned HTTP 502: Bad gateway"
+            ))
+        };
+
+        let delays = std::cell::RefCell::new(Vec::new());
+        let error = send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|delay| {
+            delays.borrow_mut().push(delay)
+        })
+        .expect_err("an endpoint that never recovers still fails the run");
+
+        // The original failure is reported rather than a retry-shaped summary of
+        // it, and the run gives up instead of resending forever.
+        assert!(error.to_string().contains("502"));
+        assert_eq!(attempts.get(), 4);
+        // Each attempt waits twice as long as the one before it.
+        assert_eq!(
+            delays.into_inner(),
+            vec![
+                StdDuration::from_secs(1),
+                StdDuration::from_secs(2),
+                StdDuration::from_secs(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn http_rollup_chunk_does_not_resend_a_decided_rejection() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_task_only_sync_batch(now, 1, 1);
+        let attempts = std::cell::Cell::new(0_usize);
+        // The endpoint decided about this batch. Sending it again could only be
+        // rejected the same way, and a conflict repeated on a schedule is worse
+        // than one reported immediately.
+        let send = |_: &SyncBatch| -> Result<()> {
+            attempts.set(attempts.get() + 1);
+            Err(anyhow::anyhow!(
+                r#"sync endpoint returned HTTP 409: {{"error":"batch_id_payload_conflict"}}"#
+            ))
+        };
+
+        let error = send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|_| {
+            panic!("a decided rejection must not wait to be resent")
+        })
+        .expect_err("conflict is reported");
+
+        assert!(error.to_string().contains("batch_id_payload_conflict"));
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn http_rollup_rate_limit_is_left_to_the_endpoints_own_retry_after() {
+        // 429 carries a `Retry-After` this backoff cannot read, so resending on
+        // our own schedule would ignore the delay the endpoint asked for.
+        assert!(!is_transient_http_sync_error(&anyhow::anyhow!(
+            r#"sync endpoint returned HTTP 429: {{"error":"sync_write_user"}}"#
+        )));
+        assert!(is_transient_http_sync_error(&anyhow::anyhow!(
+            "sync endpoint returned HTTP 503: Your worker restarted mid-request."
+        )));
+        // A body that is not JSON at all must still yield its status.
+        assert_eq!(
+            http_sync_error_status(&anyhow::anyhow!(
+                "sync endpoint returned HTTP 504: Gateway timeout"
+            )),
+            Some(504)
+        );
+        // Anything that is not a sync endpoint failure has no status to read.
+        assert_eq!(
+            http_sync_error_status(&anyhow::anyhow!("connection reset by peer")),
+            None
+        );
     }
 
     #[test]
@@ -13271,6 +13940,75 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|chunk| { chunk.task_buckets.is_empty() || chunk.task_verifications.is_empty() }));
+    }
+
+    #[test]
+    fn http_rollup_retry_preserves_metrics_when_splitting_mixed_payloads() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let mut batch = test_task_only_sync_batch(now, 1, 1);
+        batch.code_change_metrics = vec![test_code_change_metric(0, now)];
+
+        assert!(should_retry_http_rollup_chunk_after_error(
+            &batch,
+            &anyhow::anyhow!(
+                r#"sync endpoint returned HTTP 413: {{"error":"sync_batch_too_large"}}"#
+            ),
+        ));
+
+        let chunks = split_http_rollup_sync_batch_after_budget_error(&batch);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.code_change_metrics.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.task_buckets.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.task_verifications.len())
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn http_rollup_retry_splits_code_change_only_payloads() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let mut batch = test_task_only_sync_batch(now, 0, 0);
+        batch.code_change_metrics = (0..3)
+            .map(|index| test_code_change_metric(index, now))
+            .collect();
+
+        assert!(should_retry_http_rollup_chunk_after_error(
+            &batch,
+            &anyhow::anyhow!(
+                r#"sync endpoint returned HTTP 413: {{"error":"sync_batch_d1_query_budget_exceeded"}}"#
+            ),
+        ));
+
+        let chunks = split_http_rollup_sync_batch_after_budget_error(&batch);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.code_change_metrics.len())
+                .sum::<usize>(),
+            3
+        );
     }
 
     #[test]
@@ -13361,6 +14099,7 @@ mod tests {
             summaries: vec![],
             task_buckets: test_task_only_sync_batch(now, 1, 0).task_buckets,
             task_verifications: vec![],
+            code_change_metrics: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -13444,6 +14183,7 @@ mod tests {
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
+            code_change_metrics: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -13469,6 +14209,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![7, 6, 6, 6]
         );
+    }
+
+    #[test]
+    fn code_change_metric_d1_estimate_matches_batched_backend_writes() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let mut one_metric = test_task_only_sync_batch(now, 0, 0);
+        one_metric.code_change_metrics = vec![test_code_change_metric(0, now)];
+        let mut many_metrics = one_metric.clone();
+        many_metrics.code_change_metrics = (0..10_000)
+            .map(|index| test_code_change_metric(index, now))
+            .collect();
+
+        assert_eq!(estimate_http_rollup_d1_queries(&one_metric), 7);
+        assert_eq!(
+            estimate_http_rollup_d1_queries(&many_metrics),
+            estimate_http_rollup_d1_queries(&one_metric)
+        );
+    }
+
+    #[test]
+    fn code_change_metrics_use_the_backends_batched_collection_limit() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let mut batch = test_task_only_sync_batch(now, 0, 0);
+        batch.code_change_metrics = (0..1_000)
+            .map(|index| test_code_change_metric(index, now))
+            .collect();
+
+        let chunks = split_http_rollup_sync_batches_without_snapshot(&batch);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].code_change_metrics.len(), 1_000);
     }
 
     #[test]
@@ -13507,6 +14284,7 @@ mod tests {
             summaries: vec![summary],
             task_buckets: vec![],
             task_verifications: vec![],
+            code_change_metrics: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -13653,8 +14431,26 @@ mod tests {
             summaries: Vec::new(),
             task_buckets,
             task_verifications,
+            code_change_metrics: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
+        }
+    }
+
+    fn test_code_change_metric(index: usize, now: DateTime<Utc>) -> statsai_core::CodeChangeMetric {
+        statsai_core::CodeChangeMetric {
+            schema_version: statsai_core::CODE_CHANGE_METRIC_SCHEMA_VERSION.to_string(),
+            metric_id: format!("metric-retry-{index}"),
+            device_id: "device".to_string(),
+            day: now.date_naive(),
+            project_id: None,
+            repository_hash: None,
+            commit_hash: None,
+            kind: statsai_core::CodeChangeMetricKind::AgentEdit,
+            counts: statsai_core::CodeLineCounts::default(),
+            attribution_confidence: None,
+            trace_coverage: statsai_core::CoverageStatus::Complete,
+            git_coverage: statsai_core::CoverageStatus::Complete,
         }
     }
 
@@ -13788,6 +14584,7 @@ mod tests {
                 spans,
             }],
             task_verifications: Vec::new(),
+            code_change_metrics: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         }
@@ -13945,6 +14742,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets,
             task_verifications: Vec::new(),
+            code_change_metrics: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         }
@@ -14056,6 +14854,10 @@ mod tests {
         );
         assert_eq!(
             logical_http_rollup_batch_id("batch_1_part_3_of_9_task_verifications_4"),
+            "batch_1"
+        );
+        assert_eq!(
+            logical_http_rollup_batch_id("batch_1_code_changes_3"),
             "batch_1"
         );
         assert_eq!(logical_http_rollup_batch_id("batch_1"), "batch_1");
@@ -14318,6 +15120,41 @@ mod tests {
     }
 
     #[test]
+    fn only_the_configured_hosted_endpoint_requires_a_device_login() {
+        let hosted = "https://api.example.com/api/sync/batches";
+        assert!(http_endpoint_requires_authentication(hosted, hosted));
+        assert!(http_endpoint_requires_authentication(
+            "https://api.example.com/api/sync/batches/",
+            hosted
+        ));
+        // A self-hosted deployment serves the same route and may accept
+        // unauthenticated batches, so the path shape must not imply a login.
+        assert!(!http_endpoint_requires_authentication(
+            "https://sync.example.com/api/sync/batches",
+            hosted
+        ));
+        assert!(!http_endpoint_requires_authentication(
+            "https://sync.example.com/custom/batch-ingest",
+            hosted
+        ));
+    }
+
+    #[test]
+    fn custom_http_endpoint_skips_optional_remote_preflight() {
+        let command = SyncCommand {
+            auth_token: Some("token".to_string()),
+            ..test_sync_command("http")
+        };
+
+        let preflight =
+            load_http_sync_preflight(&command, "https://sync.example.com/custom/batch-ingest")
+                .expect("custom endpoint preflight");
+
+        assert_eq!(preflight.auth_token.as_deref(), Some("token"));
+        assert!(preflight.remote.is_none());
+    }
+
+    #[test]
     fn remote_hosted_tasks_enabled_defaults_true_when_capability_missing() {
         assert!(remote_hosted_tasks_enabled(&json!({
             "device": {
@@ -14333,6 +15170,62 @@ mod tests {
                 "hostedTasks": false
             }
         })));
+    }
+
+    #[test]
+    fn remote_code_change_identity_key_reads_account_scoped_blinding_key() {
+        let encoded = "ab".repeat(32);
+        assert_eq!(
+            remote_code_change_identity_key(&json!({
+                "capabilities": {
+                    "codeChangeIdentityKey": encoded
+                }
+            }))
+            .expect("identity key"),
+            Some([0xab; 32])
+        );
+        assert_eq!(
+            remote_code_change_identity_key(&json!({ "capabilities": {} }))
+                .expect("missing identity key"),
+            None
+        );
+    }
+
+    #[test]
+    fn code_change_dedup_warning_covers_only_unblinded_http_commit_uploads() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let agent_edit = test_code_change_metric(0, now);
+        let mut committed = test_code_change_metric(1, now);
+        committed.kind = statsai_core::CodeChangeMetricKind::Committed;
+
+        assert!(
+            code_change_dedup_warning("http", false, std::slice::from_ref(&committed)).is_some()
+        );
+        assert!(
+            code_change_dedup_warning("http", true, std::slice::from_ref(&committed)).is_none()
+        );
+        assert!(
+            code_change_dedup_warning("file", false, std::slice::from_ref(&committed)).is_none()
+        );
+        assert!(
+            code_change_dedup_warning("http", false, std::slice::from_ref(&agent_edit)).is_none()
+        );
+        assert!(code_change_dedup_warning("http", false, &[]).is_none());
+    }
+
+    #[test]
+    fn remote_code_change_identity_key_rejects_malformed_keys() {
+        for value in [json!("not-hex"), json!("ab"), json!(42)] {
+            assert!(remote_code_change_identity_key(&json!({
+                "capabilities": {
+                    "codeChangeIdentityKey": value
+                }
+            }))
+            .is_err());
+        }
     }
 
     #[test]
@@ -14358,7 +15251,6 @@ mod tests {
 
         for result in [
             http_remote_verify(endpoint, "token"),
-            http_remote_preflight_status(endpoint, "token"),
             http_remote_reset(endpoint, "token"),
         ] {
             let error = result.expect_err("remote plaintext must fail");
@@ -14369,7 +15261,7 @@ mod tests {
             auth_token: Some("token".to_string()),
             ..test_sync_command("http")
         };
-        let error = http_remote_hosted_tasks_enabled(&command, endpoint)
+        let error = load_http_sync_preflight(&command, endpoint)
             .expect_err("remote plaintext preflight must fail");
         assert!(error.to_string().contains("requires HTTPS"));
     }
@@ -16642,6 +17534,7 @@ mod tests {
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            code_change_metrics: Vec::new(),
             authoritative_snapshot: None,
             created_at: Utc
                 .with_ymd_and_hms(2026, 6, 14, 13, 0, 0)
@@ -17174,6 +18067,134 @@ mod tests {
         assert!(synced_span.source_record_id.is_none());
         assert!(synced_span.session_id.is_none());
         assert!(synced_span.thread_id.is_none());
+    }
+
+    #[test]
+    fn code_change_metric_project_ids_follow_sync_project_preferences() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 7, 12, 0, 0)
+            .single()
+            .expect("now");
+        let mut seed_batch = test_task_only_sync_batch(now, 0, 0);
+        let mut metric = test_code_change_metric(0, now);
+        metric.project_id = Some("project-private".to_string());
+        metric.repository_hash = Some("repository-private".to_string());
+        seed_batch.code_change_metrics.push(metric);
+        store
+            .ingest_sync_batch(&seed_batch)
+            .expect("seed code-change metric");
+
+        let default_command = SyncCommand {
+            dry_run: true,
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&default_command).expect("target");
+        let (default_batch, _) =
+            build_sync_batch(&default_command, &store, "device", &target).expect("default batch");
+        assert_eq!(default_batch.code_change_metrics.len(), 1);
+        assert!(default_batch.code_change_metrics[0].project_id.is_none());
+        assert!(default_batch.code_change_metrics[0]
+            .repository_hash
+            .is_none());
+
+        store
+            .record_code_change_metrics_synced("http", &target, &default_batch.code_change_metrics)
+            .expect("record sanitized metric");
+        store
+            .record_sync_success("http", &target, "batch_metric_default", &[], &[], None)
+            .expect("record sync state");
+        let (unchanged_batch, _) =
+            build_sync_batch(&default_command, &store, "device", &target).expect("unchanged batch");
+        assert!(unchanged_batch.code_change_metrics.is_empty());
+
+        let include_command = SyncCommand {
+            include_projects: true,
+            dry_run: true,
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let (included_batch, _) =
+            build_sync_batch(&include_command, &store, "device", &target).expect("included batch");
+        assert_eq!(
+            included_batch.code_change_metrics[0].project_id.as_deref(),
+            Some("project-private")
+        );
+        assert!(included_batch.code_change_metrics[0]
+            .repository_hash
+            .is_some());
+
+        store
+            .set_sync_preferences(SyncPreferences {
+                include_projects: true,
+                include_tasks: false,
+            })
+            .expect("persist project opt-in");
+        let exclude_command = SyncCommand {
+            exclude_projects: true,
+            full: true,
+            dry_run: true,
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let (excluded_batch, _) =
+            build_sync_batch(&exclude_command, &store, "device", &target).expect("excluded batch");
+        assert_eq!(excluded_batch.code_change_metrics.len(), 1);
+        assert!(excluded_batch.code_change_metrics[0].project_id.is_none());
+        assert!(excluded_batch.code_change_metrics[0]
+            .repository_hash
+            .is_none());
+    }
+
+    #[test]
+    fn code_change_metric_sync_sanitization_removes_raw_commit_hash() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 7, 12, 0, 0)
+            .single()
+            .expect("now");
+        let mut metric = test_code_change_metric(0, now);
+        metric.commit_hash = Some("0123456789abcdef-public-commit".to_string());
+
+        let sanitized = sanitize_code_change_metric_for_sync(metric, true);
+
+        assert!(sanitized.commit_hash.is_none());
+    }
+
+    #[test]
+    fn code_change_sync_excludes_metrics_owned_by_peer_devices() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 7, 12, 0, 0)
+            .single()
+            .expect("now");
+        let mut seed_batch = test_task_only_sync_batch(now, 0, 0);
+        let mut local_metric = test_code_change_metric(0, now);
+        local_metric.device_id = "local-device".to_string();
+        let mut peer_metric = test_code_change_metric(1, now);
+        peer_metric.device_id = "peer-device".to_string();
+        seed_batch.code_change_metrics = vec![local_metric.clone(), peer_metric];
+        store
+            .ingest_sync_batch(&seed_batch)
+            .expect("seed code-change metrics");
+        let command = SyncCommand {
+            dry_run: true,
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+
+        let (batch, _) = build_sync_batch(&command, &store, "local-device", &target)
+            .expect("build local sync batch");
+
+        assert_eq!(batch.code_change_metrics, vec![local_metric.clone()]);
+        assert_eq!(
+            batch
+                .authoritative_snapshot
+                .expect("authoritative snapshot")
+                .code_change_metric_ids,
+            vec![local_metric.metric_id]
+        );
     }
 
     #[test]

@@ -1,3 +1,5 @@
+mod mutations;
+
 use super::{
     canonical_display, codex_project_context_from_value, codex_usage_roots, collect_jsonl_files,
     expand_home_path, grok_sessions_root, model_from_nested_value, open_sqlite_readonly,
@@ -8,14 +10,19 @@ use super::{
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Utc};
+use mutations::{
+    finish_original_mutation, mark_unresolved_mutations, record_unmeasurable_mutation,
+    remember_original_mutation, MutationCompletion, MutationInvocation,
+};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use serde_json::Value;
 use statsai_core::{
     archive_artifact_metadata_signature, archive_content_id, archive_conversation_id,
     archive_item_id, hash_text, ArchiveArtifactDependency, ArchiveCompleteness, ArchiveContentKind,
-    ArchiveContentPart, ArchiveConversation, ArchiveItem, ArchiveItemKind, ArchiveRole, ModelInfo,
-    ProjectInfo, SourceLocation, UsageCounts, ARCHIVE_CONVERSATION_SCHEMA_VERSION,
+    ArchiveContentPart, ArchiveConversation, ArchiveItem, ArchiveItemKind, ArchiveRole,
+    CoverageStatus, ModelInfo, ProjectInfo, SourceLocation, TraceEdit, UsageCounts,
+    ARCHIVE_CONVERSATION_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -38,13 +45,50 @@ pub struct ArchiveScanDiagnostics {
     pub binary_bytes: u64,
     pub missing_content: u64,
     pub invalid_records: u64,
+    pub mutation_calls: u64,
+    pub applied_mutations: u64,
+    pub failed_mutations: u64,
+    pub unsupported_mutations: u64,
+    pub truncated_mutations: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ArchiveScan {
     pub conversations: Vec<ArchiveConversation>,
     pub artifact_dependencies: Vec<ArchiveArtifactDependency>,
+    pub trace_edits: Vec<TraceEdit>,
+    pub trace_coverage: CoverageStatus,
     pub diagnostics: ArchiveScanDiagnostics,
+}
+
+impl Default for ArchiveScan {
+    fn default() -> Self {
+        Self {
+            conversations: Vec::new(),
+            artifact_dependencies: Vec::new(),
+            trace_edits: Vec::new(),
+            // A scan that reconstructed nothing has measured nothing. Only a
+            // provider whose mutations this module actually parses may claim
+            // complete trace coverage, so that a new adapter cannot silently
+            // over-report by inheriting the default.
+            trace_coverage: CoverageStatus::Unavailable,
+            diagnostics: ArchiveScanDiagnostics::default(),
+        }
+    }
+}
+
+impl ArchiveScan {
+    /// Empty scan for a provider whose tool mutations this module parses.
+    ///
+    /// Coverage starts complete and degrades as unmeasurable mutations are
+    /// observed, so an archive with no edits at all reads as "nothing to
+    /// measure" rather than "not measured".
+    fn measured() -> Self {
+        Self {
+            trace_coverage: CoverageStatus::Complete,
+            ..Self::default()
+        }
+    }
 }
 
 type ArtifactDependencyMap = BTreeMap<(String, PathBuf), String>;
@@ -154,7 +198,7 @@ fn collect_codex(
             .flat_map(|path| collect_jsonl_files(&path).unwrap_or_default())
             .collect()
     });
-    let mut scan = ArchiveScan::default();
+    let mut scan = ArchiveScan::measured();
     let mut artifact_dependencies = ArtifactDependencyMap::new();
     for path in paths {
         scan.diagnostics.files_scanned += 1;
@@ -163,6 +207,8 @@ fn collect_codex(
             &path,
             &mut scan.diagnostics,
             &mut artifact_dependencies,
+            &mut scan.trace_edits,
+            &mut scan.trace_coverage,
         )?);
     }
     scan.artifact_dependencies = finish_artifact_dependencies(artifact_dependencies);
@@ -175,6 +221,8 @@ fn collect_codex_file(
     path: &Path,
     diagnostics: &mut ArchiveScanDiagnostics,
     artifact_dependencies: &mut ArtifactDependencyMap,
+    trace_edits: &mut Vec<TraceEdit>,
+    trace_coverage: &mut CoverageStatus,
 ) -> Result<ArchiveConversation> {
     let fallback_id = path
         .file_stem()
@@ -184,10 +232,12 @@ fn collect_codex_file(
     let (native_id, title, project) = codex_archive_header(path, fallback_id)?;
     let mut builder = ConversationBuilder::new(CODEX_PROVIDER, source, native_id.clone(), path);
     builder.title = title;
-    builder.project = project;
+    builder.project = project.clone();
     let mut current_model = None::<ModelInfo>;
     let mut structured_user_fingerprints = HashSet::new();
     let mut fallback_user_items = Vec::new();
+    let mut pending_mutations = HashMap::new();
+    let source_record_path = canonical_display(path);
 
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -202,6 +252,7 @@ fn collect_codex_file(
         if status == BoundedLineRead::Oversized {
             diagnostics.records_scanned += 1;
             diagnostics.invalid_records += 1;
+            record_unmeasurable_mutation(&mut diagnostics.truncated_mutations, trace_coverage);
             builder.missing_content += 1;
             continue;
         }
@@ -228,7 +279,7 @@ fn collect_codex_file(
             continue;
         }
         let timestamp = timestamp_from_nested_value(&value);
-        let record_id = format!("{}:{line_number}", path.display());
+        let record_id = format!("{source_record_path}:{line_number}");
         let top_type = value.get("type").and_then(Value::as_str);
         if top_type == Some("response_item") {
             let payload = value.get("payload").unwrap_or(&Value::Null);
@@ -292,7 +343,7 @@ fn collect_codex_file(
                         builder.push(item);
                     }
                 }
-                "function_call" | "tool_call" => {
+                "function_call" | "tool_call" | "custom_tool_call" => {
                     let native_item_id = native_id_from_value(payload)
                         .or_else(|| {
                             payload
@@ -305,6 +356,24 @@ fn collect_codex_file(
                         .get("arguments")
                         .or_else(|| payload.get("input"))
                         .unwrap_or(&Value::Null);
+                    let call_key = payload
+                        .get("call_id")
+                        .or_else(|| payload.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&native_item_id)
+                        .to_string();
+                    remember_original_mutation(
+                        &mut pending_mutations,
+                        diagnostics,
+                        trace_coverage,
+                        MutationInvocation {
+                            call_key,
+                            tool_name: payload.get("name").and_then(Value::as_str),
+                            arguments: content,
+                            source_record_id: &record_id,
+                            occurred_at: timestamp,
+                        },
+                    );
                     let (item, missing) = item_from_value(ItemInput {
                         provider: CODEX_PROVIDER,
                         conversation_native_id: &native_id,
@@ -324,7 +393,7 @@ fn collect_codex_file(
                     builder.missing_content += missing;
                     builder.push(item);
                 }
-                "function_call_output" | "tool_result" => {
+                "function_call_output" | "tool_result" | "custom_tool_call_output" => {
                     let native_item_id = native_id_from_value(payload)
                         .or_else(|| {
                             payload
@@ -337,6 +406,28 @@ fn collect_codex_file(
                         .get("output")
                         .or_else(|| payload.get("content"))
                         .unwrap_or(&Value::Null);
+                    let call_key = payload
+                        .get("call_id")
+                        .or_else(|| payload.get("tool_use_id"))
+                        .or_else(|| payload.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&native_item_id);
+                    finish_original_mutation(
+                        &mut pending_mutations,
+                        diagnostics,
+                        trace_edits,
+                        trace_coverage,
+                        MutationCompletion {
+                            call_key,
+                            cache_key: &source_record_path,
+                            result: payload,
+                            status: payload.get("status").and_then(Value::as_str),
+                            provider: CODEX_PROVIDER,
+                            source,
+                            conversation_id: &archive_conversation_id(CODEX_PROVIDER, &native_id),
+                            project: project.as_ref(),
+                        },
+                    );
                     let (item, missing) = item_from_value(ItemInput {
                         provider: CODEX_PROVIDER,
                         conversation_native_id: &native_id,
@@ -393,6 +484,7 @@ fn collect_codex_file(
             builder.push(item);
         }
     }
+    mark_unresolved_mutations(&pending_mutations, diagnostics, trace_coverage);
     Ok(builder.finish())
 }
 
@@ -450,7 +542,7 @@ fn collect_claude(
     let paths = selected_jsonl_paths(selected_cache_keys, || {
         collect_jsonl_files(&projects).unwrap_or_default()
     });
-    let mut scan = ArchiveScan::default();
+    let mut scan = ArchiveScan::measured();
     let mut artifact_dependencies = ArtifactDependencyMap::new();
     for path in paths {
         if path.file_name().and_then(|name| name.to_str()) == Some("sessions-index.json") {
@@ -462,6 +554,8 @@ fn collect_claude(
             &path,
             &mut scan.diagnostics,
             &mut artifact_dependencies,
+            &mut scan.trace_edits,
+            &mut scan.trace_coverage,
         )?);
     }
     scan.artifact_dependencies = finish_artifact_dependencies(artifact_dependencies);
@@ -474,6 +568,8 @@ fn collect_claude_file(
     path: &Path,
     diagnostics: &mut ArchiveScanDiagnostics,
     artifact_dependencies: &mut ArtifactDependencyMap,
+    trace_edits: &mut Vec<TraceEdit>,
+    trace_coverage: &mut CoverageStatus,
 ) -> Result<ArchiveConversation> {
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let fallback_id = path
@@ -495,6 +591,8 @@ fn collect_claude_file(
     let mut reader = BufReader::new(file);
     let mut line_bytes = Vec::new();
     let mut line_number = 0usize;
+    let mut pending_mutations = HashMap::new();
+    let source_record_path = canonical_display(path);
     loop {
         let status = read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
         if status == BoundedLineRead::Eof {
@@ -504,6 +602,7 @@ fn collect_claude_file(
         if status == BoundedLineRead::Oversized {
             diagnostics.records_scanned += 1;
             diagnostics.invalid_records += 1;
+            record_unmeasurable_mutation(&mut diagnostics.truncated_mutations, trace_coverage);
             builder.missing_content += 1;
             continue;
         }
@@ -576,7 +675,7 @@ fn collect_claude_file(
             .map_or_else(|| vec![content], |blocks| blocks.iter().collect());
         for (part_index, block) in content_blocks.into_iter().enumerate() {
             let content_type = block.get("type").and_then(Value::as_str).unwrap_or("");
-            let source_record_id = format!("{}:{line_number}:{part_index}", path.display());
+            let source_record_id = format!("{source_record_path}:{line_number}:{part_index}");
             if claude_block_is_opaque_reasoning(block, content_type) {
                 builder.discarded_source_record_ids.push(source_record_id);
                 continue;
@@ -609,6 +708,43 @@ fn collect_claude_file(
                 | ArchiveItemKind::ReasoningSummary
                 | ArchiveItemKind::Artifact => block,
             };
+            if kind == ArchiveItemKind::ToolCall {
+                remember_original_mutation(
+                    &mut pending_mutations,
+                    diagnostics,
+                    trace_coverage,
+                    MutationInvocation {
+                        call_key: tool_call_id.unwrap_or(&block_native_item_id).to_string(),
+                        tool_name: block
+                            .get("name")
+                            .or_else(|| block.get("tool_name"))
+                            .and_then(Value::as_str),
+                        arguments: archive_content,
+                        source_record_id: &source_record_id,
+                        occurred_at: created_at,
+                    },
+                );
+            } else if kind == ArchiveItemKind::ToolResult {
+                finish_original_mutation(
+                    &mut pending_mutations,
+                    diagnostics,
+                    trace_edits,
+                    trace_coverage,
+                    MutationCompletion {
+                        call_key: tool_call_id.unwrap_or(&block_native_item_id),
+                        cache_key: &source_record_path,
+                        result: block,
+                        status: block.get("status").and_then(Value::as_str),
+                        provider: CLAUDE_CODE_PROVIDER,
+                        source,
+                        conversation_id: &archive_conversation_id(
+                            CLAUDE_CODE_PROVIDER,
+                            &builder.native_id,
+                        ),
+                        project: builder.project.as_ref(),
+                    },
+                );
+            }
             if local_artifacts_allowed(kind, item_role) {
                 collect_artifact_dependencies(archive_content, path, artifact_dependencies);
             }
@@ -635,6 +771,7 @@ fn collect_claude_file(
             builder.push(item);
         }
     }
+    mark_unresolved_mutations(&pending_mutations, diagnostics, trace_coverage);
     Ok(builder.finish())
 }
 
@@ -680,8 +817,10 @@ fn collect_grok(
     source: &SourceLocation,
     selected_cache_keys: Option<&HashSet<String>>,
 ) -> Result<ArchiveScan> {
+    // Grok sessions record no tool mutations this module can reconstruct.
+    let mut scan = ArchiveScan::default();
     let Some(root) = source_root_path(source) else {
-        return Ok(ArchiveScan::default());
+        return Ok(scan);
     };
     let mut session_dirs = Vec::new();
     if let Some(selected) = selected_cache_keys {
@@ -703,7 +842,6 @@ fn collect_grok(
     }
     session_dirs.sort();
     session_dirs.dedup();
-    let mut scan = ArchiveScan::default();
     let mut artifact_dependencies = ArtifactDependencyMap::new();
     for session_dir in session_dirs {
         let chat_path = session_dir.join("chat_history.jsonl");
@@ -746,6 +884,8 @@ fn collect_grok(
             if status == BoundedLineRead::Oversized {
                 scan.diagnostics.records_scanned += 1;
                 scan.diagnostics.invalid_records += 1;
+                scan.diagnostics.truncated_mutations =
+                    scan.diagnostics.truncated_mutations.saturating_add(1);
                 builder.missing_content += 1;
                 continue;
             }
@@ -1118,6 +1258,8 @@ fn collect_opencode(
             .map(ConversationBuilder::finish)
             .collect(),
         artifact_dependencies: finish_artifact_dependencies(artifact_dependencies),
+        trace_edits: Vec::new(),
+        trace_coverage: CoverageStatus::Unavailable,
         diagnostics: ArchiveScanDiagnostics {
             files_scanned: 1,
             records_scanned,
@@ -1917,6 +2059,18 @@ where
 }
 
 fn finish_diagnostics(scan: &mut ArchiveScan) {
+    if scan.trace_coverage != CoverageStatus::Unavailable {
+        let diagnostic_coverage = if scan.diagnostics.failed_mutations > 0
+            || scan.diagnostics.unsupported_mutations > 0
+            || scan.diagnostics.truncated_mutations > 0
+            || scan.diagnostics.invalid_records > 0
+        {
+            CoverageStatus::Partial
+        } else {
+            CoverageStatus::Complete
+        };
+        scan.trace_coverage = scan.trace_coverage.combine(diagnostic_coverage);
+    }
     scan.diagnostics.conversations = scan.conversations.len() as u64;
     for conversation in &scan.conversations {
         scan.diagnostics.items += conversation.items.len() as u64;
@@ -2059,6 +2213,569 @@ mod tests {
         assert!(items
             .iter()
             .any(|item| item.kind == ArchiveItemKind::ToolResult));
+    }
+
+    #[test]
+    fn codex_malformed_json_record_makes_trace_coverage_partial() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"id":"thread-1"}}}}"#
+        )
+        .unwrap();
+        writeln!(file, "{{malformed json").unwrap();
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+
+        assert_eq!(scan.diagnostics.invalid_records, 1);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn claude_invalid_utf8_record_makes_trace_coverage_partial() {
+        let dir = tempdir().unwrap();
+        let projects = dir.path().join("projects/example");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("session.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "sessionId":"session-1",
+                "message":{"role":"user","content":"hello"}
+            })
+        )
+        .unwrap();
+        file.write_all(&[0xff, b'\n']).unwrap();
+
+        let scan = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+
+        assert_eq!(scan.diagnostics.invalid_records, 1);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn codex_counts_original_patch_before_archive_tool_argument_truncation() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-08-01T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "thread-1", "cwd": dir.path()}
+            })
+        )
+        .unwrap();
+        let mut patch = "*** Begin Patch\n*** Add File: src/generated.rs\n".to_string();
+        for index in 0..5_000 {
+            patch.push_str(&format!("+line {index}\n"));
+        }
+        patch.push_str("*** End Patch\n");
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-08-01T10:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "apply_patch",
+                    "arguments": patch,
+                }
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-08-01T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "Done!",
+                }
+            })
+        )
+        .unwrap();
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert_eq!(scan.trace_coverage, CoverageStatus::Complete);
+        assert_eq!(scan.trace_edits.len(), 1);
+        assert_eq!(scan.trace_edits[0].counts.source_additions, 5_000);
+        let call = scan.conversations[0]
+            .items
+            .iter()
+            .find(|item| item.kind == ArchiveItemKind::ToolCall)
+            .unwrap();
+        assert!(call.parts.iter().any(|part| part.truncated));
+    }
+
+    #[test]
+    fn codex_custom_tool_records_collect_successful_apply_patch_edits() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({
+                "timestamp":"2026-08-01T10:00:00Z",
+                "type":"session_meta",
+                "payload":{"id":"thread-1","cwd":dir.path()}
+            }),
+            serde_json::json!({
+                "timestamp":"2026-08-01T10:00:01Z",
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "input":"*** Begin Patch\n*** Add File: src/lib.rs\n+pub fn added() {}\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "timestamp":"2026-08-01T10:00:02Z",
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"call-1",
+                    "output":"Done!"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+
+        assert_eq!(scan.trace_coverage, CoverageStatus::Complete);
+        assert_eq!(scan.trace_edits.len(), 1);
+        assert_eq!(scan.trace_edits[0].counts.source_additions, 1);
+        assert_eq!(scan.diagnostics.applied_mutations, 1);
+        let items = &scan.conversations[0].items;
+        assert!(items
+            .iter()
+            .any(|item| item.kind == ArchiveItemKind::ToolCall));
+        assert!(items
+            .iter()
+            .any(|item| item.kind == ArchiveItemKind::ToolResult));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_trace_record_ids_use_the_canonical_archive_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        let sessions = real_root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}}),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "arguments":"*** Begin Patch\n*** Add File: src/lib.rs\n+line\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-1",
+                    "output":"Done!"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let linked_root = dir.path().join("linked");
+        symlink(&real_root, &linked_root).unwrap();
+        let scan = collect_codex(&source(CODEX_PROVIDER, &linked_root), None).unwrap();
+
+        assert_eq!(scan.trace_edits.len(), 1);
+        assert!(scan.trace_edits[0]
+            .source_record_id
+            .starts_with(&format!("{}:", canonical_display(&path))));
+    }
+
+    #[test]
+    fn failed_mutations_reduce_coverage_without_counting_lines() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}}),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "arguments":"*** Begin Patch\n*** Add File: src/lib.rs\n+line\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-1",
+                    "output":"patch rejected"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert!(scan.trace_edits.is_empty());
+        assert_eq!(scan.diagnostics.failed_mutations, 1);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn unparseable_successful_mutation_is_not_applied_or_complete() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}}),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "arguments":"*** Begin Patch\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-1",
+                    "output":"Done!"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+
+        assert!(scan.trace_edits.is_empty());
+        assert_eq!(scan.diagnostics.applied_mutations, 0);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn codex_invalid_context_patch_is_not_counted_as_applied() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}}),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"apply_patch",
+                    "arguments":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch\n"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-1",
+                    "output":"Invalid Context 0:\nold"
+                }
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert!(scan.trace_edits.is_empty());
+        assert_eq!(scan.diagnostics.failed_mutations, 1);
+        assert_eq!(scan.diagnostics.applied_mutations, 0);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn codex_shell_execution_makes_trace_coverage_partial() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}})
+        )
+        .unwrap();
+        for (index, command) in [
+            "git apply changes.patch",
+            "python -c \"from pathlib import Path; Path('x').write_text('x')\"",
+            "truncate -s 0 generated.txt",
+            "printf x>generated.txt",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type":"response_item",
+                    "payload":{
+                        "type":"function_call",
+                        "call_id":format!("call-{index}"),
+                        "name":"exec_command",
+                        "arguments":{"cmd":command}
+                    }
+                })
+            )
+            .unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert_eq!(scan.diagnostics.unsupported_mutations, 4);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn read_only_shell_execution_keeps_trace_coverage_complete() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("thread.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"session_meta","payload":{"id":"thread-1"}})
+        )
+        .unwrap();
+        for (index, arguments) in [
+            serde_json::json!({"cmd": "ls -la src"}),
+            serde_json::json!({"cmd": "git status --short && git diff --stat"}),
+            serde_json::json!({"cmd": "cargo test -p statsai-core 2>&1 | tail -20"}),
+            serde_json::json!({"cmd": "RUST_LOG=debug cargo clippy --all-targets"}),
+            serde_json::json!({"command": ["bash", "-lc", "rg --files-with-matches TODO crates"]}),
+            serde_json::json!({"command": ["ls", "-la"]}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type":"response_item",
+                    "payload":{
+                        "type":"function_call",
+                        "call_id":format!("call-{index}"),
+                        "name":"exec_command",
+                        "arguments":arguments
+                    }
+                })
+            )
+            .unwrap();
+        }
+
+        let scan = collect_codex(&source(CODEX_PROVIDER, dir.path()), None).unwrap();
+        assert_eq!(scan.diagnostics.unsupported_mutations, 0);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Complete);
+    }
+
+    #[test]
+    fn providers_without_mutation_parsing_report_unavailable_trace_coverage() {
+        let dir = tempdir().unwrap();
+        let scan =
+            collect_provider_archive("unwired-provider", &source("unwired", dir.path()), None)
+                .unwrap();
+        assert_eq!(scan.trace_coverage, CoverageStatus::Unavailable);
+    }
+
+    #[test]
+    fn claude_structured_edit_is_counted_after_successful_tool_result() {
+        let dir = tempdir().unwrap();
+        let projects = dir.path().join("projects/example");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("session.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({
+                "sessionId":"session-1",
+                "cwd":dir.path(),
+                "message":{"role":"assistant","content":[{
+                    "type":"tool_use",
+                    "id":"tool-1",
+                    "name":"Edit",
+                    "input":{"file_path":dir.path().join("src/lib.rs"),"old_string":"old","new_string":"new"}
+                }]}
+            }),
+            serde_json::json!({
+                "sessionId":"session-1",
+                "message":{"role":"user","content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"tool-1",
+                    "content":"updated"
+                }]}
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+        assert_eq!(scan.trace_edits.len(), 1);
+        assert_eq!(
+            scan.trace_edits[0].relative_path,
+            PathBuf::from("src/lib.rs")
+        );
+        assert_eq!(scan.trace_edits[0].counts.source_additions, 1);
+        assert_eq!(scan.trace_edits[0].counts.source_deletions, 1);
+    }
+
+    #[test]
+    fn claude_write_is_counted_as_a_creation_when_the_result_says_so() {
+        let write_session = |result: &str| {
+            let dir = tempdir().unwrap();
+            let projects = dir.path().join("projects/example");
+            std::fs::create_dir_all(&projects).unwrap();
+            let mut file = File::create(projects.join("session.jsonl")).unwrap();
+            for value in [
+                serde_json::json!({
+                    "sessionId":"session-1",
+                    "cwd":dir.path(),
+                    "message":{"role":"assistant","content":[{
+                        "type":"tool_use",
+                        "id":"tool-1",
+                        "name":"Write",
+                        "input":{
+                            "file_path":dir.path().join("src/lib.rs"),
+                            "content":"one\ntwo\nthree\n"
+                        }
+                    }]}
+                }),
+                serde_json::json!({
+                    "sessionId":"session-1",
+                    "message":{"role":"user","content":[{
+                        "type":"tool_result",
+                        "tool_use_id":"tool-1",
+                        "content":result
+                    }]}
+                }),
+            ] {
+                writeln!(file, "{value}").unwrap();
+            }
+            let scan = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+            scan.trace_edits.into_iter().next().expect("one trace edit")
+        };
+
+        // The Write tool never declares creation in its arguments, so a created
+        // file is only distinguishable from an overwrite through the outcome.
+        let created = write_session("File created successfully at: /workspace/src/lib.rs");
+        assert_eq!(
+            created.mutation_kind,
+            statsai_core::MutationKind::FileCreation
+        );
+        assert_eq!(created.counts.source_additions, 3);
+        assert_eq!(created.counts.unclassified_lines_written, 0);
+        assert_eq!(
+            created.added_line_fingerprints.len(),
+            3,
+            "a creation carries fingerprints, so it can be trace-matched"
+        );
+
+        // An overwrite mixes new and replaced lines, which stays unclassified.
+        let overwritten = write_session("The file /workspace/src/lib.rs has been updated.");
+        assert_eq!(
+            overwritten.mutation_kind,
+            statsai_core::MutationKind::FileWrite
+        );
+        assert_eq!(overwritten.counts.source_additions, 0);
+        assert_eq!(overwritten.counts.unclassified_lines_written, 3);
+    }
+
+    #[test]
+    fn claude_multiedit_collects_each_nested_edit_after_successful_result() {
+        let dir = tempdir().unwrap();
+        let projects = dir.path().join("projects/example");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join("session.jsonl");
+        let mut file = File::create(&path).unwrap();
+        for value in [
+            serde_json::json!({
+                "sessionId":"session-1",
+                "cwd":dir.path(),
+                "message":{"role":"assistant","content":[{
+                    "type":"tool_use",
+                    "id":"tool-1",
+                    "name":"MultiEdit",
+                    "input":{
+                        "file_path":dir.path().join("src/lib.rs"),
+                        "edits":[
+                            {"old_string":"old","new_string":"new"},
+                            {"old_string":"old","new_string":"new"}
+                        ]
+                    }
+                }]}
+            }),
+            serde_json::json!({
+                "sessionId":"session-1",
+                "message":{"role":"user","content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"tool-1",
+                    "content":"updated"
+                }]}
+            }),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+
+        let scan = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+
+        assert_eq!(scan.trace_coverage, CoverageStatus::Complete);
+        assert_eq!(scan.trace_edits.len(), 2);
+        assert_eq!(scan.diagnostics.applied_mutations, 1);
+        assert_ne!(
+            scan.trace_edits[0].trace_edit_id,
+            scan.trace_edits[1].trace_edit_id
+        );
+        assert!(scan.trace_edits.iter().all(|edit| {
+            edit.relative_path == Path::new("src/lib.rs")
+                && edit.counts.source_additions == 1
+                && edit.counts.source_deletions == 1
+        }));
     }
 
     #[test]
@@ -2684,6 +3401,7 @@ mod tests {
         assert_eq!(reasoning.parts.len(), 1);
         assert_eq!(reasoning.parts[0].text.as_deref(), Some("thinking"));
         assert_eq!(conversation.completeness, ArchiveCompleteness::Complete);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Unavailable);
     }
 
     #[test]
@@ -2826,5 +3544,6 @@ mod tests {
         assert!(retained_output.contains("[... truncated ...]"));
         assert!(retained_output.ends_with("-output-tail"));
         assert!(retained_output.len() <= MAX_TOOL_RESULT_TEXT_BYTES);
+        assert_eq!(scan.trace_coverage, CoverageStatus::Unavailable);
     }
 }

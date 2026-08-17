@@ -1,6 +1,7 @@
 //! Core schemas and ID helpers for `statsai`.
 
 mod archive;
+mod code_changes;
 mod tasks;
 
 use chrono::{DateTime, Utc};
@@ -10,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 pub use archive::*;
+pub use code_changes::*;
 pub use tasks::*;
 
 pub const USAGE_EVENT_SCHEMA_VERSION: &str = "usage_event.v1";
@@ -22,10 +24,12 @@ pub const SUBSCRIPTION_SCHEMA_VERSION: &str = "subscription.v1";
 pub const DAILY_ROLLUP_SCHEMA_VERSION: &str = "daily_rollup.v1";
 pub const SYNC_BATCH_V1_SCHEMA_VERSION: &str = "sync_batch.v1";
 pub const SYNC_BATCH_V2_SCHEMA_VERSION: &str = "sync_batch.v2";
+pub const SYNC_BATCH_V3_SCHEMA_VERSION: &str = "sync_batch.v3";
 pub const SYNC_ACK_V1_SCHEMA_VERSION: &str = "sync_ack.v1";
 pub const SYNC_ACK_V2_SCHEMA_VERSION: &str = "sync_ack.v2";
-pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V2_SCHEMA_VERSION;
-pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V2_SCHEMA_VERSION;
+pub const SYNC_ACK_V3_SCHEMA_VERSION: &str = "sync_ack.v3";
+pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V3_SCHEMA_VERSION;
+pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V3_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
@@ -713,6 +717,10 @@ pub struct SyncBatch {
     pub task_buckets: Vec<TaskBucketSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_verifications: Vec<TaskVerification>,
+    /// Privacy-safe numeric code-change metrics. Paths, diffs, source text, tool
+    /// arguments, and commit messages are deliberately absent from this type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_change_metrics: Vec<CodeChangeMetric>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoritative_snapshot: Option<SyncAuthoritativeSnapshot>,
     pub created_at: DateTime<Utc>,
@@ -733,6 +741,8 @@ pub struct SyncAuthoritativeSnapshot {
     pub subscription_ids: Vec<SubscriptionId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub summary_ids: Vec<SummaryId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_change_metric_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -778,6 +788,8 @@ pub struct SyncEntityCounts {
     pub task_buckets: u64,
     #[serde(default, skip_serializing_if = "sync_count_is_zero")]
     pub task_verifications: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub code_change_metrics: u64,
 }
 
 fn sync_count_is_zero(value: &u64) -> bool {
@@ -1930,7 +1942,7 @@ mod tests {
     #[test]
     fn sync_batch_without_authoritative_snapshot_remains_backward_compatible() {
         let batch: SyncBatch = serde_json::from_value(serde_json::json!({
-            "schema_version": SYNC_BATCH_SCHEMA_VERSION,
+            "schema_version": SYNC_BATCH_V2_SCHEMA_VERSION,
             "batch_id": "batch-legacy-v2",
             "device_id": "device-1",
             "created_at": "2026-05-31T10:00:00Z"
@@ -1956,6 +1968,7 @@ mod tests {
                 summaries: 2,
                 task_buckets: 0,
                 task_verifications: 0,
+                code_change_metrics: 0,
             },
             duplicates: SyncEntityCounts {
                 sources: 0,
@@ -1966,6 +1979,7 @@ mod tests {
                 summaries: 0,
                 task_buckets: 0,
                 task_verifications: 0,
+                code_change_metrics: 0,
             },
             rejected: Vec::new(),
         };
@@ -1974,12 +1988,14 @@ mod tests {
         assert_eq!(json["schema_version"], SYNC_ACK_V1_SCHEMA_VERSION);
         assert!(json["accepted"].get("task_buckets").is_none());
         assert!(json["accepted"].get("task_verifications").is_none());
+        assert!(json["accepted"].get("code_change_metrics").is_none());
         assert!(json["duplicates"].get("task_buckets").is_none());
         assert!(json["duplicates"].get("task_verifications").is_none());
+        assert!(json["duplicates"].get("code_change_metrics").is_none());
     }
 
     #[test]
-    fn sync_ack_v2_keeps_nonzero_task_counters() {
+    fn sync_ack_v3_keeps_nonzero_task_and_code_change_counters() {
         let ack = SyncAck {
             schema_version: SYNC_ACK_SCHEMA_VERSION.to_string(),
             batch_id: "batch-2".to_string(),
@@ -1992,6 +2008,7 @@ mod tests {
                 summaries: 0,
                 task_buckets: 3,
                 task_verifications: 1,
+                code_change_metrics: 2,
             },
             duplicates: SyncEntityCounts {
                 sources: 0,
@@ -2002,13 +2019,16 @@ mod tests {
                 summaries: 0,
                 task_buckets: 0,
                 task_verifications: 0,
+                code_change_metrics: 0,
             },
             rejected: Vec::new(),
         };
 
         let json = serde_json::to_value(&ack).expect("ack should serialize");
+        assert_eq!(json["schema_version"], SYNC_ACK_V3_SCHEMA_VERSION);
         assert_eq!(json["accepted"]["task_buckets"], 3);
         assert_eq!(json["accepted"]["task_verifications"], 1);
+        assert_eq!(json["accepted"]["code_change_metrics"], 2);
     }
 
     fn test_source(provider: &str, path: &str) -> SourceLocation {

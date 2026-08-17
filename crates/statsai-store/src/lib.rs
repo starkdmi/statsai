@@ -1,6 +1,7 @@
 //! Local SQLite storage for `statsai`.
 
 mod archive;
+mod code_changes;
 mod migrations;
 mod privacy;
 mod tasks;
@@ -12,19 +13,19 @@ use serde::Deserialize;
 use statsai_core::{
     hash_text, micro_usd_to_cents_rounded, normalize_email, normalize_provider_user_id,
     periods_overlap, project_bucket_key, project_contains_file_paths, project_has_stable_identity,
-    provider_account_id, provider_account_id_from_identity, sanitize_summary_for_sync,
-    semantic_event_fingerprint, source_account_assignment_id, subscription_id, summary_id,
-    timestamp_in_period, BillingPeriod, Confidence, CostAccumulator, CostInfo, DailyRollup,
-    EventId, EventSource, IdentitySource, LatencySource, MetricStats, ModelInfo, PrivacyInfo,
-    PrivacyMode, ProviderAccount, ProviderAccountId, SemanticFingerprintInput,
-    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
-    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SummaryId,
-    SummaryMetadata, SummaryMetricTotals, SummaryMetrics, SummaryModelMetrics, SummaryModelUsage,
-    SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, TaskVerificationId, UsageCounts,
-    UsageEvent, UsageSummary, VerifiedSourceObservation, VerifiedSourceState,
-    VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
-    SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
-    USAGE_SUMMARY_SCHEMA_VERSION,
+    provider_account_id, provider_account_id_from_identity, sanitize_code_change_metric_for_sync,
+    sanitize_summary_for_sync, semantic_event_fingerprint, source_account_assignment_id,
+    subscription_id, summary_id, timestamp_in_period, BillingPeriod, CodeChangeMetric, Confidence,
+    CostAccumulator, CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource,
+    MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
+    SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
+    SourceKind, SourceLocation, SourceVerificationMode, Subscription, SubscriptionId,
+    SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetricTotals, SummaryMetrics,
+    SummaryModelMetrics, SummaryModelUsage, SyncAuthoritativeSnapshot, SyncBatch,
+    TaskVerificationCursor, TaskVerificationId, UsageCounts, UsageEvent, UsageSummary,
+    VerifiedSourceObservation, VerifiedSourceState, VerifiedSubscriptionState,
+    PROVIDER_ACCOUNT_SCHEMA_VERSION, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    SUBSCRIPTION_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -38,6 +39,7 @@ const INFERRED_SOURCE_OBSERVATION_HASH_PREFIX: &str = "inferred_source.v1:";
 const VERIFIED_SOURCE_OBSERVATION_HASH_PREFIX: &str = "verified_source.v2:";
 
 pub use archive::{ArchiveConversationSummary, ArchiveSearchHit, ArchiveStats, ArchiveWriteResult};
+pub use code_changes::CodeChangeRefreshReport;
 pub use privacy::{
     FilteredConversationMetadata, FilteredConversationRecord, PrivacyDatasetStatus,
     PrivacyFailureRecord, PrivacyFindingRecord,
@@ -621,6 +623,7 @@ impl Store {
             if !buckets_needing_rebuild.is_empty() {
                 self.rebuild_task_work_items_for_project_buckets(&buckets_needing_rebuild)?;
             }
+            self.ingest_code_change_metrics_inner(&batch.code_change_metrics)?;
 
             Ok(SyncBatchIngestResult {
                 inserted_events,
@@ -2402,6 +2405,11 @@ impl Store {
                 &batch.source_account_assignments,
             )?;
             self.record_subscriptions_synced_in_transaction(sink, target, &batch.subscriptions)?;
+            self.record_code_change_metrics_synced_in_transaction(
+                sink,
+                target,
+                &batch.code_change_metrics,
+            )?;
             self.record_task_bucket_snapshots_synced_in_transaction(
                 sink,
                 target,
@@ -2820,6 +2828,14 @@ impl Store {
                     .map(|id| id.0.as_str())
                     .collect::<BTreeSet<_>>(),
             ),
+            (
+                "code_change_metric",
+                snapshot
+                    .code_change_metric_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+            ),
         ]);
         let mut statement = self.conn.prepare(
             r#"
@@ -2827,7 +2843,8 @@ impl Store {
             FROM entity_sync_state
             WHERE sink = ?1 AND target = ?2
               AND entity_kind IN (
-                'source', 'account', 'source_account_assignment', 'subscription', 'summary'
+                'source', 'account', 'source_account_assignment', 'subscription', 'summary',
+                'code_change_metric'
               )
             "#,
         )?;
@@ -2866,13 +2883,15 @@ impl Store {
     pub fn pending_http_sync_summary_counts(
         &self,
         target: &str,
+        device_id: &str,
     ) -> Result<PendingSyncSummaryCounts> {
-        self.pending_http_sync_summary_counts_with_projects(target, false)
+        self.pending_http_sync_summary_counts_with_projects(target, device_id, false)
     }
 
     pub fn pending_http_sync_summary_counts_with_projects(
         &self,
         target: &str,
+        device_id: &str,
         include_projects: bool,
     ) -> Result<PendingSyncSummaryCounts> {
         let current_rollups = self
@@ -2889,15 +2908,28 @@ impl Store {
             .collect::<Vec<_>>();
         let passthrough_summaries =
             self.pending_summaries_for_sync("http", target, &current_passthrough_summaries)?;
+        let current_code_change_metrics = self
+            .list_code_change_metrics(false)?
+            .into_iter()
+            .filter(|metric| metric.device_id == device_id)
+            .map(|metric| sanitize_code_change_metric_for_sync(metric, include_projects))
+            .collect::<Vec<_>>();
+        let code_change_metrics = self.pending_code_change_metrics_for_sync(
+            "http",
+            target,
+            &current_code_change_metrics,
+        )?;
         let current_snapshot = self.current_http_sync_authoritative_snapshot(
             &current_rollups,
             &current_passthrough_summaries,
+            &current_code_change_metrics,
         )?;
         let retired_entities = self
             .retired_sync_entity_ids("http", target, &current_snapshot)?
             .len();
         let mut days = collect_pending_summary_days(rollups.iter());
         days.extend(collect_pending_summary_days(passthrough_summaries.iter()));
+        days.extend(code_change_metrics.iter().map(|metric| metric.day));
         Ok(PendingSyncSummaryCounts {
             rollups: rollups.len() as u64,
             passthrough_summaries: passthrough_summaries.len() as u64,
@@ -2905,6 +2937,7 @@ impl Store {
             total: rollups
                 .len()
                 .saturating_add(passthrough_summaries.len())
+                .saturating_add(code_change_metrics.len())
                 .saturating_add(retired_entities) as u64,
             days: days.len() as u64,
         })
@@ -2914,6 +2947,7 @@ impl Store {
         &self,
         rollups: &[UsageSummary],
         passthrough_summaries: &[UsageSummary],
+        code_change_metrics: &[CodeChangeMetric],
     ) -> Result<SyncAuthoritativeSnapshot> {
         Ok(SyncAuthoritativeSnapshot {
             snapshot_id: String::new(),
@@ -2943,6 +2977,10 @@ impl Store {
                 .iter()
                 .chain(passthrough_summaries)
                 .map(|summary| summary.summary_id.clone())
+                .collect(),
+            code_change_metric_ids: code_change_metrics
+                .iter()
+                .map(|metric| metric.metric_id.clone())
                 .collect(),
         })
     }
@@ -3321,6 +3359,39 @@ impl Store {
                 "summary",
                 &summary.summary_id.0,
                 &payload_hash,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn record_code_change_metrics_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        metrics: &[CodeChangeMetric],
+    ) -> Result<()> {
+        if metrics.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_code_change_metrics_synced_in_transaction(sink, target, metrics)
+        })
+    }
+
+    fn record_code_change_metrics_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        metrics: &[CodeChangeMetric],
+    ) -> Result<()> {
+        for metric in metrics {
+            let payload = serde_json::to_string(metric)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                "code_change_metric",
+                &metric.metric_id,
+                &hash_text(&payload),
             )?;
         }
         Ok(())
@@ -8412,6 +8483,7 @@ mod tests {
             summaries: summaries.clone(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
+            code_change_metrics: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -9580,7 +9652,7 @@ mod tests {
         store.upsert_summary(&backfill).expect("backfill summary");
 
         let counts = store
-            .pending_http_sync_summary_counts(target)
+            .pending_http_sync_summary_counts(target, "device")
             .expect("pending counts");
         assert_eq!(
             counts,
@@ -9598,7 +9670,7 @@ mod tests {
             .expect("record synced");
 
         let counts = store
-            .pending_http_sync_summary_counts(target)
+            .pending_http_sync_summary_counts(target, "device")
             .expect("pending counts after sync");
         assert_eq!(counts.total, 0);
     }
@@ -9630,7 +9702,7 @@ mod tests {
             .expect("record synced");
         assert_eq!(
             store
-                .pending_http_sync_summary_counts(target)
+                .pending_http_sync_summary_counts(target, "device")
                 .expect("counts after sync")
                 .total,
             0
@@ -9641,7 +9713,7 @@ mod tests {
         store.upsert_summary(&edited).expect("edited summary");
 
         let counts = store
-            .pending_http_sync_summary_counts(target)
+            .pending_http_sync_summary_counts(target, "device")
             .expect("pending counts after edit");
         assert_eq!(
             counts,
@@ -9680,7 +9752,7 @@ mod tests {
             .expect("record rollup synced");
         assert_eq!(
             store
-                .pending_http_sync_summary_counts(target)
+                .pending_http_sync_summary_counts(target, "device")
                 .expect("settled counts")
                 .total,
             0
@@ -9690,7 +9762,7 @@ mod tests {
             .delete_events_for_sources(std::slice::from_ref(&source.source_id))
             .expect("retire source events");
         let counts = store
-            .pending_http_sync_summary_counts(target)
+            .pending_http_sync_summary_counts(target, "device")
             .expect("retirement counts");
 
         assert_eq!(counts.rollups, 0);
@@ -9744,7 +9816,7 @@ mod tests {
             .expect("record synced");
 
         let counts = store
-            .pending_http_sync_summary_counts(target)
+            .pending_http_sync_summary_counts(target, "device")
             .expect("pending counts after sync");
         assert_eq!(counts.total, 0);
     }
@@ -9792,15 +9864,74 @@ mod tests {
 
         assert_eq!(
             store
-                .pending_http_sync_summary_counts(target)
+                .pending_http_sync_summary_counts(target, "device")
                 .expect("default payload counts")
                 .total,
             0
         );
         assert_eq!(
             store
-                .pending_http_sync_summary_counts_with_projects(target, true)
+                .pending_http_sync_summary_counts_with_projects(target, "device", true)
                 .expect("project payload counts")
+                .total,
+            1
+        );
+    }
+
+    #[test]
+    fn pending_http_sync_summary_counts_include_code_change_only_uploads() {
+        let store = Store::in_memory().expect("store");
+        let target = "https://api.example.com/api/sync/batches";
+        let metric = CodeChangeMetric {
+            schema_version: statsai_core::CODE_CHANGE_METRIC_SCHEMA_VERSION.to_string(),
+            metric_id: "pending-code-change".to_string(),
+            device_id: "device".to_string(),
+            day: Utc::now().date_naive(),
+            project_id: Some("project".to_string()),
+            repository_hash: Some("repository".to_string()),
+            commit_hash: None,
+            kind: statsai_core::CodeChangeMetricKind::AgentEdit,
+            counts: statsai_core::CodeLineCounts::classified(
+                statsai_core::CodeCategory::Source,
+                3,
+                1,
+            ),
+            attribution_confidence: None,
+            trace_coverage: statsai_core::CoverageStatus::Complete,
+            git_coverage: statsai_core::CoverageStatus::Complete,
+        };
+        store
+            .ingest_code_change_metrics_inner(std::slice::from_ref(&metric))
+            .expect("store metric");
+        let mut peer_metric = metric.clone();
+        peer_metric.metric_id = "peer-code-change".to_string();
+        peer_metric.device_id = "peer-device".to_string();
+        store
+            .ingest_code_change_metrics_inner(std::slice::from_ref(&peer_metric))
+            .expect("store peer metric");
+
+        let counts = store
+            .pending_http_sync_summary_counts_with_projects(target, "device", false)
+            .expect("pending counts");
+
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.days, 1);
+
+        let sanitized = sanitize_code_change_metric_for_sync(metric.clone(), false);
+        store
+            .record_code_change_metrics_synced("http", target, &[sanitized])
+            .expect("record sanitized metric synced");
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts_with_projects(target, "device", false)
+                .expect("settled default counts")
+                .total,
+            0
+        );
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts_with_projects(target, "device", true)
+                .expect("project backfill counts")
                 .total,
             1
         );

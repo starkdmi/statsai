@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use statsai_core::{
     branch_family, canonical_display, display_path, expand_home_path, extract_issue_keys,
-    hash_text, home_dir, normalize_task_title, path_hash, project_bucket_key, semantic_event_id,
-    summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
+    hash_text, home_dir, normalize_git_remote, normalize_task_title, path_hash, project_bucket_key,
+    semantic_event_id, summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
     task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
     task_title_signal_score, title_topic_tokens, BillingPeriod, Confidence, CostAccumulator,
     EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats, ModelInfo,
@@ -208,6 +208,15 @@ pub trait ProviderAdapter {
     fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>>;
     fn archive_scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
         self.scan_candidates(source)
+    }
+    /// Whether the source's archive root is present and can be enumerated.
+    ///
+    /// An empty candidate list means "this archive holds no files" only when
+    /// the root exists. From an unmounted volume, a renamed home directory, or
+    /// a `--source` pointing somewhere absent it means "unavailable", and
+    /// callers must not read deletions into it.
+    fn archive_root_available(&self, source: &SourceLocation) -> bool {
+        source_root_path(source).is_some_and(|root| root.is_dir())
     }
     fn probe_verified_source_state(
         &self,
@@ -6168,41 +6177,6 @@ fn read_git_head_branch(git_dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head = text.trim();
     head.strip_prefix("ref: refs/heads/").map(ToOwned::to_owned)
-}
-
-fn normalize_git_remote(value: &str) -> Option<String> {
-    let trimmed = value.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let host_and_path = if let Some(rest) = trimmed.strip_prefix("git@") {
-        let (host, path) = rest.split_once(':')?;
-        format!("{host}/{path}")
-    } else if let Some((_, rest)) = trimmed.split_once("://") {
-        let rest = rest.trim_start_matches('/');
-        let (authority, path) = rest.split_once('/')?;
-        let host = authority.rsplit('@').next().unwrap_or(authority);
-        format!("{host}/{path}")
-    } else {
-        trimmed.to_string()
-    };
-
-    let mut parts: Vec<String> = host_and_path
-        .split('/')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_ascii_lowercase())
-        .collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    if let Some(last) = parts.last_mut() {
-        if let Some(stripped) = last.strip_suffix(".git") {
-            *last = stripped.to_string();
-        }
-    }
-    Some(parts.join("/"))
 }
 
 fn repo_label_from_normalized_remote(remote: &str) -> String {
