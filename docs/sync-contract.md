@@ -22,6 +22,10 @@ their repository. If an actively referenced repository temporarily fails to
 scan, its last successful snapshot is retained with partial Git coverage;
 unreferenced repository scans are retired from derived metrics and local cache.
 
+Removing a source's data rebuilds metrics whether or not any reconstructed edits
+went with it, because committed churn is discovered from the project paths
+carried by usage rather than from traces.
+
 ## Producer
 
 The CLI produces a sync batch with:

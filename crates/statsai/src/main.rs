@@ -1598,10 +1598,14 @@ fn source(command: SourceCommand, store: &Store, device_id: &str) -> Result<()> 
                     0
                 };
             let deleted = store.delete_source(&source_id)?;
-            // The metrics built from those traces are already materialized and
+            // Metrics built from this source's data are already materialized and
             // the authoritative snapshot keeps republishing them, so they are
             // rebuilt now rather than left live until the next collect or sync.
-            let rebuilt_code_change_metrics = if deleted_trace_edits > 0 {
+            // Traces are not the only input: committed metrics are discovered
+            // from the project paths carried by usage summaries, so a source that
+            // produced Git-derived churn but no reconstructed edits orphans them
+            // just as surely. Any data deletion therefore rebuilds.
+            let rebuilt_code_change_metrics = if delete_data {
                 store.refresh_code_changes(device_id)?.metrics
             } else {
                 0
@@ -11533,6 +11537,95 @@ mod tests {
             manual.provider_account_id
         );
         assert_eq!(assignments[0].record_source, IdentitySource::UserConfigured);
+    }
+
+    #[test]
+    fn source_remove_delete_data_retires_committed_metrics_without_any_traces() {
+        let repository = tempfile::TempDir::new().expect("temporary repository");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .status()
+                .expect("run git");
+            assert!(status.success());
+        }
+        std::fs::write(repository.path().join("main.rs"), "fn main() {}\n").expect("write source");
+        for args in [&["add", "main.rs"][..], &["commit", "-qm", "initial"]] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .status()
+                .expect("run git");
+            assert!(status.success());
+        }
+
+        let store = Store::in_memory().expect("store");
+        let committed_source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-committed-only"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&committed_source).expect("source");
+
+        // Usage carries the project path, which is how committed churn is
+        // discovered. This source has no archive and therefore no reconstructed
+        // edits at all.
+        let now = Utc
+            .with_ymd_and_hms(2026, 6, 1, 10, 0, 0)
+            .single()
+            .expect("now");
+        let mut summary = test_summary("codex", &committed_source, now, 100, None);
+        summary.project = Some(ProjectInfo {
+            project_id: "project-committed-only".to_string(),
+            project_label: None,
+            repo_remote_hash: None,
+            repo_label: None,
+            branch_hash: None,
+            branch_label: None,
+            path_hash: None,
+            path_label: Some(repository.path().to_string_lossy().to_string()),
+        });
+        store.upsert_summaries(&[summary]).expect("summary");
+
+        store
+            .refresh_code_changes("device")
+            .expect("measure committed churn");
+        assert!(store.list_trace_edits().expect("traces").is_empty());
+        assert_eq!(
+            store
+                .list_code_change_metrics(false)
+                .expect("metrics before")
+                .len(),
+            1
+        );
+
+        // Removing the source deletes the usage that carried the project path,
+        // so nothing references the repository any more. Rebuilding only when
+        // traces were dropped left these metrics materialized and the
+        // authoritative snapshot republishing them.
+        source(
+            SourceCommand {
+                command: SourceSubcommand::Remove {
+                    source_id: committed_source.source_id.0.clone(),
+                    delete_data: true,
+                },
+            },
+            &store,
+            "device",
+        )
+        .expect("remove source");
+
+        assert!(store
+            .list_code_change_metrics(false)
+            .expect("metrics after")
+            .is_empty());
     }
 
     #[test]
