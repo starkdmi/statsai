@@ -14,13 +14,38 @@ a Cloudflare Worker backed by D1 and Better Auth device tokens.
 
 Local Git collection is deliberately bounded: it inspects the current `HEAD`
 and local branches, includes only commits from the last 90 days whose committer
-email matches the repository's configured `user.email`, and ignores
-remote-tracking-only history. Repositories without a configured Git email report
-Git coverage as unavailable instead of attributing commits speculatively.
+email matches an identity the repository has been scanned under, and ignores
+remote-tracking-only history. A repository no committer identity has ever been
+known for is not scanned at all, rather than attributing commits speculatively
+or reporting an empty scan as authoritative.
 Stored Git scans are retained only while a current project or trace references
 their repository. If an actively referenced repository temporarily fails to
 scan, its last successful snapshot is retained with partial Git coverage;
-unreferenced repository scans are retired from derived metrics and local cache.
+unreferenced repository scans are retired from derived metrics and local cache,
+including the aged metrics that the rolling window can no longer rebuild.
+
+A repository is known by two names, its identity hash and its worktree root, and
+either can change while the repository stays exactly where it was: adding an
+origin remote re-keys it, and moving a worktree relocates it. Each stored
+repository is therefore claimed by the scan that is the same repository, and its
+aged metrics are rewritten onto the hash it goes by now, so retirement only ever
+compares against hashes still in use.
+
+Exempting a renamed repository from retirement is not sufficient, because a
+re-keyed repository leaves aged metrics under a hash it has stopped using: once
+that scan row is gone, no later refresh has any record of the old hash, so those
+rows match nothing, survive every retirement decision, and are republished
+indefinitely. Lineage is established by a shared worktree root, or failing that
+by a shared commit — commit hashes are globally unique, so an overlap proves two
+scans are the same repository even when both of its names changed at once.
+
+Remembered committer identities are looked up under both names for the same
+reason. A re-keyed repository is still found by its root, and a relocated one is
+still found by its hash; either lookup alone would hand the scan an empty set in
+the case the other covers, and the scan would then drop in-window commits made
+under an earlier address and retire them remotely. The root is matched exactly
+rather than by prefix, so a repository nested inside another never inherits its
+parent's identities.
 
 Removing a source's data rebuilds metrics whether or not any reconstructed edits
 went with it, because committed churn is discovered from the project paths

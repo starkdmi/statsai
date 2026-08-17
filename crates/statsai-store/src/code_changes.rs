@@ -322,6 +322,10 @@ impl Store {
         let mut scans = Vec::new();
         let mut refreshed_roots = BTreeSet::new();
         let mut failed_roots = BTreeSet::new();
+        // Identity hashes of repositories that failed to scan, kept beside the
+        // roots so a relocated repository is still recognised as one that failed
+        // rather than one that vanished.
+        let mut failed_repository_hashes = BTreeSet::<String>::new();
         // Roots whose recorded path could not be resolved this run. Whether
         // that is a lost measurement is only decided once every root has been
         // scanned, because a sibling path usually still covers the repository.
@@ -333,7 +337,10 @@ impl Store {
         // of once per project path.
         let mut project_ids_by_root = BTreeMap::<PathBuf, Option<String>>::new();
         for (path, project_id) in repositories {
-            let cache_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            // Resolved through the surviving ancestors rather than by
+            // `canonicalize` alone, so a repository whose directory is gone
+            // still matches the physical root its scan was stored under.
+            let cache_path = statsai_core::canonical_path(&path);
             let cached_root = available_scans
                 .iter()
                 .filter(|scan| cache_path.starts_with(&scan.repository_root))
@@ -382,24 +389,50 @@ impl Store {
                 }
             }
         }
-        let no_identities = BTreeSet::new();
         for (root, project_id) in project_ids_by_root {
-            let cached_scan = available_scans
+            let cached_commits = available_scans
                 .iter()
                 .filter(|scan| root.starts_with(&scan.repository_root))
-                .max_by_key(|scan| scan.repository_root.components().count());
-            let cached_commits = cached_scan.map_or(&[][..], |scan| scan.commits.as_slice());
+                .max_by_key(|scan| scan.repository_root.components().count())
+                .map_or(&[][..], |scan| scan.commits.as_slice());
             // Commits already measured stay this user's work after `user.email`
-            // changes, so the scan matches every identity this repository has
-            // been seen under rather than only the one configured now.
-            let known_identities =
-                cached_scan.map_or(&no_identities, |scan| &scan.committer_identities);
+            // changes, so a scan matches every identity its repository has been
+            // seen under rather than only the one configured now.
+            //
+            // A repository is looked up under both of its names, because either
+            // can change on its own while the repository stays the same work.
+            // Adding an origin remote re-keys it, so only the root still matches;
+            // moving the worktree relocates it, so only the hash still matches.
+            // Either lookup alone loses the identities in the case the other
+            // covers, and the scan would then drop in-window commits made under
+            // an earlier address and retire them remotely. The root is compared
+            // exactly rather than by prefix so a repository nested inside another
+            // never inherits its parent's identities.
+            let resolved_hash = statsai_core::repository_identity_hash(&root).ok();
+            let known_identities = stored_scans
+                .iter()
+                .filter(|scan| {
+                    scan.repository_root == root
+                        || resolved_hash
+                            .as_ref()
+                            .is_some_and(|hash| &scan.repository_hash == hash)
+                })
+                .flat_map(|scan| scan.committer_identities.iter().cloned())
+                .collect::<BTreeSet<_>>();
             let Ok(mut scan) = scan_local_git_repository_cached(
                 &root,
                 project_id.as_deref(),
                 cached_commits,
-                known_identities,
+                &known_identities,
             ) else {
+                // Recorded under both names. A repository that moved and then
+                // failed to scan is reached by its new root, while its stored
+                // snapshot still carries the old one, so retention keyed on the
+                // root alone would drop the snapshot and retire history this
+                // refresh is in no position to rebuild.
+                if let Some(hash) = resolved_hash {
+                    failed_repository_hashes.insert(hash);
+                }
                 failed_roots.insert(root);
                 failed_scans = failed_scans.saturating_add(1);
                 continue;
@@ -423,16 +456,88 @@ impl Store {
                 failed_scans = failed_scans.saturating_add(1);
             }
         }
-        for stored in stored_scans {
-            if failed_roots.contains(&stored.repository_root)
+        for stored in stored_scans.iter() {
+            if (failed_roots.contains(&stored.repository_root)
+                || failed_repository_hashes.contains(&stored.repository_hash))
                 && !refreshed_roots.contains(&stored.repository_root)
                 && !scans
                     .iter()
                     .any(|scan| scan.repository_root == stored.repository_root)
             {
-                scans.push(stored);
+                scans.push(stored.clone());
             }
         }
+        // Repositories nothing reaches any more. Their aged metrics are past the
+        // scan window, so no rebuild can retire them and they would otherwise be
+        // carried forward and republished in every authoritative snapshot
+        // forever.
+        //
+        // A repository answers to two names that change independently: adding an
+        // origin remote re-keys it, and moving the worktree relocates it. Rather
+        // than exempting a stored repository from retirement whenever one of its
+        // names survives, each is claimed by the fresh scan that *is* that
+        // repository, and its aged metrics are rewritten onto the hash it goes by
+        // now.
+        //
+        // Merely exempting it is not enough. A re-keyed repository leaves aged
+        // metrics under a hash it has stopped using, and once that scan row is
+        // gone no later refresh has any record of the old hash, so those rows
+        // match nothing, survive every retirement decision, and are republished in
+        // the authoritative snapshot forever. Rewriting keeps the lineage, so
+        // retirement only ever compares against hashes still in use.
+        //
+        // Lineage is established by the same root, or failing that by a shared
+        // commit: commit hashes are globally unique, so an overlap proves two
+        // scans are the same repository even when both of its names changed in one
+        // refresh.
+        let retained_hashes = scans
+            .iter()
+            .map(|scan| scan.repository_hash.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut current_repository_hashes = BTreeMap::<String, String>::new();
+        for stored in &stored_scans {
+            if retained_hashes.contains(stored.repository_hash.as_str()) {
+                continue;
+            }
+            let stored_commits = stored
+                .commits
+                .iter()
+                .map(|commit| commit.commit_hash.as_str())
+                .collect::<BTreeSet<_>>();
+            let claim = scans
+                .iter()
+                .find(|scan| scan.repository_root == stored.repository_root)
+                .or_else(|| {
+                    // Only for a stored root that is actually gone. Forks and
+                    // second checkouts of the same upstream share commits while
+                    // both still exist, so overlap alone would let one claim the
+                    // other's aged metrics when a checkout is dropped. A
+                    // repository that moved has left its old root behind, which
+                    // distinguishes the two.
+                    if stored.repository_root.exists() {
+                        return None;
+                    }
+                    scans.iter().find(|scan| {
+                        scan.commits
+                            .iter()
+                            .any(|commit| stored_commits.contains(commit.commit_hash.as_str()))
+                    })
+                });
+            if let Some(claim) = claim {
+                current_repository_hashes.insert(
+                    stored.repository_hash.clone(),
+                    claim.repository_hash.clone(),
+                );
+            }
+        }
+        let retired_repository_hashes = stored_scans
+            .iter()
+            .filter(|stored| {
+                !retained_hashes.contains(stored.repository_hash.as_str())
+                    && !current_repository_hashes.contains_key(&stored.repository_hash)
+            })
+            .map(|stored| stored.repository_hash.clone())
+            .collect::<BTreeSet<_>>();
         self.delete_git_scans_except(&scans)?;
         let matches = match_trace_edits_to_commits(&trace_edits, &scans);
         let trace_coverage = self.trace_coverage()?;
@@ -461,7 +566,25 @@ impl Store {
         let retained = self
             .historical_commit_metrics(device_id, statsai_core::git_observation_start_day(now))?
             .into_iter()
+            .filter(|metric| {
+                metric
+                    .repository_hash
+                    .as_deref()
+                    .is_none_or(|hash| !retired_repository_hashes.contains(hash))
+            })
             .map(|mut metric| {
+                // Follow the repository through a re-key, so an aged metric is
+                // never left filed under a hash that no scan will mention again.
+                // The published ID is derived from the repository hash below, so
+                // this has to happen before that: rewriting afterwards would keep
+                // publishing an ID built from a hash the repository no longer has.
+                if let Some(current) = metric
+                    .repository_hash
+                    .as_deref()
+                    .and_then(|hash| current_repository_hashes.get(hash))
+                {
+                    metric.repository_hash = Some(current.clone());
+                }
                 // A metric materialized before hosted login, against a keyless
                 // endpoint, or under a different account carries an ID no other
                 // device can derive. Re-keying it once an account key exists
@@ -524,6 +647,10 @@ impl Store {
     /// no longer be reverified, corrected, or retired when the trace behind it
     /// is deleted. Attribution is therefore a rolling window while the
     /// committed totals it splits remain complete.
+    ///
+    /// Every aged metric is returned; the caller decides which repositories are
+    /// still worth carrying, because only it knows which of them were retired
+    /// this run as opposed to merely re-identified.
     fn historical_commit_metrics(
         &self,
         device_id: &str,
@@ -1589,6 +1716,316 @@ mod tests {
     }
 
     #[test]
+    fn aged_committed_metrics_are_retired_once_their_repository_is_unreferenced() {
+        let repository = TempDir::new().expect("temporary repository");
+        init_test_repository(repository.path());
+
+        let store = Store::in_memory().expect("open store");
+        insert_project_evidence(&store, repository.path(), "project", "summary");
+        store.refresh_code_changes("device").expect("first refresh");
+        seed_aged_committed_metric(&store, "ccm_unreferenced", &stored_repository_hash(&store));
+        store
+            .refresh_code_changes("device")
+            .expect("refresh carries the aged metric");
+        assert!(metric_exists(&store, "ccm_unreferenced"));
+
+        // Nothing references the repository any more. Its aged metrics are past
+        // the scan window, so no rebuild can retire them; carrying them forward
+        // would republish them in every authoritative snapshot indefinitely.
+        store
+            .conn
+            .execute("DELETE FROM usage_summaries", [])
+            .expect("remove project evidence");
+        store
+            .refresh_code_changes("device")
+            .expect("refresh without references");
+
+        assert!(!metric_exists(&store, "ccm_unreferenced"));
+    }
+
+    #[test]
+    fn aged_committed_metrics_survive_a_repository_identity_change() {
+        let repository = TempDir::new().expect("temporary repository");
+        init_test_repository(repository.path());
+
+        let store = Store::in_memory().expect("open store");
+        insert_project_evidence(&store, repository.path(), "project", "summary");
+        store.refresh_code_changes("device").expect("first refresh");
+        let original_hash = stored_repository_hash(&store);
+        seed_aged_committed_metric(&store, "ccm_reidentified", &original_hash);
+
+        // Adding an origin remote re-keys the repository, so its aged metrics
+        // are left under a hash no scan uses. The repository is still referenced
+        // and the work is still the user's, so retirement must follow the
+        // repository root rather than the absence of its old hash.
+        run_test_git(
+            repository.path(),
+            &["remote", "add", "origin", "https://example.com/renamed.git"],
+        );
+        store
+            .refresh_code_changes("device")
+            .expect("refresh after identity change");
+
+        assert_ne!(stored_repository_hash(&store), original_hash);
+        assert!(metric_exists(&store, "ccm_reidentified"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_worktree_keeps_its_scan_when_its_recorded_path_was_logical() {
+        let parent = TempDir::new().expect("temporary parent");
+        let repository = parent.path().join("repo");
+        fs::create_dir_all(&repository).expect("create repository");
+        init_test_repository(&repository);
+
+        // Agents record the path they were invoked with, which can reach the
+        // repository through a symlink. Git reports `rev-parse --show-toplevel`
+        // as the physical path, so the two forms differ.
+        let link_root = TempDir::new().expect("temporary link root");
+        let link = link_root.path().join("link");
+        std::os::unix::fs::symlink(parent.path(), &link).expect("link the parent");
+        let logical_path = link.join("repo");
+
+        let store = Store::in_memory().expect("open store");
+        insert_project_evidence(&store, &logical_path, "project", "summary");
+        let report = store.refresh_code_changes("device").expect("first refresh");
+        assert_eq!(report.commits, 1);
+
+        // The worktree is gone but its parent still resolves. Matching the
+        // recorded path against the stored root by `canonicalize` alone fails
+        // here, which would treat an already-measured repository as one never
+        // seen and delete it as unreferenced.
+        fs::remove_dir_all(&repository).expect("remove the worktree");
+        let refreshed = store
+            .refresh_code_changes("device")
+            .expect("refresh after the worktree vanished");
+
+        assert_eq!(refreshed.commits, 1);
+        assert_eq!(refreshed.git_coverage, CoverageStatus::Partial);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM code_git_scans", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("scan count"),
+            1
+        );
+    }
+
+    /// Repoints the recorded project path at `path`, as a moved worktree would.
+    fn repoint_project_evidence(store: &Store, path: &Path, summary_id: &str) {
+        store
+            .conn
+            .execute("DELETE FROM usage_summaries", [])
+            .expect("drop previous evidence");
+        insert_project_evidence(store, path, "project", summary_id);
+    }
+
+    #[test]
+    fn aged_committed_metrics_survive_a_repository_that_moved() {
+        let parent = TempDir::new().expect("temporary parent");
+        let original = parent.path().join("original");
+        fs::create_dir_all(&original).expect("create repository");
+        init_test_repository(&original);
+
+        let store = Store::in_memory().expect("open store");
+        insert_project_evidence(&store, &original, "project", "summary");
+        store.refresh_code_changes("device").expect("first refresh");
+        let repository_hash = stored_repository_hash(&store);
+        seed_aged_committed_metric(&store, "ccm_moved", &repository_hash);
+        store
+            .refresh_code_changes("device")
+            .expect("refresh carries the aged metric");
+        assert!(metric_exists(&store, "ccm_moved"));
+
+        // Repository identity is derived from the root commits, never the
+        // location, so moving a worktree keeps the hash and only rewrites the
+        // stored path. Deciding retirement from the path alone would read a live
+        // repository as gone and prune days no rebuild can reach.
+        let moved = parent.path().join("moved");
+        fs::rename(&original, &moved).expect("move the repository");
+        repoint_project_evidence(&store, &moved, "summary-moved");
+        store
+            .refresh_code_changes("device")
+            .expect("refresh after the move");
+
+        assert_eq!(stored_repository_hash(&store), repository_hash);
+        assert!(metric_exists(&store, "ccm_moved"));
+    }
+
+    #[test]
+    fn aged_committed_metrics_are_retired_after_a_rekey_then_an_unreference() {
+        let repository = TempDir::new().expect("temporary repository");
+        init_test_repository(repository.path());
+
+        let store = Store::in_memory().expect("open store");
+        insert_project_evidence(&store, repository.path(), "project", "summary");
+        store.refresh_code_changes("device").expect("first refresh");
+        seed_aged_committed_metric(&store, "ccm_rekeyed", &stored_repository_hash(&store));
+
+        // Re-keyed while still referenced: the metric has to survive, but it is
+        // now filed under a hash the repository has stopped using.
+        run_test_git(
+            repository.path(),
+            &["remote", "add", "origin", "https://example.com/renamed.git"],
+        );
+        store
+            .refresh_code_changes("device")
+            .expect("refresh after the re-key");
+        assert!(metric_exists(&store, "ccm_rekeyed"));
+
+        // Unreferenced afterwards. Retirement compares against the hashes the
+        // repository is known by now, so a metric left under a superseded hash
+        // would match nothing, survive every later refresh, and be republished in
+        // the authoritative snapshot forever.
+        store
+            .conn
+            .execute("DELETE FROM usage_summaries", [])
+            .expect("remove project evidence");
+        store
+            .refresh_code_changes("device")
+            .expect("refresh without references");
+
+        assert!(!metric_exists(&store, "ccm_rekeyed"));
+    }
+
+    #[test]
+    fn a_rekeyed_repository_still_recognises_its_remembered_identities() {
+        let repository = TempDir::new().expect("temporary repository");
+        init_test_repository(repository.path());
+
+        let store = Store::in_memory().expect("open store");
+        insert_project_evidence(&store, repository.path(), "project", "summary");
+        let report = store.refresh_code_changes("device").expect("first refresh");
+        assert_eq!(report.commits, 1);
+
+        // Adding an origin remote re-keys the repository while its worktree stays
+        // put, so the identities remembered under the previous hash have to be
+        // handed to the scan by root as well. Selecting them by hash alone misses
+        // here, and `replace_git_scan` then deletes the superseded hash's identity
+        // rows, so the in-window commit made under the earlier address is dropped
+        // from the scan and retired remotely.
+        run_test_git(
+            repository.path(),
+            &["config", "user.email", "renamed@example.com"],
+        );
+        run_test_git(
+            repository.path(),
+            &["remote", "add", "origin", "https://example.com/renamed.git"],
+        );
+        let refreshed = store
+            .refresh_code_changes("device")
+            .expect("refresh after the re-key");
+
+        assert_eq!(refreshed.commits, 1);
+        assert_eq!(refreshed.git_coverage, CoverageStatus::Complete);
+    }
+
+    // Known gap, deliberately left failing rather than weakened into a test that
+    // passes without proving anything. When a repository moves and becomes
+    // unscannable in the same refresh, Git cannot run in the new location, so its
+    // identity hash cannot be derived either and the only remaining identifier is
+    // the path that just changed. Nothing available links the stored snapshot to
+    // the failure, so it is retired and aged days are lost. Closing this needs
+    // retirement driven by reference reachability rather than by diffing scan
+    // sets, which is a design change beyond the retention fix here.
+    #[ignore = "requires reference-reachability-driven retirement"]
+    #[test]
+    fn a_moved_repository_that_then_fails_to_scan_keeps_its_snapshot() {
+        let parent = TempDir::new().expect("temporary parent");
+        let original = parent.path().join("original");
+        fs::create_dir_all(&original).expect("create repository");
+        init_test_repository(&original);
+
+        let store = Store::in_memory().expect("open store");
+        insert_project_evidence(&store, &original, "project", "summary");
+        store.refresh_code_changes("device").expect("first refresh");
+        seed_aged_committed_metric(&store, "ccm_failed", &stored_repository_hash(&store));
+        store
+            .refresh_code_changes("device")
+            .expect("refresh carries the aged metric");
+
+        // Moved, then unable to scan. The failure is reached under the new root
+        // while the stored snapshot still carries the old one, so retention keyed
+        // only on the root would read this as a repository that vanished and
+        // retire days it cannot rebuild.
+        let moved = parent.path().join("moved");
+        fs::rename(&original, &moved).expect("move the repository");
+        repoint_project_evidence(&store, &moved, "summary-moved");
+        fs::rename(moved.join(".git"), moved.join(".git-disabled"))
+            .expect("disable repository metadata");
+
+        let refreshed = store
+            .refresh_code_changes("device")
+            .expect("refresh during the failure");
+
+        assert_eq!(refreshed.commits, 1);
+        assert_eq!(refreshed.git_coverage, CoverageStatus::Partial);
+        assert!(metric_exists(&store, "ccm_failed"));
+    }
+
+    #[test]
+    fn aged_committed_metrics_survive_a_simultaneous_move_and_rekey() {
+        let parent = TempDir::new().expect("temporary parent");
+        let original = parent.path().join("original");
+        fs::create_dir_all(&original).expect("create repository");
+        init_test_repository(&original);
+
+        let store = Store::in_memory().expect("open store");
+        insert_project_evidence(&store, &original, "project", "summary");
+        store.refresh_code_changes("device").expect("first refresh");
+        seed_aged_committed_metric(&store, "ccm_both", &stored_repository_hash(&store));
+        store
+            .refresh_code_changes("device")
+            .expect("refresh carries the aged metric");
+
+        // Both names change at once, so neither identifies the repository any
+        // more. The commits do: they are the same objects, and a commit hash is
+        // globally unique, so the fresh scan is recognised as the same repository
+        // and claims the history stored under the old hash.
+        let moved = parent.path().join("moved");
+        fs::rename(&original, &moved).expect("move the repository");
+        run_test_git(
+            &moved,
+            &["remote", "add", "origin", "https://example.com/renamed.git"],
+        );
+        repoint_project_evidence(&store, &moved, "summary-moved");
+        store
+            .refresh_code_changes("device")
+            .expect("refresh after the move and re-key");
+
+        assert!(metric_exists(&store, "ccm_both"));
+    }
+
+    #[test]
+    fn a_moved_repository_still_recognises_its_remembered_identities() {
+        let parent = TempDir::new().expect("temporary parent");
+        let original = parent.path().join("original");
+        fs::create_dir_all(&original).expect("create repository");
+        init_test_repository(&original);
+
+        let store = Store::in_memory().expect("open store");
+        insert_project_evidence(&store, &original, "project", "summary");
+        let report = store.refresh_code_changes("device").expect("first refresh");
+        assert_eq!(report.commits, 1);
+
+        // The commit belongs to the earlier identity, which is remembered under
+        // the repository hash. Looking those identities up by path prefix finds
+        // nothing once the repository moves, so the scan would recognise only the
+        // address configured now and delete the commit it already measured.
+        run_test_git(&original, &["config", "user.email", "renamed@example.com"]);
+        let moved = parent.path().join("moved");
+        fs::rename(&original, &moved).expect("move the repository");
+        repoint_project_evidence(&store, &moved, "summary-moved");
+        let refreshed = store
+            .refresh_code_changes("device")
+            .expect("refresh after the move");
+
+        assert_eq!(refreshed.commits, 1);
+        assert_eq!(refreshed.git_coverage, CoverageStatus::Complete);
+    }
+
+    #[test]
     fn retiring_a_repository_scan_also_removes_its_commit_rows() {
         let repository = TempDir::new().expect("temporary repository");
         run_test_git(repository.path(), &["init", "-q"]);
@@ -2095,6 +2532,62 @@ mod tests {
             Some(&Some("project-c".to_string()))
         );
         assert_eq!(projects.get(unidentified_path), Some(&None));
+    }
+
+    /// Creates a repository holding exactly one measurable commit.
+    fn init_test_repository(path: &Path) {
+        run_test_git(path, &["init", "-q"]);
+        run_test_git(path, &["config", "user.email", "test@example.com"]);
+        run_test_git(path, &["config", "user.name", "Test"]);
+        fs::write(path.join("main.rs"), "fn main() {}\n").expect("write source");
+        run_test_git(path, &["add", "main.rs"]);
+        run_test_git(path, &["commit", "-qm", "initial"]);
+    }
+
+    /// Seeds an aged committed metric owned by `repository_hash`.
+    ///
+    /// Its day is older than the scan window, so no rebuild can reach it and it
+    /// survives only through the carry-forward path.
+    fn seed_aged_committed_metric(store: &Store, metric_id: &str, repository_hash: &str) {
+        let observation_start_day = statsai_core::git_observation_start_day(Utc::now());
+        let aged = CodeChangeMetric {
+            schema_version: CODE_CHANGE_METRIC_SCHEMA_VERSION.to_string(),
+            metric_id: metric_id.to_string(),
+            device_id: "device".to_string(),
+            day: observation_start_day.pred_opt().expect("historical day"),
+            project_id: Some("project".to_string()),
+            repository_hash: Some(repository_hash.to_string()),
+            commit_hash: Some("aged-commit".to_string()),
+            kind: CodeChangeMetricKind::Committed,
+            counts: CodeLineCounts::classified(CodeCategory::Source, 5, 1),
+            attribution_confidence: None,
+            trace_coverage: CoverageStatus::Unavailable,
+            git_coverage: CoverageStatus::Complete,
+        };
+        store
+            .replace_matches_and_metrics("device", &[], std::slice::from_ref(&aged))
+            .expect("seed aged metric");
+    }
+
+    fn stored_repository_hash(store: &Store) -> String {
+        store
+            .conn
+            .query_row("SELECT repository_hash FROM code_git_scans", [], |row| {
+                row.get(0)
+            })
+            .expect("stored scan")
+    }
+
+    fn metric_exists(store: &Store, metric_id: &str) -> bool {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_change_metrics WHERE metric_id = ?1",
+                [metric_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("metric count")
+            > 0
     }
 
     fn insert_project_evidence(store: &Store, path: &Path, project_id: &str, summary_id: &str) {

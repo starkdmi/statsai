@@ -264,8 +264,38 @@ pub(super) fn canonical_scan_roots(git_scans: &[GitScan]) -> Vec<PathBuf> {
         .collect()
 }
 
-pub(super) fn canonical_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+/// Resolves symlinks in `path` as far as the filesystem still allows.
+///
+/// A recorded path routinely no longer exists: a deleted worktree, a scratch
+/// directory that has been cleaned up. `canonicalize` then fails outright and
+/// leaves the logical path it was recorded as, which cannot be prefix-matched
+/// against a stored Git root: Git reports `rev-parse --show-toplevel` as the
+/// physical path, so a project recorded as `/tmp/project` faces a root stored as
+/// `/private/tmp/project` and the two share no prefix. Resolving the longest
+/// surviving ancestor and re-appending the rest keeps them comparable, so a
+/// repository whose directory is gone is still recognised as one already
+/// measured rather than one never seen.
+///
+/// A path that still exists resolves exactly as before.
+pub fn canonical_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut trailing = Vec::new();
+    let mut current = path;
+    while let Some(parent) = current.parent() {
+        let Some(name) = current.file_name() else {
+            break;
+        };
+        trailing.push(name);
+        if let Ok(canonical) = parent.canonicalize() {
+            let mut resolved = canonical;
+            resolved.extend(trailing.iter().rev());
+            return resolved;
+        }
+        current = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Memoizes canonical paths, since trace edits share a handful of project roots.

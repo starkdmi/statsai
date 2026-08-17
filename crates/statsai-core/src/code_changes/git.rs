@@ -47,10 +47,18 @@ pub fn committer_identity_hash(email: &str) -> String {
 /// identities this repository is known by, and the longest rolling dashboard
 /// window.
 ///
-/// `known_identities` are the blinded addresses earlier scans of this
-/// repository ran under. They are matched in addition to the address configured
-/// now, because reconfiguring `user.email` leaves the existing commits exactly
-/// as they were.
+/// `known_identities` are the blinded addresses earlier scans of this repository
+/// ran under. They are matched in addition to the address configured now,
+/// because reconfiguring `user.email` leaves the existing commits exactly as they
+/// were.
+///
+/// Deciding which remembered identities belong to this repository is the
+/// caller's job, not this scan's. A repository answers to two names that change
+/// independently — its identity hash changes when an origin remote is added, its
+/// root changes when the worktree moves — and only the caller holding the stored
+/// scans can look up both. Selecting by either one alone loses the identities in
+/// the case the other covers, and the scan would then delete in-window commits
+/// made under an earlier address.
 pub fn scan_local_git_repository_cached(
     path: &Path,
     project_id: Option<&str>,
@@ -246,7 +254,13 @@ fn git_patches_for_commits(
     Ok(patches)
 }
 
-fn repository_identity_hash(root: &Path) -> Result<String, GitScanError> {
+/// Derives the stable identity of the repository rooted at `root`.
+///
+/// The identity is its origin remote, or its root commits when it has none, so it
+/// survives the worktree moving and changes only when the repository is re-keyed
+/// by gaining a remote. Callers that hold stored scans need it to recognise a
+/// repository whose location changed.
+pub fn repository_identity_hash(root: &Path) -> Result<String, GitScanError> {
     let remote = run_git_allow_missing(root, &["config", "--get", "remote.origin.url"])?;
     let identity = if remote.trim().is_empty() {
         let roots = run_git(root, &["rev-list", "--max-parents=0", "--all"])?;
@@ -435,6 +449,12 @@ mod tests {
         run_test_git(temp.path(), &["add", "lib.rs"]);
         run_test_git(temp.path(), &["commit", "-qm", "initial"]);
 
+        // Scanning while the identity is configured is how a repository comes to
+        // remember it, so the remembered set comes from the scan itself rather
+        // than being assumed here.
+        let remembered = scan_local_git_repository(temp.path(), None).expect("initial scan");
+        let known = remembered.committer_identities.clone();
+
         // Unsetting the repository value would fall back to the global one, so
         // the configured identity is emptied outright.
         run_test_git(temp.path(), &["config", "user.email", ""]);
@@ -449,12 +469,14 @@ mod tests {
 
         // One remembered identity answers it, so the same repository scans
         // cleanly with no address configured at all.
-        let known = BTreeSet::from([committer_identity_hash("test@example.com")]);
         let scan = scan_local_git_repository_cached(temp.path(), None, &[], &known)
             .expect("scan under a remembered identity");
         assert_eq!(scan.commits.len(), 1);
         assert_eq!(scan.coverage, CoverageStatus::Complete);
-        assert_eq!(scan.committer_identities, known);
+        assert_eq!(
+            scan.committer_identities,
+            BTreeSet::from([committer_identity_hash("test@example.com")])
+        );
     }
 
     #[test]
@@ -466,6 +488,7 @@ mod tests {
         fs::write(temp.path().join("lib.rs"), "one\n").unwrap();
         run_test_git(temp.path(), &["add", "lib.rs"]);
         run_test_git(temp.path(), &["commit", "-qm", "first"]);
+        let remembered = scan_local_git_repository(temp.path(), None).expect("first scan");
 
         run_test_git(temp.path(), &["config", "user.email", "second@example.com"]);
         fs::write(temp.path().join("lib.rs"), "one\ntwo\n").unwrap();
@@ -479,7 +502,7 @@ mod tests {
 
         // Carrying the earlier identity forward recovers it, and the scan
         // reports both identities so the caller can keep remembering them.
-        let known = BTreeSet::from([committer_identity_hash("first@example.com")]);
+        let known = remembered.committer_identities.clone();
         let both = scan_local_git_repository_cached(temp.path(), None, &[], &known).unwrap();
         assert_eq!(both.commits.len(), 2);
         assert_eq!(
