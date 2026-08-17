@@ -27,3 +27,21 @@ fi
 # Warm the dependency and build caches so the workspace is ready to build/test.
 cargo fetch --locked
 cargo build --workspace
+
+# --- optional: expose adapter fixtures as runnable provider sources -----
+# The VM has no real AI-tool history, so `statsai scan` finds nothing.
+# This writes a helper the agent can source when it wants end-to-end data.
+fixtures="$repo_root/crates/statsai-adapters/tests/fixtures"
+if [[ -d "$fixtures" ]]; then
+  cat >"$repo_root/.cursor/use-fixtures.sh" <<EOF
+#!/usr/bin/env bash
+# Point StatsAI at the sanitized adapter fixtures instead of real history.
+# Usage:  source .cursor/use-fixtures.sh
+export CLAUDE_CONFIG_DIR="$fixtures/claude/basic"
+export CODEX_HOME="$fixtures/codex/basic"
+echo "claude + codex fixtures active; register the others with:"
+echo "  statsai source add --provider grok     --path $fixtures/grok/basic"
+echo "  statsai source add --provider opencode --path $fixtures/opencode/sqlite-v2"
+EOF
+  chmod +x "$repo_root/.cursor/use-fixtures.sh"
+fi
