@@ -26,25 +26,77 @@ pub fn default_device_id() -> String {
         }
     }
 
-    let path = device_id_path();
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim();
-        if !existing.is_empty() {
-            return existing.to_string();
+    device_id_at(&device_id_path())
+}
+
+/// Loads or claims the persisted device identity at `path`.
+fn device_id_at(path: &std::path::Path) -> String {
+    // An identity is only ever this process's if this process won the claim.
+    // Every other outcome, including a transient failure while staging, falls
+    // back to reading whatever is already on disk rather than keeping an
+    // identity nobody else will agree with. `generate_device_id` seeds itself
+    // with the current PID and nanosecond, so two callers that both decide to
+    // mint one produce different answers, and any path that returns an unclaimed
+    // identity splits one install's rows across an identity recorded nowhere.
+    for _ in 0..DEVICE_ID_CLAIM_ATTEMPTS {
+        if let Some(existing) = read_device_id(path) {
+            return existing;
+        }
+        let candidate = generate_device_id();
+        if claim_device_id(path, &candidate) {
+            return candidate;
         }
     }
+    // Someone holds it and we could not read it; the next run will agree with
+    // them, and only this run is left guessing.
+    read_device_id(path).unwrap_or_else(generate_device_id)
+}
 
-    let device_id = generate_device_id();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, format!("{device_id}\n"));
+const DEVICE_ID_CLAIM_ATTEMPTS: usize = 8;
+
+fn read_device_id(path: &std::path::Path) -> Option<String> {
+    let existing = std::fs::read_to_string(path).ok()?;
+    let existing = existing.trim();
+    (!existing.is_empty()).then(|| existing.to_string())
+}
+
+/// Publishes `device_id` at `path`, reporting whether this caller claimed it.
+///
+/// The contents are staged in a private file and the claim is a hard link,
+/// which cannot succeed twice and cannot publish a half-written file: creating
+/// the target first and writing afterwards would expose an empty file that a
+/// concurrent caller reads as "no identity yet".
+fn claim_device_id(path: &std::path::Path, device_id: &str) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let _ = std::fs::create_dir_all(parent);
+    let staged = parent.join(format!(
+        ".device-id.{}.{}",
+        std::process::id(),
+        device_id.trim_start_matches("dev_")
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    device_id
+    let staged_written = match options.open(&staged) {
+        Ok(mut file) => file
+            .write_all(format!("{device_id}\n").as_bytes())
+            .and_then(|()| file.sync_all())
+            .is_ok(),
+        Err(_) => false,
+    };
+    if !staged_written {
+        let _ = std::fs::remove_file(&staged);
+        return false;
+    }
+    let claimed = std::fs::hard_link(&staged, path).is_ok();
+    let _ = std::fs::remove_file(&staged);
+    claimed
 }
 
 pub fn generate_device_id() -> String {
@@ -158,6 +210,52 @@ fn read_hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_first_runs_settle_on_one_device_identity() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("state").join("device-id");
+
+        // Every one of these is a first run: none finds a file, so each mints a
+        // distinct identity from its own PID and nanosecond. Only one may end up
+        // owning the install, and the rest have to adopt it rather than keep an
+        // identity recorded nowhere.
+        let claimed = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    scope.spawn(move || device_id_at(&path))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("claim device id"))
+                .collect::<std::collections::BTreeSet<_>>()
+        });
+
+        assert_eq!(
+            claimed.len(),
+            1,
+            "concurrent first runs kept separate identities: {claimed:?}"
+        );
+        let persisted = std::fs::read_to_string(&path).expect("device id file");
+        let persisted = persisted.trim();
+        assert_eq!(claimed.iter().next().expect("claimed id"), persisted);
+        // A later run adopts the same identity rather than minting another.
+        assert_eq!(device_id_at(&path), persisted);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("device id metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 
     #[test]
     fn daemon_auth_token_is_random_persistent_and_private() {

@@ -16,6 +16,11 @@ fn run_statsai(store: &Path, codex_home: &Path, args: &[&str]) -> Output {
         .arg(store)
         .args(args)
         .env("CODEX_HOME", codex_home)
+        // Pinned so every invocation in a test refreshes metrics as the same
+        // device. Metric replacement is deliberately scoped to one device, so an
+        // identity that changed between two runs would leave the first run's rows
+        // untouched and read as a pruning failure.
+        .env("STATSAI_DEVICE_ID", "conversation-cli-test")
         .output()
         .expect("run statsai")
 }
