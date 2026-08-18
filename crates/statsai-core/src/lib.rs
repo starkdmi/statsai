@@ -1194,12 +1194,18 @@ use chrono::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportBound {
+    pub timestamp: DateTime<Utc>,
+    pub date_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportPeriod {
     LastDays(i64),
     AllTime,
     Range {
-        since: Option<DateTime<Utc>>,
-        until: DateTime<Utc>,
+        since: Option<ReportBound>,
+        until: ReportBound,
     },
 }
 
@@ -1262,18 +1268,34 @@ pub fn report_period_from_range(
         return Err(ReportRangeError::MissingBound);
     }
     let since = from
-        .map(|value| parse_report_date_bound(value, false))
+        .map(|value| parse_report_bound(value, false))
         .transpose()?;
-    let until = to
-        .map(|value| parse_report_date_bound(value, true))
-        .transpose()?
-        .unwrap_or(now);
+    let until = match to {
+        Some(value) => parse_report_bound(value, true)?,
+        None => ReportBound {
+            timestamp: now,
+            date_only: false,
+        },
+    };
     if let (Some(since), Some(_)) = (since, to) {
-        if since > until {
-            return Err(ReportRangeError::InvertedRange { since, until });
+        if since.timestamp > until.timestamp {
+            return Err(ReportRangeError::InvertedRange {
+                since: since.timestamp,
+                until: until.timestamp,
+            });
         }
     }
     Ok(ReportPeriod::Range { since, until })
+}
+
+fn parse_report_bound(
+    value: &str,
+    end_of_calendar_day: bool,
+) -> Result<ReportBound, ReportRangeError> {
+    Ok(ReportBound {
+        timestamp: parse_report_date_bound(value, end_of_calendar_day)?,
+        date_only: DateTime::parse_from_rfc3339(value).is_err(),
+    })
 }
 
 impl ReportPeriod {
@@ -1282,7 +1304,9 @@ impl ReportPeriod {
         match self {
             Self::LastDays(days) => (Some(now - Duration::days(days)), now),
             Self::AllTime => (None, now),
-            Self::Range { since, until } => (since, until.min(now)),
+            Self::Range { since, until } => {
+                (since.map(|bound| bound.timestamp), until.timestamp.min(now))
+            }
         }
     }
 
@@ -1308,50 +1332,41 @@ impl ReportPeriod {
                 let (applied_since, applied_until) = self.window(now);
                 if applied_since.is_some_and(|start| start > applied_until) {
                     return match since {
-                        Some(since) if until > now => format!(
+                        Some(since) if until.timestamp > now => format!(
                             "{} to {} (empty)",
-                            format_range_bound(since, false),
-                            format_range_bound(until, true)
+                            format_range_bound(since),
+                            format_range_bound(until)
                         ),
-                        Some(since) => {
-                            format!("from {} (empty)", format_range_bound(since, false))
-                        }
-                        None => format!("through {} (empty)", format_range_bound(until, true)),
+                        Some(since) => format!("from {} (empty)", format_range_bound(since)),
+                        None => format!("through {} (empty)", format_range_bound(until)),
                     };
                 }
-                match applied_since {
+                match since {
                     Some(since) => format!(
                         "{} to {}",
-                        format_range_bound(since, false),
-                        format_range_bound(applied_until, true)
+                        format_range_bound(since),
+                        format_applied_until(applied_until, until)
                     ),
-                    None => format!("through {}", format_range_bound(applied_until, true)),
+                    None => format!("through {}", format_applied_until(applied_until, until)),
                 }
             }
         }
     }
 }
 
-fn format_range_bound(timestamp: DateTime<Utc>, as_end: bool) -> String {
-    if range_bound_is_calendar_day(timestamp, as_end) {
-        timestamp.format("%Y-%m-%d").to_string()
+fn format_range_bound(bound: ReportBound) -> String {
+    if bound.date_only {
+        bound.timestamp.format("%Y-%m-%d").to_string()
     } else {
-        timestamp.to_rfc3339()
+        bound.timestamp.to_rfc3339()
     }
 }
 
-fn range_bound_is_calendar_day(timestamp: DateTime<Utc>, as_end: bool) -> bool {
-    let date = timestamp.date_naive();
-    if as_end {
-        date.succ_opt()
-            .and_then(|next| next.and_hms_opt(0, 0, 0))
-            .is_some_and(|next_midnight| {
-                timestamp == next_midnight.and_utc() - Duration::nanoseconds(1)
-            })
-    } else {
-        date.and_hms_opt(0, 0, 0)
-            .is_some_and(|midnight| timestamp == midnight.and_utc())
-    }
+fn format_applied_until(applied_until: DateTime<Utc>, requested: ReportBound) -> String {
+    format_range_bound(ReportBound {
+        timestamp: applied_until,
+        date_only: requested.date_only && applied_until == requested.timestamp,
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2430,8 +2445,14 @@ mod tests {
         assert_eq!(
             period,
             ReportPeriod::Range {
-                since: Some(mk_dt(2026, 5, 1)),
-                until: now,
+                since: Some(ReportBound {
+                    timestamp: mk_dt(2026, 5, 1),
+                    date_only: true,
+                }),
+                until: ReportBound {
+                    timestamp: now,
+                    date_only: false,
+                },
             }
         );
         assert_eq!(period.label(now), "2026-05-01 to 2026-05-25T00:00:00+00:00");
@@ -2468,8 +2489,14 @@ mod tests {
         assert_eq!(
             period,
             ReportPeriod::Range {
-                since: Some(mk_dt(2026, 9, 1)),
-                until: parse_report_date_bound("2026-09-30", true).expect("end of day"),
+                since: Some(ReportBound {
+                    timestamp: mk_dt(2026, 9, 1),
+                    date_only: true,
+                }),
+                until: ReportBound {
+                    timestamp: parse_report_date_bound("2026-09-30", true).expect("end of day"),
+                    date_only: true,
+                },
             }
         );
         assert_eq!(period.label(now), "2026-09-01 to 2026-09-30 (empty)");
@@ -2495,8 +2522,14 @@ mod tests {
         assert_eq!(
             period,
             ReportPeriod::Range {
-                since: Some(mk_dt(2026, 9, 1)),
-                until: now,
+                since: Some(ReportBound {
+                    timestamp: mk_dt(2026, 9, 1),
+                    date_only: true,
+                }),
+                until: ReportBound {
+                    timestamp: now,
+                    date_only: false,
+                },
             }
         );
         assert_eq!(period.label(now), "from 2026-09-01 (empty)");
@@ -2567,6 +2600,35 @@ mod tests {
         );
         assert_eq!(report.total_events, 1);
         assert_eq!(report.total_usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn report_range_rfc3339_midnight_keeps_timestamp_label() {
+        let now = mk_dt(2026, 5, 25);
+        let period = report_period_from_range(
+            Some("2026-05-01T00:00:00Z"),
+            Some("2026-05-15T23:59:59.999999999Z"),
+            now,
+        )
+        .expect("rfc3339 midnight range");
+
+        assert_eq!(
+            period,
+            ReportPeriod::Range {
+                since: Some(ReportBound {
+                    timestamp: mk_dt(2026, 5, 1),
+                    date_only: false,
+                }),
+                until: ReportBound {
+                    timestamp: parse_report_date_bound("2026-05-15", true).expect("end of day"),
+                    date_only: false,
+                },
+            }
+        );
+        assert_eq!(
+            period.label(now),
+            "2026-05-01T00:00:00+00:00 to 2026-05-15T23:59:59.999999999+00:00"
+        );
     }
 
     #[test]

@@ -3485,10 +3485,7 @@ fn usage_report_from_command(
     let (since, until) = period.window(now);
     let (events, summaries) = match period {
         ReportPeriod::AllTime => (store.events()?, store.summaries()?),
-        _ => (
-            store.events_in_period(since.unwrap_or(DateTime::<Utc>::UNIX_EPOCH), until)?,
-            Vec::new(),
-        ),
+        _ => (store.events_in_period(since, until)?, Vec::new()),
     };
     let report = build_usage_report(
         &events,
@@ -18716,6 +18713,27 @@ mod tests {
     }
 
     #[test]
+    fn report_range_cli_rfc3339_midnight_keeps_timestamp_label() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
+            .single()
+            .expect("now");
+        let command = ReportCommand {
+            command: ReportSubcommand::Range {
+                from: Some("2026-05-01T00:00:00Z".to_string()),
+                to: Some("2026-05-15".to_string()),
+                json: false,
+                verbose: false,
+                subscriptions: false,
+            },
+        };
+        let (report, ..) =
+            usage_report_from_command(command, &store, now).expect("rfc3339 midnight from");
+        assert_eq!(report.label, "2026-05-01T00:00:00+00:00 to 2026-05-15");
+    }
+
+    #[test]
     fn report_range_cli_filters_stored_events() {
         let store = Store::in_memory().expect("store");
         let now = Utc
@@ -18885,6 +18903,51 @@ mod tests {
         assert_eq!(report.since, None);
         assert_eq!(report.total_events, 1);
         assert_eq!(report.total_usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn report_range_cli_to_only_includes_pre_unix_events() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
+            .single()
+            .expect("now");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-report-pre-unix"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let pre_unix = Utc
+            .with_ymd_and_hms(1969, 12, 31, 12, 0, 0)
+            .single()
+            .expect("pre-unix");
+        store
+            .insert_events(&[test_event(
+                "codex",
+                &source,
+                pre_unix,
+                None,
+                TokenParts::total(40),
+            )])
+            .expect("insert events");
+
+        let command = ReportCommand {
+            command: ReportSubcommand::Range {
+                from: None,
+                to: Some("1969-12-31".to_string()),
+                json: false,
+                verbose: false,
+                subscriptions: false,
+            },
+        };
+        let (report, ..) = usage_report_from_command(command, &store, now).expect("pre-unix range");
+        assert_eq!(report.label, "through 1969-12-31");
+        assert_eq!(report.since, None);
+        assert_eq!(report.total_events, 1);
+        assert_eq!(report.total_usage.total_tokens, 40);
     }
 
     #[test]
