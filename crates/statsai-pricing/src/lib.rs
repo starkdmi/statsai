@@ -435,7 +435,7 @@ pub fn estimate_cost_at(
     };
     let model_name = api_equivalent_pricing_model(&observed_name, usage_date)
         .map(ToString::to_string)
-        .unwrap_or(observed_name);
+        .unwrap_or_else(|| observed_name.clone());
     let Some(standard_pricing) = pricing_for_model_on(&model_name, usage_date) else {
         return unknown_cost();
     };
@@ -471,16 +471,16 @@ pub fn estimate_cost_at(
     let cost_cents = micro_usd_to_cents_rounded(cost_micro_usd);
 
     let mut pricing_source = match model_name.as_str() {
-        "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{model_name}"),
+        "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{observed_name}"),
         "grok-build-0.1"
         | "grok-4.3"
         | "grok-4.5"
         | "grok-4.20-multi-agent-0309"
         | "grok-4.20-0309-reasoning"
         | "grok-4.20-0309-non-reasoning" => {
-            format!("xai_api_pricing:{model_name}")
+            format!("xai_api_pricing:{observed_name}")
         }
-        _ => format!("{provider}_api_pricing:{model_name}"),
+        _ => format!("{provider}_api_pricing:{observed_name}"),
     };
     if uses_fast_mode_pricing {
         pricing_source.push_str(":fast");
@@ -1429,11 +1429,15 @@ mod tests {
         );
         assert_eq!(
             review_cost.pricing_source.as_deref(),
-            Some("codex_api_pricing:gpt-5.4")
+            Some("codex_api_pricing:codex-auto-review")
         );
         assert_eq!(
             opencode_cost.pricing_source.as_deref(),
-            Some("opencode_api_pricing:gpt-5.4")
+            Some("opencode_api_pricing:codex-auto-review")
+        );
+        assert_eq!(
+            gpt_5_4_cost.pricing_source.as_deref(),
+            Some("codex_api_pricing:gpt-5.4")
         );
         assert_eq!(review_cost.confidence, Confidence::Medium);
         assert_eq!(
@@ -1468,9 +1472,61 @@ mod tests {
         );
         assert_eq!(
             review_cost.pricing_source.as_deref(),
+            Some("codex_api_pricing:codex-auto-review")
+        );
+        assert_eq!(
+            luna_cost.pricing_source.as_deref(),
             Some("codex_api_pricing:gpt-5.6-luna")
         );
         assert_eq!(review_cost.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn codex_auto_review_reuses_mapped_model_long_context_multipliers() {
+        let review = test_model("codex-auto-review");
+        let gpt_5_4 = test_model("gpt-5.4");
+        let luna = test_model("gpt-5.6-luna");
+        let long_context = UsageCounts {
+            input_tokens: Some(300_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let aggregated = UsageCounts {
+            requests: Some(2),
+            ..long_context.clone()
+        };
+        let before_boundary = parse_utc("2026-07-29T12:00:00Z");
+        let on_boundary = parse_utc("2026-07-30T00:00:00Z");
+
+        let before_review = estimate_cost_at("codex", Some(&review), &long_context, &before_boundary);
+        let before_mapped =
+            estimate_cost_at("codex", Some(&gpt_5_4), &long_context, &before_boundary);
+        let before_aggregate =
+            estimate_cost_at("codex", Some(&review), &aggregated, &before_boundary);
+        let after_review = estimate_cost_at("codex", Some(&review), &long_context, &on_boundary);
+        let after_mapped = estimate_cost_at("codex", Some(&luna), &long_context, &on_boundary);
+
+        assert_eq!(
+            before_review.estimated_api_equivalent_micro_usd,
+            before_mapped.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(
+            after_review.estimated_api_equivalent_micro_usd,
+            after_mapped.estimated_api_equivalent_micro_usd
+        );
+        assert_ne!(
+            before_review.estimated_api_equivalent_micro_usd,
+            before_aggregate.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(
+            before_review.pricing_source.as_deref(),
+            Some("codex_api_pricing:codex-auto-review")
+        );
+        assert_eq!(
+            after_review.pricing_source.as_deref(),
+            Some("codex_api_pricing:codex-auto-review")
+        );
     }
 
     #[test]
