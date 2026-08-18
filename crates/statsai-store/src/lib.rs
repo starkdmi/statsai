@@ -1870,22 +1870,37 @@ impl Store {
 
     pub fn events_in_period(
         &self,
-        since: DateTime<Utc>,
+        since: Option<DateTime<Utc>>,
         until: DateTime<Utc>,
     ) -> Result<Vec<UsageEvent>> {
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT payload FROM usage_events
-            WHERE started_at >= ?1 AND started_at <= ?2
-            ORDER BY started_at, event_id
-            "#,
-        )?;
-        let rows = stmt.query_map(params![since.to_rfc3339(), until.to_rfc3339()], |row| {
-            row.get::<_, String>(0)
-        })?;
         let mut events = Vec::new();
-        for row in rows {
-            events.push(serde_json::from_str(&row?)?);
+        if let Some(since) = since {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT payload FROM usage_events
+                WHERE started_at >= ?1 AND started_at <= ?2
+                ORDER BY started_at, event_id
+                "#,
+            )?;
+            let rows = stmt.query_map(params![since.to_rfc3339(), until.to_rfc3339()], |row| {
+                row.get::<_, String>(0)
+            })?;
+            for row in rows {
+                events.push(serde_json::from_str(&row?)?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT payload FROM usage_events
+                WHERE started_at <= ?1
+                ORDER BY started_at, event_id
+                "#,
+            )?;
+            let rows =
+                stmt.query_map(params![until.to_rfc3339()], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                events.push(serde_json::from_str(&row?)?);
+            }
         }
         Ok(events)
     }
@@ -9960,6 +9975,48 @@ mod tests {
                 include_tasks: true,
             }
         );
+    }
+
+    #[test]
+    fn events_in_period_without_since_includes_pre_unix_history() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-pre-unix"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let pre_unix = Utc
+            .with_ymd_and_hms(1969, 12, 31, 12, 0, 0)
+            .single()
+            .expect("pre-unix");
+        let after = Utc
+            .with_ymd_and_hms(1970, 1, 2, 12, 0, 0)
+            .single()
+            .expect("after");
+        store
+            .insert_events(&[
+                test_store_event(&source, pre_unix, "pre-unix"),
+                test_store_event(&source, after, "after"),
+            ])
+            .expect("insert events");
+        let until = Utc
+            .with_ymd_and_hms(1969, 12, 31, 23, 59, 59)
+            .single()
+            .expect("end of 1969");
+
+        let unbounded = store
+            .events_in_period(None, until)
+            .expect("unbounded through 1969");
+        assert_eq!(unbounded.len(), 1);
+        assert_eq!(unbounded[0].session.started_at, pre_unix);
+
+        let epoch_floor = store
+            .events_in_period(Some(DateTime::<Utc>::UNIX_EPOCH), until)
+            .expect("epoch floor");
+        assert!(epoch_floor.is_empty());
     }
 
     fn test_store_event(

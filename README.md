@@ -124,6 +124,7 @@ statsai scan
 statsai report weekly
 statsai report monthly
 statsai report all-time
+statsai report range --from 2026-01-01 --to 2026-03-31
 ```
 
 Scans are idempotent: running the same scan again refreshes improved metadata
@@ -335,6 +336,8 @@ statsai scan --replace
 statsai report weekly
 statsai report monthly --subscriptions
 statsai report all-time --json --verbose
+statsai report range --from 2026-01-01 --to 2026-03-31
+statsai report range --from 2026-05-01 --json
 ```
 
 Normal scans use a per-source file signature cache. `--no-cache` forces a
