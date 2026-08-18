@@ -81,6 +81,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("gpt-5.4") {
         return Some("gpt-5.4");
     }
+    if lower.contains("codex-auto-review") {
+        return Some("codex-auto-review");
+    }
     if lower.contains("gpt-5.1-codex-mini") {
         return Some("gpt-5-mini");
     }
@@ -186,6 +189,7 @@ pub fn normalize_model_name(name: &str) -> String {
         "gpt-5.1-codex-mini" => "gpt-5-mini".to_string(),
         "gpt-5.2" | "gpt-5.2-chat-latest" | "gpt-5.2-codex" => "gpt-5.2".to_string(),
         "gpt-5.3-codex" => "gpt-5.3-codex".to_string(),
+        "codex-auto-review" => "codex-auto-review".to_string(),
         "gpt-5.4" => "gpt-5.4".to_string(),
         "gpt-5.4-mini" => "gpt-5.4-mini".to_string(),
         "gpt-5.6-sol" => "gpt-5.6-sol".to_string(),
@@ -217,6 +221,7 @@ pub struct ModelPricing {
 }
 
 const CLAUDE_SONNET_5_STANDARD_PRICING_START: (i32, u32, u32) = (2026, 9, 1);
+const GPT_5_6_LUNA_TERRA_PRICE_CUT_START: (i32, u32, u32) = (2026, 7, 30);
 
 fn pricing(
     input_per_million: f64,
@@ -272,8 +277,50 @@ pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
     pricing_for_model_on(model_name, Utc::now().date_naive())
 }
 
+fn date_tuple(date: chrono::NaiveDate) -> (i32, u32, u32) {
+    (date.year(), date.month(), date.day())
+}
+
+/// Maps an observed model to the catalog model whose rates should be reused.
+///
+/// Observed identity stays unchanged; this mapping is pricing-only.
+fn api_equivalent_pricing_model(
+    model_name: &str,
+    usage_date: chrono::NaiveDate,
+) -> Option<&'static str> {
+    match model_name {
+        "codex-auto-review" => {
+            if date_tuple(usage_date) >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START {
+                Some("gpt-5.6-luna")
+            } else {
+                Some("gpt-5.4")
+            }
+        }
+        _ => None,
+    }
+}
+
+fn gpt_5_6_luna_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
+    if date_tuple(usage_date) >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START {
+        pricing_with_cache_creation(0.2, 0.25, 0.02, 1.2)
+    } else {
+        pricing_with_cache_creation(1.0, 1.25, 0.1, 6.0)
+    }
+}
+
+fn gpt_5_6_terra_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
+    if date_tuple(usage_date) >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START {
+        pricing_with_cache_creation(2.0, 2.5, 0.2, 12.0)
+    } else {
+        pricing_with_cache_creation(2.5, 3.125, 0.25, 15.0)
+    }
+}
+
 fn pricing_for_model_on(model_name: &str, usage_date: chrono::NaiveDate) -> Option<ModelPricing> {
     let normalized = model_name.to_ascii_lowercase();
+    if let Some(mapped) = api_equivalent_pricing_model(&normalized, usage_date) {
+        return pricing_for_model_on(mapped, usage_date);
+    }
     match normalized.as_str() {
         "claude-fable-5" | "claude-mythos-5" => {
             Some(pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0))
@@ -299,8 +346,8 @@ fn pricing_for_model_on(model_name: &str, usage_date: chrono::NaiveDate) -> Opti
         "claude-haiku-4-5" => Some(pricing_with_cache_creation(1.0, 1.25, 0.1, 5.0)),
         // GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount.
         "gpt-5.6-sol" => Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 30.0)),
-        "gpt-5.6-terra" => Some(pricing_with_cache_creation(2.5, 3.125, 0.25, 15.0)),
-        "gpt-5.6-luna" => Some(pricing_with_cache_creation(1.0, 1.25, 0.1, 6.0)),
+        "gpt-5.6-terra" => Some(gpt_5_6_terra_pricing(usage_date)),
+        "gpt-5.6-luna" => Some(gpt_5_6_luna_pricing(usage_date)),
         "gpt-5.5" => Some(pricing(5.0, 0.5, 30.0)),
         "gpt-5.4" => Some(pricing(2.5, 0.25, 15.0)),
         "gpt-5.4-mini" => Some(pricing(0.75, 0.075, 4.5)),
@@ -343,17 +390,16 @@ pub fn pricing_changes_between(
     } else {
         (period_end, period_start)
     };
-    let start = (
-        period_start.year(),
-        period_start.month(),
-        period_start.day(),
-    );
-    let end = (period_end.year(), period_end.month(), period_end.day());
+    let start = date_tuple(period_start);
+    let end = date_tuple(period_end);
 
     match normalize_model_name(model_name).as_str() {
         "claude-sonnet-5" => {
             start < CLAUDE_SONNET_5_STANDARD_PRICING_START
                 && end >= CLAUDE_SONNET_5_STANDARD_PRICING_START
+        }
+        "gpt-5.6-luna" | "gpt-5.6-terra" | "codex-auto-review" => {
+            start < GPT_5_6_LUNA_TERRA_PRICE_CUT_START && end >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START
         }
         _ => false,
     }
@@ -399,9 +445,12 @@ pub fn estimate_cost_at(
     let Some(model) = model else {
         return unknown_cost();
     };
-    let Some(model_name) = priced_model_name(model, usage_date) else {
+    let Some(observed_name) = priced_model_name(model, usage_date) else {
         return unknown_cost();
     };
+    let model_name = api_equivalent_pricing_model(&observed_name, usage_date)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| observed_name.clone());
     let Some(standard_pricing) = pricing_for_model_on(&model_name, usage_date) else {
         return unknown_cost();
     };
@@ -437,16 +486,16 @@ pub fn estimate_cost_at(
     let cost_cents = micro_usd_to_cents_rounded(cost_micro_usd);
 
     let mut pricing_source = match model_name.as_str() {
-        "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{model_name}"),
+        "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{observed_name}"),
         "grok-build-0.1"
         | "grok-4.3"
         | "grok-4.5"
         | "grok-4.20-multi-agent-0309"
         | "grok-4.20-0309-reasoning"
         | "grok-4.20-0309-non-reasoning" => {
-            format!("xai_api_pricing:{model_name}")
+            format!("xai_api_pricing:{observed_name}")
         }
-        _ => format!("{provider}_api_pricing:{model_name}"),
+        _ => format!("{provider}_api_pricing:{observed_name}"),
     };
     if uses_fast_mode_pricing {
         pricing_source.push_str(":fast");
@@ -1187,11 +1236,12 @@ mod tests {
             output_tokens: Some(1_000_000),
             ..UsageCounts::default()
         };
+        let after_price_cut = parse_utc("2026-07-30T00:00:00Z");
 
         for (model_name, expected_cents) in [
             ("gpt-5.6-sol", 4_175),
-            ("gpt-5.6-terra", 2_088),
-            ("gpt-5.6-luna", 835),
+            ("gpt-5.6-terra", 1_670),
+            ("gpt-5.6-luna", 167),
         ] {
             let model = statsai_core::ModelInfo {
                 name: Some(model_name.to_string()),
@@ -1202,7 +1252,7 @@ mod tests {
                 reasoning_level_raw: None,
             };
 
-            let cost = estimate_cost("codex", Some(&model), &usage);
+            let cost = estimate_cost_at("codex", Some(&model), &usage, &after_price_cut);
             let expected_source = format!("codex_api_pricing:{model_name}");
             assert_eq!(cost.estimated_api_equivalent_usd, Some(expected_cents));
             assert_eq!(
@@ -1283,10 +1333,11 @@ mod tests {
             ..UsageCounts::default()
         };
 
-        let cost = estimate_cost("codex", Some(&model), &usage);
+        let after_price_cut = parse_utc("2026-07-30T00:00:00Z");
+        let cost = estimate_cost_at("codex", Some(&model), &usage, &after_price_cut);
 
-        assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(1_725_000));
-        assert_eq!(cost.estimated_api_equivalent_usd, Some(173));
+        assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(1_380_000));
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(138));
     }
 
     #[test]
@@ -1333,5 +1384,266 @@ mod tests {
         ));
         assert!(!pricing_changes_between("claude-sonnet-5", boundary, after));
         assert!(!pricing_changes_between("claude-opus-5", before, after));
+    }
+
+    fn test_model(name: &str) -> statsai_core::ModelInfo {
+        statsai_core::ModelInfo {
+            name: Some(name.to_string()),
+            normalized_name: Some(name.to_string()),
+            provider_model_id: Some(name.to_string()),
+            speed: None,
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        }
+    }
+
+    fn parse_utc(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn preserves_codex_auto_review_observed_identity() {
+        assert_eq!(
+            normalize_model_name("codex-auto-review"),
+            "codex-auto-review"
+        );
+        assert_eq!(
+            normalize_model_name("openai/codex-auto-review"),
+            "codex-auto-review"
+        );
+        assert_eq!(
+            normalize_model_name("relay/codex-auto-review"),
+            "codex-auto-review"
+        );
+    }
+
+    #[test]
+    fn codex_auto_review_reuses_gpt_5_4_rates_before_july_30() {
+        let review = test_model("codex-auto-review");
+        let gpt_5_4 = test_model("gpt-5.4");
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_creation_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+        let before_boundary = parse_utc("2026-07-29T23:59:59Z");
+
+        let review_cost = estimate_cost_at("codex", Some(&review), &usage, &before_boundary);
+        let gpt_5_4_cost = estimate_cost_at("codex", Some(&gpt_5_4), &usage, &before_boundary);
+        let opencode_cost = estimate_cost_at("opencode", Some(&review), &usage, &before_boundary);
+
+        assert_eq!(
+            review_cost.estimated_api_equivalent_usd,
+            gpt_5_4_cost.estimated_api_equivalent_usd
+        );
+        assert_eq!(
+            review_cost.estimated_api_equivalent_micro_usd,
+            gpt_5_4_cost.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(
+            review_cost.pricing_source.as_deref(),
+            Some("codex_api_pricing:codex-auto-review")
+        );
+        assert_eq!(
+            opencode_cost.pricing_source.as_deref(),
+            Some("opencode_api_pricing:codex-auto-review")
+        );
+        assert_eq!(
+            gpt_5_4_cost.pricing_source.as_deref(),
+            Some("codex_api_pricing:gpt-5.4")
+        );
+        assert_eq!(review_cost.confidence, Confidence::Medium);
+        assert_eq!(
+            review_cost.pricing_version.as_deref(),
+            Some(PRICING_CATALOG_VERSION)
+        );
+    }
+
+    #[test]
+    fn codex_auto_review_reuses_luna_rates_from_july_30() {
+        let review = test_model("codex-auto-review");
+        let luna = test_model("gpt-5.6-luna");
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_creation_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+        let on_boundary = parse_utc("2026-07-30T00:00:00Z");
+
+        let review_cost = estimate_cost_at("codex", Some(&review), &usage, &on_boundary);
+        let luna_cost = estimate_cost_at("codex", Some(&luna), &usage, &on_boundary);
+
+        assert_eq!(
+            review_cost.estimated_api_equivalent_usd,
+            luna_cost.estimated_api_equivalent_usd
+        );
+        assert_eq!(
+            review_cost.estimated_api_equivalent_micro_usd,
+            luna_cost.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(review_cost.estimated_api_equivalent_usd, Some(167));
+        assert_eq!(luna_cost.estimated_api_equivalent_usd, Some(167));
+        assert_eq!(
+            review_cost.estimated_api_equivalent_micro_usd,
+            Some(1_670_000)
+        );
+        assert_eq!(
+            review_cost.pricing_source.as_deref(),
+            Some("codex_api_pricing:codex-auto-review")
+        );
+        assert_eq!(
+            luna_cost.pricing_source.as_deref(),
+            Some("codex_api_pricing:gpt-5.6-luna")
+        );
+        assert_eq!(review_cost.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn codex_auto_review_reuses_mapped_model_long_context_multipliers() {
+        let review = test_model("codex-auto-review");
+        let gpt_5_4 = test_model("gpt-5.4");
+        let luna = test_model("gpt-5.6-luna");
+        let long_context = UsageCounts {
+            input_tokens: Some(300_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let aggregated = UsageCounts {
+            requests: Some(2),
+            ..long_context.clone()
+        };
+        let before_boundary = parse_utc("2026-07-29T12:00:00Z");
+        let on_boundary = parse_utc("2026-07-30T00:00:00Z");
+
+        let before_review =
+            estimate_cost_at("codex", Some(&review), &long_context, &before_boundary);
+        let before_mapped =
+            estimate_cost_at("codex", Some(&gpt_5_4), &long_context, &before_boundary);
+        let before_aggregate =
+            estimate_cost_at("codex", Some(&review), &aggregated, &before_boundary);
+        let after_review = estimate_cost_at("codex", Some(&review), &long_context, &on_boundary);
+        let after_mapped = estimate_cost_at("codex", Some(&luna), &long_context, &on_boundary);
+
+        assert_eq!(
+            before_review.estimated_api_equivalent_micro_usd,
+            before_mapped.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(
+            after_review.estimated_api_equivalent_micro_usd,
+            after_mapped.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(
+            after_review.estimated_api_equivalent_micro_usd,
+            Some(138_000)
+        );
+        assert_ne!(
+            before_review.estimated_api_equivalent_micro_usd,
+            before_aggregate.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(
+            before_review.pricing_source.as_deref(),
+            Some("codex_api_pricing:codex-auto-review")
+        );
+        assert_eq!(
+            after_review.pricing_source.as_deref(),
+            Some("codex_api_pricing:codex-auto-review")
+        );
+    }
+
+    #[test]
+    fn codex_auto_review_reports_aggregate_periods_that_cross_its_equivalent_change() {
+        let before = chrono::NaiveDate::from_ymd_opt(2026, 7, 29).expect("before boundary");
+        let boundary = chrono::NaiveDate::from_ymd_opt(2026, 7, 30).expect("boundary");
+        let after = chrono::NaiveDate::from_ymd_opt(2026, 7, 31).expect("after boundary");
+
+        assert!(pricing_changes_between(
+            "codex-auto-review",
+            before,
+            boundary
+        ));
+        assert!(pricing_changes_between(
+            "openai/codex-auto-review",
+            after,
+            before
+        ));
+        assert!(!pricing_changes_between(
+            "codex-auto-review",
+            boundary,
+            after
+        ));
+        assert!(!pricing_changes_between("gpt-5.4", before, after));
+    }
+
+    #[test]
+    fn gpt_5_6_luna_and_terra_pricing_uses_usage_date() {
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_creation_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
+        let before_boundary = parse_utc("2026-07-29T23:59:59Z");
+        let on_boundary = parse_utc("2026-07-30T00:00:00Z");
+
+        let luna = estimate_cost_at(
+            "codex",
+            Some(&test_model("gpt-5.6-luna")),
+            &usage,
+            &before_boundary,
+        );
+        let luna_cut = estimate_cost_at(
+            "codex",
+            Some(&test_model("gpt-5.6-luna")),
+            &usage,
+            &on_boundary,
+        );
+        let terra = estimate_cost_at(
+            "codex",
+            Some(&test_model("gpt-5.6-terra")),
+            &usage,
+            &before_boundary,
+        );
+        let terra_cut = estimate_cost_at(
+            "codex",
+            Some(&test_model("gpt-5.6-terra")),
+            &usage,
+            &on_boundary,
+        );
+
+        assert_eq!(luna.estimated_api_equivalent_usd, Some(835));
+        assert_eq!(luna_cut.estimated_api_equivalent_usd, Some(167));
+        assert_eq!(terra.estimated_api_equivalent_usd, Some(2_088));
+        assert_eq!(terra_cut.estimated_api_equivalent_usd, Some(1_670));
+    }
+
+    #[test]
+    fn gpt_5_6_luna_and_terra_report_aggregate_periods_that_cross_the_july_30_cut() {
+        let before = chrono::NaiveDate::from_ymd_opt(2026, 7, 29).expect("before boundary");
+        let boundary = chrono::NaiveDate::from_ymd_opt(2026, 7, 30).expect("boundary");
+        let after = chrono::NaiveDate::from_ymd_opt(2026, 7, 31).expect("after boundary");
+
+        assert!(pricing_changes_between("gpt-5.6-luna", before, boundary));
+        assert!(pricing_changes_between(
+            "openai/gpt-5.6-luna",
+            after,
+            before
+        ));
+        assert!(pricing_changes_between("gpt-5.6-terra", before, boundary));
+        assert!(pricing_changes_between(
+            "openai/gpt-5.6-terra",
+            after,
+            before
+        ));
+        assert!(!pricing_changes_between("gpt-5.6-luna", boundary, after));
+        assert!(!pricing_changes_between("gpt-5.6-terra", boundary, after));
+        assert!(!pricing_changes_between("gpt-5.6-sol", before, after));
     }
 }
