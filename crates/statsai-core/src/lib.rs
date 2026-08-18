@@ -1209,12 +1209,12 @@ pub enum ReportRangeError {
     InvalidDate { value: String },
     #[error("date is out of range")]
     DateOutOfRange,
-    #[error("--from ({since}) must be earlier than or equal to --to ({until})")]
+    #[error("range start ({since}) must be earlier than or equal to range end ({until})")]
     InvertedRange {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     },
-    #[error("provide --from and/or --to")]
+    #[error("provide a range start and/or end")]
     MissingBound,
 }
 
@@ -1247,10 +1247,12 @@ pub fn parse_report_date_bound(
     Ok(datetime.and_utc())
 }
 
-/// Build a custom report window from optional `--from` / `--to` strings.
+/// Build a custom report window from optional start / end strings.
 ///
-/// A missing `--to` ends at `now`. A missing `--from` starts at the beginning
-/// of stored history. `--to` in the future is clamped to `now`.
+/// A missing end bound uses `now`. A missing start bound means the beginning
+/// of stored history. A future end is left as requested; [`ReportPeriod::window`]
+/// clamps it to `now` when the report is built so future windows stay valid
+/// and simply yield no events.
 pub fn report_period_from_range(
     from: Option<&str>,
     to: Option<&str>,
@@ -1265,8 +1267,7 @@ pub fn report_period_from_range(
     let until = to
         .map(|value| parse_report_date_bound(value, true))
         .transpose()?
-        .unwrap_or(now)
-        .min(now);
+        .unwrap_or(now);
     if let Some(since) = since {
         if since > until {
             return Err(ReportRangeError::InvertedRange { since, until });
@@ -1286,24 +1287,43 @@ impl ReportPeriod {
     }
 
     #[must_use]
-    pub fn label(self, now: DateTime<Utc>) -> String {
+    pub fn label(self, _now: DateTime<Utc>) -> String {
         match self {
             Self::LastDays(7) => "last 7 days".to_string(),
             Self::LastDays(30) => "last 30 days".to_string(),
             Self::LastDays(days) => format!("last {days} days"),
             Self::AllTime => "all time".to_string(),
-            Self::Range { since, .. } => {
-                let (_, until) = self.window(now);
-                match since {
-                    Some(since) => format!(
-                        "{} to {}",
-                        since.format("%Y-%m-%d"),
-                        until.format("%Y-%m-%d")
-                    ),
-                    None => format!("through {}", until.format("%Y-%m-%d")),
-                }
-            }
+            Self::Range { since, until } => match since {
+                Some(since) => format!(
+                    "{} to {}",
+                    format_range_bound(since, false),
+                    format_range_bound(until, true)
+                ),
+                None => format!("through {}", format_range_bound(until, true)),
+            },
         }
+    }
+}
+
+fn format_range_bound(timestamp: DateTime<Utc>, as_end: bool) -> String {
+    if range_bound_is_calendar_day(timestamp, as_end) {
+        timestamp.format("%Y-%m-%d").to_string()
+    } else {
+        timestamp.to_rfc3339()
+    }
+}
+
+fn range_bound_is_calendar_day(timestamp: DateTime<Utc>, as_end: bool) -> bool {
+    let date = timestamp.date_naive();
+    if as_end {
+        date.succ_opt()
+            .and_then(|next| next.and_hms_opt(0, 0, 0))
+            .is_some_and(|next_midnight| {
+                timestamp == next_midnight.and_utc() - Duration::nanoseconds(1)
+            })
+    } else {
+        date.and_hms_opt(0, 0, 0)
+            .is_some_and(|midnight| timestamp == midnight.and_utc())
     }
 }
 
@@ -2386,7 +2406,7 @@ mod tests {
                 until: now,
             }
         );
-        assert_eq!(period.label(now), "2026-05-01 to 2026-05-25");
+        assert_eq!(period.label(now), "2026-05-01 to 2026-05-25T00:00:00+00:00");
     }
 
     #[test]
@@ -2407,6 +2427,106 @@ mod tests {
             report_period_from_range(None, None, now),
             Err(ReportRangeError::MissingBound)
         );
+    }
+
+    #[test]
+    fn report_range_keeps_future_windows_and_returns_no_events() {
+        let now = mk_dt(2026, 5, 25);
+        let source = test_source("codex", "/tmp/codex");
+        let present = test_event("codex", &source, now, 50, None);
+        let period = report_period_from_range(Some("2026-09-01"), Some("2026-09-30"), now)
+            .expect("future range is valid");
+
+        assert_eq!(
+            period,
+            ReportPeriod::Range {
+                since: Some(mk_dt(2026, 9, 1)),
+                until: parse_report_date_bound("2026-09-30", true).expect("end of day"),
+            }
+        );
+        assert_eq!(period.label(now), "2026-09-01 to 2026-09-30");
+        assert_eq!(period.window(now), (Some(mk_dt(2026, 9, 1)), now));
+
+        let report = build_usage_report(&[present], &[], &[source], &[], &[], period, now);
+        assert_eq!(report.total_events, 0);
+        assert_eq!(report.until, now);
+    }
+
+    #[test]
+    fn report_filters_events_by_rfc3339_clock_bounds() {
+        let now = mk_dt(2026, 5, 25);
+        let source = test_source("codex", "/tmp/codex");
+        let before = test_event(
+            "codex",
+            &source,
+            mk_dt(2026, 5, 10) + Duration::hours(14),
+            50,
+            None,
+        );
+        let inside = test_event(
+            "codex",
+            &source,
+            mk_dt(2026, 5, 10) + Duration::hours(15) + Duration::minutes(30),
+            100,
+            None,
+        );
+        let after = test_event(
+            "codex",
+            &source,
+            mk_dt(2026, 5, 10) + Duration::hours(16) + Duration::minutes(1),
+            200,
+            None,
+        );
+        let period = report_period_from_range(
+            Some("2026-05-10T15:00:00Z"),
+            Some("2026-05-10T16:00:00Z"),
+            now,
+        )
+        .expect("rfc3339 range");
+
+        let report = build_usage_report(
+            &[before, inside, after],
+            &[],
+            &[source],
+            &[],
+            &[],
+            period,
+            now,
+        );
+
+        assert_eq!(
+            report.label,
+            "2026-05-10T15:00:00+00:00 to 2026-05-10T16:00:00+00:00"
+        );
+        assert_eq!(report.total_events, 1);
+        assert_eq!(report.total_usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn report_range_to_today_clamps_until_to_now() {
+        let now = mk_dt(2026, 5, 25) + Duration::hours(12);
+        let source = test_source("codex", "/tmp/codex");
+        let morning = test_event(
+            "codex",
+            &source,
+            mk_dt(2026, 5, 25) + Duration::hours(8),
+            75,
+            None,
+        );
+        let evening = test_event(
+            "codex",
+            &source,
+            mk_dt(2026, 5, 25) + Duration::hours(18),
+            25,
+            None,
+        );
+        let period =
+            report_period_from_range(Some("2026-05-25"), Some("2026-05-25"), now).expect("today");
+
+        let report = build_usage_report(&[morning, evening], &[], &[source], &[], &[], period, now);
+        assert_eq!(report.until, now);
+        assert_eq!(report.total_events, 1);
+        assert_eq!(report.total_usage.total_tokens, 75);
     }
 
     #[test]
@@ -2596,6 +2716,74 @@ mod tests {
             report.subscription_rows[0].ended_at,
             Some(mk_dt(2026, 5, 30))
         );
+        assert_eq!(report.subscription_rows[0].events, 1);
+        assert_eq!(report.subscription_rows[0].usage.total_tokens, 100);
+        assert_eq!(
+            report.subscription_rows[0].usage.estimated_cost_usd,
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn subscription_rows_respect_historical_range_until() {
+        let now = mk_dt(2026, 6, 1);
+        let src = test_source("codex", "/tmp/codex-range-sub");
+        let account_id = provider_account_id("codex", "email:verified@example.com");
+        let account = ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id: account_id.clone(),
+            provider: "codex".to_string(),
+            identity_source: IdentitySource::LocalAuth,
+            provider_user_id: Some("11111111-2222-4333-8444-555555555555".to_string()),
+            provider_user_id_hash: None,
+            email: Some("verified@example.com".to_string()),
+            email_hash: None,
+            org_id_hash: None,
+            account_label: None,
+            plan_name: Some("Plus".to_string()),
+            confidence: Confidence::High,
+            verified_at: Some(mk_dt(2026, 5, 3)),
+            created_at: mk_dt(2026, 5, 3),
+            updated_at: mk_dt(2026, 5, 3),
+        };
+        let mut inside = test_event("codex", &src, mk_dt(2026, 5, 10), 100, Some(100));
+        inside.provider_account_id = Some(account_id.clone());
+        let mut after_range = test_event("codex", &src, mk_dt(2026, 5, 20), 200, Some(200));
+        after_range.provider_account_id = Some(account_id.clone());
+        let subscription = Subscription {
+            schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+            subscription_id: subscription_id("codex", &account_id, "Plus", mk_dt(2026, 4, 30)),
+            provider: "codex".to_string(),
+            provider_account_id: account_id.clone(),
+            plan_name: "Plus".to_string(),
+            price: 2000,
+            currency: "USD".to_string(),
+            billing_period: BillingPeriod::Monthly,
+            paid_at: Some(mk_dt(2026, 4, 30)),
+            renewal_day: Some(30),
+            started_at: mk_dt(2026, 4, 30),
+            ended_at: None,
+            current_period_ends_at: Some(mk_dt(2026, 5, 30)),
+            status: SubscriptionStatus::Active,
+            record_source: IdentitySource::UserConfigured,
+            verified_at: Some(mk_dt(2026, 5, 3)),
+            notes: None,
+        };
+        let period = report_period_from_range(Some("2026-05-01"), Some("2026-05-15"), now)
+            .expect("historical range");
+
+        let report = build_usage_report(
+            &[inside, after_range],
+            &[],
+            &[src],
+            &[account],
+            &[subscription],
+            period,
+            now,
+        );
+
+        assert_eq!(report.total_events, 1);
+        assert_eq!(report.subscription_rows.len(), 1);
         assert_eq!(report.subscription_rows[0].events, 1);
         assert_eq!(report.subscription_rows[0].usage.total_tokens, 100);
         assert_eq!(

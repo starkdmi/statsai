@@ -392,13 +392,13 @@ enum ReportSubcommand {
         #[arg(
             long,
             required_unless_present = "to",
-            help = "Range start (YYYY-MM-DD or RFC3339). Date-only values start at 00:00:00 UTC"
+            help = "Range start (YYYY-MM-DD or RFC3339). Date-only values are UTC calendar days starting at 00:00:00 UTC"
         )]
         from: Option<String>,
         #[arg(
             long,
             required_unless_present = "from",
-            help = "Range end (YYYY-MM-DD or RFC3339). Date-only values include the whole UTC day. Defaults to now"
+            help = "Range end (YYYY-MM-DD or RFC3339). Date-only values are UTC calendar days through 23:59:59 UTC. Defaults to now"
         )]
         to: Option<String>,
         #[arg(long, help = "Output as JSON")]
@@ -18779,6 +18779,145 @@ mod tests {
         assert_eq!(report.label, "2026-05-01 to 2026-05-15");
         assert_eq!(report.total_events, 1);
         assert_eq!(report.total_usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn report_range_cli_from_only_includes_events_through_now() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
+            .single()
+            .expect("now");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-report-from-only"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let before = test_event(
+            "codex",
+            &source,
+            Utc.with_ymd_and_hms(2026, 4, 30, 12, 0, 0)
+                .single()
+                .expect("before"),
+            None,
+            TokenParts::total(50),
+        );
+        let inside = test_event(
+            "codex",
+            &source,
+            Utc.with_ymd_and_hms(2026, 5, 10, 18, 0, 0)
+                .single()
+                .expect("inside"),
+            None,
+            TokenParts::total(100),
+        );
+        store
+            .insert_events(&[before, inside])
+            .expect("insert events");
+
+        let command = ReportCommand {
+            command: ReportSubcommand::Range {
+                from: Some("2026-05-01".to_string()),
+                to: None,
+                json: false,
+                verbose: false,
+                subscriptions: false,
+            },
+        };
+        let (report, ..) = usage_report_from_command(command, &store, now).expect("from-only");
+        assert_eq!(report.label, "2026-05-01 to 2026-05-25T00:00:00+00:00");
+        assert_eq!(report.until, now);
+        assert_eq!(report.total_events, 1);
+        assert_eq!(report.total_usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn report_range_cli_to_only_includes_events_through_end_date() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
+            .single()
+            .expect("now");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-report-to-only"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let inside = test_event(
+            "codex",
+            &source,
+            Utc.with_ymd_and_hms(2026, 5, 10, 18, 0, 0)
+                .single()
+                .expect("inside"),
+            None,
+            TokenParts::total(100),
+        );
+        let after = test_event(
+            "codex",
+            &source,
+            Utc.with_ymd_and_hms(2026, 5, 20, 9, 0, 0)
+                .single()
+                .expect("after"),
+            None,
+            TokenParts::total(200),
+        );
+        store
+            .insert_events(&[inside, after])
+            .expect("insert events");
+
+        let command = ReportCommand {
+            command: ReportSubcommand::Range {
+                from: None,
+                to: Some("2026-05-15".to_string()),
+                json: false,
+                verbose: false,
+                subscriptions: false,
+            },
+        };
+        let (report, ..) = usage_report_from_command(command, &store, now).expect("to-only");
+        assert_eq!(report.label, "through 2026-05-15");
+        assert_eq!(report.since, None);
+        assert_eq!(report.total_events, 1);
+        assert_eq!(report.total_usage.total_tokens, 100);
+    }
+
+    #[test]
+    fn report_range_cli_future_window_is_empty_not_an_error() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
+            .single()
+            .expect("now");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-report-future"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let present = test_event("codex", &source, now, None, TokenParts::total(50));
+        store.insert_events(&[present]).expect("insert events");
+
+        let command = ReportCommand {
+            command: ReportSubcommand::Range {
+                from: Some("2026-09-01".to_string()),
+                to: Some("2026-09-30".to_string()),
+                json: false,
+                verbose: false,
+                subscriptions: false,
+            },
+        };
+        let (report, ..) = usage_report_from_command(command, &store, now).expect("future range");
+        assert_eq!(report.label, "2026-09-01 to 2026-09-30");
+        assert_eq!(report.until, now);
+        assert_eq!(report.total_events, 0);
     }
 
     #[test]
