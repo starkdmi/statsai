@@ -18828,7 +18828,7 @@ mod tests {
             },
         };
         let (report, ..) = usage_report_from_command(command, &store, now).expect("from-only");
-        assert_eq!(report.label, "2026-05-01 to 2026-05-25T00:00:00+00:00");
+        assert_eq!(report.label, "2026-05-01 to 2026-05-25T12:00:00+00:00");
         assert_eq!(report.until, now);
         assert_eq!(report.total_events, 1);
         assert_eq!(report.total_usage.total_tokens, 100);
