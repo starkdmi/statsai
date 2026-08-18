@@ -1250,9 +1250,9 @@ pub fn parse_report_date_bound(
 /// Build a custom report window from optional start / end strings.
 ///
 /// A missing end bound uses `now`. A missing start bound means the beginning
-/// of stored history. A future end is left as requested; [`ReportPeriod::window`]
-/// clamps it to `now` when the report is built so future windows stay valid
-/// and simply yield no events.
+/// of stored history. Invert is only checked when the caller supplied both
+/// bounds. A start after `now` (with or without a future end) stays valid;
+/// [`ReportPeriod::window`] clamps the end to `now` and the report is empty.
 pub fn report_period_from_range(
     from: Option<&str>,
     to: Option<&str>,
@@ -1268,7 +1268,7 @@ pub fn report_period_from_range(
         .map(|value| parse_report_date_bound(value, true))
         .transpose()?
         .unwrap_or(now);
-    if let Some(since) = since {
+    if let (Some(since), Some(_)) = (since, to) {
         if since > until {
             return Err(ReportRangeError::InvertedRange { since, until });
         }
@@ -1287,20 +1287,24 @@ impl ReportPeriod {
     }
 
     #[must_use]
-    pub fn label(self, _now: DateTime<Utc>) -> String {
+    pub fn label(self, now: DateTime<Utc>) -> String {
         match self {
             Self::LastDays(7) => "last 7 days".to_string(),
             Self::LastDays(30) => "last 30 days".to_string(),
             Self::LastDays(days) => format!("last {days} days"),
             Self::AllTime => "all time".to_string(),
-            Self::Range { since, until } => match since {
-                Some(since) => format!(
-                    "{} to {}",
-                    format_range_bound(since, false),
-                    format_range_bound(until, true)
-                ),
-                None => format!("through {}", format_range_bound(until, true)),
-            },
+            Self::Range { .. } => {
+                let (since, until) = self.window(now);
+                match since {
+                    Some(since) if since > until => "empty range".to_string(),
+                    Some(since) => format!(
+                        "{} to {}",
+                        format_range_bound(since, false),
+                        format_range_bound(until, true)
+                    ),
+                    None => format!("through {}", format_range_bound(until, true)),
+                }
+            }
         }
     }
 }
@@ -2444,12 +2448,44 @@ mod tests {
                 until: parse_report_date_bound("2026-09-30", true).expect("end of day"),
             }
         );
-        assert_eq!(period.label(now), "2026-09-01 to 2026-09-30");
+        assert_eq!(period.label(now), "empty range");
         assert_eq!(period.window(now), (Some(mk_dt(2026, 9, 1)), now));
+
+        let report = build_usage_report(&[present], &[], &[source], &[], &[], period, now);
+        assert_eq!(report.label, "empty range");
+        assert_eq!(report.total_events, 0);
+        assert_eq!(report.until, now);
+    }
+
+    #[test]
+    fn report_range_from_only_in_the_future_is_empty_not_inverted() {
+        let now = mk_dt(2026, 5, 25);
+        let source = test_source("codex", "/tmp/codex");
+        let present = test_event("codex", &source, now, 50, None);
+        let period =
+            report_period_from_range(Some("2026-09-01"), None, now).expect("future from-only");
+
+        assert_eq!(
+            period,
+            ReportPeriod::Range {
+                since: Some(mk_dt(2026, 9, 1)),
+                until: now,
+            }
+        );
+        assert_eq!(period.label(now), "empty range");
 
         let report = build_usage_report(&[present], &[], &[source], &[], &[], period, now);
         assert_eq!(report.total_events, 0);
         assert_eq!(report.until, now);
+    }
+
+    #[test]
+    fn report_range_label_uses_applied_until_when_to_is_in_the_future() {
+        let now = mk_dt(2026, 5, 25) + Duration::hours(12);
+        let period = report_period_from_range(Some("2026-05-01"), Some("2026-12-31"), now)
+            .expect("open-ended future to");
+        assert_eq!(period.label(now), "2026-05-01 to 2026-05-25T12:00:00+00:00");
+        assert_eq!(period.window(now), (Some(mk_dt(2026, 5, 1)), now));
     }
 
     #[test]

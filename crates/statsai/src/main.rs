@@ -18915,7 +18915,41 @@ mod tests {
             },
         };
         let (report, ..) = usage_report_from_command(command, &store, now).expect("future range");
-        assert_eq!(report.label, "2026-09-01 to 2026-09-30");
+        assert_eq!(report.label, "empty range");
+        assert_eq!(report.until, now);
+        assert_eq!(report.total_events, 0);
+    }
+
+    #[test]
+    fn report_range_cli_future_from_only_is_empty_not_an_error() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 25, 12, 0, 0)
+            .single()
+            .expect("now");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-report-future-from"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let present = test_event("codex", &source, now, None, TokenParts::total(50));
+        store.insert_events(&[present]).expect("insert events");
+
+        let command = ReportCommand {
+            command: ReportSubcommand::Range {
+                from: Some("2026-09-01".to_string()),
+                to: None,
+                json: false,
+                verbose: false,
+                subscriptions: false,
+            },
+        };
+        let (report, ..) =
+            usage_report_from_command(command, &store, now).expect("future from-only");
+        assert_eq!(report.label, "empty range");
         assert_eq!(report.until, now);
         assert_eq!(report.total_events, 0);
     }
