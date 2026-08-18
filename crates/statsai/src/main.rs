@@ -18915,8 +18915,10 @@ mod tests {
             },
         };
         let (report, ..) = usage_report_from_command(command, &store, now).expect("future range");
-        assert_eq!(report.label, "empty range");
+        assert_eq!(report.label, "2026-09-01 to 2026-09-30 (empty)");
+        assert_eq!(report.since, Some(now));
         assert_eq!(report.until, now);
+        assert!(report.since.is_some_and(|since| since <= report.until));
         assert_eq!(report.total_events, 0);
     }
 
@@ -18949,8 +18951,10 @@ mod tests {
         };
         let (report, ..) =
             usage_report_from_command(command, &store, now).expect("future from-only");
-        assert_eq!(report.label, "empty range");
+        assert_eq!(report.label, "from 2026-09-01 (empty)");
+        assert_eq!(report.since, Some(now));
         assert_eq!(report.until, now);
+        assert!(report.since.is_some_and(|since| since <= report.until));
         assert_eq!(report.total_events, 0);
     }
 

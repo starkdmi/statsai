@@ -1286,6 +1286,17 @@ impl ReportPeriod {
         }
     }
 
+    /// Applied bounds for report output. Never inverted: a start after `now`
+    /// publishes a zero-width window at `until`.
+    #[must_use]
+    pub fn published_window(self, now: DateTime<Utc>) -> (Option<DateTime<Utc>>, DateTime<Utc>) {
+        let (since, until) = self.window(now);
+        match since {
+            Some(since) if since > until => (Some(until), until),
+            since => (since, until),
+        }
+    }
+
     #[must_use]
     pub fn label(self, now: DateTime<Utc>) -> String {
         match self {
@@ -1293,16 +1304,28 @@ impl ReportPeriod {
             Self::LastDays(30) => "last 30 days".to_string(),
             Self::LastDays(days) => format!("last {days} days"),
             Self::AllTime => "all time".to_string(),
-            Self::Range { .. } => {
-                let (since, until) = self.window(now);
-                match since {
-                    Some(since) if since > until => "empty range".to_string(),
+            Self::Range { since, until } => {
+                let (applied_since, applied_until) = self.window(now);
+                if applied_since.is_some_and(|start| start > applied_until) {
+                    return match since {
+                        Some(since) if until > now => format!(
+                            "{} to {} (empty)",
+                            format_range_bound(since, false),
+                            format_range_bound(until, true)
+                        ),
+                        Some(since) => {
+                            format!("from {} (empty)", format_range_bound(since, false))
+                        }
+                        None => format!("through {} (empty)", format_range_bound(until, true)),
+                    };
+                }
+                match applied_since {
                     Some(since) => format!(
                         "{} to {}",
                         format_range_bound(since, false),
-                        format_range_bound(until, true)
+                        format_range_bound(applied_until, true)
                     ),
-                    None => format!("through {}", format_range_bound(until, true)),
+                    None => format!("through {}", format_range_bound(applied_until, true)),
                 }
             }
         }
@@ -1648,6 +1671,7 @@ pub fn build_usage_report(
     now: DateTime<Utc>,
 ) -> UsageReport {
     let (since, until) = period.window(now);
+    let (published_since, published_until) = period.published_window(now);
     let label = period.label(now);
 
     let source_by_id: BTreeMap<_, _> = sources
@@ -1771,8 +1795,8 @@ pub fn build_usage_report(
 
     UsageReport {
         label,
-        since,
-        until,
+        since: published_since,
+        until: published_until,
         rows,
         summary_rows,
         subscription_rows,
@@ -1961,7 +1985,7 @@ fn subscription_intersects_report_window(
     since: Option<DateTime<Utc>>,
     until: DateTime<Utc>,
 ) -> bool {
-    if started_at > until {
+    if since.is_some_and(|start| start > until) || started_at > until {
         return false;
     }
     let window_start = since.unwrap_or(DateTime::<Utc>::MIN_UTC);
@@ -2448,13 +2472,16 @@ mod tests {
                 until: parse_report_date_bound("2026-09-30", true).expect("end of day"),
             }
         );
-        assert_eq!(period.label(now), "empty range");
+        assert_eq!(period.label(now), "2026-09-01 to 2026-09-30 (empty)");
         assert_eq!(period.window(now), (Some(mk_dt(2026, 9, 1)), now));
+        assert_eq!(period.published_window(now), (Some(now), now));
 
         let report = build_usage_report(&[present], &[], &[source], &[], &[], period, now);
-        assert_eq!(report.label, "empty range");
-        assert_eq!(report.total_events, 0);
+        assert_eq!(report.label, "2026-09-01 to 2026-09-30 (empty)");
+        assert_eq!(report.since, Some(now));
         assert_eq!(report.until, now);
+        assert!(report.since.is_some_and(|since| since <= report.until));
+        assert_eq!(report.total_events, 0);
     }
 
     #[test]
@@ -2472,11 +2499,15 @@ mod tests {
                 until: now,
             }
         );
-        assert_eq!(period.label(now), "empty range");
+        assert_eq!(period.label(now), "from 2026-09-01 (empty)");
+        assert_eq!(period.published_window(now), (Some(now), now));
 
         let report = build_usage_report(&[present], &[], &[source], &[], &[], period, now);
-        assert_eq!(report.total_events, 0);
+        assert_eq!(report.label, "from 2026-09-01 (empty)");
+        assert_eq!(report.since, Some(now));
         assert_eq!(report.until, now);
+        assert!(report.since.is_some_and(|since| since <= report.until));
+        assert_eq!(report.total_events, 0);
     }
 
     #[test]
@@ -2826,6 +2857,68 @@ mod tests {
             report.subscription_rows[0].usage.estimated_cost_usd,
             Some(100)
         );
+    }
+
+    #[test]
+    fn subscription_rows_exclude_future_range() {
+        let now = mk_dt(2026, 5, 25);
+        let src = test_source("codex", "/tmp/codex-future-sub");
+        let account_id = provider_account_id("codex", "email:verified@example.com");
+        let account = ProviderAccount {
+            schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+            provider_account_id: account_id.clone(),
+            provider: "codex".to_string(),
+            identity_source: IdentitySource::LocalAuth,
+            provider_user_id: Some("11111111-2222-4333-8444-555555555555".to_string()),
+            provider_user_id_hash: None,
+            email: Some("verified@example.com".to_string()),
+            email_hash: None,
+            org_id_hash: None,
+            account_label: None,
+            plan_name: Some("Plus".to_string()),
+            confidence: Confidence::High,
+            verified_at: Some(mk_dt(2026, 5, 3)),
+            created_at: mk_dt(2026, 5, 3),
+            updated_at: mk_dt(2026, 5, 3),
+        };
+        let mut present = test_event("codex", &src, now, 100, Some(100));
+        present.provider_account_id = Some(account_id.clone());
+        let subscription = Subscription {
+            schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+            subscription_id: subscription_id("codex", &account_id, "Plus", mk_dt(2026, 4, 30)),
+            provider: "codex".to_string(),
+            provider_account_id: account_id,
+            plan_name: "Plus".to_string(),
+            price: 2000,
+            currency: "USD".to_string(),
+            billing_period: BillingPeriod::Monthly,
+            paid_at: Some(mk_dt(2026, 4, 30)),
+            renewal_day: Some(30),
+            started_at: mk_dt(2026, 4, 30),
+            ended_at: None,
+            current_period_ends_at: Some(mk_dt(2026, 5, 30)),
+            status: SubscriptionStatus::Active,
+            record_source: IdentitySource::UserConfigured,
+            verified_at: Some(mk_dt(2026, 5, 3)),
+            notes: None,
+        };
+        let period = report_period_from_range(Some("2026-09-01"), Some("2026-09-30"), now)
+            .expect("future range");
+
+        let report = build_usage_report(
+            &[present],
+            &[],
+            &[src],
+            &[account],
+            &[subscription],
+            period,
+            now,
+        );
+
+        assert_eq!(report.label, "2026-09-01 to 2026-09-30 (empty)");
+        assert!(report.since.is_some_and(|since| since <= report.until));
+        assert_eq!(report.total_events, 0);
+        assert!(report.subscription_rows.is_empty());
     }
 
     #[test]
