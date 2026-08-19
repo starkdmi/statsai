@@ -4,12 +4,29 @@ pub mod privacy_cli;
 pub mod service;
 pub mod snapshot;
 
+use anyhow::Result;
 use chrono::Utc;
 use getrandom::getrandom;
 use statsai_core::{hash_text, home_dir};
+use statsai_store::{RepricingReport, Store};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Opens a store for a normal StatsAI command and applies the compiled pricing
+/// ruleset before price-derived data is read or written.
+pub fn open_operational_store(path: &Path) -> Result<Store> {
+    let store = Store::open(path)?;
+    let report = store.ensure_current_pricing()?;
+    log_repricing_report(&report);
+    Ok(store)
+}
+
+pub fn log_repricing_report(report: &RepricingReport) {
+    if !report.already_current {
+        eprintln!("{report}");
+    }
+}
 
 pub fn default_store_path() -> PathBuf {
     home_dir()
@@ -255,6 +272,29 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn open_operational_store_refuses_a_newer_pricing_ruleset() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("statsai.sqlite");
+        let store = Store::open(&path).expect("create store");
+        store
+            .set_metadata_value(statsai_store::APPLIED_PRICING_RULESET_VERSION_KEY, "99")
+            .expect("future ruleset");
+        drop(store);
+
+        let error = match open_operational_store(&path) {
+            Ok(_) => panic!("forward pricing must refuse"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("pricing ruleset version 99 is newer than this StatsAI binary supports"));
+        assert_eq!(
+            statsai_store::database_applied_pricing_ruleset_version(&path).expect("unchanged"),
+            Some(99)
+        );
     }
 
     #[test]

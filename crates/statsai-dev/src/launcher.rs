@@ -1,7 +1,7 @@
 use crate::artifact::load_cached;
 use crate::state::{Environment, Paths, State};
 use anyhow::{bail, Context, Result};
-use statsai_store::database_schema_version;
+use statsai_store::{database_applied_pricing_ruleset_version, database_schema_version};
 use std::ffi::{OsStr, OsString};
 use std::process::{Command, ExitCode};
 
@@ -62,11 +62,17 @@ pub(crate) fn forward(
             production_schema,
             installed.manifest.store_schema_version,
         )?;
+        let production_pricing = database_applied_pricing_ruleset_version(store)?;
+        ensure_production_pricing_compatible(
+            production_pricing,
+            installed.manifest.pricing_ruleset_version,
+        )?;
         eprintln!(
-            "WARNING: running development build {} against the production database {} (schema {})",
+            "WARNING: running development build {} against the production database {} (schema {}, pricing ruleset {})",
             &selected.sha[..8],
             paths.display(&paths.prod_store),
-            production_schema
+            production_schema,
+            installed.manifest.pricing_ruleset_version
         );
     }
 
@@ -99,6 +105,21 @@ fn ensure_production_schema_compatible(production_schema: i64, build_schema: i64
         );
     }
     Ok(())
+}
+
+fn ensure_production_pricing_compatible(
+    production_ruleset: Option<u64>,
+    build_ruleset: u64,
+) -> Result<()> {
+    match production_ruleset {
+        Some(applied) if applied == build_ruleset => Ok(()),
+        Some(applied) => bail!(
+            "refusing `--prod-data`: selected build supports pricing ruleset {build_ruleset}, but production uses pricing ruleset {applied}; development builds may not reprice an incompatible production database"
+        ),
+        None => bail!(
+            "refusing `--prod-data`: production database has no applied pricing ruleset, but the selected build requires pricing ruleset {build_ruleset}; development builds may not reprice an incompatible production database"
+        ),
+    }
 }
 
 fn apply_environment(command: &mut Command, environment: Environment) {
@@ -182,9 +203,56 @@ mod tests {
     use crate::github::REPOSITORY;
     use crate::state::{BuildSource, SelectedBuild};
     use sha2::{Digest, Sha256};
+    use statsai_store::{
+        APPLIED_PRICING_RULESET_VERSION_KEY, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION,
+    };
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    fn install_selected_build(
+        paths: &Paths,
+        store_schema_version: i64,
+        pricing_ruleset_version: u64,
+    ) -> (State, artifact::InstalledBuild) {
+        let sha = "a".repeat(40);
+        let mut binary = vec![0u8; 64];
+        binary[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        binary[4..8].copy_from_slice(&[0x0c, 0x00, 0x00, 0x01]);
+        let binary_sha256 = hex::encode(Sha256::digest(&binary));
+        let installed = artifact::install(
+            paths,
+            &VerifiedArtifact {
+                manifest: BuildManifest {
+                    schema: 2,
+                    repository: REPOSITORY.to_string(),
+                    sha: sha.clone(),
+                    target: TARGET.to_string(),
+                    source: ManifestSource::PullRequest { number: 12 },
+                    workflow_run_id: 104,
+                    workflow_attempt: 1,
+                    store_schema_version,
+                    pricing_ruleset_version,
+                },
+                binary,
+                binary_sha256: binary_sha256.clone(),
+            },
+        )
+        .expect("install fixture");
+        let state = State {
+            build: Some(SelectedBuild {
+                source: BuildSource::Pr,
+                pr: Some(12),
+                sha,
+                workflow_run_id: installed.manifest.workflow_run_id,
+                workflow_attempt: installed.manifest.workflow_attempt,
+                target: installed.manifest.target.clone(),
+                binary_sha256,
+            }),
+            ..State::default()
+        };
+        (state, installed)
     }
 
     #[test]
@@ -234,6 +302,14 @@ mod tests {
     }
 
     #[test]
+    fn production_data_requires_an_exact_pricing_match() {
+        assert!(ensure_production_pricing_compatible(Some(1), 1).is_ok());
+        assert!(ensure_production_pricing_compatible(None, 1).is_err());
+        assert!(ensure_production_pricing_compatible(Some(1), 2).is_err());
+        assert!(ensure_production_pricing_compatible(Some(2), 1).is_err());
+    }
+
+    #[test]
     fn production_data_refuses_a_build_that_would_migrate_the_store() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = Paths::for_test(directory.path());
@@ -241,41 +317,7 @@ mod tests {
             .expect("create production store at current schema");
         drop(production);
 
-        let sha = "a".repeat(40);
-        let mut binary = vec![0u8; 64];
-        binary[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
-        binary[4..8].copy_from_slice(&[0x0c, 0x00, 0x00, 0x01]);
-        let binary_sha256 = hex::encode(Sha256::digest(&binary));
-        let installed = artifact::install(
-            &paths,
-            &VerifiedArtifact {
-                manifest: BuildManifest {
-                    schema: 1,
-                    repository: REPOSITORY.to_string(),
-                    sha: sha.clone(),
-                    target: TARGET.to_string(),
-                    source: ManifestSource::PullRequest { number: 12 },
-                    workflow_run_id: 104,
-                    workflow_attempt: 1,
-                    store_schema_version: statsai_store::CURRENT_SCHEMA_VERSION + 1,
-                },
-                binary,
-                binary_sha256: binary_sha256.clone(),
-            },
-        )
-        .expect("install future-schema fixture");
-        let state = State {
-            build: Some(SelectedBuild {
-                source: BuildSource::Pr,
-                pr: Some(12),
-                sha,
-                workflow_run_id: installed.manifest.workflow_run_id,
-                workflow_attempt: installed.manifest.workflow_attempt,
-                target: installed.manifest.target.clone(),
-                binary_sha256,
-            }),
-            ..State::default()
-        };
+        let (state, _) = install_selected_build(&paths, CURRENT_SCHEMA_VERSION + 1, 1);
 
         let error = forward(&paths, &state, &arguments(&["status"]), true)
             .expect_err("future-schema build must not run against production");
@@ -283,7 +325,63 @@ mod tests {
         assert!(error.to_string().contains("may not migrate"));
         assert_eq!(
             database_schema_version(&paths.prod_store).expect("read unchanged production schema"),
-            Some(statsai_store::CURRENT_SCHEMA_VERSION)
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn production_data_refuses_a_missing_applied_pricing_ruleset() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        drop(
+            statsai_store::Store::open(&paths.prod_store)
+                .expect("create production store at current schema"),
+        );
+        let (state, _) =
+            install_selected_build(&paths, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION);
+
+        let error = forward(&paths, &state, &arguments(&["status"]), true)
+            .expect_err("unpriced production store must not run against development builds");
+
+        assert!(error.to_string().contains("no applied pricing ruleset"));
+        assert_eq!(
+            database_applied_pricing_ruleset_version(&paths.prod_store)
+                .expect("read unchanged production pricing"),
+            None
+        );
+    }
+
+    #[test]
+    fn production_data_refuses_older_and_newer_pricing_rulesets() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        let production = statsai_store::Store::open(&paths.prod_store)
+            .expect("create production store at current schema");
+        production
+            .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "1")
+            .expect("record older applied ruleset");
+        drop(production);
+        let (older_state, _) = install_selected_build(&paths, CURRENT_SCHEMA_VERSION, 2);
+        let older = forward(&paths, &older_state, &arguments(&["status"]), true)
+            .expect_err("older production ruleset must refuse");
+        assert!(older.to_string().contains("pricing ruleset 2"));
+        assert!(older.to_string().contains("pricing ruleset 1"));
+
+        let production =
+            statsai_store::Store::open(&paths.prod_store).expect("reopen production store");
+        production
+            .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "99")
+            .expect("record newer applied ruleset");
+        drop(production);
+        let (newer_state, _) =
+            install_selected_build(&paths, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION);
+        let newer = forward(&paths, &newer_state, &arguments(&["status"]), true)
+            .expect_err("newer production ruleset must refuse");
+        assert!(newer.to_string().contains("pricing ruleset 99"));
+        assert_eq!(
+            database_applied_pricing_ruleset_version(&paths.prod_store)
+                .expect("read unchanged production pricing"),
+            Some(99)
         );
     }
 }

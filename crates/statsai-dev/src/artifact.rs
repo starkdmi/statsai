@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 pub(crate) const TARGET: &str = "aarch64-apple-darwin";
-const MANIFEST_SCHEMA: u32 = 1;
+const MANIFEST_SCHEMA: u32 = 2;
 const MAX_BINARY_BYTES: u64 = 192 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 
@@ -24,6 +24,7 @@ pub(crate) struct BuildManifest {
     pub(crate) workflow_run_id: u64,
     pub(crate) workflow_attempt: u64,
     pub(crate) store_schema_version: i64,
+    pub(crate) pricing_ruleset_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,8 +104,7 @@ pub(crate) fn verify_download(
     let binary = binary.context("artifact is missing statsai")?;
     let manifest_bytes = manifest_bytes.context("artifact is missing build.json")?;
     let checksums = checksums.context("artifact is missing SHA256SUMS")?;
-    let manifest: BuildManifest =
-        serde_json::from_slice(&manifest_bytes).context("parse artifact build.json")?;
+    let manifest = parse_manifest(&manifest_bytes, "parse artifact build.json")?;
     validate_manifest(&manifest, expected_sha, Some(run))?;
     validate_macho_arm64(&binary)?;
     let expected_checksum = parse_statsai_checksum(&checksums)?;
@@ -171,10 +171,12 @@ pub(crate) fn load_cached(paths: &Paths, sha: &str) -> Result<Option<InstalledBu
         return Ok(None);
     }
     let manifest_path = directory.join("build.json");
-    let manifest_file = File::open(&manifest_path)
-        .with_context(|| format!("open cached manifest {}", manifest_path.display()))?;
-    let manifest: BuildManifest = serde_json::from_reader(manifest_file)
-        .with_context(|| format!("parse cached manifest {}", manifest_path.display()))?;
+    let manifest_bytes = fs::read(&manifest_path)
+        .with_context(|| format!("read cached manifest {}", manifest_path.display()))?;
+    let manifest = parse_manifest(
+        &manifest_bytes,
+        &format!("parse cached manifest {}", manifest_path.display()),
+    )?;
     validate_manifest(&manifest, sha, None)?;
 
     let sums_path = directory.join("SHA256SUMS");
@@ -236,6 +238,19 @@ fn remove_build_dir(paths: &Paths, directory: &Path) -> Result<()> {
     }
     fs::remove_dir_all(directory)
         .with_context(|| format!("remove cached build {}", directory.display()))
+}
+
+fn parse_manifest(bytes: &[u8], context: &str) -> Result<BuildManifest> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).with_context(|| context.to_string())?;
+    match value.get("schema").and_then(serde_json::Value::as_u64) {
+        Some(schema) if schema == u64::from(MANIFEST_SCHEMA) => {}
+        Some(schema) => {
+            bail!("unsupported build manifest schema {schema} (expected {MANIFEST_SCHEMA})")
+        }
+        None => bail!("build manifest is missing schema (expected {MANIFEST_SCHEMA})"),
+    }
+    serde_json::from_value(value).with_context(|| context.to_string())
 }
 
 fn validate_manifest(
@@ -403,7 +418,7 @@ mod tests {
 
     fn manifest(sha: &str) -> BuildManifest {
         BuildManifest {
-            schema: 1,
+            schema: MANIFEST_SCHEMA,
             repository: REPOSITORY.to_string(),
             sha: sha.to_string(),
             target: TARGET.to_string(),
@@ -411,7 +426,28 @@ mod tests {
             workflow_run_id: 104,
             workflow_attempt: 1,
             store_schema_version: 17,
+            pricing_ruleset_version: 1,
         }
+    }
+
+    fn archive_raw_manifest(manifest: &[u8], binary: &[u8], checksum: &str) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        writer
+            .start_file("statsai", options)
+            .expect("start binary entry");
+        writer.write_all(binary).expect("write binary entry");
+        writer
+            .start_file("build.json", options)
+            .expect("start manifest entry");
+        writer.write_all(manifest).expect("write manifest entry");
+        writer
+            .start_file("SHA256SUMS", options)
+            .expect("start checksum entry");
+        writeln!(writer, "{checksum}  statsai").expect("write checksum entry");
+        let mut cursor = writer.finish().expect("finish artifact ZIP");
+        cursor.rewind().expect("rewind artifact ZIP");
+        cursor.into_inner()
     }
 
     fn run(sha: &str) -> WorkflowRun {
@@ -459,7 +495,73 @@ mod tests {
         .expect("verify artifact");
 
         assert_eq!(verified.manifest.sha, sha);
+        assert_eq!(verified.manifest.schema, MANIFEST_SCHEMA);
+        assert_eq!(verified.manifest.pricing_ruleset_version, 1);
         assert_eq!(verified.binary_sha256, checksum);
+    }
+
+    #[test]
+    fn shipped_schema_1_manifest_is_rejected() {
+        let sha = "a".repeat(40);
+        let binary = fake_binary();
+        let checksum = sha256_bytes(&binary);
+        let schema_1 = serde_json::json!({
+            "schema": 1,
+            "repository": REPOSITORY,
+            "sha": sha,
+            "target": TARGET,
+            "source": { "kind": "pull_request", "number": 12 },
+            "workflow_run_id": 104,
+            "workflow_attempt": 1,
+            "store_schema_version": 17
+        });
+        let error = verify_download(
+            &archive_raw_manifest(
+                &serde_json::to_vec(&schema_1).expect("serialize schema 1"),
+                &binary,
+                &checksum,
+            ),
+            &sha,
+            &run(&sha),
+        )
+        .expect_err("shipped schema 1 must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported build manifest schema 1 (expected 2)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn schema_2_manifest_requires_pricing_ruleset_version() {
+        let sha = "a".repeat(40);
+        let binary = fake_binary();
+        let checksum = sha256_bytes(&binary);
+        let missing_pricing = serde_json::json!({
+            "schema": 2,
+            "repository": REPOSITORY,
+            "sha": sha,
+            "target": TARGET,
+            "source": { "kind": "main" },
+            "workflow_run_id": 104,
+            "workflow_attempt": 1,
+            "store_schema_version": 17
+        });
+        let error = verify_download(
+            &archive_raw_manifest(
+                &serde_json::to_vec(&missing_pricing).expect("serialize incomplete schema 2"),
+                &binary,
+                &checksum,
+            ),
+            &sha,
+            &run(&sha),
+        )
+        .expect_err("schema 2 without pricing_ruleset_version must fail");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("pricing_ruleset_version"), "{message}");
     }
 
     #[test]
