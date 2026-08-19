@@ -375,6 +375,8 @@ fn pricing_for_model_on(model_name: &str, usage_date: chrono::NaiveDate) -> Opti
         | "grok-4.20-0309-reasoning"
         | "grok-4.20-0309-non-reasoning" => Some(pricing(1.25, 0.2, 2.5)),
         "grok-4.5" => Some(pricing(2.0, 0.3, 6.0)),
+        // Official Grok 4.6 cached-input rate is $0.50/M below 200k prompt tokens
+        // ($1.00/M at or above 200k): https://docs.x.ai/developers/models/grok-4.6
         "grok-4.6" => Some(pricing(2.0, 0.5, 6.0)),
         _ => None,
     }
