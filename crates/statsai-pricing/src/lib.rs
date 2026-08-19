@@ -1737,7 +1737,7 @@ mod tests {
 
     #[test]
     fn ruleset_version_is_numeric_and_catalog_is_descriptive() {
-        assert!(PRICING_RULESET_VERSION >= 1);
+        const { assert!(PRICING_RULESET_VERSION >= 1) };
         assert!(PRICING_CATALOG_VERSION.contains(':'));
         assert_ne!(PRICING_RULESET_VERSION.to_string(), PRICING_CATALOG_VERSION);
     }
