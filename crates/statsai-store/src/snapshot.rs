@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 #[cfg(target_os = "macos")]
 use rusqlite::TransactionBehavior;
 use rusqlite::{Connection, OpenFlags};
+#[cfg(target_os = "macos")]
 use std::fs;
 #[cfg(target_os = "macos")]
 use std::fs::File;
