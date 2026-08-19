@@ -14382,7 +14382,7 @@ mod tests {
                         },
                         "_meta": {
                             "eventId": "prompt-0",
-                            "agentTimestampMs": 1_786_905_120_000
+                            "agentTimestampMs": 1_786_905_120_000i64
                         }
                     }
                 })
@@ -14399,7 +14399,7 @@ mod tests {
                         "_meta": {
                             "promptId": "req-4.5",
                             "totalTokens": 100_000,
-                            "agentTimestampMs": 1_786_905_130_000
+                            "agentTimestampMs": 1_786_905_130_000i64
                         }
                     }
                 })
@@ -14416,7 +14416,7 @@ mod tests {
                         },
                         "_meta": {
                             "eventId": "prompt-1",
-                            "agentTimestampMs": 1_786_905_180_000
+                            "agentTimestampMs": 1_786_905_180_000i64
                         }
                     }
                 })
@@ -14433,7 +14433,7 @@ mod tests {
                         "_meta": {
                             "promptId": "req-4.6",
                             "totalTokens": 200_000,
-                            "agentTimestampMs": 1_786_905_200_000
+                            "agentTimestampMs": 1_786_905_200_000i64
                         }
                     }
                 })
