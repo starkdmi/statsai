@@ -1,5 +1,3 @@
-compile_error!("intentional statsai-dev E2E failure; removed by sequence F");
-
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
