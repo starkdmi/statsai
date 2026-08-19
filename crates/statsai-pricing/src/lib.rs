@@ -1667,10 +1667,9 @@ mod tests {
         let grok_4_6_build = test_model("grok-4.6-build");
         let grok_4_5 = test_model("grok-4.5");
         let usage = UsageCounts {
-            input_tokens: Some(1_000_000),
-            cache_read_tokens: Some(1_000_000),
-            output_tokens: Some(1_000_000),
-            reasoning_tokens: Some(1_000_000),
+            input_tokens: Some(60_000),
+            cache_read_tokens: Some(40_000),
+            output_tokens: Some(10_000),
             requests: Some(1),
             ..UsageCounts::default()
         };
@@ -1679,10 +1678,10 @@ mod tests {
         let grok_4_6_build_cost = estimate_cost("grok_build", Some(&grok_4_6_build), &usage);
         let grok_4_5_cost = estimate_cost("grok_build", Some(&grok_4_5), &usage);
 
-        assert_eq!(grok_4_6_cost.estimated_api_equivalent_usd, Some(1_430));
+        assert_eq!(grok_4_6_cost.estimated_api_equivalent_usd, Some(19));
         assert_eq!(
             grok_4_6_cost.estimated_api_equivalent_micro_usd,
-            Some(14_300_000)
+            Some(192_000)
         );
         assert_eq!(
             grok_4_6_cost.estimated_api_equivalent_usd,
@@ -1713,8 +1712,8 @@ mod tests {
     #[test]
     fn grok_4_6_wrapped_ids_keep_observed_identity() {
         let usage = UsageCounts {
-            input_tokens: Some(1_000_000),
-            output_tokens: Some(1_000_000),
+            input_tokens: Some(100_000),
+            output_tokens: Some(10_000),
             requests: Some(1),
             ..UsageCounts::default()
         };
@@ -1722,8 +1721,8 @@ mod tests {
 
         let cost = estimate_cost("opencode", Some(&wrapped), &usage);
 
-        assert_eq!(cost.estimated_api_equivalent_usd, Some(800));
-        assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(8_000_000));
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(26));
+        assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(260_000));
         assert_eq!(
             cost.pricing_source.as_deref(),
             Some("xai_api_pricing:grok-4.6")
@@ -1766,17 +1765,27 @@ mod tests {
     #[test]
     fn grok_4_6_reasoning_tokens_use_the_output_rate() {
         let model = test_model("grok-4.6");
-        let usage = UsageCounts {
-            input_tokens: Some(1_000_000),
-            reasoning_tokens: Some(1_000_000),
+        let with_output = UsageCounts {
+            input_tokens: Some(10_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let with_reasoning = UsageCounts {
+            input_tokens: Some(10_000),
+            reasoning_tokens: Some(10_000),
             requests: Some(1),
             ..UsageCounts::default()
         };
 
-        let cost = estimate_cost("grok_build", Some(&model), &usage);
+        let output_cost = estimate_cost("grok_build", Some(&model), &with_output);
+        let reasoning_cost = estimate_cost("grok_build", Some(&model), &with_reasoning);
 
-        assert_eq!(cost.estimated_api_equivalent_usd, Some(800));
-        assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(8_000_000));
+        assert_eq!(output_cost.estimated_api_equivalent_micro_usd, Some(80_000));
+        assert_eq!(
+            reasoning_cost.estimated_api_equivalent_micro_usd,
+            output_cost.estimated_api_equivalent_micro_usd
+        );
     }
 
     #[test]
