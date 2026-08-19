@@ -425,6 +425,7 @@ Rust applications. The backend-facing sync boundary begins at
 | `statsai-daemon` | Authenticated loopback API |
 | `statsai-sdk` | Rust SDK facade |
 | `statsai` | Command-line application |
+| `statsai-dev` | Exact-SHA development build launcher with isolated APFS-cloned data |
 | `statsai-menubar` | macOS menu bar application |
 
 Local paths are hashed in source identity fields. Source and parse-evidence path
@@ -449,6 +450,10 @@ full suite before pushes:
 ```sh
 ./scripts/install-git-hooks.sh
 ```
+
+For testing exact `main` or pull-request builds on Apple Silicon without
+touching the production database, see the [`statsai-dev` development
+workflow](docs/statsai-dev.md).
 
 For an exceptional one-command bypass, set `STATSAI_SKIP_LOCAL_CI=1`.
 

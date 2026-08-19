@@ -5,10 +5,15 @@ use rusqlite::{Connection, OptionalExtension};
 pub const CURRENT_SCHEMA_VERSION: i64 = 17;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
+    if let Some(current) = existing_schema_version(conn)? {
+        ensure_supported_schema(current)?;
+    }
+
     ensure_migrations_table(conn)?;
     stamp_legacy_database(conn)?;
 
     let current = current_schema_version(conn)?;
+    ensure_supported_schema(current)?;
     for version in (current + 1)..=CURRENT_SCHEMA_VERSION {
         apply_migration(conn, version)?;
         record_migration(conn, version)?;
@@ -17,6 +22,27 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("PRAGMA optimize;")?;
     }
 
+    Ok(())
+}
+
+fn existing_schema_version(conn: &Connection) -> Result<Option<i64>> {
+    let has_migrations_table = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_migrations_table {
+        return Ok(None);
+    }
+    current_schema_version(conn).map(Some)
+}
+
+fn ensure_supported_schema(current: i64) -> Result<()> {
+    if current > CURRENT_SCHEMA_VERSION {
+        bail!(
+            "database schema version {current} is newer than this StatsAI binary supports ({CURRENT_SCHEMA_VERSION}); upgrade StatsAI or use a compatible database"
+        );
+    }
     Ok(())
 }
 
@@ -836,6 +862,33 @@ mod tests {
         assert!(table_exists(&conn, "code_git_identities"));
         assert!(table_exists(&conn, "code_change_matches"));
         assert!(table_exists(&conn, "code_change_metrics"));
+    }
+
+    #[test]
+    fn newer_database_schema_is_rejected_without_modification() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations (
+              version INTEGER PRIMARY KEY,
+              applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (18, '2026-08-19T00:00:00Z');
+            "#,
+        )
+        .expect("create future schema marker");
+
+        let error = migrate(&conn).expect_err("schema 18 must be rejected by schema 17 binary");
+
+        assert_eq!(
+            error.to_string(),
+            "database schema version 18 is newer than this StatsAI binary supports (17); upgrade StatsAI or use a compatible database"
+        );
+        assert_eq!(
+            current_schema_version(&conn).expect("read unchanged version"),
+            18
+        );
     }
 
     #[test]

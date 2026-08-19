@@ -42,7 +42,7 @@ use statsai_store::{
     close_active_verified_source_linkages, derive_task_work_items, find_existing_provider_account,
     reconcile_verified_source_state, upsert_provider_account, verified_source_observation_hash,
     ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
-    UpsertProviderAccountInput,
+    UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION,
 };
 use statsai_sync::{
     validate_authenticated_http_endpoint, FileSink, HttpSink, StdoutSink, SyncSink,
@@ -114,6 +114,8 @@ enum Command {
     Sync(SyncCommand),
     #[command(about = "Print JSON schemas for backend-facing contracts")]
     Schema(SchemaCommand),
+    #[command(about = "Manage the local SQLite store")]
+    Store(StoreAdminCommand),
     #[command(about = "Start the loopback API daemon")]
     Daemon(DaemonCommand),
     #[command(about = "Show stored event and token counts")]
@@ -837,6 +839,23 @@ struct SchemaCommand {
     command: SchemaSubcommand,
 }
 
+#[derive(Debug, Args)]
+struct StoreAdminCommand {
+    #[command(subcommand)]
+    command: StoreAdminSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum StoreAdminSubcommand {
+    #[command(about = "Create a consistent APFS clone of the SQLite store")]
+    CloneTo {
+        #[arg(value_name = "PATH", help = "Destination database path")]
+        destination: PathBuf,
+    },
+    #[command(about = "Print the store schema version supported by this binary")]
+    SupportedSchemaVersion,
+}
+
 #[derive(Debug, Subcommand)]
 enum SchemaSubcommand {
     #[command(about = "Print the sync_batch.v3 JSON Schema")]
@@ -868,6 +887,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Schema(command) => schema(command),
+        Command::Store(command) => store_admin(command, &store_path),
         Command::Doctor => doctor(&store_path),
         Command::Auth(command) => auth(command),
         Command::Service(command) => service(command),
@@ -891,6 +911,7 @@ fn main() -> Result<()> {
                 Command::Daemon(command) => daemon(command, store, &device_id),
                 Command::Status => status(&store),
                 Command::Schema(_)
+                | Command::Store(_)
                 | Command::Doctor
                 | Command::Auth(_)
                 | Command::Service(_)
@@ -898,6 +919,26 @@ fn main() -> Result<()> {
                     unreachable!("handled before store open")
                 }
             }
+        }
+    }
+}
+
+fn store_admin(command: StoreAdminCommand, source: &Path) -> Result<()> {
+    match command.command {
+        StoreAdminSubcommand::CloneTo { destination } => {
+            let cloned = statsai_store::clone_database_to(source, &destination)?;
+            println!(
+                "Cloned {} to {} (schema {}, {} logical bytes)",
+                source.display(),
+                destination.display(),
+                cloned.schema_version,
+                cloned.logical_size
+            );
+            Ok(())
+        }
+        StoreAdminSubcommand::SupportedSchemaVersion => {
+            println!("{CURRENT_SCHEMA_VERSION}");
+            Ok(())
         }
     }
 }
@@ -18683,6 +18724,30 @@ mod tests {
             message.contains("--from") || message.contains("--to"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn supported_store_schema_version_is_available_without_opening_a_store() {
+        let cli = Cli::try_parse_from(["statsai", "store", "supported-schema-version"])
+            .expect("parse supported schema query");
+
+        assert!(matches!(
+            cli.command,
+            Command::Store(StoreAdminCommand {
+                command: StoreAdminSubcommand::SupportedSchemaVersion,
+            })
+        ));
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store_path = directory.path().join("must-not-be-created.sqlite");
+        store_admin(
+            StoreAdminCommand {
+                command: StoreAdminSubcommand::SupportedSchemaVersion,
+            },
+            &store_path,
+        )
+        .expect("print supported schema");
+        assert!(!store_path.exists());
     }
 
     #[test]
