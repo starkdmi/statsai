@@ -1,7 +1,7 @@
 //! Versioned automatic repricing of persisted normalized usage.
 
 use super::{is_daily_rollup_summary, summary_period_bounds, Store, SyncRollupBucketKey};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use rusqlite::params;
 use statsai_core::{CostAccumulator, CostInfo, ModelInfo, UsageEvent, UsageSummary};
 use statsai_pricing::{
@@ -433,7 +433,7 @@ fn maybe_fail_after_event_writes(changed_events: u64) -> Result<()> {
     {
         FAIL_AFTER_EVENT_WRITES.with(|cell| {
             if cell.get().is_some_and(|limit| changed_events >= limit) {
-                bail!("injected repricing failure after {changed_events} event writes")
+                anyhow::bail!("injected repricing failure after {changed_events} event writes")
             } else {
                 Ok(())
             }

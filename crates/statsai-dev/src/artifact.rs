@@ -560,11 +560,8 @@ mod tests {
         )
         .expect_err("schema 2 without pricing_ruleset_version must fail");
 
-        let message = error.to_string();
-        assert!(
-            message.contains("pricing_ruleset_version") || message.contains("missing field"),
-            "{message}"
-        );
+        let message = format!("{error:#}");
+        assert!(message.contains("pricing_ruleset_version"), "{message}");
     }
 
     #[test]
