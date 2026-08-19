@@ -11,11 +11,11 @@ use statsai_core::{
     semantic_event_id, summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
     task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
     task_title_signal_score, title_topic_tokens, BillingPeriod, Confidence, CostAccumulator,
-    EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats, ModelInfo,
-    ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo, SessionInfo,
-    SourceKind, SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics, TaskSpan,
-    UsageCounts, UsageEvent, UsageSummary, TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
-    USAGE_SUMMARY_SCHEMA_VERSION,
+    CostInfo, EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats,
+    ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo,
+    SessionInfo, SourceKind, SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics,
+    TaskSpan, UsageCounts, UsageEvent, UsageSummary, TASK_SPAN_SCHEMA_VERSION,
+    USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{
     estimate_cost_at, normalize_model_name, pricing_changes_between, unknown_cost,
@@ -42,7 +42,7 @@ const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v26";
 const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v23";
 const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
-const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v17";
+const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v20";
 const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -3894,6 +3894,20 @@ struct GrokSessionStats {
     max_total_tokens: Option<u64>,
     max_tokens_used: Option<u64>,
     max_tokens_after: Option<u64>,
+    prompt_models: Vec<GrokModelObservation>,
+    turn_models: Vec<GrokModelObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrokModelObservation {
+    model_id: String,
+    observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct GrokInferenceSample {
+    usage: UsageCounts,
+    observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3905,6 +3919,7 @@ struct GrokInferenceStats {
     reasoning_tokens: u64,
     model_elapsed_ms: Vec<u64>,
     time_to_first_token_ms: Vec<u64>,
+    request_samples: Vec<GrokInferenceSample>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3941,6 +3956,27 @@ impl GrokInferenceStats {
             reasoning_tokens: nonzero_u64(self.reasoning_tokens),
             total_tokens: None,
             requests: nonzero_u64(self.rows),
+            local_prompt_eval_tokens: None,
+            local_eval_tokens: None,
+        }
+    }
+
+    fn request_sample_usage(
+        input_tokens: u64,
+        cache_read_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    ) -> UsageCounts {
+        UsageCounts {
+            input_tokens: nonzero_u64(input_tokens),
+            output_tokens: nonzero_u64(output_tokens),
+            cache_creation_tokens: None,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
+            cache_read_tokens: nonzero_u64(cache_read_tokens),
+            reasoning_tokens: nonzero_u64(reasoning_tokens),
+            total_tokens: None,
+            requests: Some(1),
             local_prompt_eval_tokens: None,
             local_eval_tokens: None,
         }
@@ -3993,7 +4029,7 @@ fn grok_session_stats(session_dir: &Path, invalid_rows: &mut u64) -> Result<Grok
         invalid_rows,
     )?;
     parse_grok_updates(&session_dir.join("updates.jsonl"), &mut stats, invalid_rows)?;
-    stats.events_rows = count_jsonl_records(&session_dir.join("events.jsonl"), invalid_rows)?;
+    parse_grok_events(&session_dir.join("events.jsonl"), &mut stats, invalid_rows)?;
     Ok(stats)
 }
 
@@ -4034,13 +4070,21 @@ fn parse_grok_unified_log_with_invalid_rows(root: &Path) -> Result<(GrokUnifiedL
             .session_stats
             .entry(session_id.to_string())
             .or_default();
+        let input_tokens = prompt_tokens.saturating_sub(cached_prompt_tokens);
         stats.rows += 1;
-        stats.input_tokens = stats
-            .input_tokens
-            .saturating_add(prompt_tokens.saturating_sub(cached_prompt_tokens));
+        stats.input_tokens = stats.input_tokens.saturating_add(input_tokens);
         stats.cache_read_tokens = stats.cache_read_tokens.saturating_add(cached_prompt_tokens);
         stats.output_tokens = stats.output_tokens.saturating_add(completion_tokens);
         stats.reasoning_tokens = stats.reasoning_tokens.saturating_add(reasoning_tokens);
+        stats.request_samples.push(GrokInferenceSample {
+            usage: GrokInferenceStats::request_sample_usage(
+                input_tokens,
+                cached_prompt_tokens,
+                completion_tokens,
+                reasoning_tokens,
+            ),
+            observed_at: value.get("ts").and_then(timestamp_from_scalar),
+        });
         if let Some(value) = ctx.get("model_elapsed_ms").and_then(value_as_u64) {
             stats.model_elapsed_ms.push(value);
         }
@@ -4104,6 +4148,9 @@ fn parse_grok_updates(
                 .and_modify(|current| *current = (*current).max(tokens))
                 .or_insert(tokens);
         }
+        if let Some(observation) = grok_prompt_model_observation(value) {
+            stats.prompt_models.push(observation);
+        }
         update_max(
             &mut stats.max_tokens_used,
             value.pointer("/params/update/tokens_used"),
@@ -4123,10 +4170,178 @@ fn parse_grok_updates(
     Ok(())
 }
 
-fn count_jsonl_records(path: &Path, invalid_rows: &mut u64) -> Result<u64> {
-    let parse_stats = for_grok_jsonl_value(path, |_| Ok(()))?;
-    *invalid_rows += parse_stats.invalid_rows;
-    Ok(parse_stats.rows)
+fn parse_grok_events(
+    path: &Path,
+    stats: &mut GrokSessionStats,
+    invalid_rows: &mut u64,
+) -> Result<()> {
+    *invalid_rows += for_grok_jsonl_value(path, |value| {
+        stats.events_rows += 1;
+        if value.get("type").and_then(Value::as_str) == Some("turn_started") {
+            if let Some(observation) = grok_turn_model_observation(value) {
+                stats.turn_models.push(observation);
+            }
+        }
+        Ok(())
+    })?
+    .invalid_rows;
+    Ok(())
+}
+
+fn grok_prompt_model_observation(value: &Value) -> Option<GrokModelObservation> {
+    let meta = value.pointer("/params/update/_meta")?;
+    // User-prompt rows carry both modelId and promptIndex. Later stream/tool
+    // chunks share promptId but omit modelId, so only this pair is a stable
+    // per-prompt identity.
+    let model_id = grok_nonempty_model_id(meta.get("modelId"))?;
+    meta.get("promptIndex").and_then(value_as_u64)?;
+    Some(GrokModelObservation {
+        model_id,
+        observed_at: grok_update_timestamp(value),
+    })
+}
+
+fn grok_turn_model_observation(value: &Value) -> Option<GrokModelObservation> {
+    Some(GrokModelObservation {
+        model_id: grok_nonempty_model_id(value.get("model_id"))?,
+        observed_at: value.get("ts").and_then(timestamp_from_scalar),
+    })
+}
+
+fn grok_update_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    value
+        .pointer("/params/_meta/agentTimestampMs")
+        .and_then(timestamp_from_scalar)
+        .or_else(|| value.get("timestamp").and_then(timestamp_from_scalar))
+}
+
+fn grok_nonempty_model_id(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn grok_signals_models_used(signals: Option<&Value>) -> Vec<String> {
+    signals
+        .and_then(|signals| signals.get("modelsUsed"))
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|value| grok_nonempty_model_id(Some(value)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn grok_normalized_model_id(model_id: &str) -> String {
+    normalize_model_name(model_id)
+}
+
+fn grok_models_equivalent(left: &str, right: &str) -> bool {
+    grok_normalized_model_id(left) == grok_normalized_model_id(right)
+}
+
+fn unique_grok_normalized_models<'a>(ids: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    ids.into_iter()
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+        .map(grok_normalized_model_id)
+        .collect()
+}
+
+fn grok_current_model_id(model: Option<&ModelInfo>) -> Option<&str> {
+    model.and_then(|model| {
+        model
+            .name
+            .as_deref()
+            .or(model.provider_model_id.as_deref())
+            .map(str::trim)
+            .filter(|model_id| !model_id.is_empty())
+    })
+}
+
+fn last_grok_model_at_or_before(
+    observations: &[GrokModelObservation],
+    at: DateTime<Utc>,
+) -> Option<&str> {
+    observations
+        .iter()
+        .enumerate()
+        .filter(|(_, observation)| {
+            observation
+                .observed_at
+                .is_some_and(|observed_at| observed_at <= at)
+        })
+        .max_by_key(|(index, observation)| (observation.observed_at, *index))
+        .map(|(_, observation)| observation.model_id.as_str())
+}
+
+fn resolve_grok_inference_sample_model(
+    sample: &GrokInferenceSample,
+    prompt_models: &[GrokModelObservation],
+    turn_models: &[GrokModelObservation],
+    session_models_used: &[String],
+    current_model: Option<&ModelInfo>,
+) -> Option<ModelInfo> {
+    let assignable_ids = prompt_models
+        .iter()
+        .map(|observation| observation.model_id.as_str())
+        .chain(
+            turn_models
+                .iter()
+                .map(|observation| observation.model_id.as_str()),
+        );
+    let assignable = unique_grok_normalized_models(assignable_ids);
+    if assignable.len() == 1 {
+        let models_used =
+            unique_grok_normalized_models(session_models_used.iter().map(String::as_str));
+        // A lone prompt/turn observation cannot cover every inference when
+        // modelsUsed reports another model: request-level attribution is
+        // incomplete, so do not silently price the missing model as this one.
+        if !models_used.is_empty() && models_used != assignable {
+            return None;
+        }
+        let model_id = prompt_models
+            .iter()
+            .map(|observation| observation.model_id.as_str())
+            .chain(
+                turn_models
+                    .iter()
+                    .map(|observation| observation.model_id.as_str()),
+            )
+            .next()?;
+        return Some(model_info(model_id));
+    }
+    if assignable.len() >= 2 {
+        let observed_at = sample.observed_at?;
+        let from_prompt = last_grok_model_at_or_before(prompt_models, observed_at);
+        let from_turn = last_grok_model_at_or_before(turn_models, observed_at);
+        return match (from_prompt, from_turn) {
+            (Some(prompt), Some(turn)) if grok_models_equivalent(prompt, turn) => {
+                Some(model_info(prompt))
+            }
+            (Some(_prompt), Some(_turn)) => None,
+            (Some(prompt), None) => Some(model_info(prompt)),
+            (None, Some(turn)) => Some(model_info(turn)),
+            (None, None) => None,
+        };
+    }
+
+    let session_ids = session_models_used
+        .iter()
+        .map(String::as_str)
+        .chain(grok_current_model_id(current_model));
+    if unique_grok_normalized_models(session_ids).len() == 1 {
+        return current_model.cloned().or_else(|| {
+            session_models_used
+                .first()
+                .map(|model_id| model_info(model_id))
+        });
+    }
+    None
 }
 
 fn for_grok_jsonl_record(
@@ -4214,6 +4429,57 @@ fn update_max(target: &mut Option<u64>, value: Option<&Value>) {
     }
 }
 
+fn estimate_grok_inference_sample_costs(
+    provider: &str,
+    current_model: Option<&ModelInfo>,
+    samples: &[GrokInferenceSample],
+    prompt_models: &[GrokModelObservation],
+    turn_models: &[GrokModelObservation],
+    session_models_used: &[String],
+    fallback_observed_at: &DateTime<Utc>,
+) -> CostInfo {
+    if samples.is_empty() {
+        return unknown_cost();
+    }
+    let mut total = CostAccumulator::default();
+    let mut representative = None;
+    let mut pricing_sources = HashSet::new();
+    for sample in samples {
+        let Some(model) = resolve_grok_inference_sample_model(
+            sample,
+            prompt_models,
+            turn_models,
+            session_models_used,
+            current_model,
+        ) else {
+            return unknown_cost();
+        };
+        let occurred_at = sample.observed_at.as_ref().unwrap_or(fallback_observed_at);
+        let cost = estimate_cost_at(provider, Some(&model), &sample.usage, occurred_at);
+        if cost.estimated_micro_usd().is_none() {
+            return unknown_cost();
+        }
+        if let Some(source) = &cost.pricing_source {
+            pricing_sources.insert(source.clone());
+        }
+        if representative.is_none() {
+            representative = Some(cost.clone());
+        }
+        total.add_estimated(&cost);
+    }
+    let Some(mut cost) = representative else {
+        return unknown_cost();
+    };
+    let Some(micro_usd) = total.micro_usd() else {
+        return unknown_cost();
+    };
+    cost.set_estimated_micro_usd(micro_usd);
+    if pricing_sources.len() > 1 {
+        cost.pricing_source = Some("xai_api_pricing:mixed".to_string());
+    }
+    cost
+}
+
 fn parse_grok_summary(
     adapter: &GrokBuildAdapter,
     source: &SourceLocation,
@@ -4248,6 +4514,7 @@ fn parse_grok_summary(
         .cloned()
         .unwrap_or_default();
     let signal_value = signals.as_ref().map(|(_, signals)| signals);
+    let session_models_used = grok_signals_models_used(signal_value);
     let total_messages = value
         .get("num_messages")
         .and_then(value_as_u64)
@@ -4371,12 +4638,34 @@ fn parse_grok_summary(
         },
     );
     summary.usage = usage;
-    summary.cost = estimate_cost_at(
-        adapter.provider(),
-        summary.model.as_ref(),
-        &summary.usage,
-        &summary.observed_at,
-    );
+    summary.cost = if inference_stats.has_usage() && !inference_stats.request_samples.is_empty() {
+        estimate_grok_inference_sample_costs(
+            adapter.provider(),
+            summary.model.as_ref(),
+            &inference_stats.request_samples,
+            &stats.prompt_models,
+            &stats.turn_models,
+            &session_models_used,
+            &summary.observed_at,
+        )
+    } else if unique_grok_normalized_models(
+        session_models_used
+            .iter()
+            .map(String::as_str)
+            .chain(grok_current_model_id(summary.model.as_ref())),
+    )
+    .len()
+        > 1
+    {
+        unknown_cost()
+    } else {
+        estimate_cost_at(
+            adapter.provider(),
+            summary.model.as_ref(),
+            &summary.usage,
+            &summary.observed_at,
+        )
+    };
     if summary.cost.estimated_api_equivalent_usd.is_some() {
         if inference_stats.has_usage() {
             summary.cost.confidence = Confidence::Medium;
@@ -10033,7 +10322,17 @@ mod tests {
         assert!(revision_number(CODEX_SCAN_CACHE_PARSER_REVISION) > 25);
         assert!(revision_number(CLAUDE_SCAN_CACHE_PARSER_REVISION) > 15);
         assert!(revision_number(OPENCODE_SCAN_CACHE_PARSER_REVISION) > 14);
-        assert!(revision_number(GROK_BUILD_SCAN_CACHE_PARSER_REVISION) > 16);
+        assert!(revision_number(GROK_BUILD_SCAN_CACHE_PARSER_REVISION) > 19);
+    }
+
+    #[test]
+    fn grok_request_level_pricing_upgrade_advances_parser_revision() {
+        let revision = GROK_BUILD_SCAN_CACHE_PARSER_REVISION
+            .rsplit_once(".v")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .expect("Grok parser revision");
+
+        assert!(revision > 19);
     }
 
     #[test]
@@ -13951,6 +14250,767 @@ mod tests {
 
         assert_eq!(before_a.cache_signature, after_a.cache_signature);
         assert_ne!(before_b.cache_signature, after_b.cache_signature);
+    }
+
+    #[test]
+    fn grok_build_prices_unified_log_inferences_independently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-mixed");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-mixed", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6-build",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:52.141Z",
+                    "sid": "session-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 100_000,
+                        "cached_prompt_tokens": 40_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:03.314Z",
+                    "sid": "session-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 200_000,
+                        "cached_prompt_tokens": 80_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        let model = summary.model.as_ref().expect("model");
+        assert_eq!(model.name.as_deref(), Some("grok-4.6-build"));
+        assert_eq!(model.normalized_name.as_deref(), Some("grok-4.6"));
+        assert_eq!(summary.usage.input_tokens, Some(180_000));
+        assert_eq!(summary.usage.cache_read_tokens, Some(120_000));
+        assert_eq!(summary.usage.output_tokens, Some(20_000));
+        assert_eq!(summary.usage.reasoning_tokens, None);
+        assert_eq!(summary.usage.requests, Some(2));
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(880_000)
+        );
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(88));
+        assert_eq!(summary.cost.confidence, Confidence::Medium);
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6:unified_log_inference_usage")
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .summary_version
+                .as_deref()
+                .map(|value| value.contains("inference_rows=2;usage_source=unified_log")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn grok_build_prices_mixed_model_session_from_prompt_model_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-mixed-models");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-mixed-models", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6-build",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "modelsUsed": ["grok-4.5", "grok-4.6"],
+                "primaryModelId": "grok-4.6",
+                "turnCount": 2
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        std::fs::write(
+            session.join("updates.jsonl"),
+            [
+                serde_json::json!({
+                    "timestamp": 1_786_905_120,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-mixed-models",
+                        "update": {
+                            "sessionUpdate": "user_message",
+                            "content": {"type": "text", "text": "first"},
+                            "_meta": {"modelId": "grok-4.5", "promptIndex": 0}
+                        },
+                        "_meta": {
+                            "eventId": "prompt-0",
+                            "agentTimestampMs": 1_786_905_120_000i64
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp": 1_786_905_130,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-mixed-models",
+                        "update": {
+                            "sessionUpdate": "assistant_chunk",
+                            "content": {"type": "text", "text": "working"}
+                        },
+                        "_meta": {
+                            "promptId": "req-4.5",
+                            "totalTokens": 100_000,
+                            "agentTimestampMs": 1_786_905_130_000i64
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp": 1_786_905_180,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-mixed-models",
+                        "update": {
+                            "sessionUpdate": "user_message",
+                            "content": {"type": "text", "text": "/model grok-4.6"},
+                            "_meta": {"modelId": "grok-4.6", "promptIndex": 1}
+                        },
+                        "_meta": {
+                            "eventId": "prompt-1",
+                            "agentTimestampMs": 1_786_905_180_000i64
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp": 1_786_905_200,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-mixed-models",
+                        "update": {
+                            "sessionUpdate": "assistant_chunk",
+                            "content": {"type": "text", "text": "switched"}
+                        },
+                        "_meta": {
+                            "promptId": "req-4.6",
+                            "totalTokens": 200_000,
+                            "agentTimestampMs": 1_786_905_200_000i64
+                        }
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("updates");
+        std::fs::write(
+            session.join("events.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:00Z",
+                    "type": "turn_started",
+                    "model_id": "grok-4.5",
+                    "turn_number": 0
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:00.100Z",
+                    "type": "loop_started",
+                    "loop_index": 0
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:00Z",
+                    "type": "turn_started",
+                    "model_id": "grok-4.6",
+                    "turn_number": 1
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("events");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:10Z",
+                    "sid": "session-mixed-models",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "loop_index": 1,
+                        "prompt_tokens": 100_000,
+                        "cached_prompt_tokens": 40_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:20Z",
+                    "sid": "session-mixed-models",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "loop_index": 1,
+                        "prompt_tokens": 200_000,
+                        "cached_prompt_tokens": 80_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        let model = summary.model.as_ref().expect("model");
+        assert_eq!(model.name.as_deref(), Some("grok-4.6-build"));
+        assert_eq!(model.normalized_name.as_deref(), Some("grok-4.6"));
+        assert_eq!(summary.usage.input_tokens, Some(180_000));
+        assert_eq!(summary.usage.cache_read_tokens, Some(120_000));
+        assert_eq!(summary.usage.output_tokens, Some(20_000));
+        assert_eq!(summary.usage.requests, Some(2));
+        // grok-4.5 short (60k/40k/10k @ $2/$0.30/$6) + grok-4.6 long (120k/80k/10k
+        // @ $4/$1/$12) = $0.192 + $0.680. Pricing both as current_model_id (4.6)
+        // would be $0.880.
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(872_000)
+        );
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(87));
+        assert_eq!(summary.cost.confidence, Confidence::Medium);
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:mixed:unified_log_inference_usage")
+        );
+    }
+
+    #[test]
+    fn grok_build_keeps_unresolved_mixed_models_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-mixed-unknown");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-mixed-unknown", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6-build",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "modelsUsed": ["grok-4.5", "grok-4.6"],
+                "primaryModelId": "grok-4.6",
+                "turnCount": 2
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:10Z",
+                    "sid": "session-mixed-unknown",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 100_000,
+                        "cached_prompt_tokens": 40_000,
+                        "completion_tokens": 10_000
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:20Z",
+                    "sid": "session-mixed-unknown",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 200_000,
+                        "cached_prompt_tokens": 80_000,
+                        "completion_tokens": 10_000
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.name.as_deref()),
+            Some("grok-4.6-build")
+        );
+        assert_eq!(summary.usage.requests, Some(2));
+        assert_eq!(summary.cost.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, None);
+        assert_eq!(summary.cost.pricing_source.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn grok_build_keeps_partial_observation_mixed_models_used_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-partial-mixed");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-partial-mixed", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6-build",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "modelsUsed": ["grok-4.5", "grok-4.6"],
+                "primaryModelId": "grok-4.6",
+                "turnCount": 2
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        std::fs::write(
+            session.join("updates.jsonl"),
+            serde_json::json!({
+                "timestamp": 1_786_905_120,
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-partial-mixed",
+                    "update": {
+                        "sessionUpdate": "user_message",
+                        "content": {"type": "text", "text": "first"},
+                        "_meta": {"modelId": "grok-4.5", "promptIndex": 0}
+                    },
+                    "_meta": {
+                        "eventId": "prompt-0",
+                        "agentTimestampMs": 1_786_905_120_000i64
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("updates");
+        std::fs::write(
+            session.join("events.jsonl"),
+            serde_json::json!({
+                "ts": "2026-08-16T18:32:00Z",
+                "type": "turn_started",
+                "model_id": "grok-4.5",
+                "turn_number": 0
+            })
+            .to_string(),
+        )
+        .expect("events");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:10Z",
+                    "sid": "session-partial-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "loop_index": 1,
+                        "prompt_tokens": 100_000,
+                        "cached_prompt_tokens": 40_000,
+                        "completion_tokens": 10_000
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:20Z",
+                    "sid": "session-partial-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "loop_index": 2,
+                        "prompt_tokens": 200_000,
+                        "cached_prompt_tokens": 80_000,
+                        "completion_tokens": 10_000
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.name.as_deref()),
+            Some("grok-4.6-build")
+        );
+        assert_eq!(summary.usage.requests, Some(2));
+        // A sole grok-4.5 prompt/turn observation must not price the second
+        // request as 4.5 when modelsUsed also reports grok-4.6 (that would be
+        // $0.840). Attribution is incomplete, so cost stays unknown.
+        assert_eq!(summary.cost.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, None);
+        assert_eq!(summary.cost.pricing_source.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn grok_build_keeps_aggregate_prompt_context_conservative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-aggregate");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-aggregate", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "turnCount": 2,
+                "contextTokensUsed": 300_000
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("grok-4.6")
+        );
+        assert_eq!(summary.usage.input_tokens, Some(300_000));
+        assert_eq!(summary.usage.requests, Some(2));
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(600_000)
+        );
+        assert_eq!(summary.cost.confidence, Confidence::Low);
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6:prompt_context_token_footprint")
+        );
+    }
+
+    #[test]
+    fn grok_fixture_session_keeps_grok_4_6_identity_and_is_priced() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok/basic");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            &root,
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.name.as_deref()),
+            Some("grok-4.6")
+        );
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("grok-4.6")
+        );
+        assert_eq!(summary.usage.input_tokens, Some(15_534));
+        assert_eq!(summary.usage.cache_read_tokens, Some(42_624));
+        assert_eq!(summary.usage.output_tokens, Some(917));
+        assert_eq!(summary.usage.reasoning_tokens, Some(508));
+        assert_eq!(summary.usage.requests, Some(3));
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(60_930)
+        );
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6:unified_log_inference_usage")
+        );
+    }
+
+    #[test]
+    fn grok_inference_sample_costs_stay_unknown_when_unpriced() {
+        let observed_at = Utc::now();
+        let sample = GrokInferenceSample {
+            usage: UsageCounts {
+                input_tokens: Some(1_000),
+                output_tokens: Some(100),
+                requests: Some(1),
+                ..UsageCounts::default()
+            },
+            observed_at: Some(observed_at),
+        };
+
+        let missing_model = estimate_grok_inference_sample_costs(
+            GROK_BUILD_PROVIDER,
+            None,
+            std::slice::from_ref(&sample),
+            &[],
+            &[],
+            &[],
+            &observed_at,
+        );
+        let empty = estimate_grok_inference_sample_costs(
+            GROK_BUILD_PROVIDER,
+            Some(&ModelInfo {
+                name: Some("grok-4.6".to_string()),
+                normalized_name: Some("grok-4.6".to_string()),
+                provider_model_id: Some("grok-4.6".to_string()),
+                speed: None,
+                reasoning_level: None,
+                reasoning_level_raw: None,
+            }),
+            &[],
+            &[],
+            &[],
+            &[],
+            &observed_at,
+        );
+
+        assert_eq!(missing_model.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(missing_model.estimated_api_equivalent_usd, None);
+        assert_eq!(missing_model.pricing_source.as_deref(), Some("unknown"));
+        assert_eq!(empty.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(empty.pricing_source.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn grok_inference_model_resolution_joins_prompt_model_id_by_timestamp() {
+        let first = DateTime::parse_from_rfc3339("2026-08-16T18:32:10Z")
+            .expect("first")
+            .with_timezone(&Utc);
+        let second = DateTime::parse_from_rfc3339("2026-08-16T18:33:20Z")
+            .expect("second")
+            .with_timezone(&Utc);
+        let prompt_models = [
+            GrokModelObservation {
+                model_id: "grok-4.5".to_string(),
+                observed_at: Some(
+                    DateTime::parse_from_rfc3339("2026-08-16T18:32:00Z")
+                        .expect("prompt 0")
+                        .with_timezone(&Utc),
+                ),
+            },
+            GrokModelObservation {
+                model_id: "grok-4.6".to_string(),
+                observed_at: Some(
+                    DateTime::parse_from_rfc3339("2026-08-16T18:33:00Z")
+                        .expect("prompt 1")
+                        .with_timezone(&Utc),
+                ),
+            },
+        ];
+        let current = model_info("grok-4.6-build");
+
+        let first_model = resolve_grok_inference_sample_model(
+            &GrokInferenceSample {
+                usage: UsageCounts::default(),
+                observed_at: Some(first),
+            },
+            &prompt_models,
+            &[],
+            &["grok-4.5".to_string(), "grok-4.6".to_string()],
+            Some(&current),
+        )
+        .expect("first model");
+        let second_model = resolve_grok_inference_sample_model(
+            &GrokInferenceSample {
+                usage: UsageCounts::default(),
+                observed_at: Some(second),
+            },
+            &prompt_models,
+            &[],
+            &["grok-4.5".to_string(), "grok-4.6".to_string()],
+            Some(&current),
+        )
+        .expect("second model");
+        let unresolved = resolve_grok_inference_sample_model(
+            &GrokInferenceSample {
+                usage: UsageCounts::default(),
+                observed_at: Some(first),
+            },
+            &[],
+            &[],
+            &["grok-4.5".to_string(), "grok-4.6".to_string()],
+            Some(&current),
+        );
+
+        assert_eq!(first_model.name.as_deref(), Some("grok-4.5"));
+        assert_eq!(first_model.normalized_name.as_deref(), Some("grok-4.5"));
+        assert_eq!(second_model.name.as_deref(), Some("grok-4.6"));
+        assert_eq!(second_model.normalized_name.as_deref(), Some("grok-4.6"));
+        assert_eq!(unresolved, None);
+    }
+
+    #[test]
+    fn grok_inference_model_resolution_rejects_partial_observation_when_models_used_is_mixed() {
+        let observed_at = DateTime::parse_from_rfc3339("2026-08-16T18:32:10Z")
+            .expect("observed")
+            .with_timezone(&Utc);
+        let sample = GrokInferenceSample {
+            usage: UsageCounts::default(),
+            observed_at: Some(observed_at),
+        };
+        let prompt_models = [GrokModelObservation {
+            model_id: "grok-4.5".to_string(),
+            observed_at: Some(
+                DateTime::parse_from_rfc3339("2026-08-16T18:32:00Z")
+                    .expect("prompt")
+                    .with_timezone(&Utc),
+            ),
+        }];
+        let current = model_info("grok-4.6-build");
+
+        let mixed = resolve_grok_inference_sample_model(
+            &sample,
+            &prompt_models,
+            &[],
+            &["grok-4.5".to_string(), "grok-4.6".to_string()],
+            Some(&current),
+        );
+        let matching = resolve_grok_inference_sample_model(
+            &sample,
+            &prompt_models,
+            &[],
+            &["grok-4.5".to_string()],
+            Some(&current),
+        )
+        .expect("matching modelsUsed");
+        let empty_used =
+            resolve_grok_inference_sample_model(&sample, &prompt_models, &[], &[], Some(&current))
+                .expect("empty modelsUsed");
+
+        assert_eq!(mixed, None);
+        assert_eq!(matching.name.as_deref(), Some("grok-4.5"));
+        assert_eq!(empty_used.name.as_deref(), Some("grok-4.5"));
     }
 }
 mod archive;
