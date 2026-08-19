@@ -12892,6 +12892,85 @@ mod tests {
     }
 
     #[test]
+    fn incremental_http_sync_includes_repriced_passthrough_summaries_without_full() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-reprice-passthrough"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 7, 28, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Utc
+            .with_ymd_and_hms(2026, 7, 29, 23, 59, 59)
+            .single()
+            .expect("end");
+        let mut summary = test_summary("codex", &source, end, 4_000_000, None);
+        summary.source.source_kind = SourceKind::LocalAdapter;
+        summary.source.source_type = "build-session.json".to_string();
+        summary.metadata.summary_format = "grok_build_session_summary".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(end);
+        summary.model = Some(ModelInfo {
+            name: Some("codex-auto-review".to_string()),
+            normalized_name: Some("codex-auto-review".to_string()),
+            provider_model_id: Some("codex-auto-review".to_string()),
+            speed: None,
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        });
+        summary.usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_creation_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            total_tokens: Some(4_000_000),
+            ..UsageCounts::default()
+        };
+        store.upsert_summary(&summary).expect("passthrough summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        assert!(!command.full);
+        let target = sync_target(&command).expect("target");
+        let (initial_batch, _) =
+            build_sync_batch(&command, &store, "device", &target).expect("initial batch");
+        assert_eq!(initial_batch.summaries.len(), 1);
+        assert!(!is_daily_rollup_summary(&initial_batch.summaries[0]));
+        assert!(initial_batch.summaries[0]
+            .cost
+            .estimated_api_equivalent_usd
+            .is_none());
+        record_rollup_sync_success(&store, "http", &target, &initial_batch)
+            .expect("record initial sync");
+
+        let (repeat_batch, _) =
+            build_sync_batch(&command, &store, "device", &target).expect("repeat batch");
+        assert!(repeat_batch.summaries.is_empty());
+
+        let report = store.ensure_current_pricing().expect("automatic reprice");
+        assert_eq!(report.changed_summaries, 1);
+
+        let (incremental_batch, incremental_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("incremental batch");
+        assert_eq!(incremental_mode, SyncPayloadMode::Rollups);
+        assert_eq!(incremental_batch.summaries.len(), 1);
+        assert!(!is_daily_rollup_summary(&incremental_batch.summaries[0]));
+        assert!(incremental_batch.summaries[0]
+            .cost
+            .estimated_api_equivalent_usd
+            .is_some());
+    }
+
+    #[test]
     fn http_incremental_rollups_are_tracked_per_target() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(

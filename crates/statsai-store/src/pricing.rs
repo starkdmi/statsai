@@ -8,7 +8,7 @@ use statsai_pricing::{
     estimate_cost_at, overlay_estimated_cost, pricing_changes_between, unknown_cost,
     PRICING_CATALOG_VERSION, PRICING_RULESET_VERSION,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 pub const APPLIED_PRICING_RULESET_VERSION_KEY: &str = "pricing.applied_ruleset_version";
@@ -113,12 +113,11 @@ impl Store {
 
             let mut report = RepricingReport::default();
             let mut dirty_keys = BTreeSet::new();
-            let mut changed_event_ids = BTreeSet::new();
 
-            self.reprice_events_in_tx(&mut report, &mut dirty_keys, &mut changed_event_ids)?;
+            self.reprice_events_in_tx(&mut report, &mut dirty_keys)?;
             self.reprice_summaries_in_tx(&mut report)?;
             report.refreshed_rollups = self.refresh_sync_rollups_for_keys_counted(&dirty_keys)?;
-            self.reprice_task_spans_in_tx(&mut report, &changed_event_ids)?;
+            self.reprice_task_spans_in_tx(&mut report)?;
 
             self.set_metadata_value(
                 APPLIED_PRICING_RULESET_VERSION_KEY,
@@ -141,7 +140,6 @@ impl Store {
         &self,
         report: &mut RepricingReport,
         dirty_keys: &mut BTreeSet<SyncRollupBucketKey>,
-        changed_event_ids: &mut BTreeSet<String>,
     ) -> Result<()> {
         let mut after: Option<String> = None;
         loop {
@@ -154,8 +152,7 @@ impl Store {
                 report.examined_events += 1;
                 maybe_fail_after_event_writes(report.changed_events)?;
                 if let Some(updated) = reprice_event(&event) {
-                    dirty_keys.extend(self.update_event_payload(&updated)?);
-                    changed_event_ids.insert(updated.event_id.0);
+                    dirty_keys.insert(self.update_event_cost_payload(&updated)?);
                     report.changed_events += 1;
                 }
             }
@@ -231,42 +228,37 @@ impl Store {
         Ok(summaries)
     }
 
-    fn reprice_task_spans_in_tx(
-        &self,
-        report: &mut RepricingReport,
-        changed_event_ids: &BTreeSet<String>,
-    ) -> Result<()> {
-        if changed_event_ids.is_empty() {
-            return Ok(());
-        }
+    fn reprice_task_spans_in_tx(&self, report: &mut RepricingReport) -> Result<()> {
         let mut after: Option<String> = None;
         let mut changed_buckets = BTreeSet::new();
         loop {
-            let page = self.task_span_page_after(after.as_deref(), TASK_SPAN_PAGE_SIZE)?;
+            let page = self.linked_task_span_page_after(after.as_deref(), TASK_SPAN_PAGE_SIZE)?;
             if page.is_empty() {
                 break;
             }
             after = page.last().map(|span| span.span_id.0.clone());
+            let event_ids = page
+                .iter()
+                .flat_map(|span| {
+                    span.linked_event_ids
+                        .iter()
+                        .map(|event_id| event_id.0.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            let events = self.events_by_ids(&event_ids)?;
             let mut updated_spans = Vec::new();
             for mut span in page {
-                if span
-                    .linked_event_ids
-                    .iter()
-                    .any(|event_id| changed_event_ids.contains(&event_id.0))
-                {
-                    if let Some((cents, micro)) =
-                        self.estimated_cost_for_linked_events(&span.linked_event_ids)?
-                    {
-                        if span.estimated_cost_usd != cents
-                            || span.estimated_cost_micro_usd != micro
-                        {
-                            span.estimated_cost_usd = cents;
-                            span.estimated_cost_micro_usd = micro;
-                            changed_buckets.insert(span.project_bucket.clone());
-                            updated_spans.push(span);
-                            report.changed_task_spans += 1;
-                        }
-                    }
+                let Some((cents, micro)) =
+                    estimated_cost_for_loaded_events(&span.linked_event_ids, &events)
+                else {
+                    continue;
+                };
+                if span.estimated_cost_usd != cents || span.estimated_cost_micro_usd != micro {
+                    span.estimated_cost_usd = cents;
+                    span.estimated_cost_micro_usd = micro;
+                    changed_buckets.insert(span.project_bucket.clone());
+                    updated_spans.push(span);
+                    report.changed_task_spans += 1;
                 }
             }
             if !updated_spans.is_empty() {
@@ -280,25 +272,35 @@ impl Store {
         Ok(())
     }
 
-    fn task_span_page_after(
+    fn linked_task_span_page_after(
         &self,
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<statsai_core::TaskSpan>> {
+        let sql = if after.is_some() {
+            "SELECT payload FROM task_spans
+             WHERE span_id > ?1
+               AND EXISTS (
+                 SELECT 1 FROM task_span_event_links WHERE span_id = task_spans.span_id
+               )
+             ORDER BY span_id LIMIT ?2"
+        } else {
+            "SELECT payload FROM task_spans
+             WHERE EXISTS (
+               SELECT 1 FROM task_span_event_links WHERE span_id = task_spans.span_id
+             )
+             ORDER BY span_id LIMIT ?1"
+        };
         let mut spans = Vec::new();
         if let Some(after) = after {
-            let mut statement = self.conn.prepare(
-                "SELECT payload FROM task_spans WHERE span_id > ?1 ORDER BY span_id LIMIT ?2",
-            )?;
+            let mut statement = self.conn.prepare(sql)?;
             let rows =
                 statement.query_map(params![after, limit as i64], |row| row.get::<_, String>(0))?;
             for row in rows {
                 spans.push(serde_json::from_str(&row?)?);
             }
         } else {
-            let mut statement = self
-                .conn
-                .prepare("SELECT payload FROM task_spans ORDER BY span_id LIMIT ?1")?;
+            let mut statement = self.conn.prepare(sql)?;
             let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
             for row in rows {
                 spans.push(serde_json::from_str(&row?)?);
@@ -307,26 +309,50 @@ impl Store {
         Ok(spans)
     }
 
-    fn estimated_cost_for_linked_events(
-        &self,
-        event_ids: &[statsai_core::EventId],
-    ) -> Result<Option<(Option<i64>, Option<i64>)>> {
-        if event_ids.is_empty() {
-            return Ok(None);
-        }
-        let mut estimated = CostAccumulator::default();
-        let mut found = false;
-        for event_id in event_ids {
-            if let Some(event) = self.event_by_id(&event_id.0)? {
-                estimated.add_estimated(&event.cost);
-                found = true;
+    fn events_by_ids(&self, event_ids: &BTreeSet<String>) -> Result<HashMap<String, UsageEvent>> {
+        let mut events = HashMap::new();
+        let ids = event_ids.iter().cloned().collect::<Vec<_>>();
+        for chunk in ids.chunks(128) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT event_id, payload FROM usage_events WHERE event_id IN ({placeholders})"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = statement.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (event_id, payload) = row?;
+                events.insert(event_id, serde_json::from_str(&payload)?);
             }
         }
-        if !found {
-            return Ok(None);
-        }
-        Ok(Some((estimated.cents_rounded(), estimated.micro_usd())))
+        Ok(events)
     }
+}
+
+fn estimated_cost_for_loaded_events(
+    event_ids: &[statsai_core::EventId],
+    events: &HashMap<String, UsageEvent>,
+) -> Option<(Option<i64>, Option<i64>)> {
+    if event_ids.is_empty() {
+        return None;
+    }
+    let mut estimated = CostAccumulator::default();
+    let mut found = false;
+    for event_id in event_ids {
+        if let Some(event) = events.get(&event_id.0) {
+            estimated.add_estimated(&event.cost);
+            found = true;
+        }
+    }
+    found.then_some((estimated.cents_rounded(), estimated.micro_usd()))
 }
 
 fn reprice_event(event: &UsageEvent) -> Option<UsageEvent> {
@@ -591,6 +617,104 @@ mod tests {
             .event_by_id(event_id)
             .expect("load event")
             .expect("event present")
+    }
+
+    fn test_span(
+        source: &statsai_core::SourceLocation,
+        started_at: chrono::DateTime<Utc>,
+        record_id: &str,
+        linked_event_ids: Vec<statsai_core::EventId>,
+        estimated_cost_usd: Option<i64>,
+        estimated_cost_micro_usd: Option<i64>,
+    ) -> TaskSpan {
+        TaskSpan {
+            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+            span_id: task_span_id("codex", &source.source_id, record_id),
+            provider: "codex".to_string(),
+            source_id: source.source_id.clone(),
+            span_kind: "codex_session".to_string(),
+            source_record_id: Some(record_id.to_string()),
+            source_file_path_hash: None,
+            summary_id: None,
+            session_id: Some("session".to_string()),
+            thread_id: None,
+            title: "Review".to_string(),
+            normalized_title: "review".to_string(),
+            title_source: Some("summary".to_string()),
+            summary_preview: None,
+            todo_excerpt: None,
+            issue_keys: Vec::new(),
+            branch_family: None,
+            project_bucket: "none".to_string(),
+            project: None,
+            git: None,
+            usage: million_token_usage(),
+            estimated_cost_usd,
+            estimated_cost_micro_usd,
+            event_count: linked_event_ids.len() as u64,
+            has_usage_evidence: !linked_event_ids.is_empty(),
+            total_messages: 0,
+            user_messages: 0,
+            assistant_messages: 0,
+            developer_messages: 0,
+            linked_event_ids,
+            confidence: Confidence::Medium,
+            is_meta: false,
+            started_at,
+            ended_at: Some(started_at),
+            duration_seconds: Some(0),
+        }
+    }
+
+    fn test_summary(
+        source: &statsai_core::SourceLocation,
+        model: &str,
+        start: chrono::DateTime<Utc>,
+        end: chrono::DateTime<Utc>,
+        cost: CostInfo,
+    ) -> UsageSummary {
+        UsageSummary {
+            schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
+            summary_id: summary_id("codex", &source.source_id, "period"),
+            device_id: "device".to_string(),
+            provider: "codex".to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: None,
+            source: EventSource {
+                adapter_id: "test".to_string(),
+                adapter_version: "0".to_string(),
+                source_kind: SourceKind::LocalAdapter,
+                location_origin: Some(LocationOrigin::Configured),
+                source_type: "stats-cache.json".to_string(),
+                source_path_hash: source.path_hash.clone(),
+                source_record_id: Some("period".to_string()),
+                parse_confidence: Confidence::Medium,
+            },
+            model: Some(test_model(model)),
+            models: Vec::new(),
+            usage: million_token_usage(),
+            cost,
+            parse_evidence: None,
+            project: None,
+            privacy: PrivacyInfo {
+                mode: PrivacyMode::MetadataOnly,
+                contains_prompt_text: false,
+                contains_response_text: false,
+                contains_file_paths: false,
+            },
+            metrics: None,
+            period_start: Some(start),
+            period_end: Some(end),
+            observed_at: end,
+            metadata: SummaryMetadata {
+                summary_format: "grok_build_session_summary".to_string(),
+                summary_version: Some("1".to_string()),
+                total_sessions: Some(1),
+                total_messages: Some(2),
+                last_computed_at: Some(end),
+            },
+            imported_at: end,
+        }
     }
 
     #[test]
@@ -1114,50 +1238,228 @@ mod tests {
             missing_cost(),
         );
         store.insert_event(&event).expect("insert");
-        let span = TaskSpan {
-            schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
-            span_id: task_span_id("codex", &source.source_id, "span"),
-            provider: "codex".to_string(),
-            source_id: source.source_id.clone(),
-            span_kind: "codex_session".to_string(),
-            source_record_id: Some("span".to_string()),
-            source_file_path_hash: None,
-            summary_id: None,
-            session_id: Some("session".to_string()),
-            thread_id: None,
-            title: "Review".to_string(),
-            normalized_title: "review".to_string(),
-            title_source: Some("summary".to_string()),
-            summary_preview: None,
-            todo_excerpt: None,
-            issue_keys: Vec::new(),
-            branch_family: None,
-            project_bucket: "none".to_string(),
-            project: None,
-            git: None,
-            usage: million_token_usage(),
-            estimated_cost_usd: Some(0),
-            estimated_cost_micro_usd: Some(0),
-            event_count: 1,
-            has_usage_evidence: true,
-            total_messages: 0,
-            user_messages: 0,
-            assistant_messages: 0,
-            developer_messages: 0,
-            linked_event_ids: vec![event.event_id.clone()],
-            confidence: Confidence::Medium,
-            is_meta: false,
-            started_at,
-            ended_at: Some(started_at),
-            duration_seconds: Some(0),
-        };
-        store.upsert_task_spans(&[span]).expect("span");
+        store
+            .upsert_task_spans(&[test_span(
+                &source,
+                started_at,
+                "span",
+                vec![event.event_id.clone()],
+                Some(0),
+                Some(0),
+            )])
+            .expect("span");
 
         let report = store.ensure_current_pricing().expect("reprice");
         let stored = store.task_spans().expect("spans");
         assert_eq!(report.changed_task_spans, 1);
         assert_eq!(
             stored[0].estimated_cost_usd,
+            expected_review_cost(started_at).estimated_api_equivalent_usd
+        );
+    }
+
+    #[test]
+    fn stale_task_spans_are_repriced_when_events_already_match() {
+        let (store, source) = store_with_source("/tmp/codex-stale-span-current-event");
+        let started_at = parse_utc("2026-07-29T12:00:00Z");
+        let expected = expected_review_cost(started_at);
+        let event = test_event(
+            &source,
+            started_at,
+            "already-priced",
+            "codex-auto-review",
+            million_token_usage(),
+            expected.clone(),
+        );
+        store.insert_event(&event).expect("insert");
+        store
+            .upsert_task_spans(&[test_span(
+                &source,
+                started_at,
+                "stale-span",
+                vec![event.event_id.clone()],
+                Some(0),
+                Some(0),
+            )])
+            .expect("span");
+
+        let report = store.ensure_current_pricing().expect("reprice");
+        let stored = store.task_spans().expect("spans");
+        assert_eq!(report.changed_events, 0);
+        assert_eq!(report.changed_task_spans, 1);
+        assert!(!report.already_current);
+        assert_eq!(
+            stored[0].estimated_cost_usd,
+            expected.estimated_api_equivalent_usd
+        );
+        assert_eq!(
+            store.applied_pricing_ruleset_version().expect("applied"),
+            Some(PRICING_RULESET_VERSION)
+        );
+    }
+
+    #[test]
+    fn unlinked_task_spans_are_left_unchanged() {
+        let (store, source) = store_with_source("/tmp/codex-unlinked-span");
+        let started_at = parse_utc("2026-07-29T12:00:00Z");
+        store
+            .insert_event(&test_event(
+                &source,
+                started_at,
+                "priced",
+                "codex-auto-review",
+                million_token_usage(),
+                expected_review_cost(started_at),
+            ))
+            .expect("insert");
+        store
+            .upsert_task_spans(&[test_span(
+                &source,
+                started_at,
+                "unlinked",
+                Vec::new(),
+                Some(0),
+                Some(0),
+            )])
+            .expect("span");
+
+        let report = store.ensure_current_pricing().expect("reprice");
+        let stored = store.task_spans().expect("spans");
+        assert_eq!(report.changed_task_spans, 0);
+        assert_eq!(stored[0].estimated_cost_usd, Some(0));
+        assert_eq!(stored[0].estimated_cost_micro_usd, Some(0));
+    }
+
+    #[test]
+    fn summary_inside_one_pricing_window_is_repriced() {
+        let (store, source) = store_with_source("/tmp/codex-window-summary");
+        let start = parse_utc("2026-07-28T00:00:00Z");
+        let end = parse_utc("2026-07-29T23:59:59Z");
+        store
+            .upsert_summary(&test_summary(
+                &source,
+                "codex-auto-review",
+                start,
+                end,
+                missing_cost(),
+            ))
+            .expect("summary");
+
+        let report = store.ensure_current_pricing().expect("reprice");
+        let stored = store
+            .summaries()
+            .expect("summaries")
+            .into_iter()
+            .next()
+            .expect("one summary");
+        assert_eq!(report.changed_summaries, 1);
+        assert_eq!(stored.cost, expected_review_cost(end));
+    }
+
+    #[test]
+    fn invalid_applied_ruleset_metadata_fails_closed() {
+        let (store, source) = store_with_source("/tmp/codex-invalid-ruleset-meta");
+        let started_at = parse_utc("2026-07-29T12:00:00Z");
+        let event = test_event(
+            &source,
+            started_at,
+            "legacy-review",
+            "codex-auto-review",
+            million_token_usage(),
+            missing_cost(),
+        );
+        store.insert_event(&event).expect("insert");
+        store
+            .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "not-a-number")
+            .expect("write invalid metadata");
+        let payload_before =
+            serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize");
+
+        let error = store
+            .ensure_current_pricing()
+            .expect_err("invalid metadata must fail");
+
+        assert!(error
+            .to_string()
+            .contains("invalid pricing.applied_ruleset_version"));
+        assert_eq!(
+            serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize"),
+            payload_before
+        );
+    }
+
+    #[test]
+    fn repriced_task_buckets_are_marked_dirty_for_incremental_sync() {
+        let (store, source) = store_with_source("/tmp/codex-task-bucket-dirty");
+        let started_at = parse_utc("2026-07-29T12:00:00Z");
+        let event = test_event(
+            &source,
+            started_at,
+            "legacy-review",
+            "codex-auto-review",
+            million_token_usage(),
+            missing_cost(),
+        );
+        store.insert_event(&event).expect("insert");
+        store
+            .upsert_task_spans(&[test_span(
+                &source,
+                started_at,
+                "span",
+                vec![event.event_id.clone()],
+                Some(0),
+                Some(0),
+            )])
+            .expect("span");
+        store
+            .rebuild_task_work_items_for_project_buckets(&BTreeSet::from(["none".to_string()]))
+            .expect("seed work items");
+        let snapshots = store
+            .pending_task_bucket_snapshots_for_sync(
+                "http",
+                "https://example.invalid/api/sync/batches",
+                "device",
+                true,
+                None,
+            )
+            .expect("initial snapshots");
+        assert!(!snapshots.is_empty());
+        store
+            .record_task_bucket_snapshots_synced(
+                "http",
+                "https://example.invalid/api/sync/batches",
+                "device",
+                &snapshots,
+            )
+            .expect("mark synced");
+        assert!(store
+            .pending_task_bucket_snapshots_for_sync(
+                "http",
+                "https://example.invalid/api/sync/batches",
+                "device",
+                false,
+                None,
+            )
+            .expect("clean pending")
+            .is_empty());
+
+        let report = store.ensure_current_pricing().expect("reprice");
+        assert_eq!(report.changed_task_spans, 1);
+        assert!(report.rebuilt_work_items > 0);
+        let pending = store
+            .pending_task_bucket_snapshots_for_sync(
+                "http",
+                "https://example.invalid/api/sync/batches",
+                "device",
+                false,
+                None,
+            )
+            .expect("dirty pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].project_bucket, "none");
+        let work_items = store.work_items().expect("work items");
+        assert_eq!(
+            work_items[0].estimated_cost_usd,
             expected_review_cost(started_at).estimated_api_equivalent_usd
         );
     }

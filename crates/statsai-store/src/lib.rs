@@ -1611,6 +1611,23 @@ impl Store {
         let existing_bucket = self
             .event_by_id(&event.event_id.0)?
             .map(|existing| sync_rollup_bucket_key(&existing));
+        let bucket = self.update_event_cost_payload(event)?;
+        let mut dirty_keys = BTreeSet::new();
+        if let Some(existing_bucket) = existing_bucket {
+            dirty_keys.insert(existing_bucket);
+        }
+        dirty_keys.insert(bucket);
+        Ok(dirty_keys)
+    }
+
+    /// Updates a persisted event's payload without re-reading it.
+    ///
+    /// Repricing only changes estimated cost, so the sync-rollup bucket is the
+    /// in-memory event's bucket.
+    pub(crate) fn update_event_cost_payload(
+        &self,
+        event: &UsageEvent,
+    ) -> Result<SyncRollupBucketKey> {
         let payload = serde_json::to_string(event)?;
         let fingerprint = event_fingerprint(event);
         self.conn.execute(
@@ -1636,12 +1653,7 @@ impl Store {
                 &payload
             ],
         )?;
-        let mut dirty_keys = BTreeSet::new();
-        if let Some(existing_bucket) = existing_bucket {
-            dirty_keys.insert(existing_bucket);
-        }
-        dirty_keys.insert(sync_rollup_bucket_key(event));
-        Ok(dirty_keys)
+        Ok(sync_rollup_bucket_key(event))
     }
 
     fn insert_event_in_batch(

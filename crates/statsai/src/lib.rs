@@ -275,6 +275,29 @@ mod tests {
     }
 
     #[test]
+    fn open_operational_store_refuses_a_newer_pricing_ruleset() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("statsai.sqlite");
+        let store = Store::open(&path).expect("create store");
+        store
+            .set_metadata_value(statsai_store::APPLIED_PRICING_RULESET_VERSION_KEY, "99")
+            .expect("future ruleset");
+        drop(store);
+
+        let error = match open_operational_store(&path) {
+            Ok(_) => panic!("forward pricing must refuse"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("pricing ruleset version 99 is newer than this StatsAI binary supports"));
+        assert_eq!(
+            statsai_store::database_applied_pricing_ruleset_version(&path).expect("unchanged"),
+            Some(99)
+        );
+    }
+
+    #[test]
     fn daemon_auth_token_is_random_persistent_and_private() {
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().join("state").join("daemon-token");
