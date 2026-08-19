@@ -4256,12 +4256,18 @@ fn estimate_grok_inference_sample_costs(
     samples: &[GrokInferenceSample],
     fallback_observed_at: &DateTime<Utc>,
 ) -> CostInfo {
+    if samples.is_empty() {
+        return unknown_cost();
+    }
     let mut total = CostAccumulator::default();
     let mut representative = None;
     for sample in samples {
         let occurred_at = sample.observed_at.as_ref().unwrap_or(fallback_observed_at);
         let cost = estimate_cost_at(provider, model, &sample.usage, occurred_at);
-        if representative.is_none() && cost.estimated_api_equivalent_usd.is_some() {
+        if cost.estimated_micro_usd().is_none() {
+            return unknown_cost();
+        }
+        if representative.is_none() {
             representative = Some(cost.clone());
         }
         total.add_estimated(&cost);
@@ -4269,9 +4275,10 @@ fn estimate_grok_inference_sample_costs(
     let Some(mut cost) = representative else {
         return unknown_cost();
     };
-    if let Some(micro_usd) = total.micro_usd() {
-        cost.set_estimated_micro_usd(micro_usd);
-    }
+    let Some(micro_usd) = total.micro_usd() else {
+        return unknown_cost();
+    };
+    cost.set_estimated_micro_usd(micro_usd);
     cost
 }
 
@@ -14107,9 +14114,9 @@ mod tests {
         assert_eq!(summary.usage.requests, Some(2));
         assert_eq!(
             summary.cost.estimated_api_equivalent_micro_usd,
-            Some(840_000)
+            Some(880_000)
         );
-        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(84));
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(88));
         assert_eq!(summary.cost.confidence, Confidence::Medium);
         assert_eq!(
             summary.cost.pricing_source.as_deref(),
@@ -14222,12 +14229,52 @@ mod tests {
         assert_eq!(summary.usage.requests, Some(3));
         assert_eq!(
             summary.cost.estimated_api_equivalent_micro_usd,
-            Some(52_405)
+            Some(60_930)
         );
         assert_eq!(
             summary.cost.pricing_source.as_deref(),
             Some("xai_api_pricing:grok-4.6:unified_log_inference_usage")
         );
+    }
+
+    #[test]
+    fn grok_inference_sample_costs_stay_unknown_when_unpriced() {
+        let observed_at = Utc::now();
+        let sample = GrokInferenceSample {
+            usage: UsageCounts {
+                input_tokens: Some(1_000),
+                output_tokens: Some(100),
+                requests: Some(1),
+                ..UsageCounts::default()
+            },
+            observed_at: Some(observed_at),
+        };
+
+        let missing_model = estimate_grok_inference_sample_costs(
+            GROK_BUILD_PROVIDER,
+            None,
+            std::slice::from_ref(&sample),
+            &observed_at,
+        );
+        let empty = estimate_grok_inference_sample_costs(
+            GROK_BUILD_PROVIDER,
+            Some(&ModelInfo {
+                name: Some("grok-4.6".to_string()),
+                normalized_name: Some("grok-4.6".to_string()),
+                provider_model_id: Some("grok-4.6".to_string()),
+                speed: None,
+                reasoning_level: None,
+                reasoning_level_raw: None,
+            }),
+            &[],
+            &observed_at,
+        );
+
+        assert_eq!(missing_model.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(missing_model.estimated_api_equivalent_usd, None);
+        assert_eq!(missing_model.pricing_source.as_deref(), Some("unknown"));
+        assert_eq!(empty.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(empty.pricing_source.as_deref(), Some("unknown"));
     }
 }
 mod archive;

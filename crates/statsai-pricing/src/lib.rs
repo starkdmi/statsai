@@ -300,7 +300,6 @@ fn api_equivalent_pricing_model(
                 Some("gpt-5.4")
             }
         }
-        "grok-4.6" => Some("grok-4.5"),
         _ => None,
     }
 }
@@ -376,6 +375,7 @@ fn pricing_for_model_on(model_name: &str, usage_date: chrono::NaiveDate) -> Opti
         | "grok-4.20-0309-reasoning"
         | "grok-4.20-0309-non-reasoning" => Some(pricing(1.25, 0.2, 2.5)),
         "grok-4.5" => Some(pricing(2.0, 0.3, 6.0)),
+        "grok-4.6" => Some(pricing(2.0, 0.5, 6.0)),
         _ => None,
     }
 }
@@ -495,6 +495,7 @@ pub fn estimate_cost_at(
         "grok-build-0.1"
         | "grok-4.3"
         | "grok-4.5"
+        | "grok-4.6"
         | "grok-4.20-multi-agent-0309"
         | "grok-4.20-0309-reasoning"
         | "grok-4.20-0309-non-reasoning" => {
@@ -585,6 +586,7 @@ fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (i128, i128) {
         "grok-build-0.1"
             | "grok-4.3"
             | "grok-4.5"
+            | "grok-4.6"
             | "grok-4.20-multi-agent-0309"
             | "grok-4.20-0309-reasoning"
             | "grok-4.20-0309-non-reasoning"
@@ -1662,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_4_6_reuses_grok_4_5_short_context_rates_without_rewriting_identity() {
+    fn grok_4_6_uses_official_short_context_rates_without_rewriting_identity() {
         let grok_4_6 = test_model("grok-4.6");
         let grok_4_6_build = test_model("grok-4.6-build");
         let grok_4_5 = test_model("grok-4.5");
@@ -1673,24 +1675,38 @@ mod tests {
             requests: Some(1),
             ..UsageCounts::default()
         };
+        let million_token_usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        };
 
         let grok_4_6_cost = estimate_cost("grok_build", Some(&grok_4_6), &usage);
         let grok_4_6_build_cost = estimate_cost("grok_build", Some(&grok_4_6_build), &usage);
         let grok_4_5_cost = estimate_cost("grok_build", Some(&grok_4_5), &usage);
+        let grok_4_6_million = estimate_cost("grok_build", Some(&grok_4_6), &million_token_usage);
+        let grok_4_5_million = estimate_cost("grok_build", Some(&grok_4_5), &million_token_usage);
 
-        assert_eq!(grok_4_6_cost.estimated_api_equivalent_usd, Some(19));
+        assert_eq!(grok_4_6_cost.estimated_api_equivalent_usd, Some(20));
         assert_eq!(
             grok_4_6_cost.estimated_api_equivalent_micro_usd,
-            Some(192_000)
-        );
-        assert_eq!(
-            grok_4_6_cost.estimated_api_equivalent_usd,
-            grok_4_5_cost.estimated_api_equivalent_usd
+            Some(200_000)
         );
         assert_eq!(
             grok_4_6_build_cost.estimated_api_equivalent_micro_usd,
             grok_4_6_cost.estimated_api_equivalent_micro_usd
         );
+        assert_ne!(
+            grok_4_6_cost.estimated_api_equivalent_micro_usd,
+            grok_4_5_cost.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(grok_4_6_million.estimated_api_equivalent_usd, Some(850));
+        assert_eq!(
+            grok_4_6_million.estimated_api_equivalent_micro_usd,
+            Some(8_500_000)
+        );
+        assert_eq!(grok_4_5_million.estimated_api_equivalent_usd, Some(830));
         assert_eq!(
             grok_4_6_cost.pricing_source.as_deref(),
             Some("xai_api_pricing:grok-4.6")
@@ -1750,8 +1766,8 @@ mod tests {
         let short = estimate_cost("grok_build", Some(&model), &just_below);
         let long = estimate_cost("grok_build", Some(&model), &on_threshold);
 
-        assert_eq!(short.estimated_api_equivalent_micro_usd, Some(323_998));
-        assert_eq!(long.estimated_api_equivalent_micro_usd, Some(648_000));
+        assert_eq!(short.estimated_api_equivalent_micro_usd, Some(339_998));
+        assert_eq!(long.estimated_api_equivalent_micro_usd, Some(680_000));
         assert_eq!(
             short.pricing_source.as_deref(),
             Some("xai_api_pricing:grok-4.6")
@@ -1820,11 +1836,11 @@ mod tests {
         combined.add_estimated(&short);
         combined.add_estimated(&long);
 
-        assert_eq!(short.estimated_api_equivalent_micro_usd, Some(192_000));
-        assert_eq!(long.estimated_api_equivalent_micro_usd, Some(648_000));
-        assert_eq!(combined.micro_usd(), Some(840_000));
-        assert_eq!(combined.cents_rounded(), Some(84));
-        assert_eq!(aggregate.estimated_api_equivalent_micro_usd, Some(516_000));
+        assert_eq!(short.estimated_api_equivalent_micro_usd, Some(200_000));
+        assert_eq!(long.estimated_api_equivalent_micro_usd, Some(680_000));
+        assert_eq!(combined.micro_usd(), Some(880_000));
+        assert_eq!(combined.cents_rounded(), Some(88));
+        assert_eq!(aggregate.estimated_api_equivalent_micro_usd, Some(540_000));
         assert_ne!(
             combined.micro_usd(),
             aggregate.estimated_api_equivalent_micro_usd
