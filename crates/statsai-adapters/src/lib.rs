@@ -11,11 +11,11 @@ use statsai_core::{
     semantic_event_id, summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
     task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
     task_title_signal_score, title_topic_tokens, BillingPeriod, Confidence, CostAccumulator,
-    EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats, ModelInfo,
-    ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo, SessionInfo,
-    SourceKind, SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics, TaskSpan,
-    UsageCounts, UsageEvent, UsageSummary, TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
-    USAGE_SUMMARY_SCHEMA_VERSION,
+    CostInfo, EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats,
+    ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo,
+    SessionInfo, SourceKind, SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics,
+    TaskSpan, UsageCounts, UsageEvent, UsageSummary, TASK_SPAN_SCHEMA_VERSION,
+    USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{
     estimate_cost_at, normalize_model_name, pricing_changes_between, unknown_cost,
@@ -42,7 +42,7 @@ const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v26";
 const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v23";
 const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
-const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v17";
+const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v18";
 const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -3896,6 +3896,12 @@ struct GrokSessionStats {
     max_tokens_after: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct GrokInferenceSample {
+    usage: UsageCounts,
+    observed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct GrokInferenceStats {
     rows: u64,
@@ -3905,6 +3911,7 @@ struct GrokInferenceStats {
     reasoning_tokens: u64,
     model_elapsed_ms: Vec<u64>,
     time_to_first_token_ms: Vec<u64>,
+    request_samples: Vec<GrokInferenceSample>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3941,6 +3948,27 @@ impl GrokInferenceStats {
             reasoning_tokens: nonzero_u64(self.reasoning_tokens),
             total_tokens: None,
             requests: nonzero_u64(self.rows),
+            local_prompt_eval_tokens: None,
+            local_eval_tokens: None,
+        }
+    }
+
+    fn request_sample_usage(
+        input_tokens: u64,
+        cache_read_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    ) -> UsageCounts {
+        UsageCounts {
+            input_tokens: nonzero_u64(input_tokens),
+            output_tokens: nonzero_u64(output_tokens),
+            cache_creation_tokens: None,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
+            cache_read_tokens: nonzero_u64(cache_read_tokens),
+            reasoning_tokens: nonzero_u64(reasoning_tokens),
+            total_tokens: None,
+            requests: Some(1),
             local_prompt_eval_tokens: None,
             local_eval_tokens: None,
         }
@@ -4034,13 +4062,21 @@ fn parse_grok_unified_log_with_invalid_rows(root: &Path) -> Result<(GrokUnifiedL
             .session_stats
             .entry(session_id.to_string())
             .or_default();
+        let input_tokens = prompt_tokens.saturating_sub(cached_prompt_tokens);
         stats.rows += 1;
-        stats.input_tokens = stats
-            .input_tokens
-            .saturating_add(prompt_tokens.saturating_sub(cached_prompt_tokens));
+        stats.input_tokens = stats.input_tokens.saturating_add(input_tokens);
         stats.cache_read_tokens = stats.cache_read_tokens.saturating_add(cached_prompt_tokens);
         stats.output_tokens = stats.output_tokens.saturating_add(completion_tokens);
         stats.reasoning_tokens = stats.reasoning_tokens.saturating_add(reasoning_tokens);
+        stats.request_samples.push(GrokInferenceSample {
+            usage: GrokInferenceStats::request_sample_usage(
+                input_tokens,
+                cached_prompt_tokens,
+                completion_tokens,
+                reasoning_tokens,
+            ),
+            observed_at: value.get("ts").and_then(timestamp_from_scalar),
+        });
         if let Some(value) = ctx.get("model_elapsed_ms").and_then(value_as_u64) {
             stats.model_elapsed_ms.push(value);
         }
@@ -4214,6 +4250,31 @@ fn update_max(target: &mut Option<u64>, value: Option<&Value>) {
     }
 }
 
+fn estimate_grok_inference_sample_costs(
+    provider: &str,
+    model: Option<&ModelInfo>,
+    samples: &[GrokInferenceSample],
+    fallback_observed_at: &DateTime<Utc>,
+) -> CostInfo {
+    let mut total = CostAccumulator::default();
+    let mut representative = None;
+    for sample in samples {
+        let occurred_at = sample.observed_at.as_ref().unwrap_or(fallback_observed_at);
+        let cost = estimate_cost_at(provider, model, &sample.usage, occurred_at);
+        if representative.is_none() && cost.estimated_api_equivalent_usd.is_some() {
+            representative = Some(cost.clone());
+        }
+        total.add_estimated(&cost);
+    }
+    let Some(mut cost) = representative else {
+        return unknown_cost();
+    };
+    if let Some(micro_usd) = total.micro_usd() {
+        cost.set_estimated_micro_usd(micro_usd);
+    }
+    cost
+}
+
 fn parse_grok_summary(
     adapter: &GrokBuildAdapter,
     source: &SourceLocation,
@@ -4371,12 +4432,21 @@ fn parse_grok_summary(
         },
     );
     summary.usage = usage;
-    summary.cost = estimate_cost_at(
-        adapter.provider(),
-        summary.model.as_ref(),
-        &summary.usage,
-        &summary.observed_at,
-    );
+    summary.cost = if inference_stats.has_usage() && !inference_stats.request_samples.is_empty() {
+        estimate_grok_inference_sample_costs(
+            adapter.provider(),
+            summary.model.as_ref(),
+            &inference_stats.request_samples,
+            &summary.observed_at,
+        )
+    } else {
+        estimate_cost_at(
+            adapter.provider(),
+            summary.model.as_ref(),
+            &summary.usage,
+            &summary.observed_at,
+        )
+    };
     if summary.cost.estimated_api_equivalent_usd.is_some() {
         if inference_stats.has_usage() {
             summary.cost.confidence = Confidence::Medium;
@@ -10033,7 +10103,17 @@ mod tests {
         assert!(revision_number(CODEX_SCAN_CACHE_PARSER_REVISION) > 25);
         assert!(revision_number(CLAUDE_SCAN_CACHE_PARSER_REVISION) > 15);
         assert!(revision_number(OPENCODE_SCAN_CACHE_PARSER_REVISION) > 14);
-        assert!(revision_number(GROK_BUILD_SCAN_CACHE_PARSER_REVISION) > 16);
+        assert!(revision_number(GROK_BUILD_SCAN_CACHE_PARSER_REVISION) > 17);
+    }
+
+    #[test]
+    fn grok_request_level_pricing_upgrade_advances_parser_revision() {
+        let revision = GROK_BUILD_SCAN_CACHE_PARSER_REVISION
+            .rsplit_once(".v")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .expect("Grok parser revision");
+
+        assert!(revision > 17);
     }
 
     #[test]
@@ -13951,6 +14031,203 @@ mod tests {
 
         assert_eq!(before_a.cache_signature, after_a.cache_signature);
         assert_ne!(before_b.cache_signature, after_b.cache_signature);
+    }
+
+    #[test]
+    fn grok_build_prices_unified_log_inferences_independently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-mixed");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-mixed", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6-build",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:52.141Z",
+                    "sid": "session-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 100_000,
+                        "cached_prompt_tokens": 40_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:03.314Z",
+                    "sid": "session-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 200_000,
+                        "cached_prompt_tokens": 80_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        let model = summary.model.as_ref().expect("model");
+        assert_eq!(model.name.as_deref(), Some("grok-4.6-build"));
+        assert_eq!(model.normalized_name.as_deref(), Some("grok-4.6"));
+        assert_eq!(summary.usage.input_tokens, Some(180_000));
+        assert_eq!(summary.usage.cache_read_tokens, Some(120_000));
+        assert_eq!(summary.usage.output_tokens, Some(20_000));
+        assert_eq!(summary.usage.reasoning_tokens, None);
+        assert_eq!(summary.usage.requests, Some(2));
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(840_000)
+        );
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(84));
+        assert_eq!(summary.cost.confidence, Confidence::Medium);
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6:unified_log_inference_usage")
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .summary_version
+                .as_deref()
+                .map(|value| value.contains("inference_rows=2;usage_source=unified_log")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn grok_build_keeps_aggregate_prompt_context_conservative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-aggregate");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-aggregate", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "turnCount": 2,
+                "contextTokensUsed": 300_000
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("grok-4.6")
+        );
+        assert_eq!(summary.usage.input_tokens, Some(300_000));
+        assert_eq!(summary.usage.requests, Some(2));
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(600_000)
+        );
+        assert_eq!(summary.cost.confidence, Confidence::Low);
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6:prompt_context_token_footprint")
+        );
+    }
+
+    #[test]
+    fn grok_fixture_session_keeps_grok_4_6_identity_and_is_priced() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok/basic");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            &root,
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.name.as_deref()),
+            Some("grok-4.6")
+        );
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("grok-4.6")
+        );
+        assert_eq!(summary.usage.input_tokens, Some(15_534));
+        assert_eq!(summary.usage.cache_read_tokens, Some(42_624));
+        assert_eq!(summary.usage.output_tokens, Some(917));
+        assert_eq!(summary.usage.reasoning_tokens, Some(508));
+        assert_eq!(summary.usage.requests, Some(3));
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(52_405)
+        );
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6:unified_log_inference_usage")
+        );
     }
 }
 mod archive;

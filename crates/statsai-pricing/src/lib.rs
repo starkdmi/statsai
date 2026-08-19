@@ -6,7 +6,7 @@
 use chrono::{DateTime, Datelike, Utc};
 use statsai_core::{micro_usd_to_cents_rounded, Confidence, CostInfo, ModelInfo, UsageCounts};
 
-const PRICING_CATALOG_VERSION: &str = "official:2026-08-03";
+const PRICING_CATALOG_VERSION: &str = "official:2026-08-19";
 const MICRO_USD_PER_USD: i128 = 1_000_000;
 const TOKENS_PER_MILLION: i128 = 1_000_000;
 const MULTIPLIER_SCALE: i128 = 10_000;
@@ -120,6 +120,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("grok-composer-2.5") || lower.contains("composer-2.5") {
         return Some("composer-2.5");
     }
+    if lower.contains("grok-4.6") {
+        return Some("grok-4.6");
+    }
     if lower.contains("grok-4.5-latest")
         || lower.contains("grok-4.5")
         || lower.contains("grok-build-latest")
@@ -201,6 +204,7 @@ pub fn normalize_model_name(name: &str) -> String {
         "composer-2.5" | "grok-composer-2.5" => "composer-2.5".to_string(),
         "composer-2.5-fast" | "grok-composer-2.5-fast" => "composer-2.5-fast".to_string(),
         "grok-build" | "grok-build-0.1" => "grok-build-0.1".to_string(),
+        "grok-4.6" | "grok-4.6-build" | "grok-4.6-latest" => "grok-4.6".to_string(),
         "grok-4.5" | "grok-4.5-latest" | "grok-build-latest" => "grok-4.5".to_string(),
         "grok-4.3" | "grok-4.3-latest" => "grok-4.3".to_string(),
         "grok-4.20-multi-agent-0309" => "grok-4.20-multi-agent-0309".to_string(),
@@ -296,6 +300,7 @@ fn api_equivalent_pricing_model(
                 Some("gpt-5.4")
             }
         }
+        "grok-4.6" => Some("grok-4.5"),
         _ => None,
     }
 }
@@ -713,6 +718,15 @@ mod tests {
             normalize_model_name("openrouter/x-ai/grok-build-latest"),
             "grok-4.5"
         );
+        assert_eq!(normalize_model_name("grok-4.6"), "grok-4.6");
+        assert_eq!(normalize_model_name("grok-4.6-build"), "grok-4.6");
+        assert_eq!(normalize_model_name("grok-4.6-latest"), "grok-4.6");
+        assert_eq!(normalize_model_name("openrouter/x-ai/grok-4.6"), "grok-4.6");
+        assert_eq!(
+            normalize_model_name("openrouter/x-ai/grok-4.6-build"),
+            "grok-4.6"
+        );
+        assert_eq!(normalize_model_name("relay/xai-grok-4.6"), "grok-4.6");
     }
 
     #[test]
@@ -1645,5 +1659,166 @@ mod tests {
         assert!(!pricing_changes_between("gpt-5.6-luna", boundary, after));
         assert!(!pricing_changes_between("gpt-5.6-terra", boundary, after));
         assert!(!pricing_changes_between("gpt-5.6-sol", before, after));
+    }
+
+    #[test]
+    fn grok_4_6_reuses_grok_4_5_short_context_rates_without_rewriting_identity() {
+        let grok_4_6 = test_model("grok-4.6");
+        let grok_4_6_build = test_model("grok-4.6-build");
+        let grok_4_5 = test_model("grok-4.5");
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            reasoning_tokens: Some(1_000_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+
+        let grok_4_6_cost = estimate_cost("grok_build", Some(&grok_4_6), &usage);
+        let grok_4_6_build_cost = estimate_cost("grok_build", Some(&grok_4_6_build), &usage);
+        let grok_4_5_cost = estimate_cost("grok_build", Some(&grok_4_5), &usage);
+
+        assert_eq!(grok_4_6_cost.estimated_api_equivalent_usd, Some(1_430));
+        assert_eq!(
+            grok_4_6_cost.estimated_api_equivalent_micro_usd,
+            Some(14_300_000)
+        );
+        assert_eq!(
+            grok_4_6_cost.estimated_api_equivalent_usd,
+            grok_4_5_cost.estimated_api_equivalent_usd
+        );
+        assert_eq!(
+            grok_4_6_build_cost.estimated_api_equivalent_micro_usd,
+            grok_4_6_cost.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(
+            grok_4_6_cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6")
+        );
+        assert_eq!(
+            grok_4_6_build_cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6")
+        );
+        assert_eq!(
+            grok_4_5_cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.5")
+        );
+        assert_eq!(
+            grok_4_6_cost.pricing_version.as_deref(),
+            Some(PRICING_CATALOG_VERSION)
+        );
+    }
+
+    #[test]
+    fn grok_4_6_wrapped_ids_keep_observed_identity() {
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let wrapped = test_model("openrouter/x-ai/grok-4.6");
+
+        let cost = estimate_cost("opencode", Some(&wrapped), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(800));
+        assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(8_000_000));
+        assert_eq!(
+            cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6")
+        );
+    }
+
+    #[test]
+    fn grok_4_6_xai_long_context_boundary_includes_cached_tokens() {
+        let model = test_model("grok-4.6");
+        let just_below = UsageCounts {
+            input_tokens: Some(119_999),
+            cache_read_tokens: Some(80_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let on_threshold = UsageCounts {
+            input_tokens: Some(120_000),
+            cache_read_tokens: Some(80_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+
+        let short = estimate_cost("grok_build", Some(&model), &just_below);
+        let long = estimate_cost("grok_build", Some(&model), &on_threshold);
+
+        assert_eq!(short.estimated_api_equivalent_micro_usd, Some(323_998));
+        assert_eq!(long.estimated_api_equivalent_micro_usd, Some(648_000));
+        assert_eq!(
+            short.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6")
+        );
+        assert_eq!(
+            long.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6")
+        );
+    }
+
+    #[test]
+    fn grok_4_6_reasoning_tokens_use_the_output_rate() {
+        let model = test_model("grok-4.6");
+        let usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            reasoning_tokens: Some(1_000_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+
+        let cost = estimate_cost("grok_build", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, Some(800));
+        assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(8_000_000));
+    }
+
+    #[test]
+    fn grok_4_6_mixed_requests_sum_short_and_long_context_costs() {
+        let model = test_model("grok-4.6");
+        let short_request = UsageCounts {
+            input_tokens: Some(60_000),
+            cache_read_tokens: Some(40_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let long_request = UsageCounts {
+            input_tokens: Some(120_000),
+            cache_read_tokens: Some(80_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let aggregated = UsageCounts {
+            input_tokens: Some(180_000),
+            cache_read_tokens: Some(120_000),
+            output_tokens: Some(20_000),
+            requests: Some(2),
+            ..UsageCounts::default()
+        };
+
+        let short = estimate_cost("grok_build", Some(&model), &short_request);
+        let long = estimate_cost("grok_build", Some(&model), &long_request);
+        let aggregate = estimate_cost("grok_build", Some(&model), &aggregated);
+        let mut combined = statsai_core::CostAccumulator::default();
+        combined.add_estimated(&short);
+        combined.add_estimated(&long);
+
+        assert_eq!(short.estimated_api_equivalent_micro_usd, Some(192_000));
+        assert_eq!(long.estimated_api_equivalent_micro_usd, Some(648_000));
+        assert_eq!(combined.micro_usd(), Some(840_000));
+        assert_eq!(combined.cents_rounded(), Some(84));
+        assert_eq!(aggregate.estimated_api_equivalent_micro_usd, Some(516_000));
+        assert_ne!(
+            combined.micro_usd(),
+            aggregate.estimated_api_equivalent_micro_usd
+        );
     }
 }
