@@ -3,6 +3,7 @@ members = [
   "crates/statsai-core",
   "crates/statsai-adapters",
   "crates/statsai-store",
+  "crates/statsai-dev",
   "crates/statsai-sync",
   "crates/statsai-daemon",
   "crates/statsai-sdk",
@@ -42,6 +43,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 schemars = { version = "0.8", features = ["chrono"] }
 serde = { version = "1", features = ["derive"] }
@@ -61,6 +63,7 @@ getrandom = { version = "0.2", features = ["std"] }
 hmac = "0.12"
 regex = "1"
 unicode-normalization = "0.1"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 
 [profile.release]

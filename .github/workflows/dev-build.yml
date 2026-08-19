@@ -1,0 +1,113 @@
+name: dev-build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: statsai-dev-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_TARGET: aarch64-apple-darwin
+  BUILD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  build:
+    name: Exact-SHA ARM64 development build
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact source commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify exact checkout
+        run: |
+          actual_sha=$(git rev-parse HEAD)
+          if [[ "$actual_sha" != "$BUILD_SHA" ]]; then
+            echo "checked out $actual_sha, expected $BUILD_SHA" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dev-build-aarch64-apple-darwin
+
+      - name: Build minimal StatsAI CLI artifact
+        run: cargo build --locked --release --package statsai --bin statsai --target "$BUILD_TARGET"
+
+      - name: Smoke-test development binary and auth path
+        run: |
+          binary="target/$BUILD_TARGET/release/statsai"
+          file "$binary" | grep -q 'arm64'
+          "$binary" --version
+          unsigned_home="$RUNNER_TEMP/statsai-dev-unsigned-home"
+          mkdir -p "$unsigned_home"
+          HOME="$unsigned_home" "$binary" auth status
+          codesign -dv "$binary" 2>&1 || true
+
+      - id: artifact
+        name: Assemble and verify artifact metadata
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          artifact_dir="$RUNNER_TEMP/statsai-dev-artifact"
+          mkdir -p "$artifact_dir"
+          cp "target/$BUILD_TARGET/release/statsai" "$artifact_dir/statsai"
+          store_schema_version=$("$artifact_dir/statsai" store supported-schema-version)
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            source_json=$(jq -n --argjson number "$PR_NUMBER" '{kind: "pull_request", number: $number}')
+          else
+            source_json=$(jq -n '{kind: "main"}')
+          fi
+
+          jq -n \
+            --arg repository "${{ github.repository }}" \
+            --arg sha "$BUILD_SHA" \
+            --arg target "$BUILD_TARGET" \
+            --argjson source "$source_json" \
+            --argjson workflow_run_id "$WORKFLOW_RUN_ID" \
+            --argjson workflow_attempt "$WORKFLOW_ATTEMPT" \
+            --argjson store_schema_version "$store_schema_version" \
+            '{
+              schema: 1,
+              repository: $repository,
+              sha: $sha,
+              target: $target,
+              source: $source,
+              workflow_run_id: $workflow_run_id,
+              workflow_attempt: $workflow_attempt,
+              store_schema_version: $store_schema_version
+            }' > "$artifact_dir/build.json"
+
+          (cd "$artifact_dir" && shasum -a 256 statsai > SHA256SUMS)
+          test "$(find "$artifact_dir" -type f | wc -l | tr -d ' ')" = 3
+          test "$(jq -r .sha "$artifact_dir/build.json")" = "$BUILD_SHA"
+          test "$(jq -r .store_schema_version "$artifact_dir/build.json")" = "$store_schema_version"
+          (cd "$artifact_dir" && shasum -a 256 -c SHA256SUMS)
+          echo "sha=$BUILD_SHA" >> "$GITHUB_OUTPUT"
+          echo "path=$artifact_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact-SHA development artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: statsai-dev-${{ steps.artifact.outputs.sha }}
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

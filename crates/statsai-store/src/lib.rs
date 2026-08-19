@@ -4,6 +4,7 @@ mod archive;
 mod code_changes;
 mod migrations;
 mod privacy;
+mod snapshot;
 mod tasks;
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +30,9 @@ use statsai_core::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+
+pub use migrations::CURRENT_SCHEMA_VERSION;
+pub use snapshot::{clone_database_to, database_schema_version, DatabaseClone};
 use std::time::Duration;
 
 #[cfg(test)]
