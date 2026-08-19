@@ -958,7 +958,7 @@ impl Store {
         })
     }
 
-    fn task_spans_by_sql(
+    pub(crate) fn task_spans_by_sql(
         &self,
         sql: &str,
         params: &[&dyn rusqlite::types::ToSql],
@@ -972,7 +972,7 @@ impl Store {
         Ok(spans)
     }
 
-    fn upsert_task_spans_in_tx(&self, spans: &[TaskSpan]) -> Result<u64> {
+    pub(crate) fn upsert_task_spans_in_tx(&self, spans: &[TaskSpan]) -> Result<u64> {
         let mut changed = 0u64;
         let mut span_stmt = self.conn.prepare(
             r#"

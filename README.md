@@ -436,6 +436,14 @@ Cost figures are API-equivalent estimates, not subscription invoices. StatsAI
 selects published pricing by usage timestamp, preserves integer micro-USD
 values, and leaves cost unknown when a source does not prove the billable model.
 
+Pricing updates are version-driven and automatic. The selected `statsai` binary
+reprices persisted normalized events when its compiled ruleset is newer than
+the store's last applied ruleset. A raw provider rescan (`--no-cache`) is not
+required. Ordinary incremental `statsai sync --sink http` then uploads the
+corrected dirty rollups; `--rebuild-rollups` and `--full` are unnecessary just
+because prices changed. A store already processed by a newer ruleset is
+refused rather than silently repriced backward.
+
 ## Develop locally
 
 This is a Rust workspace. Run the same checks used in CI:

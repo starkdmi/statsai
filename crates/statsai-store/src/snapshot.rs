@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 #[cfg(target_os = "macos")]
 use rusqlite::TransactionBehavior;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 #[cfg(target_os = "macos")]
 use std::fs;
 #[cfg(target_os = "macos")]
@@ -66,6 +66,58 @@ pub fn database_schema_version(path: impl AsRef<Path>) -> Result<Option<i64>> {
         })
         .map(|version| Some(version.unwrap_or(0)))
         .with_context(|| format!("read database schema version at {}", path.display()))
+}
+
+/// Reads the last applied pricing ruleset without creating, migrating, or
+/// repricing the database.
+///
+/// `Ok(None)` means the path does not exist, the metadata table is missing, or
+/// no applied ruleset has been recorded yet.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be opened as a readable
+/// SQLite database, or when the stored value is not a valid unsigned integer.
+pub fn database_applied_pricing_ruleset_version(path: impl AsRef<Path>) -> Result<Option<u64>> {
+    let path = path.as_ref();
+    if !path
+        .try_exists()
+        .with_context(|| format!("check whether database {} exists", path.display()))?
+    {
+        return Ok(None);
+    }
+
+    let connection = open_read_only(path)?;
+    let has_metadata_table = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'local_metadata')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .with_context(|| format!("inspect local metadata at {}", path.display()))?;
+    if !has_metadata_table {
+        return Ok(None);
+    }
+
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM local_metadata WHERE key = ?1",
+            [super::APPLIED_PRICING_RULESET_VERSION_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("read applied pricing ruleset version at {}", path.display()))?;
+    parse_applied_pricing_ruleset_value(value.as_deref())
+}
+
+pub(crate) fn parse_applied_pricing_ruleset_value(value: Option<&str>) -> Result<Option<u64>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .with_context(|| format!("invalid pricing.applied_ruleset_version value {value:?}"))
 }
 
 /// Replaces `destination` with a SQLite-consistent APFS copy-on-write clone.

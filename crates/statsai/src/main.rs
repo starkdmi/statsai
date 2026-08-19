@@ -42,7 +42,7 @@ use statsai_store::{
     close_active_verified_source_linkages, derive_task_work_items, find_existing_provider_account,
     reconcile_verified_source_state, upsert_provider_account, verified_source_observation_hash,
     ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
-    UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION,
+    UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION,
 };
 use statsai_sync::{
     validate_authenticated_http_endpoint, FileSink, HttpSink, StdoutSink, SyncSink,
@@ -854,6 +854,8 @@ enum StoreAdminSubcommand {
     },
     #[command(about = "Print the store schema version supported by this binary")]
     SupportedSchemaVersion,
+    #[command(about = "Print the pricing ruleset version supported by this binary")]
+    SupportedPricingRulesetVersion,
 }
 
 #[derive(Debug, Subcommand)]
@@ -893,7 +895,7 @@ fn main() -> Result<()> {
         Command::Service(command) => service(command),
         Command::Snapshot(command) => snapshot::run(command, &store_path, &device_id),
         command => {
-            let store = Store::open(&store_path)?;
+            let store = statsai::open_operational_store(&store_path)?;
             match command {
                 Command::Scan(command) => scan(command, &store, &device_id),
                 Command::Report(command) => report(command, &store),
@@ -938,6 +940,10 @@ fn store_admin(command: StoreAdminCommand, source: &Path) -> Result<()> {
         }
         StoreAdminSubcommand::SupportedSchemaVersion => {
             println!("{CURRENT_SCHEMA_VERSION}");
+            Ok(())
+        }
+        StoreAdminSubcommand::SupportedPricingRulesetVersion => {
+            println!("{PRICING_RULESET_VERSION}");
             Ok(())
         }
     }
@@ -6411,7 +6417,7 @@ fn doctor(store_path: &Path) -> Result<()> {
     if let Ok(value) = std::env::var("CODEX_HOME") {
         println!("env CODEX_HOME: {}", value);
     }
-    let store = Store::open(store_path)?;
+    let store = statsai::open_operational_store(store_path)?;
     let configured = store.list_sources()?;
     for adapter in default_adapters() {
         let sources = scan_sources_for_adapter(adapter.as_ref(), &configured);
@@ -12792,6 +12798,100 @@ mod tests {
     }
 
     #[test]
+    fn incremental_http_sync_includes_repriced_rollups_without_full() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-reprice-sync"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 7, 29, 12, 0, 0)
+            .single()
+            .expect("started_at");
+        let mut event = test_event(
+            "codex",
+            &source,
+            started_at,
+            None,
+            TokenParts {
+                input: 1_000_000,
+                cached_input: 1_000_000,
+                output: 1_000_000,
+                reasoning: 0,
+                total: 4_000_000,
+                cost: None,
+            },
+        );
+        event.model = Some(ModelInfo {
+            name: Some("codex-auto-review".to_string()),
+            normalized_name: Some("codex-auto-review".to_string()),
+            provider_model_id: Some("codex-auto-review".to_string()),
+            speed: None,
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        });
+        store.insert_event(&event).expect("legacy unpriced event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        assert!(!command.full);
+        assert!(!command.rebuild_rollups);
+        let target = sync_target(&command).expect("target");
+        let (initial_batch, initial_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("initial batch");
+        assert_eq!(initial_mode, SyncPayloadMode::Rollups);
+        assert_eq!(initial_batch.summaries.len(), 1);
+        assert!(initial_batch.summaries[0]
+            .cost
+            .estimated_api_equivalent_usd
+            .is_none());
+        record_rollup_sync_success(&store, "http", &target, &initial_batch)
+            .expect("record initial sync");
+
+        let (repeat_batch, _) =
+            build_sync_batch(&command, &store, "device", &target).expect("repeat batch");
+        assert!(
+            repeat_batch.summaries.is_empty(),
+            "synced rollups must stay unpublished until pricing changes them"
+        );
+
+        let report = store.ensure_current_pricing().expect("automatic reprice");
+        assert_eq!(report.changed_events, 1);
+        assert_eq!(report.refreshed_rollups, 1);
+
+        let (incremental_batch, incremental_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("incremental batch");
+        assert_eq!(incremental_mode, SyncPayloadMode::Rollups);
+        assert_eq!(incremental_batch.summaries.len(), 1);
+        assert!(is_daily_rollup_summary(&incremental_batch.summaries[0]));
+        assert_eq!(
+            incremental_batch.summaries[0]
+                .cost
+                .estimated_api_equivalent_usd,
+            store
+                .events()
+                .expect("repriced events")
+                .into_iter()
+                .next()
+                .expect("one event")
+                .cost
+                .estimated_api_equivalent_usd
+        );
+        assert!(incremental_batch.summaries[0]
+            .cost
+            .estimated_api_equivalent_usd
+            .is_some());
+    }
+
+    #[test]
     fn http_incremental_rollups_are_tracked_per_target() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
@@ -18747,6 +18847,30 @@ mod tests {
             &store_path,
         )
         .expect("print supported schema");
+        assert!(!store_path.exists());
+    }
+
+    #[test]
+    fn supported_pricing_ruleset_version_is_available_without_opening_a_store() {
+        let cli = Cli::try_parse_from(["statsai", "store", "supported-pricing-ruleset-version"])
+            .expect("parse supported pricing query");
+
+        assert!(matches!(
+            cli.command,
+            Command::Store(StoreAdminCommand {
+                command: StoreAdminSubcommand::SupportedPricingRulesetVersion,
+            })
+        ));
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store_path = directory.path().join("must-not-be-created.sqlite");
+        store_admin(
+            StoreAdminCommand {
+                command: StoreAdminSubcommand::SupportedPricingRulesetVersion,
+            },
+            &store_path,
+        )
+        .expect("print supported pricing ruleset");
         assert!(!store_path.exists());
     }
 

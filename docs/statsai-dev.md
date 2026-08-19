@@ -117,7 +117,8 @@ Each download is checked before selection:
 4. `build.json.repository` is `starkdmi/statsai`;
 5. `build.json.sha` is the exact resolved SHA;
 6. workflow run ID and attempt match the downloaded run;
-7. the supported store schema version is recorded in the manifest;
+7. the supported store schema version and pricing ruleset version are recorded
+   in the manifest (`build.json` schema 2);
 8. the target and Mach-O header are ARM64 macOS.
 
 Selection is an atomic state-file replacement. The cache retains the current
@@ -185,10 +186,18 @@ statsai-dev --prod-data report monthly
 
 This choice is never persisted.
 
-The escape hatch is allowed only when the production database schema exactly
-matches the schema supported by the selected build. A development build is
-never allowed to migrate production data; use the isolated development clone
-to test a schema-changing PR.
+The escape hatch is allowed only when the production database schema **and**
+applied pricing ruleset exactly match the versions supported by the selected
+build. Missing, older, or newer production pricing metadata is refused. A
+development build is never allowed to migrate or reprice production data; use
+the isolated development clone to test a schema-changing or pricing-changing
+PR.
+
+Ordinary isolated `statsai-dev` stores are opened by the selected exact-SHA
+`statsai` binary. That binary applies its own pricing ruleset automatically
+before scan, report, sync, and other operational commands. A pricing catalog
+change does not require a raw rescan; a later incremental sync publishes
+corrected dirty rollups.
 
 Development daemon commands and mutating service commands are blocked:
 

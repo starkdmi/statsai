@@ -4,12 +4,29 @@ pub mod privacy_cli;
 pub mod service;
 pub mod snapshot;
 
+use anyhow::Result;
 use chrono::Utc;
 use getrandom::getrandom;
 use statsai_core::{hash_text, home_dir};
+use statsai_store::{RepricingReport, Store};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Opens a store for a normal StatsAI command and applies the compiled pricing
+/// ruleset before price-derived data is read or written.
+pub fn open_operational_store(path: &Path) -> Result<Store> {
+    let store = Store::open(path)?;
+    let report = store.ensure_current_pricing()?;
+    log_repricing_report(&report);
+    Ok(store)
+}
+
+pub fn log_repricing_report(report: &RepricingReport) {
+    if !report.already_current {
+        eprintln!("{report}");
+    }
+}
 
 pub fn default_store_path() -> PathBuf {
     home_dir()
