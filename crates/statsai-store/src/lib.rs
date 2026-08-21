@@ -458,6 +458,25 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Restores the store's commit durability when dropped.
+///
+/// Held for the length of a bulk import. Restoring on drop rather than at the
+/// end of the import keeps a failed import from leaving a long-lived process
+/// writing everything else at reduced durability.
+pub struct BulkImportDurability<'a> {
+    store: &'a Store,
+    restore_to: i64,
+}
+
+impl Drop for BulkImportDurability<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .store
+            .conn
+            .execute_batch(&format!("PRAGMA synchronous = {}", self.restore_to));
+    }
+}
+
 impl Store {
     /// Opens a store and applies migrations.
     ///
@@ -478,8 +497,39 @@ impl Store {
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         let store = Self { conn };
         store.migrate()?;
+        store.configure_connection()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
+    }
+
+    /// Applies the per-connection settings the write paths rely on.
+    ///
+    /// Commit durability is deliberately left alone: this connection also
+    /// writes state that exists nowhere else — verifications a person entered,
+    /// subscriptions, account assignments, privacy identity — and none of that
+    /// can be collected again from local files. Relaxing durability is scoped
+    /// to the imports that can, in [`Store::relax_durability_for_bulk_import`].
+    ///
+    /// The page cache is raised because these archives are far larger than the
+    /// 2MB default, which turns index maintenance into a stream of single-page
+    /// reads.
+    fn configure_connection(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "PRAGMA cache_size = -65536;
+             PRAGMA temp_store = MEMORY;
+             CREATE TEMP TABLE IF NOT EXISTS incoming_records (
+               source_record_id TEXT,
+               item_id TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS incoming_records_source_idx
+               ON incoming_records (source_record_id);
+             CREATE INDEX IF NOT EXISTS incoming_records_item_idx
+               ON incoming_records (item_id);",
+        )?;
+        // Batched writes issue one statement per batch size, and the archive
+        // paths alternate between a handful of them.
+        self.conn.set_prepared_statement_cache_capacity(64);
+        Ok(())
     }
 
     /// Opens an independent connection to the same file-backed store.
@@ -521,8 +571,37 @@ impl Store {
         };
         store.conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         store.migrate()?;
+        store.configure_connection()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
+    }
+
+    /// Relaxes commit durability until the returned guard is dropped.
+    ///
+    /// In WAL mode `synchronous = NORMAL` cannot corrupt the database; it only
+    /// means a power loss may cost the most recently committed transactions.
+    /// That is an acceptable trade for importing a provider's archive, because
+    /// each file's rows and the cache entry recording it commit together, so a
+    /// lost commit is collected again on the next run rather than going
+    /// silently missing.
+    ///
+    /// It is not an acceptable trade for the rest of the store, which holds
+    /// state that no local file can reproduce, so the relaxation is scoped to
+    /// the import rather than applied to the connection for good.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite rejects the durability change.
+    pub fn relax_durability_for_bulk_import(&self) -> Result<BulkImportDurability<'_>> {
+        let restore_to = self
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .context("read commit durability")?;
+        self.conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        Ok(BulkImportDurability {
+            store: self,
+            restore_to,
+        })
     }
 
     fn with_immediate_transaction<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -5688,6 +5767,40 @@ mod tests {
         USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
     };
     use std::path::Path;
+
+    /// Importing an archive may trade durability for speed because a lost
+    /// commit is simply collected again. The rest of the store holds work that
+    /// no local file can reproduce, so the trade must not outlive the import.
+    #[test]
+    fn relaxed_durability_is_scoped_to_the_bulk_import() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&dir.path().join("statsai.sqlite")).expect("store");
+        let durability = || {
+            store
+                .conn
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .expect("read durability")
+        };
+
+        let opened_with = durability();
+        assert_ne!(
+            opened_with, 0,
+            "a store must never open with durability disabled"
+        );
+
+        {
+            let _relaxed = store
+                .relax_durability_for_bulk_import()
+                .expect("relax durability");
+            assert_eq!(durability(), 1, "the import did not get NORMAL durability");
+        }
+
+        assert_eq!(
+            durability(),
+            opened_with,
+            "durability stayed relaxed after the import"
+        );
+    }
 
     #[test]
     #[cfg(unix)]

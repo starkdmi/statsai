@@ -200,7 +200,7 @@ pub struct AdapterScan {
     pub verified_source_state: Option<VerifiedSourceState>,
 }
 
-pub trait ProviderAdapter {
+pub trait ProviderAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn version(&self) -> &'static str;
     fn provider(&self) -> &'static str;
