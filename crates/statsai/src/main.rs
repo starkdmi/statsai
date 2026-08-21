@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 #[cfg(test)]
 use statsai_adapters::VerifiedSubscriptionState;
 use statsai_adapters::{
-    adapter_for_provider, default_adapters, ProviderAdapter, ScanCandidateFile, ScanDiagnostics,
-    ScanOptions, VerifiedSourceObservation,
+    adapter_for_provider, default_adapters, ArchiveScan, ProviderAdapter, ScanCandidateFile,
+    ScanDiagnostics, ScanOptions, VerifiedSourceObservation,
 };
 #[cfg(test)]
 use statsai_adapters::{SourceIdentityInference, VerifiedSourceState};
@@ -6089,18 +6089,71 @@ fn collect_conversations(
 ) -> Result<()> {
     let canonical_provider_filter = canonical_conversation_provider_filter(provider_filter)?;
     let configured_sources = store.list_sources()?;
-    let mut sources_collected = 0u64;
-    let mut total_conversations = 0u64;
-    let mut total_items = 0u64;
-    let mut total_parts = 0u64;
-    let mut total_binary_bytes = 0u64;
-    let mut total_missing = 0u64;
+    // Reduced durability covers the imports and nothing after them. An import
+    // rebuilds from the provider's own files, so a commit lost to a power cut
+    // costs a re-collect. The code-change refresh that follows carries metrics
+    // forward for commits too old for Git to be rescanned for, and writes them
+    // across several transactions, so it keeps the store's normal durability.
+    // Anything added below belongs after this block unless it is as reproducible
+    // as an import.
+    let totals = {
+        let _durability = store.relax_durability_for_bulk_import()?;
+        collect_archive_sources(
+            store,
+            canonical_provider_filter,
+            &configured_sources,
+            no_cache,
+            verbose,
+        )?
+    };
+    println!(
+        "archive collection: sources={} conversations={} items={} parts={} binary_bytes={} missing={}",
+        totals.sources,
+        totals.conversations,
+        totals.items,
+        totals.parts,
+        totals.binary_bytes,
+        totals.missing,
+    );
+    let code_changes = store.refresh_code_changes(device_id)?;
+    println!(
+        "code changes: trace_edits={} repositories={} commits={} trace_matched={} metrics={} trace_coverage={:?} git_coverage={:?}",
+        code_changes.trace_edits,
+        code_changes.repositories,
+        code_changes.commits,
+        code_changes.matches,
+        code_changes.metrics,
+        code_changes.trace_coverage,
+        code_changes.git_coverage,
+    );
+    Ok(())
+}
 
+/// What one `conversation collect` run imported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ArchiveCollectionTotals {
+    sources: u64,
+    conversations: u64,
+    items: u64,
+    parts: u64,
+    binary_bytes: u64,
+    missing: u64,
+}
+
+/// Imports every archive source the filter admits.
+fn collect_archive_sources(
+    store: &Store,
+    canonical_provider_filter: Option<&str>,
+    configured_sources: &[SourceLocation],
+    no_cache: bool,
+    verbose: bool,
+) -> Result<ArchiveCollectionTotals> {
+    let mut totals = ArchiveCollectionTotals::default();
     for adapter in default_adapters() {
         if canonical_provider_filter.is_some_and(|provider| provider != adapter.provider()) {
             continue;
         }
-        for source in scan_sources_for_adapter(adapter.as_ref(), &configured_sources) {
+        for source in scan_sources_for_adapter(adapter.as_ref(), configured_sources) {
             let candidates = adapter.archive_scan_candidates(&source)?;
             let entries = scan_file_state_entries(&candidates);
             // An empty candidate list from an unreachable root — an unmounted
@@ -6145,12 +6198,12 @@ fn collect_conversations(
                 &pending,
                 verbose,
             )?;
-            sources_collected += 1;
-            total_conversations += collected.conversations;
-            total_items += collected.items;
-            total_parts += collected.parts;
-            total_binary_bytes += collected.binary_bytes;
-            total_missing += collected.missing;
+            totals.sources += 1;
+            totals.conversations += collected.conversations;
+            totals.items += collected.items;
+            totals.parts += collected.parts;
+            totals.binary_bytes += collected.binary_bytes;
+            totals.missing += collected.missing;
             if verbose {
                 println!(
                     "{} {}: files={} conversations={} items={} parts={} binary_bytes={} missing={} invalid_records={}",
@@ -6167,27 +6220,7 @@ fn collect_conversations(
             }
         }
     }
-    println!(
-        "archive collection: sources={} conversations={} items={} parts={} binary_bytes={} missing={}",
-        sources_collected,
-        total_conversations,
-        total_items,
-        total_parts,
-        total_binary_bytes,
-        total_missing,
-    );
-    let code_changes = store.refresh_code_changes(device_id)?;
-    println!(
-        "code changes: trace_edits={} repositories={} commits={} trace_matched={} metrics={} trace_coverage={:?} git_coverage={:?}",
-        code_changes.trace_edits,
-        code_changes.repositories,
-        code_changes.commits,
-        code_changes.matches,
-        code_changes.metrics,
-        code_changes.trace_coverage,
-        code_changes.git_coverage,
-    );
-    Ok(())
+    Ok(totals)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -6213,63 +6246,235 @@ fn collect_archive_source_entries(
         .iter()
         .map(|candidate| (candidate.cache_key.as_str(), candidate))
         .collect::<HashMap<_, _>>();
+    // Sized once: grouping and the reconstruction budget both ask for this, and
+    // a source can hold thousands of files.
+    let source_bytes = pending
+        .iter()
+        .map(|entry| {
+            candidates_by_key
+                .get(entry.cache_key.as_str())
+                .and_then(|candidate| std::fs::metadata(&candidate.path).ok())
+                .map_or(0, |metadata| metadata.len())
+        })
+        .collect::<Vec<_>>();
     let mut collected = ArchiveSourceCollection::default();
-    for (index, entry) in pending.iter().enumerate() {
-        let candidate = candidates_by_key.get(entry.cache_key.as_str()).copied();
-        let candidate_bytes = candidate
-            .and_then(|candidate| std::fs::metadata(&candidate.path).ok())
-            .map_or(0, |metadata| metadata.len());
-        let report_candidate =
-            verbose && (index == 0 || (index + 1) % 25 == 0 || candidate_bytes >= 16 * 1024 * 1024);
-        if report_candidate {
-            println!(
-                "{} {}: collecting file {}/{} ({} bytes) {}",
-                adapter.provider(),
-                preview_path_label(source),
-                index + 1,
-                pending.len(),
-                candidate_bytes,
-                candidate
-                    .and_then(|candidate| candidate.path.file_name())
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(entry.cache_key.as_str()),
-            );
-        }
+    let mut index = 0;
+    while index < pending.len() {
+        let group = archive_collection_group(&source_bytes, index);
+        let group_entries = &pending[index..index + group];
 
+        // Reading and reconstructing a transcript is independent per file and
+        // is what the wall clock is mostly spent on, so the group is parsed on
+        // several threads. The results are written in file order on this
+        // thread: two files can describe the same conversation, and the record
+        // that wins must not depend on which thread finished first.
         let collect_started = Instant::now();
-        let selected = HashSet::from([entry.cache_key.clone()]);
-        let scan = adapter.collect_archive(source, Some(&selected))?;
+        let scans = parse_archive_group(
+            adapter,
+            source,
+            group_entries,
+            &source_bytes[index..index + group],
+        );
         let collect_elapsed = collect_started.elapsed();
+        // Reconstruction stops early when it is already holding enough content,
+        // so the run advances by what came back rather than what was offered.
+        // Advancing by anything else would step over a file that was never
+        // stored, and a run that reconstructed nothing has to say so rather
+        // than skip the file or ask for it forever.
+        let group = scans.len();
+        ensure!(
+            group > 0,
+            "reconstructed no archive files from {} at file {}",
+            preview_path_label(source),
+            index + 1,
+        );
+
         let store_started = Instant::now();
-        let write = store.store_archive_scan_with_code_changes(
-            &source.source_id,
-            &scan.conversations,
-            std::slice::from_ref(entry),
-            &scan.artifact_dependencies,
-            &scan.trace_edits,
-            scan.trace_coverage,
-        )?;
+        // One transaction per file: a file's rows and the cache entry that
+        // records it are committed together, and a file that fails stops the
+        // run only after every file before it has been stored.
+        for (entry, scan) in group_entries.iter().zip(scans) {
+            let scan = scan?;
+            let write = store.store_archive_scan_with_code_changes(
+                &source.source_id,
+                &scan.conversations,
+                std::slice::from_ref(entry),
+                &scan.artifact_dependencies,
+                &scan.trace_edits,
+                scan.trace_coverage,
+            )?;
+            collected.files += scan.diagnostics.files_scanned;
+            collected.conversations += write.conversations;
+            collected.items += write.items;
+            collected.parts += write.content_parts;
+            collected.binary_bytes += write.binary_bytes;
+            collected.missing += scan.diagnostics.missing_content;
+            collected.invalid_records += scan.diagnostics.invalid_records;
+        }
         let store_elapsed = store_started.elapsed();
-        collected.files += scan.diagnostics.files_scanned;
-        collected.conversations += write.conversations;
-        collected.items += write.items;
-        collected.parts += write.content_parts;
-        collected.binary_bytes += write.binary_bytes;
-        collected.missing += scan.diagnostics.missing_content;
-        collected.invalid_records += scan.diagnostics.invalid_records;
-        if report_candidate {
+        if verbose {
             println!(
-                "{} {}: completed file {}/{} collect={:.1}s store={:.1}s",
+                "{} {}: collected files {}-{}/{} collect={:.1}s store={:.1}s",
                 adapter.provider(),
                 preview_path_label(source),
                 index + 1,
+                index + group,
                 pending.len(),
                 collect_elapsed.as_secs_f64(),
                 store_elapsed.as_secs_f64(),
             );
         }
+        index += group;
     }
     Ok(collected)
+}
+
+/// Files parsed together before their results are written.
+const ARCHIVE_COLLECTION_GROUP_FILES: usize = 16;
+/// Source bytes a group stops growing at.
+///
+/// A group is held in memory in full, and one transcript can be tens of
+/// megabytes that expand further once reconstructed, so the bound is on the
+/// input size rather than the file count alone.
+const ARCHIVE_COLLECTION_GROUP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Number of files to take for the group starting at `index`, always at least
+/// one so that a single oversized file still makes progress.
+fn archive_collection_group(source_bytes: &[u64], index: usize) -> usize {
+    let mut group = 0;
+    let mut bytes = 0u64;
+    while index + group < source_bytes.len() && group < ARCHIVE_COLLECTION_GROUP_FILES {
+        bytes = bytes.saturating_add(source_bytes[index + group]);
+        group += 1;
+        if bytes >= ARCHIVE_COLLECTION_GROUP_BYTES {
+            break;
+        }
+    }
+    group.max(1)
+}
+
+/// Reconstructed content a group holds before its results are stored.
+///
+/// Source size does not predict this: a one-line transcript can name a local
+/// artifact of tens of megabytes, which is materialized and carried as base64.
+/// Workers therefore stop taking new files once the group has this much
+/// outstanding, and the files they did not reach are simply the next group.
+const ARCHIVE_COLLECTION_RETAINED_BYTES: usize = 192 * 1024 * 1024;
+/// Files reconstructed at once.
+///
+/// A file's real cost is only known once it has been read: a one-line
+/// transcript may name artifacts many times its own size, so no estimate taken
+/// beforehand can bound it. What can be bounded is how many files are being
+/// read at once, which is what keeps the worst case a small multiple of the
+/// largest single file rather than a multiple of the core count.
+const ARCHIVE_COLLECTION_IN_FLIGHT: usize = 4;
+/// Least a file is charged against the budget while it is being reconstructed.
+///
+/// Set so that the budget alone admits [`ARCHIVE_COLLECTION_IN_FLIGHT`] files
+/// of unknown size, and fewer once one of them is known to be large.
+const ARCHIVE_COLLECTION_FILE_RESERVE: usize =
+    ARCHIVE_COLLECTION_RETAINED_BYTES / ARCHIVE_COLLECTION_IN_FLIGHT;
+
+/// How much of the budget a group has outstanding, and which file is next.
+///
+/// Both move together under one lock: a worker that decided to take a file
+/// having seen the budget empty, while its peers were deciding the same thing,
+/// is how a bound on retained content stops being one.
+struct ArchiveGroupClaim {
+    next: usize,
+    retained: usize,
+}
+
+/// Reconstructs a leading run of `entries`, in parallel, preserving their order.
+///
+/// Returns one result per file reconstructed, which may be fewer than were
+/// offered; the caller advances by however many came back. A file that cannot
+/// be read is reported in its own position rather than aborting the run, so the
+/// caller can still store every file that precedes it. Collection is resumable
+/// precisely because a file that was stored stays stored when a later one
+/// fails.
+fn parse_archive_group(
+    adapter: &dyn ProviderAdapter,
+    source: &SourceLocation,
+    entries: &[ScanFileStateEntry],
+    source_bytes: &[u64],
+) -> Vec<Result<ArchiveScan>> {
+    let collect_one = |entry: &ScanFileStateEntry| {
+        let selected = HashSet::from([entry.cache_key.clone()]);
+        adapter.collect_archive(source, Some(&selected))
+    };
+    if entries.len() == 1 {
+        return vec![collect_one(&entries[0])];
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(ARCHIVE_COLLECTION_IN_FLIGHT, std::num::NonZeroUsize::get)
+        .min(entries.len())
+        .min(ARCHIVE_COLLECTION_IN_FLIGHT);
+    let claim = std::sync::Mutex::new(ArchiveGroupClaim {
+        next: 0,
+        retained: 0,
+    });
+    let results = (0..entries.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let (index, reserved) = {
+                    let mut claim = claim.lock().expect("archive group claim");
+                    let index = claim.next;
+                    if index >= entries.len() {
+                        return;
+                    }
+                    let reserved = usize::try_from(source_bytes.get(index).copied().unwrap_or(0))
+                        .unwrap_or(usize::MAX)
+                        .max(ARCHIVE_COLLECTION_FILE_RESERVE);
+                    // The first file is always taken, so one file larger than
+                    // the whole budget still makes progress.
+                    if index > 0
+                        && claim.retained.saturating_add(reserved)
+                            > ARCHIVE_COLLECTION_RETAINED_BYTES
+                    {
+                        return;
+                    }
+                    claim.next = index + 1;
+                    claim.retained = claim.retained.saturating_add(reserved);
+                    (index, reserved)
+                };
+                let scan = collect_one(&entries[index]);
+                // What the file actually costs replaces what it was charged.
+                let actual = scan.as_ref().map_or(0, archive_scan_retained_bytes);
+                {
+                    let mut claim = claim.lock().expect("archive group claim");
+                    claim.retained = claim
+                        .retained
+                        .saturating_sub(reserved)
+                        .saturating_add(actual);
+                }
+                *results[index].lock().expect("archive scan slot") = Some(scan);
+            });
+        }
+    });
+    // Indices are handed out in order and every one handed out is reconstructed,
+    // so the results form a leading run. Stopping at the first gap keeps that
+    // true whatever the workers did.
+    results
+        .into_iter()
+        .map_while(|slot| slot.into_inner().expect("archive scan slot"))
+        .collect()
+}
+
+/// Reconstructed content a scan is holding in memory.
+fn archive_scan_retained_bytes(scan: &ArchiveScan) -> usize {
+    scan.conversations
+        .iter()
+        .flat_map(|conversation| &conversation.items)
+        .flat_map(|item| &item.parts)
+        .map(|part| {
+            part.text.as_ref().map_or(0, String::len)
+                + part.data_base64.as_ref().map_or(0, String::len)
+        })
+        .sum()
 }
 
 fn canonical_conversation_provider_filter(provider: Option<&str>) -> Result<Option<&'static str>> {
@@ -8971,6 +9176,197 @@ mod tests {
             .pending_archive_import_entries(&source.source_id, &entries)
             .expect("pending archive entries");
         assert_eq!(pending, vec![entries[1].clone()]);
+    }
+
+    /// Files are reconstructed on several threads but must be handed back in
+    /// the order they were listed: two files can describe the same
+    /// conversation, and which record wins must not depend on scheduling.
+    #[test]
+    fn archive_group_parsing_preserves_file_order() {
+        struct OrderedArchiveAdapter;
+
+        impl ProviderAdapter for OrderedArchiveAdapter {
+            fn id(&self) -> &'static str {
+                "ordered-archive-test"
+            }
+            fn version(&self) -> &'static str {
+                "0"
+            }
+            fn provider(&self) -> &'static str {
+                "archive_test"
+            }
+            fn discover(&self) -> Vec<SourceLocation> {
+                Vec::new()
+            }
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(Vec::new())
+            }
+            fn scan(
+                &self,
+                _source: &SourceLocation,
+                _options: &ScanOptions,
+            ) -> Result<statsai_adapters::AdapterScan> {
+                Ok(statsai_adapters::AdapterScan::default())
+            }
+            fn collect_archive(
+                &self,
+                _source: &SourceLocation,
+                selected_cache_keys: Option<&HashSet<String>>,
+            ) -> Result<statsai_adapters::ArchiveScan> {
+                let selected = selected_cache_keys
+                    .and_then(|keys| keys.iter().next())
+                    .context("selected archive cache key")?;
+                // The earlier files are the slow ones, so a run that returned
+                // results as they arrived would reorder them.
+                let index: u64 = selected.parse().context("cache key index")?;
+                std::thread::sleep(std::time::Duration::from_millis(40 - index * 4));
+                let mut scan = statsai_adapters::ArchiveScan::default();
+                scan.diagnostics.files_scanned = index;
+                Ok(scan)
+            }
+        }
+
+        let source = SourceLocation::local_adapter(
+            "archive_test",
+            "ordered-archive-test",
+            "0",
+            Path::new("/tmp/archive-order-test"),
+            LocationOrigin::Configured,
+        );
+        let entries = (0..10)
+            .map(|index| ScanFileStateEntry {
+                cache_key: index.to_string(),
+                cache_signature: format!("signature-{index}"),
+            })
+            .collect::<Vec<_>>();
+
+        let scans = parse_archive_group(
+            &OrderedArchiveAdapter,
+            &source,
+            &entries,
+            &vec![0; entries.len()],
+        );
+
+        let order = scans
+            .into_iter()
+            .map(|scan| scan.expect("collected archive").diagnostics.files_scanned)
+            .collect::<Vec<_>>();
+        assert_eq!(order, (0..10).collect::<Vec<_>>());
+    }
+
+    /// A transcript's size on disk says nothing about how much content it
+    /// materializes, so reconstruction stops taking new files once it is
+    /// holding enough. The files it did not reach must come back for the
+    /// caller to collect next, never be reported as done.
+    #[test]
+    fn archive_group_parsing_stops_before_holding_too_much_content() {
+        struct HeavyArchiveAdapter;
+
+        impl ProviderAdapter for HeavyArchiveAdapter {
+            fn id(&self) -> &'static str {
+                "heavy-archive-test"
+            }
+            fn version(&self) -> &'static str {
+                "0"
+            }
+            fn provider(&self) -> &'static str {
+                "archive_test"
+            }
+            fn discover(&self) -> Vec<SourceLocation> {
+                Vec::new()
+            }
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(Vec::new())
+            }
+            fn scan(
+                &self,
+                _source: &SourceLocation,
+                _options: &ScanOptions,
+            ) -> Result<statsai_adapters::AdapterScan> {
+                Ok(statsai_adapters::AdapterScan::default())
+            }
+            fn collect_archive(
+                &self,
+                _source: &SourceLocation,
+                _selected_cache_keys: Option<&HashSet<String>>,
+            ) -> Result<statsai_adapters::ArchiveScan> {
+                // A tiny record naming an artifact that materializes far
+                // larger than the file it came from.
+                let mut conversation = ArchiveConversation {
+                    schema_version: statsai_core::ARCHIVE_CONVERSATION_SCHEMA_VERSION.to_string(),
+                    conversation_id: "conv_heavy".to_string(),
+                    provider: "archive_test".to_string(),
+                    source_id: statsai_core::SourceId("heavy".to_string()),
+                    native_conversation_id: "heavy".to_string(),
+                    title: None,
+                    project: None,
+                    started_at: None,
+                    updated_at: None,
+                    completeness: statsai_core::ArchiveCompleteness::Complete,
+                    missing_content_count: 0,
+                    missing_content_scope_id: None,
+                    discarded_source_record_ids: Vec::new(),
+                    superseded_conversation_ids: Vec::new(),
+                    items: Vec::new(),
+                };
+                let item_id = "item_heavy".to_string();
+                conversation.items.push(statsai_core::ArchiveItem {
+                    item_id: item_id.clone(),
+                    native_item_id: None,
+                    source_record_id: None,
+                    ordinal: 0,
+                    kind: statsai_core::ArchiveItemKind::Message,
+                    role: None,
+                    created_at: None,
+                    model: None,
+                    tool_name: None,
+                    tool_call_id: None,
+                    status: None,
+                    usage: None,
+                    parts_authoritative: true,
+                    parts: vec![statsai_core::ArchiveContentPart::text(
+                        statsai_core::archive_content_id(&item_id, 0),
+                        0,
+                        ArchiveContentKind::Text,
+                        "x".repeat(ARCHIVE_COLLECTION_RETAINED_BYTES / 4),
+                    )],
+                });
+                // Held long enough that every worker has tried to claim before
+                // any capacity is released.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let mut scan = statsai_adapters::ArchiveScan::default();
+                scan.conversations.push(conversation);
+                Ok(scan)
+            }
+        }
+
+        let source = SourceLocation::local_adapter(
+            "archive_test",
+            "heavy-archive-test",
+            "0",
+            Path::new("/tmp/archive-heavy-test"),
+            LocationOrigin::Configured,
+        );
+        let entries = (0..ARCHIVE_COLLECTION_GROUP_FILES)
+            .map(|index| ScanFileStateEntry {
+                cache_key: index.to_string(),
+                cache_signature: format!("signature-{index}"),
+            })
+            .collect::<Vec<_>>();
+        // A quarter of the budget each, so only a few may be outstanding.
+        let source_bytes =
+            vec![ARCHIVE_COLLECTION_RETAINED_BYTES as u64 / 4; ARCHIVE_COLLECTION_GROUP_FILES];
+
+        let scans = parse_archive_group(&HeavyArchiveAdapter, &source, &entries, &source_bytes);
+
+        // Every worker reaches the budget before any of them finishes, which is
+        // exactly when a check that does not reserve lets all of them through.
+        assert!(!scans.is_empty(), "no file was reconstructed");
+        assert!(
+            scans.len() <= 4,
+            "budget did not gate concurrent claims: {} files were taken",
+            scans.len()
+        );
     }
 
     #[test]
