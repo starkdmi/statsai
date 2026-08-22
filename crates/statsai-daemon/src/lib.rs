@@ -4,8 +4,9 @@ use anyhow::{bail, Context, Result};
 use serde_json::json;
 use statsai_core::{
     SyncAck, SyncBatch, SyncEntityCounts, SyncRejectedRecord, SYNC_ACK_V1_SCHEMA_VERSION,
-    SYNC_ACK_V2_SCHEMA_VERSION, SYNC_ACK_V3_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION,
-    SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION,
+    SYNC_ACK_V2_SCHEMA_VERSION, SYNC_ACK_V3_SCHEMA_VERSION, SYNC_ACK_V4_SCHEMA_VERSION,
+    SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION,
+    SYNC_BATCH_V4_SCHEMA_VERSION,
 };
 use statsai_store::Store;
 use std::io::Read;
@@ -30,6 +31,7 @@ fn sync_ack_schema_version(batch_schema_version: &str) -> Result<&'static str> {
         SYNC_BATCH_V1_SCHEMA_VERSION => Ok(SYNC_ACK_V1_SCHEMA_VERSION),
         SYNC_BATCH_V2_SCHEMA_VERSION => Ok(SYNC_ACK_V2_SCHEMA_VERSION),
         SYNC_BATCH_V3_SCHEMA_VERSION => Ok(SYNC_ACK_V3_SCHEMA_VERSION),
+        SYNC_BATCH_V4_SCHEMA_VERSION => Ok(SYNC_ACK_V4_SCHEMA_VERSION),
         other => bail!("unsupported sync batch schema {other}"),
     }
 }
@@ -219,12 +221,21 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     if batch.schema_version != SYNC_BATCH_V1_SCHEMA_VERSION
         && batch.schema_version != SYNC_BATCH_V2_SCHEMA_VERSION
         && batch.schema_version != SYNC_BATCH_V3_SCHEMA_VERSION
+        && batch.schema_version != SYNC_BATCH_V4_SCHEMA_VERSION
     {
         bail!("unsupported sync batch schema {}", batch.schema_version);
     }
-    if batch.schema_version != SYNC_BATCH_V3_SCHEMA_VERSION && !batch.code_change_metrics.is_empty()
+    if !matches!(
+        batch.schema_version.as_str(),
+        SYNC_BATCH_V3_SCHEMA_VERSION | SYNC_BATCH_V4_SCHEMA_VERSION
+    ) && !batch.code_change_metrics.is_empty()
     {
         bail!("code-change metrics require sync_batch.v3");
+    }
+    if batch.schema_version != SYNC_BATCH_V4_SCHEMA_VERSION
+        && !batch.quota_cycle_contributions.is_empty()
+    {
+        bail!("quota cycle contributions require sync_batch.v4");
     }
     if batch
         .code_change_metrics
@@ -252,6 +263,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             task_buckets: batch.task_buckets.len() as u64,
             task_verifications: result.merged_task_verifications,
             code_change_metrics: batch.code_change_metrics.len() as u64,
+            quota_cycle_contributions: batch.quota_cycle_contributions.len() as u64,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -264,6 +276,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             task_verifications: (batch.task_verifications.len() as u64)
                 .saturating_sub(result.merged_task_verifications),
             code_change_metrics: 0,
+            quota_cycle_contributions: 0,
         },
         rejected: Vec::<SyncRejectedRecord>::new(),
     })
@@ -2682,6 +2695,7 @@ mod tests {
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: Utc::now(),
         }
@@ -2839,6 +2853,32 @@ mod tests {
         assert!(error
             .to_string()
             .contains("code-change metrics require sync_batch.v3"));
+    }
+
+    #[test]
+    fn ingest_v3_batch_rejects_quota_cycle_contributions() {
+        let store = Store::in_memory().expect("store");
+        let mut batch = empty_batch();
+        batch.schema_version = SYNC_BATCH_V3_SCHEMA_VERSION.to_string();
+        batch
+            .quota_cycle_contributions
+            .push(statsai_core::QuotaCycleContributionV1 {
+                schema_version: statsai_core::QUOTA_CYCLE_CONTRIBUTION_SCHEMA_VERSION.to_string(),
+                contribution_id: "quota_cycle_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                provider: "codex".to_string(),
+                provider_account_id: statsai_core::ProviderAccountId("acct-1".to_string()),
+                limit_id: None,
+                window_minutes: statsai_core::QUOTA_WEEKLY_WINDOW_MINUTES,
+                representative_reset: Utc::now(),
+                representative_reset_epoch_seconds: Utc::now().timestamp(),
+                daily_envelopes: Vec::new(),
+                boundary_slices: Vec::new(),
+            });
+
+        let error = ingest_sync_batch(&store, &batch).expect_err("v3 quota payload");
+        assert!(error
+            .to_string()
+            .contains("quota cycle contributions require sync_batch.v4"));
     }
 
     #[test]

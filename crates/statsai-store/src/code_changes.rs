@@ -2166,6 +2166,7 @@ mod tests {
                 task_buckets: Vec::new(),
                 task_verifications: Vec::new(),
                 code_change_metrics: vec![remote_metric.clone()],
+                quota_cycle_contributions: Vec::new(),
                 authoritative_snapshot: None,
                 created_at: Utc::now(),
             })

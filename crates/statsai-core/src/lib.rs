@@ -27,11 +27,13 @@ pub const DAILY_ROLLUP_SCHEMA_VERSION: &str = "daily_rollup.v1";
 pub const SYNC_BATCH_V1_SCHEMA_VERSION: &str = "sync_batch.v1";
 pub const SYNC_BATCH_V2_SCHEMA_VERSION: &str = "sync_batch.v2";
 pub const SYNC_BATCH_V3_SCHEMA_VERSION: &str = "sync_batch.v3";
+pub const SYNC_BATCH_V4_SCHEMA_VERSION: &str = "sync_batch.v4";
 pub const SYNC_ACK_V1_SCHEMA_VERSION: &str = "sync_ack.v1";
 pub const SYNC_ACK_V2_SCHEMA_VERSION: &str = "sync_ack.v2";
 pub const SYNC_ACK_V3_SCHEMA_VERSION: &str = "sync_ack.v3";
-pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V3_SCHEMA_VERSION;
-pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V3_SCHEMA_VERSION;
+pub const SYNC_ACK_V4_SCHEMA_VERSION: &str = "sync_ack.v4";
+pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V4_SCHEMA_VERSION;
+pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V4_SCHEMA_VERSION;
 
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
@@ -727,6 +729,10 @@ pub struct SyncBatch {
     /// arguments, and commit messages are deliberately absent from this type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_change_metrics: Vec<CodeChangeMetric>,
+    /// Attributed quota-cycle contributions. Local quota records, payloads,
+    /// plans, credits, and sample counts are deliberately absent from this type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_cycle_contributions: Vec<QuotaCycleContributionV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoritative_snapshot: Option<SyncAuthoritativeSnapshot>,
     pub created_at: DateTime<Utc>,
@@ -749,6 +755,8 @@ pub struct SyncAuthoritativeSnapshot {
     pub summary_ids: Vec<SummaryId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_change_metric_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_cycle_contribution_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -796,6 +804,8 @@ pub struct SyncEntityCounts {
     pub task_verifications: u64,
     #[serde(default, skip_serializing_if = "sync_count_is_zero")]
     pub code_change_metrics: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub quota_cycle_contributions: u64,
 }
 
 fn sync_count_is_zero(value: &u64) -> bool {
@@ -2138,6 +2148,7 @@ mod tests {
                 task_buckets: 0,
                 task_verifications: 0,
                 code_change_metrics: 0,
+                quota_cycle_contributions: 0,
             },
             duplicates: SyncEntityCounts {
                 sources: 0,
@@ -2149,6 +2160,7 @@ mod tests {
                 task_buckets: 0,
                 task_verifications: 0,
                 code_change_metrics: 0,
+                quota_cycle_contributions: 0,
             },
             rejected: Vec::new(),
         };
@@ -2166,7 +2178,7 @@ mod tests {
     #[test]
     fn sync_ack_v3_keeps_nonzero_task_and_code_change_counters() {
         let ack = SyncAck {
-            schema_version: SYNC_ACK_SCHEMA_VERSION.to_string(),
+            schema_version: SYNC_ACK_V3_SCHEMA_VERSION.to_string(),
             batch_id: "batch-2".to_string(),
             accepted: SyncEntityCounts {
                 sources: 0,
@@ -2178,6 +2190,7 @@ mod tests {
                 task_buckets: 3,
                 task_verifications: 1,
                 code_change_metrics: 2,
+                quota_cycle_contributions: 0,
             },
             duplicates: SyncEntityCounts {
                 sources: 0,
@@ -2189,6 +2202,7 @@ mod tests {
                 task_buckets: 0,
                 task_verifications: 0,
                 code_change_metrics: 0,
+                quota_cycle_contributions: 0,
             },
             rejected: Vec::new(),
         };
@@ -2198,6 +2212,60 @@ mod tests {
         assert_eq!(json["accepted"]["task_buckets"], 3);
         assert_eq!(json["accepted"]["task_verifications"], 1);
         assert_eq!(json["accepted"]["code_change_metrics"], 2);
+        assert!(json["accepted"].get("quota_cycle_contributions").is_none());
+    }
+
+    #[test]
+    fn sync_ack_v4_keeps_nonzero_quota_cycle_counters() {
+        let ack = SyncAck {
+            schema_version: SYNC_ACK_V4_SCHEMA_VERSION.to_string(),
+            batch_id: "batch-quota".to_string(),
+            accepted: SyncEntityCounts {
+                sources: 0,
+                accounts: 0,
+                source_account_assignments: 0,
+                subscriptions: 0,
+                events: 0,
+                summaries: 0,
+                task_buckets: 0,
+                task_verifications: 0,
+                code_change_metrics: 1,
+                quota_cycle_contributions: 4,
+            },
+            duplicates: SyncEntityCounts {
+                sources: 0,
+                accounts: 0,
+                source_account_assignments: 0,
+                subscriptions: 0,
+                events: 0,
+                summaries: 0,
+                task_buckets: 0,
+                task_verifications: 0,
+                code_change_metrics: 0,
+                quota_cycle_contributions: 0,
+            },
+            rejected: Vec::new(),
+        };
+
+        let json = serde_json::to_value(&ack).expect("ack should serialize");
+        assert_eq!(json["schema_version"], SYNC_ACK_V4_SCHEMA_VERSION);
+        assert_eq!(json["accepted"]["code_change_metrics"], 1);
+        assert_eq!(json["accepted"]["quota_cycle_contributions"], 4);
+    }
+
+    #[test]
+    fn sync_batch_v3_without_quota_contributions_remains_backward_compatible() {
+        let batch: SyncBatch = serde_json::from_value(serde_json::json!({
+            "schema_version": SYNC_BATCH_V3_SCHEMA_VERSION,
+            "batch_id": "batch-legacy-v3",
+            "device_id": "device-1",
+            "created_at": "2026-05-31T10:00:00Z"
+        }))
+        .expect("legacy v3 batch should deserialize");
+
+        assert!(batch.quota_cycle_contributions.is_empty());
+        let serialized = serde_json::to_value(batch).expect("batch should serialize");
+        assert!(serialized.get("quota_cycle_contributions").is_none());
     }
 
     fn test_source(provider: &str, path: &str) -> SourceLocation {

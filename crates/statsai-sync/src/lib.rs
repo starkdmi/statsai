@@ -3,8 +3,8 @@
 use anyhow::{bail, Context, Result};
 use statsai_core::{
     SyncAck, SyncBatch, SYNC_ACK_V1_SCHEMA_VERSION, SYNC_ACK_V2_SCHEMA_VERSION,
-    SYNC_ACK_V3_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
-    SYNC_BATCH_V3_SCHEMA_VERSION,
+    SYNC_ACK_V3_SCHEMA_VERSION, SYNC_ACK_V4_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION,
+    SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION, SYNC_BATCH_V4_SCHEMA_VERSION,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -153,6 +153,7 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         SYNC_BATCH_V1_SCHEMA_VERSION => SYNC_ACK_V1_SCHEMA_VERSION,
         SYNC_BATCH_V2_SCHEMA_VERSION => SYNC_ACK_V2_SCHEMA_VERSION,
         SYNC_BATCH_V3_SCHEMA_VERSION => SYNC_ACK_V3_SCHEMA_VERSION,
+        SYNC_BATCH_V4_SCHEMA_VERSION => SYNC_ACK_V4_SCHEMA_VERSION,
         other => bail!("unsupported sync batch schema {other}"),
     };
     if ack.schema_version != expected_ack_schema {
@@ -234,6 +235,12 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         batch.code_change_metrics.len() as u64,
         ack.accepted.code_change_metrics,
         ack.duplicates.code_change_metrics,
+    )?;
+    validate_sync_ack_counts(
+        "quota_cycle_contributions",
+        batch.quota_cycle_contributions.len() as u64,
+        ack.accepted.quota_cycle_contributions,
+        ack.duplicates.quota_cycle_contributions,
     )?;
     Ok(())
 }
@@ -333,6 +340,7 @@ mod tests {
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: Utc::now(),
         }
@@ -434,7 +442,7 @@ mod tests {
         let (auth, content_type, body) = rx.recv().expect("request body");
         assert_eq!(auth.as_deref(), Some("Bearer token_123"));
         assert_eq!(content_type.as_deref(), Some("application/json"));
-        assert!(body.contains("\"schema_version\":\"sync_batch.v3\""));
+        assert!(body.contains("\"schema_version\":\"sync_batch.v4\""));
         assert!(body.contains("\"batch_id\":\"batch_1\""));
     }
 

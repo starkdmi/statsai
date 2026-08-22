@@ -1,19 +1,21 @@
 use super::{assignment_for_timestamp, Store};
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use statsai_core::{
     hash_text, periods_overlap, EventId, ProviderAccountId, QuotaChangePointV1,
-    QuotaObservationRecordV1, QuotaObservationV1, QuotaProjectionStatusV1, QuotaTransitionKind,
-    QuotaUsageLinkKind, QuotaUsageTotalsV1, QuotaWindowObservationV1, QuotaWindowSyncProjectionV1,
-    QuotaWindowV1, SourceAccountAssignment, SourceId, QUOTA_WINDOW_SCHEMA_VERSION,
+    QuotaCycleContributionV1, QuotaDailyEnvelopeV1, QuotaObservationRecordV1, QuotaObservationV1,
+    QuotaProjectionStatusV1, QuotaTransitionKind, QuotaUsageLinkKind, QuotaUsageSliceV1,
+    QuotaUsageTotalsV1, QuotaWindowObservationV1, QuotaWindowSyncProjectionV1, QuotaWindowV1,
+    SourceAccountAssignment, SourceId, QUOTA_CYCLE_CONTRIBUTION_SCHEMA_VERSION,
+    QUOTA_WEEKLY_WINDOW_MINUTES, QUOTA_WINDOW_SCHEMA_VERSION,
     QUOTA_WINDOW_SYNC_PROJECTION_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const RESET_CLUSTER_TOLERANCE_SECONDS: i64 = 5 * 60;
-pub const SYNC_ELIGIBLE_WINDOW_MINUTES: u64 = 10_080;
+pub const SYNC_ELIGIBLE_WINDOW_MINUTES: u64 = QUOTA_WEEKLY_WINDOW_MINUTES;
 
 #[derive(Debug, Clone, Default)]
 pub struct QuotaQuery {
@@ -498,6 +500,17 @@ impl Store {
         &self,
         query: &QuotaQuery,
     ) -> Result<Vec<QuotaWindowV1>> {
+        Ok(self
+            .reconstruct_quota_windows(query)?
+            .into_iter()
+            .map(|reconstructed| reconstructed.window)
+            .collect())
+    }
+
+    fn reconstruct_quota_windows(
+        &self,
+        query: &QuotaQuery,
+    ) -> Result<Vec<ReconstructedQuotaWindow>> {
         let mut reconstruction_query = query.clone();
         reconstruction_query.from = None;
         reconstruction_query.to = None;
@@ -561,6 +574,7 @@ impl Store {
                 if !quota_cluster_matches_time_query(schedule, query) {
                     continue;
                 }
+                let daily_envelopes = daily_envelopes_from_points(&cluster);
                 let mut window = Self::materialize_quota_window(&scope, schedule, cluster);
                 window.transition = if index == 0 {
                     QuotaTransitionKind::Initial
@@ -574,16 +588,20 @@ impl Store {
                         && schedule.inferred_start < peer.representative_reset
                         && schedule.representative_reset > peer.inferred_start
                 });
-                scope_windows.push(window);
+                scope_windows.push(ReconstructedQuotaWindow {
+                    window,
+                    daily_envelopes,
+                });
             }
             windows.extend(scope_windows);
         }
         windows.sort_by(|left, right| {
             right
+                .window
                 .representative_reset
-                .cmp(&left.representative_reset)
-                .then_with(|| right.window_minutes.cmp(&left.window_minutes))
-                .then_with(|| left.window_id.cmp(&right.window_id))
+                .cmp(&left.window.representative_reset)
+                .then_with(|| right.window.window_minutes.cmp(&left.window.window_minutes))
+                .then_with(|| left.window.window_id.cmp(&right.window.window_id))
         });
         Ok(windows)
     }
@@ -805,6 +823,166 @@ impl Store {
             })
             .collect())
     }
+
+    pub fn quota_cycle_contributions(
+        &self,
+        query: &QuotaQuery,
+        device_id: &str,
+    ) -> Result<Vec<QuotaCycleContributionV1>> {
+        let reconstructed = self.reconstruct_quota_windows(query)?;
+        let mut contributions = Vec::new();
+        let mut pending = Vec::new();
+        for item in reconstructed {
+            if item.window.window_minutes != QUOTA_WEEKLY_WINDOW_MINUTES {
+                continue;
+            }
+            let Some(provider_account_id) = item.window.provider_account_id.clone() else {
+                continue;
+            };
+            let Some(anchor) = item.window.change_points.first() else {
+                continue;
+            };
+            let contribution_id = format!(
+                "quota_cycle_{}",
+                &hash_text(&format!(
+                    "quota_cycle_contribution.v1:{device_id}:{}:{}:{}:{}:{}",
+                    item.window.provider,
+                    provider_account_id.0,
+                    item.window.limit_id.as_deref().unwrap_or("default"),
+                    item.window.window_minutes,
+                    anchor.point_fingerprint
+                ))[..32]
+            );
+            pending.push(PendingQuotaCycleContribution {
+                contribution_id,
+                provider_account_id,
+                reconstructed: item,
+            });
+        }
+
+        let effective_bounds = effective_cycle_bounds(
+            pending
+                .iter()
+                .map(|item| &item.reconstructed.window)
+                .collect::<Vec<_>>(),
+        );
+        let mut slices_by_window = HashMap::<String, Vec<QuotaUsageSliceV1>>::new();
+        if !pending.is_empty() {
+            let first_start = pending
+                .iter()
+                .map(|item| {
+                    effective_bounds
+                        .get(&item.reconstructed.window.window_id)
+                        .map(|bounds| bounds.start)
+                        .unwrap_or(item.reconstructed.window.inferred_start)
+                })
+                .min()
+                .expect("pending contributions are non-empty");
+            let last_end = pending
+                .iter()
+                .map(|item| {
+                    effective_bounds
+                        .get(&item.reconstructed.window.window_id)
+                        .map(|bounds| bounds.end)
+                        .unwrap_or(item.reconstructed.window.representative_reset)
+                })
+                .max()
+                .expect("pending contributions are non-empty");
+            let mut slice_builders = pending
+                .iter()
+                .map(|item| {
+                    let bounds = effective_bounds
+                        .get(&item.reconstructed.window.window_id)
+                        .copied()
+                        .unwrap_or(CycleBounds {
+                            start: item.reconstructed.window.inferred_start,
+                            end: item.reconstructed.window.representative_reset,
+                        });
+                    (
+                        item.reconstructed.window.window_id.clone(),
+                        boundary_slice_builders(
+                            bounds.start,
+                            bounds.end,
+                            &item.reconstructed.window.provider,
+                            item.reconstructed
+                                .window
+                                .provider_account_id
+                                .as_ref()
+                                .expect("attributed cycle"),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            for event in self.events_in_period(Some(first_start), last_end)? {
+                let Some(account_id) = event.provider_account_id.as_ref() else {
+                    continue;
+                };
+                let estimated_cost = event.cost.estimated_micro_usd();
+                for (_, builders) in &mut slice_builders {
+                    if event.provider != builders.provider || account_id != &builders.account_id {
+                        continue;
+                    }
+                    for slice in builders.slices.iter_mut() {
+                        if event.session.started_at < slice.period_start
+                            || event.session.started_at >= slice.period_end
+                        {
+                            continue;
+                        }
+                        slice.add_usage(&event.usage, estimated_cost);
+                    }
+                }
+            }
+
+            for (window_id, builders) in slice_builders {
+                slices_by_window.insert(window_id, builders.slices);
+            }
+        }
+
+        for item in pending {
+            let boundary_slices = slices_by_window
+                .remove(&item.reconstructed.window.window_id)
+                .unwrap_or_default();
+            contributions.push(QuotaCycleContributionV1 {
+                schema_version: QUOTA_CYCLE_CONTRIBUTION_SCHEMA_VERSION.to_string(),
+                contribution_id: item.contribution_id,
+                provider: item.reconstructed.window.provider,
+                provider_account_id: item.provider_account_id,
+                limit_id: item.reconstructed.window.limit_id,
+                window_minutes: item.reconstructed.window.window_minutes,
+                representative_reset: item.reconstructed.window.representative_reset,
+                representative_reset_epoch_seconds: item
+                    .reconstructed
+                    .window
+                    .representative_reset_epoch_seconds,
+                daily_envelopes: item.reconstructed.daily_envelopes,
+                boundary_slices,
+            });
+        }
+        Ok(contributions)
+    }
+
+    pub fn pending_quota_cycle_contributions_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        contributions: &[QuotaCycleContributionV1],
+    ) -> Result<Vec<QuotaCycleContributionV1>> {
+        let mut pending = Vec::new();
+        for contribution in contributions {
+            let payload = serde_json::to_string(contribution)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                "quota_cycle_contribution",
+                &contribution.contribution_id,
+                &hash_text(&payload),
+            )? {
+                pending.push(contribution.clone());
+            }
+        }
+        Ok(pending)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -862,6 +1040,184 @@ impl QuotaClusterSchedule {
                 .expect("non-empty reset cluster"),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ReconstructedQuotaWindow {
+    window: QuotaWindowV1,
+    daily_envelopes: Vec<QuotaDailyEnvelopeV1>,
+}
+
+struct PendingQuotaCycleContribution {
+    contribution_id: String,
+    provider_account_id: ProviderAccountId,
+    reconstructed: ReconstructedQuotaWindow,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CycleBounds {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
+struct BoundarySliceBuilders {
+    provider: String,
+    account_id: ProviderAccountId,
+    slices: Vec<QuotaUsageSliceV1>,
+}
+
+fn daily_envelopes_from_points(points: &[WindowPoint]) -> Vec<QuotaDailyEnvelopeV1> {
+    let mut grouped = BTreeMap::<String, Vec<&WindowPoint>>::new();
+    for point in points {
+        grouped
+            .entry(point.observation.observed_at.date_naive().to_string())
+            .or_default()
+            .push(point);
+    }
+    grouped
+        .into_iter()
+        .map(|(day, mut day_points)| {
+            day_points.sort_by_key(|point| point.observation.observed_at);
+            let first = day_points.first().expect("non-empty utc day");
+            let last = day_points.last().expect("non-empty utc day");
+            QuotaDailyEnvelopeV1 {
+                day,
+                first_observed_at: first.observation.observed_at,
+                first_used_percent: first.window.used_percent,
+                last_observed_at: last.observation.observed_at,
+                last_used_percent: last.window.used_percent,
+                minimum_used_percent: day_points
+                    .iter()
+                    .map(|point| point.window.used_percent)
+                    .fold(f64::INFINITY, f64::min),
+                maximum_used_percent: day_points
+                    .iter()
+                    .map(|point| point.window.used_percent)
+                    .fold(f64::NEG_INFINITY, f64::max),
+            }
+        })
+        .collect()
+}
+
+fn utc_day_start(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    timestamp
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight")
+        .and_utc()
+}
+
+fn is_utc_midnight(timestamp: DateTime<Utc>) -> bool {
+    timestamp.time().num_seconds_from_midnight() == 0 && timestamp.nanosecond() == 0
+}
+
+fn next_utc_day_start(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    utc_day_start(timestamp) + Duration::days(1)
+}
+
+fn empty_usage_slice(period_start: DateTime<Utc>, period_end: DateTime<Utc>) -> QuotaUsageSliceV1 {
+    QuotaUsageSliceV1 {
+        period_start,
+        period_end,
+        ..QuotaUsageSliceV1::default()
+    }
+}
+
+fn boundary_slice_builders(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    provider: &str,
+    account_id: &ProviderAccountId,
+) -> BoundarySliceBuilders {
+    let mut slices = Vec::new();
+    if start >= end {
+        return BoundarySliceBuilders {
+            provider: provider.to_string(),
+            account_id: account_id.clone(),
+            slices,
+        };
+    }
+    if start.date_naive() == end.date_naive() {
+        if !is_utc_midnight(start) || !is_utc_midnight(end) {
+            slices.push(empty_usage_slice(start, end));
+        }
+        return BoundarySliceBuilders {
+            provider: provider.to_string(),
+            account_id: account_id.clone(),
+            slices,
+        };
+    }
+    if !is_utc_midnight(start) {
+        slices.push(empty_usage_slice(start, next_utc_day_start(start)));
+    }
+    if !is_utc_midnight(end) {
+        slices.push(empty_usage_slice(utc_day_start(end), end));
+    }
+    BoundarySliceBuilders {
+        provider: provider.to_string(),
+        account_id: account_id.clone(),
+        slices,
+    }
+}
+
+fn clamp_datetime(value: DateTime<Utc>, min: DateTime<Utc>, max: DateTime<Utc>) -> DateTime<Utc> {
+    value.max(min).min(max)
+}
+
+fn effective_cycle_bounds(windows: Vec<&QuotaWindowV1>) -> HashMap<String, CycleBounds> {
+    let mut grouped = BTreeMap::<(String, String, Option<String>, u64), Vec<&QuotaWindowV1>>::new();
+    for window in windows {
+        let Some(account_id) = window.provider_account_id.as_ref() else {
+            continue;
+        };
+        grouped
+            .entry((
+                window.provider.clone(),
+                account_id.0.clone(),
+                window.limit_id.clone(),
+                window.window_minutes,
+            ))
+            .or_default()
+            .push(window);
+    }
+    let mut bounds = HashMap::new();
+    for mut scope_windows in grouped.into_values() {
+        scope_windows.sort_by_key(|window| {
+            (
+                window.inferred_start,
+                window.representative_reset,
+                window.window_id.clone(),
+            )
+        });
+        for window in &scope_windows {
+            bounds.insert(
+                window.window_id.clone(),
+                CycleBounds {
+                    start: window.inferred_start,
+                    end: window.representative_reset,
+                },
+            );
+        }
+        for index in 1..scope_windows.len() {
+            let previous = scope_windows[index - 1];
+            let current = scope_windows[index];
+            let overlap_start = previous.inferred_start.max(current.inferred_start);
+            let overlap_end = previous
+                .representative_reset
+                .min(current.representative_reset);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let transition = clamp_datetime(current.first_observed_at, overlap_start, overlap_end);
+            if let Some(previous_bounds) = bounds.get_mut(&previous.window_id) {
+                previous_bounds.end = previous_bounds.end.min(transition);
+            }
+            if let Some(current_bounds) = bounds.get_mut(&current.window_id) {
+                current_bounds.start = current_bounds.start.max(transition);
+            }
+        }
+    }
+    bounds
 }
 
 fn quota_point_fingerprint(scope: &WindowScope, point: &WindowPoint) -> String {
@@ -1057,8 +1413,10 @@ fn parse_usage_link_kind(value: &str) -> QuotaUsageLinkKind {
 mod tests {
     use super::*;
     use statsai_core::{
-        IdentitySource, LocationOrigin, QuotaCreditsV1, QuotaStatusV1, SourceAccountAssignment,
-        SourceAccountAssignmentId, SourceLocation, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+        event_id, Confidence, CostInfo, EventSource, IdentitySource, LocationOrigin, PrivacyInfo,
+        PrivacyMode, QuotaCreditsV1, QuotaStatusV1, SessionInfo, SourceAccountAssignment,
+        SourceAccountAssignmentId, SourceKind, SourceLocation, UsageCounts, UsageEvent,
+        SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
     };
     use std::collections::HashSet;
     use std::path::Path;
@@ -1901,5 +2259,369 @@ mod tests {
         assert!(projection_json.get("source_id").is_none());
         assert!(projection_json.get("total_tokens").is_none());
         assert!(projection_json.get("estimated_cost").is_none());
+    }
+
+    fn sample_usage_event(
+        source_id: &SourceId,
+        account_id: &ProviderAccountId,
+        started_at: DateTime<Utc>,
+        record_id: &str,
+        input_tokens: u64,
+        cache_read_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+        estimated_cost_micro_usd: i64,
+    ) -> UsageEvent {
+        UsageEvent {
+            schema_version: USAGE_EVENT_SCHEMA_VERSION.to_string(),
+            event_id: event_id("codex", source_id, record_id, None, started_at),
+            device_id: "device".to_string(),
+            provider: "codex".to_string(),
+            source_id: source_id.clone(),
+            provider_account_id: Some(account_id.clone()),
+            subscription_id: None,
+            source: EventSource {
+                adapter_id: "test".to_string(),
+                adapter_version: "0".to_string(),
+                source_kind: SourceKind::LocalAdapter,
+                location_origin: Some(LocationOrigin::Configured),
+                source_type: "jsonl".to_string(),
+                source_path_hash: Some("quota-event".to_string()),
+                source_record_id: Some(record_id.to_string()),
+                parse_confidence: Confidence::High,
+            },
+            session: SessionInfo {
+                session_id: record_id.to_string(),
+                local_session_id_hash: Some(record_id.to_string()),
+                title: None,
+                started_at,
+                ended_at: None,
+                duration_seconds: None,
+            },
+            model: None,
+            usage: UsageCounts {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                cache_read_tokens: Some(cache_read_tokens),
+                reasoning_tokens: Some(reasoning_tokens),
+                total_tokens: Some(
+                    input_tokens + cache_read_tokens + output_tokens + reasoning_tokens,
+                ),
+                ..UsageCounts::default()
+            },
+            runtime: None,
+            cost: CostInfo {
+                currency: "USD".to_string(),
+                estimated_api_equivalent_usd: None,
+                provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: Some(estimated_cost_micro_usd),
+                provider_reported_micro_usd: None,
+                pricing_source: Some("test".to_string()),
+                pricing_version: None,
+                confidence: Confidence::High,
+            },
+            parse_evidence: None,
+            project: None,
+            git: None,
+            privacy: PrivacyInfo {
+                mode: PrivacyMode::MetadataOnly,
+                contains_prompt_text: false,
+                contains_response_text: false,
+                contains_file_paths: false,
+            },
+            created_at: started_at,
+            imported_at: started_at,
+        }
+    }
+
+    #[test]
+    fn quota_cycle_contributions_select_weekly_attributed_cycles_only() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_011_200, 0).expect("observed");
+        let reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let (source_id, _) = assigned_source(&store, observed_at - Duration::days(8));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "weekly",
+                    "weekly",
+                    observed_at,
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    20.0,
+                ),
+                sample_record(
+                    source_id.clone(),
+                    "five-hour",
+                    "five-hour",
+                    observed_at,
+                    (reset - Duration::hours(4)).timestamp(),
+                    "primary",
+                    300,
+                    40.0,
+                ),
+                sample_record(
+                    source_id,
+                    "monthly",
+                    "monthly",
+                    observed_at,
+                    (reset + Duration::days(20)).timestamp(),
+                    "monthly",
+                    43_200,
+                    8.0,
+                ),
+            ])
+            .expect("observations");
+
+        let contributions = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-a")
+            .expect("contributions");
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(contributions[0].window_minutes, 10_080);
+        assert_eq!(
+            contributions[0].schema_version,
+            "quota_cycle_contribution.v1"
+        );
+        let json = serde_json::to_value(&contributions[0]).expect("json");
+        assert!(json.get("source_id").is_none());
+        assert!(json.get("device_id").is_none());
+        assert!(json.get("change_points").is_none());
+        assert!(json.get("sample_count").is_none());
+        assert!(json.get("latest_status").is_none());
+    }
+
+    #[test]
+    fn quota_cycle_contributions_exclude_unattributed_cycles() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_011_200, 0).expect("observed");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "codex-local-jsonl",
+            "unattributed",
+            Path::new("/tmp/quota-unattributed-cycle"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        store
+            .upsert_quota_observations(&[sample_record(
+                source.source_id,
+                "unattributed-weekly",
+                "unattributed-weekly",
+                observed_at,
+                1_787_616_000,
+                "secondary",
+                10_080,
+                15.0,
+            )])
+            .expect("observation");
+
+        let contributions = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-a")
+            .expect("contributions");
+        assert!(contributions.is_empty());
+    }
+
+    #[test]
+    fn quota_cycle_contributions_build_daily_envelopes_without_carry_forward() {
+        let store = Store::in_memory().expect("store");
+        let day_one = DateTime::from_timestamp(1_787_011_200, 0).expect("day one");
+        let day_three = day_one + Duration::days(2) + Duration::hours(3);
+        let reset = day_one + Duration::days(7);
+        let (source_id, _) = assigned_source(&store, day_one - Duration::days(1));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "day-one-first",
+                    "day-one-first",
+                    day_one + Duration::hours(1),
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    10.0,
+                ),
+                sample_record(
+                    source_id.clone(),
+                    "day-one-last",
+                    "day-one-last",
+                    day_one + Duration::hours(8),
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    25.0,
+                ),
+                sample_record(
+                    source_id,
+                    "day-three",
+                    "day-three",
+                    day_three,
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    40.0,
+                ),
+            ])
+            .expect("observations");
+
+        let contributions = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-a")
+            .expect("contributions");
+        assert_eq!(contributions.len(), 1);
+        let days = contributions[0]
+            .daily_envelopes
+            .iter()
+            .map(|envelope| envelope.day.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(days, ["2026-08-18", "2026-08-20"]);
+        assert_eq!(contributions[0].daily_envelopes[0].first_used_percent, 10.0);
+        assert_eq!(contributions[0].daily_envelopes[0].last_used_percent, 25.0);
+        assert_eq!(
+            contributions[0].daily_envelopes[0].minimum_used_percent,
+            10.0
+        );
+        assert_eq!(
+            contributions[0].daily_envelopes[0].maximum_used_percent,
+            25.0
+        );
+        assert_eq!(contributions[0].daily_envelopes[1].first_used_percent, 40.0);
+        assert_eq!(contributions[0].daily_envelopes[1].last_used_percent, 40.0);
+    }
+
+    #[test]
+    fn quota_cycle_contributions_emit_exact_boundary_slices() {
+        let store = Store::in_memory().expect("store");
+        // Use a mid-day reset so start and end fall on partial UTC days.
+        let reset = DateTime::from_timestamp(1_787_670_000, 0).expect("reset");
+        let inferred_start = reset - Duration::minutes(10_080);
+        let observed_at = inferred_start + Duration::hours(2);
+        let (source_id, account_id) = assigned_source(&store, inferred_start - Duration::days(1));
+        store
+            .upsert_quota_observations(&[sample_record(
+                source_id.clone(),
+                "weekly-boundary",
+                "weekly-boundary",
+                observed_at,
+                reset.timestamp(),
+                "secondary",
+                10_080,
+                33.0,
+            )])
+            .expect("observation");
+        store
+            .insert_event(&sample_usage_event(
+                &source_id,
+                &account_id,
+                inferred_start + Duration::minutes(30),
+                "start-boundary",
+                100,
+                20,
+                10,
+                5,
+                1_500,
+            ))
+            .expect("start event");
+        store
+            .insert_event(&sample_usage_event(
+                &source_id,
+                &account_id,
+                utc_day_start(reset) + Duration::hours(1),
+                "end-boundary",
+                40,
+                0,
+                8,
+                2,
+                700,
+            ))
+            .expect("end event");
+        store
+            .insert_event(&sample_usage_event(
+                &source_id,
+                &account_id,
+                inferred_start + Duration::days(1) + Duration::hours(2),
+                "interior-day",
+                9_999,
+                0,
+                0,
+                0,
+                99_000,
+            ))
+            .expect("interior event");
+
+        let contributions = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-a")
+            .expect("contributions");
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(contributions[0].boundary_slices.len(), 2);
+        assert_eq!(
+            contributions[0].boundary_slices[0].period_start,
+            inferred_start
+        );
+        assert_eq!(
+            contributions[0].boundary_slices[0].period_end,
+            next_utc_day_start(inferred_start)
+        );
+        assert_eq!(contributions[0].boundary_slices[0].input_tokens, 100);
+        assert_eq!(contributions[0].boundary_slices[0].cache_read_tokens, 20);
+        assert_eq!(contributions[0].boundary_slices[0].output_tokens, 10);
+        assert_eq!(contributions[0].boundary_slices[0].reasoning_tokens, 5);
+        assert_eq!(contributions[0].boundary_slices[0].total_tokens, 135);
+        assert_eq!(
+            contributions[0].boundary_slices[0].estimated_cost_micro_usd,
+            1_500
+        );
+        assert_eq!(
+            contributions[0].boundary_slices[1].period_start,
+            utc_day_start(reset)
+        );
+        assert_eq!(contributions[0].boundary_slices[1].period_end, reset);
+        assert_eq!(contributions[0].boundary_slices[1].input_tokens, 40);
+        assert_eq!(
+            contributions[0].boundary_slices[1].estimated_cost_micro_usd,
+            700
+        );
+        assert!(
+            contributions[0]
+                .boundary_slices
+                .iter()
+                .all(|slice| slice.input_tokens != 9_999),
+            "complete utc days stay out of boundary slices"
+        );
+    }
+
+    #[test]
+    fn quota_cycle_contribution_ids_are_stable_for_the_same_device_anchor() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_011_200, 0).expect("observed");
+        let reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let (source_id, _) = assigned_source(&store, observed_at - Duration::days(8));
+        store
+            .upsert_quota_observations(&[sample_record(
+                source_id,
+                "stable-id",
+                "stable-id",
+                observed_at,
+                reset.timestamp(),
+                "secondary",
+                10_080,
+                18.0,
+            )])
+            .expect("observation");
+
+        let first = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-a")
+            .expect("first");
+        let second = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-a")
+            .expect("second");
+        let peer = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-b")
+            .expect("peer");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].contribution_id, second[0].contribution_id);
+        assert_ne!(first[0].contribution_id, peer[0].contribution_id);
+        assert!(first[0].contribution_id.starts_with("quota_cycle_"));
+        assert_eq!(first[0].contribution_id.len(), "quota_cycle_".len() + 32);
     }
 }

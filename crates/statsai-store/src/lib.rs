@@ -2510,6 +2510,11 @@ impl Store {
                 target,
                 &batch.code_change_metrics,
             )?;
+            self.record_quota_cycle_contributions_synced_in_transaction(
+                sink,
+                target,
+                &batch.quota_cycle_contributions,
+            )?;
             self.record_task_bucket_snapshots_synced_in_transaction(
                 sink,
                 target,
@@ -2936,6 +2941,14 @@ impl Store {
                     .map(String::as_str)
                     .collect::<BTreeSet<_>>(),
             ),
+            (
+                "quota_cycle_contribution",
+                snapshot
+                    .quota_cycle_contribution_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+            ),
         ]);
         let mut statement = self.conn.prepare(
             r#"
@@ -2944,7 +2957,7 @@ impl Store {
             WHERE sink = ?1 AND target = ?2
               AND entity_kind IN (
                 'source', 'account', 'source_account_assignment', 'subscription', 'summary',
-                'code_change_metric'
+                'code_change_metric', 'quota_cycle_contribution'
               )
             "#,
         )?;
@@ -3019,10 +3032,16 @@ impl Store {
             target,
             &current_code_change_metrics,
         )?;
+        let current_quota_cycle_contributions =
+            self.quota_cycle_contributions(&QuotaQuery::default(), device_id)?;
         let current_snapshot = self.current_http_sync_authoritative_snapshot(
             &current_rollups,
             &current_passthrough_summaries,
             &current_code_change_metrics,
+            &current_quota_cycle_contributions
+                .iter()
+                .map(|contribution| contribution.contribution_id.clone())
+                .collect::<Vec<_>>(),
         )?;
         let retired_entities = self
             .retired_sync_entity_ids("http", target, &current_snapshot)?
@@ -3048,6 +3067,7 @@ impl Store {
         rollups: &[UsageSummary],
         passthrough_summaries: &[UsageSummary],
         code_change_metrics: &[CodeChangeMetric],
+        quota_cycle_contribution_ids: &[String],
     ) -> Result<SyncAuthoritativeSnapshot> {
         Ok(SyncAuthoritativeSnapshot {
             snapshot_id: String::new(),
@@ -3082,6 +3102,7 @@ impl Store {
                 .iter()
                 .map(|metric| metric.metric_id.clone())
                 .collect(),
+            quota_cycle_contribution_ids: quota_cycle_contribution_ids.to_vec(),
         })
     }
 
@@ -3491,6 +3512,39 @@ impl Store {
                 target,
                 "code_change_metric",
                 &metric.metric_id,
+                &hash_text(&payload),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn record_quota_cycle_contributions_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        contributions: &[statsai_core::QuotaCycleContributionV1],
+    ) -> Result<()> {
+        if contributions.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_quota_cycle_contributions_synced_in_transaction(sink, target, contributions)
+        })
+    }
+
+    fn record_quota_cycle_contributions_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        contributions: &[statsai_core::QuotaCycleContributionV1],
+    ) -> Result<()> {
+        for contribution in contributions {
+            let payload = serde_json::to_string(contribution)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                "quota_cycle_contribution",
+                &contribution.contribution_id,
                 &hash_text(&payload),
             )?;
         }
@@ -8619,6 +8673,7 @@ mod tests {
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         };

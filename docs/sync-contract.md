@@ -7,6 +7,9 @@ marker for deletion reconciliation.
 `sync_batch.v3` adds privacy-safe numeric code-change metrics and makes their
 acknowledgement counts and authoritative snapshot IDs part of the versioned
 contract. Versions 1 and 2 never treat those new fields as authoritative.
+`sync_batch.v4` adds provider-neutral quota-cycle contributions and makes their
+acknowledgement counts and authoritative snapshot IDs part of the versioned
+contract. Versions 1–3 never treat those new fields as authoritative.
 The collector owns local scanning, normalization, idempotent local storage, and
 privacy scrubbing. The backend owns authentication, validation, deduplication,
 rollups, and user-facing queries. The production path sends sanitized batches to
@@ -244,7 +247,7 @@ contract. A compatible backend should:
 
 - require an authenticated device access token
 - accept `Authorization: Bearer <device_access_token>` from stored auth, `--auth-token`, or `STATSAI_SYNC_TOKEN`
-- validate the request body against `sync_batch.v1`, `sync_batch.v2`, and `sync_batch.v3`
+- validate the request body against `sync_batch.v1`, `sync_batch.v2`, `sync_batch.v3`, and `sync_batch.v4`
 - reject unsupported `schema_version` values
 - deduplicate sources, accounts, source-account assignments, subscriptions, and summaries by their IDs when server-side deduplication is needed
 - treat collector IDs as stable client-provided IDs, not database primary keys exposed to users
@@ -252,7 +255,8 @@ contract. A compatible backend should:
 - atomically replace accepted task bucket snapshots per `(user, device, project_bucket)`
 - treat the ordered `authoritative_snapshot` fragments sharing one `snapshot_id`
   as the complete set of metadata and summary IDs owned by the authenticated
-  device; v3 fragments also carry code-change metric IDs; each fragment carries
+  device; v3 fragments also carry code-change metric IDs; v4 fragments also
+  carry quota-cycle contribution IDs; each fragment carries
   zero-based `part_index` and a common
   `part_count`, with at most 200 IDs across its ID arrays
 - stage snapshot ownership without pruning until the final in-order fragment;
@@ -311,9 +315,12 @@ run immediately.
 `task_verifications` counters under both `accepted` and `duplicates`.
 `sync_batch.v3` returns `sync_ack.v3`, which additionally adds the
 `code_change_metrics` counter.
+`sync_batch.v4` returns `sync_ack.v4`, which additionally adds the
+`quota_cycle_contributions` counter.
 Collectors require the acknowledgement version to match the submitted batch
 version exactly; a v1 acknowledgement cannot successfully acknowledge a v2
-batch, and a v2 acknowledgement cannot acknowledge a v3 batch.
+batch, a v2 acknowledgement cannot acknowledge a v3 batch, and a v3
+acknowledgement cannot acknowledge a v4 batch.
 
 The current loopback daemon returns this shape and reports duplicate events
 when the existing store already has the semantic event. Source, account,
@@ -331,7 +338,8 @@ metadata.
 
 Full HTTP rollup syncs send their authoritative snapshot as the final logical
 chunk. The marker lists all current source, provider-account,
-source-account-assignment, subscription, summary, and code-change metric IDs,
+source-account-assignment, subscription, summary, code-change metric, and
+quota-cycle contribution IDs,
 including empty lists.
 The backend tracks ownership per authenticated device and keeps device-local IDs
 separate from server-canonical IDs so account alias reconciliation cannot delete
@@ -345,7 +353,8 @@ snapshot are retained through their active ownership mapping; omitted unowned
 rows are pruned. Legacy rows from other devices, and canonical rows still owned
 by any device, are preserved.
 
-The HTTP sink parses `sync_ack.v1`, `sync_ack.v2`, and `sync_ack.v3` before
+The HTTP sink parses `sync_ack.v1`, `sync_ack.v2`, `sync_ack.v3`, and
+`sync_ack.v4` before
 updating local state. File and stdout sinks update state after their local write
 succeeds.
 
@@ -380,8 +389,9 @@ Auth token precedence for sync is:
 
 The Worker rejects raw event cloud sync by default and accepts sanitized daily
 summary rollups plus metadata, along with hosted task snapshots and hosted task
-verification actions for `sync_batch.v2` and `sync_batch.v3`, plus code-change
-metrics for `sync_batch.v3`. The collector now prepares those
+verification actions for `sync_batch.v2` and later, plus code-change
+metrics for `sync_batch.v3` and later, plus quota-cycle contributions for
+`sync_batch.v4`. The collector now prepares those
 daily rollups before HTTP sync, so a normal Cloudflare sync can populate the
 dashboard without shipping raw events. Repeated batches are idempotent by
 stable IDs.
