@@ -541,8 +541,8 @@ mod tests {
         ))
         .expect("v1 ack");
 
-        let error = validate_sync_ack(&batch, &ack).expect_err("v3 batch with v1 ack");
-        assert!(error.to_string().contains("requires sync_ack.v3"));
+        let error = validate_sync_ack(&batch, &ack).expect_err("v4 batch with v1 ack");
+        assert!(error.to_string().contains("requires sync_ack.v4"));
 
         batch.schema_version = SYNC_BATCH_V1_SCHEMA_VERSION.to_string();
         ack.schema_version = SYNC_ACK_V2_SCHEMA_VERSION.to_string();
@@ -555,6 +555,10 @@ mod tests {
         batch.schema_version = SYNC_BATCH_V3_SCHEMA_VERSION.to_string();
         ack.schema_version = SYNC_ACK_V3_SCHEMA_VERSION.to_string();
         validate_sync_ack(&batch, &ack).expect("matching v3 schemas");
+
+        batch.schema_version = SYNC_BATCH_V4_SCHEMA_VERSION.to_string();
+        ack.schema_version = SYNC_ACK_V4_SCHEMA_VERSION.to_string();
+        validate_sync_ack(&batch, &ack).expect("matching v4 schemas");
     }
 
     #[test]
