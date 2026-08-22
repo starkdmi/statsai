@@ -4,6 +4,7 @@ mod archive;
 mod code_changes;
 mod migrations;
 mod privacy;
+mod quota;
 mod snapshot;
 mod tasks;
 
@@ -48,6 +49,7 @@ pub use privacy::{
     FilteredConversationMetadata, FilteredConversationRecord, PrivacyDatasetStatus,
     PrivacyFailureRecord, PrivacyFindingRecord,
 };
+pub use quota::{QuotaDateRange, QuotaQuery, QuotaStatus};
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
@@ -4813,6 +4815,7 @@ fn reattribute_source_records(store: &Store, source_id: &SourceId) -> Result<()>
     }
     store.rewrite_events(&events)?;
     store.rewrite_summaries(&summaries)?;
+    store.reattribute_quota_observations(source_id)?;
     Ok(())
 }
 

@@ -1,5 +1,5 @@
 use anyhow::{bail, ensure, Context, Result};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,7 +18,8 @@ use statsai_core::{
     sanitize_code_change_metric_for_sync, sanitize_task_bucket_for_sync,
     source_account_assignment_id, source_id as statsai_source_id, subscription_id,
     timestamp_in_period, ArchiveContentKind, ArchiveConversation, BillingPeriod, EventId,
-    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
+    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId,
+    QuotaObservationRecordV1, QuotaWindowSyncProjectionV1, QuotaWindowV1, ReportPeriod,
     SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
     SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
     SyncAuthoritativeSnapshot, SyncBatch, TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict,
@@ -41,7 +42,7 @@ use statsai_store::{apply_verified_source_state, verified_source_state_hash};
 use statsai_store::{
     close_active_verified_source_linkages, derive_task_work_items, find_existing_provider_account,
     reconcile_verified_source_state, upsert_provider_account, verified_source_observation_hash,
-    ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
+    QuotaQuery, ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
     UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION,
 };
 use statsai_sync::{
@@ -108,6 +109,8 @@ enum Command {
     Task(TaskCommand),
     #[command(about = "Collect and explore durable local conversation archives")]
     Conversation(ConversationCommand),
+    #[command(about = "Inspect reconstructed provider quota history")]
+    Quota(QuotaCommand),
     #[command(about = "Build and inspect the local privacy-filtered dataset")]
     Privacy(statsai::privacy_cli::PrivacyCommand),
     #[command(about = "Export a sync batch to a sink")]
@@ -212,6 +215,67 @@ struct TaskCommand {
 struct ConversationCommand {
     #[command(subcommand)]
     command: ConversationSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct QuotaCommand {
+    #[command(subcommand)]
+    command: QuotaSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum QuotaSubcommand {
+    #[command(about = "Show quota collection and account-attribution coverage")]
+    Status {
+        #[arg(long, help = "Account id, email, provider id, or label")]
+        account: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Show the newest activated quota window")]
+    Current {
+        #[arg(long, help = "Account id, email, provider id, or label")]
+        account: Option<String>,
+        #[arg(long, help = "Include shorter quota scopes")]
+        all_scopes: bool,
+        #[arg(long, help = "Include older epochs that overlap the selected window")]
+        include_overlaps: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "List reconstructed quota windows")]
+    Windows {
+        #[arg(long, help = "Provider filter")]
+        provider: Option<String>,
+        #[arg(long, help = "Account id, email, provider id, or label")]
+        account: Option<String>,
+        #[arg(long, help = "Observation range start (date or RFC 3339)")]
+        from: Option<String>,
+        #[arg(long, help = "Observation range end (date or RFC 3339)")]
+        to: Option<String>,
+        #[arg(long, help = "Provider limit identity")]
+        limit_id: Option<String>,
+        #[arg(long, default_value_t = 50, help = "Maximum windows to return")]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Show quota change points for one reconstructed window")]
+    History {
+        #[arg(long, help = "Reconstructed quota window id; newest when omitted")]
+        window_id: Option<String>,
+        #[arg(long, help = "Include source observations and raw provider payloads")]
+        raw: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Export quota observations, windows, or weekly sync projections")]
+    Export {
+        #[arg(long, value_parser = ["observations", "windows", "sync-windows"])]
+        level: String,
+        #[arg(long, value_parser = ["csv", "json", "jsonl"])]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -860,6 +924,8 @@ enum StoreAdminSubcommand {
 enum SchemaSubcommand {
     #[command(about = "Print the sync_batch.v3 JSON Schema")]
     SyncBatch,
+    #[command(about = "Print the quota_window_sync_projection.v1 JSON Schema")]
+    QuotaWindowProjection,
 }
 
 #[derive(Debug, Args)]
@@ -904,6 +970,7 @@ fn main() -> Result<()> {
                 Command::Export(command) => export(command, &store),
                 Command::Task(command) => task(command, &store),
                 Command::Conversation(command) => conversation(command, &store, &device_id),
+                Command::Quota(command) => quota(command, &store, &device_id),
                 Command::Privacy(command) => {
                     statsai::privacy_cli::run(command, &store, &store_path)
                 }
@@ -989,6 +1056,7 @@ fn scan_with_adapters(
     let mut event_count = 0u64;
     let mut summary_count = 0u64;
     let mut task_span_count = 0u64;
+    let mut quota_observation_count = 0u64;
     let mut inserted_count = 0u64;
     let mut summary_written_count = 0u64;
     let mut task_span_written_count = 0u64;
@@ -1137,11 +1205,13 @@ fn scan_with_adapters(
             let source_event_count = scan.events.len() as u64;
             let source_summary_count = scan.summaries.len() as u64;
             let source_task_span_count = scan.task_spans.len() as u64;
+            let source_quota_observation_count = scan.quota_observations.len() as u64;
             let has_scan_activity = touched_files
                 || (has_cache_entry_upgrades && !command.preview)
                 || source_event_count > 0
                 || source_summary_count > 0
                 || source_task_span_count > 0
+                || source_quota_observation_count > 0
                 || scan.diagnostics.files_scanned > 0
                 || scan.diagnostics.files_skipped_unchanged > 0
                 || log_rows > 0
@@ -1151,6 +1221,7 @@ fn scan_with_adapters(
                 && source_event_count == 0
                 && source_summary_count == 0
                 && source_task_span_count == 0
+                && source_quota_observation_count == 0
                 && !touched_files
                 && !has_cache_entry_upgrades
                 && !verified_state_changed;
@@ -1164,6 +1235,7 @@ fn scan_with_adapters(
             event_count += source_event_count;
             summary_count += source_summary_count;
             task_span_count += source_task_span_count;
+            quota_observation_count += source_quota_observation_count;
             total_usage.add_totals(&source_usage);
             total_summary_usage.add_totals(&source_summary_usage);
             add_diagnostics(&mut total_diagnostics, &scan.diagnostics);
@@ -1194,6 +1266,7 @@ fn scan_with_adapters(
                     usage: &source_usage,
                     summaries: source_summary_count,
                     task_spans: source_task_span_count,
+                    quota_observations: source_quota_observation_count,
                     summary_usage: &source_summary_usage,
                     diagnostics: &scan.diagnostics,
                     verbose: command.verbose || command.explain,
@@ -1229,6 +1302,9 @@ fn scan_with_adapters(
                         store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
                     removed_summary_count += store
                         .delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
+                    store.delete_quota_observations_for_sources(std::slice::from_ref(
+                        &source.source_id,
+                    ))?;
                     if command.include_tasks {
                         let deleted = store.delete_task_spans_for_sources(std::slice::from_ref(
                             &source.source_id,
@@ -1253,6 +1329,10 @@ fn scan_with_adapters(
                         &source.source_id,
                         &reconciled_file_hashes,
                     )?;
+                    store.delete_quota_observations_for_source_file_hashes(
+                        &source.source_id,
+                        &reconciled_file_hashes,
+                    )?;
                     if command.include_tasks {
                         let deleted = store.delete_task_spans_for_source_file_hashes(
                             &source.source_id,
@@ -1269,6 +1349,12 @@ fn scan_with_adapters(
                 let insert_result = store.insert_events_with_resolution(&scan.events)?;
                 inserted_count += insert_result.inserted;
                 insert_events_duration_ms += insert_started_at.elapsed().as_millis() as u64;
+                rewrite_quota_usage_event_ids(
+                    &mut scan.quota_observations,
+                    &insert_result.canonical_event_ids,
+                );
+                store.upsert_quota_observations(&scan.quota_observations)?;
+                store.clear_orphaned_quota_usage_links()?;
                 if command.include_tasks {
                     rewrite_task_span_linked_event_ids(
                         &mut scan.task_spans,
@@ -1342,10 +1428,11 @@ fn scan_with_adapters(
     if command.preview {
         if command.verbose {
             println!(
-                "preview total: sources={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={} written=0",
+                "preview total: sources={} usage_events={} summaries={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={} written=0",
                 format_u64(total_sources),
                 format_u64(event_count),
                 format_u64(summary_count),
+                format_u64(quota_observation_count),
                 format_u64(total_usage.input_tokens),
                 format_u64(total_usage.cache_creation_tokens),
                 format_u64(total_usage.cached_input_tokens),
@@ -1370,10 +1457,11 @@ fn scan_with_adapters(
             print_scan_diagnostics_total(&total_diagnostics);
         } else {
             println!(
-                "preview total: sources={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} written=0",
+                "preview total: sources={} usage_events={} summaries={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} written=0",
                 format_u64(total_sources),
                 format_u64(event_count),
                 format_u64(summary_count),
+                format_u64(quota_observation_count),
                 format_u64(total_usage.input_tokens),
                 format_u64(total_usage.cache_creation_tokens),
                 format_u64(total_usage.cached_input_tokens),
@@ -1391,7 +1479,7 @@ fn scan_with_adapters(
         }
     } else {
         println!(
-            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} task_spans={} task_spans_written={} work_items_rebuilt={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={}",
+            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} task_spans={} task_spans_written={} quota_observations={} work_items_rebuilt={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={}",
             format_u64(total_sources),
             format_u64(event_count),
             format_u64(inserted_count),
@@ -1399,6 +1487,7 @@ fn scan_with_adapters(
             format_u64(summary_written_count),
             format_u64(task_span_count),
             format_u64(task_span_written_count),
+            format_u64(quota_observation_count),
             format_u64(rebuilt_work_item_count),
             format_u64(total_usage.input_tokens),
             format_u64(total_usage.cache_creation_tokens),
@@ -1647,6 +1736,14 @@ fn source(command: SourceCommand, store: &Store, device_id: &str) -> Result<()> 
             } else {
                 Default::default()
             };
+            let deleted_quota_observations = if delete_data {
+                store.delete_quota_observations_for_sources(std::slice::from_ref(&source_id))?
+            } else {
+                0
+            };
+            if delete_data {
+                store.clear_orphaned_quota_usage_links()?;
+            }
             let deleted_trace_edits = if delete_data {
                 store.delete_archive_import_for_sources(std::slice::from_ref(&source_id))?
             } else {
@@ -1683,6 +1780,7 @@ fn source(command: SourceCommand, store: &Store, device_id: &str) -> Result<()> 
                     "deleted_summaries": deleted_summaries,
                     "deleted_scan_cache_entries": deleted_scan_entries,
                     "deleted_task_spans": deleted_task_spans.deleted,
+                    "deleted_quota_observations": deleted_quota_observations,
                     "deleted_code_change_traces": deleted_trace_edits,
                     "work_items_rebuilt": rebuilt_work_items,
                     "code_change_metrics_rebuilt": rebuilt_code_change_metrics,
@@ -2490,11 +2588,16 @@ struct AccountReferenceCounts {
     subscriptions: usize,
     events: usize,
     summaries: usize,
+    quota_observations: usize,
 }
 
 impl AccountReferenceCounts {
     fn total(&self) -> usize {
-        self.source_account_assignments + self.subscriptions + self.events + self.summaries
+        self.source_account_assignments
+            + self.subscriptions
+            + self.events
+            + self.summaries
+            + self.quota_observations
     }
 }
 
@@ -2629,12 +2732,13 @@ fn remove_orphan_provider_account(
         account_reference_counts(store, &account.provider_account_id, Some(provider))?;
     if remaining_references.total() > 0 {
         bail!(
-            "account {} still has references: {} source assignments, {} subscriptions, {} events, {} summaries",
+            "account {} still has references: {} source assignments, {} subscriptions, {} events, {} summaries, {} quota observations",
             display_account_identity(&account),
             remaining_references.source_account_assignments,
             remaining_references.subscriptions,
             remaining_references.events,
-            remaining_references.summaries
+            remaining_references.summaries,
+            remaining_references.quota_observations
         );
     }
     let deleted = if dry_run {
@@ -2831,12 +2935,21 @@ fn account_reference_counts(
         .filter(|summary| summary.provider_account_id.as_ref() == Some(provider_account_id))
         .filter(|summary| provider_matches(&summary.provider))
         .count();
+    let quota_observations = store
+        .quota_observations(&QuotaQuery::default(), false)?
+        .into_iter()
+        .filter(|record| {
+            record.observation.provider_account_id.as_ref() == Some(provider_account_id)
+        })
+        .filter(|record| provider_matches(&record.observation.provider))
+        .count();
 
     Ok(AccountReferenceCounts {
         source_account_assignments,
         subscriptions,
         events,
         summaries,
+        quota_observations,
     })
 }
 
@@ -5952,6 +6065,663 @@ fn schema(command: SchemaCommand) -> Result<()> {
             let schema = schemars::schema_for!(SyncBatch);
             println!("{}", serde_json::to_string_pretty(&schema)?);
         }
+        SchemaSubcommand::QuotaWindowProjection => {
+            let schema = schemars::schema_for!(QuotaWindowSyncProjectionV1);
+            println!("{}", serde_json::to_string_pretty(&schema)?);
+        }
+    }
+    Ok(())
+}
+
+fn quota(command: QuotaCommand, store: &Store, device_id: &str) -> Result<()> {
+    match command.command {
+        QuotaSubcommand::Status { account, json } => {
+            let query = quota_query(store, None, account.as_deref(), None, None, None)?;
+            let status = store.quota_status(&query)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "quota observations: {}",
+                    format_u64(status.total_observations)
+                );
+                println!(
+                    "distinct: {} ({} copied duplicates collapsed)",
+                    format_u64(status.distinct_observations),
+                    format_u64(status.duplicate_observations)
+                );
+                println!(
+                    "attributed: {}  range: {}",
+                    format_u64(status.attributed_observations),
+                    format_quota_range(status.attributed_range.as_ref())
+                );
+                println!(
+                    "unattributed: {}  range: {}",
+                    format_u64(status.unattributed_observations),
+                    format_quota_range(status.unattributed_range.as_ref())
+                );
+                println!(
+                    "weekly sync coverage: {}/{} ({:.1}%)",
+                    format_u64(status.weekly_sync_eligible_observations),
+                    format_u64(status.weekly_observations),
+                    status.weekly_sync_eligible_coverage_percent
+                );
+                if status.unattributed_observations > 0 {
+                    eprintln!(
+                        "warning: historical quota observations remain unassigned; backdate a source connection with `statsai source connect --started-at ...`"
+                    );
+                }
+                for warning in status.assignment_overlap_warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+        }
+        QuotaSubcommand::Current {
+            account,
+            all_scopes,
+            include_overlaps,
+            json,
+        } => {
+            let query = quota_query(store, None, account.as_deref(), None, None, None)?;
+            let mut windows = select_current_quota_windows(
+                store.quota_windows_without_usage_totals(&query)?,
+                all_scopes,
+                include_overlaps,
+            );
+            store.enrich_quota_window_usage_totals(&mut windows)?;
+            print_quota_windows(&windows, json)?;
+        }
+        QuotaSubcommand::Windows {
+            provider,
+            account,
+            from,
+            to,
+            limit_id,
+            limit,
+            json,
+        } => {
+            let query = quota_query(
+                store,
+                provider.as_deref(),
+                account.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                limit_id,
+            )?;
+            let mut windows = store.quota_windows_without_usage_totals(&query)?;
+            windows.truncate(limit.min(10_000));
+            store.enrich_quota_window_usage_totals(&mut windows)?;
+            print_quota_windows(&windows, json)?;
+        }
+        QuotaSubcommand::History {
+            window_id,
+            raw,
+            json,
+        } => {
+            let query = QuotaQuery::default();
+            let windows = store.quota_windows_without_usage_totals(&query)?;
+            let window = window_id
+                .as_deref()
+                .map(|id| windows.iter().find(|window| window.window_id == id))
+                .unwrap_or_else(|| windows.first())
+                .with_context(|| {
+                    window_id.map_or_else(
+                        || "no quota windows found".to_string(),
+                        |id| format!("quota window not found: {id}"),
+                    )
+                })?;
+            if raw {
+                let observations =
+                    raw_observations_for_window(store.quota_observations(&query, false)?, window);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "schema_version": "quota_history.v1",
+                            "window_id": window.window_id,
+                            "raw": true,
+                            "observations": observations,
+                        }))?
+                    );
+                } else {
+                    for record in observations {
+                        println!("{}", serde_json::to_string_pretty(&record)?);
+                    }
+                }
+            } else if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": "quota_history.v1",
+                        "window_id": window.window_id,
+                        "raw": false,
+                        "change_points": window.change_points,
+                    }))?
+                );
+            } else {
+                println!("{}", quota_window_heading(window));
+                for point in &window.change_points {
+                    println!(
+                        "  {}  {:>6.2}%  reset {}  slot={}",
+                        format_local_timestamp(point.observed_at),
+                        point.used_percent,
+                        format_local_timestamp(point.resets_at),
+                        point.provider_slot,
+                    );
+                }
+            }
+        }
+        QuotaSubcommand::Export { level, format } => {
+            let query = QuotaQuery::default();
+            match level.as_str() {
+                "observations" => {
+                    export_quota_observations(&store.quota_observations(&query, false)?, &format)?
+                }
+                "windows" => export_quota_windows(&store.quota_windows(&query)?, &format)?,
+                "sync-windows" => {
+                    let status = store.quota_status(&query)?;
+                    if status.weekly_sync_eligible_observations < status.weekly_observations {
+                        eprintln!(
+                            "warning: only {}/{} weekly observations are attributed and eligible for sync projection export",
+                            status.weekly_sync_eligible_observations,
+                            status.weekly_observations
+                        );
+                    }
+                    export_quota_projections(
+                        &store.quota_sync_projections(&query, device_id)?,
+                        &format,
+                    )?;
+                }
+                _ => unreachable!("clap validates quota export level"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn quota_query(
+    store: &Store,
+    provider: Option<&str>,
+    account: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    limit_id: Option<String>,
+) -> Result<QuotaQuery> {
+    let provider = provider.map(canonical_provider).transpose()?;
+    let provider_account_id = account
+        .map(|selector| resolve_quota_account_selector(store, provider.as_deref(), selector))
+        .transpose()?
+        .map(|account| account.provider_account_id);
+    Ok(QuotaQuery {
+        provider,
+        provider_account_id,
+        source_id: None,
+        from: from.map(parse_date).transpose()?,
+        to: to.map(parse_quota_range_end).transpose()?,
+        limit_id,
+    })
+}
+
+fn parse_quota_range_end(value: &str) -> Result<DateTime<Utc>> {
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+        return Ok(timestamp.with_timezone(&Utc));
+    }
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")?;
+    let next_day = date
+        .succ_opt()
+        .context("quota range end is outside the supported calendar")?;
+    Ok(next_day
+        .and_hms_opt(0, 0, 0)
+        .context("failed to build quota range end")?
+        .and_utc()
+        - Duration::nanoseconds(1))
+}
+
+fn resolve_quota_account_selector(
+    store: &Store,
+    provider: Option<&str>,
+    selector: &str,
+) -> Result<ProviderAccount> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("account selector cannot be empty");
+    }
+    let normalized_email = normalize_email(selector);
+    let normalized_provider_user_id = normalize_provider_user_id(selector);
+    let normalized_label = selector.to_ascii_lowercase();
+    let mut matches = store
+        .list_accounts()?
+        .into_iter()
+        .filter(|account| provider.is_none_or(|provider| account.provider == provider))
+        .filter(|account| {
+            account.provider_account_id.0 == selector
+                || account.email.as_deref().map(normalize_email).as_deref()
+                    == Some(normalized_email.as_str())
+                || account
+                    .provider_user_id
+                    .as_deref()
+                    .map(normalize_provider_user_id)
+                    .as_deref()
+                    == Some(normalized_provider_user_id.as_str())
+                || account
+                    .account_label
+                    .as_deref()
+                    .map(|label| label.trim().to_ascii_lowercase())
+                    .as_deref()
+                    == Some(normalized_label.as_str())
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|account| account.provider_account_id.0.clone());
+    matches.dedup_by(|left, right| left.provider_account_id == right.provider_account_id);
+    match matches.len() {
+        0 => bail!("no account matched '{selector}'"),
+        1 => Ok(matches.remove(0)),
+        _ => bail!(
+            "multiple provider accounts matched '{selector}'; use a stable provider account id"
+        ),
+    }
+}
+
+fn select_current_quota_windows(
+    windows: Vec<QuotaWindowV1>,
+    all_scopes: bool,
+    include_overlaps: bool,
+) -> Vec<QuotaWindowV1> {
+    let mut by_scope = BTreeMap::<
+        (String, Option<String>, Option<String>, Option<String>, u64),
+        Vec<QuotaWindowV1>,
+    >::new();
+    for window in windows {
+        by_scope
+            .entry((
+                window.provider.clone(),
+                window.provider_account_id.as_ref().map(|id| id.0.clone()),
+                window.source_id.as_ref().map(|id| id.0.clone()),
+                window.limit_id.clone(),
+                window.window_minutes,
+            ))
+            .or_default()
+            .push(window);
+    }
+    let mut selected = Vec::new();
+    for mut scope_windows in by_scope.into_values() {
+        scope_windows.sort_by_key(|window| window.first_observed_at);
+        let newest = scope_windows.pop().expect("scope contains a window");
+        if include_overlaps {
+            selected.extend(scope_windows.into_iter().filter(|older| {
+                older.inferred_start < newest.representative_reset
+                    && older.representative_reset > newest.inferred_start
+            }));
+        }
+        selected.push(newest);
+    }
+    if !all_scopes {
+        let mut longest =
+            BTreeMap::<(String, Option<String>, Option<String>, Option<String>), u64>::new();
+        for window in &selected {
+            let key = (
+                window.provider.clone(),
+                window.provider_account_id.as_ref().map(|id| id.0.clone()),
+                window.source_id.as_ref().map(|id| id.0.clone()),
+                window.limit_id.clone(),
+            );
+            longest
+                .entry(key)
+                .and_modify(|duration| *duration = (*duration).max(window.window_minutes))
+                .or_insert(window.window_minutes);
+        }
+        selected.retain(|window| {
+            longest.get(&(
+                window.provider.clone(),
+                window.provider_account_id.as_ref().map(|id| id.0.clone()),
+                window.source_id.as_ref().map(|id| id.0.clone()),
+                window.limit_id.clone(),
+            )) == Some(&window.window_minutes)
+        });
+    }
+    selected.sort_by(|left, right| {
+        right
+            .window_minutes
+            .cmp(&left.window_minutes)
+            .then_with(|| right.first_observed_at.cmp(&left.first_observed_at))
+    });
+    selected
+}
+
+fn print_quota_windows(windows: &[QuotaWindowV1], json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(windows)?);
+        return Ok(());
+    }
+    if windows.is_empty() {
+        println!("no quota windows");
+        return Ok(());
+    }
+    for window in windows {
+        println!("{}", quota_window_heading(window));
+        println!(
+            "  observed {} to {}; samples={} transition={:?}",
+            format_local_timestamp(window.first_observed_at),
+            format_local_timestamp(window.last_observed_at),
+            format_u64(window.sample_count),
+            window.transition,
+        );
+        if let Some(usage_totals) = &window.usage_totals {
+            println!(
+                "  usage events={} tokens={} cost_micro_usd={}",
+                format_u64(usage_totals.event_count),
+                format_u64(usage_totals.total_tokens),
+                usage_totals
+                    .estimated_cost_micro_usd
+                    .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            );
+        } else {
+            println!("  usage unavailable until the quota history is attributed to an account");
+        }
+        if window.has_schedule_overlap {
+            eprintln!(
+                "warning: {} overlaps another reconstructed epoch in the same quota scope",
+                window.window_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn quota_window_heading(window: &QuotaWindowV1) -> String {
+    let identity = window.provider_account_id.as_ref().map_or_else(
+        || {
+            window.source_id.as_ref().map_or_else(
+                || "unassigned".to_string(),
+                |id| format!("unassigned@{}", id.0),
+            )
+        },
+        |id| id.0.clone(),
+    );
+    format!(
+        "{}  {}  {}m  {:.2}%  reset {}  id={}",
+        window.provider,
+        identity,
+        window.window_minutes,
+        window.latest_used_percent,
+        format_local_timestamp(window.representative_reset),
+        window.window_id,
+    )
+}
+
+fn format_local_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
+}
+
+fn format_quota_range(range: Option<&statsai_store::QuotaDateRange>) -> String {
+    range.map_or_else(
+        || "none".to_string(),
+        |range| {
+            format!(
+                "{} to {}",
+                format_local_timestamp(range.first),
+                format_local_timestamp(range.last)
+            )
+        },
+    )
+}
+
+fn raw_observations_for_window(
+    records: Vec<QuotaObservationRecordV1>,
+    window: &QuotaWindowV1,
+) -> Vec<QuotaObservationRecordV1> {
+    records
+        .into_iter()
+        .filter(|record| {
+            record.observation.provider == window.provider
+                && record.observation.provider_account_id == window.provider_account_id
+                && window
+                    .source_id
+                    .as_ref()
+                    .is_none_or(|source_id| &record.observation.source_id == source_id)
+                && record.windows.iter().any(|candidate| {
+                    candidate.limit_id == window.limit_id
+                        && candidate.window_minutes == window.window_minutes
+                        && candidate.resets_at_epoch_seconds >= window.reset_min_epoch_seconds
+                        && candidate.resets_at_epoch_seconds <= window.reset_max_epoch_seconds
+                })
+        })
+        .collect()
+}
+
+fn export_quota_observations(records: &[QuotaObservationRecordV1], format: &str) -> Result<()> {
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(records)?),
+        "jsonl" => print_json_lines(records)?,
+        "csv" => {
+            let mut writer = csv::Writer::from_writer(std::io::stdout());
+            writer.write_record([
+                "schema_version",
+                "observation_id",
+                "semantic_fingerprint",
+                "provider",
+                "source_id",
+                "provider_account_id",
+                "observed_at",
+                "source_file_path_hash",
+                "source_record_id",
+                "usage_event_id",
+                "usage_link_kind",
+                "payload_hash",
+                "usage_total_tokens",
+                "provider_slot",
+                "limit_id",
+                "window_minutes",
+                "used_percent",
+                "resets_at",
+                "resets_at_epoch_seconds",
+            ])?;
+            for record in records {
+                let observation = &record.observation;
+                let base = vec![
+                    observation.schema_version.clone(),
+                    observation.observation_id.clone(),
+                    observation.semantic_fingerprint.clone(),
+                    observation.provider.clone(),
+                    observation.source_id.0.clone(),
+                    observation
+                        .provider_account_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default(),
+                    observation.observed_at.to_rfc3339(),
+                    observation.source_file_path_hash.clone(),
+                    observation.source_record_id.clone(),
+                    observation
+                        .usage_event_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default(),
+                    serde_json::to_value(observation.usage_link_kind)?
+                        .as_str()
+                        .unwrap_or("none")
+                        .to_string(),
+                    observation.payload_hash.clone(),
+                    observation
+                        .usage_sample
+                        .as_ref()
+                        .map(|usage| usage.computed_total().to_string())
+                        .unwrap_or_default(),
+                ];
+                if record.windows.is_empty() {
+                    let mut row = base;
+                    row.extend(std::iter::repeat_n(String::new(), 6));
+                    writer.write_record(row)?;
+                    continue;
+                }
+                for window in &record.windows {
+                    let mut row = base.clone();
+                    row.extend([
+                        window.provider_slot.clone(),
+                        window.limit_id.clone().unwrap_or_default(),
+                        window.window_minutes.to_string(),
+                        window.used_percent.to_string(),
+                        window.resets_at.to_rfc3339(),
+                        window.resets_at_epoch_seconds.to_string(),
+                    ]);
+                    writer.write_record(row)?;
+                }
+            }
+            writer.flush()?;
+        }
+        _ => unreachable!("clap validates quota export format"),
+    }
+    Ok(())
+}
+
+fn export_quota_windows(windows: &[QuotaWindowV1], format: &str) -> Result<()> {
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(windows)?),
+        "jsonl" => print_json_lines(windows)?,
+        "csv" => {
+            let mut writer = csv::Writer::from_writer(std::io::stdout());
+            writer.write_record([
+                "schema_version",
+                "window_id",
+                "provider",
+                "provider_account_id",
+                "source_id",
+                "limit_id",
+                "window_minutes",
+                "inferred_start",
+                "representative_reset",
+                "representative_reset_epoch_seconds",
+                "reset_min_epoch_seconds",
+                "reset_max_epoch_seconds",
+                "first_observed_at",
+                "last_observed_at",
+                "sample_count",
+                "first_used_percent",
+                "latest_used_percent",
+                "minimum_used_percent",
+                "maximum_used_percent",
+                "event_count",
+                "total_tokens",
+                "estimated_cost_micro_usd",
+            ])?;
+            for window in windows {
+                writer.write_record([
+                    window.schema_version.clone(),
+                    window.window_id.clone(),
+                    window.provider.clone(),
+                    window
+                        .provider_account_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default(),
+                    window
+                        .source_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default(),
+                    window.limit_id.clone().unwrap_or_default(),
+                    window.window_minutes.to_string(),
+                    window.inferred_start.to_rfc3339(),
+                    window.representative_reset.to_rfc3339(),
+                    window.representative_reset_epoch_seconds.to_string(),
+                    window.reset_min_epoch_seconds.to_string(),
+                    window.reset_max_epoch_seconds.to_string(),
+                    window.first_observed_at.to_rfc3339(),
+                    window.last_observed_at.to_rfc3339(),
+                    window.sample_count.to_string(),
+                    window.first_used_percent.to_string(),
+                    window.latest_used_percent.to_string(),
+                    window.minimum_used_percent.to_string(),
+                    window.maximum_used_percent.to_string(),
+                    window
+                        .usage_totals
+                        .as_ref()
+                        .map(|totals| totals.event_count.to_string())
+                        .unwrap_or_default(),
+                    window
+                        .usage_totals
+                        .as_ref()
+                        .map(|totals| totals.total_tokens.to_string())
+                        .unwrap_or_default(),
+                    window
+                        .usage_totals
+                        .as_ref()
+                        .and_then(|totals| totals.estimated_cost_micro_usd)
+                        .map(|cost| cost.to_string())
+                        .unwrap_or_default(),
+                ])?;
+            }
+            writer.flush()?;
+        }
+        _ => unreachable!("clap validates quota export format"),
+    }
+    Ok(())
+}
+
+fn export_quota_projections(
+    projections: &[QuotaWindowSyncProjectionV1],
+    format: &str,
+) -> Result<()> {
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(projections)?),
+        "jsonl" => print_json_lines(projections)?,
+        "csv" => {
+            let mut writer = csv::Writer::from_writer(std::io::stdout());
+            writer.write_record([
+                "schema_version",
+                "projection_id",
+                "device_id",
+                "provider",
+                "provider_account_id",
+                "limit_id",
+                "window_minutes",
+                "inferred_start",
+                "representative_reset",
+                "representative_reset_epoch_seconds",
+                "reset_min_epoch_seconds",
+                "reset_max_epoch_seconds",
+                "first_observed_at",
+                "last_observed_at",
+                "sample_count",
+                "latest_used_percent",
+                "change_points_json",
+                "status_json",
+            ])?;
+            for projection in projections {
+                writer.write_record([
+                    projection.schema_version.clone(),
+                    projection.projection_id.clone(),
+                    projection.device_id.clone(),
+                    projection.provider.clone(),
+                    projection.provider_account_id.0.clone(),
+                    projection.limit_id.clone().unwrap_or_default(),
+                    projection.window_minutes.to_string(),
+                    projection.inferred_start.to_rfc3339(),
+                    projection.representative_reset.to_rfc3339(),
+                    projection.representative_reset_epoch_seconds.to_string(),
+                    projection.reset_min_epoch_seconds.to_string(),
+                    projection.reset_max_epoch_seconds.to_string(),
+                    projection.first_observed_at.to_rfc3339(),
+                    projection.last_observed_at.to_rfc3339(),
+                    projection.sample_count.to_string(),
+                    projection.latest_used_percent.to_string(),
+                    serde_json::to_string(&projection.change_points)?,
+                    serde_json::to_string(&projection.latest_status)?,
+                ])?;
+            }
+            writer.flush()?;
+        }
+        _ => unreachable!("clap validates quota export format"),
+    }
+    Ok(())
+}
+
+fn print_json_lines<T: Serialize>(values: &[T]) -> Result<()> {
+    for value in values {
+        println!("{}", serde_json::to_string(value)?);
     }
     Ok(())
 }
@@ -6302,6 +7072,7 @@ fn collect_archive_source_entries(
                 &scan.artifact_dependencies,
                 &scan.trace_edits,
                 scan.trace_coverage,
+                &scan.quota_observations,
             )?;
             collected.files += scan.diagnostics.files_scanned;
             collected.conversations += write.conversations;
@@ -7777,6 +8548,7 @@ fn reattribute_source_records(store: &Store, source_id: &SourceId) -> Result<()>
     }
     store.rewrite_events(&events)?;
     store.rewrite_summaries(&summaries)?;
+    store.reattribute_quota_observations(source_id)?;
     Ok(())
 }
 
@@ -8004,6 +8776,7 @@ struct ScanPreviewLine<'a> {
     usage: &'a UsageTotals,
     summaries: u64,
     task_spans: u64,
+    quota_observations: u64,
     summary_usage: &'a UsageTotals,
     diagnostics: &'a ScanDiagnostics,
     verbose: bool,
@@ -8012,12 +8785,13 @@ struct ScanPreviewLine<'a> {
 fn print_scan_preview_line(line: ScanPreviewLine<'_>) {
     if line.verbose {
         println!(
-            "{} path={} usage_events={} summaries={} task_spans={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
+            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
             line.source.provider,
             preview_path_label(line.source),
             line.usage_events,
             line.summaries,
             line.task_spans,
+            line.quota_observations,
             format_u64(line.usage.input_tokens),
             format_u64(line.usage.cache_creation_tokens),
             format_u64(line.usage.cached_input_tokens),
@@ -8040,12 +8814,13 @@ fn print_scan_preview_line(line: ScanPreviewLine<'_>) {
         );
     } else {
         println!(
-            "{} path={} usage_events={} summaries={} task_spans={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={}",
+            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={}",
             line.source.provider,
             preview_path_label(line.source),
             line.usage_events,
             line.summaries,
             line.task_spans,
+            line.quota_observations,
             format_u64(line.usage.input_tokens),
             format_u64(line.usage.cache_creation_tokens),
             format_u64(line.usage.cached_input_tokens),
@@ -8252,6 +9027,20 @@ fn rewrite_task_span_linked_event_ids(
             }
         }
         span.linked_event_ids = rewritten;
+    }
+}
+
+fn rewrite_quota_usage_event_ids(
+    observations: &mut [QuotaObservationRecordV1],
+    canonical_event_ids: &HashMap<EventId, EventId>,
+) {
+    for record in observations {
+        let Some(event_id) = record.observation.usage_event_id.as_ref() else {
+            continue;
+        };
+        if let Some(canonical) = canonical_event_ids.get(event_id) {
+            record.observation.usage_event_id = Some(canonical.clone());
+        }
     }
 }
 
@@ -12240,6 +13029,7 @@ mod tests {
                     &[],
                     &edits,
                     statsai_core::CoverageStatus::Complete,
+                    &[],
                 )
                 .expect("seed trace edits");
         }
@@ -20179,5 +20969,117 @@ mod tests {
 
         assert_eq!(value["price"], json!(20.0));
         assert_eq!(value["price_cents"], json!(2000));
+    }
+
+    fn test_unattributed_quota_window(source_id: &str, window_id: &str) -> QuotaWindowV1 {
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .expect("observed at");
+        let reset = observed_at + Duration::days(7);
+        QuotaWindowV1 {
+            schema_version: "quota_window.v1".to_string(),
+            window_id: window_id.to_string(),
+            provider: "codex".to_string(),
+            provider_account_id: None,
+            source_id: Some(SourceId(source_id.to_string())),
+            limit_id: Some("subscription".to_string()),
+            window_minutes: 10_080,
+            inferred_start: reset - Duration::days(7),
+            representative_reset: reset,
+            representative_reset_epoch_seconds: reset.timestamp(),
+            reset_min: reset,
+            reset_min_epoch_seconds: reset.timestamp(),
+            reset_max: reset,
+            reset_max_epoch_seconds: reset.timestamp(),
+            first_observed_at: observed_at,
+            last_observed_at: observed_at,
+            sample_count: 1,
+            first_used_percent: 20.0,
+            latest_used_percent: 20.0,
+            minimum_used_percent: 20.0,
+            maximum_used_percent: 20.0,
+            transition: statsai_core::QuotaTransitionKind::Initial,
+            has_schedule_overlap: false,
+            change_points: Vec::new(),
+            latest_status: statsai_core::QuotaStatusV1::default(),
+            usage_totals: None,
+        }
+    }
+
+    fn test_unattributed_quota_record(source_id: &str) -> QuotaObservationRecordV1 {
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .expect("observed at");
+        let reset = observed_at + Duration::days(7);
+        QuotaObservationRecordV1 {
+            observation: statsai_core::QuotaObservationV1 {
+                schema_version: "quota_observation.v1".to_string(),
+                observation_id: format!("observation-{source_id}"),
+                semantic_fingerprint: format!("semantic-{source_id}"),
+                provider: "codex".to_string(),
+                source_id: SourceId(source_id.to_string()),
+                provider_account_id: None,
+                observed_at,
+                source_file_path_hash: format!("file-{source_id}"),
+                source_record_id: format!("record-{source_id}"),
+                source_line_number: 1,
+                payload_hash: format!("payload-{source_id}"),
+                usage_sample: None,
+                usage_event_id: None,
+                usage_link_kind: statsai_core::QuotaUsageLinkKind::None,
+                status: statsai_core::QuotaStatusV1::default(),
+            },
+            windows: vec![statsai_core::QuotaWindowObservationV1 {
+                schema_version: "quota_window_observation.v1".to_string(),
+                window_observation_id: format!("window-observation-{source_id}"),
+                observation_id: format!("observation-{source_id}"),
+                provider_slot: "primary".to_string(),
+                limit_id: Some("subscription".to_string()),
+                window_minutes: 10_080,
+                used_percent: 20.0,
+                resets_at: reset,
+                resets_at_epoch_seconds: reset.timestamp(),
+            }],
+            raw_rate_limits: json!({}),
+        }
+    }
+
+    #[test]
+    fn current_quota_windows_keep_unattributed_source_scopes_separate() {
+        let selected = select_current_quota_windows(
+            vec![
+                test_unattributed_quota_window("source-a", "window-a"),
+                test_unattributed_quota_window("source-b", "window-b"),
+            ],
+            false,
+            false,
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected
+                .iter()
+                .filter_map(|window| window.source_id.as_ref())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn raw_quota_history_isolated_to_unattributed_window_source() {
+        let window = test_unattributed_quota_window("source-a", "window-a");
+        let observations = raw_observations_for_window(
+            vec![
+                test_unattributed_quota_record("source-a"),
+                test_unattributed_quota_record("source-b"),
+            ],
+            &window,
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].observation.source_id.0, "source-a");
     }
 }

@@ -13,10 +13,10 @@ chrono.workspace = true
 hex.workspace = true
 schemars.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
