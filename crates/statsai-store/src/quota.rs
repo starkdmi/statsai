@@ -439,7 +439,7 @@ impl Store {
         })
     }
 
-    fn quota_observations_for_source(
+    pub(crate) fn quota_observations_for_source(
         &self,
         source_id: &SourceId,
     ) -> Result<Vec<QuotaObservationRecordV1>> {
@@ -1683,6 +1683,100 @@ mod tests {
             })
             .expect("assignment");
         (source.source_id, account_id)
+    }
+
+    #[test]
+    fn quota_plan_evidence_rebuild_replaces_corrected_plan_rows() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let reset_at = observed_at + Duration::days(7);
+        let (source_id, account_id) = assigned_source(&store, observed_at - Duration::days(1));
+        let mut record = sample_record(
+            source_id.clone(),
+            "quota-plan",
+            "quota-plan-v1",
+            observed_at,
+            reset_at.timestamp(),
+            "primary",
+            10_080,
+            25.0,
+        );
+        store
+            .upsert_quota_observations(std::slice::from_ref(&record))
+            .expect("initial quota row");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("initial plan rebuild");
+        let initial = store.account_plan_observations().expect("initial plan");
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].raw_plan_name, "pro");
+        assert_eq!(initial[0].provider_account_id, Some(account_id.clone()));
+
+        record.observation.status.plan_type = Some("future_ultra".to_string());
+        record.observation.semantic_fingerprint = "quota-plan-v2".to_string();
+        store
+            .upsert_quota_observations(&[record])
+            .expect("corrected quota row");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("corrected plan rebuild");
+
+        let corrected = store.account_plan_observations().expect("corrected plan");
+        assert_eq!(corrected.len(), 1);
+        assert_eq!(corrected[0].raw_plan_name, "future_ultra");
+        assert_eq!(corrected[0].plan_name, "Future Ultra");
+        assert_eq!(corrected[0].provider_account_id, Some(account_id));
+        assert_ne!(corrected[0].observation_id, initial[0].observation_id);
+    }
+
+    #[test]
+    fn quota_plan_label_never_identifies_an_unassigned_account() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed_at");
+        let reset_at = observed_at.timestamp() + 3_600;
+        let unassigned = sample_record(
+            SourceId("unassigned-source".to_string()),
+            "quota-plan-unassigned",
+            "quota-plan-unassigned-fingerprint",
+            observed_at,
+            reset_at,
+            "primary",
+            300,
+            25.0,
+        );
+
+        assert_eq!(
+            store
+                .upsert_quota_plan_observations(&[unassigned])
+                .expect("unassigned plan label"),
+            0
+        );
+        assert!(store
+            .account_plan_observations()
+            .expect("no plan observations")
+            .is_empty());
+
+        let (source_id, account_id) = assigned_source(&store, observed_at);
+        let assigned = sample_record(
+            source_id,
+            "quota-plan-assigned",
+            "quota-plan-assigned-fingerprint",
+            observed_at,
+            reset_at,
+            "primary",
+            300,
+            25.0,
+        );
+        assert_eq!(
+            store
+                .upsert_quota_plan_observations(&[assigned])
+                .expect("assigned plan label"),
+            1
+        );
+        let observations = store.account_plan_observations().expect("plan observation");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].provider_account_id, Some(account_id));
+        assert_eq!(observations[0].raw_plan_name, "pro");
     }
 
     #[test]

@@ -2,22 +2,29 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use regex::Regex;
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use serde_json::Value;
 use statsai_core::{
-    branch_family, canonical_display, display_path, expand_home_path, extract_issue_keys,
-    hash_text, home_dir, normalize_git_remote, normalize_task_title, path_hash, project_bucket_key,
-    semantic_event_id, summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
+    account_identity_observation_id, account_plan_observation_id, branch_family, canonical_display,
+    conversation_account_binding_id, display_path, expand_home_path, extract_issue_keys, hash_text,
+    home_dir, normalize_email, normalize_git_remote, normalize_plan_name, normalize_task_title,
+    path_hash, project_bucket_key, provider_account_id_from_identity, semantic_event_id,
+    summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
     task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
-    task_title_signal_score, title_topic_tokens, BillingPeriod, Confidence, CostAccumulator,
-    CostInfo, EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats,
-    ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, QuotaCreditsV1,
-    QuotaObservationRecordV1, QuotaObservationV1, QuotaStatusV1, QuotaUsageLinkKind,
-    QuotaWindowObservationV1, ReasoningLevel, RuntimeInfo, SessionInfo, SourceKind, SourceLocation,
-    SubscriptionStatus, SummaryMetadata, SummaryMetrics, TaskSpan, UsageCounts, UsageEvent,
-    UsageSummary, QUOTA_OBSERVATION_SCHEMA_VERSION, QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION,
-    TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+    task_title_signal_score, title_topic_tokens, AccountEvidenceCheckpointV1, AccountEvidenceKind,
+    AccountIdentityObservationV1, AccountPlanObservationV1, Confidence,
+    ConversationAccountBindingV1, CostAccumulator, CostInfo, EventId, EventSource, IdentitySource,
+    LatencySource, LocationOrigin, MetricStats, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode,
+    ProjectInfo, ProviderAccountId, QuotaCreditsV1, QuotaObservationRecordV1, QuotaObservationV1,
+    QuotaStatusV1, QuotaUsageLinkKind, QuotaWindowObservationV1, ReasoningLevel, RuntimeInfo,
+    SessionInfo, SourceKind, SourceLocation, SummaryMetadata, SummaryMetrics, TaskSpan,
+    UsageCounts, UsageEvent, UsageSummary, ACCOUNT_EVIDENCE_CHECKPOINT_SCHEMA_VERSION,
+    ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION, ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION,
+    CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION, QUOTA_OBSERVATION_SCHEMA_VERSION,
+    QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
+    USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{
     estimate_cost_at, normalize_model_name, pricing_changes_between, unknown_cost,
@@ -60,7 +67,85 @@ const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 ];
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
+const CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION: &str = "codex-account-evidence.v1";
 pub(crate) const MAX_JSONL_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexTelemetryCursor {
+    maximum_row_id: i64,
+    checkpoint_row_fingerprint: Option<String>,
+    database_size: i64,
+    database_modified_nanos: i64,
+    wal_size: i64,
+    wal_modified_nanos: i64,
+}
+
+fn codex_telemetry_file_state(
+    path: &Path,
+    maximum_row_id: i64,
+    checkpoint_row_fingerprint: Option<String>,
+) -> CodexTelemetryCursor {
+    let metadata = std::fs::metadata(path).ok();
+    let wal_metadata = std::fs::metadata(path.with_extension("sqlite-wal")).ok();
+    let modified_nanos = |metadata: Option<&std::fs::Metadata>| {
+        metadata
+            .and_then(|value| value.modified().ok())
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |value| {
+                i64::try_from(value.as_nanos()).unwrap_or(i64::MAX)
+            })
+    };
+    CodexTelemetryCursor {
+        maximum_row_id,
+        checkpoint_row_fingerprint,
+        database_size: metadata
+            .as_ref()
+            .map_or(0, |value| i64::try_from(value.len()).unwrap_or(i64::MAX)),
+        database_modified_nanos: modified_nanos(metadata.as_ref()),
+        wal_size: wal_metadata
+            .as_ref()
+            .map_or(0, |value| i64::try_from(value.len()).unwrap_or(i64::MAX)),
+        wal_modified_nanos: modified_nanos(wal_metadata.as_ref()),
+    }
+}
+
+fn codex_telemetry_cursor(checkpoint: &AccountEvidenceCheckpointV1) -> CodexTelemetryCursor {
+    CodexTelemetryCursor {
+        maximum_row_id: checkpoint.maximum_row_id,
+        checkpoint_row_fingerprint: checkpoint.checkpoint_row_fingerprint.clone(),
+        database_size: checkpoint.database_size,
+        database_modified_nanos: checkpoint.database_modified_nanos,
+        wal_size: checkpoint.wal_size,
+        wal_modified_nanos: checkpoint.wal_modified_nanos,
+    }
+}
+
+fn codex_telemetry_checkpoint_row_fingerprint(
+    connection: &Connection,
+    row_id: i64,
+) -> Option<String> {
+    if row_id == 0 {
+        return Some(hash_text("codex-telemetry-checkpoint-row.v1:empty"));
+    }
+    let (seconds, nanos, body) = connection
+        .query_row(
+            "SELECT ts, ts_nanos, feedback_log_body FROM logs WHERE id = ?1",
+            [row_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok()?;
+    Some(hash_text(&format!(
+        "codex-telemetry-checkpoint-row.v1:{row_id}:{seconds}:{nanos}:{}",
+        body.as_deref()
+            .map_or_else(|| "none".to_string(), hash_text,)
+    )))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BoundedLineRead {
@@ -203,6 +288,111 @@ pub struct AdapterScan {
     pub verified_source_state: Option<VerifiedSourceState>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedProviderAccount {
+    pub provider_user_id: Option<String>,
+    pub email: Option<String>,
+    pub plan_name: Option<String>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AccountEvidenceScan {
+    pub accounts: Vec<ObservedProviderAccount>,
+    pub identity_observations: Vec<AccountIdentityObservationV1>,
+    pub plan_observations: Vec<AccountPlanObservationV1>,
+    pub conversation_bindings: Vec<ConversationAccountBindingV1>,
+    pub checkpoints: Vec<AccountEvidenceCheckpointV1>,
+}
+
+/// Rewrites collected account references and their account-dependent deterministic IDs.
+///
+/// Callers use this with already-known aliases before Store deduplication, and again after an
+/// identity upsert when a newly discovered identity changes the canonical account reference.
+pub fn remap_account_evidence_account_ids(
+    evidence: &mut AccountEvidenceScan,
+    canonical_ids: &HashMap<ProviderAccountId, ProviderAccountId>,
+) {
+    for observation in &mut evidence.identity_observations {
+        if let Some(canonical_id) = observation
+            .provider_account_id
+            .as_ref()
+            .and_then(|account_id| canonical_ids.get(account_id))
+        {
+            observation.provider_account_id = Some(canonical_id.clone());
+        }
+    }
+    for observation in &mut evidence.plan_observations {
+        if let Some(canonical_id) = observation
+            .provider_account_id
+            .as_ref()
+            .and_then(|account_id| canonical_ids.get(account_id))
+        {
+            observation.provider_account_id = Some(canonical_id.clone());
+            observation.observation_id = account_plan_observation_id(
+                &observation.source_id,
+                Some(canonical_id),
+                &observation.raw_plan_name,
+                observation.observed_at,
+                observation.evidence_kind,
+            );
+        }
+    }
+    for binding in &mut evidence.conversation_bindings {
+        if let Some(canonical_id) = canonical_ids.get(&binding.provider_account_id) {
+            binding.provider_account_id = canonical_id.clone();
+            binding.binding_id = conversation_account_binding_id(
+                &binding.source_id,
+                &binding.conversation_id_hash,
+                binding.turn_id_hash.as_deref(),
+                canonical_id,
+            );
+        }
+    }
+}
+
+/// Drops discovered accounts whose evidence was already filtered out by the Store.
+///
+/// Call this after `Store::retain_unseen_account_evidence` so unrelated usage-file changes do not
+/// refresh an unchanged account and mark it pending for cloud sync again.
+pub fn retain_accounts_referenced_by_account_evidence(
+    provider: &str,
+    canonical_ids: &HashMap<ProviderAccountId, ProviderAccountId>,
+    evidence: &mut AccountEvidenceScan,
+) {
+    let referenced_account_ids = evidence
+        .identity_observations
+        .iter()
+        .filter_map(|observation| observation.provider_account_id.clone())
+        .chain(
+            evidence
+                .plan_observations
+                .iter()
+                .filter_map(|observation| observation.provider_account_id.clone()),
+        )
+        .chain(
+            evidence
+                .conversation_bindings
+                .iter()
+                .map(|binding| binding.provider_account_id.clone()),
+        )
+        .collect::<HashSet<_>>();
+    evidence.accounts.retain(|observed| {
+        provider_account_id_from_identity(
+            provider,
+            observed.provider_user_id.as_deref(),
+            observed.email.as_deref(),
+        )
+        .map(|account_id| {
+            canonical_ids
+                .get(&account_id)
+                .cloned()
+                .unwrap_or(account_id)
+        })
+        .is_some_and(|account_id| referenced_account_ids.contains(&account_id))
+    });
+}
+
 pub trait ProviderAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn version(&self) -> &'static str;
@@ -236,6 +426,13 @@ pub trait ProviderAdapter: Send + Sync {
         _changed: &[PathBuf],
     ) -> bool {
         false
+    }
+    fn collect_account_evidence(
+        &self,
+        _source: &SourceLocation,
+        _checkpoints: &[AccountEvidenceCheckpointV1],
+    ) -> Result<AccountEvidenceScan> {
+        Ok(AccountEvidenceScan::default())
     }
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan>;
 
@@ -397,6 +594,17 @@ impl ProviderAdapter for CodexAdapter {
             .map(Box::new)
             .map(VerifiedSourceObservation::Verified)
             .unwrap_or(VerifiedSourceObservation::Unavailable))
+    }
+
+    fn collect_account_evidence(
+        &self,
+        source: &SourceLocation,
+        checkpoints: &[AccountEvidenceCheckpointV1],
+    ) -> Result<AccountEvidenceScan> {
+        let Some(root) = source_root_path(source) else {
+            return Ok(AccountEvidenceScan::default());
+        };
+        collect_codex_account_evidence(source, &codex_source_root(&root), checkpoints)
     }
 
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
@@ -5534,6 +5742,14 @@ fn open_sqlite_readonly(path: &Path) -> Result<Connection> {
     .with_context(|| format!("open sqlite {}", path.display()))
 }
 
+fn sqlite_table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
 fn sqlite_column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = statement.query([])?;
@@ -7627,7 +7843,19 @@ fn claude_profile_timestamp(value: &Value) -> Option<DateTime<Utc>> {
     }
 }
 
-fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
+#[derive(Debug)]
+struct CodexAuthClaims {
+    provider_user_id: Option<String>,
+    email: Option<String>,
+    plan_type: Option<String>,
+    auth_mode: Option<String>,
+    authenticated_at: Option<DateTime<Utc>>,
+    subscription_checked_at: Option<DateTime<Utc>>,
+    active_from: Option<DateTime<Utc>>,
+    active_until: Option<DateTime<Utc>>,
+}
+
+fn codex_auth_claims(root: &Path) -> Option<CodexAuthClaims> {
     let auth_path = root.join("auth.json");
     let value = std::fs::read_to_string(&auth_path).ok()?;
     let value: Value = serde_json::from_str(&value).ok()?;
@@ -7671,7 +7899,7 @@ fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
     }
 
     let plan_type = auth.and_then(|auth| string_at_any(auth, &["chatgpt_plan_type"]));
-    let plan_name = plan_type.as_deref().map(display_codex_plan_name);
+    let auth_mode = string_at_any(&value, &["auth_mode", "authMode"]);
     let authenticated_at = payload
         .as_ref()
         .and_then(|payload| timestamp_at_any(payload, &["auth_time", "iat"]))
@@ -7680,28 +7908,646 @@ fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
     // that the embedded subscription claims were refreshed at the same time.
     let subscription_checked_at =
         auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_last_checked"]));
-    let verified_at = subscription_checked_at.or(authenticated_at);
-    let paid_at =
+    let active_from =
         auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_active_start"]));
-    let current_period_ends_at =
+    let active_until =
         auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_active_until"]));
-    let subscription = plan_type.as_deref().and_then(|plan_type| {
-        codex_verified_subscription(
-            plan_type,
-            paid_at,
-            current_period_ends_at,
-            subscription_checked_at,
-        )
-    });
-
-    Some(VerifiedSourceState {
+    Some(CodexAuthClaims {
         provider_user_id,
         email,
+        plan_type,
+        auth_mode,
+        authenticated_at,
+        subscription_checked_at,
+        active_from,
+        active_until,
+    })
+}
+
+fn collect_codex_account_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    checkpoints: &[AccountEvidenceCheckpointV1],
+) -> Result<AccountEvidenceScan> {
+    let mut scan = AccountEvidenceScan::default();
+    collect_codex_auth_evidence(source, root, &mut scan);
+    collect_codex_telemetry_evidence(source, root, checkpoints, &mut scan)?;
+    collect_codex_reset_history_evidence(source, root, &mut scan);
+    collect_codex_login_evidence(source, root, &mut scan)?;
+    dedupe_codex_account_evidence(&mut scan);
+    Ok(scan)
+}
+
+fn collect_codex_auth_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    scan: &mut AccountEvidenceScan,
+) {
+    let Some(claims) = codex_auth_claims(root) else {
+        return;
+    };
+    let observed_at = claims
+        .subscription_checked_at
+        .or(claims.authenticated_at)
+        .unwrap_or_else(Utc::now);
+    let provider_account_id = provider_account_id_from_identity(
+        CODEX_PROVIDER,
+        claims.provider_user_id.as_deref(),
+        claims.email.as_deref(),
+    );
+    let auth_path = root.join("auth.json");
+    let artifact_path_hash = hash_text(&canonical_display(&auth_path));
+    let record_fingerprint = hash_text(&format!(
+        "codex-auth-evidence.v1:{}:{}:{}:{}:{}:{}",
+        claims.provider_user_id.as_deref().unwrap_or("none"),
+        claims.email.as_deref().unwrap_or("none"),
+        claims.plan_type.as_deref().unwrap_or("none"),
+        claims.auth_mode.as_deref().unwrap_or("none"),
+        claims
+            .active_from
+            .map_or_else(|| "none".to_string(), |value| value.to_rfc3339()),
+        claims
+            .active_until
+            .map_or_else(|| "none".to_string(), |value| value.to_rfc3339()),
+    ));
+    scan.accounts.push(ObservedProviderAccount {
+        provider_user_id: claims.provider_user_id.clone(),
+        email: claims.email.clone(),
+        plan_name: claims.plan_type.as_deref().map(normalize_plan_name),
+        observed_at,
+    });
+    scan.identity_observations
+        .push(AccountIdentityObservationV1 {
+            schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: account_identity_observation_id(
+                &source.source_id,
+                AccountEvidenceKind::AuthSnapshot,
+                observed_at,
+                &record_fingerprint,
+            ),
+            provider: CODEX_PROVIDER.to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: provider_account_id.clone(),
+            provider_user_id_hash: claims.provider_user_id.as_deref().map(hash_text),
+            email_hash: claims
+                .email
+                .as_deref()
+                .map(normalize_email)
+                .as_deref()
+                .map(hash_text),
+            conversation_id_hash: None,
+            turn_id_hash: None,
+            observed_at,
+            evidence_kind: AccountEvidenceKind::AuthSnapshot,
+            confidence: Confidence::High,
+            auth_mode: claims.auth_mode.clone(),
+            application_version: None,
+            parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+            artifact_kind: "auth_json".to_string(),
+            artifact_path_hash: artifact_path_hash.clone(),
+            record_fingerprint: record_fingerprint.clone(),
+        });
+
+    let plan_allowed = claims.auth_mode.as_deref().is_none_or(|mode| {
+        !matches!(
+            mode.trim().to_ascii_lowercase().as_str(),
+            "api" | "api_key" | "apikey"
+        )
+    });
+    if plan_allowed {
+        if let Some(raw_plan_name) = claims.plan_type {
+            let observation_id = account_plan_observation_id(
+                &source.source_id,
+                provider_account_id.as_ref(),
+                &raw_plan_name,
+                observed_at,
+                AccountEvidenceKind::AuthSnapshot,
+            );
+            scan.plan_observations.push(AccountPlanObservationV1 {
+                schema_version: ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id,
+                provider: CODEX_PROVIDER.to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id,
+                plan_name: normalize_plan_name(&raw_plan_name),
+                raw_plan_name,
+                observed_at,
+                active_from: claims.active_from,
+                active_until: claims.active_until,
+                is_current_snapshot: true,
+                evidence_kind: AccountEvidenceKind::AuthSnapshot,
+                confidence: Confidence::High,
+                parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                artifact_path_hash,
+                record_fingerprint,
+            });
+        }
+    }
+}
+
+fn collect_codex_telemetry_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    checkpoints: &[AccountEvidenceCheckpointV1],
+    scan: &mut AccountEvidenceScan,
+) -> Result<()> {
+    let account_attribute = Regex::new(
+        r#"(?i)(?:\"?user\.account_id\"?|\"?user_account_id\"?)\s*[:=]\s*[\"']?([a-z0-9_:\-]{3,256})"#,
+    )?;
+    let email_attribute = Regex::new(
+        r#"(?i)\"?user\.email\"?\s*[:=]\s*[\"']?([a-z0-9.!#$%&'*+/=?^_`{|}~\-]+@[a-z0-9.\-]+\.[a-z]{2,})"#,
+    )?;
+    let conversation_attribute = Regex::new(
+        r#"(?i)(?:\"?conversation\.id\"?|\"?conversation_id\"?|\"?conversationId\"?)\s*[:=]\s*[\"']?([a-z0-9_:\-]{3,256})"#,
+    )?;
+    let auth_mode_attribute = Regex::new(
+        r#"(?i)(?:\"?auth\.mode\"?|\"?auth_mode\"?)\s*[:=]\s*[\"']?([a-z0-9_:\-]{2,64})"#,
+    )?;
+    let app_version_attribute = Regex::new(
+        r#"(?i)(?:\"?app\.version\"?|\"?application_version\"?|\"?cli_version\"?)\s*[:=]\s*[\"']?([a-z0-9.+_\-]{1,64})"#,
+    )?;
+    let event_name = Regex::new(r#"(?:^|\s)event\.name\s*=\s*\"([a-z0-9._-]+)\""#)?;
+    let auth_reload =
+        Regex::new(r#"(?i)^\s*Reloading auth for account\s+([a-z0-9_:\-]{3,256})(?:\s|$)"#)?;
+
+    for database_path in [
+        root.join("logs_2.sqlite"),
+        root.join("sqlite/logs_2.sqlite"),
+    ] {
+        if !database_path.is_file() {
+            continue;
+        }
+        let Ok(connection) = open_sqlite_readonly(&database_path) else {
+            continue;
+        };
+        let Ok(has_logs_table) = sqlite_table_exists(&connection, "logs") else {
+            continue;
+        };
+        if !has_logs_table {
+            continue;
+        }
+        let Ok(maximum_row_id) =
+            connection.query_row("SELECT COALESCE(MAX(id), 0) FROM logs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        else {
+            continue;
+        };
+        let checkpoint_row_fingerprint =
+            codex_telemetry_checkpoint_row_fingerprint(&connection, maximum_row_id);
+        let current_state =
+            codex_telemetry_file_state(&database_path, maximum_row_id, checkpoint_row_fingerprint);
+        let path_hash = hash_text(&canonical_display(&database_path));
+        let previous_state = checkpoints
+            .iter()
+            .find(|checkpoint| {
+                checkpoint.source_id == source.source_id
+                    && checkpoint.artifact_path_hash == path_hash
+                    && checkpoint.parser_version == CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION
+            })
+            .map(codex_telemetry_cursor);
+        if previous_state.as_ref() == Some(&current_state) {
+            continue;
+        }
+        let database_generation_matches = previous_state.as_ref().is_some_and(|previous| {
+            previous
+                .checkpoint_row_fingerprint
+                .as_ref()
+                .is_some_and(|expected| {
+                    codex_telemetry_checkpoint_row_fingerprint(&connection, previous.maximum_row_id)
+                        .as_ref()
+                        == Some(expected)
+                })
+        });
+        let minimum_row_id = previous_state
+            .as_ref()
+            .filter(|previous| {
+                database_generation_matches
+                    && maximum_row_id > previous.maximum_row_id
+                    && current_state.database_size >= previous.database_size
+            })
+            .map_or(i64::MIN, |previous| previous.maximum_row_id);
+        let Ok(mut statement) = connection.prepare(
+            r#"
+            SELECT id, ts, ts_nanos, target, feedback_log_body
+            FROM logs
+            WHERE feedback_log_body IS NOT NULL
+              AND id > ?1
+              AND (
+                (
+                  target IN ('codex_otel.log_only', 'codex_otel.trace_safe')
+                  AND instr(feedback_log_body, 'codex.conversation_starts') > 0
+                  AND (
+                    instr(feedback_log_body, 'user.account_id') > 0
+                    OR instr(feedback_log_body, 'user.email') > 0
+                  )
+                )
+                OR (
+                  target LIKE 'codex_core::auth%'
+                  AND instr(feedback_log_body, 'Reloading auth for account') > 0
+                )
+              )
+            ORDER BY id
+            "#,
+        ) else {
+            continue;
+        };
+        let Ok(rows) = statement.query_map([minimum_row_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        }) else {
+            continue;
+        };
+        let mut read_complete = true;
+        for row in rows {
+            let Ok((row_id, seconds, nanos, target, body)) = row else {
+                read_complete = false;
+                break;
+            };
+            let Some(observed_at) = Utc
+                .timestamp_opt(seconds, nanos.clamp(0, 999_999_999) as u32)
+                .single()
+            else {
+                continue;
+            };
+            let structured_identity_event = matches!(
+                target.as_str(),
+                "codex_otel.log_only" | "codex_otel.trace_safe"
+            ) && event_name
+                .captures(&body)
+                .and_then(|captures| captures.get(1))
+                .is_some_and(|value| value.as_str() == "codex.conversation_starts");
+            let reload_account_id = target
+                .starts_with("codex_core::auth")
+                .then(|| {
+                    auth_reload
+                        .captures(&body)
+                        .and_then(|captures| captures.get(1))
+                        .map(|value| value.as_str().to_string())
+                })
+                .flatten();
+            let provider_user_id = reload_account_id.clone().or_else(|| {
+                structured_identity_event
+                    .then(|| {
+                        account_attribute
+                            .captures(&body)
+                            .and_then(|captures| captures.get(1))
+                            .map(|value| value.as_str().to_string())
+                    })
+                    .flatten()
+            });
+            let email = structured_identity_event
+                .then(|| {
+                    email_attribute
+                        .captures(&body)
+                        .and_then(|captures| captures.get(1))
+                        .map(|value| normalize_email(value.as_str()))
+                })
+                .flatten();
+            if provider_user_id.is_none() && email.is_none() {
+                continue;
+            }
+            let conversation_id = structured_identity_event
+                .then(|| {
+                    conversation_attribute
+                        .captures(&body)
+                        .and_then(|captures| captures.get(1))
+                        .map(|value| value.as_str().to_string())
+                })
+                .flatten();
+            let auth_mode = structured_identity_event
+                .then(|| {
+                    auth_mode_attribute
+                        .captures(&body)
+                        .and_then(|captures| captures.get(1))
+                        .map(|value| value.as_str().to_string())
+                })
+                .flatten();
+            let application_version = structured_identity_event
+                .then(|| {
+                    app_version_attribute
+                        .captures(&body)
+                        .and_then(|captures| captures.get(1))
+                        .map(|value| value.as_str().to_string())
+                })
+                .flatten();
+            let provider_account_id = provider_account_id_from_identity(
+                CODEX_PROVIDER,
+                provider_user_id.as_deref(),
+                email.as_deref(),
+            );
+            let Some(provider_account_id) = provider_account_id else {
+                continue;
+            };
+            let evidence_kind = if reload_account_id.is_some() {
+                AccountEvidenceKind::AuthReload
+            } else {
+                AccountEvidenceKind::TelemetryIdentity
+            };
+            let conversation_id_hash = conversation_id.as_deref().map(hash_text);
+            let record_fingerprint = hash_text(&format!(
+                "codex-telemetry-identity.v1:{row_id}:{}:{}:{}:{}",
+                provider_user_id.as_deref().unwrap_or("none"),
+                email.as_deref().unwrap_or("none"),
+                conversation_id.as_deref().unwrap_or("none"),
+                observed_at.to_rfc3339()
+            ));
+            scan.accounts.push(ObservedProviderAccount {
+                provider_user_id: provider_user_id.clone(),
+                email: email.clone(),
+                plan_name: None,
+                observed_at,
+            });
+            scan.identity_observations
+                .push(AccountIdentityObservationV1 {
+                    schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+                    observation_id: account_identity_observation_id(
+                        &source.source_id,
+                        evidence_kind,
+                        observed_at,
+                        &record_fingerprint,
+                    ),
+                    provider: CODEX_PROVIDER.to_string(),
+                    source_id: source.source_id.clone(),
+                    provider_account_id: Some(provider_account_id.clone()),
+                    provider_user_id_hash: provider_user_id.as_deref().map(hash_text),
+                    email_hash: email.as_deref().map(hash_text),
+                    conversation_id_hash: conversation_id_hash.clone(),
+                    turn_id_hash: None,
+                    observed_at,
+                    evidence_kind,
+                    confidence: Confidence::High,
+                    auth_mode,
+                    application_version,
+                    parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                    artifact_kind: "logs_2_sqlite".to_string(),
+                    artifact_path_hash: path_hash.clone(),
+                    record_fingerprint,
+                });
+            if let Some(conversation_id_hash) = conversation_id_hash {
+                scan.conversation_bindings
+                    .push(ConversationAccountBindingV1 {
+                        schema_version: CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION.to_string(),
+                        binding_id: conversation_account_binding_id(
+                            &source.source_id,
+                            &conversation_id_hash,
+                            None,
+                            &provider_account_id,
+                        ),
+                        provider: CODEX_PROVIDER.to_string(),
+                        source_id: source.source_id.clone(),
+                        provider_account_id,
+                        conversation_id_hash,
+                        turn_id_hash: None,
+                        observed_at,
+                        evidence_kind,
+                        confidence: Confidence::High,
+                    });
+            }
+        }
+        if read_complete {
+            scan.checkpoints.push(AccountEvidenceCheckpointV1 {
+                schema_version: ACCOUNT_EVIDENCE_CHECKPOINT_SCHEMA_VERSION.to_string(),
+                source_id: source.source_id.clone(),
+                artifact_path_hash: path_hash,
+                parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                maximum_row_id: current_state.maximum_row_id,
+                checkpoint_row_fingerprint: current_state.checkpoint_row_fingerprint.clone(),
+                database_size: current_state.database_size,
+                database_modified_nanos: current_state.database_modified_nanos,
+                wal_size: current_state.wal_size,
+                wal_modified_nanos: current_state.wal_modified_nanos,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_codex_reset_history_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    scan: &mut AccountEvidenceScan,
+) {
+    let state_path = root.join(".codex-global-state.json");
+    let Some(value) = read_json_file(&state_path) else {
+        return;
+    };
+    let Some(entries) = value
+        .pointer("/electron-persisted-atom-state/codex-rate-limit-reset-history")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let artifact_path_hash = hash_text(&canonical_display(&state_path));
+    for entry in entries {
+        let Some(provider_user_id) = string_at_any(entry, &["accountId", "account_id"]) else {
+            continue;
+        };
+        let Some(conversation_id) = string_at_any(entry, &["conversationId", "conversation_id"])
+        else {
+            continue;
+        };
+        let turn_id = string_at_any(entry, &["turnId", "turn_id"]);
+        let Some(observed_at) = entry
+            .get("occurredAtMs")
+            .or_else(|| entry.get("occurred_at_ms"))
+            .and_then(timestamp_from_scalar)
+        else {
+            continue;
+        };
+        let Some(provider_account_id) =
+            provider_account_id_from_identity(CODEX_PROVIDER, Some(&provider_user_id), None)
+        else {
+            continue;
+        };
+        let conversation_id_hash = hash_text(&conversation_id);
+        let turn_id_hash = turn_id.as_deref().map(hash_text);
+        let record_fingerprint = hash_text(&format!(
+            "codex-reset-history.v1:{provider_user_id}:{conversation_id}:{}:{}",
+            turn_id.as_deref().unwrap_or("none"),
+            observed_at.to_rfc3339()
+        ));
+        scan.accounts.push(ObservedProviderAccount {
+            provider_user_id: Some(provider_user_id.clone()),
+            email: None,
+            plan_name: None,
+            observed_at,
+        });
+        scan.identity_observations
+            .push(AccountIdentityObservationV1 {
+                schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id: account_identity_observation_id(
+                    &source.source_id,
+                    AccountEvidenceKind::ResetHistory,
+                    observed_at,
+                    &record_fingerprint,
+                ),
+                provider: CODEX_PROVIDER.to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(provider_account_id.clone()),
+                provider_user_id_hash: Some(hash_text(&provider_user_id)),
+                email_hash: None,
+                conversation_id_hash: Some(conversation_id_hash.clone()),
+                turn_id_hash: turn_id_hash.clone(),
+                observed_at,
+                evidence_kind: AccountEvidenceKind::ResetHistory,
+                confidence: Confidence::High,
+                auth_mode: None,
+                application_version: None,
+                parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                artifact_kind: "global_state_reset_history".to_string(),
+                artifact_path_hash: artifact_path_hash.clone(),
+                record_fingerprint,
+            });
+        scan.conversation_bindings
+            .push(ConversationAccountBindingV1 {
+                schema_version: CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION.to_string(),
+                binding_id: conversation_account_binding_id(
+                    &source.source_id,
+                    &conversation_id_hash,
+                    turn_id_hash.as_deref(),
+                    &provider_account_id,
+                ),
+                provider: CODEX_PROVIDER.to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id,
+                conversation_id_hash,
+                turn_id_hash,
+                observed_at,
+                evidence_kind: AccountEvidenceKind::ResetHistory,
+                confidence: Confidence::High,
+            });
+    }
+}
+
+fn collect_codex_login_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    scan: &mut AccountEvidenceScan,
+) -> Result<()> {
+    let log_directory = root.join("log");
+    let mut login_paths = std::fs::read_dir(&log_directory)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (name == "codex-login.log" || name.starts_with("codex-login.log."))
+                .then(|| entry.path())
+        })
+        .collect::<Vec<_>>();
+    login_paths.sort();
+    for login_path in login_paths {
+        let Ok(file) = File::open(&login_path) else {
+            continue;
+        };
+        let artifact_path_hash = hash_text(&canonical_display(&login_path));
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut line_number = 0u64;
+        loop {
+            match read_bounded_jsonl_line(&mut reader, &mut line, 64 * 1024)? {
+                BoundedLineRead::Eof => break,
+                BoundedLineRead::Oversized => {
+                    line_number += 1;
+                    continue;
+                }
+                BoundedLineRead::Complete => {}
+            }
+            line_number += 1;
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let lower = text.to_ascii_lowercase();
+            if ![
+                "successfully logged in",
+                "login successful",
+                "authentication successful",
+                "login completed",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+            {
+                continue;
+            }
+            let Some(timestamp) = text.split_whitespace().next() else {
+                continue;
+            };
+            let Ok(observed_at) = DateTime::parse_from_rfc3339(timestamp) else {
+                continue;
+            };
+            let observed_at = observed_at.with_timezone(&Utc);
+            let record_fingerprint = hash_text(&format!(
+                "codex-login-success.v1:{}:{line_number}:{}",
+                artifact_path_hash,
+                observed_at.to_rfc3339()
+            ));
+            scan.identity_observations
+                .push(AccountIdentityObservationV1 {
+                    schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+                    observation_id: account_identity_observation_id(
+                        &source.source_id,
+                        AccountEvidenceKind::LoginSuccess,
+                        observed_at,
+                        &record_fingerprint,
+                    ),
+                    provider: CODEX_PROVIDER.to_string(),
+                    source_id: source.source_id.clone(),
+                    provider_account_id: None,
+                    provider_user_id_hash: None,
+                    email_hash: None,
+                    conversation_id_hash: None,
+                    turn_id_hash: None,
+                    observed_at,
+                    evidence_kind: AccountEvidenceKind::LoginSuccess,
+                    confidence: Confidence::Low,
+                    auth_mode: None,
+                    application_version: None,
+                    parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                    artifact_kind: "codex_login_log".to_string(),
+                    artifact_path_hash: artifact_path_hash.clone(),
+                    record_fingerprint,
+                });
+        }
+    }
+    Ok(())
+}
+
+fn dedupe_codex_account_evidence(scan: &mut AccountEvidenceScan) {
+    let mut account_keys = HashSet::new();
+    scan.accounts.retain(|account| {
+        account_keys.insert((account.provider_user_id.clone(), account.email.clone()))
+    });
+    let mut identity_ids = HashSet::new();
+    scan.identity_observations
+        .retain(|observation| identity_ids.insert(observation.observation_id.clone()));
+    let mut plan_ids = HashSet::new();
+    scan.plan_observations
+        .retain(|observation| plan_ids.insert(observation.observation_id.clone()));
+    let mut binding_ids = HashSet::new();
+    scan.conversation_bindings
+        .retain(|binding| binding_ids.insert(binding.binding_id.clone()));
+}
+
+fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
+    let claims = codex_auth_claims(root)?;
+    let plan_name = claims.plan_type.as_deref().map(display_codex_plan_name);
+    let verified_at = claims.subscription_checked_at.or(claims.authenticated_at);
+    Some(VerifiedSourceState {
+        provider_user_id: claims.provider_user_id,
+        email: claims.email,
         account_label: None,
         plan_name,
-        authenticated_at,
+        authenticated_at: claims.authenticated_at,
         verified_at,
-        subscription,
+        // Provider plan detection is intentionally separate from user-entered billing facts.
+        subscription: None,
     })
 }
 
@@ -7771,32 +8617,6 @@ fn display_codex_plan_name(plan_type: &str) -> String {
             .collect::<Vec<_>>()
             .join(" "),
     }
-}
-
-fn codex_verified_subscription(
-    plan_type: &str,
-    paid_at: Option<DateTime<Utc>>,
-    current_period_ends_at: Option<DateTime<Utc>>,
-    verified_at: Option<DateTime<Utc>>,
-) -> Option<VerifiedSubscriptionState> {
-    let started_at = paid_at?;
-    let (plan_name, price) = match plan_type.trim().to_ascii_lowercase().as_str() {
-        "plus" => ("Plus".to_string(), 2000),
-        "pro" => ("Pro".to_string(), 20000),
-        _ => return None,
-    };
-    Some(VerifiedSubscriptionState {
-        plan_name,
-        price,
-        currency: "USD".to_string(),
-        billing_period: BillingPeriod::Monthly,
-        paid_at,
-        started_at,
-        ended_at: None,
-        current_period_ends_at,
-        status: SubscriptionStatus::Active,
-        verified_at,
-    })
 }
 
 fn jwt_payload_value(token: &str) -> Option<Value> {
@@ -11969,20 +12789,21 @@ mod tests {
             verified.verified_at.map(|value| value.to_rfc3339()),
             Some("2026-05-29T10:14:56.058278+00:00".to_string())
         );
-        let subscription = verified.subscription.as_ref().expect("subscription");
-        assert_eq!(subscription.plan_name, "Plus");
-        assert_eq!(subscription.price, 2000);
+        assert!(verified.subscription.is_none());
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+        let plan = evidence.plan_observations.first().expect("plan evidence");
+        assert_eq!(plan.raw_plan_name, "plus");
+        assert_eq!(plan.plan_name, "Plus");
         assert_eq!(
-            subscription.started_at.to_rfc3339(),
+            plan.active_from.expect("active from").to_rfc3339(),
             "2026-05-29T10:12:43+00:00"
         );
         assert_eq!(
-            subscription
-                .current_period_ends_at
-                .map(|value| value.to_rfc3339()),
+            plan.active_until.map(|value| value.to_rfc3339()),
             Some("2026-06-29T10:12:43+00:00".to_string())
         );
-        assert_eq!(subscription.ended_at, None);
         assert_eq!(scan.events[0].provider_account_id, None);
         assert_ne!(
             scan.events[0]
@@ -12042,20 +12863,20 @@ mod tests {
             verified.verified_at.map(|value| value.to_rfc3339()),
             Some("2026-05-29T10:14:56.058278+00:00".to_string())
         );
-        let subscription = verified.subscription.as_ref().expect("subscription");
-        assert_eq!(subscription.plan_name, "Plus");
-        assert_eq!(subscription.price, 2000);
+        assert!(verified.subscription.is_none());
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+        let plan = evidence.plan_observations.first().expect("plan evidence");
+        assert_eq!(plan.raw_plan_name, "plus");
         assert_eq!(
-            subscription.started_at.to_rfc3339(),
+            plan.active_from.expect("active from").to_rfc3339(),
             "2026-05-29T10:12:43+00:00"
         );
         assert_eq!(
-            subscription
-                .current_period_ends_at
-                .map(|value| value.to_rfc3339()),
+            plan.active_until.map(|value| value.to_rfc3339()),
             Some("2026-06-29T10:12:43+00:00".to_string())
         );
-        assert_eq!(subscription.ended_at, None);
         assert_eq!(scan.events[0].provider_account_id, None);
     }
 
@@ -12092,8 +12913,317 @@ mod tests {
         };
 
         assert!(verified.verified_at.is_some());
-        let subscription = verified.subscription.expect("subscription");
-        assert_eq!(subscription.verified_at, None);
+        assert!(verified.subscription.is_none());
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+        assert_eq!(evidence.plan_observations.len(), 1);
+        assert!(evidence.plan_observations[0].is_current_snapshot);
+        assert_eq!(
+            evidence.plan_observations[0]
+                .active_until
+                .map(|value| value.to_rfc3339()),
+            Some("2026-06-29T10:12:43+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_collects_allowlisted_telemetry_reset_and_login_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_path = dir.path().join("logs_2.sqlite");
+        let connection = Connection::open(&database_path).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    1,
+                    1_787_227_200_i64,
+                    123_i64,
+                    "codex_otel.log_only",
+                    "event.name=\"codex.conversation_starts\" user.account_id=acct-telemetry user.email=owner@example.test conversation.id=conversation-1 auth.mode=chatgpt app.version=1.2.3"
+                ],
+            )
+            .expect("telemetry row");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    2,
+                    1_787_227_201_i64,
+                    0_i64,
+                    "codex_core::auth",
+                    "Reloading auth for account acct-reloaded"
+                ],
+            )
+            .expect("reload row");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    3,
+                    1_787_227_202_i64,
+                    0_i64,
+                    "codex_otel.log_only",
+                    "event.name=\"codex.user_prompt\" prompt=\"Please discuss user.account_id=acct-prompt user.email=prompt@example.test conversation.id=conversation-prompt\""
+                ],
+            )
+            .expect("arbitrary text row");
+        drop(connection);
+
+        std::fs::write(
+            dir.path().join(".codex-global-state.json"),
+            serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "codex-rate-limit-reset-history": [{
+                        "accountId": "acct-reset",
+                        "conversationId": "conversation-reset",
+                        "turnId": "turn-reset",
+                        "occurredAtMs": 1_787_227_203_000_i64
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("global state");
+        std::fs::create_dir_all(dir.path().join("log")).expect("log directory");
+        std::fs::write(
+            dir.path().join("log/codex-login.log.1"),
+            "2026-08-20T12:00:04Z login successful for arbitrary@example.test acct-visible-only-in-body\n",
+        )
+        .expect("rotated login log");
+        std::fs::write(
+            dir.path().join("log/codex-login.log"),
+            "2026-08-20T12:00:05Z unrelated message\n2026-08-20T12:00:06Z login completed\n",
+        )
+        .expect("login log");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        assert_eq!(
+            evidence
+                .identity_observations
+                .iter()
+                .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+                .count(),
+            1
+        );
+        assert_eq!(
+            evidence
+                .identity_observations
+                .iter()
+                .filter(|item| item.evidence_kind == AccountEvidenceKind::AuthReload)
+                .count(),
+            1
+        );
+        assert_eq!(
+            evidence
+                .identity_observations
+                .iter()
+                .filter(|item| item.evidence_kind == AccountEvidenceKind::ResetHistory)
+                .count(),
+            1
+        );
+        let login_observations = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::LoginSuccess)
+            .collect::<Vec<_>>();
+        assert_eq!(login_observations.len(), 2);
+        assert!(login_observations.iter().all(|item| {
+            item.provider_account_id.is_none()
+                && item.provider_user_id_hash.is_none()
+                && item.email_hash.is_none()
+        }));
+        assert_eq!(evidence.conversation_bindings.len(), 2);
+        assert!(evidence
+            .conversation_bindings
+            .iter()
+            .all(|binding| binding.conversation_id_hash.len() == 64));
+        assert!(evidence
+            .conversation_bindings
+            .iter()
+            .all(|binding| binding.conversation_id_hash != "conversation-1"));
+
+        let retry_before_ack = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("retry account evidence before acknowledgement");
+        assert_eq!(
+            retry_before_ack
+                .identity_observations
+                .iter()
+                .filter(|item| matches!(
+                    item.evidence_kind,
+                    AccountEvidenceKind::TelemetryIdentity | AccountEvidenceKind::AuthReload
+                ))
+                .count(),
+            2,
+            "telemetry must remain retryable until the caller commits the evidence"
+        );
+        let committed_checkpoints = evidence.checkpoints.clone();
+
+        let repeated = CodexAdapter
+            .collect_account_evidence(&source, &committed_checkpoints)
+            .expect("repeat account evidence after checkpoint commit");
+        assert_eq!(
+            repeated
+                .identity_observations
+                .iter()
+                .filter(|item| matches!(
+                    item.evidence_kind,
+                    AccountEvidenceKind::TelemetryIdentity | AccountEvidenceKind::AuthReload
+                ))
+                .count(),
+            0,
+            "an unchanged telemetry database must not be rescanned"
+        );
+
+        let connection = Connection::open(&database_path).expect("reopen logs database");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    4,
+                    1_787_227_204_i64,
+                    0_i64,
+                    "codex_otel.trace_safe",
+                    "event.name=\"codex.conversation_starts\" user.account_id=acct-appended"
+                ],
+            )
+            .expect("append telemetry row");
+        drop(connection);
+        let appended = CodexAdapter
+            .collect_account_evidence(&source, &committed_checkpoints)
+            .expect("incremental account evidence");
+        assert_eq!(
+            appended
+                .identity_observations
+                .iter()
+                .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+                .count(),
+            1,
+            "only the appended telemetry range should be parsed"
+        );
+        assert_eq!(appended.checkpoints.len(), 1);
+
+        std::fs::rename(&database_path, dir.path().join("logs_2.previous.sqlite"))
+            .expect("archive replaced telemetry database");
+        let mut replacement = Connection::open(&database_path).expect("replacement logs database");
+        replacement
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("replacement logs schema");
+        let transaction = replacement.transaction().expect("replacement transaction");
+        for row_id in 1..=100_i64 {
+            let body = match row_id {
+                1 => "event.name=\"codex.conversation_starts\" user.account_id=acct-replacement-early".to_string(),
+                100 => "event.name=\"codex.conversation_starts\" user.account_id=acct-replacement-late".to_string(),
+                _ => format!("replacement filler row {row_id} {}", "x".repeat(256)),
+            };
+            transaction
+                .execute(
+                    "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        row_id,
+                        1_787_227_300_i64 + row_id,
+                        0_i64,
+                        "codex_otel.log_only",
+                        body
+                    ],
+                )
+                .expect("replacement telemetry row");
+        }
+        transaction.commit().expect("commit replacement telemetry");
+        drop(replacement);
+
+        let replacement_scan = CodexAdapter
+            .collect_account_evidence(&source, &appended.checkpoints)
+            .expect("replacement telemetry evidence");
+        let replacement_accounts = replacement_scan
+            .accounts
+            .iter()
+            .filter_map(|account| account.provider_user_id.as_deref())
+            .collect::<HashSet<_>>();
+        assert!(replacement_accounts.contains("acct-replacement-early"));
+        assert!(replacement_accounts.contains("acct-replacement-late"));
+        assert_eq!(replacement_scan.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn codex_skips_malformed_or_locked_telemetry_databases() {
+        let malformed = tempfile::tempdir().expect("malformed tempdir");
+        let malformed_connection =
+            Connection::open(malformed.path().join("logs_2.sqlite")).expect("malformed database");
+        malformed_connection
+            .execute_batch("CREATE TABLE logs (id INTEGER PRIMARY KEY, unexpected TEXT);")
+            .expect("malformed schema");
+        drop(malformed_connection);
+        let malformed_source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            malformed.path(),
+            LocationOrigin::Configured,
+        );
+        assert!(CodexAdapter
+            .collect_account_evidence(&malformed_source, &[])
+            .expect("malformed database is non-fatal")
+            .identity_observations
+            .is_empty());
+
+        let locked = tempfile::tempdir().expect("locked tempdir");
+        let locked_connection =
+            Connection::open(locked.path().join("logs_2.sqlite")).expect("locked database");
+        locked_connection
+            .execute_batch(
+                "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, feedback_log_body TEXT); PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;",
+            )
+            .expect("exclusive lock");
+        let locked_source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            locked.path(),
+            LocationOrigin::Configured,
+        );
+        assert!(CodexAdapter
+            .collect_account_evidence(&locked_source, &[])
+            .expect("locked database is non-fatal")
+            .identity_observations
+            .is_empty());
+        locked_connection
+            .execute_batch("ROLLBACK")
+            .expect("unlock database");
     }
 
     #[test]

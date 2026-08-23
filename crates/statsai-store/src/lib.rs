@@ -1,5 +1,6 @@
 //! Local SQLite storage for `statsai`.
 
+mod account_plan;
 mod archive;
 mod code_changes;
 mod migrations;
@@ -11,15 +12,16 @@ mod tasks;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use statsai_core::{
     hash_text, micro_usd_to_cents_rounded, normalize_email, normalize_provider_user_id,
     periods_overlap, project_bucket_key, project_contains_file_paths, project_has_stable_identity,
     provider_account_id, provider_account_id_from_identity, sanitize_code_change_metric_for_sync,
     sanitize_summary_for_sync, semantic_event_fingerprint, source_account_assignment_id,
-    subscription_id, summary_id, timestamp_in_period, BillingPeriod, CodeChangeMetric, Confidence,
-    CostAccumulator, CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource,
-    MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
+    subscription_id, summary_id, timestamp_in_period, AccountEvidenceSummaryV1,
+    AccountPlanProjectionV1, BillingPeriod, CodeChangeMetric, Confidence, CostAccumulator,
+    CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource, MetricStats,
+    ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
     SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
     SourceKind, SourceLocation, SourceVerificationMode, Subscription, SubscriptionId,
     SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetricTotals, SummaryMetrics,
@@ -32,6 +34,7 @@ use statsai_core::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+pub use account_plan::AccountEvidenceReferenceCounts;
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use snapshot::{clone_database_to, database_schema_version, DatabaseClone};
 use std::time::Duration;
@@ -58,6 +61,7 @@ pub use tasks::{
 const SYNC_ROLLUP_SUMMARY_VERSION: &str = "12";
 const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
 const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
+const LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY: &str = "migration.legacy_codex_plan_evidence.v1";
 const SQLITE_BUSY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(50)
 } else {
@@ -720,7 +724,26 @@ impl Store {
     }
 
     pub fn migrate(&self) -> Result<()> {
-        migrations::migrate(&self.conn)
+        migrations::migrate(&self.conn)?;
+        if self
+            .metadata_value(LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY)?
+            .as_deref()
+            != Some("1")
+        {
+            self.with_immediate_transaction(|| {
+                if self
+                    .metadata_value(LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY)?
+                    .as_deref()
+                    == Some("1")
+                {
+                    return Ok(());
+                }
+                self.migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()?;
+                self.set_metadata_value(LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY, "1")?;
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -2516,6 +2539,20 @@ impl Store {
                 target,
                 &batch.quota_cycle_contributions,
             )?;
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "account_plan_observation",
+                &batch.account_plan_observations,
+                |projection| projection.projection_id.as_str(),
+            )?;
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "account_evidence_summary",
+                &batch.account_evidence_summaries,
+                |summary| summary.summary_id.as_str(),
+            )?;
             self.record_task_bucket_snapshots_synced_in_transaction(
                 sink,
                 target,
@@ -2829,6 +2866,60 @@ impl Store {
         Ok(changed)
     }
 
+    fn pending_serialized_entities_for_sync<T: Clone + Serialize>(
+        &self,
+        sink: &str,
+        target: &str,
+        entity_kind: &str,
+        entities: &[T],
+        entity_id: impl Fn(&T) -> &str,
+    ) -> Result<Vec<T>> {
+        let mut changed = Vec::new();
+        for entity in entities {
+            let payload = serde_json::to_string(entity)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                entity_kind,
+                entity_id(entity),
+                &hash_text(&payload),
+            )? {
+                changed.push(entity.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn pending_account_plan_projections_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        projections: &[AccountPlanProjectionV1],
+    ) -> Result<Vec<AccountPlanProjectionV1>> {
+        self.pending_serialized_entities_for_sync(
+            sink,
+            target,
+            "account_plan_observation",
+            projections,
+            |projection| projection.projection_id.as_str(),
+        )
+    }
+
+    pub fn pending_account_evidence_summaries_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        summaries: &[AccountEvidenceSummaryV1],
+    ) -> Result<Vec<AccountEvidenceSummaryV1>> {
+        self.pending_serialized_entities_for_sync(
+            sink,
+            target,
+            "account_evidence_summary",
+            summaries,
+            |summary| summary.summary_id.as_str(),
+        )
+    }
+
     pub fn pending_summaries_for_sync(
         &self,
         sink: &str,
@@ -2950,6 +3041,22 @@ impl Store {
                     .map(String::as_str)
                     .collect::<BTreeSet<_>>(),
             ),
+            (
+                "account_plan_observation",
+                snapshot
+                    .account_plan_observation_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                "account_evidence_summary",
+                snapshot
+                    .account_evidence_summary_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+            ),
         ]);
         let mut statement = self.conn.prepare(
             r#"
@@ -2958,7 +3065,8 @@ impl Store {
             WHERE sink = ?1 AND target = ?2
               AND entity_kind IN (
                 'source', 'account', 'source_account_assignment', 'subscription', 'summary',
-                'code_change_metric', 'quota_cycle_contribution'
+                'code_change_metric', 'quota_cycle_contribution',
+                'account_plan_observation', 'account_evidence_summary'
               )
             "#,
         )?;
@@ -3035,6 +3143,18 @@ impl Store {
         )?;
         let current_quota_cycle_contributions =
             self.quota_cycle_contributions(&QuotaQuery::default(), device_id)?;
+        let current_account_plan_observations = self.account_plan_projections(device_id)?;
+        let account_plan_observations = self.pending_account_plan_projections_for_sync(
+            "http",
+            target,
+            &current_account_plan_observations,
+        )?;
+        let current_account_evidence_summaries = self.account_evidence_summaries(device_id)?;
+        let account_evidence_summaries = self.pending_account_evidence_summaries_for_sync(
+            "http",
+            target,
+            &current_account_evidence_summaries,
+        )?;
         let current_snapshot = self.current_http_sync_authoritative_snapshot(
             &current_rollups,
             &current_passthrough_summaries,
@@ -3043,6 +3163,8 @@ impl Store {
                 .iter()
                 .map(|contribution| contribution.contribution_id.clone())
                 .collect::<Vec<_>>(),
+            &current_account_plan_observations,
+            &current_account_evidence_summaries,
         )?;
         // A quota cycle can change without any summary changing: a reset moves,
         // or an observation carries no tokens. Counting only the summary-shaped
@@ -3069,6 +3191,8 @@ impl Store {
                 .saturating_add(passthrough_summaries.len())
                 .saturating_add(code_change_metrics.len())
                 .saturating_add(quota_cycle_contributions.len())
+                .saturating_add(account_plan_observations.len())
+                .saturating_add(account_evidence_summaries.len())
                 .saturating_add(retired_entities) as u64,
             days: days.len() as u64,
         })
@@ -3080,6 +3204,8 @@ impl Store {
         passthrough_summaries: &[UsageSummary],
         code_change_metrics: &[CodeChangeMetric],
         quota_cycle_contribution_ids: &[String],
+        account_plan_observations: &[AccountPlanProjectionV1],
+        account_evidence_summaries: &[AccountEvidenceSummaryV1],
     ) -> Result<SyncAuthoritativeSnapshot> {
         Ok(SyncAuthoritativeSnapshot {
             snapshot_id: String::new(),
@@ -3115,6 +3241,14 @@ impl Store {
                 .map(|metric| metric.metric_id.clone())
                 .collect(),
             quota_cycle_contribution_ids: quota_cycle_contribution_ids.to_vec(),
+            account_plan_observation_ids: account_plan_observations
+                .iter()
+                .map(|observation| observation.projection_id.clone())
+                .collect(),
+            account_evidence_summary_ids: account_evidence_summaries
+                .iter()
+                .map(|summary| summary.summary_id.clone())
+                .collect(),
         })
     }
 
@@ -3561,6 +3695,67 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    fn record_serialized_entities_synced_in_transaction<T: Serialize>(
+        &self,
+        sink: &str,
+        target: &str,
+        entity_kind: &str,
+        entities: &[T],
+        entity_id: impl Fn(&T) -> &str,
+    ) -> Result<()> {
+        for entity in entities {
+            let payload = serde_json::to_string(entity)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                entity_kind,
+                entity_id(entity),
+                &hash_text(&payload),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn record_account_plan_projections_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        projections: &[AccountPlanProjectionV1],
+    ) -> Result<()> {
+        if projections.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "account_plan_observation",
+                projections,
+                |projection| projection.projection_id.as_str(),
+            )
+        })
+    }
+
+    pub fn record_account_evidence_summaries_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        summaries: &[AccountEvidenceSummaryV1],
+    ) -> Result<()> {
+        if summaries.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "account_evidence_summary",
+                summaries,
+                |summary| summary.summary_id.as_str(),
+            )
+        })
     }
 
     pub fn compute_daily_rollup(&self, date: &str, device_id: &str) -> Result<DailyRollup> {
@@ -4184,7 +4379,9 @@ fn apply_verified_source_state_with_recovery_boundary(
             provider_user_id: verified_state.provider_user_id.as_deref(),
             email: verified_state.email.as_deref(),
             label: verified_state.account_label.clone(),
-            plan_name: verified_state.plan_name.clone(),
+            plan_name: (!source.provider.eq_ignore_ascii_case("codex"))
+                .then(|| verified_state.plan_name.clone())
+                .flatten(),
             identity_source: Some(record_source.clone()),
             verified_at: verified_state.verified_at,
         },
@@ -4591,6 +4788,11 @@ fn upsert_verified_subscription(
     provider_account_id: &ProviderAccountId,
     verified: &VerifiedSubscriptionState,
 ) -> Result<()> {
+    // Codex authentication exposes provider plan state, not user billing facts. Its adapter
+    // persists that information through the plan-evidence ledger instead of this billing table.
+    if provider.eq_ignore_ascii_case("codex") {
+        return Ok(());
+    }
     validate_time_window(verified.started_at, None, "subscription")?;
     let subscriptions: Vec<_> = store
         .list_subscriptions()?
@@ -4882,6 +5084,7 @@ fn reattribute_source_records(store: &Store, source_id: &SourceId) -> Result<()>
     store.rewrite_events(&events)?;
     store.rewrite_summaries(&summaries)?;
     store.reattribute_quota_observations(source_id)?;
+    store.rebuild_quota_plan_observations_for_source(source_id)?;
     Ok(())
 }
 
@@ -6735,6 +6938,396 @@ mod tests {
                 .single()
                 .expect("started_at")
         );
+    }
+
+    #[test]
+    fn migrates_only_codex_local_auth_subscriptions_into_plan_evidence() {
+        let store = Store::in_memory().expect("store");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("started_at");
+        let active_until = Utc
+            .with_ymd_and_hms(2026, 7, 1, 0, 0, 0)
+            .single()
+            .expect("active_until");
+        let account_id = provider_account_id("codex", "provider-user");
+        let synthetic = Subscription {
+            schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+            subscription_id: SubscriptionId("synthetic-codex-plan".to_string()),
+            provider: "codex".to_string(),
+            provider_account_id: account_id.clone(),
+            plan_name: "future_ultra".to_string(),
+            price: 20_00,
+            currency: "USD".to_string(),
+            billing_period: BillingPeriod::Monthly,
+            paid_at: Some(started_at),
+            renewal_day: Some(1),
+            started_at,
+            ended_at: None,
+            current_period_ends_at: Some(active_until),
+            status: SubscriptionStatus::Active,
+            record_source: IdentitySource::LocalAuth,
+            verified_at: Some(started_at),
+            notes: None,
+        };
+        let manual = Subscription {
+            subscription_id: SubscriptionId("manual-codex-billing".to_string()),
+            record_source: IdentitySource::UserConfigured,
+            price: 12_34,
+            ..synthetic.clone()
+        };
+        store.upsert_subscription(&synthetic).expect("synthetic");
+        store.upsert_subscription(&manual).expect("manual");
+
+        assert_eq!(
+            store
+                .migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()
+                .expect("migration"),
+            1
+        );
+        assert_eq!(
+            store
+                .migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()
+                .expect("repeat migration"),
+            0
+        );
+
+        assert_eq!(store.list_subscriptions().expect("billing"), vec![manual]);
+        let observations = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].provider_account_id, Some(account_id));
+        assert_eq!(observations[0].raw_plan_name, "future_ultra");
+        assert_eq!(observations[0].plan_name, "Future Ultra");
+        assert_eq!(observations[0].active_from, Some(started_at));
+        assert_eq!(observations[0].active_until, Some(active_until));
+        assert_eq!(
+            observations[0].evidence_kind,
+            statsai_core::AccountEvidenceKind::LegacyLocalAuth
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_codex_account_plan_without_subscription() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("observed at");
+        let account_id = provider_account_id("codex", "legacy-plan-account");
+        store
+            .upsert_account(&ProviderAccount {
+                schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+                provider_account_id: account_id.clone(),
+                provider: "codex".to_string(),
+                identity_source: IdentitySource::LocalAuth,
+                provider_user_id: None,
+                provider_user_id_hash: Some("a".repeat(64)),
+                email: None,
+                email_hash: None,
+                org_id_hash: None,
+                account_label: Some("Codex account".to_string()),
+                plan_name: Some("future_ultra".to_string()),
+                confidence: Confidence::High,
+                verified_at: Some(observed_at),
+                created_at: observed_at,
+                updated_at: observed_at,
+            })
+            .expect("legacy account");
+
+        assert_eq!(
+            store
+                .migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()
+                .expect("migration"),
+            0
+        );
+
+        let account = store
+            .account(&account_id)
+            .expect("account")
+            .expect("exists");
+        assert_eq!(account.plan_name, None);
+        assert_eq!(account.account_label.as_deref(), Some("Codex account"));
+        let observations = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].provider_account_id, Some(account_id));
+        assert_eq!(observations[0].raw_plan_name, "future_ultra");
+        assert_eq!(observations[0].plan_name, "Future Ultra");
+        assert_eq!(observations[0].active_from, None);
+        assert_eq!(observations[0].active_until, None);
+        assert_eq!(
+            observations[0].evidence_kind,
+            statsai_core::AccountEvidenceKind::LegacyLocalAuth
+        );
+        assert_eq!(
+            store
+                .migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()
+                .expect("repeat migration"),
+            0
+        );
+        assert_eq!(
+            store
+                .account_plan_observations()
+                .expect("repeated plan evidence")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn completed_legacy_plan_conversion_is_not_repeated_on_migrate() {
+        let store = Store::in_memory().expect("store");
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO account_plan_observations (
+                  observation_id, provider, source_id, provider_account_id,
+                  observed_at, active_from, active_until, plan_name, evidence_kind, payload
+                ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, ?5, ?6, ?7)
+                "#,
+                params![
+                    "post-conversion-malformed-observation",
+                    "codex",
+                    "source-after-conversion",
+                    "2026-08-23T00:00:00Z",
+                    "Pro",
+                    "quota_status",
+                    "not-json"
+                ],
+            )
+            .expect("insert evidence that must not be rescanned");
+
+        store.migrate().expect("completed conversion stays skipped");
+    }
+
+    #[test]
+    fn direct_conversation_evidence_overrides_only_that_event_and_preserves_manual_interval() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-direct-account-binding"),
+            LocationOrigin::Configured,
+        );
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
+            .single()
+            .expect("observed_at");
+        let manual_account = ProviderAccountId("manual-account".to_string());
+        let directly_bound_account = ProviderAccountId("direct-account".to_string());
+        store.upsert_source(&source).expect("source");
+        let manual_assignment = SourceAccountAssignment {
+            schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+            assignment_id: SourceAccountAssignmentId("manual-assignment".to_string()),
+            source_id: source.source_id.clone(),
+            provider: "codex".to_string(),
+            provider_account_id: manual_account.clone(),
+            started_at: observed_at - chrono::Duration::days(1),
+            ended_at: None,
+            record_source: IdentitySource::UserConfigured,
+            verified_at: None,
+            created_at: observed_at,
+            updated_at: observed_at,
+        };
+        store
+            .upsert_source_account_assignment(&manual_assignment)
+            .expect("manual assignment");
+        let direct_binding = statsai_core::ConversationAccountBindingV1 {
+            schema_version: statsai_core::CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION.to_string(),
+            binding_id: "direct-binding".to_string(),
+            provider: "codex".to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: directly_bound_account.clone(),
+            conversation_id_hash: "same-session".to_string(),
+            turn_id_hash: None,
+            observed_at,
+            evidence_kind: statsai_core::AccountEvidenceKind::ResetHistory,
+            confidence: Confidence::High,
+        };
+        assert_eq!(
+            store
+                .upsert_conversation_account_bindings(std::slice::from_ref(&direct_binding))
+                .expect("direct binding"),
+            1
+        );
+        assert_eq!(
+            store
+                .upsert_conversation_account_bindings(&[direct_binding])
+                .expect("repeat direct binding"),
+            0
+        );
+        store
+            .upsert_account_identity_observations(&[statsai_core::AccountIdentityObservationV1 {
+                schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                    .to_string(),
+                observation_id: "direct-identity".to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(directly_bound_account.clone()),
+                provider_user_id_hash: Some("provider-id-hash".to_string()),
+                email_hash: None,
+                conversation_id_hash: Some("same-session".to_string()),
+                turn_id_hash: None,
+                observed_at,
+                evidence_kind: statsai_core::AccountEvidenceKind::ResetHistory,
+                confidence: Confidence::High,
+                auth_mode: None,
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "test".to_string(),
+                artifact_path_hash: "path-hash".to_string(),
+                record_fingerprint: "record-hash".to_string(),
+            }])
+            .expect("identity observation");
+        let mut directly_bound = test_store_event(&source, observed_at, "direct");
+        directly_bound.provider_account_id = Some(manual_account.clone());
+        let mut unrelated = test_store_event(&source, observed_at, "unrelated");
+        unrelated.session.local_session_id_hash = Some("other-session".to_string());
+        unrelated.provider_account_id = Some(manual_account.clone());
+        let mut events = vec![directly_bound, unrelated];
+
+        store
+            .apply_conversation_account_bindings(&source.source_id, &mut events)
+            .expect("apply binding");
+
+        assert_eq!(events[0].provider_account_id, Some(directly_bound_account));
+        assert_eq!(events[1].provider_account_id, Some(manual_account.clone()));
+        assert_eq!(
+            store
+                .list_source_account_assignments_for_source(&source.source_id)
+                .expect("manual interval"),
+            vec![manual_assignment]
+        );
+        let summaries = store
+            .account_evidence_summaries("device")
+            .expect("evidence summary");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].directly_bound_conversations, 1);
+        assert_eq!(summaries[0].uncovered_gap_count, 0);
+        assert_eq!(summaries[0].conflict_count, 1);
+    }
+
+    #[test]
+    fn confirmed_auth_reload_boundaries_repair_switches_conservatively() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-account-evidence-switch"),
+            LocationOrigin::Configured,
+        );
+        let base = Utc
+            .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
+            .single()
+            .expect("base");
+        let account_a = ProviderAccountId("account-a".to_string());
+        let account_b = ProviderAccountId("account-b".to_string());
+        store.upsert_source(&source).expect("source");
+        store
+            .upsert_source_account_assignment(&SourceAccountAssignment {
+                schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                assignment_id: SourceAccountAssignmentId("broad-account-a".to_string()),
+                source_id: source.source_id.clone(),
+                provider: "codex".to_string(),
+                provider_account_id: account_a.clone(),
+                started_at: base,
+                ended_at: None,
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(base),
+                created_at: base,
+                updated_at: base,
+            })
+            .expect("broad assignment");
+        let observation = |id: &str,
+                           account: ProviderAccountId,
+                           observed_at: chrono::DateTime<Utc>,
+                           kind: statsai_core::AccountEvidenceKind| {
+            statsai_core::AccountIdentityObservationV1 {
+                schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                    .to_string(),
+                observation_id: id.to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(account),
+                provider_user_id_hash: Some(format!("hash-{id}")),
+                email_hash: None,
+                conversation_id_hash: None,
+                turn_id_hash: None,
+                observed_at,
+                evidence_kind: kind,
+                confidence: Confidence::High,
+                auth_mode: Some("chatgpt".to_string()),
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "test".to_string(),
+                artifact_path_hash: "path-hash".to_string(),
+                record_fingerprint: format!("fingerprint-{id}"),
+            }
+        };
+        let account_a_reload = base + chrono::Duration::days(1);
+        let account_a_confirmation = base + chrono::Duration::days(2);
+        let account_b_reload = base + chrono::Duration::days(3);
+        let account_b_confirmation = base + chrono::Duration::days(4);
+        store
+            .upsert_account_identity_observations(&[
+                observation(
+                    "a-reload",
+                    account_a.clone(),
+                    account_a_reload,
+                    statsai_core::AccountEvidenceKind::AuthReload,
+                ),
+                observation(
+                    "a-confirm",
+                    account_a.clone(),
+                    account_a_confirmation,
+                    statsai_core::AccountEvidenceKind::TelemetryIdentity,
+                ),
+                observation(
+                    "b-reload",
+                    account_b.clone(),
+                    account_b_reload,
+                    statsai_core::AccountEvidenceKind::AuthReload,
+                ),
+                observation(
+                    "b-confirm",
+                    account_b.clone(),
+                    account_b_confirmation,
+                    statsai_core::AccountEvidenceKind::AuthSnapshot,
+                ),
+            ])
+            .expect("identity evidence");
+
+        assert!(
+            store
+                .reconcile_source_account_evidence_assignments(&source.source_id)
+                .expect("repair intervals")
+                > 0
+        );
+        assert_eq!(
+            store
+                .reconcile_source_account_evidence_assignments(&source.source_id)
+                .expect("repeat repair"),
+            0
+        );
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 2);
+        let repaired_a = assignments
+            .iter()
+            .find(|assignment| assignment.provider_account_id == account_a)
+            .expect("account a interval");
+        assert_eq!(repaired_a.started_at, base);
+        assert_eq!(repaired_a.ended_at, Some(account_b_reload));
+        let repaired_b = assignments
+            .iter()
+            .find(|assignment| assignment.provider_account_id == account_b)
+            .expect("account b interval");
+        assert_eq!(repaired_b.started_at, account_b_reload);
+        assert_eq!(repaired_b.ended_at, None);
     }
 
     #[test]
@@ -8680,6 +9273,8 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: summaries.clone(),
             task_buckets: Vec::new(),
@@ -10138,6 +10733,98 @@ mod tests {
                 .expect("project backfill counts")
                 .total,
             1
+        );
+    }
+
+    #[test]
+    fn pending_http_sync_summary_counts_include_account_plan_and_evidence_only_uploads() {
+        let store = Store::in_memory().expect("store");
+        let target = "https://api.example.com/api/sync/batches";
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .expect("observed at");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-pending-account-evidence"),
+            LocationOrigin::Configured,
+        );
+        let account_id = ProviderAccountId("pending-account".to_string());
+        store.upsert_source(&source).expect("source");
+        store
+            .upsert_account_identity_observations(&[statsai_core::AccountIdentityObservationV1 {
+                schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                    .to_string(),
+                observation_id: "pending-identity".to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(account_id.clone()),
+                provider_user_id_hash: Some("provider-id-hash".to_string()),
+                email_hash: None,
+                conversation_id_hash: None,
+                turn_id_hash: None,
+                observed_at,
+                evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+                confidence: Confidence::High,
+                auth_mode: Some("chatgpt".to_string()),
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "auth_json".to_string(),
+                artifact_path_hash: "path-hash".to_string(),
+                record_fingerprint: "identity-fingerprint".to_string(),
+            }])
+            .expect("identity evidence");
+        store
+            .upsert_account_plan_observations(&[statsai_core::AccountPlanObservationV1 {
+                schema_version: statsai_core::ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id: "pending-plan".to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id,
+                provider_account_id: Some(account_id),
+                raw_plan_name: "plus".to_string(),
+                plan_name: "Plus".to_string(),
+                observed_at,
+                active_from: None,
+                active_until: None,
+                is_current_snapshot: true,
+                evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+                confidence: Confidence::High,
+                parser_version: "test.v1".to_string(),
+                artifact_path_hash: "path-hash".to_string(),
+                record_fingerprint: "plan-fingerprint".to_string(),
+            }])
+            .expect("plan evidence");
+
+        let plans = store
+            .account_plan_projections("device")
+            .expect("plan projections");
+        let evidence = store
+            .account_evidence_summaries("device")
+            .expect("evidence summaries");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts(target, "device")
+                .expect("pending counts")
+                .total,
+            2
+        );
+
+        store
+            .record_account_plan_projections_synced("http", target, &plans)
+            .expect("record plan synced");
+        store
+            .record_account_evidence_summaries_synced("http", target, &evidence)
+            .expect("record evidence synced");
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts(target, "device")
+                .expect("settled counts")
+                .total,
+            0
         );
     }
 

@@ -2161,6 +2161,8 @@ mod tests {
                 accounts: Vec::new(),
                 source_account_assignments: Vec::new(),
                 subscriptions: Vec::new(),
+                account_plan_observations: Vec::new(),
+                account_evidence_summaries: Vec::new(),
                 events: Vec::new(),
                 summaries: Vec::new(),
                 task_buckets: Vec::new(),

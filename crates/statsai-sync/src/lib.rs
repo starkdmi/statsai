@@ -3,8 +3,9 @@
 use anyhow::{bail, Context, Result};
 use statsai_core::{
     SyncAck, SyncBatch, SYNC_ACK_V1_SCHEMA_VERSION, SYNC_ACK_V2_SCHEMA_VERSION,
-    SYNC_ACK_V3_SCHEMA_VERSION, SYNC_ACK_V4_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION,
-    SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION, SYNC_BATCH_V4_SCHEMA_VERSION,
+    SYNC_ACK_V3_SCHEMA_VERSION, SYNC_ACK_V4_SCHEMA_VERSION, SYNC_ACK_V5_SCHEMA_VERSION,
+    SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION,
+    SYNC_BATCH_V4_SCHEMA_VERSION, SYNC_BATCH_V5_SCHEMA_VERSION,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -180,6 +181,7 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         SYNC_BATCH_V2_SCHEMA_VERSION => SYNC_ACK_V2_SCHEMA_VERSION,
         SYNC_BATCH_V3_SCHEMA_VERSION => SYNC_ACK_V3_SCHEMA_VERSION,
         SYNC_BATCH_V4_SCHEMA_VERSION => SYNC_ACK_V4_SCHEMA_VERSION,
+        SYNC_BATCH_V5_SCHEMA_VERSION => SYNC_ACK_V5_SCHEMA_VERSION,
         other => bail!("unsupported sync batch schema {other}"),
     };
     if ack.schema_version != expected_ack_schema {
@@ -233,6 +235,24 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         ack.duplicates.subscriptions,
     )?;
     validate_sync_ack_counts(
+        "account_plan_observations",
+        batch.account_plan_observations.len() as u64,
+        ack.accepted.account_plan_observations,
+        ack.duplicates.account_plan_observations,
+    )?;
+    validate_sync_ack_counts(
+        "account_evidence_summaries",
+        batch.account_evidence_summaries.len() as u64,
+        ack.accepted.account_evidence_summaries,
+        ack.duplicates.account_evidence_summaries,
+    )?;
+    validate_sync_ack_counts(
+        "quota_cycle_contributions",
+        batch.quota_cycle_contributions.len() as u64,
+        ack.accepted.quota_cycle_contributions,
+        ack.duplicates.quota_cycle_contributions,
+    )?;
+    validate_sync_ack_counts(
         "events",
         batch.events.len() as u64,
         ack.accepted.events,
@@ -267,6 +287,18 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         batch.quota_cycle_contributions.len() as u64,
         ack.accepted.quota_cycle_contributions,
         ack.duplicates.quota_cycle_contributions,
+    )?;
+    validate_sync_ack_counts(
+        "account_plan_observations",
+        batch.account_plan_observations.len() as u64,
+        ack.accepted.account_plan_observations,
+        ack.duplicates.account_plan_observations,
+    )?;
+    validate_sync_ack_counts(
+        "account_evidence_summaries",
+        batch.account_evidence_summaries.len() as u64,
+        ack.accepted.account_evidence_summaries,
+        ack.duplicates.account_evidence_summaries,
     )?;
     Ok(())
 }
@@ -386,6 +418,8 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets: Vec::new(),
@@ -493,7 +527,7 @@ mod tests {
         let (auth, content_type, body) = rx.recv().expect("request body");
         assert_eq!(auth.as_deref(), Some("Bearer token_123"));
         assert_eq!(content_type.as_deref(), Some("application/json"));
-        assert!(body.contains("\"schema_version\":\"sync_batch.v4\""));
+        assert!(body.contains("\"schema_version\":\"sync_batch.v5\""));
         assert!(body.contains("\"batch_id\":\"batch_1\""));
     }
 
@@ -592,8 +626,8 @@ mod tests {
         ))
         .expect("v1 ack");
 
-        let error = validate_sync_ack(&batch, &ack).expect_err("v4 batch with v1 ack");
-        assert!(error.to_string().contains("requires sync_ack.v4"));
+        let error = validate_sync_ack(&batch, &ack).expect_err("v5 batch with v1 ack");
+        assert!(error.to_string().contains("requires sync_ack.v5"));
 
         batch.schema_version = SYNC_BATCH_V1_SCHEMA_VERSION.to_string();
         ack.schema_version = SYNC_ACK_V2_SCHEMA_VERSION.to_string();
@@ -610,6 +644,10 @@ mod tests {
         batch.schema_version = SYNC_BATCH_V4_SCHEMA_VERSION.to_string();
         ack.schema_version = SYNC_ACK_V4_SCHEMA_VERSION.to_string();
         validate_sync_ack(&batch, &ack).expect("matching v4 schemas");
+
+        batch.schema_version = SYNC_BATCH_V5_SCHEMA_VERSION.to_string();
+        ack.schema_version = SYNC_ACK_V5_SCHEMA_VERSION.to_string();
+        validate_sync_ack(&batch, &ack).expect("matching v5 schemas");
     }
 
     #[test]
