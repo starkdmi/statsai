@@ -577,6 +577,24 @@ impl Store {
                 clusters.push(vec![point]);
             }
 
+            // A window that reported zero usage for its whole life and was then
+            // replaced never functioned as a cycle: nothing was ever attributed
+            // to it, so it cannot be told apart from a reschedule of the window
+            // that followed. Provider-side resets during the July 2026 tier
+            // migration left runs of these minutes apart, each one drawn as a
+            // separate reset that never happened. The final cluster is exempt,
+            // because a cycle that has only just begun legitimately reads zero.
+            let cluster_count = clusters.len();
+            let clusters = clusters
+                .into_iter()
+                .enumerate()
+                .filter(|(index, cluster)| {
+                    *index + 1 == cluster_count
+                        || cluster.iter().any(|point| point.window.used_percent > 0.0)
+                })
+                .map(|(_, cluster)| cluster)
+                .collect::<Vec<_>>();
+
             let schedules = clusters
                 .iter()
                 .map(|cluster| QuotaClusterSchedule::from_points(&scope, cluster))
@@ -2420,6 +2438,112 @@ mod tests {
         assert!(json.get("sample_count").is_none());
         assert!(json.get("latest_status").is_none());
         assert_eq!(json.get("has_schedule_overlap"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn a_window_that_never_left_zero_is_not_a_cycle() {
+        let store = Store::in_memory().expect("store");
+        let real = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        // The provider briefly reported a window resetting 40 minutes earlier,
+        // at zero, before settling on the one that went on to be used.
+        let stub_reset = real - Duration::minutes(40);
+        let (source_id, _) = assigned_source(&store, real - Duration::days(9));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "stub",
+                    "stub",
+                    stub_reset - Duration::days(7) + Duration::minutes(5),
+                    stub_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    0.0,
+                ),
+                sample_record(
+                    source_id,
+                    "real",
+                    "real",
+                    real - Duration::days(6),
+                    real.timestamp(),
+                    "secondary",
+                    10_080,
+                    64.0,
+                ),
+            ])
+            .expect("observations");
+
+        let windows = store
+            .quota_windows(&QuotaQuery::default())
+            .expect("windows");
+        assert_eq!(
+            windows.len(),
+            1,
+            "the zero-only window is not its own cycle"
+        );
+        assert_eq!(windows[0].representative_reset, real);
+    }
+
+    #[test]
+    fn a_cycle_that_has_only_just_begun_survives_at_zero() {
+        let store = Store::in_memory().expect("store");
+        let reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let (source_id, _) = assigned_source(&store, reset - Duration::days(9));
+        store
+            .upsert_quota_observations(&[sample_record(
+                source_id,
+                "fresh",
+                "fresh",
+                reset - Duration::days(7) + Duration::minutes(5),
+                reset.timestamp(),
+                "secondary",
+                10_080,
+                0.0,
+            )])
+            .expect("observation");
+
+        let windows = store
+            .quota_windows(&QuotaQuery::default())
+            .expect("windows");
+        assert_eq!(windows.len(), 1, "the newest cycle is exempt");
+        assert_eq!(windows[0].maximum_used_percent, 0.0);
+    }
+
+    #[test]
+    fn a_superseded_window_that_spent_anything_stays_a_cycle() {
+        let store = Store::in_memory().expect("store");
+        let real = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let earlier_reset = real - Duration::minutes(40);
+        let (source_id, _) = assigned_source(&store, real - Duration::days(9));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "spent-a-little",
+                    "spent-a-little",
+                    earlier_reset - Duration::days(7) + Duration::minutes(5),
+                    earlier_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    3.0,
+                ),
+                sample_record(
+                    source_id,
+                    "real",
+                    "real",
+                    real - Duration::days(6),
+                    real.timestamp(),
+                    "secondary",
+                    10_080,
+                    64.0,
+                ),
+            ])
+            .expect("observations");
+
+        let windows = store
+            .quota_windows(&QuotaQuery::default())
+            .expect("windows");
+        assert_eq!(windows.len(), 2, "3% spent is still a real cycle");
     }
 
     #[test]
