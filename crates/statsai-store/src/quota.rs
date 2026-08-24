@@ -1119,7 +1119,7 @@ fn daily_envelopes_from_points(points: &[WindowPoint]) -> Vec<QuotaDailyEnvelope
             .or_default()
             .push(point);
     }
-    grouped
+    let mut envelopes = grouped
         .into_iter()
         .map(|(day, mut day_points)| {
             day_points.sort_by_key(|point| point.observation.observed_at);
@@ -1141,7 +1141,23 @@ fn daily_envelopes_from_points(points: &[WindowPoint]) -> Vec<QuotaDailyEnvelope
                     .fold(f64::NEG_INFINITY, f64::max),
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    // Consumption cannot fall inside a window, so a reading below one already
+    // seen is stale rather than a refund. Concurrent sessions produce them
+    // routinely: two poll at once and the slower one still holds the earlier
+    // figure, sometimes within the same second. Left alone the daily closing
+    // walks backwards. The observed extremes stay untouched, since they are
+    // the evidence that the jitter happened.
+    let mut consumed = f64::NEG_INFINITY;
+    for envelope in &mut envelopes {
+        if consumed.is_finite() {
+            envelope.first_used_percent = envelope.first_used_percent.max(consumed);
+        }
+        consumed = consumed.max(envelope.maximum_used_percent);
+        envelope.last_used_percent = envelope.last_used_percent.max(consumed);
+    }
+    envelopes
 }
 
 fn utc_day_start(timestamp: DateTime<Utc>) -> DateTime<Utc> {
@@ -2438,6 +2454,70 @@ mod tests {
         assert!(json.get("sample_count").is_none());
         assert!(json.get("latest_status").is_none());
         assert_eq!(json.get("has_schedule_overlap"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn stale_concurrent_readings_never_walk_the_daily_closing_backwards() {
+        let store = Store::in_memory().expect("store");
+        let reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let day_one = reset - Duration::days(3);
+        let day_two = day_one + Duration::days(1);
+        let (source_id, _) = assigned_source(&store, reset - Duration::days(9));
+        // Two sessions poll together; the slower one still reports the older
+        // figure, and on the second day it lands last.
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "d1-low",
+                    "d1-low",
+                    day_one,
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    27.0,
+                ),
+                sample_record(
+                    source_id.clone(),
+                    "d1-high",
+                    "d1-high",
+                    day_one + Duration::hours(2),
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    59.0,
+                ),
+                sample_record(
+                    source_id,
+                    "d2-stale",
+                    "d2-stale",
+                    day_two,
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    56.0,
+                ),
+            ])
+            .expect("observations");
+
+        let contributions = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-a")
+            .expect("contributions");
+        assert_eq!(contributions.len(), 1);
+        let envelopes = &contributions[0].daily_envelopes;
+        assert_eq!(envelopes.len(), 2);
+        // The stale 56% must not read as a drop from the 59% already spent.
+        assert_eq!(envelopes[0].last_used_percent, 59.0);
+        assert_eq!(envelopes[1].last_used_percent, 59.0);
+        assert_eq!(envelopes[1].first_used_percent, 59.0);
+        // The raw extremes still record that a 56% reading arrived.
+        assert_eq!(envelopes[1].minimum_used_percent, 56.0);
+        assert!(
+            envelopes
+                .windows(2)
+                .all(|pair| pair[1].last_used_percent >= pair[0].last_used_percent),
+            "daily closings never decrease inside a cycle"
+        );
     }
 
     #[test]
