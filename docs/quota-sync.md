@@ -46,6 +46,17 @@ or granted server-side. Overlapping schedules are consequently expected, and
 `has_schedule_overlap` records that a single device reconstructed the overlap
 from its own observations.
 
+A reset is a handover: once a window resets, the provider reports the new
+schedule and never returns to the old one. Local reconstruction therefore
+discards any schedule that another schedule brackets — reported before it
+appeared and again after it vanished — once that other schedule has passed
+everything the bracketed one ever claimed. During the July 2026 tier migration
+Codex answered scattered turns with a blank snapshot, near-zero usage against a
+fresh weekly reset, interleaved with the live schedule for up to 34 hours; each
+such run would otherwise become a cycle that takes days away from the cycle
+actually running. A genuine early reset leads from the moment it starts and the
+schedule it replaced stops being reported, so it can never be bracketed.
+
 Complete UTC days are not copied into the contribution. The backend joins
 existing daily summaries for those days. Boundary slices exist only to avoid
 inaccurate proration at cycle and schedule-transition edges. Usage observed on

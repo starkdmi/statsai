@@ -595,6 +595,14 @@ impl Store {
                 .map(|(_, cluster)| cluster)
                 .collect::<Vec<_>>();
 
+            let phantoms = phantom_cluster_indices(&clusters);
+            let clusters = clusters
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !phantoms.contains(index))
+                .map(|(_, cluster)| cluster)
+                .collect::<Vec<_>>();
+
             let schedules = clusters
                 .iter()
                 .map(|cluster| QuotaClusterSchedule::from_points(&scope, cluster))
@@ -1031,6 +1039,74 @@ struct WindowScope {
 struct WindowPoint {
     observation: QuotaObservationV1,
     window: QuotaWindowObservationV1,
+}
+
+/// When a cluster was observed and the most it ever reported.
+struct ClusterLife {
+    first_observed_at: DateTime<Utc>,
+    last_observed_at: DateTime<Utc>,
+    peak_used_percent: f64,
+}
+
+fn cluster_life(cluster: &[WindowPoint]) -> Option<ClusterLife> {
+    let first = cluster.iter().map(|p| p.observation.observed_at).min()?;
+    let last = cluster.iter().map(|p| p.observation.observed_at).max()?;
+    Some(ClusterLife {
+        first_observed_at: first,
+        last_observed_at: last,
+        peak_used_percent: cluster
+            .iter()
+            .map(|p| p.window.used_percent)
+            .fold(f64::NEG_INFINITY, f64::max),
+    })
+}
+
+/// True when `live` was still being reported both before `suspect` appeared and
+/// after it vanished, and had by then outrun everything `suspect` ever claimed.
+fn brackets_and_outruns(live: &[WindowPoint], suspect: &ClusterLife) -> bool {
+    let preceded = live
+        .iter()
+        .any(|p| p.observation.observed_at < suspect.first_observed_at);
+    let resumed = live
+        .iter()
+        .filter(|p| p.observation.observed_at > suspect.last_observed_at)
+        .min_by_key(|p| p.observation.observed_at);
+    let Some(resumed) = resumed else { return false };
+    preceded && resumed.window.used_percent > suspect.peak_used_percent
+}
+
+/// Clusters that describe a schedule the provider never actually switched to.
+///
+/// A reset is a handover: once a window resets, the provider reports the new
+/// schedule and never returns to the old one. So a cluster that another cluster
+/// brackets in observation time — reported before this one appeared and again
+/// after it vanished — cannot be a cycle in its own right, however many
+/// observations back it.
+///
+/// During the July 2026 tier migration Codex answered a scattering of turns
+/// with a blank snapshot: near-zero usage and a fresh weekly reset, interleaved
+/// with the live schedule for as long as 34 hours. Each run became a cycle that
+/// took days away from the cycle actually running, which is what put two rising
+/// lines over the same hours for a single account.
+///
+/// Requiring the bracketing cluster to have outrun the suspect's peak by the
+/// time it resumes preserves genuine early resets. A redeemed reset takes the
+/// lead from the moment it starts and the schedule it replaced is never
+/// reported again, so it cannot be bracketed at all — let alone outrun.
+fn phantom_cluster_indices(clusters: &[Vec<WindowPoint>]) -> HashSet<usize> {
+    let lives = clusters.iter().map(|c| cluster_life(c)).collect::<Vec<_>>();
+    let mut phantoms = HashSet::new();
+    for (index, life) in lives.iter().enumerate() {
+        let Some(life) = life else { continue };
+        let bracketed = clusters
+            .iter()
+            .enumerate()
+            .any(|(other, live)| other != index && brackets_and_outruns(live, life));
+        if bracketed {
+            phantoms.insert(index);
+        }
+    }
+    phantoms
 }
 
 #[derive(Debug, Clone)]
@@ -2562,6 +2638,140 @@ mod tests {
             "the zero-only window is not its own cycle"
         );
         assert_eq!(windows[0].representative_reset, real);
+    }
+
+    #[test]
+    fn an_interleaved_schedule_the_provider_never_switched_to_is_not_a_cycle() {
+        let store = Store::in_memory().expect("store");
+        let live_reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let start = live_reset - Duration::days(7);
+        // Codex answered two turns mid-cycle with a blank snapshot: a token
+        // percentage against a reset a day later than the one it kept
+        // reporting either side.
+        let phantom_reset = live_reset + Duration::days(1);
+        let (source_id, _) = assigned_source(&store, start - Duration::days(2));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "live-1",
+                    "live-1",
+                    start + Duration::hours(1),
+                    live_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    21.0,
+                ),
+                sample_record(
+                    source_id.clone(),
+                    "phantom-1",
+                    "phantom-1",
+                    start + Duration::hours(2),
+                    phantom_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    0.0,
+                ),
+                sample_record(
+                    source_id.clone(),
+                    "phantom-2",
+                    "phantom-2",
+                    start + Duration::hours(3),
+                    phantom_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    1.0,
+                ),
+                sample_record(
+                    source_id,
+                    "live-2",
+                    "live-2",
+                    start + Duration::hours(4),
+                    live_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    44.0,
+                ),
+            ])
+            .expect("observations");
+
+        let windows = store
+            .quota_windows(&QuotaQuery::default())
+            .expect("windows");
+        assert_eq!(
+            windows.len(),
+            1,
+            "a schedule reported between two readings of the one that outran it did not reset"
+        );
+        assert_eq!(windows[0].representative_reset, live_reset);
+        assert_eq!(windows[0].maximum_used_percent, 44.0);
+    }
+
+    #[test]
+    fn an_early_reset_that_took_over_stays_a_cycle() {
+        let store = Store::in_memory().expect("store");
+        let first_reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let start = first_reset - Duration::days(7);
+        // A redeemed reset zeroes the window and issues a fresh schedule. The
+        // schedule it replaced is never reported again, so nothing brackets it.
+        let redeemed_reset = first_reset + Duration::days(4);
+        let (source_id, _) = assigned_source(&store, start - Duration::days(2));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "before-1",
+                    "before-1",
+                    start + Duration::hours(1),
+                    first_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    21.0,
+                ),
+                sample_record(
+                    source_id.clone(),
+                    "before-2",
+                    "before-2",
+                    start + Duration::hours(2),
+                    first_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    64.0,
+                ),
+                sample_record(
+                    source_id.clone(),
+                    "after-1",
+                    "after-1",
+                    start + Duration::hours(3),
+                    redeemed_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    0.0,
+                ),
+                sample_record(
+                    source_id,
+                    "after-2",
+                    "after-2",
+                    start + Duration::hours(4),
+                    redeemed_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    9.0,
+                ),
+            ])
+            .expect("observations");
+
+        let windows = store
+            .quota_windows(&QuotaQuery::default())
+            .expect("windows");
+        assert_eq!(
+            windows.len(),
+            2,
+            "an early reset that the provider switched to is its own cycle"
+        );
+        assert!(windows
+            .iter()
+            .any(|window| window.representative_reset == redeemed_reset));
     }
 
     #[test]
