@@ -265,6 +265,12 @@ pub struct QuotaCycleContributionV1 {
     pub window_minutes: u64,
     pub representative_reset: DateTime<Utc>,
     pub representative_reset_epoch_seconds: i64,
+    /// True when this device locally reconstructed another cycle for the same
+    /// scope whose schedule overlaps this one. Codex weekly cycles start lazily
+    /// at first use, so a corroborated overlap means the neighbouring cycle was
+    /// reset early (banked or server-granted), not that the data conflicts.
+    #[serde(default)]
+    pub has_schedule_overlap: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub daily_envelopes: Vec<QuotaDailyEnvelopeV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

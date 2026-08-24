@@ -955,6 +955,7 @@ impl Store {
                     .reconstructed
                     .window
                     .representative_reset_epoch_seconds,
+                has_schedule_overlap: item.reconstructed.window.has_schedule_overlap,
                 daily_envelopes: item.reconstructed.daily_envelopes,
                 boundary_slices,
             });
@@ -1412,6 +1413,7 @@ fn parse_usage_link_kind(value: &str) -> QuotaUsageLinkKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use statsai_core::{
         event_id, Confidence, CostInfo, EventSource, IdentitySource, LocationOrigin, PrivacyInfo,
         PrivacyMode, QuotaCreditsV1, QuotaStatusV1, SessionInfo, SourceAccountAssignment,
@@ -2391,6 +2393,70 @@ mod tests {
         assert!(json.get("change_points").is_none());
         assert!(json.get("sample_count").is_none());
         assert!(json.get("latest_status").is_none());
+        assert_eq!(json.get("has_schedule_overlap"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn quota_cycle_contributions_report_locally_reconstructed_schedule_overlaps() {
+        let store = Store::in_memory().expect("store");
+        // An early reset restarts the weekly schedule three days in, so the two
+        // reconstructed cycles overlap for the remaining four days.
+        let first_reset = DateTime::from_timestamp(1_787_616_000, 0).expect("first reset");
+        let second_reset = first_reset + Duration::days(3);
+        let first_start = first_reset - Duration::days(7);
+        let (source_id, _) = assigned_source(&store, first_start - Duration::days(1));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "weekly-first",
+                    "weekly-first",
+                    first_start + Duration::hours(1),
+                    first_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    62.0,
+                ),
+                sample_record(
+                    source_id,
+                    "weekly-second",
+                    "weekly-second",
+                    second_reset - Duration::days(7) + Duration::hours(1),
+                    second_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    4.0,
+                ),
+            ])
+            .expect("observations");
+
+        let contributions = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-a")
+            .expect("contributions");
+        assert_eq!(contributions.len(), 2);
+        assert!(
+            contributions
+                .iter()
+                .all(|contribution| contribution.has_schedule_overlap),
+            "both sides of a locally reconstructed overlap carry the flag"
+        );
+    }
+
+    #[test]
+    fn quota_cycle_contributions_default_schedule_overlap_when_absent_on_the_wire() {
+        let wire = json!({
+            "schema_version": "quota_cycle_contribution.v1",
+            "contribution_id": "quota_cycle_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "provider": "codex",
+            "provider_account_id": "acct_aaaaaaaaaaaaaaaaaaaaaaaa",
+            "limit_id": "codex",
+            "window_minutes": 10_080,
+            "representative_reset": "2026-08-25T15:00:00Z",
+            "representative_reset_epoch_seconds": 1_787_670_000i64,
+        });
+        let contribution: QuotaCycleContributionV1 =
+            serde_json::from_value(wire).expect("legacy payload deserializes");
+        assert!(!contribution.has_schedule_overlap);
     }
 
     #[test]

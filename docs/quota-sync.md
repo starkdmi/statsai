@@ -24,6 +24,8 @@ Each hosted contribution contains only:
 - provider and provider-account ID
 - optional provider limit ID and nominal duration
 - the representative reset timestamp
+- whether local reconstruction saw another cycle in the same scope overlapping
+  this one (`has_schedule_overlap`)
 - UTC daily envelopes with timestamped first, last, minimum, and maximum percentages
 - exact usage slices for partial UTC days at cycle and observed schedule-transition boundaries
 
@@ -35,6 +37,14 @@ counts.
 Codex currently emits only attributed weekly windows (`window_minutes = 10080`).
 Five-hour, monthly, and unattributed cycles stay local. Reset timestamps may
 shift, and consecutive cycles need not be exactly seven days apart.
+
+A Codex weekly cycle starts lazily at the first request after the previous
+reset, not at the previous reset itself. An idle stretch therefore leaves a gap
+between cycles, while consecutive cycles are never closer than the nominal
+duration unless the earlier one was reset ahead of schedule — banked by the user
+or granted server-side. Overlapping schedules are consequently expected, and
+`has_schedule_overlap` records that a single device reconstructed the overlap
+from its own observations.
 
 Complete UTC days are not copied into the contribution. The backend joins
 existing daily summaries for those days. Boundary slices exist only to avoid
@@ -62,7 +72,12 @@ installations cannot be blended.
 6. Preserve cycles observed only by another device.
 7. For overlapping schedules, use the first observation of the newer schedule as
    the transition boundary, clamped to the overlap. Do not assign usage to both
-   cycles.
+   cycles. When a device contributed to both cycles and flagged
+   `has_schedule_overlap` on each, the overlap is an expected early reset and
+   both cycles stay complete. An overlap no single device reconstructed is
+   reported as a conflict, because it can only arise from cross-device records
+   that failed to cluster or from two provider accounts resolving to one
+   identity.
 8. Combine full UTC-day summaries with exact boundary slices. If required
    boundary evidence is absent, return the available value as partial rather
    than prorating it.

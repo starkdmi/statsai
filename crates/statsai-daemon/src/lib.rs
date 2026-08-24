@@ -2871,6 +2871,7 @@ mod tests {
                 window_minutes: statsai_core::QUOTA_WEEKLY_WINDOW_MINUTES,
                 representative_reset: Utc::now(),
                 representative_reset_epoch_seconds: Utc::now().timestamp(),
+                has_schedule_overlap: false,
                 daily_envelopes: Vec::new(),
                 boundary_slices: Vec::new(),
             });
