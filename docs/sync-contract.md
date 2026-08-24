@@ -327,6 +327,56 @@ when the existing store already has the semantic event. Source, account,
 source-account assignment, subscription, and summary upserts are currently
 reported as accepted writes.
 
+## Evolving the Contract
+
+Two kinds of addition behave very differently, and the difference decides the
+release order.
+
+**A new top-level collection is backward compatible.** Batch collections carry
+`#[serde(default, skip_serializing_if = "Vec::is_empty")]`, and the backend
+reads named fields without a top-level allowlist, so a deployment that predates
+the collection ignores it rather than failing. That is not silent data loss:
+collectors require `accepted + duplicates == submitted` for every collection
+they send, so an endpoint that ignores one reports zero against a non-zero
+submission and the sync fails loudly with a count mismatch. Local sync state
+stays dirty and the records are resent. Adding a collection therefore needs no
+schema-version bump.
+
+**A new field on an existing record is not.** Every synced record is checked
+against a closed set of permitted keys, and an unrecognized key refuses the
+whole batch with `400 invalid_sync_batch`. This is deliberate: an unexpected
+key may carry a path, address, or message that this contract excludes, and the
+refusal guarantees none of it is stored. The consequence is a hard release
+order:
+
+> **Deploy the backend before releasing a collector that adds a record field.**
+> Until it is deployed, upgraded collectors cannot sync anything — not just the
+> affected collection.
+
+To keep the two causes distinguishable, the refusal names the offending field:
+
+```json
+{
+  "error": "invalid_sync_batch",
+  "rejected": [
+    {
+      "kind": "quota_cycle_contributions",
+      "id": "quota_cycle_0f2c…",
+      "reason": "unknown_field:has_schedule_overlap"
+    }
+  ]
+}
+```
+
+Nested records report a dotted path, such as
+`unknown_field:boundary_slices.working_directory`. Only the field name is
+returned; its value is never echoed. Collectors render this as
+`endpoint does not recognize \`<field>\` on <collection>` rather than an opaque
+HTTP error.
+
+Malformed values inside a *known* field remain a plain `400` with no `rejected`
+detail — that is a client defect, not version skew.
+
 ## Local Sync State
 
 After a successful sync, the collector records local sync state keyed by sink

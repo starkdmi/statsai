@@ -91,6 +91,9 @@ impl HttpSink {
             Ok(response) => response,
             Err(ureq::Error::Status(code, response)) => {
                 let body = response.into_string().unwrap_or_default();
+                if let Some(detail) = unrecognized_field_detail(&body) {
+                    bail!("sync endpoint returned HTTP {code}: {detail}");
+                }
                 bail!(
                     "sync endpoint returned HTTP {}: {}",
                     code,
@@ -146,6 +149,29 @@ impl SyncSink for HttpSink {
         self.send_with_ack(batch)?;
         Ok(())
     }
+}
+
+/// Renders a refused batch field into an actionable message.
+///
+/// The endpoint refuses any record carrying a field it does not recognize. That
+/// happens for two reasons worth telling apart: a collector sending data the
+/// contract excludes, and a collector newer than the deployment it syncs to.
+/// Only the field name crosses the wire, never its value.
+fn unrecognized_field_detail(body: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let first = parsed.get("rejected")?.as_array()?.first()?;
+    let field = first
+        .get("reason")?
+        .as_str()?
+        .strip_prefix("unknown_field:")?;
+    let kind = first
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("record");
+    Some(format!(
+        "endpoint does not recognize `{field}` on {kind}. \
+         Deploy the API before upgrading collectors, or stop sending the field."
+    ))
 }
 
 fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
@@ -325,6 +351,31 @@ mod tests {
     use statsai_core::{SyncBatch, SYNC_ACK_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION};
     use std::sync::mpsc;
     use tiny_http::{Header, Method, Response, Server};
+
+    #[test]
+    fn unrecognized_field_refusals_name_the_field_and_the_remedy() {
+        let detail = unrecognized_field_detail(
+            r#"{"error":"invalid_sync_batch","rejected":[{"kind":"quota_cycle_contributions","id":"quota_cycle_aaaa","reason":"unknown_field:has_schedule_overlap"}]}"#,
+        )
+        .expect("refusal detail");
+        assert!(detail.contains("has_schedule_overlap"));
+        assert!(detail.contains("quota_cycle_contributions"));
+        assert!(detail.contains("Deploy the API before upgrading collectors"));
+
+        let nested = unrecognized_field_detail(
+            r#"{"error":"invalid_sync_batch","rejected":[{"kind":"quota_cycle_contributions","id":null,"reason":"unknown_field:boundary_slices.working_directory"}]}"#,
+        )
+        .expect("nested refusal detail");
+        assert!(nested.contains("boundary_slices.working_directory"));
+
+        // Anything that is not a field refusal falls back to the raw body.
+        assert!(unrecognized_field_detail(r#"{"error":"invalid_sync_batch"}"#).is_none());
+        assert!(unrecognized_field_detail(
+            r#"{"rejected":[{"kind":"events","id":null,"reason":"raw_event_cloud_sync_disabled"}]}"#
+        )
+        .is_none());
+        assert!(unrecognized_field_detail("upstream timeout").is_none());
+    }
 
     fn empty_batch() -> SyncBatch {
         SyncBatch {
