@@ -2261,6 +2261,7 @@ mod tests {
         assert!(projection_json.get("estimated_cost").is_none());
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sample_usage_event(
         source_id: &SourceId,
         account_id: &ProviderAccountId,
