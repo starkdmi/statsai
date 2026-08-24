@@ -560,14 +560,22 @@ impl Store {
                     point.observation.observed_at,
                 )
             });
+            // The tolerance is a gap between neighbouring resets, not a width
+            // the whole cycle must fit inside. A cycle's reported reset drifts
+            // a second or two at a time and has been seen wandering nine
+            // minutes over its life; measured against the cluster's first
+            // point that cycle is cut in two the moment it passes five, and
+            // the remainder is drawn as a second cycle running beside the
+            // first over the same days. Consecutive resets sit hours apart at
+            // the very least, so chaining cannot reach across one.
             let mut clusters: Vec<Vec<WindowPoint>> = Vec::new();
             for point in points {
                 if let Some(cluster) = clusters.last_mut() {
-                    let min_reset = cluster
-                        .first()
+                    let previous_reset = cluster
+                        .last()
                         .map(|point| point.window.resets_at_epoch_seconds)
                         .unwrap_or(point.window.resets_at_epoch_seconds);
-                    if point.window.resets_at_epoch_seconds - min_reset
+                    if point.window.resets_at_epoch_seconds - previous_reset
                         <= RESET_CLUSTER_TOLERANCE_SECONDS
                     {
                         cluster.push(point);
@@ -1041,38 +1049,27 @@ struct WindowPoint {
     window: QuotaWindowObservationV1,
 }
 
-/// When a cluster was observed and the most it ever reported.
+/// The span over which a cluster was observed.
 struct ClusterLife {
     first_observed_at: DateTime<Utc>,
     last_observed_at: DateTime<Utc>,
-    peak_used_percent: f64,
 }
 
 fn cluster_life(cluster: &[WindowPoint]) -> Option<ClusterLife> {
-    let first = cluster.iter().map(|p| p.observation.observed_at).min()?;
-    let last = cluster.iter().map(|p| p.observation.observed_at).max()?;
     Some(ClusterLife {
-        first_observed_at: first,
-        last_observed_at: last,
-        peak_used_percent: cluster
-            .iter()
-            .map(|p| p.window.used_percent)
-            .fold(f64::NEG_INFINITY, f64::max),
+        first_observed_at: cluster.iter().map(|p| p.observation.observed_at).min()?,
+        last_observed_at: cluster.iter().map(|p| p.observation.observed_at).max()?,
     })
 }
 
-/// True when `live` was still being reported both before `suspect` appeared and
-/// after it vanished, and had by then outrun everything `suspect` ever claimed.
-fn brackets_and_outruns(live: &[WindowPoint], suspect: &ClusterLife) -> bool {
-    let preceded = live
-        .iter()
-        .any(|p| p.observation.observed_at < suspect.first_observed_at);
-    let resumed = live
-        .iter()
-        .filter(|p| p.observation.observed_at > suspect.last_observed_at)
-        .min_by_key(|p| p.observation.observed_at);
-    let Some(resumed) = resumed else { return false };
-    preceded && resumed.window.used_percent > suspect.peak_used_percent
+/// True when `live` was reported before `suspect` appeared and again after it
+/// vanished.
+fn brackets(live: &[WindowPoint], suspect: &ClusterLife) -> bool {
+    live.iter()
+        .any(|p| p.observation.observed_at < suspect.first_observed_at)
+        && live
+            .iter()
+            .any(|p| p.observation.observed_at > suspect.last_observed_at)
 }
 
 /// Clusters that describe a schedule the provider never actually switched to.
@@ -1089,10 +1086,16 @@ fn brackets_and_outruns(live: &[WindowPoint], suspect: &ClusterLife) -> bool {
 /// took days away from the cycle actually running, which is what put two rising
 /// lines over the same hours for a single account.
 ///
-/// Requiring the bracketing cluster to have outrun the suspect's peak by the
-/// time it resumes preserves genuine early resets. A redeemed reset takes the
-/// lead from the moment it starts and the schedule it replaced is never
-/// reported again, so it cannot be bracketed at all — let alone outrun.
+/// Bracketing alone settles it, whatever the two schedules claim was spent.
+/// Once a window resets, its `resets_at` moves forward and that value can never
+/// be reported again, so a schedule cannot resume after another has taken over
+/// from it. A genuine early reset — banked or granted — is therefore never
+/// bracketed: the schedule it replaced simply stops.
+///
+/// This deliberately drops well-evidenced clusters. One such ran to 99% over
+/// 19 hours across 623 observations while the schedule either side of it sat
+/// near 54%, which is not a cycle that reset early but a second counter
+/// reported under the same slot for the same account.
 fn phantom_cluster_indices(clusters: &[Vec<WindowPoint>]) -> HashSet<usize> {
     let lives = clusters.iter().map(|c| cluster_life(c)).collect::<Vec<_>>();
     let mut phantoms = HashSet::new();
@@ -1101,7 +1104,7 @@ fn phantom_cluster_indices(clusters: &[Vec<WindowPoint>]) -> HashSet<usize> {
         let bracketed = clusters
             .iter()
             .enumerate()
-            .any(|(other, live)| other != index && brackets_and_outruns(live, life));
+            .any(|(other, live)| other != index && brackets(live, life));
         if bracketed {
             phantoms.insert(index);
         }
