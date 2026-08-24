@@ -15,6 +15,17 @@ use statsai_core::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const RESET_CLUSTER_TOLERANCE_SECONDS: i64 = 5 * 60;
+/// A window cannot be observed once it has reset: the provider issues a fresh
+/// `resets_at` from that moment on. An observation that post-dates its own reset
+/// by more than provider recomputation lag is therefore a replay of historical
+/// evidence recorded at import time, and must not extend the closed window.
+///
+/// The bound is an hour because the provider has been seen reporting an elapsed
+/// reset with a steady percentage for a continuous 47 minutes afterwards, and
+/// that evidence is real. Replays look nothing like lag: they arrive weeks late,
+/// in bursts of unrelated windows sharing one timestamp, so an hour separates the
+/// two by more than two orders of magnitude.
+const STALE_OBSERVATION_TOLERANCE_SECONDS: i64 = 60 * 60;
 pub const SYNC_ELIGIBLE_WINDOW_MINUTES: u64 = QUOTA_WEEKLY_WINDOW_MINUTES;
 
 #[derive(Debug, Clone, Default)]
@@ -518,6 +529,9 @@ impl Store {
         let mut grouped = BTreeMap::<WindowScope, Vec<WindowPoint>>::new();
         for record in records {
             for window in &record.windows {
+                if observation_postdates_reset(&record.observation, window) {
+                    continue;
+                }
                 grouped
                     .entry(WindowScope {
                         provider: record.observation.provider.clone(),
@@ -1065,6 +1079,18 @@ struct BoundarySliceBuilders {
     provider: String,
     account_id: ProviderAccountId,
     slices: Vec<QuotaUsageSliceV1>,
+}
+
+/// True when the evidence was recorded after the window it describes had already
+/// reset, which only happens when historical records are re-imported and stamped
+/// with the import time. Such a point would otherwise be clustered into the long
+/// closed cycle by its `resets_at` and then bucketed into a daily envelope by its
+/// `observed_at`, giving that cycle an observation days or weeks past its end.
+fn observation_postdates_reset(
+    observation: &QuotaObservationV1,
+    window: &QuotaWindowObservationV1,
+) -> bool {
+    (observation.observed_at - window.resets_at).num_seconds() > STALE_OBSERVATION_TOLERANCE_SECONDS
 }
 
 fn daily_envelopes_from_points(points: &[WindowPoint]) -> Vec<QuotaDailyEnvelopeV1> {
@@ -2394,6 +2420,135 @@ mod tests {
         assert!(json.get("sample_count").is_none());
         assert!(json.get("latest_status").is_none());
         assert_eq!(json.get("has_schedule_overlap"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn replayed_observations_do_not_extend_a_window_that_already_reset() {
+        let store = Store::in_memory().expect("store");
+        let reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let live = reset - Duration::days(2);
+        // A re-import three weeks later re-reads the same historical window and
+        // stamps it with the import time.
+        let replay = reset + Duration::days(21);
+        let (source_id, _) = assigned_source(&store, live - Duration::days(8));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "live",
+                    "live",
+                    live,
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    26.0,
+                ),
+                sample_record(
+                    source_id,
+                    "replayed",
+                    "replayed",
+                    replay,
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    58.0,
+                ),
+            ])
+            .expect("observations");
+
+        let windows = store
+            .quota_windows(&QuotaQuery::default())
+            .expect("windows");
+        assert_eq!(windows.len(), 1);
+        let days = windows[0]
+            .change_points
+            .iter()
+            .map(|point| point.observed_at.date_naive().to_string())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            days,
+            HashSet::from([live.date_naive().to_string()]),
+            "the closed window keeps only evidence recorded while it was open"
+        );
+        assert_eq!(windows[0].maximum_used_percent, 26.0);
+    }
+
+    #[test]
+    fn an_observation_within_recomputation_lag_still_belongs_to_its_window() {
+        let store = Store::in_memory().expect("store");
+        let reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let (source_id, _) = assigned_source(&store, reset - Duration::days(8));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "before",
+                    "before",
+                    reset - Duration::hours(1),
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    90.0,
+                ),
+                // The provider has not recomputed the window yet, so it keeps
+                // reporting the reset that elapsed 45 minutes ago.
+                sample_record(
+                    source_id,
+                    "lagging",
+                    "lagging",
+                    reset + Duration::minutes(45),
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    100.0,
+                ),
+            ])
+            .expect("observations");
+
+        let windows = store
+            .quota_windows(&QuotaQuery::default())
+            .expect("windows");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].maximum_used_percent, 100.0);
+        assert_eq!(windows[0].sample_count, 2);
+    }
+
+    #[test]
+    fn an_observation_beyond_recomputation_lag_is_treated_as_a_replay() {
+        let store = Store::in_memory().expect("store");
+        let reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let (source_id, _) = assigned_source(&store, reset - Duration::days(8));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "live",
+                    "live",
+                    reset - Duration::hours(2),
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    90.0,
+                ),
+                sample_record(
+                    source_id,
+                    "past-lag",
+                    "past-lag",
+                    reset + Duration::minutes(61),
+                    reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    100.0,
+                ),
+            ])
+            .expect("observations");
+
+        let windows = store
+            .quota_windows(&QuotaQuery::default())
+            .expect("windows");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].sample_count, 1);
+        assert_eq!(windows[0].maximum_used_percent, 90.0);
     }
 
     #[test]
