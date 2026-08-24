@@ -6207,6 +6207,13 @@ fn quota(command: QuotaCommand, store: &Store, device_id: &str) -> Result<()> {
                     format_u64(status.weekly_observations),
                     status.weekly_sync_eligible_coverage_percent
                 );
+                let discarded = &status.discarded;
+                println!(
+                    "reconstruction discarded: {} replayed observations, {} unused windows, {} bracketed schedules",
+                    format_u64(discarded.replayed_observations),
+                    format_u64(discarded.unused_windows),
+                    format_u64(discarded.bracketed_schedules)
+                );
                 if status.unattributed_observations > 0 {
                     eprintln!(
                         "warning: historical quota observations remain unassigned; backdate a source connection with `statsai source connect --started-at ...`"

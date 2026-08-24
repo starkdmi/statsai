@@ -57,7 +57,25 @@ pub struct QuotaStatus {
     pub weekly_observations: u64,
     pub weekly_sync_eligible_observations: u64,
     pub weekly_sync_eligible_coverage_percent: f64,
+    pub discarded: QuotaDiscardCounts,
     pub assignment_overlap_warnings: Vec<String>,
+}
+
+/// What reconstruction threw away, and why.
+///
+/// Each rule discards evidence that cannot describe a real cycle, and each is
+/// silent by design. Counting the discards is what tells a provider change
+/// apart from a quiet week: if these numbers climb, the rules have started
+/// firing on data they were never meant to judge.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct QuotaDiscardCounts {
+    /// Observations recorded more than an hour after the window they describe
+    /// had already reset.
+    pub replayed_observations: u64,
+    /// Windows that reported zero for their whole life and were superseded.
+    pub unused_windows: u64,
+    /// Schedules another schedule was reported both before and after.
+    pub bracketed_schedules: u64,
 }
 
 impl Store {
@@ -434,6 +452,7 @@ impl Store {
     }
 
     pub fn quota_status(&self, query: &QuotaQuery) -> Result<QuotaStatus> {
+        let (_, discarded) = self.reconstruct_quota_windows_counted(query)?;
         let raw = self.quota_observations(query, false)?;
         let total_observations = raw.len();
         let distinct = collapse_semantic_duplicates(raw);
@@ -497,6 +516,7 @@ impl Store {
             } else {
                 weekly_eligible as f64 * 100.0 / weekly.len() as f64
             },
+            discarded,
             assignment_overlap_warnings: warnings,
         })
     }
@@ -522,6 +542,15 @@ impl Store {
         &self,
         query: &QuotaQuery,
     ) -> Result<Vec<ReconstructedQuotaWindow>> {
+        let (windows, _) = self.reconstruct_quota_windows_counted(query)?;
+        Ok(windows)
+    }
+
+    fn reconstruct_quota_windows_counted(
+        &self,
+        query: &QuotaQuery,
+    ) -> Result<(Vec<ReconstructedQuotaWindow>, QuotaDiscardCounts)> {
+        let mut discarded = QuotaDiscardCounts::default();
         let mut reconstruction_query = query.clone();
         reconstruction_query.from = None;
         reconstruction_query.to = None;
@@ -530,6 +559,7 @@ impl Store {
         for record in records {
             for window in &record.windows {
                 if observation_postdates_reset(&record.observation, window) {
+                    discarded.replayed_observations += 1;
                     continue;
                 }
                 grouped
@@ -602,8 +632,10 @@ impl Store {
                 })
                 .map(|(_, cluster)| cluster)
                 .collect::<Vec<_>>();
+            discarded.unused_windows += (cluster_count - clusters.len()) as u64;
 
             let phantoms = phantom_cluster_indices(&clusters);
+            discarded.bracketed_schedules += phantoms.len() as u64;
             let clusters = clusters
                 .into_iter()
                 .enumerate()
@@ -651,7 +683,7 @@ impl Store {
                 .then_with(|| right.window.window_minutes.cmp(&left.window.window_minutes))
                 .then_with(|| left.window.window_id.cmp(&right.window.window_id))
         });
-        Ok(windows)
+        Ok((windows, discarded))
     }
 
     fn materialize_quota_window(
@@ -2641,6 +2673,64 @@ mod tests {
             "the zero-only window is not its own cycle"
         );
         assert_eq!(windows[0].representative_reset, real);
+    }
+
+    #[test]
+    fn status_reports_what_reconstruction_threw_away() {
+        let store = Store::in_memory().expect("store");
+        let live_reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let start = live_reset - Duration::days(7);
+        let (source_id, _) = assigned_source(&store, start - Duration::days(2));
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    source_id.clone(),
+                    "live-1",
+                    "live-1",
+                    start + Duration::hours(1),
+                    live_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    21.0,
+                ),
+                // Bracketed by the live schedule, so not a cycle of its own.
+                sample_record(
+                    source_id.clone(),
+                    "phantom",
+                    "phantom",
+                    start + Duration::hours(2),
+                    (live_reset + Duration::days(1)).timestamp(),
+                    "secondary",
+                    10_080,
+                    1.0,
+                ),
+                sample_record(
+                    source_id.clone(),
+                    "live-2",
+                    "live-2",
+                    start + Duration::hours(3),
+                    live_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    44.0,
+                ),
+                // Recorded a day after the window it describes had reset.
+                sample_record(
+                    source_id,
+                    "replayed",
+                    "replayed",
+                    live_reset + Duration::days(1),
+                    live_reset.timestamp(),
+                    "secondary",
+                    10_080,
+                    44.0,
+                ),
+            ])
+            .expect("observations");
+
+        let status = store.quota_status(&QuotaQuery::default()).expect("status");
+        assert_eq!(status.discarded.replayed_observations, 1);
+        assert_eq!(status.discarded.bracketed_schedules, 1);
     }
 
     #[test]
