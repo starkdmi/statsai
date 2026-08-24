@@ -64,13 +64,19 @@ installations cannot be blended.
    minutes. This tolerance covers provider recomputation drift; it is not a
    device clock-skew correction.
 3. Use the median reset as the representative reset.
-4. Merge daily envelopes using earliest first, latest last, lowest minimum, and
-   highest maximum observations, and derive contributing-device counts.
-5. Never synthesize a zero-percent start. A device first observed at 80% joins
+4. Drop daily envelopes whose first or last observation is more than one hour
+   after that contribution's representative reset. Provider recomputation lag of
+   about 47 minutes is genuine; replay stamps weeks later are not. Already-stored
+   rows are filtered on read, and ingest strips the envelopes rather than
+   rejecting the batch, so devices need not re-sync.
+5. Merge remaining daily envelopes using earliest first, latest last, lowest
+   minimum, and highest maximum observations, and derive contributing-device
+   counts.
+6. Never synthesize a zero-percent start. A device first observed at 80% joins
    the existing cycle identified by its reset; another device may supply earlier
    evidence.
-6. Preserve cycles observed only by another device.
-7. For overlapping schedules, use the first observation of the newer schedule as
+7. Preserve cycles observed only by another device.
+8. For overlapping schedules, use the first observation of the newer schedule as
    the transition boundary, clamped to the overlap. Do not assign usage to both
    cycles. When a device contributed to both cycles and flagged
    `has_schedule_overlap` on each, the overlap is an expected early reset and
@@ -78,7 +84,7 @@ installations cannot be blended.
    reported as a conflict, because it can only arise from cross-device records
    that failed to cluster or from two provider accounts resolving to one
    identity.
-8. Combine full UTC-day summaries with exact boundary slices. If required
+9. Combine full UTC-day summaries with exact boundary slices. If required
    boundary evidence is absent, return the available value as partial rather
    than prorating it.
 
