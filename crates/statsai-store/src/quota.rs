@@ -20,11 +20,12 @@ const RESET_CLUSTER_TOLERANCE_SECONDS: i64 = 5 * 60;
 /// by more than provider recomputation lag is therefore a replay of historical
 /// evidence recorded at import time, and must not extend the closed window.
 ///
-/// The bound is an hour because the provider has been seen reporting an elapsed
-/// reset with a steady percentage for a continuous 47 minutes afterwards, and
-/// that evidence is real. Replays look nothing like lag: they arrive weeks late,
-/// in bursts of unrelated windows sharing one timestamp, so an hour separates the
-/// two by more than two orders of magnitude.
+/// The bound is an hour because the provider has been seen serving an elapsed
+/// window for 37 continuous minutes: roughly 180 separate requests, seconds
+/// apart, every one still carrying the expired `resets_at` at a steady 96%.
+/// Discarding those loses the closing figure of a cycle spent to exhaustion.
+/// Genuine lag has never been observed to outlast that; the stale records past
+/// it sit 14 hours to 3 days late, which is import time, not lag.
 const STALE_OBSERVATION_TOLERANCE_SECONDS: i64 = 60 * 60;
 pub const SYNC_ELIGIBLE_WINDOW_MINUTES: u64 = QUOTA_WEEKLY_WINDOW_MINUTES;
 
