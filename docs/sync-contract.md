@@ -242,8 +242,11 @@ hostnames, including `localhost`, are rejected.
 
 The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
 rejects batches containing `authoritative_snapshot` because it does not stage
-device ownership or reconcile deletions. `/api/sync/batches` is the production
-contract. A compatible backend should:
+device ownership or reconcile deletions. It rejects batches carrying
+`quota_cycle_contributions` for the same reason: a local store keeps quota
+observations and derives its own cycles from them, so acknowledging another
+device's cycles would tell the sender they had been stored when they had not.
+`/api/sync/batches` is the production contract. A compatible backend should:
 
 - require an authenticated device access token
 - accept `Authorization: Bearer <device_access_token>` from stored auth, `--auth-token`, or `STATSAI_SYNC_TOKEN`
@@ -325,7 +328,9 @@ acknowledgement cannot acknowledge a v4 batch.
 The current loopback daemon returns this shape and reports duplicate events
 when the existing store already has the semantic event. Source, account,
 source-account assignment, subscription, and summary upserts are currently
-reported as accepted writes.
+reported as accepted writes. Its `quota_cycle_contributions` counter is
+therefore always zero: a batch carrying any is refused outright rather than
+acknowledged, since the daemon has nowhere to store them.
 
 ## Evolving the Contract
 

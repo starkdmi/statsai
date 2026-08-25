@@ -247,6 +247,16 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     if batch.authoritative_snapshot.is_some() {
         bail!("authoritative snapshots are not supported by the loopback daemon");
     }
+    // A local store holds quota observations and derives its own cycles from
+    // them; there is no table for another device's contributions. Acknowledging
+    // them as accepted told the sender to record them synced against this
+    // target and stop offering them, certifying a write that never happened.
+    // Refusing follows the authoritative-snapshot precedent above: this
+    // endpoint is for loopback diagnostics, and `/api/sync/batches` is the
+    // contract that stores quota cycles.
+    if !batch.quota_cycle_contributions.is_empty() {
+        bail!("quota cycle contributions are not supported by the loopback daemon");
+    }
 
     let result = store.ingest_sync_batch(batch)?;
 
@@ -2880,6 +2890,35 @@ mod tests {
         assert!(error
             .to_string()
             .contains("quota cycle contributions require sync_batch.v4"));
+    }
+
+    #[test]
+    fn ingest_v4_batch_refuses_quota_cycle_contributions_it_cannot_store() {
+        let store = Store::in_memory().expect("store");
+        let mut batch = empty_batch();
+        batch.schema_version = SYNC_BATCH_V4_SCHEMA_VERSION.to_string();
+        batch
+            .quota_cycle_contributions
+            .push(statsai_core::QuotaCycleContributionV1 {
+                schema_version: statsai_core::QUOTA_CYCLE_CONTRIBUTION_SCHEMA_VERSION.to_string(),
+                contribution_id: "quota_cycle_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                provider: "codex".to_string(),
+                provider_account_id: statsai_core::ProviderAccountId("acct-1".to_string()),
+                limit_id: None,
+                window_minutes: statsai_core::QUOTA_WEEKLY_WINDOW_MINUTES,
+                representative_reset: Utc::now(),
+                representative_reset_epoch_seconds: Utc::now().timestamp(),
+                has_schedule_overlap: false,
+                daily_envelopes: Vec::new(),
+                boundary_slices: Vec::new(),
+            });
+
+        // Accepting them would tell the sender to stop offering cycles this
+        // store has nowhere to put.
+        let error = ingest_sync_batch(&store, &batch).expect_err("unsupported contributions");
+        assert!(error
+            .to_string()
+            .contains("quota cycle contributions are not supported"));
     }
 
     #[test]
