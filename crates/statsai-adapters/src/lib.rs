@@ -7946,10 +7946,20 @@ fn collect_codex_auth_evidence(
     let Some(claims) = codex_auth_claims(root) else {
         return;
     };
-    let observed_at = claims
+    // Two different facts live in one file and they are not observed together.
+    // `chatgpt_subscription_last_checked` moves when the plan claims are
+    // revalidated, which can be long before the current login: signing out of
+    // A and into B rewrites the account without refreshing it. Dating the
+    // identity by that stale stamp said "this source was B" at a moment it was
+    // still A, and `ends_source_attribution` turns an AuthSnapshot into a
+    // source-wide boundary, so A's interval was truncated back to the last
+    // subscription check and every event in between lost its account.
+    let authenticated_at = claims.authenticated_at.unwrap_or_else(Utc::now);
+    let plan_observed_at = claims
         .subscription_checked_at
         .or(claims.authenticated_at)
-        .unwrap_or_else(Utc::now);
+        .unwrap_or(authenticated_at);
+    let observed_at = authenticated_at;
     let provider_account_id = provider_account_id_from_identity(
         CODEX_PROVIDER,
         claims.provider_user_id.as_deref(),
@@ -8020,7 +8030,7 @@ fn collect_codex_auth_evidence(
                 &source.source_id,
                 provider_account_id.as_ref(),
                 &raw_plan_name,
-                observed_at,
+                plan_observed_at,
                 AccountEvidenceKind::AuthSnapshot,
             );
             scan.plan_observations.push(AccountPlanObservationV1 {
@@ -8031,7 +8041,7 @@ fn collect_codex_auth_evidence(
                 provider_account_id,
                 plan_name: normalize_plan_name(&raw_plan_name),
                 raw_plan_name,
-                observed_at,
+                observed_at: plan_observed_at,
                 active_from: claims.active_from,
                 active_until: claims.active_until,
                 is_current_snapshot: true,
@@ -12813,6 +12823,50 @@ mod tests {
                 .map(|evidence| evidence.account_identity_source.clone()),
             Some(IdentitySource::LocalAuth)
         );
+    }
+
+    #[test]
+    fn codex_auth_identity_is_dated_by_the_login_not_the_subscription_check() {
+        // `auth_time` is 2026-06-10; the embedded subscription claims were last
+        // revalidated on 2026-05-01. Signing into a different account rewrites
+        // the account id without touching that older stamp, so dating the
+        // identity by it would claim this source was already `acct-b` five
+        // weeks before the login — and `AuthSnapshot` ends a source's account
+        // interval, so the previous account would lose those five weeks.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            serde_json::json!({
+                "tokens": {
+                    "id_token": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6InBlcnNvbkBleGFtcGxlLmNvbSIsImF1dGhfdGltZSI6MTc4MTA0OTYwMCwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3QtYiIsImNoYXRncHRfcGxhbl90eXBlIjoicGx1cyIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2xhc3RfY2hlY2tlZCI6IjIwMjYtMDUtMDFUMDA6MDA6MDArMDA6MDAifX0."
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let identity = evidence
+            .identity_observations
+            .iter()
+            .find(|item| item.evidence_kind == AccountEvidenceKind::AuthSnapshot)
+            .expect("auth snapshot identity");
+        assert_eq!(
+            identity.observed_at.to_rfc3339(),
+            "2026-06-10T00:00:00+00:00"
+        );
+        let plan = evidence.plan_observations.first().expect("plan evidence");
+        assert_eq!(plan.observed_at.to_rfc3339(), "2026-05-01T00:00:00+00:00");
     }
 
     #[test]
