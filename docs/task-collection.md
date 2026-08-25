@@ -3,7 +3,7 @@
 `statsai` can extract local task spans during `scan`, rebuild derived work items
 in SQLite, and let you verify or correct those work items from the CLI. Older
 usage-only clients still emit `sync_batch.v1`. Hosted task sync was introduced
-with `sync_batch.v2`; current `sync_batch.v4` clients retain the same task bucket
+with `sync_batch.v2`; current `sync_batch.v5` clients retain the same task bucket
 snapshot and task verification fields.
 
 ## Normal Loop

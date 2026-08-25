@@ -11127,6 +11127,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reset_history_does_not_bound_a_reopened_auth_reload_interval() {
+        let store = Store::in_memory().expect("store");
+        let base = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("base");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            std::path::Path::new("/tmp/reload-interval-bounds"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let reloaded = ProviderAccountId("account-reloaded".to_string());
+
+        // reload A, telemetry A, then a turn-scoped reset-history entry naming B.
+        for (index, (kind, account, offset_days)) in [
+            (
+                statsai_core::AccountEvidenceKind::AuthReload,
+                "account-reloaded",
+                1_i64,
+            ),
+            (
+                statsai_core::AccountEvidenceKind::TelemetryIdentity,
+                "account-reloaded",
+                2,
+            ),
+            (
+                statsai_core::AccountEvidenceKind::ResetHistory,
+                "account-other",
+                3,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .upsert_account_identity_observations(&[
+                    statsai_core::AccountIdentityObservationV1 {
+                        schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                            .to_string(),
+                        observation_id: format!("reload-identity-{index}"),
+                        provider: "codex".to_string(),
+                        source_id: source.source_id.clone(),
+                        provider_account_id: Some(ProviderAccountId(account.to_string())),
+                        provider_user_id_hash: None,
+                        email_hash: None,
+                        conversation_id_hash: Some("f".repeat(64)),
+                        turn_id_hash: Some("a".repeat(64)),
+                        observed_at: base + chrono::Duration::days(offset_days),
+                        evidence_kind: kind,
+                        confidence: Confidence::High,
+                        auth_mode: None,
+                        application_version: None,
+                        parser_version: "test.v1".to_string(),
+                        artifact_kind: "test".to_string(),
+                        artifact_path_hash: "c".repeat(64),
+                        record_fingerprint: format!("{index}").repeat(64),
+                    },
+                ])
+                .expect("identity observation");
+        }
+
+        store
+            .reconcile_source_account_evidence_assignments(&source.source_id)
+            .expect("reconcile");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].provider_account_id, reloaded);
+        assert_eq!(
+            assignments[0].ended_at, None,
+            "reset history must not close the interval an auth reload opened"
+        );
+    }
+
     fn test_store_event(
         source: &statsai_core::SourceLocation,
         now: chrono::DateTime<Utc>,

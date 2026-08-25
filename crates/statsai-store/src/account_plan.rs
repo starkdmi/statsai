@@ -506,6 +506,10 @@ impl Store {
             // A reload is an explicit boundary, but only a later strong point for the same account
             // promotes it into a source interval. Current auth snapshots are handled by the
             // existing verified-auth reconciliation path.
+            //
+            // Both searches below read source-wide evidence only, for the same reason the
+            // truncation above does: a turn-scoped reset-history entry neither proves the source
+            // was signed in as that account nor, naming another, that it stopped being.
             for (index, boundary) in strong.iter().enumerate().filter(|(_, observation)| {
                 observation.evidence_kind == AccountEvidenceKind::AuthReload
             }) {
@@ -513,14 +517,18 @@ impl Store {
                     .provider_account_id
                     .as_ref()
                     .expect("filtered account identity");
-                let confirmation = strong[index + 1..].iter().find(|observation| {
+                let later_source_evidence = || {
+                    strong[index + 1..]
+                        .iter()
+                        .filter(|observation| observation.evidence_kind.ends_source_attribution())
+                };
+                let confirmation = later_source_evidence().find(|observation| {
                     observation.provider_account_id.as_ref() == Some(account_id)
                 });
                 let Some(confirmation) = confirmation else {
                     continue;
                 };
-                let ended_at = strong[index + 1..]
-                    .iter()
+                let ended_at = later_source_evidence()
                     .find(|observation| {
                         observation.provider_account_id.as_ref() != Some(account_id)
                     })
