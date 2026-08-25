@@ -262,6 +262,48 @@ impl Store {
         })
     }
 
+    /// Reads the subscriptions this one-shot conversion can act on, skipping rows it cannot parse.
+    ///
+    /// This runs inside `Store::migrate`, so an error here fails `Store::open` for good: the
+    /// transaction rolls back, the completion flag is never written, and every later launch
+    /// retries the same row and fails again. One payload written by a newer build, or corrupted
+    /// on disk, is not a reason to make the store unopenable — and an unparsable record could
+    /// not have been converted anyway. It stays where it is, still visible as a legacy row.
+    fn subscriptions_for_legacy_plan_migration(&self) -> Result<Vec<statsai_core::Subscription>> {
+        let mut statement = self.conn.prepare(
+            "SELECT payload, provider_account_id FROM subscriptions ORDER BY provider, subscription_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut subscriptions = Vec::new();
+        for row in rows {
+            let (payload, provider_account_id) = row?;
+            if let Ok(subscription) =
+                super::deserialize_subscription_payload(&payload, provider_account_id.as_deref())
+            {
+                subscriptions.push(subscription);
+            }
+        }
+        Ok(subscriptions)
+    }
+
+    /// The account counterpart of [`Self::subscriptions_for_legacy_plan_migration`], and skipping
+    /// for the same reason.
+    fn accounts_for_legacy_plan_migration(&self) -> Result<Vec<statsai_core::ProviderAccount>> {
+        let mut statement = self.conn.prepare(
+            "SELECT payload FROM provider_accounts ORDER BY provider, provider_account_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            if let Ok(account) = serde_json::from_str(&row?) {
+                accounts.push(account);
+            }
+        }
+        Ok(accounts)
+    }
+
     /// Converts historical Codex subscriptions and account-level plan fields synthesized from
     /// local authentication into provider-plan evidence. User-entered billing records are
     /// deliberately left untouched.
@@ -270,7 +312,7 @@ impl Store {
     /// discard the legacy record. The deterministic observation ID makes this safe to repeat.
     pub fn migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence(&self) -> Result<u64> {
         self.with_immediate_transaction(|| {
-            let subscriptions = self.list_subscriptions()?;
+            let subscriptions = self.subscriptions_for_legacy_plan_migration()?;
             let mut converted = 0u64;
             for subscription in subscriptions.into_iter().filter(|subscription| {
                 subscription.provider.eq_ignore_ascii_case("codex")
@@ -335,7 +377,7 @@ impl Store {
                 })
                 .collect::<HashSet<_>>();
             for mut account in self
-                .list_accounts()?
+                .accounts_for_legacy_plan_migration()?
                 .into_iter()
                 .filter(|account| account.provider.eq_ignore_ascii_case("codex"))
             {
@@ -422,8 +464,12 @@ impl Store {
 
             let mut changed = 0u64;
             // A contradictory strong point invalidates generated continuity from that point. The
-            // previous account is not resumed unless a later explicit boundary supports it.
-            for observation in &strong {
+            // previous account is not resumed unless a later explicit boundary supports it, so
+            // only evidence that could supply such a boundary is allowed to end an interval.
+            for observation in strong
+                .iter()
+                .filter(|observation| observation.evidence_kind.ends_source_attribution())
+            {
                 let account_id = observation
                     .provider_account_id
                     .as_ref()
@@ -556,13 +602,28 @@ impl Store {
 
     /// Convert an attributed quota status into plan evidence. A plan label by itself never
     /// identifies an account, so records without an unambiguous source assignment are skipped.
+    ///
+    /// Quota rows arrive one per provider response, and a plan label barely ever changes between
+    /// them: ten thousand rows saying "Pro" are one fact, not ten thousand. Keying each row's own
+    /// `observed_at` made them ten thousand ledger rows, ten thousand `entity_requires_sync`
+    /// queries, and a snapshot split across fifty-odd fragments. Consecutive rows carrying the
+    /// same label for the same account therefore collapse into one observation spanning the run,
+    /// timed at its most recent evidence and identified by its first, so that history stays put
+    /// and only the open run re-syncs as it grows.
     pub fn upsert_quota_plan_observations(
         &self,
         records: &[QuotaObservationRecordV1],
     ) -> Result<u64> {
+        struct PlanRun<'a> {
+            quota: &'a statsai_core::QuotaObservationV1,
+            provider_account_id: ProviderAccountId,
+            raw_plan_name: &'a str,
+            started_at: chrono::DateTime<chrono::Utc>,
+        }
+
         let mut assignments_by_source = HashMap::new();
-        let mut observations = Vec::new();
-        let mut seen = HashSet::new();
+        let mut attributed: Vec<(ProviderAccountId, &str, &statsai_core::QuotaObservationV1)> =
+            Vec::new();
         for record in records {
             let quota = &record.observation;
             let Some(raw_plan_name) = quota
@@ -591,35 +652,74 @@ impl Store {
             let Some(provider_account_id) = provider_account_id else {
                 continue;
             };
-            let observation_id = account_plan_observation_id(
-                &quota.source_id,
-                Some(&provider_account_id),
-                raw_plan_name,
-                quota.observed_at,
-                AccountEvidenceKind::QuotaStatus,
-            );
-            if !seen.insert(observation_id.clone()) {
+            attributed.push((provider_account_id, raw_plan_name, quota));
+        }
+        // Records reach here in scan order, which is not observation order once a
+        // rotated file or a re-import interleaves them. A run is only meaningful
+        // along the timeline, so sort before collapsing.
+        attributed.sort_by(|left, right| {
+            left.2
+                .source_id
+                .0
+                .cmp(&right.2.source_id.0)
+                .then_with(|| left.0 .0.cmp(&right.0 .0))
+                .then_with(|| left.2.observed_at.cmp(&right.2.observed_at))
+                .then_with(|| left.2.observation_id.cmp(&right.2.observation_id))
+        });
+
+        let mut runs: Vec<PlanRun<'_>> = Vec::new();
+        for (provider_account_id, raw_plan_name, quota) in attributed {
+            let continues_run = runs.last().is_some_and(|run| {
+                run.quota.source_id == quota.source_id
+                    && run.provider_account_id == provider_account_id
+                    && run.raw_plan_name.eq_ignore_ascii_case(raw_plan_name)
+            });
+            if continues_run {
+                let run = runs.last_mut().expect("checked above");
+                run.quota = quota;
+                run.raw_plan_name = raw_plan_name;
                 continue;
             }
-            observations.push(AccountPlanObservationV1 {
-                schema_version: ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
-                observation_id,
-                provider: quota.provider.clone(),
-                source_id: quota.source_id.clone(),
-                provider_account_id: Some(provider_account_id),
-                raw_plan_name: raw_plan_name.to_string(),
-                plan_name: normalize_plan_name(raw_plan_name),
-                observed_at: quota.observed_at,
-                active_from: None,
-                active_until: None,
-                is_current_snapshot: false,
-                evidence_kind: AccountEvidenceKind::QuotaStatus,
-                confidence: Confidence::High,
-                parser_version: "quota-plan-evidence.v1".to_string(),
-                artifact_path_hash: quota.source_file_path_hash.clone(),
-                record_fingerprint: quota.semantic_fingerprint.clone(),
+            runs.push(PlanRun {
+                quota,
+                provider_account_id,
+                raw_plan_name,
+                started_at: quota.observed_at,
             });
         }
+
+        let observations = runs
+            .into_iter()
+            .map(|run| {
+                let quota = run.quota;
+                AccountPlanObservationV1 {
+                    schema_version: ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+                    // Identified by where the run began, so extending it does not
+                    // mint a new row and retire the old one on every scan.
+                    observation_id: account_plan_observation_id(
+                        &quota.source_id,
+                        Some(&run.provider_account_id),
+                        run.raw_plan_name,
+                        run.started_at,
+                        AccountEvidenceKind::QuotaStatus,
+                    ),
+                    provider: quota.provider.clone(),
+                    source_id: quota.source_id.clone(),
+                    provider_account_id: Some(run.provider_account_id),
+                    raw_plan_name: run.raw_plan_name.to_string(),
+                    plan_name: normalize_plan_name(run.raw_plan_name),
+                    observed_at: quota.observed_at,
+                    active_from: None,
+                    active_until: None,
+                    is_current_snapshot: false,
+                    evidence_kind: AccountEvidenceKind::QuotaStatus,
+                    confidence: Confidence::High,
+                    parser_version: "quota-plan-evidence.v1".to_string(),
+                    artifact_path_hash: quota.source_file_path_hash.clone(),
+                    record_fingerprint: quota.semantic_fingerprint.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
         self.upsert_account_plan_observations(&observations)
     }
 
@@ -829,7 +929,32 @@ impl Store {
                 continue;
             };
             if accounts.len() != 1 {
-                event.provider_account_id = None;
+                // Conflicting bindings are weaker evidence than a person telling
+                // us who owns this source. Clearing the account here dropped a
+                // `UserConfigured` assignment and left `account_identity_source`
+                // still naming it, so the event claimed a manual attribution to
+                // an account that was no longer on it. Leave the event as it is
+                // and let the conflict stay visible in the evidence summary.
+                if !matches!(
+                    event
+                        .parse_evidence
+                        .as_ref()
+                        .map(|evidence| &evidence.account_identity_source),
+                    Some(IdentitySource::UserConfigured)
+                ) {
+                    event.provider_account_id = None;
+                }
+                continue;
+            }
+            // A manual assignment also outranks a single agreeing binding: it is
+            // the only source the user can correct by hand.
+            if matches!(
+                event
+                    .parse_evidence
+                    .as_ref()
+                    .map(|evidence| &evidence.account_identity_source),
+                Some(IdentitySource::UserConfigured)
+            ) {
                 continue;
             }
             event.provider_account_id = accounts.iter().next().map(|value| (*value).clone());
@@ -841,11 +966,20 @@ impl Store {
     }
 
     pub fn reattribute_conversation_bound_events(&self, source_id: &SourceId) -> Result<u64> {
-        let mut events = self
-            .events()?
-            .into_iter()
-            .filter(|event| event.source_id == *source_id)
-            .collect::<Vec<_>>();
+        // Nothing to reattribute without bindings, and this is the common case:
+        // every scan of every Auto-verified source reached here. Checking first
+        // avoids loading and deserializing the source's events for no reason.
+        if self
+            .conversation_account_bindings(Some(source_id))?
+            .is_empty()
+        {
+            return Ok(0);
+        }
+        // `events()` reads every row in `usage_events` and deserializes each
+        // payload before this filter sees it. On a store with hundreds of
+        // thousands of events that is the whole table parsed to keep one
+        // source's share; `events_for_source` pushes the same filter into SQL.
+        let mut events = self.events_for_source(source_id)?;
         let previous_accounts = events
             .iter()
             .map(|event| event.provider_account_id.clone())

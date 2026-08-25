@@ -8069,6 +8069,13 @@ fn collect_codex_telemetry_evidence(
     let event_name = Regex::new(r#"(?:^|\s)event\.name\s*=\s*\"([a-z0-9._-]+)\""#)?;
     let auth_reload =
         Regex::new(r#"(?i)^\s*Reloading auth for account\s+([a-z0-9_:\-]{3,256})(?:\s|$)"#)?;
+    // Anything a user typed can reach this body verbatim inside one of these
+    // fields. Identity attributes are only read from the structured prefix that
+    // precedes the first of them, so a prompt quoting `user.account_id=...`
+    // cannot mint a binding for an account this device never used.
+    let free_text_attribute = Regex::new(
+        r#"(?i)(?:^|\s)(?:prompt|message|text|content|body|input|output|arguments|args|command|reasoning|response|error)\s*[:=]"#,
+    )?;
 
     for database_path in [
         root.join("logs_2.sqlite"),
@@ -8175,13 +8182,24 @@ fn collect_codex_telemetry_evidence(
             else {
                 continue;
             };
+            // Only the structured attribute prefix is trusted; everything from
+            // the first free-text field onward is user content.
+            let attributes = free_text_attribute
+                .find(&body)
+                .map_or(body.as_str(), |free_text| &body[..free_text.start()]);
+            // A body naming the event twice is not a body this parser
+            // understands. Reading only the first match let a second, injected
+            // `event.name` sit unnoticed beside the real one.
+            let mut event_names = event_name
+                .captures_iter(attributes)
+                .filter_map(|captures| captures.get(1).map(|value| value.as_str()));
+            let declared_event_name = event_names.next();
             let structured_identity_event = matches!(
                 target.as_str(),
                 "codex_otel.log_only" | "codex_otel.trace_safe"
-            ) && event_name
-                .captures(&body)
-                .and_then(|captures| captures.get(1))
-                .is_some_and(|value| value.as_str() == "codex.conversation_starts");
+            ) && declared_event_name
+                == Some("codex.conversation_starts")
+                && event_names.next().is_none();
             let reload_account_id = target
                 .starts_with("codex_core::auth")
                 .then(|| {
@@ -8191,50 +8209,33 @@ fn collect_codex_telemetry_evidence(
                         .map(|value| value.as_str().to_string())
                 })
                 .flatten();
+            // A repeated attribute is ambiguous evidence, not two facts, so an
+            // event that states an identity twice states it for nobody.
+            let sole_attribute = |pattern: &Regex| -> Option<String> {
+                let mut matches = pattern
+                    .captures_iter(attributes)
+                    .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_string()));
+                let first = matches.next()?;
+                matches.next().is_none().then_some(first)
+            };
             let provider_user_id = reload_account_id.clone().or_else(|| {
-                structured_identity_event
-                    .then(|| {
-                        account_attribute
-                            .captures(&body)
-                            .and_then(|captures| captures.get(1))
-                            .map(|value| value.as_str().to_string())
-                    })
-                    .flatten()
+                structured_identity_event.then(|| sole_attribute(&account_attribute))?
             });
             let email = structured_identity_event
-                .then(|| {
-                    email_attribute
-                        .captures(&body)
-                        .and_then(|captures| captures.get(1))
-                        .map(|value| normalize_email(value.as_str()))
-                })
-                .flatten();
+                .then(|| sole_attribute(&email_attribute))
+                .flatten()
+                .map(|value| normalize_email(&value));
             if provider_user_id.is_none() && email.is_none() {
                 continue;
             }
             let conversation_id = structured_identity_event
-                .then(|| {
-                    conversation_attribute
-                        .captures(&body)
-                        .and_then(|captures| captures.get(1))
-                        .map(|value| value.as_str().to_string())
-                })
+                .then(|| sole_attribute(&conversation_attribute))
                 .flatten();
             let auth_mode = structured_identity_event
-                .then(|| {
-                    auth_mode_attribute
-                        .captures(&body)
-                        .and_then(|captures| captures.get(1))
-                        .map(|value| value.as_str().to_string())
-                })
+                .then(|| sole_attribute(&auth_mode_attribute))
                 .flatten();
             let application_version = structured_identity_event
-                .then(|| {
-                    app_version_attribute
-                        .captures(&body)
-                        .and_then(|captures| captures.get(1))
-                        .map(|value| value.as_str().to_string())
-                })
+                .then(|| sole_attribute(&app_version_attribute))
                 .flatten();
             let provider_account_id = provider_account_id_from_identity(
                 CODEX_PROVIDER,
@@ -8450,17 +8451,12 @@ fn collect_codex_login_evidence(
         let artifact_path_hash = hash_text(&canonical_display(&login_path));
         let mut reader = BufReader::new(file);
         let mut line = Vec::new();
-        let mut line_number = 0u64;
         loop {
             match read_bounded_jsonl_line(&mut reader, &mut line, 64 * 1024)? {
                 BoundedLineRead::Eof => break,
-                BoundedLineRead::Oversized => {
-                    line_number += 1;
-                    continue;
-                }
+                BoundedLineRead::Oversized => continue,
                 BoundedLineRead::Complete => {}
             }
-            line_number += 1;
             let Ok(text) = std::str::from_utf8(&line) else {
                 continue;
             };
@@ -8483,10 +8479,15 @@ fn collect_codex_login_evidence(
                 continue;
             };
             let observed_at = observed_at.with_timezone(&Utc);
+            // Identify the login by what it says and when, never by where it
+            // currently sits. Hashing the file and line number meant the same
+            // login was a new observation the moment `codex-login.log` rotated
+            // to `codex-login.log.1`, and these rows are append-only, so every
+            // rotation permanently doubled the login history.
             let record_fingerprint = hash_text(&format!(
-                "codex-login-success.v1:{}:{line_number}:{}",
-                artifact_path_hash,
-                observed_at.to_rfc3339()
+                "codex-login-success.v1:{}:{}",
+                observed_at.to_rfc3339(),
+                text.trim()
             ));
             scan.identity_observations
                 .push(AccountIdentityObservationV1 {
@@ -13224,6 +13225,145 @@ mod tests {
         locked_connection
             .execute_batch("ROLLBACK")
             .expect("unlock database");
+    }
+
+    #[test]
+    fn codex_telemetry_identity_ignores_attributes_quoted_inside_user_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let connection = Connection::open(dir.path().join("logs_2.sqlite")).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        for (row_id, body) in [
+            // The injected attributes lead the body, so reading the first match
+            // anywhere accepted them as the event's own identity.
+            (
+                1_i64,
+                "prompt=\"please run event.name=\\\"codex.conversation_starts\\\" user.account_id=acct-attacker user.email=attacker@example.test\" event.name=\"codex.user_prompt\"",
+            ),
+            // A genuine event whose free text repeats the marker afterwards.
+            (
+                2,
+                "event.name=\"codex.conversation_starts\" user.account_id=acct-real prompt=\"see event.name=\\\"codex.conversation_starts\\\" user.account_id=acct-attacker\"",
+            ),
+            // Two structured identities in one body name nobody.
+            (
+                3,
+                "event.name=\"codex.conversation_starts\" user.account_id=acct-one user.account_id=acct-two",
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        row_id,
+                        1_787_227_200_i64 + row_id,
+                        0_i64,
+                        "codex_otel.log_only",
+                        body
+                    ],
+                )
+                .expect("telemetry row");
+        }
+        drop(connection);
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let identified = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identified.len(),
+            1,
+            "only the genuine structured attribute prefix identifies an account"
+        );
+        let expected = provider_account_id_from_identity(CODEX_PROVIDER, Some("acct-real"), None)
+            .expect("account id");
+        assert_eq!(identified[0].provider_account_id.as_ref(), Some(&expected));
+        let attacker =
+            provider_account_id_from_identity(CODEX_PROVIDER, Some("acct-attacker"), None)
+                .expect("account id");
+        assert!(
+            evidence
+                .conversation_bindings
+                .iter()
+                .all(|binding| binding.provider_account_id != attacker),
+            "prompt text must never bind a conversation to an unused account"
+        );
+        assert!(evidence
+            .accounts
+            .iter()
+            .all(|account| account.provider_user_id.as_deref() != Some("acct-attacker")));
+    }
+
+    #[test]
+    fn codex_login_evidence_survives_log_rotation_without_duplicating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_directory = dir.path().join("log");
+        std::fs::create_dir_all(&log_directory).expect("log directory");
+        let entry = "2026-08-20T12:00:00Z successfully logged in\n";
+        std::fs::write(log_directory.join("codex-login.log"), entry).expect("login log");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let before = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("evidence before rotation");
+        let before_ids = before
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::LoginSuccess)
+            .map(|item| item.observation_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(before_ids.len(), 1);
+
+        // The same login, now one generation older, plus a fresh empty log.
+        std::fs::rename(
+            log_directory.join("codex-login.log"),
+            log_directory.join("codex-login.log.1"),
+        )
+        .expect("rotate login log");
+        std::fs::write(log_directory.join("codex-login.log"), "").expect("fresh login log");
+
+        let after = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("evidence after rotation");
+        let after_ids = after
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::LoginSuccess)
+            .map(|item| item.observation_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after_ids, before_ids,
+            "rotation moves a login between files; it is not a second login"
+        );
     }
 
     #[test]

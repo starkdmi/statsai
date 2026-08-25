@@ -7008,6 +7008,65 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_legacy_payload_does_not_make_the_store_unopenable() {
+        let path = tempfile::tempdir()
+            .expect("tempdir")
+            .keep()
+            .join("store.db");
+        {
+            let store = Store::open(&path).expect("initial store");
+            store
+                .conn
+                .execute(
+                    "INSERT INTO subscriptions
+                       (subscription_id, provider, provider_account_id, payload)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        "corrupt-subscription",
+                        "codex",
+                        "codex:corrupt",
+                        "{ this is not json",
+                    ],
+                )
+                .expect("corrupt subscription row");
+            store
+                .conn
+                .execute(
+                    "INSERT INTO provider_accounts
+                       (provider_account_id, provider, payload, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        "codex:corrupt-account",
+                        "codex",
+                        "{ also not json",
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .expect("corrupt account row");
+            store
+                .conn
+                .execute(
+                    "DELETE FROM local_metadata WHERE key = ?1",
+                    params![LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY],
+                )
+                .expect("clear conversion flag");
+        }
+
+        // The conversion runs inside `migrate`, so a hard error here would roll
+        // back before the completion flag is written and fail every later open.
+        let reopened = Store::open(&path).expect("a corrupt legacy row must not brick the store");
+        assert_eq!(
+            reopened
+                .metadata_value(LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY)
+                .expect("conversion flag")
+                .as_deref(),
+            Some("1"),
+            "the one-shot conversion must be recorded as done, not retried forever"
+        );
+        Store::open(&path).expect("a second open still succeeds");
+    }
+
+    #[test]
     fn migrates_legacy_codex_account_plan_without_subscription() {
         let store = Store::in_memory().expect("store");
         let observed_at = Utc
@@ -10893,6 +10952,179 @@ mod tests {
             .events_in_period(Some(DateTime::<Utc>::UNIX_EPOCH), until)
             .expect("epoch floor");
         assert!(epoch_floor.is_empty());
+    }
+
+    #[test]
+    fn conflicting_bindings_keep_a_manual_account_assignment() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc::now();
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            std::path::Path::new("/tmp/binding-conflict"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let manual = ProviderAccountId("account-manual".to_string());
+
+        // The same conversation is bound to two different accounts.
+        for (index, account) in ["account-one", "account-two"].iter().enumerate() {
+            store
+                .upsert_conversation_account_bindings(&[
+                    statsai_core::ConversationAccountBindingV1 {
+                        schema_version: statsai_core::CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION
+                            .to_string(),
+                        binding_id: format!("binding-{index}"),
+                        provider: "codex".to_string(),
+                        source_id: source.source_id.clone(),
+                        provider_account_id: ProviderAccountId((*account).to_string()),
+                        conversation_id_hash: "same-session".to_string(),
+                        turn_id_hash: None,
+                        observed_at: now,
+                        evidence_kind: statsai_core::AccountEvidenceKind::TelemetryIdentity,
+                        confidence: Confidence::High,
+                    },
+                ])
+                .expect("binding");
+        }
+
+        let mut manual_event = test_store_event(&source, now, "manual-record");
+        manual_event.provider_account_id = Some(manual.clone());
+        manual_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "test".to_string(),
+            source_file_path_hash: None,
+            source_line_number: None,
+            source_record_id: None,
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: IdentitySource::UserConfigured,
+        });
+        let mut derived_event = test_store_event(&source, now, "derived-record");
+        derived_event.provider_account_id = Some(ProviderAccountId("account-one".to_string()));
+        derived_event.parse_evidence = Some(ParseEvidence {
+            account_identity_source: IdentitySource::LocalAuth,
+            ..manual_event
+                .parse_evidence
+                .clone()
+                .expect("evidence template")
+        });
+
+        let mut events = vec![manual_event, derived_event];
+        store
+            .apply_conversation_account_bindings(&source.source_id, &mut events)
+            .expect("apply bindings");
+
+        assert_eq!(
+            events[0].provider_account_id.as_ref(),
+            Some(&manual),
+            "a conflict between derived bindings must not discard a manual assignment"
+        );
+        assert_eq!(
+            events[0]
+                .parse_evidence
+                .as_ref()
+                .map(|evidence| &evidence.account_identity_source),
+            Some(&IdentitySource::UserConfigured),
+            "the recorded identity source must still describe the account on the event"
+        );
+        assert_eq!(
+            events[1].provider_account_id, None,
+            "a derived attribution is still cleared by a genuine conflict"
+        );
+    }
+
+    #[test]
+    fn reset_history_alone_does_not_truncate_a_source_assignment() {
+        let store = Store::in_memory().expect("store");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("started at");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            std::path::Path::new("/tmp/reset-history-truncation"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let bound = ProviderAccountId("account-bound".to_string());
+        let assignment = statsai_core::SourceAccountAssignment {
+            schema_version: statsai_core::SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+            assignment_id: statsai_core::SourceAccountAssignmentId("assignment-1".to_string()),
+            source_id: source.source_id.clone(),
+            provider: "codex".to_string(),
+            provider_account_id: bound.clone(),
+            started_at,
+            ended_at: None,
+            record_source: IdentitySource::LocalAuth,
+            verified_at: Some(started_at),
+            created_at: started_at,
+            updated_at: started_at,
+        };
+        store
+            .upsert_source_account_assignment(&assignment)
+            .expect("assignment");
+
+        // An auth snapshot corroborates the assignment, then a single
+        // conversation-scoped reset-history entry names a different account.
+        for (index, (kind, account, offset_days)) in [
+            (
+                statsai_core::AccountEvidenceKind::AuthSnapshot,
+                "account-bound",
+                1_i64,
+            ),
+            (
+                statsai_core::AccountEvidenceKind::ResetHistory,
+                "account-other",
+                2,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .upsert_account_identity_observations(&[
+                    statsai_core::AccountIdentityObservationV1 {
+                        schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                            .to_string(),
+                        observation_id: format!("identity-{index}"),
+                        provider: "codex".to_string(),
+                        source_id: source.source_id.clone(),
+                        provider_account_id: Some(ProviderAccountId(account.to_string())),
+                        provider_user_id_hash: None,
+                        email_hash: None,
+                        conversation_id_hash: Some("f".repeat(64)),
+                        turn_id_hash: Some("a".repeat(64)),
+                        observed_at: started_at + chrono::Duration::days(offset_days),
+                        evidence_kind: kind,
+                        confidence: Confidence::High,
+                        auth_mode: None,
+                        application_version: None,
+                        parser_version: "test.v1".to_string(),
+                        artifact_kind: "test".to_string(),
+                        artifact_path_hash: "c".repeat(64),
+                        record_fingerprint: format!("{index}").repeat(64),
+                    },
+                ])
+                .expect("identity observation");
+        }
+
+        store
+            .reconcile_source_account_evidence_assignments(&source.source_id)
+            .expect("reconcile");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].provider_account_id, bound);
+        assert_eq!(
+            assignments[0].ended_at, None,
+            "a per-conversation reset-history entry cannot end a source-wide assignment, \
+             because nothing downstream is able to reopen one"
+        );
     }
 
     fn test_store_event(

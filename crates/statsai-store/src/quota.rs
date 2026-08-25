@@ -1730,6 +1730,120 @@ mod tests {
     }
 
     #[test]
+    fn many_quota_rows_naming_one_plan_collapse_into_one_observation() {
+        let store = Store::in_memory().expect("store");
+        let start = DateTime::from_timestamp(1_787_227_200, 0).expect("start");
+        let (source_id, account_id) = assigned_source(&store, start - Duration::days(1));
+
+        // Two hundred provider responses across two plans: "pro", then "team",
+        // then "pro" again after a downgrade.
+        let mut records = Vec::new();
+        for index in 0..200i64 {
+            let observed_at = start + Duration::minutes(index);
+            let mut record = sample_record(
+                source_id.clone(),
+                &format!("quota-run-{index}"),
+                &format!("quota-run-fingerprint-{index}"),
+                observed_at,
+                (observed_at + Duration::days(7)).timestamp(),
+                "primary",
+                10_080,
+                25.0,
+            );
+            record.observation.status.plan_type = Some(
+                match index {
+                    ..=99 => "pro",
+                    100..=149 => "team",
+                    _ => "pro",
+                }
+                .to_string(),
+            );
+            records.push(record);
+        }
+        store
+            .upsert_quota_observations(&records)
+            .expect("quota observations");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("plan rebuild");
+
+        let observations = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(
+            observations.len(),
+            3,
+            "one observation per run of an unchanged plan, not one per quota row"
+        );
+        let mut runs = observations
+            .iter()
+            .map(|observation| {
+                (
+                    observation.raw_plan_name.as_str(),
+                    observation.observed_at,
+                    observation.provider_account_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        runs.sort_by_key(|run| run.1);
+        assert_eq!(runs[0].0, "pro");
+        assert_eq!(runs[0].1, start + Duration::minutes(99));
+        assert_eq!(runs[1].0, "team");
+        assert_eq!(runs[1].1, start + Duration::minutes(149));
+        assert_eq!(runs[2].0, "pro");
+        assert_eq!(runs[2].1, start + Duration::minutes(199));
+        assert!(runs.iter().all(|run| run.2.as_ref() == Some(&account_id)));
+
+        // Rebuilding without new data must not churn the ledger.
+        let ids_before = observations
+            .iter()
+            .map(|observation| observation.observation_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("repeat plan rebuild");
+        let ids_after = store
+            .account_plan_observations()
+            .expect("plan evidence")
+            .iter()
+            .map(|observation| observation.observation_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids_after, ids_before);
+
+        // Extending the open run keeps its identity, so history stays put and
+        // only the newest observation re-syncs.
+        let extension = {
+            let observed_at = start + Duration::minutes(200);
+            let mut record = sample_record(
+                source_id.clone(),
+                "quota-run-200",
+                "quota-run-fingerprint-200",
+                observed_at,
+                (observed_at + Duration::days(7)).timestamp(),
+                "primary",
+                10_080,
+                26.0,
+            );
+            record.observation.status.plan_type = Some("pro".to_string());
+            record
+        };
+        store
+            .upsert_quota_observations(&[extension])
+            .expect("extend run");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("plan rebuild after extension");
+        let extended = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(extended.len(), 3);
+        assert_eq!(
+            extended
+                .iter()
+                .map(|observation| observation.observation_id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ids_before,
+            "extending a run must not mint a new observation and retire the old one"
+        );
+    }
+
+    #[test]
     fn quota_plan_label_never_identifies_an_unassigned_account() {
         let store = Store::in_memory().expect("store");
         let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed_at");

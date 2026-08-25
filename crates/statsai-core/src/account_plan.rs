@@ -33,6 +33,23 @@ impl AccountEvidenceKind {
             Self::AuthSnapshot | Self::TelemetryIdentity | Self::AuthReload | Self::ResetHistory
         )
     }
+
+    /// Whether this evidence says the *source* itself changed account at that moment.
+    ///
+    /// `ResetHistory` is deliberately excluded. It is replayed from a persisted
+    /// state file, is scoped to one conversation and turn, and describes a
+    /// rate-limit reset rather than an authentication state, so it can name an
+    /// account the source was never signed in as. Only kinds that can also
+    /// reopen an interval belong here: ending an interval on evidence that
+    /// cannot restart one leaves the rest of the source's history permanently
+    /// unattributed, with no later scan able to repair it.
+    #[must_use]
+    pub const fn ends_source_attribution(self) -> bool {
+        matches!(
+            self,
+            Self::AuthSnapshot | Self::TelemetryIdentity | Self::AuthReload
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
