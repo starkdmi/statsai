@@ -717,9 +717,17 @@ impl Store {
                     raw_plan_name: run.raw_plan_name.to_string(),
                     plan_name: normalize_plan_name(run.raw_plan_name),
                     observed_at: quota.observed_at,
+                    // No period: the provider reported a plan while serving a
+                    // request, it did not declare a billing window. It did
+                    // report it *as of that moment*, though, which is what
+                    // `is_current_snapshot` means -- and it is fresher than
+                    // `auth.json`, which can sit on disk unchanged for weeks.
+                    // Leaving this false meant an account whose logs say "plus"
+                    // every day still read as `last_detected` as soon as its
+                    // last declared provider period ran out.
                     active_from: None,
                     active_until: None,
-                    is_current_snapshot: false,
+                    is_current_snapshot: true,
                     evidence_kind: AccountEvidenceKind::QuotaStatus,
                     confidence: Confidence::High,
                     parser_version: "quota-plan-evidence.v1".to_string(),

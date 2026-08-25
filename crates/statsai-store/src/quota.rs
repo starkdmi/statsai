@@ -1686,6 +1686,42 @@ mod tests {
     }
 
     #[test]
+    fn quota_plan_evidence_speaks_for_the_moment_it_was_read() {
+        // The provider names the plan while serving a request, so the reading
+        // is evidence of the plan *now* even though it declares no billing
+        // window. Without that, an account whose logs say "plus" every day
+        // still read as `last_detected` once its last declared provider period
+        // ran out, and it dropped off every current-plan surface.
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let reset_at = observed_at + Duration::days(7);
+        let (source_id, _) = assigned_source(&store, observed_at - Duration::days(1));
+        let record = sample_record(
+            source_id.clone(),
+            "quota-current",
+            "quota-current-v1",
+            observed_at,
+            reset_at.timestamp(),
+            "primary",
+            10_080,
+            25.0,
+        );
+        store
+            .upsert_quota_observations(std::slice::from_ref(&record))
+            .expect("quota row");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("plan rebuild");
+
+        let plans = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].is_current_snapshot);
+        // Still no invented billing period.
+        assert_eq!(plans[0].active_from, None);
+        assert_eq!(plans[0].active_until, None);
+    }
+
+    #[test]
     fn quota_plan_evidence_rebuild_replaces_corrected_plan_rows() {
         let store = Store::in_memory().expect("store");
         let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
