@@ -471,7 +471,7 @@ impl Store {
                 record
                     .windows
                     .iter()
-                    .any(|window| window.window_minutes >= SYNC_ELIGIBLE_WINDOW_MINUTES)
+                    .any(|window| window.window_minutes == SYNC_ELIGIBLE_WINDOW_MINUTES)
             })
             .collect::<Vec<_>>();
         let weekly_eligible = weekly
@@ -861,7 +861,7 @@ impl Store {
         Ok(self
             .quota_windows_without_usage_totals(query)?
             .into_iter()
-            .filter(|window| window.window_minutes >= SYNC_ELIGIBLE_WINDOW_MINUTES)
+            .filter(|window| window.window_minutes == SYNC_ELIGIBLE_WINDOW_MINUTES)
             .filter_map(|window| {
                 let provider_account_id = window.provider_account_id.clone()?;
                 let anchor = window.change_points.first()?;

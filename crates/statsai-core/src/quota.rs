@@ -228,13 +228,20 @@ impl QuotaUsageSliceV1 {
         self.input_tokens = self
             .input_tokens
             .saturating_add(usage.input_tokens.unwrap_or(0));
-        self.cache_creation_tokens = self.cache_creation_tokens.saturating_add(
-            usage
-                .cache_creation_tokens
-                .unwrap_or(0)
-                .saturating_add(usage.cache_creation_5m_tokens.unwrap_or(0))
-                .saturating_add(usage.cache_creation_1h_tokens.unwrap_or(0)),
-        );
+        // The 5m and 1h counters are the lifetime breakdown of the aggregate,
+        // not additional writes: Claude reports 248 alongside 148 + 100. Adding
+        // all three counted every cached write twice and pushed the slice
+        // components past its own `total_tokens`. Every other accumulator in
+        // the workspace takes the aggregate alone; the lifetimes are only a
+        // fallback for records that arrive without it.
+        self.cache_creation_tokens =
+            self.cache_creation_tokens
+                .saturating_add(usage.cache_creation_tokens.unwrap_or_else(|| {
+                    usage
+                        .cache_creation_5m_tokens
+                        .unwrap_or(0)
+                        .saturating_add(usage.cache_creation_1h_tokens.unwrap_or(0))
+                }));
         self.cache_read_tokens = self
             .cache_read_tokens
             .saturating_add(usage.cache_read_tokens.unwrap_or(0));
@@ -275,4 +282,48 @@ pub struct QuotaCycleContributionV1 {
     pub daily_envelopes: Vec<QuotaDailyEnvelopeV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boundary_slices: Vec<QuotaUsageSliceV1>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slice_counts_each_cached_write_once() {
+        // Claude reports the aggregate beside its lifetime breakdown, and the
+        // two describe the same 248 tokens.
+        let usage = UsageCounts {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            cache_creation_tokens: Some(248),
+            cache_creation_5m_tokens: Some(148),
+            cache_creation_1h_tokens: Some(100),
+            total_tokens: Some(278),
+            ..UsageCounts::default()
+        };
+
+        let mut slice = QuotaUsageSliceV1::default();
+        slice.add_usage(&usage, None);
+
+        assert_eq!(slice.cache_creation_tokens, 248);
+        assert!(
+            slice.input_tokens + slice.output_tokens + slice.cache_creation_tokens
+                <= slice.total_tokens
+        );
+    }
+
+    #[test]
+    fn a_slice_falls_back_to_the_lifetime_breakdown() {
+        let usage = UsageCounts {
+            cache_creation_tokens: None,
+            cache_creation_5m_tokens: Some(8),
+            cache_creation_1h_tokens: Some(5),
+            ..UsageCounts::default()
+        };
+
+        let mut slice = QuotaUsageSliceV1::default();
+        slice.add_usage(&usage, None);
+
+        assert_eq!(slice.cache_creation_tokens, 13);
+    }
 }
