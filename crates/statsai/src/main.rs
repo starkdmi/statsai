@@ -59,6 +59,7 @@ use statsai::{auth, default_device_id, default_store_path, service, snapshot};
 const HTTP_ROLLUP_SUMMARIES_PER_BATCH: usize = 25;
 const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
 const HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH: usize = 1_000;
+const HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH: usize = 100;
 const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 const HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE: usize = 90;
 const HTTP_ROLLUP_DAILY_ROLLUP_ROWS_PER_QUERY: usize = 7;
@@ -922,7 +923,7 @@ enum StoreAdminSubcommand {
 
 #[derive(Debug, Subcommand)]
 enum SchemaSubcommand {
-    #[command(about = "Print the sync_batch.v3 JSON Schema")]
+    #[command(about = "Print the sync_batch.v4 JSON Schema")]
     SyncBatch,
     #[command(about = "Print the quota_window_sync_projection.v1 JSON Schema")]
     QuotaWindowProjection,
@@ -4139,6 +4140,21 @@ fn build_sync_batch_with_identity_key(
         .iter()
         .map(|metric| metric.metric_id.clone())
         .collect::<Vec<_>>();
+    let all_quota_cycle_contributions =
+        store.quota_cycle_contributions(&QuotaQuery::default(), device_id)?;
+    let quota_cycle_contributions = if command.full || state.is_none() {
+        all_quota_cycle_contributions.clone()
+    } else {
+        store.pending_quota_cycle_contributions_for_sync(
+            &command.sink,
+            target,
+            &all_quota_cycle_contributions,
+        )?
+    };
+    let all_quota_cycle_contribution_ids = all_quota_cycle_contributions
+        .iter()
+        .map(|contribution| contribution.contribution_id.clone())
+        .collect::<Vec<_>>();
 
     if payload_mode == SyncPayloadMode::Rollups {
         let label = rollup_mode_label(command);
@@ -4178,6 +4194,7 @@ fn build_sync_batch_with_identity_key(
                 .map(|summary| summary.summary_id.clone())
                 .collect(),
             code_change_metric_ids: all_code_change_metric_ids,
+            quota_cycle_contribution_ids: all_quota_cycle_contribution_ids,
         };
         let failed_without_resume = state.as_ref().is_some_and(|state| {
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()
@@ -4240,6 +4257,7 @@ fn build_sync_batch_with_identity_key(
             task_buckets,
             task_verifications,
             code_change_metrics,
+            quota_cycle_contributions,
             authoritative_snapshot,
             created_at,
         },
@@ -4278,6 +4296,11 @@ fn record_rollup_sync_chunk_success(
             .map(|metric| metric.metric_id.clone())
             .collect::<Vec<_>>(),
     )?;
+    store.record_quota_cycle_contributions_synced(
+        sink,
+        target,
+        &batch.quota_cycle_contributions,
+    )?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
 }
@@ -4311,6 +4334,11 @@ fn record_sync_batch_success(
             .iter()
             .map(|metric| metric.metric_id.clone())
             .collect::<Vec<_>>(),
+    )?;
+    store.record_quota_cycle_contributions_synced(
+        sink,
+        target,
+        &batch.quota_cycle_contributions,
     )?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
@@ -4630,9 +4658,11 @@ fn should_retry_http_rollup_chunk_after_error(chunk: &SyncBatch, error: &anyhow:
         || chunk.task_buckets.len() > 1
         || chunk.task_verifications.len() > 1
         || chunk.code_change_metrics.len() > 1
+        || chunk.quota_cycle_contributions.len() > 1
         || (!chunk.task_buckets.is_empty() && !chunk.task_verifications.is_empty())
         || (http_rollup_metadata_count(chunk) > 0 && !chunk.summaries.is_empty())
         || (!chunk.code_change_metrics.is_empty() && has_non_code_change_payload(chunk))
+        || (!chunk.quota_cycle_contributions.is_empty() && has_non_quota_cycle_payload(chunk))
 }
 
 fn http_rollup_retry_error_label(error: &anyhow::Error) -> &'static str {
@@ -4711,6 +4741,7 @@ fn split_authoritative_snapshot(
         subscription_ids: Vec::new(),
         summary_ids: Vec::new(),
         code_change_metric_ids: Vec::new(),
+        quota_cycle_contribution_ids: Vec::new(),
     };
     let mut parts = Vec::new();
     let mut current = empty_part();
@@ -4735,6 +4766,10 @@ fn split_authoritative_snapshot(
     append_ids!(snapshot.subscription_ids, subscription_ids);
     append_ids!(snapshot.summary_ids, summary_ids);
     append_ids!(snapshot.code_change_metric_ids, code_change_metric_ids);
+    append_ids!(
+        snapshot.quota_cycle_contribution_ids,
+        quota_cycle_contribution_ids
+    );
     if authoritative_snapshot_id_count(&current) > 0 || parts.is_empty() {
         parts.push(current);
     }
@@ -4753,6 +4788,7 @@ fn authoritative_snapshot_id_count(snapshot: &SyncAuthoritativeSnapshot) -> usiz
         + snapshot.subscription_ids.len()
         + snapshot.summary_ids.len()
         + snapshot.code_change_metric_ids.len()
+        + snapshot.quota_cycle_contribution_ids.len()
 }
 
 fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<SyncBatch> {
@@ -4763,11 +4799,14 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
     );
     let has_task_payload = !task_chunks.is_empty();
     let metadata_count = http_rollup_metadata_count(batch);
-    let has_rollup_payload =
-        metadata_count > 0 || !batch.summaries.is_empty() || !batch.code_change_metrics.is_empty();
+    let has_rollup_payload = metadata_count > 0
+        || !batch.summaries.is_empty()
+        || !batch.code_change_metrics.is_empty()
+        || !batch.quota_cycle_contributions.is_empty();
     if !has_task_payload
         && batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
         && batch.code_change_metrics.len() <= HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH
+        && batch.quota_cycle_contributions.len() <= HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH
         && metadata_count <= HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH
     {
         return fit_http_rollup_batches_to_d1_budget(vec![batch.clone()]);
@@ -4785,8 +4824,17 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
         .code_change_metrics
         .len()
         .div_ceil(HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH);
-    let mut chunks =
-        Vec::with_capacity(total_chunks + metadata_chunks + code_change_chunks + task_chunks.len());
+    let quota_cycle_chunks = batch
+        .quota_cycle_contributions
+        .len()
+        .div_ceil(HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH);
+    let mut chunks = Vec::with_capacity(
+        total_chunks
+            + metadata_chunks
+            + code_change_chunks
+            + quota_cycle_chunks
+            + task_chunks.len(),
+    );
 
     chunks.extend(split_http_rollup_metadata_chunks(
         batch,
@@ -4797,6 +4845,10 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
         batch,
         HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH,
     ));
+    chunks.extend(split_http_quota_cycle_contribution_chunks(
+        batch,
+        HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH,
+    ));
     chunks.extend(split_http_rollup_summary_chunks(
         batch,
         HTTP_ROLLUP_SUMMARIES_PER_BATCH,
@@ -4806,6 +4858,24 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
 }
 
 fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<SyncBatch> {
+    if !batch.quota_cycle_contributions.is_empty() && has_non_quota_cycle_payload(batch) {
+        let mut without_quota = batch.clone();
+        without_quota.quota_cycle_contributions.clear();
+        let mut chunks = split_http_quota_cycle_contribution_chunks(
+            batch,
+            batch.quota_cycle_contributions.len(),
+        );
+        chunks.extend(split_http_rollup_sync_batch_after_budget_error(
+            &without_quota,
+        ));
+        return chunks;
+    }
+    if batch.quota_cycle_contributions.len() > 1 {
+        return split_http_quota_cycle_contribution_chunks(
+            batch,
+            batch.quota_cycle_contributions.len().div_ceil(2),
+        );
+    }
     if !batch.code_change_metrics.is_empty() && has_non_code_change_payload(batch) {
         let mut without_code_changes = batch.clone();
         without_code_changes.code_change_metrics.clear();
@@ -4885,6 +4955,16 @@ fn has_non_code_change_payload(batch: &SyncBatch) -> bool {
         || !batch.summaries.is_empty()
         || !batch.task_buckets.is_empty()
         || !batch.task_verifications.is_empty()
+        || !batch.quota_cycle_contributions.is_empty()
+}
+
+fn has_non_quota_cycle_payload(batch: &SyncBatch) -> bool {
+    http_rollup_metadata_count(batch) > 0
+        || !batch.events.is_empty()
+        || !batch.summaries.is_empty()
+        || !batch.task_buckets.is_empty()
+        || !batch.task_verifications.is_empty()
+        || !batch.code_change_metrics.is_empty()
 }
 
 fn http_rollup_metadata_count(batch: &SyncBatch) -> usize {
@@ -4938,6 +5018,22 @@ fn split_http_code_change_metric_chunks(batch: &SyncBatch, chunk_size: usize) ->
         .map(|(index, metrics)| {
             let mut chunk = empty_http_rollup_chunk(batch, &format!("code_changes_{}", index + 1));
             chunk.code_change_metrics = metrics.to_vec();
+            chunk
+        })
+        .collect()
+}
+
+fn split_http_quota_cycle_contribution_chunks(
+    batch: &SyncBatch,
+    chunk_size: usize,
+) -> Vec<SyncBatch> {
+    batch
+        .quota_cycle_contributions
+        .chunks(chunk_size.max(1))
+        .enumerate()
+        .map(|(index, contributions)| {
+            let mut chunk = empty_http_rollup_chunk(batch, &format!("quota_cycles_{}", index + 1));
+            chunk.quota_cycle_contributions = contributions.to_vec();
             chunk
         })
         .collect()
@@ -5016,6 +5112,8 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     // The backend batches metrics into one json_each upsert and one ownership
     // statement regardless of metric count.
     let code_change_metric_queries = usize::from(!batch.code_change_metrics.is_empty()) * 2;
+    let quota_cycle_contribution_queries =
+        usize::from(!batch.quota_cycle_contributions.is_empty()) * 2;
     let code_change_owner_metadata_refresh_queries = usize::from(
         batch.schema_version == SYNC_BATCH_SCHEMA_VERSION
             && batch
@@ -5038,6 +5136,7 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
         + monthly_rollup_queries
         + dashboard_snapshot_queries
         + code_change_metric_queries
+        + quota_cycle_contribution_queries
         + code_change_owner_metadata_refresh_queries
         + estimate_http_rollup_task_queries(batch)
         + final_sync_bookkeeping_queries
@@ -5410,6 +5509,7 @@ fn split_http_rollup_summary_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec
             chunk.task_buckets.clear();
             chunk.task_verifications.clear();
             chunk.code_change_metrics.clear();
+            chunk.quota_cycle_contributions.clear();
             chunk.authoritative_snapshot = None;
             chunk
         })
@@ -5428,6 +5528,7 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
     chunk.task_buckets.clear();
     chunk.task_verifications.clear();
     chunk.code_change_metrics.clear();
+    chunk.quota_cycle_contributions.clear();
     chunk.authoritative_snapshot = None;
     chunk
 }
@@ -6105,6 +6206,13 @@ fn quota(command: QuotaCommand, store: &Store, device_id: &str) -> Result<()> {
                     format_u64(status.weekly_sync_eligible_observations),
                     format_u64(status.weekly_observations),
                     status.weekly_sync_eligible_coverage_percent
+                );
+                let discarded = &status.discarded;
+                println!(
+                    "reconstruction discarded: {} replayed observations, {} unused windows, {} bracketed schedules",
+                    format_u64(discarded.replayed_observations),
+                    format_u64(discarded.unused_windows),
+                    format_u64(discarded.bracketed_schedules)
                 );
                 if status.unattributed_observations > 0 {
                     eprintln!(
@@ -14291,6 +14399,7 @@ mod tests {
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -14339,6 +14448,7 @@ mod tests {
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
                 source_ids: vec![source.source_id.clone()],
                 ..SyncAuthoritativeSnapshot::default()
@@ -14390,6 +14500,7 @@ mod tests {
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
                 summary_ids,
                 ..SyncAuthoritativeSnapshot::default()
@@ -14509,6 +14620,7 @@ mod tests {
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -14576,6 +14688,7 @@ mod tests {
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -14668,6 +14781,7 @@ mod tests {
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -15024,6 +15138,7 @@ mod tests {
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -15369,6 +15484,7 @@ mod tests {
             task_buckets: test_task_only_sync_batch(now, 1, 0).task_buckets,
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -15453,6 +15569,7 @@ mod tests {
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -15554,6 +15671,7 @@ mod tests {
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -15701,6 +15819,7 @@ mod tests {
             task_buckets,
             task_verifications,
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         }
@@ -15854,6 +15973,7 @@ mod tests {
             }],
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         }
@@ -16012,6 +16132,7 @@ mod tests {
             task_buckets,
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         }
@@ -18804,6 +18925,7 @@ mod tests {
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: Utc
                 .with_ymd_and_hms(2026, 6, 14, 13, 0, 0)

@@ -107,6 +107,7 @@ pub struct PendingSyncSummaryCounts {
     pub rollups: u64,
     pub passthrough_summaries: u64,
     pub retired_entities: u64,
+    pub quota_cycle_contributions: u64,
     pub total: u64,
     pub days: u64,
 }
@@ -2510,6 +2511,11 @@ impl Store {
                 target,
                 &batch.code_change_metrics,
             )?;
+            self.record_quota_cycle_contributions_synced_in_transaction(
+                sink,
+                target,
+                &batch.quota_cycle_contributions,
+            )?;
             self.record_task_bucket_snapshots_synced_in_transaction(
                 sink,
                 target,
@@ -2936,6 +2942,14 @@ impl Store {
                     .map(String::as_str)
                     .collect::<BTreeSet<_>>(),
             ),
+            (
+                "quota_cycle_contribution",
+                snapshot
+                    .quota_cycle_contribution_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+            ),
         ]);
         let mut statement = self.conn.prepare(
             r#"
@@ -2944,7 +2958,7 @@ impl Store {
             WHERE sink = ?1 AND target = ?2
               AND entity_kind IN (
                 'source', 'account', 'source_account_assignment', 'subscription', 'summary',
-                'code_change_metric'
+                'code_change_metric', 'quota_cycle_contribution'
               )
             "#,
         )?;
@@ -3019,10 +3033,25 @@ impl Store {
             target,
             &current_code_change_metrics,
         )?;
+        let current_quota_cycle_contributions =
+            self.quota_cycle_contributions(&QuotaQuery::default(), device_id)?;
         let current_snapshot = self.current_http_sync_authoritative_snapshot(
             &current_rollups,
             &current_passthrough_summaries,
             &current_code_change_metrics,
+            &current_quota_cycle_contributions
+                .iter()
+                .map(|contribution| contribution.contribution_id.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        // A quota cycle can change without any summary changing: a reset moves,
+        // or an observation carries no tokens. Counting only the summary-shaped
+        // entities left those uploads invisible, so the menubar reported nothing
+        // pending while a sync would still have sent them.
+        let quota_cycle_contributions = self.pending_quota_cycle_contributions_for_sync(
+            "http",
+            target,
+            &current_quota_cycle_contributions,
         )?;
         let retired_entities = self
             .retired_sync_entity_ids("http", target, &current_snapshot)?
@@ -3034,10 +3063,12 @@ impl Store {
             rollups: rollups.len() as u64,
             passthrough_summaries: passthrough_summaries.len() as u64,
             retired_entities: retired_entities as u64,
+            quota_cycle_contributions: quota_cycle_contributions.len() as u64,
             total: rollups
                 .len()
                 .saturating_add(passthrough_summaries.len())
                 .saturating_add(code_change_metrics.len())
+                .saturating_add(quota_cycle_contributions.len())
                 .saturating_add(retired_entities) as u64,
             days: days.len() as u64,
         })
@@ -3048,6 +3079,7 @@ impl Store {
         rollups: &[UsageSummary],
         passthrough_summaries: &[UsageSummary],
         code_change_metrics: &[CodeChangeMetric],
+        quota_cycle_contribution_ids: &[String],
     ) -> Result<SyncAuthoritativeSnapshot> {
         Ok(SyncAuthoritativeSnapshot {
             snapshot_id: String::new(),
@@ -3082,6 +3114,7 @@ impl Store {
                 .iter()
                 .map(|metric| metric.metric_id.clone())
                 .collect(),
+            quota_cycle_contribution_ids: quota_cycle_contribution_ids.to_vec(),
         })
     }
 
@@ -3491,6 +3524,39 @@ impl Store {
                 target,
                 "code_change_metric",
                 &metric.metric_id,
+                &hash_text(&payload),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn record_quota_cycle_contributions_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        contributions: &[statsai_core::QuotaCycleContributionV1],
+    ) -> Result<()> {
+        if contributions.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_quota_cycle_contributions_synced_in_transaction(sink, target, contributions)
+        })
+    }
+
+    fn record_quota_cycle_contributions_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        contributions: &[statsai_core::QuotaCycleContributionV1],
+    ) -> Result<()> {
+        for contribution in contributions {
+            let payload = serde_json::to_string(contribution)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                "quota_cycle_contribution",
+                &contribution.contribution_id,
                 &hash_text(&payload),
             )?;
         }
@@ -8619,6 +8685,7 @@ mod tests {
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -9795,6 +9862,7 @@ mod tests {
                 rollups: 0,
                 passthrough_summaries: 2,
                 retired_entities: 0,
+                quota_cycle_contributions: 0,
                 total: 2,
                 days: 5,
             }
@@ -9856,6 +9924,7 @@ mod tests {
                 rollups: 0,
                 passthrough_summaries: 1,
                 retired_entities: 0,
+                quota_cycle_contributions: 0,
                 total: 1,
                 days: 1,
             }

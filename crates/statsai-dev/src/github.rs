@@ -12,6 +12,20 @@ pub(crate) const REPOSITORY: &str = "starkdmi/statsai";
 pub(crate) const WORKFLOW_FILE: &str = "dev-build.yml";
 const GITHUB_API: &str = "https://api.github.com";
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+/// Enough for a JSON reply, and short enough that an unreachable API gives up
+/// promptly.
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+/// `ureq`'s request timeout covers reading the body too, so the API bound also
+/// capped every artifact download. Thirty seconds for an archive that may reach
+/// the 256 MiB ceiling demands roughly 68 Mbit/s sustained, which turned an
+/// ordinary home connection into an intermittent "timed out reading response".
+/// Ten minutes covers the ceiling at about 3.5 Mbit/s.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// Overrides [`DOWNLOAD_TIMEOUT`], in seconds. Zero waits indefinitely.
+const DOWNLOAD_TIMEOUT_ENV: &str = "STATSAI_DEV_DOWNLOAD_TIMEOUT_SECONDS";
+/// One initial attempt plus two retries.
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
+const DOWNLOAD_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BuildRequest {
@@ -250,7 +264,7 @@ impl GitHubClient {
         let mut downloads = Vec::with_capacity(artifacts.len());
         let mut errors = Vec::new();
         for artifact in artifacts {
-            match self.download(&artifact.archive_download_url, &expected_name) {
+            match self.download_with_retries(&artifact.archive_download_url, &expected_name) {
                 Ok(bytes) => downloads.push(bytes),
                 Err(error) => errors.push(format!("artifact #{}: {error:#}", artifact.id)),
             }
@@ -265,16 +279,34 @@ impl GitHubClient {
         Ok(downloads)
     }
 
+    /// The wait loop that precedes this retries the *build lookup*, not the
+    /// download, so a transfer cut short by a slow link failed the whole install
+    /// on the first try. A body cannot be resumed, so a retry re-requests it.
+    fn download_with_retries(&self, url: &str, expected_name: &str) -> Result<Vec<u8>> {
+        retrying_download(
+            || self.download(url, expected_name),
+            std::thread::sleep,
+            |message| eprintln!("{message}"),
+        )
+    }
+
     fn download(&self, url: &str, expected_name: &str) -> Result<Vec<u8>> {
         let response = self.call(
-            self.request(url),
+            self.request_with_timeout(url, download_timeout()),
             &format!("download artifact {expected_name}"),
         )?;
         let mut reader = response.into_reader().take(MAX_ARTIFACT_BYTES + 1);
         let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("read downloaded artifact {expected_name}"))?;
+        // A read that dies partway is as transient as one that never connected,
+        // but it surfaces here rather than from `call`, so it has to be marked
+        // retryable explicitly or the loop above would give up on it.
+        if let Err(error) = reader.read_to_end(&mut bytes) {
+            return Err(GitHubRequestFailure {
+                message: format!("read downloaded artifact {expected_name}: {error}"),
+                retry: Some(RetryAdvice { delay: None }),
+            }
+            .into());
+        }
         if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
             bail!("artifact {expected_name} exceeds the 256 MiB safety limit");
         }
@@ -282,8 +314,16 @@ impl GitHubClient {
     }
 
     fn request(&self, url: &str) -> ureq::Request {
-        let request = ureq::get(url)
-            .timeout(Duration::from_secs(30))
+        self.request_with_timeout(url, Some(API_TIMEOUT))
+    }
+
+    fn request_with_timeout(&self, url: &str, timeout: Option<Duration>) -> ureq::Request {
+        let request = ureq::get(url);
+        let request = match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        };
+        let request = request
             .set(
                 "User-Agent",
                 &format!("statsai-dev/{}", env!("CARGO_PKG_VERSION")),
@@ -407,6 +447,46 @@ fn compare_runs(left: &WorkflowRun, right: &WorkflowRun) -> Ordering {
         .then_with(|| left.id.cmp(&right.id))
 }
 
+fn retrying_download<D, S, W>(mut download: D, mut sleep: S, mut warn: W) -> Result<Vec<u8>>
+where
+    D: FnMut() -> Result<Vec<u8>>,
+    S: FnMut(Duration),
+    W: FnMut(String),
+{
+    let mut attempt = 1;
+    loop {
+        let error = match download() {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => error,
+        };
+        let Some(retry) = retry_advice(&error) else {
+            return Err(error);
+        };
+        if attempt >= MAX_DOWNLOAD_ATTEMPTS {
+            return Err(error.context(format!("download failed {MAX_DOWNLOAD_ATTEMPTS} times")));
+        }
+        let delay = retry.delay.unwrap_or(DOWNLOAD_RETRY_BASE_DELAY * attempt);
+        warn(format!(
+            "warning: {error:#}; retrying download ({attempt} of {}) in {} seconds",
+            MAX_DOWNLOAD_ATTEMPTS - 1,
+            delay.as_secs()
+        ));
+        sleep(delay);
+        attempt += 1;
+    }
+}
+
+fn download_timeout() -> Option<Duration> {
+    let Ok(raw) = std::env::var(DOWNLOAD_TIMEOUT_ENV) else {
+        return Some(DOWNLOAD_TIMEOUT);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(seconds) => Some(Duration::from_secs(seconds)),
+        Err(_) => Some(DOWNLOAD_TIMEOUT),
+    }
+}
+
 fn github_token() -> Option<String> {
     for variable in ["STATSAI_DEV_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(value) = std::env::var(variable) {
@@ -499,6 +579,108 @@ const fn default_attempt() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn a_cut_off_download_is_retried_rather_than_failing_the_install() {
+        // The wait loop retries the build lookup, not the transfer, so before
+        // this a single interrupted read ended the whole install.
+        let mut attempts = 0;
+        let mut slept = Vec::new();
+        let mut warnings = Vec::new();
+        let bytes = retrying_download(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(GitHubRequestFailure {
+                        message: "timed out reading response".to_string(),
+                        retry: Some(RetryAdvice { delay: None }),
+                    }
+                    .into())
+                } else {
+                    Ok(vec![7, 7, 7])
+                }
+            },
+            |delay| slept.push(delay),
+            |message| warnings.push(message),
+        )
+        .expect("third attempt succeeds");
+
+        assert_eq!(bytes, vec![7, 7, 7]);
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            slept,
+            vec![DOWNLOAD_RETRY_BASE_DELAY, DOWNLOAD_RETRY_BASE_DELAY * 2]
+        );
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("retrying download"));
+    }
+
+    #[test]
+    fn a_download_gives_up_after_the_attempt_limit() {
+        let mut attempts = 0;
+        let error = retrying_download(
+            || {
+                attempts += 1;
+                Err(GitHubRequestFailure {
+                    message: "timed out reading response".to_string(),
+                    retry: Some(RetryAdvice { delay: None }),
+                }
+                .into())
+            },
+            |_| {},
+            |_| {},
+        )
+        .expect_err("always fails");
+
+        assert_eq!(attempts, MAX_DOWNLOAD_ATTEMPTS);
+        assert!(format!("{error:#}").contains("download failed"));
+    }
+
+    #[test]
+    fn an_oversized_artifact_is_not_retried() {
+        // Re-requesting cannot make it smaller.
+        let mut attempts = 0;
+        let error = retrying_download(
+            || {
+                attempts += 1;
+                bail!("artifact exceeds the 256 MiB safety limit")
+            },
+            |_| panic!("must not sleep"),
+            |_| panic!("must not warn"),
+        )
+        .expect_err("permanent failure");
+
+        assert_eq!(attempts, 1);
+        assert!(format!("{error:#}").contains("safety limit"));
+    }
+
+    #[test]
+    fn the_download_timeout_is_generous_and_overridable() {
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        std::env::remove_var(DOWNLOAD_TIMEOUT_ENV);
+        // A 256 MiB artifact cannot arrive inside the API timeout on an
+        // ordinary connection, which is what made downloads fail at random.
+        assert_eq!(download_timeout(), Some(DOWNLOAD_TIMEOUT));
+        assert!(DOWNLOAD_TIMEOUT > API_TIMEOUT);
+
+        std::env::set_var(DOWNLOAD_TIMEOUT_ENV, "45");
+        assert_eq!(download_timeout(), Some(Duration::from_secs(45)));
+
+        std::env::set_var(DOWNLOAD_TIMEOUT_ENV, "0");
+        assert_eq!(download_timeout(), None, "zero waits indefinitely");
+
+        std::env::set_var(DOWNLOAD_TIMEOUT_ENV, "not-a-number");
+        assert_eq!(download_timeout(), Some(DOWNLOAD_TIMEOUT));
+
+        std::env::remove_var(DOWNLOAD_TIMEOUT_ENV);
+    }
+
     use super::*;
 
     fn run(
