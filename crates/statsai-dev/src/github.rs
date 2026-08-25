@@ -12,6 +12,17 @@ pub(crate) const REPOSITORY: &str = "starkdmi/statsai";
 pub(crate) const WORKFLOW_FILE: &str = "dev-build.yml";
 const GITHUB_API: &str = "https://api.github.com";
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+/// Enough for a JSON reply, and short enough that an unreachable API gives up
+/// promptly.
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+/// `ureq`'s request timeout covers reading the body too, so the API bound also
+/// capped every artifact download. Thirty seconds for an archive that may reach
+/// the 256 MiB ceiling demands roughly 68 Mbit/s sustained, which turned an
+/// ordinary home connection into an intermittent "timed out reading response".
+/// Ten minutes covers the ceiling at about 3.5 Mbit/s.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// Overrides [`DOWNLOAD_TIMEOUT`], in seconds. Zero waits indefinitely.
+const DOWNLOAD_TIMEOUT_ENV: &str = "STATSAI_DEV_DOWNLOAD_TIMEOUT_SECONDS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BuildRequest {
@@ -267,7 +278,7 @@ impl GitHubClient {
 
     fn download(&self, url: &str, expected_name: &str) -> Result<Vec<u8>> {
         let response = self.call(
-            self.request(url),
+            self.request_with_timeout(url, download_timeout()),
             &format!("download artifact {expected_name}"),
         )?;
         let mut reader = response.into_reader().take(MAX_ARTIFACT_BYTES + 1);
@@ -282,8 +293,16 @@ impl GitHubClient {
     }
 
     fn request(&self, url: &str) -> ureq::Request {
-        let request = ureq::get(url)
-            .timeout(Duration::from_secs(30))
+        self.request_with_timeout(url, Some(API_TIMEOUT))
+    }
+
+    fn request_with_timeout(&self, url: &str, timeout: Option<Duration>) -> ureq::Request {
+        let request = ureq::get(url);
+        let request = match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        };
+        let request = request
             .set(
                 "User-Agent",
                 &format!("statsai-dev/{}", env!("CARGO_PKG_VERSION")),
@@ -407,6 +426,17 @@ fn compare_runs(left: &WorkflowRun, right: &WorkflowRun) -> Ordering {
         .then_with(|| left.id.cmp(&right.id))
 }
 
+fn download_timeout() -> Option<Duration> {
+    let Ok(raw) = std::env::var(DOWNLOAD_TIMEOUT_ENV) else {
+        return Some(DOWNLOAD_TIMEOUT);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(seconds) => Some(Duration::from_secs(seconds)),
+        Err(_) => Some(DOWNLOAD_TIMEOUT),
+    }
+}
+
 fn github_token() -> Option<String> {
     for variable in ["STATSAI_DEV_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(value) = std::env::var(variable) {
@@ -499,6 +529,34 @@ const fn default_attempt() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn the_download_timeout_is_generous_and_overridable() {
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        std::env::remove_var(DOWNLOAD_TIMEOUT_ENV);
+        // A 256 MiB artifact cannot arrive inside the API timeout on an
+        // ordinary connection, which is what made downloads fail at random.
+        assert_eq!(download_timeout(), Some(DOWNLOAD_TIMEOUT));
+        assert!(DOWNLOAD_TIMEOUT > API_TIMEOUT);
+
+        std::env::set_var(DOWNLOAD_TIMEOUT_ENV, "45");
+        assert_eq!(download_timeout(), Some(Duration::from_secs(45)));
+
+        std::env::set_var(DOWNLOAD_TIMEOUT_ENV, "0");
+        assert_eq!(download_timeout(), None, "zero waits indefinitely");
+
+        std::env::set_var(DOWNLOAD_TIMEOUT_ENV, "not-a-number");
+        assert_eq!(download_timeout(), Some(DOWNLOAD_TIMEOUT));
+
+        std::env::remove_var(DOWNLOAD_TIMEOUT_ENV);
+    }
+
     use super::*;
 
     fn run(
