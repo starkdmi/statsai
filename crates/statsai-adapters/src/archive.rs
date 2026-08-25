@@ -1,9 +1,10 @@
 mod mutations;
 
 use super::{
-    canonical_display, codex_project_context_from_value, codex_usage_roots, collect_jsonl_files,
-    expand_home_path, grok_sessions_root, model_from_nested_value, open_sqlite_readonly,
-    read_bounded_jsonl_line, resolve_project_context, source_root_path,
+    canonical_display, codex_project_context_from_value, codex_quota_observation,
+    codex_usage_counts_from_value, codex_usage_roots, collect_jsonl_files, expand_home_path,
+    file_modified_timestamp, grok_sessions_root, model_from_nested_value, open_sqlite_readonly,
+    read_bounded_jsonl_line, resolve_project_context, source_root_path, subtract_usage_counts,
     timestamp_from_nested_value, BoundedLineRead, ProjectContextCache, CLAUDE_CODE_PROVIDER,
     CODEX_PROVIDER, GROK_BUILD_PROVIDER, MAX_JSONL_RECORD_BYTES, OPENCODE_PROVIDER,
 };
@@ -21,8 +22,8 @@ use statsai_core::{
     archive_artifact_metadata_signature, archive_content_id, archive_conversation_id,
     archive_item_id, hash_text, ArchiveArtifactDependency, ArchiveCompleteness, ArchiveContentKind,
     ArchiveContentPart, ArchiveConversation, ArchiveItem, ArchiveItemKind, ArchiveRole,
-    CoverageStatus, ModelInfo, ProjectInfo, SourceLocation, TraceEdit, UsageCounts,
-    ARCHIVE_CONVERSATION_SCHEMA_VERSION,
+    CoverageStatus, ModelInfo, ProjectInfo, QuotaObservationRecordV1, SourceLocation, TraceEdit,
+    UsageCounts, ARCHIVE_CONVERSATION_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -57,6 +58,7 @@ pub struct ArchiveScan {
     pub conversations: Vec<ArchiveConversation>,
     pub artifact_dependencies: Vec<ArchiveArtifactDependency>,
     pub trace_edits: Vec<TraceEdit>,
+    pub quota_observations: Vec<QuotaObservationRecordV1>,
     pub trace_coverage: CoverageStatus,
     pub diagnostics: ArchiveScanDiagnostics,
 }
@@ -67,6 +69,7 @@ impl Default for ArchiveScan {
             conversations: Vec::new(),
             artifact_dependencies: Vec::new(),
             trace_edits: Vec::new(),
+            quota_observations: Vec::new(),
             // A scan that reconstructed nothing has measured nothing. Only a
             // provider whose mutations this module actually parses may claim
             // complete trace coverage, so that a new adapter cannot silently
@@ -210,10 +213,68 @@ fn collect_codex(
             &mut scan.trace_edits,
             &mut scan.trace_coverage,
         )?);
+        scan.quota_observations
+            .extend(collect_codex_quota_observations(source, &path)?);
     }
     scan.artifact_dependencies = finish_artifact_dependencies(artifact_dependencies);
     finish_diagnostics(&mut scan);
     Ok(scan)
+}
+
+fn collect_codex_quota_observations(
+    source: &SourceLocation,
+    path: &Path,
+) -> Result<Vec<QuotaObservationRecordV1>> {
+    let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
+    let mut previous_totals: Option<UsageCounts> = None;
+    let mut observations = Vec::new();
+    let mut line_bytes = Vec::new();
+    let mut line_number = 0usize;
+    loop {
+        let status = read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
+        if status == BoundedLineRead::Eof {
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        if status == BoundedLineRead::Oversized {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("event_msg")
+            || value.pointer("/payload/type").and_then(Value::as_str) != Some("token_count")
+        {
+            continue;
+        }
+        let info = value.pointer("/payload/info");
+        let total_usage = info
+            .and_then(|info| info.get("total_token_usage"))
+            .map(codex_usage_counts_from_value);
+        let usage_sample = info
+            .and_then(|info| info.get("last_token_usage"))
+            .map(codex_usage_counts_from_value)
+            .or_else(|| {
+                total_usage
+                    .as_ref()
+                    .map(|total| subtract_usage_counts(total, previous_totals.as_ref()))
+            });
+        if let Some(total_usage) = total_usage {
+            previous_totals = Some(total_usage);
+        }
+        let observed_at = timestamp_from_nested_value(&value).unwrap_or(fallback_timestamp);
+        if let Some(observation) =
+            codex_quota_observation(source, path, line_number, observed_at, usage_sample, &value)
+        {
+            observations.push(observation);
+        }
+    }
+    Ok(observations)
 }
 
 fn collect_codex_file(
@@ -1268,6 +1329,7 @@ fn collect_opencode(
             .collect(),
         artifact_dependencies: finish_artifact_dependencies(artifact_dependencies),
         trace_edits: Vec::new(),
+        quota_observations: Vec::new(),
         trace_coverage: CoverageStatus::Unavailable,
         diagnostics: ArchiveScanDiagnostics {
             files_scanned: 1,

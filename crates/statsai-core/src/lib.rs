@@ -2,6 +2,7 @@
 
 mod archive;
 mod code_changes;
+mod quota;
 mod tasks;
 
 use chrono::{DateTime, Utc};
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub use archive::*;
 pub use code_changes::*;
+pub use quota::*;
 pub use tasks::*;
 
 pub const USAGE_EVENT_SCHEMA_VERSION: &str = "usage_event.v1";
@@ -31,11 +33,15 @@ pub const SYNC_ACK_V3_SCHEMA_VERSION: &str = "sync_ack.v3";
 pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V3_SCHEMA_VERSION;
 pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V3_SCHEMA_VERSION;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct SourceId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ProviderAccountId(pub String);
 

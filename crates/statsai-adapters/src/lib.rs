@@ -12,10 +12,12 @@ use statsai_core::{
     task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
     task_title_signal_score, title_topic_tokens, BillingPeriod, Confidence, CostAccumulator,
     CostInfo, EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats,
-    ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo,
-    SessionInfo, SourceKind, SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics,
-    TaskSpan, UsageCounts, UsageEvent, UsageSummary, TASK_SPAN_SCHEMA_VERSION,
-    USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+    ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, QuotaCreditsV1,
+    QuotaObservationRecordV1, QuotaObservationV1, QuotaStatusV1, QuotaUsageLinkKind,
+    QuotaWindowObservationV1, ReasoningLevel, RuntimeInfo, SessionInfo, SourceKind, SourceLocation,
+    SubscriptionStatus, SummaryMetadata, SummaryMetrics, TaskSpan, UsageCounts, UsageEvent,
+    UsageSummary, QUOTA_OBSERVATION_SCHEMA_VERSION, QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION,
+    TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{
     estimate_cost_at, normalize_model_name, pricing_changes_between, unknown_cost,
@@ -39,7 +41,7 @@ const PROVIDER_RECORD_EVENT_KEY_VERSION: &str = "provider_record_usage_event.v1"
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever provider parsing semantics change,
 // so historical sessions get rescanned for runtime, pricing, and project context updates.
-const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v26";
+const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "quota-history.v27";
 const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v23";
 const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
 const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v20";
@@ -196,6 +198,7 @@ pub struct AdapterScan {
     pub events: Vec<UsageEvent>,
     pub summaries: Vec<UsageSummary>,
     pub task_spans: Vec<TaskSpan>,
+    pub quota_observations: Vec<QuotaObservationRecordV1>,
     pub diagnostics: ScanDiagnostics,
     pub verified_source_state: Option<VerifiedSourceState>,
 }
@@ -2593,6 +2596,7 @@ fn parse_codex_file(
     let mut current_thread_id: Option<String> = None;
     let session_raw = codex_session_id(usage_root, path);
     let mut records = Vec::new();
+    let mut quota_observation_indices = HashMap::new();
     let mut project_cache = ProjectContextCache::new();
     let mut line_bytes = Vec::new();
     let mut index = 0usize;
@@ -2619,7 +2623,7 @@ fn parse_codex_file(
         }
         ctx.scan.diagnostics.raw_rows += 1;
         let line_kind = codex_line_kind(line);
-        if line_kind == CodexLineKind::Irrelevant {
+        if line_kind == CodexLineKind::Irrelevant && !is_codex_quota_line_structurally(line) {
             continue;
         }
         if line_kind == CodexLineKind::ResponseItemMessage {
@@ -2918,12 +2922,24 @@ fn parse_codex_file(
         } else {
             codex_headless_usage_value(&value).map(codex_usage_counts_from_value)
         };
+        let quota_usage_sample = usage.clone();
 
         let (timestamp, timestamp_inferred) = timestamp_from_nested_value(&value)
             .map(|timestamp| (timestamp, false))
             .unwrap_or((fallback_timestamp, true));
         if timestamp_inferred {
             ctx.scan.diagnostics.timestamp_fallbacks += 1;
+        }
+        if let Some(quota) = codex_quota_observation(
+            ctx.source,
+            path,
+            index,
+            timestamp,
+            quota_usage_sample,
+            &value,
+        ) {
+            quota_observation_indices.insert(index, ctx.scan.quota_observations.len());
+            ctx.scan.quota_observations.push(quota);
         }
 
         let explicit_model =
@@ -3131,8 +3147,8 @@ fn parse_codex_file(
             let Some(usage) = usage else {
                 continue;
             };
-            for line_number in turn.usage_lines {
-                consumed_usage_lines.insert(line_number);
+            for line_number in &turn.usage_lines {
+                consumed_usage_lines.insert(*line_number);
             }
             if record.usage.is_some() {
                 consumed_usage_lines.insert(record.line_number);
@@ -3183,6 +3199,17 @@ fn parse_codex_file(
                     deduplication: EventDeduplication::PathIndependent,
                     dedupe_salt: None,
                 },
+            );
+            let mut linked_quota_lines = turn.usage_lines.clone();
+            if record.usage.is_some() {
+                linked_quota_lines.push(record.line_number);
+            }
+            link_quota_observations(
+                ctx.scan,
+                &quota_observation_indices,
+                &linked_quota_lines,
+                &event.event_id,
+                QuotaUsageLinkKind::TurnEvent,
             );
             let task_span = if ctx.options.should_collect_tasks() {
                 let event_id = event.event_id.clone();
@@ -3402,10 +3429,287 @@ fn parse_codex_file(
                 dedupe_salt: None,
             },
         );
+        link_quota_observations(
+            ctx.scan,
+            &quota_observation_indices,
+            &[record.line_number],
+            &event.event_id,
+            QuotaUsageLinkKind::RecordEvent,
+        );
         push_deduped(ctx.scan, ctx.seen, event);
     }
 
     Ok(())
+}
+
+fn link_quota_observations(
+    scan: &mut AdapterScan,
+    quota_observation_indices: &HashMap<usize, usize>,
+    line_numbers: &[usize],
+    event_id: &EventId,
+    link_kind: QuotaUsageLinkKind,
+) {
+    if line_numbers.is_empty() {
+        return;
+    }
+    for line_number in line_numbers {
+        let Some(record) = quota_observation_indices
+            .get(line_number)
+            .and_then(|index| scan.quota_observations.get_mut(*index))
+        else {
+            continue;
+        };
+        if record
+            .observation
+            .usage_sample
+            .as_ref()
+            .is_some_and(|usage| usage.computed_total() > 0)
+        {
+            record.observation.usage_event_id = Some(event_id.clone());
+            record.observation.usage_link_kind = link_kind;
+        }
+    }
+}
+
+pub(crate) fn codex_quota_observation(
+    source: &SourceLocation,
+    path: &Path,
+    line_number: usize,
+    observed_at: DateTime<Utc>,
+    usage_sample: Option<UsageCounts>,
+    value: &Value,
+) -> Option<QuotaObservationRecordV1> {
+    if !is_codex_token_count(value) {
+        return None;
+    }
+    let rate_limits = value.pointer("/payload/rate_limits")?.as_object()?;
+    let raw_rate_limits = Value::Object(rate_limits.clone());
+    let raw_json = serde_json::to_string(&raw_rate_limits).ok()?;
+    let payload_hash = hash_text(&raw_json);
+    let source_file_path_hash = hash_text(&canonical_display(path));
+    let source_record_id = format!("quota:{source_file_path_hash}:{line_number}");
+    let observation_id = format!(
+        "quota_observation_{}",
+        &hash_text(&format!("{}:{source_record_id}", source.source_id.0))[..32]
+    );
+    let semantic_fingerprint = hash_text(&format!(
+        "quota_semantic.v1:{}:{}:{payload_hash}",
+        source.provider,
+        observed_at.to_rfc3339()
+    ));
+    let global_limit_id = quota_string_at_any(
+        &raw_rate_limits,
+        &["limit_id", "limitId", "limit_name", "limitName", "id"],
+    );
+    let mut windows = Vec::new();
+    for (slot, candidate) in rate_limits {
+        let Some(candidate) = candidate.as_object() else {
+            continue;
+        };
+        let Some(window_minutes) = quota_u64_at_any(
+            candidate,
+            &["window_minutes", "windowMinutes", "duration_minutes"],
+        ) else {
+            continue;
+        };
+        let Some(used_percent) = quota_f64_at_any(
+            candidate,
+            &["used_percent", "usedPercent", "percentage", "percent_used"],
+        ) else {
+            continue;
+        };
+        let Some(resets_at_epoch_seconds) =
+            quota_i64_at_any(candidate, &["resets_at", "resetsAt", "reset_at", "resetAt"])
+        else {
+            continue;
+        };
+        let Some(resets_at) = Utc.timestamp_opt(resets_at_epoch_seconds, 0).single() else {
+            continue;
+        };
+        let limit_id = quota_string_at_any_from_map(
+            candidate,
+            &["limit_id", "limitId", "limit_name", "limitName", "id"],
+        )
+        .or_else(|| global_limit_id.clone());
+        let window_observation_id = format!(
+            "quota_window_observation_{}",
+            &hash_text(&format!("{observation_id}:{slot}"))[..32]
+        );
+        windows.push(QuotaWindowObservationV1 {
+            schema_version: QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION.to_string(),
+            window_observation_id,
+            observation_id: observation_id.clone(),
+            provider_slot: slot.clone(),
+            limit_id,
+            window_minutes,
+            used_percent,
+            resets_at,
+            resets_at_epoch_seconds,
+        });
+    }
+
+    let credits_value = rate_limits.get("credits").and_then(Value::as_object);
+    let balance_raw = credits_value
+        .and_then(|credits| credits.get("balance"))
+        .cloned();
+    let balance = balance_raw.as_ref().and_then(normalize_quota_decimal);
+    let status = QuotaStatusV1 {
+        plan_type: quota_string_at_any(
+            &raw_rate_limits,
+            &["plan_type", "planType", "plan", "subscription_type"],
+        ),
+        individual_limit: rate_limits
+            .get("individual_limit")
+            .or_else(|| rate_limits.get("individualLimit"))
+            .cloned(),
+        spend_control_state: quota_string_at_any(
+            &raw_rate_limits,
+            &["spend_control_state", "spendControlState"],
+        )
+        .or_else(|| {
+            raw_rate_limits
+                .pointer("/spend_control/state")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        }),
+        reached_type: quota_string_at_any(
+            &raw_rate_limits,
+            &["reached_type", "reachedType", "limit_reached_type"],
+        ),
+        credits: QuotaCreditsV1 {
+            has_credits: credits_value
+                .and_then(|credits| credits.get("has_credits"))
+                .and_then(Value::as_bool),
+            unlimited: credits_value
+                .and_then(|credits| credits.get("unlimited"))
+                .and_then(Value::as_bool),
+            balance,
+            balance_raw,
+        },
+    };
+    Some(QuotaObservationRecordV1 {
+        observation: QuotaObservationV1 {
+            schema_version: QUOTA_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id,
+            semantic_fingerprint,
+            provider: source.provider.clone(),
+            source_id: source.source_id.clone(),
+            provider_account_id: None,
+            observed_at,
+            source_file_path_hash,
+            source_record_id,
+            source_line_number: line_number as u64,
+            payload_hash,
+            usage_sample,
+            usage_event_id: None,
+            usage_link_kind: QuotaUsageLinkKind::None,
+            status,
+        },
+        windows,
+        raw_rate_limits,
+    })
+}
+
+fn quota_string_at_any(value: &Value, keys: &[&str]) -> Option<String> {
+    value
+        .as_object()
+        .and_then(|map| quota_string_at_any_from_map(map, keys))
+}
+
+fn quota_string_at_any_from_map(
+    map: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn quota_u64_at_any(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(Value::as_u64)
+}
+
+fn quota_i64_at_any(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(Value::as_i64)
+}
+
+fn quota_f64_at_any(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(Value::as_f64)
+        .filter(|value| value.is_finite())
+}
+
+fn normalize_quota_decimal(value: &Value) -> Option<String> {
+    let text: Cow<'_, str> = match value {
+        Value::String(value) => Cow::Borrowed(value.trim()),
+        Value::Number(value) => Cow::Owned(value.to_string()),
+        Value::Null => return None,
+        _ => return None,
+    };
+    if text.is_empty() || text.len() > 4_096 {
+        return None;
+    }
+    let (negative, unsigned) = text
+        .strip_prefix('-')
+        .map_or((false, text.as_ref()), |value| (true, value));
+    let (mantissa, exponent) =
+        unsigned
+            .split_once(['e', 'E'])
+            .map_or((unsigned, 0i32), |(mantissa, exponent)| {
+                exponent
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|value| value.unsigned_abs() <= 4_096)
+                    .map(|exponent| (mantissa, exponent))
+                    .unwrap_or(("", 0))
+            });
+    if mantissa.is_empty() {
+        return None;
+    }
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{whole}{fraction}");
+    let decimal_position = i64::try_from(whole.len()).ok()? + i64::from(exponent);
+    let expanded = if decimal_position <= 0 {
+        let zeroes = usize::try_from(-decimal_position).ok()?;
+        format!("0.{}{}", "0".repeat(zeroes), digits)
+    } else if decimal_position >= i64::try_from(digits.len()).ok()? {
+        let zeroes = usize::try_from(decimal_position)
+            .ok()?
+            .saturating_sub(digits.len());
+        format!("{digits}{}", "0".repeat(zeroes))
+    } else {
+        let position = usize::try_from(decimal_position).ok()?;
+        format!("{}.{}", &digits[..position], &digits[position..])
+    };
+    let (whole, fraction) = expanded
+        .split_once('.')
+        .map_or((expanded.as_str(), ""), |parts| parts);
+    let whole = whole.trim_start_matches('0');
+    let fraction = fraction.trim_end_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let mut normalized = if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    };
+    if negative && normalized != "0" {
+        normalized.insert(0, '-');
+    }
+    Some(normalized)
 }
 
 #[derive(Debug, Clone)]
@@ -3542,6 +3846,9 @@ fn merge_adapter_scan(
     }
     target.summaries.append(&mut source.summaries);
     target.task_spans.append(&mut source.task_spans);
+    target
+        .quota_observations
+        .append(&mut source.quota_observations);
     target.diagnostics.files_scanned = target
         .diagnostics
         .files_scanned
@@ -5570,6 +5877,38 @@ enum CodexLineKind {
     TaskStarted,
     TaskComplete,
     HeadlessUsage,
+}
+
+#[derive(Deserialize)]
+struct CodexQuotaLineProbe {
+    #[serde(rename = "type")]
+    line_type: Option<String>,
+    payload: Option<CodexQuotaPayloadProbe>,
+}
+
+#[derive(Deserialize)]
+struct CodexQuotaPayloadProbe {
+    #[serde(rename = "type")]
+    payload_type: Option<String>,
+    rate_limits: Option<serde::de::IgnoredAny>,
+}
+
+fn is_codex_quota_line_structurally(line: &str) -> bool {
+    if !line.contains("\"event_msg\"")
+        || !line.contains("\"token_count\"")
+        || !line.contains("\"rate_limits\"")
+    {
+        return false;
+    }
+    serde_json::from_str::<CodexQuotaLineProbe>(line)
+        .ok()
+        .is_some_and(|probe| {
+            probe.line_type.as_deref() == Some("event_msg")
+                && probe.payload.is_some_and(|payload| {
+                    payload.payload_type.as_deref() == Some("token_count")
+                        && payload.rate_limits.is_some()
+                })
+        })
 }
 
 fn codex_line_header(line: &str) -> &str {
@@ -7647,6 +7986,233 @@ mod tests {
     }
 
     #[test]
+    fn codex_quota_parser_is_anchored_and_preserves_modern_status_fields() {
+        let adapter = CodexAdapter;
+        let source = codex_source_for_root(
+            &adapter,
+            Path::new("/tmp/codex-home"),
+            LocationOrigin::Configured,
+        );
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+        let value = serde_json::json!({
+            "timestamp": observed_at,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"last_token_usage": {"total_tokens": 0}},
+                "rate_limits": {
+                    "limit_id": "codex_subscription",
+                    "plan_type": "pro",
+                    "individual_limit": null,
+                    "spend_control_state": "allowed",
+                    "reached_type": "weekly",
+                    "primary": {
+                        "used_percent": 12.5,
+                        "window_minutes": 10080,
+                        "resets_at": 1787832000
+                    },
+                    "credits": {
+                        "has_credits": true,
+                        "unlimited": false,
+                        "balance": "0012.5000"
+                    }
+                }
+            }
+        });
+        let record = codex_quota_observation(
+            &source,
+            Path::new("/tmp/codex-home/sessions/thread.jsonl"),
+            7,
+            observed_at,
+            Some(UsageCounts::default()),
+            &value,
+        )
+        .expect("quota observation");
+
+        assert_eq!(record.windows.len(), 1);
+        assert_eq!(record.windows[0].provider_slot, "primary");
+        assert_eq!(record.windows[0].window_minutes, 10_080);
+        assert_eq!(
+            record.windows[0].limit_id.as_deref(),
+            Some("codex_subscription")
+        );
+        assert_eq!(record.observation.status.plan_type.as_deref(), Some("pro"));
+        assert_eq!(
+            record.observation.status.credits.balance.as_deref(),
+            Some("12.5")
+        );
+        assert_eq!(
+            record.observation.status.credits.balance_raw,
+            Some(Value::String("0012.5000".to_string()))
+        );
+        assert_eq!(record.observation.usage_link_kind, QuotaUsageLinkKind::None);
+
+        let nested_as_text = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": value.to_string()
+            }
+        });
+        assert!(codex_quota_observation(
+            &source,
+            Path::new("/tmp/thread.jsonl"),
+            1,
+            observed_at,
+            None,
+            &nested_as_text,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_quota_parser_requires_integer_reset_epochs_and_leniently_reads_balances() {
+        let adapter = CodexAdapter;
+        let source = codex_source_for_root(
+            &adapter,
+            Path::new("/tmp/codex-home"),
+            LocationOrigin::Configured,
+        );
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+        for (balance, normalized) in [
+            (serde_json::json!(14.25), Some("14.25")),
+            (serde_json::json!("1.25e-3"), Some("0.00125")),
+            (Value::Null, None),
+        ] {
+            let value = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 1,
+                            "window_minutes": 300,
+                            "resets_at": "1787832000"
+                        },
+                        "credits": {"balance": balance}
+                    }
+                }
+            });
+            let record = codex_quota_observation(
+                &source,
+                Path::new("/tmp/thread.jsonl"),
+                1,
+                observed_at,
+                None,
+                &value,
+            )
+            .expect("structural quota payload");
+            assert!(record.windows.is_empty(), "string epochs are invalid");
+            assert_eq!(
+                record.observation.status.credits.balance.as_deref(),
+                normalized
+            );
+        }
+        assert!(codex_quota_observation(
+            &source,
+            Path::new("/tmp/thread.jsonl"),
+            1,
+            observed_at,
+            None,
+            &serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "token_count", "rate_limits": "malformed"}
+            }),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_quota_links_consumed_samples_to_turn_events_and_preserves_zero_samples() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("codex");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let path = sessions.join("thread.jsonl");
+        let mut fixture = File::create(&path).expect("fixture");
+        for value in [
+            serde_json::json!({
+                "timestamp": "2026-08-20T12:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T12:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"input_tokens": 10, "output_tokens": 5},
+                        "total_token_usage": {"input_tokens": 10, "output_tokens": 5}
+                    },
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 10,
+                            "window_minutes": 10080,
+                            "resets_at": 1787832000
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T12:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T12:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"total_tokens": 0},
+                        "total_token_usage": {"input_tokens": 10, "output_tokens": 5}
+                    },
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 11,
+                            "window_minutes": 10080,
+                            "resets_at": 1787832000
+                        }
+                    }
+                }
+            }),
+        ] {
+            writeln!(fixture, "{value}").expect("write fixture");
+        }
+        drop(fixture);
+        let source = codex_source_for_root(&CodexAdapter, &root, LocationOrigin::Configured);
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.quota_observations.len(), 2);
+        assert_eq!(
+            scan.quota_observations[0].observation.usage_link_kind,
+            QuotaUsageLinkKind::TurnEvent
+        );
+        assert_eq!(
+            scan.quota_observations[0].observation.usage_event_id,
+            Some(scan.events[0].event_id.clone())
+        );
+        assert_eq!(
+            scan.quota_observations[1]
+                .observation
+                .usage_sample
+                .as_ref()
+                .map(UsageCounts::computed_total),
+            Some(0)
+        );
+        assert_eq!(
+            scan.quota_observations[1].observation.usage_link_kind,
+            QuotaUsageLinkKind::None
+        );
+        assert!(scan.quota_observations[1]
+            .observation
+            .usage_event_id
+            .is_none());
+    }
+
+    #[test]
     fn claude_normalizes_projects_path_to_config_root() {
         let adapter = ClaudeCodeAdapter;
         let source = claude_source_for_root(
@@ -9214,6 +9780,14 @@ mod tests {
             codex_line_kind(user_message),
             CodexLineKind::ResponseItemMessage
         );
+
+        let unrelated_event = r#"{"timestamp":"2026-06-03T09:36:26.000Z","type":"event_msg","payload":{"type":"agent_message","model":"gpt-incorrect"}}"#;
+        assert_eq!(codex_line_kind(unrelated_event), CodexLineKind::Irrelevant);
+        assert!(!is_codex_quota_line_structurally(reasoning));
+
+        let reordered_quota = r#"{"payload": {"rate_limits": {"primary": {"used_percent": 1, "window_minutes": 300, "resets_at": 1787832000}}, "type": "token_count"}, "type": "event_msg"}"#;
+        assert_eq!(codex_line_kind(reordered_quota), CodexLineKind::Irrelevant);
+        assert!(is_codex_quota_line_structurally(reordered_quota));
     }
 
     #[test]
@@ -12018,6 +12592,47 @@ mod tests {
                 .as_ref()
                 .and_then(|model| model.reasoning_level_raw.as_deref()),
             Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn codex_non_usage_event_messages_do_not_override_turn_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let mut file = File::create(sessions.join("model.jsonl")).expect("fixture");
+        file.write_all(
+            br#"{"timestamp":"2026-05-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4"}}
+"#,
+        )
+        .expect("write context");
+        file.write_all(
+            br#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","model":"gpt-incorrect"}}
+"#,
+        )
+        .expect("write unrelated event");
+        file.write_all(
+            br#"{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":80,"output_tokens":40,"total_tokens":120},"total_token_usage":{"input_tokens":80,"output_tokens":40,"total_tokens":120}}}}
+"#,
+        )
+        .expect("write usage");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(
+            scan.events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("gpt-5.4")
         );
     }
 

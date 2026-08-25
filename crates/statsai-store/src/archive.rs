@@ -5,10 +5,10 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use statsai_core::{
-    archive_artifact_metadata_signature, ArchiveArtifactDependency, ArchiveCompleteness,
+    archive_artifact_metadata_signature, hash_text, ArchiveArtifactDependency, ArchiveCompleteness,
     ArchiveContentKind, ArchiveContentPart, ArchiveConversation, ArchiveItem, ArchiveItemKind,
-    ArchiveRole, CoverageStatus, ModelInfo, ProjectInfo, SourceId, TraceEdit, UsageCounts,
-    ARCHIVE_CONVERSATION_SCHEMA_VERSION,
+    ArchiveRole, CoverageStatus, ModelInfo, ProjectInfo, QuotaObservationRecordV1, SourceId,
+    TraceEdit, UsageCounts, ARCHIVE_CONVERSATION_SCHEMA_VERSION,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -21,8 +21,9 @@ use std::path::Path;
 // files a `Write` created become counted additions with matchable fingerprints
 // instead of unclassified lines; v8 binds a trace edit to the conversation its
 // file is written as, so edits a resumed session recorded against its parent
-// stop being attributed to that parent.
-const ARCHIVE_IMPORT_REVISION: &str = "archive.v8";
+// stop being attributed to that parent; v9 backfills quota observations from
+// immutable Codex archives.
+const ARCHIVE_IMPORT_REVISION: &str = "archive.v9";
 const UNSCOPED_MISSING_CONTENT_SCOPE: &str = "unscoped";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -188,6 +189,7 @@ fn append_row_placeholders(sql: &mut String, rows: usize, columns: usize) {
 }
 
 impl Store {
+    #[allow(clippy::too_many_arguments)]
     pub fn store_archive_scan_with_code_changes(
         &self,
         source_id: &SourceId,
@@ -196,6 +198,7 @@ impl Store {
         artifact_dependencies: &[ArchiveArtifactDependency],
         trace_edits: &[TraceEdit],
         trace_coverage: CoverageStatus,
+        quota_observations: &[QuotaObservationRecordV1],
     ) -> Result<ArchiveWriteResult> {
         self.with_immediate_transaction(|| {
             let result = self.upsert_archive_conversations(conversations)?;
@@ -210,6 +213,15 @@ impl Store {
                 source_id,
                 imported_entries,
                 artifact_dependencies,
+            )?;
+            let source_file_path_hashes = imported_entries
+                .iter()
+                .map(|entry| hash_text(&entry.cache_key))
+                .collect::<Vec<_>>();
+            self.replace_quota_observations_for_source_files_inner(
+                source_id,
+                &source_file_path_hashes,
+                quota_observations,
             )?;
             Ok(result)
         })
@@ -297,7 +309,19 @@ impl Store {
                     "DELETE FROM archive_import_state WHERE source_id = ?1 AND cache_key = ?2",
                     params![&source_id.0, cache_key],
                 )?;
+                self.conn.execute(
+                    "DELETE FROM quota_window_observations WHERE observation_id IN (SELECT observation_id FROM quota_observations WHERE source_id = ?1 AND source_file_path_hash = ?2)",
+                    params![&source_id.0, hash_text(cache_key)],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM quota_observations WHERE source_id = ?1 AND source_file_path_hash = ?2",
+                    params![&source_id.0, hash_text(cache_key)],
+                )?;
             }
+            self.conn.execute(
+                "DELETE FROM quota_payloads WHERE payload_hash NOT IN (SELECT payload_hash FROM quota_observations)",
+                [],
+            )?;
             Ok(removed_cache_keys.len() as u64)
         })
     }
@@ -1602,6 +1626,7 @@ mod tests {
                 &[],
                 &[],
                 CoverageStatus::Unavailable,
+                &[],
             )
             .expect("store archive scan");
         assert!(
@@ -1662,6 +1687,7 @@ mod tests {
                 std::slice::from_ref(&dependency),
                 &[],
                 CoverageStatus::Unavailable,
+                &[],
             )
             .expect("store archive scan");
         assert!(store
