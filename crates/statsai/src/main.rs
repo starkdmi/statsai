@@ -9821,8 +9821,13 @@ fn sanitize_account_for_sync(mut account: ProviderAccount) -> ProviderAccount {
     if !matches!(account.identity_source, IdentitySource::UserConfigured) {
         account.account_label = None;
     }
-    account.provider_user_id = None;
-    account.email = None;
+    // The email and provider user id stay. They are how a person tells one of
+    // their own accounts from another in the dashboard, which is the whole
+    // point of syncing accounts at all; stripping them left every account
+    // showing as a bare `acct_` hash. The new evidence types are the ones that
+    // must never carry them -- those travel as hashes and are covered by their
+    // own contracts. `plan_name` still goes, because a plan is now evidence
+    // rather than an account attribute.
     account.plan_name = None;
     account
 }
@@ -20688,8 +20693,14 @@ mod tests {
 
         let sanitized = sanitize_account_for_sync(account);
         assert_eq!(sanitized.account_label.as_deref(), Some("personal"));
-        assert_eq!(sanitized.provider_user_id, None);
-        assert_eq!(sanitized.email, None);
+        // The account's own identity travels: without it the dashboard can
+        // only name an account by its `acct_` hash, and telling your own
+        // accounts apart is why they sync in the first place.
+        assert_eq!(
+            sanitized.provider_user_id.as_deref(),
+            Some("provider-user-secret")
+        );
+        assert_eq!(sanitized.email.as_deref(), Some("private@example.com"));
         assert_eq!(
             sanitized.provider_user_id_hash.as_deref(),
             Some("a".repeat(64).as_str())
@@ -20698,11 +20709,8 @@ mod tests {
             sanitized.email_hash.as_deref(),
             Some("b".repeat(64).as_str())
         );
+        // A plan is evidence now, not an account attribute.
         assert_eq!(sanitized.plan_name, None);
-
-        let payload = serde_json::to_string(&sanitized).expect("serialize sanitized account");
-        assert!(!payload.contains("provider-user-secret"));
-        assert!(!payload.contains("private@example.com"));
     }
 
     #[test]
