@@ -107,6 +107,7 @@ pub struct PendingSyncSummaryCounts {
     pub rollups: u64,
     pub passthrough_summaries: u64,
     pub retired_entities: u64,
+    pub quota_cycle_contributions: u64,
     pub total: u64,
     pub days: u64,
 }
@@ -3043,6 +3044,15 @@ impl Store {
                 .map(|contribution| contribution.contribution_id.clone())
                 .collect::<Vec<_>>(),
         )?;
+        // A quota cycle can change without any summary changing: a reset moves,
+        // or an observation carries no tokens. Counting only the summary-shaped
+        // entities left those uploads invisible, so the menubar reported nothing
+        // pending while a sync would still have sent them.
+        let quota_cycle_contributions = self.pending_quota_cycle_contributions_for_sync(
+            "http",
+            target,
+            &current_quota_cycle_contributions,
+        )?;
         let retired_entities = self
             .retired_sync_entity_ids("http", target, &current_snapshot)?
             .len();
@@ -3053,10 +3063,12 @@ impl Store {
             rollups: rollups.len() as u64,
             passthrough_summaries: passthrough_summaries.len() as u64,
             retired_entities: retired_entities as u64,
+            quota_cycle_contributions: quota_cycle_contributions.len() as u64,
             total: rollups
                 .len()
                 .saturating_add(passthrough_summaries.len())
                 .saturating_add(code_change_metrics.len())
+                .saturating_add(quota_cycle_contributions.len())
                 .saturating_add(retired_entities) as u64,
             days: days.len() as u64,
         })
@@ -9850,6 +9862,7 @@ mod tests {
                 rollups: 0,
                 passthrough_summaries: 2,
                 retired_entities: 0,
+                quota_cycle_contributions: 0,
                 total: 2,
                 days: 5,
             }
@@ -9911,6 +9924,7 @@ mod tests {
                 rollups: 0,
                 passthrough_summaries: 1,
                 retired_entities: 0,
+                quota_cycle_contributions: 0,
                 total: 1,
                 days: 1,
             }

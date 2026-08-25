@@ -2510,6 +2510,52 @@ mod tests {
     }
 
     #[test]
+    fn a_quota_only_change_still_reports_pending_upload_work() {
+        // Nothing here writes a summary: the pending count has to see the
+        // contribution itself or the menubar claims there is nothing to send.
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_011_200, 0).expect("observed");
+        let reset = DateTime::from_timestamp(1_787_616_000, 0).expect("reset");
+        let (source_id, _) = assigned_source(&store, observed_at - Duration::days(8));
+        store
+            .upsert_quota_observations(&[sample_record(
+                source_id,
+                "weekly",
+                "weekly",
+                observed_at,
+                reset.timestamp(),
+                "secondary",
+                10_080,
+                20.0,
+            )])
+            .expect("observations");
+
+        let target = "https://api.example.com/api/sync/batches";
+        let counts = store
+            .pending_http_sync_summary_counts(target, "device-a")
+            .expect("counts");
+        assert_eq!(counts.rollups, 0);
+        assert_eq!(counts.passthrough_summaries, 0);
+        assert_eq!(counts.quota_cycle_contributions, 1);
+        assert!(
+            counts.total > 0,
+            "a quota-only change is pending upload work"
+        );
+
+        let contributions = store
+            .quota_cycle_contributions(&QuotaQuery::default(), "device-a")
+            .expect("contributions");
+        store
+            .record_quota_cycle_contributions_synced("http", target, &contributions)
+            .expect("record synced");
+
+        let settled = store
+            .pending_http_sync_summary_counts(target, "device-a")
+            .expect("settled counts");
+        assert_eq!(settled.quota_cycle_contributions, 0);
+    }
+
+    #[test]
     fn quota_cycle_contributions_select_weekly_attributed_cycles_only() {
         let store = Store::in_memory().expect("store");
         let observed_at = DateTime::from_timestamp(1_787_011_200, 0).expect("observed");
