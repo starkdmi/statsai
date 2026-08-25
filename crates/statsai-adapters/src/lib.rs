@@ -48,7 +48,10 @@ const PROVIDER_RECORD_EVENT_KEY_VERSION: &str = "provider_record_usage_event.v1"
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever provider parsing semantics change,
 // so historical sessions get rescanned for runtime, pricing, and project context updates.
-const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "quota-history.v27";
+// session-identity.v28: usage events adopt the session_meta id (the telemetry
+// `conversation.id`) as their session identity; cached files must reparse or
+// conversation-to-account bindings can never reach previously scanned events.
+const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "session-identity.v28";
 const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v23";
 const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
 const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v20";
@@ -67,7 +70,7 @@ const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 ];
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
-const CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION: &str = "codex-account-evidence.v1";
+const CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION: &str = "codex-account-evidence.v2";
 pub(crate) const MAX_JSONL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2802,7 +2805,12 @@ fn parse_codex_file(
     let mut current_project: Option<ProjectInfo> = None;
     let mut current_title: Option<String> = None;
     let mut current_thread_id: Option<String> = None;
-    let session_raw = codex_session_id(usage_root, path);
+    // Seeded from the file path, replaced by the session's own id as soon as
+    // the `session_meta` line declares one. The embedded id is the same UUID
+    // Codex reports as `conversation.id` in telemetry, and conversation-to-
+    // account bindings hash that UUID — a path-derived identity can never meet
+    // them, which left every binding unable to attribute a single event.
+    let mut session_raw = codex_session_id(usage_root, path);
     let mut records = Vec::new();
     let mut quota_observation_indices = HashMap::new();
     let mut project_cache = ProjectContextCache::new();
@@ -3043,11 +3051,15 @@ fn parse_codex_file(
         };
 
         if is_codex_session_meta(&value) {
+            let declared_session_id = value
+                .pointer("/payload/id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if let Some(declared_session_id) = declared_session_id.clone() {
+                session_raw = declared_session_id;
+            }
             if collect_tasks {
-                current_thread_id = value
-                    .pointer("/payload/id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
+                current_thread_id = declared_session_id;
                 let session_id = current_thread_id
                     .clone()
                     .or_else(|| Some(session_raw.clone()));
@@ -7855,9 +7867,8 @@ struct CodexAuthClaims {
     active_until: Option<DateTime<Utc>>,
 }
 
-fn codex_auth_claims(root: &Path) -> Option<CodexAuthClaims> {
-    let auth_path = root.join("auth.json");
-    let value = std::fs::read_to_string(&auth_path).ok()?;
+fn codex_auth_claims(auth_path: &Path) -> Option<CodexAuthClaims> {
+    let value = std::fs::read_to_string(auth_path).ok()?;
     let value: Value = serde_json::from_str(&value).ok()?;
     let payload = string_at_any(
         &value,
@@ -7903,7 +7914,7 @@ fn codex_auth_claims(root: &Path) -> Option<CodexAuthClaims> {
     let authenticated_at = payload
         .as_ref()
         .and_then(|payload| timestamp_at_any(payload, &["auth_time", "iat"]))
-        .or_else(|| file_modified_at(&auth_path));
+        .or_else(|| file_modified_at(auth_path));
     // An auth-file mtime or a fresh ID token proves a refreshed local session, not
     // that the embedded subscription claims were refreshed at the same time.
     let subscription_checked_at =
@@ -7943,9 +7954,45 @@ fn collect_codex_auth_evidence(
     root: &Path,
     scan: &mut AccountEvidenceScan,
 ) {
-    let Some(claims) = codex_auth_claims(root) else {
+    push_codex_auth_snapshot(source, &root.join("auth.json"), true, scan);
+    // Multi-account setups keep the other logins next to the live one as
+    // `auth-<label>.json` and switch by swapping files. Each is a genuine auth
+    // artifact for a real past login, so it is read as a historical snapshot:
+    // it proves the source was that account when the file was written, but it
+    // is never current and its plan claims are dated, not live.
+    let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
+    let mut variant_paths = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("auth-") && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    variant_paths.sort();
+    for variant_path in variant_paths {
+        push_codex_auth_snapshot(source, &variant_path, false, scan);
+    }
+}
+
+fn push_codex_auth_snapshot(
+    source: &SourceLocation,
+    auth_path: &Path,
+    is_current: bool,
+    scan: &mut AccountEvidenceScan,
+) {
+    let Some(claims) = codex_auth_claims(auth_path) else {
+        return;
+    };
+    // A historical file with no derivable timestamp would have to be dated
+    // "now", which would assert a login that is not happening. Skip it.
+    if !is_current && claims.authenticated_at.is_none() {
+        return;
+    }
     // Two different facts live in one file and they are not observed together.
     // `chatgpt_subscription_last_checked` moves when the plan claims are
     // revalidated, which can be long before the current login: signing out of
@@ -7965,10 +8012,16 @@ fn collect_codex_auth_evidence(
         claims.provider_user_id.as_deref(),
         claims.email.as_deref(),
     );
-    let auth_path = root.join("auth.json");
-    let artifact_path_hash = hash_text(&canonical_display(&auth_path));
+    let artifact_path_hash = hash_text(&canonical_display(auth_path));
+    // The current file keeps its v1 fingerprint so re-scans stay idempotent;
+    // variants add their path, since two of them can carry identical claims.
+    let fingerprint_scope = if is_current {
+        String::new()
+    } else {
+        format!("{artifact_path_hash}:")
+    };
     let record_fingerprint = hash_text(&format!(
-        "codex-auth-evidence.v1:{}:{}:{}:{}:{}:{}",
+        "codex-auth-evidence.v1:{fingerprint_scope}{}:{}:{}:{}:{}:{}",
         claims.provider_user_id.as_deref().unwrap_or("none"),
         claims.email.as_deref().unwrap_or("none"),
         claims.plan_type.as_deref().unwrap_or("none"),
@@ -8044,7 +8097,7 @@ fn collect_codex_auth_evidence(
                 observed_at: plan_observed_at,
                 active_from: claims.active_from,
                 active_until: claims.active_until,
-                is_current_snapshot: true,
+                is_current_snapshot: is_current,
                 evidence_kind: AccountEvidenceKind::AuthSnapshot,
                 confidence: Confidence::High,
                 parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
@@ -8077,8 +8130,14 @@ fn collect_codex_telemetry_evidence(
         r#"(?i)(?:\"?app\.version\"?|\"?application_version\"?|\"?cli_version\"?)\s*[:=]\s*[\"']?([a-z0-9.+_\-]{1,64})"#,
     )?;
     let event_name = Regex::new(r#"(?:^|\s)event\.name\s*=\s*\"([a-z0-9._-]+)\""#)?;
+    // Newer builds emit the reload line at the end of a tracing span context
+    // (`app_server.request{...}: Reloading auth for account <id>`), so the
+    // message is accepted either at the start of the body or right after a
+    // span close, and nothing may follow the account id. Requiring the id to
+    // end the body keeps quoted copies of this phrase inside logged user
+    // content from ever being read as a reload.
     let auth_reload =
-        Regex::new(r#"(?i)^\s*Reloading auth for account\s+([a-z0-9_:\-]{3,256})(?:\s|$)"#)?;
+        Regex::new(r#"(?i)(?:^\s*|\}:\s*)Reloading auth for account\s+([a-z0-9_:\-]{3,256})\s*$"#)?;
     // Anything a user typed can reach this body verbatim inside one of these
     // fields. Identity attributes are only read from the structured prefix that
     // precedes the first of them, so a prompt quoting `user.account_id=...`
@@ -8153,14 +8212,16 @@ fn collect_codex_telemetry_evidence(
               AND (
                 (
                   target IN ('codex_otel.log_only', 'codex_otel.trace_safe')
-                  AND instr(feedback_log_body, 'codex.conversation_starts') > 0
                   AND (
                     instr(feedback_log_body, 'user.account_id') > 0
                     OR instr(feedback_log_body, 'user.email') > 0
                   )
                 )
                 OR (
-                  target LIKE 'codex_core::auth%'
+                  (
+                    target LIKE 'codex_core::auth%'
+                    OR target = 'codex_login::auth::manager'
+                  )
                   AND instr(feedback_log_body, 'Reloading auth for account') > 0
                 )
               )
@@ -8204,18 +8265,32 @@ fn collect_codex_telemetry_evidence(
                 .captures_iter(attributes)
                 .filter_map(|captures| captures.get(1).map(|value| value.as_str()));
             let declared_event_name = event_names.next();
+            // Identity is not tied to one event name: this Codex generation
+            // carries `user.account_id`/`user.email` on ordinary telemetry
+            // events (`codex.turn_ttft`, `codex.tool_decision`, ...) and emits
+            // `codex.conversation_starts` rarely or never. Any single declared
+            // `codex.*` event in the trusted prefix qualifies; the free-text
+            // cut above and the sole-attribute rule below still decide what
+            // may be read from it.
             let structured_identity_event = matches!(
                 target.as_str(),
                 "codex_otel.log_only" | "codex_otel.trace_safe"
             ) && declared_event_name
-                == Some("codex.conversation_starts")
+                .is_some_and(|name| name.starts_with("codex."))
                 && event_names.next().is_none();
-            let reload_account_id = target
-                .starts_with("codex_core::auth")
+            let reload_account_id = (target.starts_with("codex_core::auth")
+                || target == "codex_login::auth::manager")
                 .then(|| {
                     auth_reload
                         .captures(&body)
                         .and_then(|captures| captures.get(1))
+                        // A reload line sitting at or past the first free-text
+                        // field is quoted content, not an auth event.
+                        .filter(|account| {
+                            free_text_attribute
+                                .find(&body)
+                                .is_none_or(|free_text| account.start() < free_text.start())
+                        })
                         .map(|value| value.as_str().to_string())
                 })
                 .flatten();
@@ -8538,6 +8613,7 @@ fn dedupe_codex_account_evidence(scan: &mut AccountEvidenceScan) {
     let mut identity_ids = HashSet::new();
     scan.identity_observations
         .retain(|observation| identity_ids.insert(observation.observation_id.clone()));
+    collapse_codex_identity_observation_runs(scan);
     let mut plan_ids = HashSet::new();
     scan.plan_observations
         .retain(|observation| plan_ids.insert(observation.observation_id.clone()));
@@ -8546,8 +8622,77 @@ fn dedupe_codex_account_evidence(scan: &mut AccountEvidenceScan) {
         .retain(|binding| binding_ids.insert(binding.binding_id.clone()));
 }
 
+/// Collapse consecutive telemetry/reload observations of the same identity.
+///
+/// A single conversation emits hundreds of telemetry events naming the same
+/// account, and each one became a ledger row. The ledger is read back in full
+/// on every reconcile, so that redundancy is paid for on every scan forever.
+/// Only the run's endpoints carry information: the first observation is the
+/// boundary and the last is the freshest confirmation. Everything between two
+/// identical neighbours restates them. Runs are collapsed in time order, so
+/// every alternation — the actual account-switch signal — survives exactly.
+fn collapse_codex_identity_observation_runs(scan: &mut AccountEvidenceScan) {
+    scan.identity_observations.sort_by(|left, right| {
+        left.observed_at
+            .cmp(&right.observed_at)
+            .then_with(|| left.observation_id.cmp(&right.observation_id))
+    });
+    // Deliberately conversation-blind: parallel conversations interleave in
+    // time, and a per-conversation key would break every run they straddle.
+    // Per-conversation identity is carried by the bindings collection; the
+    // ledger only has to preserve *which account, when*.
+    let run_key = |observation: &AccountIdentityObservationV1| {
+        (
+            observation.evidence_kind,
+            observation.provider_account_id.clone(),
+            observation.email_hash.clone(),
+        )
+    };
+    let collapsible = |observation: &AccountIdentityObservationV1| {
+        matches!(
+            observation.evidence_kind,
+            AccountEvidenceKind::TelemetryIdentity | AccountEvidenceKind::AuthReload
+        )
+    };
+    let mut keep = vec![true; scan.identity_observations.len()];
+    let mut run_start: Option<usize> = None;
+    for index in 0..=scan.identity_observations.len() {
+        let continues_run = run_start.is_some_and(|start| {
+            scan.identity_observations
+                .get(index)
+                .is_some_and(|observation| {
+                    collapsible(observation)
+                        && run_key(observation) == run_key(&scan.identity_observations[start])
+                })
+        });
+        if continues_run {
+            continue;
+        }
+        if let Some(start) = run_start.take() {
+            // The run covers `start..index`; keep its first and last rows.
+            let last = (index - 1).max(start + 1);
+            for middle in &mut keep[start + 1..last] {
+                *middle = false;
+            }
+        }
+        if scan
+            .identity_observations
+            .get(index)
+            .is_some_and(collapsible)
+        {
+            run_start = Some(index);
+        }
+    }
+    let mut index = 0;
+    scan.identity_observations.retain(|_| {
+        let retained = keep[index];
+        index += 1;
+        retained
+    });
+}
+
 fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
-    let claims = codex_auth_claims(root)?;
+    let claims = codex_auth_claims(&root.join("auth.json"))?;
     let plan_name = claims.plan_type.as_deref().map(display_codex_plan_name);
     let verified_at = claims.subscription_checked_at.or(claims.authenticated_at);
     Some(VerifiedSourceState {
@@ -10961,7 +11106,10 @@ mod tests {
 
         assert_eq!(scan.task_spans.len(), 1);
         assert_eq!(scan.task_spans[0].thread_id.as_deref(), Some("thread-123"));
-        assert_eq!(scan.task_spans[0].session_id.as_deref(), Some("session"));
+        // The declared session id is the session identity now: it is the same
+        // UUID telemetry calls `conversation.id`, so usage, tasks, and
+        // account bindings all meet on one key instead of a file path.
+        assert_eq!(scan.task_spans[0].session_id.as_deref(), Some("thread-123"));
         assert_eq!(scan.task_spans[0].title, "Fix parser bug");
     }
 
@@ -13232,6 +13380,257 @@ mod tests {
         assert!(replacement_accounts.contains("acct-replacement-early"));
         assert!(replacement_accounts.contains("acct-replacement-late"));
         assert_eq!(replacement_scan.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn codex_reads_identity_from_ordinary_telemetry_and_modern_auth_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_path = dir.path().join("logs_2.sqlite");
+        let connection = Connection::open(&database_path).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        let rows: [(i64, &str, &str); 4] = [
+            // The generation that never emits `codex.conversation_starts`:
+            // identity rides on ordinary telemetry events at the end of a span
+            // context.
+            (
+                1,
+                "codex_otel.trace_safe",
+                "session_loop{thread_id=t-1}:turn{otel.name=\"session_task.turn\" model=gpt-5.4}: event.name=\"codex.turn_ttft\" duration_ms=250 conversation.id=conversation-ttft app.version=0.140.0 auth_mode=\"Chatgpt\" user.account_id=\"acct-ttft\" user.email=\"owner@example.test\" model=gpt-5.4",
+            ),
+            // The renamed reload target, with the message after the span close.
+            (
+                2,
+                "codex_login::auth::manager",
+                "app_server.request{otel.kind=\"server\" otel.name=\"getAuthStatus\" rpc.method=\"getAuthStatus\" rpc.request_id=desktop-auth:751da426}: Reloading auth for account acct-live-reload",
+            ),
+            // Quoted copies of the reload phrase must stay inert: one shadowed
+            // by a free-text field, one with trailing content after the id.
+            (
+                3,
+                "codex_login::auth::manager",
+                "prompt=\"quoted\"}: Reloading auth for account acct-evil",
+            ),
+            (
+                4,
+                "codex_login::auth::manager",
+                "app_server.request{otel.kind=\"server\"}: Reloading auth for account acct-evil trailing=1",
+            ),
+        ];
+        for (row_id, target, body) in rows {
+            connection
+                .execute(
+                    "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![row_id, 1_787_227_200_i64 + row_id, 0_i64, target, body],
+                )
+                .expect("telemetry row");
+        }
+        drop(connection);
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let telemetry = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+            .collect::<Vec<_>>();
+        assert_eq!(telemetry.len(), 1);
+        assert_eq!(
+            telemetry[0].provider_user_id_hash.as_deref(),
+            Some(hash_text("acct-ttft").as_str())
+        );
+        assert_eq!(telemetry[0].auth_mode.as_deref(), Some("Chatgpt"));
+        assert_eq!(evidence.conversation_bindings.len(), 1);
+        let reloads = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::AuthReload)
+            .collect::<Vec<_>>();
+        assert_eq!(reloads.len(), 1);
+        assert_eq!(
+            reloads[0].provider_user_id_hash.as_deref(),
+            Some(hash_text("acct-live-reload").as_str())
+        );
+        assert!(evidence.identity_observations.iter().all(|item| {
+            item.provider_user_id_hash.as_deref() != Some(hash_text("acct-evil").as_str())
+        }));
+    }
+
+    #[test]
+    fn codex_collapses_repeated_telemetry_identity_runs_to_endpoints() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_path = dir.path().join("logs_2.sqlite");
+        let connection = Connection::open(&database_path).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        // A(x5), B(x1), A(x2): the collapse must keep A's first and last on
+        // each side of B — the alternation is the account-switch signal. A's
+        // rows alternate between two parallel conversations to pin down that
+        // the collapse is conversation-blind: interleaving must not split runs.
+        let rows = [
+            ("a", "one"),
+            ("a", "two"),
+            ("a", "one"),
+            ("a", "two"),
+            ("a", "one"),
+            ("b", "three"),
+            ("a", "two"),
+            ("a", "one"),
+        ];
+        for (offset, (account, conversation)) in rows.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        offset as i64 + 1,
+                        1_787_227_200_i64 + offset as i64,
+                        0_i64,
+                        "codex_otel.log_only",
+                        format!(
+                            "event.name=\"codex.turn_ttft\" duration_ms=1 conversation.id=conversation-{conversation} user.account_id=\"acct-{account}\""
+                        )
+                    ],
+                )
+                .expect("telemetry row");
+        }
+        drop(connection);
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let telemetry_accounts = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+            .map(|item| item.provider_user_id_hash.clone().expect("account hash"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            telemetry_accounts,
+            vec![
+                hash_text("acct-a"),
+                hash_text("acct-a"),
+                hash_text("acct-b"),
+                hash_text("acct-a"),
+                hash_text("acct-a"),
+            ],
+            "each run keeps exactly its first and last observation"
+        );
+    }
+
+    #[test]
+    fn codex_reads_historical_auth_file_variants_as_dated_snapshots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ImV4aXN0aW5nQGV4YW1wbGUuY29tIiwiaWF0IjoxNzQ4NTEzNTYzLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1yZWFsIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIiwiY2hhdGdwdF9zdWJzY3JpcHRpb25fYWN0aXZlX3N0YXJ0IjoiMjAyNi0wNS0yOVQxMDoxMjo0MyswMDowMCIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6IjIwMjYtMDYtMjlUMTA6MTI6NDMrMDA6MDAiLCJjaGF0Z3B0X3N1YnNjcmlwdGlvbl9sYXN0X2NoZWNrZWQiOiIyMDI2LTA1LTI5VDEwOjE0OjU2LjA1ODI3OCswMDowMCJ9fQ."
+                }
+            })
+            .to_string(),
+        )
+        .expect("current auth");
+        // A swapped-out login kept beside the live one; its claims date to the
+        // moment that account was last authenticated here.
+        std::fs::write(
+            dir.path().join("auth-previous.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6InByZXZpb3VzQGV4YW1wbGUudGVzdCIsImF1dGhfdGltZSI6MTc3OTc4MjQwMCwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3QtcHJldmlvdXMiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X3N1YnNjcmlwdGlvbl9hY3RpdmVfc3RhcnQiOiIyMDI2LTA0LTI2VDAwOjAwOjAwKzAwOjAwIiwiY2hhdGdwdF9zdWJzY3JpcHRpb25fYWN0aXZlX3VudGlsIjoiMjAyNi0wNS0yNlQwMDowMDowMCswMDowMCIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2xhc3RfY2hlY2tlZCI6IjIwMjYtMDUtMjZUMDk6MDA6MDArMDA6MDAifX0."
+                }
+            })
+            .to_string(),
+        )
+        .expect("historical auth");
+        std::fs::write(dir.path().join("auth-broken.json"), "not json").expect("broken variant");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let snapshots = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::AuthSnapshot)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 2);
+        let previous_identity = snapshots
+            .iter()
+            .find(|item| {
+                item.provider_user_id_hash.as_deref() == Some(hash_text("acct-previous").as_str())
+            })
+            .expect("historical snapshot identity");
+        assert_eq!(
+            previous_identity.observed_at.to_rfc3339(),
+            "2026-05-26T08:00:00+00:00"
+        );
+        let current_plan = evidence
+            .plan_observations
+            .iter()
+            .find(|item| item.is_current_snapshot)
+            .expect("current plan claim");
+        assert_eq!(current_plan.source_id, source.source_id);
+        let historical_plan = evidence
+            .plan_observations
+            .iter()
+            .find(|item| !item.is_current_snapshot)
+            .expect("historical plan claim");
+        assert_eq!(
+            historical_plan.observed_at.to_rfc3339(),
+            "2026-05-26T09:00:00+00:00"
+        );
+        assert_eq!(
+            historical_plan.active_until.map(|value| value.to_rfc3339()),
+            Some("2026-05-26T00:00:00+00:00".to_string())
+        );
     }
 
     #[test]
