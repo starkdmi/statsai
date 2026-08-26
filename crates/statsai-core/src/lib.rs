@@ -1,5 +1,6 @@
 //! Core schemas and ID helpers for `statsai`.
 
+mod account_plan;
 mod archive;
 mod code_changes;
 mod quota;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+pub use account_plan::*;
 pub use archive::*;
 pub use code_changes::*;
 pub use quota::*;
@@ -28,12 +30,14 @@ pub const SYNC_BATCH_V1_SCHEMA_VERSION: &str = "sync_batch.v1";
 pub const SYNC_BATCH_V2_SCHEMA_VERSION: &str = "sync_batch.v2";
 pub const SYNC_BATCH_V3_SCHEMA_VERSION: &str = "sync_batch.v3";
 pub const SYNC_BATCH_V4_SCHEMA_VERSION: &str = "sync_batch.v4";
+pub const SYNC_BATCH_V5_SCHEMA_VERSION: &str = "sync_batch.v5";
 pub const SYNC_ACK_V1_SCHEMA_VERSION: &str = "sync_ack.v1";
 pub const SYNC_ACK_V2_SCHEMA_VERSION: &str = "sync_ack.v2";
 pub const SYNC_ACK_V3_SCHEMA_VERSION: &str = "sync_ack.v3";
 pub const SYNC_ACK_V4_SCHEMA_VERSION: &str = "sync_ack.v4";
-pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V4_SCHEMA_VERSION;
-pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V4_SCHEMA_VERSION;
+pub const SYNC_ACK_V5_SCHEMA_VERSION: &str = "sync_ack.v5";
+pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V5_SCHEMA_VERSION;
+pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V5_SCHEMA_VERSION;
 
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
@@ -733,6 +737,15 @@ pub struct SyncBatch {
     /// plans, credits, and sample counts are deliberately absent from this type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quota_cycle_contributions: Vec<QuotaCycleContributionV1>,
+    /// Plan labels carrying only the canonical account reference, provider bounds,
+    /// and evidence grade. Emails, provider user IDs, conversation and turn IDs,
+    /// artifact paths, and raw provenance are deliberately absent from this type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_plan_observations: Vec<AccountPlanProjectionV1>,
+    /// Aggregate coverage and conflict counts describing how well each account is
+    /// evidenced. Individual observations never leave the device through this type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_evidence_summaries: Vec<AccountEvidenceSummaryV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoritative_snapshot: Option<SyncAuthoritativeSnapshot>,
     pub created_at: DateTime<Utc>,
@@ -757,6 +770,10 @@ pub struct SyncAuthoritativeSnapshot {
     pub code_change_metric_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quota_cycle_contribution_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_plan_observation_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_evidence_summary_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -806,6 +823,10 @@ pub struct SyncEntityCounts {
     pub code_change_metrics: u64,
     #[serde(default, skip_serializing_if = "sync_count_is_zero")]
     pub quota_cycle_contributions: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub account_plan_observations: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub account_evidence_summaries: u64,
 }
 
 fn sync_count_is_zero(value: &u64) -> bool {
@@ -2149,6 +2170,8 @@ mod tests {
                 task_verifications: 0,
                 code_change_metrics: 0,
                 quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             duplicates: SyncEntityCounts {
                 sources: 0,
@@ -2161,6 +2184,8 @@ mod tests {
                 task_verifications: 0,
                 code_change_metrics: 0,
                 quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             rejected: Vec::new(),
         };
@@ -2191,6 +2216,8 @@ mod tests {
                 task_verifications: 1,
                 code_change_metrics: 2,
                 quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             duplicates: SyncEntityCounts {
                 sources: 0,
@@ -2203,6 +2230,8 @@ mod tests {
                 task_verifications: 0,
                 code_change_metrics: 0,
                 quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             rejected: Vec::new(),
         };
@@ -2213,6 +2242,8 @@ mod tests {
         assert_eq!(json["accepted"]["task_verifications"], 1);
         assert_eq!(json["accepted"]["code_change_metrics"], 2);
         assert!(json["accepted"].get("quota_cycle_contributions").is_none());
+        assert!(json["accepted"].get("account_plan_observations").is_none());
+        assert!(json["accepted"].get("account_evidence_summaries").is_none());
     }
 
     #[test]
@@ -2231,6 +2262,8 @@ mod tests {
                 task_verifications: 0,
                 code_change_metrics: 1,
                 quota_cycle_contributions: 4,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             duplicates: SyncEntityCounts {
                 sources: 0,
@@ -2243,6 +2276,8 @@ mod tests {
                 task_verifications: 0,
                 code_change_metrics: 0,
                 quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             rejected: Vec::new(),
         };

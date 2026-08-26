@@ -165,7 +165,7 @@ impl Store {
                 ],
             )?;
             let observation_payload = serde_json::to_string(&record.observation)?;
-            self.conn.execute(
+            let observation_changed = self.conn.execute(
                 r#"
                     INSERT INTO quota_observations (
                       observation_id, semantic_fingerprint, provider, source_id,
@@ -184,6 +184,17 @@ impl Store {
                       usage_link_kind = excluded.usage_link_kind,
                       payload_hash = excluded.payload_hash,
                       payload = excluded.payload
+                    WHERE quota_observations.semantic_fingerprint IS NOT excluded.semantic_fingerprint
+                       OR quota_observations.provider IS NOT excluded.provider
+                       OR quota_observations.source_id IS NOT excluded.source_id
+                       OR quota_observations.provider_account_id IS NOT excluded.provider_account_id
+                       OR quota_observations.observed_at IS NOT excluded.observed_at
+                       OR quota_observations.source_file_path_hash IS NOT excluded.source_file_path_hash
+                       OR quota_observations.source_record_id IS NOT excluded.source_record_id
+                       OR quota_observations.usage_event_id IS NOT excluded.usage_event_id
+                       OR quota_observations.usage_link_kind IS NOT excluded.usage_link_kind
+                       OR quota_observations.payload_hash IS NOT excluded.payload_hash
+                       OR quota_observations.payload IS NOT excluded.payload
                     "#,
                 params![
                     &record.observation.observation_id,
@@ -207,30 +218,62 @@ impl Store {
                     &record.observation.payload_hash,
                     observation_payload,
                 ],
-            )?;
-            self.conn.execute(
-                "DELETE FROM quota_window_observations WHERE observation_id = ?1",
-                [&record.observation.observation_id],
-            )?;
-            for window in &record.windows {
+            )? > 0;
+            let mut incoming_windows = record
+                .windows
+                .iter()
+                .map(|window| Ok((window, serde_json::to_string(window)?)))
+                .collect::<Result<Vec<_>>>()?;
+            incoming_windows.sort_by_key(|(window, _)| window.window_observation_id.as_str());
+            let stored_windows = if observation_changed {
+                Vec::new()
+            } else {
+                let mut statement = self.conn.prepare(
+                    "SELECT window_observation_id, payload
+                     FROM quota_window_observations
+                     WHERE observation_id = ?1
+                     ORDER BY window_observation_id",
+                )?;
+                let windows = statement
+                    .query_map([&record.observation.observation_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                windows
+            };
+            let windows_changed = observation_changed
+                || incoming_windows.len() != stored_windows.len()
+                || incoming_windows.iter().zip(&stored_windows).any(
+                    |((incoming_window, incoming_payload), (stored_id, stored_payload))| {
+                        incoming_window.window_observation_id != *stored_id
+                            || incoming_payload != stored_payload
+                    },
+                );
+            if windows_changed {
                 self.conn.execute(
-                    r#"
+                    "DELETE FROM quota_window_observations WHERE observation_id = ?1",
+                    [&record.observation.observation_id],
+                )?;
+                for (window, payload) in &incoming_windows {
+                    self.conn.execute(
+                        r#"
                         INSERT INTO quota_window_observations (
                           window_observation_id, observation_id, provider_slot, limit_id,
                           window_minutes, used_percent, resets_at, payload
                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                         "#,
-                    params![
-                        &window.window_observation_id,
-                        &window.observation_id,
-                        &window.provider_slot,
-                        window.limit_id.as_deref(),
-                        i64::try_from(window.window_minutes).unwrap_or(i64::MAX),
-                        window.used_percent,
-                        window.resets_at_epoch_seconds,
-                        serde_json::to_string(window)?,
-                    ],
-                )?;
+                        params![
+                            &window.window_observation_id,
+                            &window.observation_id,
+                            &window.provider_slot,
+                            window.limit_id.as_deref(),
+                            i64::try_from(window.window_minutes).unwrap_or(i64::MAX),
+                            window.used_percent,
+                            window.resets_at_epoch_seconds,
+                            payload,
+                        ],
+                    )?;
+                }
             }
             written = written.saturating_add(1);
         }
@@ -243,11 +286,16 @@ impl Store {
         source_file_path_hashes: &[String],
         records: &[QuotaObservationRecordV1],
     ) -> Result<u64> {
+        let source_file_path_hashes = source_file_path_hashes
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
         let retained_observation_ids = records
             .iter()
             .filter(|record| {
                 record.observation.source_id == *source_id
-                    && source_file_path_hashes.contains(&record.observation.source_file_path_hash)
+                    && source_file_path_hashes
+                        .contains(record.observation.source_file_path_hash.as_str())
             })
             .map(|record| record.observation.observation_id.as_str())
             .collect::<HashSet<_>>();
@@ -284,32 +332,58 @@ impl Store {
         Ok(written)
     }
 
+    pub fn replace_quota_observations_for_source_files(
+        &self,
+        source_id: &SourceId,
+        source_file_path_hashes: &[String],
+        records: &[QuotaObservationRecordV1],
+    ) -> Result<u64> {
+        self.with_immediate_transaction(|| {
+            self.replace_quota_observations_for_source_files_inner(
+                source_id,
+                source_file_path_hashes,
+                records,
+            )
+        })
+    }
+
     pub fn quota_observations(
         &self,
         query: &QuotaQuery,
         collapse_duplicates: bool,
     ) -> Result<Vec<QuotaObservationRecordV1>> {
         let mut observations = BTreeMap::<String, QuotaObservationRecordV1>::new();
-        let mut statement = self.conn.prepare(
+        let observation_sql = if query.source_id.is_some() {
+            r#"
+            SELECT q.payload, q.provider_account_id, q.usage_event_id, q.usage_link_kind,
+                   p.payload
+            FROM quota_observations q
+            JOIN quota_payloads p ON p.payload_hash = q.payload_hash
+            WHERE q.source_id = ?1
+            ORDER BY q.observed_at, q.observation_id
+            "#
+        } else {
             r#"
             SELECT q.payload, q.provider_account_id, q.usage_event_id, q.usage_link_kind,
                    p.payload
             FROM quota_observations q
             JOIN quota_payloads p ON p.payload_hash = q.payload_hash
             ORDER BY q.observed_at, q.observation_id
-            "#,
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (payload, account_id, usage_event_id, usage_link_kind, raw_payload) = row?;
+            "#
+        };
+        let source_bindings = query
+            .source_id
+            .as_ref()
+            .map(|source_id| source_id.0.as_str())
+            .into_iter();
+        let mut statement = self.conn.prepare(observation_sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(source_bindings))?;
+        while let Some(row) = rows.next()? {
+            let payload = row.get::<_, String>(0)?;
+            let account_id = row.get::<_, Option<String>>(1)?;
+            let usage_event_id = row.get::<_, Option<String>>(2)?;
+            let usage_link_kind = row.get::<_, String>(3)?;
+            let raw_payload = row.get::<_, String>(4)?;
             let mut observation: QuotaObservationV1 = serde_json::from_str(&payload)?;
             observation.provider_account_id = account_id.map(ProviderAccountId);
             observation.usage_event_id = usage_event_id.map(EventId);
@@ -326,16 +400,31 @@ impl Store {
                 },
             );
         }
+        drop(rows);
         drop(statement);
 
-        let mut statement = self.conn.prepare(
-            "SELECT observation_id, payload FROM quota_window_observations ORDER BY resets_at, window_observation_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (observation_id, payload) = row?;
+        let window_sql = if query.source_id.is_some() {
+            r#"
+            SELECT window.observation_id, window.payload
+            FROM quota_observations observation INDEXED BY quota_observations_source_idx
+            CROSS JOIN quota_window_observations window
+              ON window.observation_id = observation.observation_id
+            WHERE observation.source_id = ?1
+            ORDER BY window.resets_at, window.window_observation_id
+            "#
+        } else {
+            "SELECT observation_id, payload FROM quota_window_observations ORDER BY resets_at, window_observation_id"
+        };
+        let source_bindings = query
+            .source_id
+            .as_ref()
+            .map(|source_id| source_id.0.as_str())
+            .into_iter();
+        let mut statement = self.conn.prepare(window_sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(source_bindings))?;
+        while let Some(row) = rows.next()? {
+            let observation_id = row.get::<_, String>(0)?;
+            let payload = row.get::<_, String>(1)?;
             let Some(record) = observations.get_mut(&observation_id) else {
                 continue;
             };
@@ -403,6 +492,58 @@ impl Store {
         })
     }
 
+    /// Deletes this source's quota rows that no file in `source_file_path_hashes` accounts for.
+    ///
+    /// A full rescan replaces every file it can see, but `replace_quota_observations_for_source_files`
+    /// only reconciles the hashes handed to it, so rows written for a file that has since disappeared
+    /// -- and legacy rows stored before file hashes were recorded -- outlive the scan that should have
+    /// retired them. Deleting the whole source instead would retire them, and that is what `--no-cache`
+    /// used to do: on a store with six figures of observations it walked every row, every window, and
+    /// the payload table, which is the stall this replaces. The unmatched set is normally empty, and the
+    /// source index covers the lookup, so the common case reads an index range and writes nothing.
+    pub fn delete_quota_observations_for_source_outside_file_hashes(
+        &self,
+        source_id: &SourceId,
+        source_file_path_hashes: &[String],
+    ) -> Result<u64> {
+        self.with_immediate_transaction(|| {
+            let retained = source_file_path_hashes
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let mut statement = self.conn.prepare(
+                "SELECT observation_id, source_file_path_hash FROM quota_observations
+                 WHERE source_id = ?1",
+            )?;
+            let orphaned = statement
+                .query_map([&source_id.0], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(_, file_hash)| !retained.contains(file_hash.as_str()))
+                .map(|(observation_id, _)| observation_id)
+                .collect::<Vec<_>>();
+            drop(statement);
+            if orphaned.is_empty() {
+                return Ok(0);
+            }
+            let mut deleted = 0u64;
+            for observation_id in orphaned {
+                self.conn.execute(
+                    "DELETE FROM quota_window_observations WHERE observation_id = ?1",
+                    [&observation_id],
+                )?;
+                deleted = deleted.saturating_add(self.conn.execute(
+                    "DELETE FROM quota_observations WHERE observation_id = ?1",
+                    [&observation_id],
+                )? as u64);
+            }
+            self.delete_unreferenced_quota_payloads()?;
+            Ok(deleted)
+        })
+    }
+
     fn delete_unreferenced_quota_payloads(&self) -> Result<()> {
         self.conn.execute(
             "DELETE FROM quota_payloads WHERE payload_hash NOT IN (SELECT payload_hash FROM quota_observations)",
@@ -439,7 +580,7 @@ impl Store {
         })
     }
 
-    fn quota_observations_for_source(
+    pub(crate) fn quota_observations_for_source(
         &self,
         source_id: &SourceId,
     ) -> Result<Vec<QuotaObservationRecordV1>> {
@@ -1683,6 +1824,485 @@ mod tests {
             })
             .expect("assignment");
         (source.source_id, account_id)
+    }
+
+    #[test]
+    fn quota_plan_evidence_speaks_for_the_moment_it_was_read() {
+        // The provider names the plan while serving a request, so the reading
+        // is evidence of the plan *now* even though it declares no billing
+        // window. Without that, an account whose logs say "plus" every day
+        // still read as `last_detected` once its last declared provider period
+        // ran out, and it dropped off every current-plan surface.
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let reset_at = observed_at + Duration::days(7);
+        let (source_id, _) = assigned_source(&store, observed_at - Duration::days(1));
+        let record = sample_record(
+            source_id.clone(),
+            "quota-current",
+            "quota-current-v1",
+            observed_at,
+            reset_at.timestamp(),
+            "primary",
+            10_080,
+            25.0,
+        );
+        store
+            .upsert_quota_observations(std::slice::from_ref(&record))
+            .expect("quota row");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("plan rebuild");
+
+        let plans = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].is_current_snapshot);
+        // Still no invented billing period.
+        assert_eq!(plans[0].active_from, None);
+        assert_eq!(plans[0].active_until, None);
+    }
+
+    #[test]
+    fn source_quota_reads_do_not_deserialize_unrelated_rows() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let target = SourceId("quota-target".to_string());
+        let unrelated = SourceId("quota-unrelated".to_string());
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    target.clone(),
+                    "quota-target",
+                    "quota-target-v1",
+                    observed_at,
+                    (observed_at + Duration::days(7)).timestamp(),
+                    "primary",
+                    10_080,
+                    25.0,
+                ),
+                sample_record(
+                    unrelated,
+                    "quota-unrelated",
+                    "quota-unrelated-v1",
+                    observed_at,
+                    (observed_at + Duration::days(7)).timestamp(),
+                    "primary",
+                    10_080,
+                    50.0,
+                ),
+            ])
+            .expect("quota rows");
+        store
+            .conn
+            .execute(
+                "UPDATE quota_observations SET payload = 'not-json' WHERE observation_id = 'quota-unrelated'",
+                [],
+            )
+            .expect("corrupt unrelated row");
+
+        let records = store
+            .quota_observations_for_source(&target)
+            .expect("read target source only");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].observation.observation_id, "quota-target");
+    }
+
+    #[test]
+    fn orphan_purge_retires_only_rows_no_rescanned_file_explains() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let source_id = SourceId("quota-orphan-source".to_string());
+        let other_source_id = SourceId("quota-other-source".to_string());
+        let record = |source: SourceId, id: &str| {
+            sample_record(
+                source,
+                id,
+                &format!("{id}-v1"),
+                observed_at,
+                (observed_at + Duration::days(7)).timestamp(),
+                "primary",
+                10_080,
+                25.0,
+            )
+        };
+        let kept = record(source_id.clone(), "kept");
+        let orphaned = record(source_id.clone(), "orphaned");
+        let untouched = record(other_source_id.clone(), "other");
+        store
+            .upsert_quota_observations(&[kept, orphaned, untouched])
+            .expect("seed quota rows");
+
+        // What a full rescan sees: only `kept`'s file still exists.
+        let deleted = store
+            .delete_quota_observations_for_source_outside_file_hashes(
+                &source_id,
+                &["file-kept".to_string()],
+            )
+            .expect("purge orphaned quota rows");
+
+        assert_eq!(deleted, 1, "only the row without a current file is retired");
+        let remaining = store
+            .quota_observations_for_source(&source_id)
+            .expect("read source quota rows")
+            .into_iter()
+            .map(|record| record.observation.observation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec!["kept".to_string()]);
+        let orphaned_windows: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM quota_window_observations WHERE observation_id = 'orphaned'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count orphaned windows");
+        assert_eq!(orphaned_windows, 0, "windows follow their observation");
+        // A hash absent from one source's rescan says nothing about another source.
+        assert_eq!(
+            store
+                .quota_observations_for_source(&other_source_id)
+                .expect("read other source")
+                .len(),
+            1,
+            "the purge is scoped to the rescanned source"
+        );
+    }
+
+    #[test]
+    fn file_reconciliation_does_not_rewrite_retained_quota_rows() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let source_id = SourceId("quota-retained".to_string());
+        let mut record = sample_record(
+            source_id.clone(),
+            "quota-retained",
+            "quota-retained-v1",
+            observed_at,
+            (observed_at + Duration::days(7)).timestamp(),
+            "primary",
+            10_080,
+            25.0,
+        );
+        record.windows[0].window_observation_id = "z-window".to_string();
+        record.windows[0].provider_slot = "secondary".to_string();
+        let mut earlier_window = record.windows[0].clone();
+        earlier_window.window_observation_id = "a-window".to_string();
+        earlier_window.provider_slot = "primary".to_string();
+        record.windows.push(earlier_window);
+        store
+            .upsert_quota_observations(std::slice::from_ref(&record))
+            .expect("initial quota row");
+        store
+            .conn
+            .execute_batch(
+                r#"
+                CREATE TABLE quota_write_audit (
+                  observation_updates INTEGER NOT NULL,
+                  window_deletes INTEGER NOT NULL,
+                  window_inserts INTEGER NOT NULL
+                );
+                INSERT INTO quota_write_audit VALUES (0, 0, 0);
+                CREATE TRIGGER count_quota_observation_updates
+                AFTER UPDATE ON quota_observations
+                BEGIN
+                  UPDATE quota_write_audit
+                  SET observation_updates = observation_updates + 1;
+                END;
+                CREATE TRIGGER count_quota_window_deletes
+                AFTER DELETE ON quota_window_observations
+                BEGIN
+                  UPDATE quota_write_audit SET window_deletes = window_deletes + 1;
+                END;
+                CREATE TRIGGER count_quota_window_inserts
+                AFTER INSERT ON quota_window_observations
+                BEGIN
+                  UPDATE quota_write_audit SET window_inserts = window_inserts + 1;
+                END;
+                "#,
+            )
+            .expect("audit triggers");
+
+        store
+            .replace_quota_observations_for_source_files(
+                &source_id,
+                std::slice::from_ref(&record.observation.source_file_path_hash),
+                std::slice::from_ref(&record),
+            )
+            .expect("reconcile retained quota row");
+
+        let writes = store
+            .conn
+            .query_row(
+                "SELECT observation_updates, window_deletes, window_inserts FROM quota_write_audit",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .expect("audit counts");
+        assert_eq!(writes, (0, 0, 0));
+    }
+
+    #[test]
+    fn quota_plan_evidence_rebuild_replaces_corrected_plan_rows() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let reset_at = observed_at + Duration::days(7);
+        let (source_id, account_id) = assigned_source(&store, observed_at - Duration::days(1));
+        let mut record = sample_record(
+            source_id.clone(),
+            "quota-plan",
+            "quota-plan-v1",
+            observed_at,
+            reset_at.timestamp(),
+            "primary",
+            10_080,
+            25.0,
+        );
+        store
+            .upsert_quota_observations(std::slice::from_ref(&record))
+            .expect("initial quota row");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("initial plan rebuild");
+        let initial = store.account_plan_observations().expect("initial plan");
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].raw_plan_name, "pro");
+        assert_eq!(initial[0].provider_account_id, Some(account_id.clone()));
+
+        record.observation.status.plan_type = Some("future_ultra".to_string());
+        record.observation.semantic_fingerprint = "quota-plan-v2".to_string();
+        store
+            .upsert_quota_observations(&[record])
+            .expect("corrected quota row");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("corrected plan rebuild");
+
+        let corrected = store.account_plan_observations().expect("corrected plan");
+        assert_eq!(corrected.len(), 1);
+        assert_eq!(corrected[0].raw_plan_name, "future_ultra");
+        assert_eq!(corrected[0].plan_name, "Future Ultra");
+        assert_eq!(corrected[0].provider_account_id, Some(account_id));
+        assert_ne!(corrected[0].observation_id, initial[0].observation_id);
+    }
+
+    #[test]
+    fn many_quota_rows_naming_one_plan_collapse_into_one_observation() {
+        let store = Store::in_memory().expect("store");
+        let start = DateTime::from_timestamp(1_787_227_200, 0).expect("start");
+        let (source_id, account_id) = assigned_source(&store, start - Duration::days(1));
+
+        // Two hundred provider responses across two plans: "pro", then "team",
+        // then "pro" again after a downgrade.
+        let mut records = Vec::new();
+        for index in 0..200i64 {
+            let observed_at = start + Duration::minutes(index);
+            let mut record = sample_record(
+                source_id.clone(),
+                &format!("quota-run-{index}"),
+                &format!("quota-run-fingerprint-{index}"),
+                observed_at,
+                (observed_at + Duration::days(7)).timestamp(),
+                "primary",
+                10_080,
+                25.0,
+            );
+            record.observation.status.plan_type = Some(
+                match index {
+                    ..=99 => "pro",
+                    100..=149 => "team",
+                    _ => "pro",
+                }
+                .to_string(),
+            );
+            records.push(record);
+        }
+        store
+            .upsert_quota_observations(&records)
+            .expect("quota observations");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("plan rebuild");
+
+        let observations = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(
+            observations.len(),
+            3,
+            "one observation per run of an unchanged plan, not one per quota row"
+        );
+        let mut runs = observations
+            .iter()
+            .map(|observation| {
+                (
+                    observation.raw_plan_name.as_str(),
+                    observation.observed_at,
+                    observation.provider_account_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        runs.sort_by_key(|run| run.1);
+        assert_eq!(runs[0].0, "pro");
+        assert_eq!(runs[0].1, start + Duration::minutes(99));
+        assert_eq!(runs[1].0, "team");
+        assert_eq!(runs[1].1, start + Duration::minutes(149));
+        assert_eq!(runs[2].0, "pro");
+        assert_eq!(runs[2].1, start + Duration::minutes(199));
+        assert!(runs.iter().all(|run| run.2.as_ref() == Some(&account_id)));
+
+        // Rebuilding without new data must not churn the ledger.
+        let ids_before = observations
+            .iter()
+            .map(|observation| observation.observation_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("repeat plan rebuild");
+        let ids_after = store
+            .account_plan_observations()
+            .expect("plan evidence")
+            .iter()
+            .map(|observation| observation.observation_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids_after, ids_before);
+
+        // Extending the open run keeps its identity, so history stays put and
+        // only the newest observation re-syncs.
+        let extension = {
+            let observed_at = start + Duration::minutes(200);
+            let mut record = sample_record(
+                source_id.clone(),
+                "quota-run-200",
+                "quota-run-fingerprint-200",
+                observed_at,
+                (observed_at + Duration::days(7)).timestamp(),
+                "primary",
+                10_080,
+                26.0,
+            );
+            record.observation.status.plan_type = Some("pro".to_string());
+            record
+        };
+        store
+            .upsert_quota_observations(&[extension])
+            .expect("extend run");
+        store
+            .rebuild_quota_plan_observations_for_source(&source_id)
+            .expect("plan rebuild after extension");
+        let extended = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(extended.len(), 3);
+        assert_eq!(
+            extended
+                .iter()
+                .map(|observation| observation.observation_id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ids_before,
+            "extending a run must not mint a new observation and retire the old one"
+        );
+    }
+
+    #[test]
+    fn quota_plan_run_collapse_preserves_account_switches() {
+        let store = Store::in_memory().expect("store");
+        let start = DateTime::from_timestamp(1_787_227_200, 0).expect("start");
+        let source_id = SourceId("quota-account-switches".to_string());
+        let mut records = [
+            ("account-a-first", "account-a", 0),
+            ("account-b", "account-b", 1),
+            ("account-a-last", "account-a", 2),
+        ]
+        .into_iter()
+        .map(|(observation_id, account_id, minute)| {
+            let observed_at = start + Duration::minutes(minute);
+            let mut record = sample_record(
+                source_id.clone(),
+                observation_id,
+                &format!("fingerprint-{observation_id}"),
+                observed_at,
+                (observed_at + Duration::days(7)).timestamp(),
+                "primary",
+                10_080,
+                25.0,
+            );
+            record.observation.provider_account_id =
+                Some(ProviderAccountId(account_id.to_string()));
+            record
+        })
+        .collect::<Vec<_>>();
+        records.reverse();
+
+        store
+            .upsert_quota_plan_observations(&records)
+            .expect("plan observations");
+
+        let mut observations = store.account_plan_observations().expect("plan evidence");
+        observations.sort_by_key(|observation| observation.observed_at);
+        assert_eq!(observations.len(), 3);
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.provider_account_id.as_ref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(&ProviderAccountId("account-a".to_string())),
+                Some(&ProviderAccountId("account-b".to_string())),
+                Some(&ProviderAccountId("account-a".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn quota_plan_label_never_identifies_an_unassigned_account() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed_at");
+        let reset_at = observed_at.timestamp() + 3_600;
+        let unassigned = sample_record(
+            SourceId("unassigned-source".to_string()),
+            "quota-plan-unassigned",
+            "quota-plan-unassigned-fingerprint",
+            observed_at,
+            reset_at,
+            "primary",
+            300,
+            25.0,
+        );
+
+        assert_eq!(
+            store
+                .upsert_quota_plan_observations(&[unassigned])
+                .expect("unassigned plan label"),
+            0
+        );
+        assert!(store
+            .account_plan_observations()
+            .expect("no plan observations")
+            .is_empty());
+
+        let (source_id, account_id) = assigned_source(&store, observed_at);
+        let assigned = sample_record(
+            source_id,
+            "quota-plan-assigned",
+            "quota-plan-assigned-fingerprint",
+            observed_at,
+            reset_at,
+            "primary",
+            300,
+            25.0,
+        );
+        assert_eq!(
+            store
+                .upsert_quota_plan_observations(&[assigned])
+                .expect("assigned plan label"),
+            1
+        );
+        let observations = store.account_plan_observations().expect("plan observation");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].provider_account_id, Some(account_id));
+        assert_eq!(observations[0].raw_plan_name, "pro");
     }
 
     #[test]

@@ -5,8 +5,8 @@ use serde_json::json;
 use statsai_core::{
     SyncAck, SyncBatch, SyncEntityCounts, SyncRejectedRecord, SYNC_ACK_V1_SCHEMA_VERSION,
     SYNC_ACK_V2_SCHEMA_VERSION, SYNC_ACK_V3_SCHEMA_VERSION, SYNC_ACK_V4_SCHEMA_VERSION,
-    SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION,
-    SYNC_BATCH_V4_SCHEMA_VERSION,
+    SYNC_ACK_V5_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
+    SYNC_BATCH_V3_SCHEMA_VERSION, SYNC_BATCH_V4_SCHEMA_VERSION, SYNC_BATCH_V5_SCHEMA_VERSION,
 };
 use statsai_store::Store;
 use std::io::Read;
@@ -32,6 +32,7 @@ fn sync_ack_schema_version(batch_schema_version: &str) -> Result<&'static str> {
         SYNC_BATCH_V2_SCHEMA_VERSION => Ok(SYNC_ACK_V2_SCHEMA_VERSION),
         SYNC_BATCH_V3_SCHEMA_VERSION => Ok(SYNC_ACK_V3_SCHEMA_VERSION),
         SYNC_BATCH_V4_SCHEMA_VERSION => Ok(SYNC_ACK_V4_SCHEMA_VERSION),
+        SYNC_BATCH_V5_SCHEMA_VERSION => Ok(SYNC_ACK_V5_SCHEMA_VERSION),
         other => bail!("unsupported sync batch schema {other}"),
     }
 }
@@ -222,20 +223,29 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
         && batch.schema_version != SYNC_BATCH_V2_SCHEMA_VERSION
         && batch.schema_version != SYNC_BATCH_V3_SCHEMA_VERSION
         && batch.schema_version != SYNC_BATCH_V4_SCHEMA_VERSION
+        && batch.schema_version != SYNC_BATCH_V5_SCHEMA_VERSION
     {
         bail!("unsupported sync batch schema {}", batch.schema_version);
     }
     if !matches!(
         batch.schema_version.as_str(),
-        SYNC_BATCH_V3_SCHEMA_VERSION | SYNC_BATCH_V4_SCHEMA_VERSION
+        SYNC_BATCH_V3_SCHEMA_VERSION | SYNC_BATCH_V4_SCHEMA_VERSION | SYNC_BATCH_V5_SCHEMA_VERSION
     ) && !batch.code_change_metrics.is_empty()
     {
         bail!("code-change metrics require sync_batch.v3");
     }
-    if batch.schema_version != SYNC_BATCH_V4_SCHEMA_VERSION
-        && !batch.quota_cycle_contributions.is_empty()
+    if !matches!(
+        batch.schema_version.as_str(),
+        SYNC_BATCH_V4_SCHEMA_VERSION | SYNC_BATCH_V5_SCHEMA_VERSION
+    ) && !batch.quota_cycle_contributions.is_empty()
     {
         bail!("quota cycle contributions require sync_batch.v4");
+    }
+    if batch.schema_version != SYNC_BATCH_V5_SCHEMA_VERSION
+        && (!batch.account_plan_observations.is_empty()
+            || !batch.account_evidence_summaries.is_empty())
+    {
+        bail!("account-plan evidence requires sync_batch.v5");
     }
     if batch
         .code_change_metrics
@@ -247,15 +257,18 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     if batch.authoritative_snapshot.is_some() {
         bail!("authoritative snapshots are not supported by the loopback daemon");
     }
-    // A local store holds quota observations and derives its own cycles from
-    // them; there is no table for another device's contributions. Acknowledging
-    // them as accepted told the sender to record them synced against this
-    // target and stop offering them, certifying a write that never happened.
-    // Refusing follows the authoritative-snapshot precedent above: this
-    // endpoint is for loopback diagnostics, and `/api/sync/batches` is the
-    // contract that stores quota cycles.
+    // A local store holds quota observations and account-plan evidence it
+    // derives from its own scans; there is no table for another device's
+    // contributions. Acknowledging them as accepted told the sender to record
+    // them synced against this target and stop offering them, certifying a
+    // write that never happened. Refusing follows the authoritative-snapshot
+    // precedent above: this endpoint is for loopback diagnostics, and
+    // `/api/sync/batches` is the contract that stores these collections.
     if !batch.quota_cycle_contributions.is_empty() {
         bail!("quota cycle contributions are not supported by the loopback daemon");
+    }
+    if !batch.account_plan_observations.is_empty() || !batch.account_evidence_summaries.is_empty() {
+        bail!("account-plan evidence is not supported by the loopback daemon");
     }
 
     let result = store.ingest_sync_batch(batch)?;
@@ -274,6 +287,8 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             task_verifications: result.merged_task_verifications,
             code_change_metrics: batch.code_change_metrics.len() as u64,
             quota_cycle_contributions: batch.quota_cycle_contributions.len() as u64,
+            account_plan_observations: batch.account_plan_observations.len() as u64,
+            account_evidence_summaries: batch.account_evidence_summaries.len() as u64,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -287,6 +302,8 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
                 .saturating_sub(result.merged_task_verifications),
             code_change_metrics: 0,
             quota_cycle_contributions: 0,
+            account_plan_observations: 0,
+            account_evidence_summaries: 0,
         },
         rejected: Vec::<SyncRejectedRecord>::new(),
     })
@@ -321,16 +338,19 @@ mod watch {
     use chrono::{DateTime, Utc};
     use notify::{Event, EventKind, RecursiveMode, Watcher};
     use statsai_adapters::{
-        adapter_for_provider, default_adapters, ProviderAdapter, ScanCandidateFile, ScanOptions,
-        VerifiedSourceObservation,
+        adapter_for_provider, default_adapters, remap_account_evidence_account_ids,
+        retain_accounts_referenced_by_account_evidence, AccountEvidenceScan, ProviderAdapter,
+        ScanCandidateFile, ScanOptions, VerifiedSourceObservation,
     };
     use statsai_core::{
-        hash_text, timestamp_in_period, IdentitySource, ProviderAccountId, SourceAccountAssignment,
-        SourceId, SourceKind, SourceLocation, SourceVerificationMode, UsageEvent, UsageSummary,
+        hash_text, provider_account_id_from_identity, timestamp_in_period, IdentitySource,
+        ProviderAccountId, SourceAccountAssignment, SourceId, SourceKind, SourceLocation,
+        SourceVerificationMode, UsageEvent, UsageSummary,
     };
     use statsai_store::{
-        reconcile_verified_source_state, verified_source_observation_hash, ScanFileReplacement,
-        ScanFileStateEntry, Store,
+        find_existing_provider_account, reconcile_verified_source_state, upsert_provider_account,
+        verified_source_observation_hash, ScanFileReplacement, ScanFileStateEntry, Store,
+        UpsertProviderAccountInput,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
@@ -1003,6 +1023,51 @@ mod watch {
                 verification_dependencies,
             );
             for mut source in sources {
+                let verification_mode = source.verification_mode.clone();
+                let account_evidence_enabled =
+                    matches!(verification_mode, SourceVerificationMode::Auto);
+                let mut account_evidence = statsai_adapters::AccountEvidenceScan::default();
+                if account_evidence_enabled {
+                    let account_evidence_checkpoints = scan_store
+                        .account_evidence_checkpoints(&source.source_id)
+                        .context("load account evidence checkpoints")?;
+                    account_evidence = match adapter
+                        .collect_account_evidence(&source, &account_evidence_checkpoints)
+                    {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            eprintln!(
+                                "daemon: account evidence scan failed for {}: {error}",
+                                source.path_label.as_deref().unwrap_or("unknown")
+                            );
+                            failed = true;
+                            continue;
+                        }
+                    };
+                    let known_account_aliases = canonicalize_known_account_evidence(
+                        scan_store,
+                        adapter.provider(),
+                        &mut account_evidence,
+                    )
+                    .context("canonicalize known account evidence")?;
+                    scan_store
+                        .retain_unseen_account_evidence(
+                            &source.source_id,
+                            &mut account_evidence.identity_observations,
+                            &mut account_evidence.plan_observations,
+                            &mut account_evidence.conversation_bindings,
+                        )
+                        .context("filter previously collected account evidence")?;
+                    retain_accounts_referenced_by_account_evidence(
+                        adapter.provider(),
+                        &known_account_aliases,
+                        &mut account_evidence,
+                    );
+                }
+                let has_account_evidence = !account_evidence.identity_observations.is_empty()
+                    || !account_evidence.plan_observations.is_empty()
+                    || !account_evidence.conversation_bindings.is_empty()
+                    || !account_evidence.checkpoints.is_empty();
                 let expected_data_version = commit_store
                     .map(|_| scan_store.data_version())
                     .transpose()
@@ -1061,7 +1126,6 @@ mod watch {
                     .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
                     .collect::<Vec<_>>();
                 let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
-                let verification_mode = source.verification_mode.clone();
                 let probed_verified_source_state =
                     if matches!(verification_mode, SourceVerificationMode::Disabled) {
                         VerifiedSourceObservation::Unavailable
@@ -1111,6 +1175,7 @@ mod watch {
                     && removed_file_entries.is_empty()
                     && !has_cache_entry_upgrades
                     && !verified_state_changed
+                    && !has_account_evidence
                 {
                     continue;
                 }
@@ -1199,6 +1264,30 @@ mod watch {
                                 store
                                     .upsert_source(source)
                                     .context("update source verified auth state")?;
+                                if account_evidence_enabled {
+                                    canonicalize_account_evidence(
+                                        store,
+                                        adapter.provider(),
+                                        &mut account_evidence,
+                                    )?;
+                                    store.upsert_account_identity_observations(
+                                        &account_evidence.identity_observations,
+                                    )?;
+                                    store.upsert_account_plan_observations(
+                                        &account_evidence.plan_observations,
+                                    )?;
+                                    store.reconcile_source_account_evidence_assignments(
+                                        &source.source_id,
+                                    )?;
+                                    store.upsert_conversation_account_bindings(
+                                        &account_evidence.conversation_bindings,
+                                    )?;
+                                    store
+                                        .reattribute_conversation_bound_events(&source.source_id)?;
+                                    store.upsert_account_evidence_checkpoints(
+                                        &account_evidence.checkpoints,
+                                    )?;
+                                }
                                 if pending_file_entries.is_empty()
                                     && removed_file_entries.is_empty()
                                 {
@@ -1217,6 +1306,12 @@ mod watch {
                                     &mut scan.summaries,
                                 )
                                 .context("resolve source accounts")?;
+                                if account_evidence_enabled {
+                                    store.apply_conversation_account_bindings(
+                                        &source.source_id,
+                                        &mut scan.events,
+                                    )?;
+                                }
                                 let replacement = store
                                     .replace_scan_file_records(ScanFileReplacement {
                                         source_id: &source.source_id,
@@ -1395,6 +1490,65 @@ mod watch {
             apply_account_resolution_to_summary(&assignments, summary);
         }
         Ok(())
+    }
+
+    fn canonicalize_account_evidence(
+        store: &Store,
+        provider: &str,
+        evidence: &mut AccountEvidenceScan,
+    ) -> Result<()> {
+        let mut canonical_ids = HashMap::new();
+        for observed in &evidence.accounts {
+            let Some(detected_id) = provider_account_id_from_identity(
+                provider,
+                observed.provider_user_id.as_deref(),
+                observed.email.as_deref(),
+            ) else {
+                continue;
+            };
+            let account = upsert_provider_account(
+                store,
+                UpsertProviderAccountInput {
+                    provider,
+                    provider_user_id: observed.provider_user_id.as_deref(),
+                    email: observed.email.as_deref(),
+                    label: None,
+                    plan_name: None,
+                    identity_source: Some(IdentitySource::LocalAuth),
+                    verified_at: Some(observed.observed_at),
+                },
+            )?;
+            canonical_ids.insert(detected_id, account.provider_account_id);
+        }
+        remap_account_evidence_account_ids(evidence, &canonical_ids);
+        Ok(())
+    }
+
+    fn canonicalize_known_account_evidence(
+        store: &Store,
+        provider: &str,
+        evidence: &mut AccountEvidenceScan,
+    ) -> Result<HashMap<ProviderAccountId, ProviderAccountId>> {
+        let mut canonical_ids = HashMap::new();
+        for observed in &evidence.accounts {
+            let Some(detected_id) = provider_account_id_from_identity(
+                provider,
+                observed.provider_user_id.as_deref(),
+                observed.email.as_deref(),
+            ) else {
+                continue;
+            };
+            if let Some(account) = find_existing_provider_account(
+                store,
+                provider,
+                observed.provider_user_id.as_deref(),
+                observed.email.as_deref(),
+            )? {
+                canonical_ids.insert(detected_id, account.provider_account_id);
+            }
+        }
+        remap_account_evidence_account_ids(evidence, &canonical_ids);
+        Ok(canonical_ids)
     }
 
     fn apply_account_resolution_to_event(
@@ -1951,6 +2105,49 @@ mod watch {
             }
         }
 
+        struct AccountEvidenceTrackingAdapter {
+            collect_calls: Arc<Mutex<u64>>,
+        }
+
+        impl ProviderAdapter for AccountEvidenceTrackingAdapter {
+            fn id(&self) -> &'static str {
+                "test-account-evidence"
+            }
+
+            fn version(&self) -> &'static str {
+                "0"
+            }
+
+            fn provider(&self) -> &'static str {
+                "codex"
+            }
+
+            fn discover(&self) -> Vec<SourceLocation> {
+                Vec::new()
+            }
+
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(Vec::new())
+            }
+
+            fn collect_account_evidence(
+                &self,
+                _source: &SourceLocation,
+                _checkpoints: &[statsai_core::AccountEvidenceCheckpointV1],
+            ) -> Result<statsai_adapters::AccountEvidenceScan> {
+                *self.collect_calls.lock().expect("collect calls") += 1;
+                Ok(statsai_adapters::AccountEvidenceScan::default())
+            }
+
+            fn scan(
+                &self,
+                _source: &SourceLocation,
+                _options: &ScanOptions,
+            ) -> Result<statsai_adapters::AdapterScan> {
+                Ok(statsai_adapters::AdapterScan::default())
+            }
+        }
+
         struct DuplicateFileAdapter {
             candidate: ScanCandidateFile,
             event: UsageEvent,
@@ -2300,7 +2497,10 @@ mod watch {
 
             assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
             assert_eq!(store.list_accounts().expect("accounts").len(), 1);
-            assert_eq!(store.list_subscriptions().expect("subscriptions").len(), 1);
+            assert!(store
+                .list_subscriptions()
+                .expect("subscriptions")
+                .is_empty());
             let assignments = store
                 .list_source_account_assignments_for_source(&source.source_id)
                 .expect("assignments");
@@ -2316,7 +2516,7 @@ mod watch {
 
             // A watcher can observe auth.json while it is being rewritten. That
             // transiently produces no local snapshot, which must not end the
-            // account assignment or its verified subscription.
+            // account assignment.
             let unavailable_adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(TestAdapter {
                 provider: "codex",
                 verified_observation: VerifiedSourceObservation::Unavailable,
@@ -2339,9 +2539,10 @@ mod watch {
                 .expect("assignments after unavailable auth");
             assert_eq!(assignments.len(), 1);
             assert_eq!(assignments[0].ended_at, None);
-            let subscriptions = store.list_subscriptions().expect("subscriptions");
-            assert_eq!(subscriptions.len(), 1);
-            assert_eq!(subscriptions[0].ended_at, None);
+            assert!(store
+                .list_subscriptions()
+                .expect("subscriptions")
+                .is_empty());
 
             let blocked_adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(TestAdapter {
                 provider: "codex",
@@ -2367,11 +2568,42 @@ mod watch {
                 .expect("assignments after blocked auth");
             assert_eq!(assignments.len(), 1);
             assert_eq!(assignments[0].ended_at, Some(blocked_since));
-            let subscriptions = store.list_subscriptions().expect("subscriptions");
-            assert_eq!(subscriptions.len(), 1);
-            assert_eq!(subscriptions[0].ended_at, None);
+            assert!(store
+                .list_subscriptions()
+                .expect("subscriptions")
+                .is_empty());
 
             let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn manual_only_watcher_rescan_does_not_collect_account_evidence() {
+            let store = Store::in_memory().expect("store");
+            let root = tempfile::tempdir().expect("source root");
+            let mut source = SourceLocation::local_adapter(
+                "codex",
+                "test-account-evidence",
+                "0",
+                root.path(),
+                LocationOrigin::Configured,
+            );
+            source.verification_mode = SourceVerificationMode::ManualOnly;
+            store.upsert_source(&source).expect("source");
+            let collect_calls = Arc::new(Mutex::new(0));
+            let adapters: Vec<Box<dyn ProviderAdapter>> =
+                vec![Box::new(AccountEvidenceTrackingAdapter {
+                    collect_calls: Arc::clone(&collect_calls),
+                })];
+
+            rescan_changed_sources_with_adapters(
+                &store,
+                "device-test",
+                &[root.path().join("auth.json")],
+                &adapters,
+            )
+            .expect("watcher rescan");
+
+            assert_eq!(*collect_calls.lock().expect("collect calls"), 0);
         }
 
         #[test]
@@ -2693,13 +2925,15 @@ mod tests {
 
     fn empty_batch() -> SyncBatch {
         SyncBatch {
-            schema_version: SYNC_BATCH_V3_SCHEMA_VERSION.to_string(),
+            schema_version: SYNC_BATCH_V4_SCHEMA_VERSION.to_string(),
             batch_id: "batch_test".to_string(),
             device_id: "device_test".to_string(),
             sources: Vec::new(),
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets: Vec::new(),
@@ -2822,11 +3056,53 @@ mod tests {
         let store = Store::in_memory().expect("store");
         let ack = ingest_sync_batch(&store, &empty_batch()).expect("ack");
 
-        assert_eq!(ack.schema_version, SYNC_ACK_V3_SCHEMA_VERSION);
+        assert_eq!(ack.schema_version, SYNC_ACK_V4_SCHEMA_VERSION);
         assert_eq!(ack.batch_id, "batch_test");
         assert_eq!(ack.accepted.events, 0);
         assert_eq!(ack.duplicates.events, 0);
         assert!(ack.rejected.is_empty());
+    }
+
+    #[test]
+    fn ingest_rejects_projection_collections_the_loopback_store_cannot_persist() {
+        let store = Store::in_memory().expect("store");
+        let mut batch = empty_batch();
+        batch.account_plan_observations.push(
+            serde_json::from_value(json!({
+                "schema_version": "account_plan_projection.v1",
+                "projection_id": "projection-1",
+                "semantic_fingerprint": "fingerprint-1",
+                "device_id": batch.device_id,
+                "provider": "codex",
+                "provider_account_id": "account-1",
+                "raw_plan_name": "pro",
+                "plan_name": "Pro",
+                "observed_at": "2026-08-20T12:00:00Z",
+                "active_from": null,
+                "active_until": null,
+                "is_current_snapshot": true,
+                "evidence_kind": "auth_snapshot",
+                "confidence": "high"
+            }))
+            .expect("plan projection"),
+        );
+
+        // `empty_batch` is v4, which has no acknowledgement counter for these,
+        // so the version guard fires before the persistence one.
+        let versioned = ingest_sync_batch(&store, &batch).expect_err("account plan below v5");
+        assert!(versioned
+            .to_string()
+            .contains("account-plan evidence requires sync_batch.v5"));
+
+        batch.schema_version = SYNC_BATCH_V5_SCHEMA_VERSION.to_string();
+        let error = ingest_sync_batch(&store, &batch).expect_err("unsupported projection");
+        assert!(error
+            .to_string()
+            .contains("account-plan evidence is not supported by the loopback daemon"));
+        assert!(store
+            .account_plan_observations()
+            .expect("local plan ledger")
+            .is_empty());
     }
 
     #[test]
