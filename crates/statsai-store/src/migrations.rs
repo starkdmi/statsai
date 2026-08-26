@@ -836,10 +836,12 @@ fn apply_migration_020(conn: &Connection) -> Result<()> {
 }
 
 fn apply_migration_021(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "ALTER TABLE account_evidence_checkpoints ADD COLUMN checkpoint_row_fingerprint TEXT;",
-    )?;
-    Ok(())
+    ensure_column(
+        conn,
+        "account_evidence_checkpoints",
+        "checkpoint_row_fingerprint",
+        "TEXT",
+    )
 }
 
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
@@ -1053,6 +1055,30 @@ mod tests {
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
         assert!(table_exists(&conn, "task_bucket_sync_state"));
         assert!(column_exists(&conn, "scan_file_state", "tasks_collected"));
+    }
+
+    #[test]
+    fn migration_twenty_one_retries_after_column_was_added_without_history() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        ensure_migrations_table(&conn).expect("ensure migrations table");
+        for version in 1..=20 {
+            apply_migration(&conn, version).expect("apply migration");
+            record_migration(&conn, version).expect("record migration");
+        }
+        apply_migration_021(&conn).expect("interrupted migration schema change");
+        assert_eq!(
+            current_schema_version(&conn).expect("version before retry"),
+            20
+        );
+
+        migrate(&conn).expect("retry migration");
+
+        assert_eq!(schema_version(&conn).expect("version after retry"), 21);
+        assert!(column_exists(
+            &conn,
+            "account_evidence_checkpoints",
+            "checkpoint_row_fingerprint"
+        ));
     }
 
     #[test]

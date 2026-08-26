@@ -670,7 +670,6 @@ impl Store {
                 .source_id
                 .0
                 .cmp(&right.2.source_id.0)
-                .then_with(|| left.0 .0.cmp(&right.0 .0))
                 .then_with(|| left.2.observed_at.cmp(&right.2.observed_at))
                 .then_with(|| left.2.observation_id.cmp(&right.2.observation_id))
         });

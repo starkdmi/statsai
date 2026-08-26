@@ -5267,6 +5267,12 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     let existing_batch_lookup_queries = 1;
     let final_sync_bookkeeping_queries = 2;
     let account_alias_lookup_queries = usize::from(!batch.accounts.is_empty());
+    // The backend reads existing ownership for every non-empty plan batch and
+    // may spend one more query deleting a fingerprint the device repointed.
+    // The client cannot know whether that cleanup will be needed until the
+    // server reads its ownership state, so reserve the worst case here.
+    let account_plan_ownership_queries =
+        usize::from(!batch.account_plan_observations.is_empty()) * 2;
     let semantic_lookup_queries =
         http_rollup_query_chunks(
             unique_non_empty_provider_account_ids(
@@ -5346,6 +5352,7 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     authenticated_device_queries
         + existing_batch_lookup_queries
         + account_alias_lookup_queries
+        + account_plan_ownership_queries
         + semantic_lookup_queries
         + existing_summary_state_queries
         + project_location_lookup_queries
@@ -16539,8 +16546,8 @@ mod tests {
 
         assert_eq!(
             estimate_http_rollup_d1_queries(&batch),
-            baseline + 3,
-            "two metadata writes and one evidence-alias lookup must be budgeted"
+            baseline + 5,
+            "metadata, evidence-alias, ownership lookup, and possible cleanup must be budgeted"
         );
     }
 

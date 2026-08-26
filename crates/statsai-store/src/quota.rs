@@ -1880,6 +1880,56 @@ mod tests {
     }
 
     #[test]
+    fn quota_plan_run_collapse_preserves_account_switches() {
+        let store = Store::in_memory().expect("store");
+        let start = DateTime::from_timestamp(1_787_227_200, 0).expect("start");
+        let source_id = SourceId("quota-account-switches".to_string());
+        let mut records = [
+            ("account-a-first", "account-a", 0),
+            ("account-b", "account-b", 1),
+            ("account-a-last", "account-a", 2),
+        ]
+        .into_iter()
+        .map(|(observation_id, account_id, minute)| {
+            let observed_at = start + Duration::minutes(minute);
+            let mut record = sample_record(
+                source_id.clone(),
+                observation_id,
+                &format!("fingerprint-{observation_id}"),
+                observed_at,
+                (observed_at + Duration::days(7)).timestamp(),
+                "primary",
+                10_080,
+                25.0,
+            );
+            record.observation.provider_account_id =
+                Some(ProviderAccountId(account_id.to_string()));
+            record
+        })
+        .collect::<Vec<_>>();
+        records.reverse();
+
+        store
+            .upsert_quota_plan_observations(&records)
+            .expect("plan observations");
+
+        let mut observations = store.account_plan_observations().expect("plan evidence");
+        observations.sort_by_key(|observation| observation.observed_at);
+        assert_eq!(observations.len(), 3);
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.provider_account_id.as_ref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(&ProviderAccountId("account-a".to_string())),
+                Some(&ProviderAccountId("account-b".to_string())),
+                Some(&ProviderAccountId("account-a".to_string())),
+            ]
+        );
+    }
+
+    #[test]
     fn quota_plan_label_never_identifies_an_unassigned_account() {
         let store = Store::in_memory().expect("store");
         let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed_at");
