@@ -1,9 +1,10 @@
 mod mutations;
 
 use super::{
-    canonical_display, codex_project_context_from_value, codex_usage_roots, collect_jsonl_files,
-    expand_home_path, grok_sessions_root, model_from_nested_value, open_sqlite_readonly,
-    read_bounded_jsonl_line, resolve_project_context, source_root_path,
+    canonical_display, codex_project_context_from_value, codex_quota_observation,
+    codex_usage_counts_from_value, codex_usage_roots, collect_jsonl_files, expand_home_path,
+    file_modified_timestamp, grok_sessions_root, model_from_nested_value, open_sqlite_readonly,
+    read_bounded_jsonl_line, resolve_project_context, source_root_path, subtract_usage_counts,
     timestamp_from_nested_value, BoundedLineRead, ProjectContextCache, CLAUDE_CODE_PROVIDER,
     CODEX_PROVIDER, GROK_BUILD_PROVIDER, MAX_JSONL_RECORD_BYTES, OPENCODE_PROVIDER,
 };
@@ -21,8 +22,8 @@ use statsai_core::{
     archive_artifact_metadata_signature, archive_content_id, archive_conversation_id,
     archive_item_id, hash_text, ArchiveArtifactDependency, ArchiveCompleteness, ArchiveContentKind,
     ArchiveContentPart, ArchiveConversation, ArchiveItem, ArchiveItemKind, ArchiveRole,
-    CoverageStatus, ModelInfo, ProjectInfo, SourceLocation, TraceEdit, UsageCounts,
-    ARCHIVE_CONVERSATION_SCHEMA_VERSION,
+    CoverageStatus, ModelInfo, ProjectInfo, QuotaObservationRecordV1, SourceLocation, TraceEdit,
+    UsageCounts, ARCHIVE_CONVERSATION_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -57,6 +58,7 @@ pub struct ArchiveScan {
     pub conversations: Vec<ArchiveConversation>,
     pub artifact_dependencies: Vec<ArchiveArtifactDependency>,
     pub trace_edits: Vec<TraceEdit>,
+    pub quota_observations: Vec<QuotaObservationRecordV1>,
     pub trace_coverage: CoverageStatus,
     pub diagnostics: ArchiveScanDiagnostics,
 }
@@ -67,6 +69,7 @@ impl Default for ArchiveScan {
             conversations: Vec::new(),
             artifact_dependencies: Vec::new(),
             trace_edits: Vec::new(),
+            quota_observations: Vec::new(),
             // A scan that reconstructed nothing has measured nothing. Only a
             // provider whose mutations this module actually parses may claim
             // complete trace coverage, so that a new adapter cannot silently
@@ -210,10 +213,68 @@ fn collect_codex(
             &mut scan.trace_edits,
             &mut scan.trace_coverage,
         )?);
+        scan.quota_observations
+            .extend(collect_codex_quota_observations(source, &path)?);
     }
     scan.artifact_dependencies = finish_artifact_dependencies(artifact_dependencies);
     finish_diagnostics(&mut scan);
     Ok(scan)
+}
+
+fn collect_codex_quota_observations(
+    source: &SourceLocation,
+    path: &Path,
+) -> Result<Vec<QuotaObservationRecordV1>> {
+    let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
+    let mut previous_totals: Option<UsageCounts> = None;
+    let mut observations = Vec::new();
+    let mut line_bytes = Vec::new();
+    let mut line_number = 0usize;
+    loop {
+        let status = read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
+        if status == BoundedLineRead::Eof {
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        if status == BoundedLineRead::Oversized {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("event_msg")
+            || value.pointer("/payload/type").and_then(Value::as_str) != Some("token_count")
+        {
+            continue;
+        }
+        let info = value.pointer("/payload/info");
+        let total_usage = info
+            .and_then(|info| info.get("total_token_usage"))
+            .map(codex_usage_counts_from_value);
+        let usage_sample = info
+            .and_then(|info| info.get("last_token_usage"))
+            .map(codex_usage_counts_from_value)
+            .or_else(|| {
+                total_usage
+                    .as_ref()
+                    .map(|total| subtract_usage_counts(total, previous_totals.as_ref()))
+            });
+        if let Some(total_usage) = total_usage {
+            previous_totals = Some(total_usage);
+        }
+        let observed_at = timestamp_from_nested_value(&value).unwrap_or(fallback_timestamp);
+        if let Some(observation) =
+            codex_quota_observation(source, path, line_number, observed_at, usage_sample, &value)
+        {
+            observations.push(observation);
+        }
+    }
+    Ok(observations)
 }
 
 fn collect_codex_file(
@@ -593,6 +654,11 @@ fn collect_claude_file(
     let mut line_number = 0usize;
     let mut pending_mutations = HashMap::new();
     let source_record_path = canonical_display(path);
+    // Claude records the conversation identity per line, and a resumed session
+    // carries its parent's identifier before its own. Edits reconstructed
+    // before the last identity is known are re-bound to it below, so they
+    // always reference the conversation this file is finally written as.
+    let trace_edits_start = trace_edits.len();
     loop {
         let status = read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
         if status == BoundedLineRead::Eof {
@@ -772,7 +838,11 @@ fn collect_claude_file(
         }
     }
     mark_unresolved_mutations(&pending_mutations, diagnostics, trace_coverage);
-    Ok(builder.finish())
+    let conversation = builder.finish();
+    for edit in &mut trace_edits[trace_edits_start..] {
+        edit.rebind_conversation(&conversation.conversation_id);
+    }
+    Ok(conversation)
 }
 
 fn claude_archive_native_id(
@@ -1259,6 +1329,7 @@ fn collect_opencode(
             .collect(),
         artifact_dependencies: finish_artifact_dependencies(artifact_dependencies),
         trace_edits: Vec::new(),
+        quota_observations: Vec::new(),
         trace_coverage: CoverageStatus::Unavailable,
         diagnostics: ArchiveScanDiagnostics {
             files_scanned: 1,
@@ -1289,7 +1360,11 @@ struct ItemInput<'a> {
 }
 
 fn item_from_value(input: ItemInput<'_>) -> (ArchiveItem, u64) {
-    let fingerprint = hash_text(&input.content.to_string());
+    // Rendered once and reused: the identifier hashes the same JSON that a
+    // tool call or result goes on to store, and rendering a large tool payload
+    // twice is pure duplicate work.
+    let rendered = input.content.to_string();
+    let fingerprint = hash_text(&rendered);
     let item_id = archive_item_id(
         input.provider,
         input.conversation_native_id,
@@ -1307,7 +1382,7 @@ fn item_from_value(input: ItemInput<'_>) -> (ArchiveItem, u64) {
         if !input.content.is_null() {
             let text = match input.content {
                 Value::String(value) => value.clone(),
-                value => value.to_string(),
+                _ => rendered.clone(),
             };
             if !text.trim().is_empty() && text != "null" {
                 push_text_part(&item_id, ArchiveContentKind::Json, text, &mut parts);
@@ -1339,7 +1414,7 @@ fn item_from_value(input: ItemInput<'_>) -> (ArchiveItem, u64) {
     } else if parts.is_empty() && !input.content.is_null() {
         let text = match input.content {
             Value::String(value) => value.clone(),
-            value => value.to_string(),
+            _ => rendered,
         };
         if !text.trim().is_empty() && text != "null" {
             push_text_part(&item_id, ArchiveContentKind::Json, text, &mut parts);
@@ -1582,7 +1657,9 @@ fn extract_content_parts(
                 return;
             }
             if matches!(content_type, "tool_use" | "tool_call" | "tool_result") {
-                let compact = Value::Object(object.clone()).to_string();
+                // Serialized borrowed: cloning the block first copied every
+                // nested value only to render and drop it.
+                let compact = serde_json::to_string(object).unwrap_or_default();
                 push_text_part(item_id, ArchiveContentKind::Json, compact, parts);
                 return;
             }
@@ -2154,6 +2231,72 @@ mod tests {
             claude_archive_native_id(&serde_json::json!({}), "main-session", "fallback", false),
             "main-session"
         );
+    }
+
+    /// A resumed session records its parent's identifier before its own, so the
+    /// conversation this file becomes is known only at the end. Every edit must
+    /// still reference it, or the store rejects the import outright.
+    #[test]
+    fn claude_resumed_session_binds_every_edit_to_the_written_conversation() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("projects").join("workspace");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("resumed.jsonl");
+        let mut file = File::create(&path).unwrap();
+        // The parent session's edit is reconstructed before the record that
+        // reveals this file is really the resumed session.
+        for record in [
+            serde_json::json!({
+                "sessionId": "parent-session",
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "Write",
+                    "input": {"file_path": "src/lib.rs", "content": "one\ntwo\n"}
+                }]}
+            }),
+            serde_json::json!({
+                "sessionId": "parent-session",
+                "type": "user",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "File created successfully at: src/lib.rs"
+                }]}
+            }),
+            serde_json::json!({
+                "sessionId": "resumed-session",
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": "carry on"}]}
+            }),
+        ] {
+            writeln!(file, "{record}").unwrap();
+        }
+        drop(file);
+
+        let scan = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+
+        assert_eq!(scan.conversations.len(), 1);
+        let conversation = &scan.conversations[0];
+        assert_eq!(conversation.native_conversation_id, "resumed-session");
+        assert!(!scan.trace_edits.is_empty(), "the write must be measured");
+        // Every edit references the conversation that was actually written, and
+        // no two edits collapsed onto one identifier while being re-bound.
+        assert!(scan
+            .trace_edits
+            .iter()
+            .all(|edit| edit.conversation_id == conversation.conversation_id));
+        let distinct_ids = scan
+            .trace_edits
+            .iter()
+            .map(|edit| edit.trace_edit_id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(distinct_ids.len(), scan.trace_edits.len());
+        // Re-reading the same file reproduces the identifiers, so a re-import
+        // replaces the edits instead of duplicating them.
+        let repeated = collect_claude(&source(CLAUDE_CODE_PROVIDER, dir.path()), None).unwrap();
+        assert_eq!(repeated.trace_edits, scan.trace_edits);
     }
 
     #[test]

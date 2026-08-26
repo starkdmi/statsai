@@ -7,6 +7,15 @@ marker for deletion reconciliation.
 `sync_batch.v3` adds privacy-safe numeric code-change metrics and makes their
 acknowledgement counts and authoritative snapshot IDs part of the versioned
 contract. Versions 1 and 2 never treat those new fields as authoritative.
+`sync_batch.v4` adds provider-neutral quota-cycle contributions and makes their
+acknowledgement counts and authoritative snapshot IDs part of the versioned
+contract. Versions 1–3 never treat those new fields as authoritative.
+`sync_batch.v5` adds privacy-safe account-plan observations and aggregate
+evidence-quality summaries, and makes their acknowledgement counts and
+authoritative snapshot IDs part of the versioned contract. Versions 1–4 never
+treat those collections or their snapshot IDs as authoritative. Because a v4
+acknowledgement carries no counter for them, a collector must not place them in
+a v4 batch even though a v4 backend would ignore the unknown keys.
 The collector owns local scanning, normalization, idempotent local storage, and
 privacy scrubbing. The backend owns authentication, validation, deduplication,
 rollups, and user-facing queries. The production path sends sanitized batches to
@@ -86,6 +95,11 @@ The current production sync path strips record-level local evidence before sendi
 - `Subscription.notes`
 - code source text, diffs, file paths, tool arguments, and commit messages
 
+Account-plan sync sends only the canonical account reference, provider, raw and
+display plan names, observation time, explicit provider bounds, evidence kind,
+confidence, and aggregate coverage/conflict counts. Email, provider user ID,
+conversation and turn IDs, artifact paths, tokens, and raw provenance remain local.
+
 Code-change counting uses an explicit source-file extension allowlist.
 Documentation, configuration, manifests, lockfiles, generated output, and
 unknown text formats are excluded. Mutation records that claim a whole-file
@@ -102,9 +116,10 @@ are removed while the retained conversation archive remains available locally.
 Reconciliation is skipped when the archive root itself is unreachable, because
 an unmounted volume or a renamed home directory produces the same empty file
 list as an emptied archive and must not be read as a deletion. Removing a source
-with `--delete-data` drops that source's reconstructed edits and coverage and
-rebuilds the metrics immediately, so the authoritative snapshot retires the
-hosted rows instead of continuing to republish them.
+with `--delete-data` drops that source's reconstructed edits, coverage, identity
+observations, plan observations, and conversation bindings, then rebuilds the
+derived metrics immediately. The next authoritative snapshot therefore retires
+hosted rows instead of continuing to republish deleted source evidence.
 
 An edit is placed in a repository only when its path stays inside that
 repository. A tool call naming an absolute path elsewhere, or escaping the
@@ -245,20 +260,25 @@ hostnames, including `localhost`, are rejected.
 
 The daemon still supports `/v1/sync/batches` for loopback-only diagnostics, but
 rejects batches containing `authoritative_snapshot` because it does not stage
-device ownership or reconcile deletions. `/api/sync/batches` is the production
-contract. A compatible backend should:
+device ownership or reconcile deletions. It rejects batches carrying
+`quota_cycle_contributions` for the same reason: a local store keeps quota
+observations and derives its own cycles from them, so acknowledging another
+device's cycles would tell the sender they had been stored when they had not.
+`/api/sync/batches` is the production contract. A compatible backend should:
 
 - require an authenticated device access token
 - accept `Authorization: Bearer <device_access_token>` from stored auth, `--auth-token`, or `STATSAI_SYNC_TOKEN`
-- validate the request body against `sync_batch.v1`, `sync_batch.v2`, and `sync_batch.v3`
+- validate the request body against `sync_batch.v1` through `sync_batch.v5`
 - reject unsupported `schema_version` values
-- deduplicate sources, accounts, source-account assignments, subscriptions, and summaries by their IDs when server-side deduplication is needed
+- deduplicate sources, accounts, source-account assignments, subscriptions, summaries, and equivalent account-plan evidence when server-side deduplication is needed
 - treat collector IDs as stable client-provided IDs, not database primary keys exposed to users
 - compute daily, monthly, and dashboard rollups server-side from accepted summaries
 - atomically replace accepted task bucket snapshots per `(user, device, project_bucket)`
 - treat the ordered `authoritative_snapshot` fragments sharing one `snapshot_id`
   as the complete set of metadata and summary IDs owned by the authenticated
-  device; v3 fragments also carry code-change metric IDs; each fragment carries
+  device; v3 fragments also carry code-change metric IDs; v4 fragments also
+  carry quota-cycle contribution IDs; v5 fragments also carry account-plan
+  observation and evidence-summary IDs; each fragment carries
   zero-based `part_index` and a common
   `part_count`, with at most 200 IDs across its ID arrays
 - stage snapshot ownership without pruning until the final in-order fragment;
@@ -317,14 +337,72 @@ run immediately.
 `task_verifications` counters under both `accepted` and `duplicates`.
 `sync_batch.v3` returns `sync_ack.v3`, which additionally adds the
 `code_change_metrics` counter.
+`sync_batch.v4` returns `sync_ack.v4`, which additionally adds the
+`quota_cycle_contributions` counter.
+`sync_batch.v5` returns `sync_ack.v5`, which additionally adds the
+`account_plan_observations` and `account_evidence_summaries` counters.
 Collectors require the acknowledgement version to match the submitted batch
 version exactly; a v1 acknowledgement cannot successfully acknowledge a v2
-batch, and a v2 acknowledgement cannot acknowledge a v3 batch.
+batch, a v2 acknowledgement cannot acknowledge a v3 batch, a v3
+acknowledgement cannot acknowledge a v4 batch, and a v4 acknowledgement cannot
+acknowledge a v5 batch.
 
 The current loopback daemon returns this shape and reports duplicate events
 when the existing store already has the semantic event. Source, account,
 source-account assignment, subscription, and summary upserts are currently
-reported as accepted writes.
+reported as accepted writes. Its `quota_cycle_contributions` counter is
+therefore always zero: a batch carrying any is refused outright rather than
+acknowledged, since the daemon has nowhere to store them.
+
+## Evolving the Contract
+
+Two kinds of addition behave very differently, and the difference decides the
+release order.
+
+**A new top-level collection is backward compatible.** Batch collections carry
+`#[serde(default, skip_serializing_if = "Vec::is_empty")]`, and the backend
+reads named fields without a top-level allowlist, so a deployment that predates
+the collection ignores it rather than failing. That is not silent data loss:
+collectors require `accepted + duplicates == submitted` for every collection
+they send, so an endpoint that ignores one reports zero against a non-zero
+submission and the sync fails loudly with a count mismatch. Local sync state
+stays dirty and the records are resent. Adding a collection therefore needs no
+schema-version bump.
+
+**A new field on an existing record is not.** Every synced record is checked
+against a closed set of permitted keys, and an unrecognized key refuses the
+whole batch with `400 invalid_sync_batch`. This is deliberate: an unexpected
+key may carry a path, address, or message that this contract excludes, and the
+refusal guarantees none of it is stored. The consequence is a hard release
+order:
+
+> **Deploy the backend before releasing a collector that adds a record field.**
+> Until it is deployed, upgraded collectors cannot sync anything — not just the
+> affected collection.
+
+To keep the two causes distinguishable, the refusal names the offending field:
+
+```json
+{
+  "error": "invalid_sync_batch",
+  "rejected": [
+    {
+      "kind": "quota_cycle_contributions",
+      "id": "quota_cycle_0f2c…",
+      "reason": "unknown_field:has_schedule_overlap"
+    }
+  ]
+}
+```
+
+Nested records report a dotted path, such as
+`unknown_field:boundary_slices.working_directory`. Only the field name is
+returned; its value is never echoed. Collectors render this as
+`endpoint does not recognize \`<field>\` on <collection>` rather than an opaque
+HTTP error.
+
+Malformed values inside a *known* field remain a plain `400` with no `rejected`
+detail — that is a client defect, not version skew.
 
 ## Local Sync State
 
@@ -337,7 +415,8 @@ metadata.
 
 Full HTTP rollup syncs send their authoritative snapshot as the final logical
 chunk. The marker lists all current source, provider-account,
-source-account-assignment, subscription, summary, and code-change metric IDs,
+source-account-assignment, subscription, summary, code-change metric,
+quota-cycle contribution, account-plan-observation, and evidence-summary IDs,
 including empty lists.
 The backend tracks ownership per authenticated device and keeps device-local IDs
 separate from server-canonical IDs so account alias reconciliation cannot delete
@@ -351,7 +430,7 @@ snapshot are retained through their active ownership mapping; omitted unowned
 rows are pruned. Legacy rows from other devices, and canonical rows still owned
 by any device, are preserved.
 
-The HTTP sink parses `sync_ack.v1`, `sync_ack.v2`, and `sync_ack.v3` before
+The HTTP sink parses `sync_ack.v1` through `sync_ack.v5` before
 updating local state. File and stdout sinks update state after their local write
 succeeds.
 
@@ -386,8 +465,10 @@ Auth token precedence for sync is:
 
 The Worker rejects raw event cloud sync by default and accepts sanitized daily
 summary rollups plus metadata, along with hosted task snapshots and hosted task
-verification actions for `sync_batch.v2` and `sync_batch.v3`, plus code-change
-metrics for `sync_batch.v3`. The collector now prepares those
+verification actions for `sync_batch.v2` and later, plus code-change
+metrics for `sync_batch.v3` and later, plus quota-cycle contributions for
+`sync_batch.v4` and later, plus privacy-safe account-plan evidence for
+`sync_batch.v5`. The collector now prepares those
 daily rollups before HTTP sync, so a normal Cloudflare sync can populate the
 dashboard without shipping raw events. Repeated batches are idempotent by
 stable IDs.
@@ -400,7 +481,8 @@ HTTP chunking is a transport concern and must not change canonical hosted
 state. Account aliases are persisted per user and device in
 `sync_entity_owners`. Every later assignment, subscription, and summary chunk
 resolves its device-local account ID through that mapping, even when the chunk
-contains no account records. When a newly observed alias matches historical
+contains no account records. Account-plan observations and evidence summaries
+use the same mapping. When a newly observed alias matches historical
 rows from that device, the backend repairs their indexed account ID and JSON
 payload in the same D1 transaction. The repair first discovers affected daily
 months and period rows, then rebuilds their monthly rollups and the all-time

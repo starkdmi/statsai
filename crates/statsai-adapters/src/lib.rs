@@ -2,19 +2,28 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use regex::Regex;
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use serde_json::Value;
 use statsai_core::{
-    branch_family, canonical_display, display_path, expand_home_path, extract_issue_keys,
-    hash_text, home_dir, normalize_git_remote, normalize_task_title, path_hash, project_bucket_key,
-    semantic_event_id, summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
+    account_identity_observation_id, account_plan_observation_id, branch_family, canonical_display,
+    conversation_account_binding_id, display_path, expand_home_path, extract_issue_keys, hash_text,
+    home_dir, normalize_email, normalize_git_remote, normalize_plan_name, normalize_task_title,
+    path_hash, project_bucket_key, provider_account_id_from_identity, semantic_event_id,
+    summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
     task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
-    task_title_signal_score, title_topic_tokens, BillingPeriod, Confidence, CostAccumulator,
-    EventId, EventSource, IdentitySource, LatencySource, LocationOrigin, MetricStats, ModelInfo,
-    ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, RuntimeInfo, SessionInfo,
-    SourceKind, SourceLocation, SubscriptionStatus, SummaryMetadata, SummaryMetrics, TaskSpan,
-    UsageCounts, UsageEvent, UsageSummary, TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
+    task_title_signal_score, title_topic_tokens, AccountEvidenceCheckpointV1, AccountEvidenceKind,
+    AccountIdentityObservationV1, AccountPlanObservationV1, Confidence,
+    ConversationAccountBindingV1, CostAccumulator, CostInfo, EventId, EventSource, IdentitySource,
+    LatencySource, LocationOrigin, MetricStats, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode,
+    ProjectInfo, ProviderAccountId, QuotaCreditsV1, QuotaObservationRecordV1, QuotaObservationV1,
+    QuotaStatusV1, QuotaUsageLinkKind, QuotaWindowObservationV1, ReasoningLevel, RuntimeInfo,
+    SessionInfo, SourceKind, SourceLocation, SummaryMetadata, SummaryMetrics, TaskSpan,
+    UsageCounts, UsageEvent, UsageSummary, ACCOUNT_EVIDENCE_CHECKPOINT_SCHEMA_VERSION,
+    ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION, ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION,
+    CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION, QUOTA_OBSERVATION_SCHEMA_VERSION,
+    QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{
@@ -39,10 +48,13 @@ const PROVIDER_RECORD_EVENT_KEY_VERSION: &str = "provider_record_usage_event.v1"
 const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever provider parsing semantics change,
 // so historical sessions get rescanned for runtime, pricing, and project context updates.
-const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v26";
+// session-identity.v28: usage events adopt the session_meta id (the telemetry
+// `conversation.id`) as their session identity; cached files must reparse or
+// conversation-to-account bindings can never reach previously scanned events.
+const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "session-identity.v28";
 const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v23";
 const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
-const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v17";
+const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v20";
 const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -58,7 +70,85 @@ const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 ];
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
+const CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION: &str = "codex-account-evidence.v2";
 pub(crate) const MAX_JSONL_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexTelemetryCursor {
+    maximum_row_id: i64,
+    checkpoint_row_fingerprint: Option<String>,
+    database_size: i64,
+    database_modified_nanos: i64,
+    wal_size: i64,
+    wal_modified_nanos: i64,
+}
+
+fn codex_telemetry_file_state(
+    path: &Path,
+    maximum_row_id: i64,
+    checkpoint_row_fingerprint: Option<String>,
+) -> CodexTelemetryCursor {
+    let metadata = std::fs::metadata(path).ok();
+    let wal_metadata = std::fs::metadata(path.with_extension("sqlite-wal")).ok();
+    let modified_nanos = |metadata: Option<&std::fs::Metadata>| {
+        metadata
+            .and_then(|value| value.modified().ok())
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |value| {
+                i64::try_from(value.as_nanos()).unwrap_or(i64::MAX)
+            })
+    };
+    CodexTelemetryCursor {
+        maximum_row_id,
+        checkpoint_row_fingerprint,
+        database_size: metadata
+            .as_ref()
+            .map_or(0, |value| i64::try_from(value.len()).unwrap_or(i64::MAX)),
+        database_modified_nanos: modified_nanos(metadata.as_ref()),
+        wal_size: wal_metadata
+            .as_ref()
+            .map_or(0, |value| i64::try_from(value.len()).unwrap_or(i64::MAX)),
+        wal_modified_nanos: modified_nanos(wal_metadata.as_ref()),
+    }
+}
+
+fn codex_telemetry_cursor(checkpoint: &AccountEvidenceCheckpointV1) -> CodexTelemetryCursor {
+    CodexTelemetryCursor {
+        maximum_row_id: checkpoint.maximum_row_id,
+        checkpoint_row_fingerprint: checkpoint.checkpoint_row_fingerprint.clone(),
+        database_size: checkpoint.database_size,
+        database_modified_nanos: checkpoint.database_modified_nanos,
+        wal_size: checkpoint.wal_size,
+        wal_modified_nanos: checkpoint.wal_modified_nanos,
+    }
+}
+
+fn codex_telemetry_checkpoint_row_fingerprint(
+    connection: &Connection,
+    row_id: i64,
+) -> Option<String> {
+    if row_id == 0 {
+        return Some(hash_text("codex-telemetry-checkpoint-row.v1:empty"));
+    }
+    let (seconds, nanos, body) = connection
+        .query_row(
+            "SELECT ts, ts_nanos, feedback_log_body FROM logs WHERE id = ?1",
+            [row_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok()?;
+    Some(hash_text(&format!(
+        "codex-telemetry-checkpoint-row.v1:{row_id}:{seconds}:{nanos}:{}",
+        body.as_deref()
+            .map_or_else(|| "none".to_string(), hash_text,)
+    )))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BoundedLineRead {
@@ -196,11 +286,117 @@ pub struct AdapterScan {
     pub events: Vec<UsageEvent>,
     pub summaries: Vec<UsageSummary>,
     pub task_spans: Vec<TaskSpan>,
+    pub quota_observations: Vec<QuotaObservationRecordV1>,
     pub diagnostics: ScanDiagnostics,
     pub verified_source_state: Option<VerifiedSourceState>,
 }
 
-pub trait ProviderAdapter {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedProviderAccount {
+    pub provider_user_id: Option<String>,
+    pub email: Option<String>,
+    pub plan_name: Option<String>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AccountEvidenceScan {
+    pub accounts: Vec<ObservedProviderAccount>,
+    pub identity_observations: Vec<AccountIdentityObservationV1>,
+    pub plan_observations: Vec<AccountPlanObservationV1>,
+    pub conversation_bindings: Vec<ConversationAccountBindingV1>,
+    pub checkpoints: Vec<AccountEvidenceCheckpointV1>,
+}
+
+/// Rewrites collected account references and their account-dependent deterministic IDs.
+///
+/// Callers use this with already-known aliases before Store deduplication, and again after an
+/// identity upsert when a newly discovered identity changes the canonical account reference.
+pub fn remap_account_evidence_account_ids(
+    evidence: &mut AccountEvidenceScan,
+    canonical_ids: &HashMap<ProviderAccountId, ProviderAccountId>,
+) {
+    for observation in &mut evidence.identity_observations {
+        if let Some(canonical_id) = observation
+            .provider_account_id
+            .as_ref()
+            .and_then(|account_id| canonical_ids.get(account_id))
+        {
+            observation.provider_account_id = Some(canonical_id.clone());
+        }
+    }
+    for observation in &mut evidence.plan_observations {
+        if let Some(canonical_id) = observation
+            .provider_account_id
+            .as_ref()
+            .and_then(|account_id| canonical_ids.get(account_id))
+        {
+            observation.provider_account_id = Some(canonical_id.clone());
+            observation.observation_id = account_plan_observation_id(
+                &observation.source_id,
+                Some(canonical_id),
+                &observation.raw_plan_name,
+                observation.observed_at,
+                observation.evidence_kind,
+            );
+        }
+    }
+    for binding in &mut evidence.conversation_bindings {
+        if let Some(canonical_id) = canonical_ids.get(&binding.provider_account_id) {
+            binding.provider_account_id = canonical_id.clone();
+            binding.binding_id = conversation_account_binding_id(
+                &binding.source_id,
+                &binding.conversation_id_hash,
+                binding.turn_id_hash.as_deref(),
+                canonical_id,
+            );
+        }
+    }
+}
+
+/// Drops discovered accounts whose evidence was already filtered out by the Store.
+///
+/// Call this after `Store::retain_unseen_account_evidence` so unrelated usage-file changes do not
+/// refresh an unchanged account and mark it pending for cloud sync again.
+pub fn retain_accounts_referenced_by_account_evidence(
+    provider: &str,
+    canonical_ids: &HashMap<ProviderAccountId, ProviderAccountId>,
+    evidence: &mut AccountEvidenceScan,
+) {
+    let referenced_account_ids = evidence
+        .identity_observations
+        .iter()
+        .filter_map(|observation| observation.provider_account_id.clone())
+        .chain(
+            evidence
+                .plan_observations
+                .iter()
+                .filter_map(|observation| observation.provider_account_id.clone()),
+        )
+        .chain(
+            evidence
+                .conversation_bindings
+                .iter()
+                .map(|binding| binding.provider_account_id.clone()),
+        )
+        .collect::<HashSet<_>>();
+    evidence.accounts.retain(|observed| {
+        provider_account_id_from_identity(
+            provider,
+            observed.provider_user_id.as_deref(),
+            observed.email.as_deref(),
+        )
+        .map(|account_id| {
+            canonical_ids
+                .get(&account_id)
+                .cloned()
+                .unwrap_or(account_id)
+        })
+        .is_some_and(|account_id| referenced_account_ids.contains(&account_id))
+    });
+}
+
+pub trait ProviderAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn version(&self) -> &'static str;
     fn provider(&self) -> &'static str;
@@ -233,6 +429,13 @@ pub trait ProviderAdapter {
         _changed: &[PathBuf],
     ) -> bool {
         false
+    }
+    fn collect_account_evidence(
+        &self,
+        _source: &SourceLocation,
+        _checkpoints: &[AccountEvidenceCheckpointV1],
+    ) -> Result<AccountEvidenceScan> {
+        Ok(AccountEvidenceScan::default())
     }
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan>;
 
@@ -394,6 +597,17 @@ impl ProviderAdapter for CodexAdapter {
             .map(Box::new)
             .map(VerifiedSourceObservation::Verified)
             .unwrap_or(VerifiedSourceObservation::Unavailable))
+    }
+
+    fn collect_account_evidence(
+        &self,
+        source: &SourceLocation,
+        checkpoints: &[AccountEvidenceCheckpointV1],
+    ) -> Result<AccountEvidenceScan> {
+        let Some(root) = source_root_path(source) else {
+            return Ok(AccountEvidenceScan::default());
+        };
+        collect_codex_account_evidence(source, &codex_source_root(&root), checkpoints)
     }
 
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
@@ -2591,8 +2805,14 @@ fn parse_codex_file(
     let mut current_project: Option<ProjectInfo> = None;
     let mut current_title: Option<String> = None;
     let mut current_thread_id: Option<String> = None;
-    let session_raw = codex_session_id(usage_root, path);
+    // Seeded from the file path, replaced by the session's own id as soon as
+    // the `session_meta` line declares one. The embedded id is the same UUID
+    // Codex reports as `conversation.id` in telemetry, and conversation-to-
+    // account bindings hash that UUID — a path-derived identity can never meet
+    // them, which left every binding unable to attribute a single event.
+    let mut session_raw = codex_session_id(usage_root, path);
     let mut records = Vec::new();
+    let mut quota_observation_indices = HashMap::new();
     let mut project_cache = ProjectContextCache::new();
     let mut line_bytes = Vec::new();
     let mut index = 0usize;
@@ -2619,7 +2839,7 @@ fn parse_codex_file(
         }
         ctx.scan.diagnostics.raw_rows += 1;
         let line_kind = codex_line_kind(line);
-        if line_kind == CodexLineKind::Irrelevant {
+        if line_kind == CodexLineKind::Irrelevant && !is_codex_quota_line_structurally(line) {
             continue;
         }
         if line_kind == CodexLineKind::ResponseItemMessage {
@@ -2831,11 +3051,15 @@ fn parse_codex_file(
         };
 
         if is_codex_session_meta(&value) {
+            let declared_session_id = value
+                .pointer("/payload/id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if let Some(declared_session_id) = declared_session_id.clone() {
+                session_raw = declared_session_id;
+            }
             if collect_tasks {
-                current_thread_id = value
-                    .pointer("/payload/id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
+                current_thread_id = declared_session_id;
                 let session_id = current_thread_id
                     .clone()
                     .or_else(|| Some(session_raw.clone()));
@@ -2918,12 +3142,24 @@ fn parse_codex_file(
         } else {
             codex_headless_usage_value(&value).map(codex_usage_counts_from_value)
         };
+        let quota_usage_sample = usage.clone();
 
         let (timestamp, timestamp_inferred) = timestamp_from_nested_value(&value)
             .map(|timestamp| (timestamp, false))
             .unwrap_or((fallback_timestamp, true));
         if timestamp_inferred {
             ctx.scan.diagnostics.timestamp_fallbacks += 1;
+        }
+        if let Some(quota) = codex_quota_observation(
+            ctx.source,
+            path,
+            index,
+            timestamp,
+            quota_usage_sample,
+            &value,
+        ) {
+            quota_observation_indices.insert(index, ctx.scan.quota_observations.len());
+            ctx.scan.quota_observations.push(quota);
         }
 
         let explicit_model =
@@ -3131,8 +3367,8 @@ fn parse_codex_file(
             let Some(usage) = usage else {
                 continue;
             };
-            for line_number in turn.usage_lines {
-                consumed_usage_lines.insert(line_number);
+            for line_number in &turn.usage_lines {
+                consumed_usage_lines.insert(*line_number);
             }
             if record.usage.is_some() {
                 consumed_usage_lines.insert(record.line_number);
@@ -3183,6 +3419,17 @@ fn parse_codex_file(
                     deduplication: EventDeduplication::PathIndependent,
                     dedupe_salt: None,
                 },
+            );
+            let mut linked_quota_lines = turn.usage_lines.clone();
+            if record.usage.is_some() {
+                linked_quota_lines.push(record.line_number);
+            }
+            link_quota_observations(
+                ctx.scan,
+                &quota_observation_indices,
+                &linked_quota_lines,
+                &event.event_id,
+                QuotaUsageLinkKind::TurnEvent,
             );
             let task_span = if ctx.options.should_collect_tasks() {
                 let event_id = event.event_id.clone();
@@ -3402,10 +3649,287 @@ fn parse_codex_file(
                 dedupe_salt: None,
             },
         );
+        link_quota_observations(
+            ctx.scan,
+            &quota_observation_indices,
+            &[record.line_number],
+            &event.event_id,
+            QuotaUsageLinkKind::RecordEvent,
+        );
         push_deduped(ctx.scan, ctx.seen, event);
     }
 
     Ok(())
+}
+
+fn link_quota_observations(
+    scan: &mut AdapterScan,
+    quota_observation_indices: &HashMap<usize, usize>,
+    line_numbers: &[usize],
+    event_id: &EventId,
+    link_kind: QuotaUsageLinkKind,
+) {
+    if line_numbers.is_empty() {
+        return;
+    }
+    for line_number in line_numbers {
+        let Some(record) = quota_observation_indices
+            .get(line_number)
+            .and_then(|index| scan.quota_observations.get_mut(*index))
+        else {
+            continue;
+        };
+        if record
+            .observation
+            .usage_sample
+            .as_ref()
+            .is_some_and(|usage| usage.computed_total() > 0)
+        {
+            record.observation.usage_event_id = Some(event_id.clone());
+            record.observation.usage_link_kind = link_kind;
+        }
+    }
+}
+
+pub(crate) fn codex_quota_observation(
+    source: &SourceLocation,
+    path: &Path,
+    line_number: usize,
+    observed_at: DateTime<Utc>,
+    usage_sample: Option<UsageCounts>,
+    value: &Value,
+) -> Option<QuotaObservationRecordV1> {
+    if !is_codex_token_count(value) {
+        return None;
+    }
+    let rate_limits = value.pointer("/payload/rate_limits")?.as_object()?;
+    let raw_rate_limits = Value::Object(rate_limits.clone());
+    let raw_json = serde_json::to_string(&raw_rate_limits).ok()?;
+    let payload_hash = hash_text(&raw_json);
+    let source_file_path_hash = hash_text(&canonical_display(path));
+    let source_record_id = format!("quota:{source_file_path_hash}:{line_number}");
+    let observation_id = format!(
+        "quota_observation_{}",
+        &hash_text(&format!("{}:{source_record_id}", source.source_id.0))[..32]
+    );
+    let semantic_fingerprint = hash_text(&format!(
+        "quota_semantic.v1:{}:{}:{payload_hash}",
+        source.provider,
+        observed_at.to_rfc3339()
+    ));
+    let global_limit_id = quota_string_at_any(
+        &raw_rate_limits,
+        &["limit_id", "limitId", "limit_name", "limitName", "id"],
+    );
+    let mut windows = Vec::new();
+    for (slot, candidate) in rate_limits {
+        let Some(candidate) = candidate.as_object() else {
+            continue;
+        };
+        let Some(window_minutes) = quota_u64_at_any(
+            candidate,
+            &["window_minutes", "windowMinutes", "duration_minutes"],
+        ) else {
+            continue;
+        };
+        let Some(used_percent) = quota_f64_at_any(
+            candidate,
+            &["used_percent", "usedPercent", "percentage", "percent_used"],
+        ) else {
+            continue;
+        };
+        let Some(resets_at_epoch_seconds) =
+            quota_i64_at_any(candidate, &["resets_at", "resetsAt", "reset_at", "resetAt"])
+        else {
+            continue;
+        };
+        let Some(resets_at) = Utc.timestamp_opt(resets_at_epoch_seconds, 0).single() else {
+            continue;
+        };
+        let limit_id = quota_string_at_any_from_map(
+            candidate,
+            &["limit_id", "limitId", "limit_name", "limitName", "id"],
+        )
+        .or_else(|| global_limit_id.clone());
+        let window_observation_id = format!(
+            "quota_window_observation_{}",
+            &hash_text(&format!("{observation_id}:{slot}"))[..32]
+        );
+        windows.push(QuotaWindowObservationV1 {
+            schema_version: QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION.to_string(),
+            window_observation_id,
+            observation_id: observation_id.clone(),
+            provider_slot: slot.clone(),
+            limit_id,
+            window_minutes,
+            used_percent,
+            resets_at,
+            resets_at_epoch_seconds,
+        });
+    }
+
+    let credits_value = rate_limits.get("credits").and_then(Value::as_object);
+    let balance_raw = credits_value
+        .and_then(|credits| credits.get("balance"))
+        .cloned();
+    let balance = balance_raw.as_ref().and_then(normalize_quota_decimal);
+    let status = QuotaStatusV1 {
+        plan_type: quota_string_at_any(
+            &raw_rate_limits,
+            &["plan_type", "planType", "plan", "subscription_type"],
+        ),
+        individual_limit: rate_limits
+            .get("individual_limit")
+            .or_else(|| rate_limits.get("individualLimit"))
+            .cloned(),
+        spend_control_state: quota_string_at_any(
+            &raw_rate_limits,
+            &["spend_control_state", "spendControlState"],
+        )
+        .or_else(|| {
+            raw_rate_limits
+                .pointer("/spend_control/state")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        }),
+        reached_type: quota_string_at_any(
+            &raw_rate_limits,
+            &["reached_type", "reachedType", "limit_reached_type"],
+        ),
+        credits: QuotaCreditsV1 {
+            has_credits: credits_value
+                .and_then(|credits| credits.get("has_credits"))
+                .and_then(Value::as_bool),
+            unlimited: credits_value
+                .and_then(|credits| credits.get("unlimited"))
+                .and_then(Value::as_bool),
+            balance,
+            balance_raw,
+        },
+    };
+    Some(QuotaObservationRecordV1 {
+        observation: QuotaObservationV1 {
+            schema_version: QUOTA_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id,
+            semantic_fingerprint,
+            provider: source.provider.clone(),
+            source_id: source.source_id.clone(),
+            provider_account_id: None,
+            observed_at,
+            source_file_path_hash,
+            source_record_id,
+            source_line_number: line_number as u64,
+            payload_hash,
+            usage_sample,
+            usage_event_id: None,
+            usage_link_kind: QuotaUsageLinkKind::None,
+            status,
+        },
+        windows,
+        raw_rate_limits,
+    })
+}
+
+fn quota_string_at_any(value: &Value, keys: &[&str]) -> Option<String> {
+    value
+        .as_object()
+        .and_then(|map| quota_string_at_any_from_map(map, keys))
+}
+
+fn quota_string_at_any_from_map(
+    map: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn quota_u64_at_any(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(Value::as_u64)
+}
+
+fn quota_i64_at_any(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(Value::as_i64)
+}
+
+fn quota_f64_at_any(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(Value::as_f64)
+        .filter(|value| value.is_finite())
+}
+
+fn normalize_quota_decimal(value: &Value) -> Option<String> {
+    let text: Cow<'_, str> = match value {
+        Value::String(value) => Cow::Borrowed(value.trim()),
+        Value::Number(value) => Cow::Owned(value.to_string()),
+        Value::Null => return None,
+        _ => return None,
+    };
+    if text.is_empty() || text.len() > 4_096 {
+        return None;
+    }
+    let (negative, unsigned) = text
+        .strip_prefix('-')
+        .map_or((false, text.as_ref()), |value| (true, value));
+    let (mantissa, exponent) =
+        unsigned
+            .split_once(['e', 'E'])
+            .map_or((unsigned, 0i32), |(mantissa, exponent)| {
+                exponent
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|value| value.unsigned_abs() <= 4_096)
+                    .map(|exponent| (mantissa, exponent))
+                    .unwrap_or(("", 0))
+            });
+    if mantissa.is_empty() {
+        return None;
+    }
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{whole}{fraction}");
+    let decimal_position = i64::try_from(whole.len()).ok()? + i64::from(exponent);
+    let expanded = if decimal_position <= 0 {
+        let zeroes = usize::try_from(-decimal_position).ok()?;
+        format!("0.{}{}", "0".repeat(zeroes), digits)
+    } else if decimal_position >= i64::try_from(digits.len()).ok()? {
+        let zeroes = usize::try_from(decimal_position)
+            .ok()?
+            .saturating_sub(digits.len());
+        format!("{digits}{}", "0".repeat(zeroes))
+    } else {
+        let position = usize::try_from(decimal_position).ok()?;
+        format!("{}.{}", &digits[..position], &digits[position..])
+    };
+    let (whole, fraction) = expanded
+        .split_once('.')
+        .map_or((expanded.as_str(), ""), |parts| parts);
+    let whole = whole.trim_start_matches('0');
+    let fraction = fraction.trim_end_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let mut normalized = if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    };
+    if negative && normalized != "0" {
+        normalized.insert(0, '-');
+    }
+    Some(normalized)
 }
 
 #[derive(Debug, Clone)]
@@ -3542,6 +4066,9 @@ fn merge_adapter_scan(
     }
     target.summaries.append(&mut source.summaries);
     target.task_spans.append(&mut source.task_spans);
+    target
+        .quota_observations
+        .append(&mut source.quota_observations);
     target.diagnostics.files_scanned = target
         .diagnostics
         .files_scanned
@@ -3894,6 +4421,20 @@ struct GrokSessionStats {
     max_total_tokens: Option<u64>,
     max_tokens_used: Option<u64>,
     max_tokens_after: Option<u64>,
+    prompt_models: Vec<GrokModelObservation>,
+    turn_models: Vec<GrokModelObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrokModelObservation {
+    model_id: String,
+    observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct GrokInferenceSample {
+    usage: UsageCounts,
+    observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3905,6 +4446,7 @@ struct GrokInferenceStats {
     reasoning_tokens: u64,
     model_elapsed_ms: Vec<u64>,
     time_to_first_token_ms: Vec<u64>,
+    request_samples: Vec<GrokInferenceSample>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3941,6 +4483,27 @@ impl GrokInferenceStats {
             reasoning_tokens: nonzero_u64(self.reasoning_tokens),
             total_tokens: None,
             requests: nonzero_u64(self.rows),
+            local_prompt_eval_tokens: None,
+            local_eval_tokens: None,
+        }
+    }
+
+    fn request_sample_usage(
+        input_tokens: u64,
+        cache_read_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    ) -> UsageCounts {
+        UsageCounts {
+            input_tokens: nonzero_u64(input_tokens),
+            output_tokens: nonzero_u64(output_tokens),
+            cache_creation_tokens: None,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
+            cache_read_tokens: nonzero_u64(cache_read_tokens),
+            reasoning_tokens: nonzero_u64(reasoning_tokens),
+            total_tokens: None,
+            requests: Some(1),
             local_prompt_eval_tokens: None,
             local_eval_tokens: None,
         }
@@ -3993,7 +4556,7 @@ fn grok_session_stats(session_dir: &Path, invalid_rows: &mut u64) -> Result<Grok
         invalid_rows,
     )?;
     parse_grok_updates(&session_dir.join("updates.jsonl"), &mut stats, invalid_rows)?;
-    stats.events_rows = count_jsonl_records(&session_dir.join("events.jsonl"), invalid_rows)?;
+    parse_grok_events(&session_dir.join("events.jsonl"), &mut stats, invalid_rows)?;
     Ok(stats)
 }
 
@@ -4034,13 +4597,21 @@ fn parse_grok_unified_log_with_invalid_rows(root: &Path) -> Result<(GrokUnifiedL
             .session_stats
             .entry(session_id.to_string())
             .or_default();
+        let input_tokens = prompt_tokens.saturating_sub(cached_prompt_tokens);
         stats.rows += 1;
-        stats.input_tokens = stats
-            .input_tokens
-            .saturating_add(prompt_tokens.saturating_sub(cached_prompt_tokens));
+        stats.input_tokens = stats.input_tokens.saturating_add(input_tokens);
         stats.cache_read_tokens = stats.cache_read_tokens.saturating_add(cached_prompt_tokens);
         stats.output_tokens = stats.output_tokens.saturating_add(completion_tokens);
         stats.reasoning_tokens = stats.reasoning_tokens.saturating_add(reasoning_tokens);
+        stats.request_samples.push(GrokInferenceSample {
+            usage: GrokInferenceStats::request_sample_usage(
+                input_tokens,
+                cached_prompt_tokens,
+                completion_tokens,
+                reasoning_tokens,
+            ),
+            observed_at: value.get("ts").and_then(timestamp_from_scalar),
+        });
         if let Some(value) = ctx.get("model_elapsed_ms").and_then(value_as_u64) {
             stats.model_elapsed_ms.push(value);
         }
@@ -4104,6 +4675,9 @@ fn parse_grok_updates(
                 .and_modify(|current| *current = (*current).max(tokens))
                 .or_insert(tokens);
         }
+        if let Some(observation) = grok_prompt_model_observation(value) {
+            stats.prompt_models.push(observation);
+        }
         update_max(
             &mut stats.max_tokens_used,
             value.pointer("/params/update/tokens_used"),
@@ -4123,10 +4697,178 @@ fn parse_grok_updates(
     Ok(())
 }
 
-fn count_jsonl_records(path: &Path, invalid_rows: &mut u64) -> Result<u64> {
-    let parse_stats = for_grok_jsonl_value(path, |_| Ok(()))?;
-    *invalid_rows += parse_stats.invalid_rows;
-    Ok(parse_stats.rows)
+fn parse_grok_events(
+    path: &Path,
+    stats: &mut GrokSessionStats,
+    invalid_rows: &mut u64,
+) -> Result<()> {
+    *invalid_rows += for_grok_jsonl_value(path, |value| {
+        stats.events_rows += 1;
+        if value.get("type").and_then(Value::as_str) == Some("turn_started") {
+            if let Some(observation) = grok_turn_model_observation(value) {
+                stats.turn_models.push(observation);
+            }
+        }
+        Ok(())
+    })?
+    .invalid_rows;
+    Ok(())
+}
+
+fn grok_prompt_model_observation(value: &Value) -> Option<GrokModelObservation> {
+    let meta = value.pointer("/params/update/_meta")?;
+    // User-prompt rows carry both modelId and promptIndex. Later stream/tool
+    // chunks share promptId but omit modelId, so only this pair is a stable
+    // per-prompt identity.
+    let model_id = grok_nonempty_model_id(meta.get("modelId"))?;
+    meta.get("promptIndex").and_then(value_as_u64)?;
+    Some(GrokModelObservation {
+        model_id,
+        observed_at: grok_update_timestamp(value),
+    })
+}
+
+fn grok_turn_model_observation(value: &Value) -> Option<GrokModelObservation> {
+    Some(GrokModelObservation {
+        model_id: grok_nonempty_model_id(value.get("model_id"))?,
+        observed_at: value.get("ts").and_then(timestamp_from_scalar),
+    })
+}
+
+fn grok_update_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    value
+        .pointer("/params/_meta/agentTimestampMs")
+        .and_then(timestamp_from_scalar)
+        .or_else(|| value.get("timestamp").and_then(timestamp_from_scalar))
+}
+
+fn grok_nonempty_model_id(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn grok_signals_models_used(signals: Option<&Value>) -> Vec<String> {
+    signals
+        .and_then(|signals| signals.get("modelsUsed"))
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|value| grok_nonempty_model_id(Some(value)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn grok_normalized_model_id(model_id: &str) -> String {
+    normalize_model_name(model_id)
+}
+
+fn grok_models_equivalent(left: &str, right: &str) -> bool {
+    grok_normalized_model_id(left) == grok_normalized_model_id(right)
+}
+
+fn unique_grok_normalized_models<'a>(ids: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    ids.into_iter()
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+        .map(grok_normalized_model_id)
+        .collect()
+}
+
+fn grok_current_model_id(model: Option<&ModelInfo>) -> Option<&str> {
+    model.and_then(|model| {
+        model
+            .name
+            .as_deref()
+            .or(model.provider_model_id.as_deref())
+            .map(str::trim)
+            .filter(|model_id| !model_id.is_empty())
+    })
+}
+
+fn last_grok_model_at_or_before(
+    observations: &[GrokModelObservation],
+    at: DateTime<Utc>,
+) -> Option<&str> {
+    observations
+        .iter()
+        .enumerate()
+        .filter(|(_, observation)| {
+            observation
+                .observed_at
+                .is_some_and(|observed_at| observed_at <= at)
+        })
+        .max_by_key(|(index, observation)| (observation.observed_at, *index))
+        .map(|(_, observation)| observation.model_id.as_str())
+}
+
+fn resolve_grok_inference_sample_model(
+    sample: &GrokInferenceSample,
+    prompt_models: &[GrokModelObservation],
+    turn_models: &[GrokModelObservation],
+    session_models_used: &[String],
+    current_model: Option<&ModelInfo>,
+) -> Option<ModelInfo> {
+    let assignable_ids = prompt_models
+        .iter()
+        .map(|observation| observation.model_id.as_str())
+        .chain(
+            turn_models
+                .iter()
+                .map(|observation| observation.model_id.as_str()),
+        );
+    let assignable = unique_grok_normalized_models(assignable_ids);
+    if assignable.len() == 1 {
+        let models_used =
+            unique_grok_normalized_models(session_models_used.iter().map(String::as_str));
+        // A lone prompt/turn observation cannot cover every inference when
+        // modelsUsed reports another model: request-level attribution is
+        // incomplete, so do not silently price the missing model as this one.
+        if !models_used.is_empty() && models_used != assignable {
+            return None;
+        }
+        let model_id = prompt_models
+            .iter()
+            .map(|observation| observation.model_id.as_str())
+            .chain(
+                turn_models
+                    .iter()
+                    .map(|observation| observation.model_id.as_str()),
+            )
+            .next()?;
+        return Some(model_info(model_id));
+    }
+    if assignable.len() >= 2 {
+        let observed_at = sample.observed_at?;
+        let from_prompt = last_grok_model_at_or_before(prompt_models, observed_at);
+        let from_turn = last_grok_model_at_or_before(turn_models, observed_at);
+        return match (from_prompt, from_turn) {
+            (Some(prompt), Some(turn)) if grok_models_equivalent(prompt, turn) => {
+                Some(model_info(prompt))
+            }
+            (Some(_prompt), Some(_turn)) => None,
+            (Some(prompt), None) => Some(model_info(prompt)),
+            (None, Some(turn)) => Some(model_info(turn)),
+            (None, None) => None,
+        };
+    }
+
+    let session_ids = session_models_used
+        .iter()
+        .map(String::as_str)
+        .chain(grok_current_model_id(current_model));
+    if unique_grok_normalized_models(session_ids).len() == 1 {
+        return current_model.cloned().or_else(|| {
+            session_models_used
+                .first()
+                .map(|model_id| model_info(model_id))
+        });
+    }
+    None
 }
 
 fn for_grok_jsonl_record(
@@ -4214,6 +4956,57 @@ fn update_max(target: &mut Option<u64>, value: Option<&Value>) {
     }
 }
 
+fn estimate_grok_inference_sample_costs(
+    provider: &str,
+    current_model: Option<&ModelInfo>,
+    samples: &[GrokInferenceSample],
+    prompt_models: &[GrokModelObservation],
+    turn_models: &[GrokModelObservation],
+    session_models_used: &[String],
+    fallback_observed_at: &DateTime<Utc>,
+) -> CostInfo {
+    if samples.is_empty() {
+        return unknown_cost();
+    }
+    let mut total = CostAccumulator::default();
+    let mut representative = None;
+    let mut pricing_sources = HashSet::new();
+    for sample in samples {
+        let Some(model) = resolve_grok_inference_sample_model(
+            sample,
+            prompt_models,
+            turn_models,
+            session_models_used,
+            current_model,
+        ) else {
+            return unknown_cost();
+        };
+        let occurred_at = sample.observed_at.as_ref().unwrap_or(fallback_observed_at);
+        let cost = estimate_cost_at(provider, Some(&model), &sample.usage, occurred_at);
+        if cost.estimated_micro_usd().is_none() {
+            return unknown_cost();
+        }
+        if let Some(source) = &cost.pricing_source {
+            pricing_sources.insert(source.clone());
+        }
+        if representative.is_none() {
+            representative = Some(cost.clone());
+        }
+        total.add_estimated(&cost);
+    }
+    let Some(mut cost) = representative else {
+        return unknown_cost();
+    };
+    let Some(micro_usd) = total.micro_usd() else {
+        return unknown_cost();
+    };
+    cost.set_estimated_micro_usd(micro_usd);
+    if pricing_sources.len() > 1 {
+        cost.pricing_source = Some("xai_api_pricing:mixed".to_string());
+    }
+    cost
+}
+
 fn parse_grok_summary(
     adapter: &GrokBuildAdapter,
     source: &SourceLocation,
@@ -4248,6 +5041,7 @@ fn parse_grok_summary(
         .cloned()
         .unwrap_or_default();
     let signal_value = signals.as_ref().map(|(_, signals)| signals);
+    let session_models_used = grok_signals_models_used(signal_value);
     let total_messages = value
         .get("num_messages")
         .and_then(value_as_u64)
@@ -4371,12 +5165,34 @@ fn parse_grok_summary(
         },
     );
     summary.usage = usage;
-    summary.cost = estimate_cost_at(
-        adapter.provider(),
-        summary.model.as_ref(),
-        &summary.usage,
-        &summary.observed_at,
-    );
+    summary.cost = if inference_stats.has_usage() && !inference_stats.request_samples.is_empty() {
+        estimate_grok_inference_sample_costs(
+            adapter.provider(),
+            summary.model.as_ref(),
+            &inference_stats.request_samples,
+            &stats.prompt_models,
+            &stats.turn_models,
+            &session_models_used,
+            &summary.observed_at,
+        )
+    } else if unique_grok_normalized_models(
+        session_models_used
+            .iter()
+            .map(String::as_str)
+            .chain(grok_current_model_id(summary.model.as_ref())),
+    )
+    .len()
+        > 1
+    {
+        unknown_cost()
+    } else {
+        estimate_cost_at(
+            adapter.provider(),
+            summary.model.as_ref(),
+            &summary.usage,
+            &summary.observed_at,
+        )
+    };
     if summary.cost.estimated_api_equivalent_usd.is_some() {
         if inference_stats.has_usage() {
             summary.cost.confidence = Confidence::Medium;
@@ -4938,6 +5754,14 @@ fn open_sqlite_readonly(path: &Path) -> Result<Connection> {
     .with_context(|| format!("open sqlite {}", path.display()))
 }
 
+fn sqlite_table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
 fn sqlite_column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = statement.query([])?;
@@ -5281,6 +6105,38 @@ enum CodexLineKind {
     TaskStarted,
     TaskComplete,
     HeadlessUsage,
+}
+
+#[derive(Deserialize)]
+struct CodexQuotaLineProbe {
+    #[serde(rename = "type")]
+    line_type: Option<String>,
+    payload: Option<CodexQuotaPayloadProbe>,
+}
+
+#[derive(Deserialize)]
+struct CodexQuotaPayloadProbe {
+    #[serde(rename = "type")]
+    payload_type: Option<String>,
+    rate_limits: Option<serde::de::IgnoredAny>,
+}
+
+fn is_codex_quota_line_structurally(line: &str) -> bool {
+    if !line.contains("\"event_msg\"")
+        || !line.contains("\"token_count\"")
+        || !line.contains("\"rate_limits\"")
+    {
+        return false;
+    }
+    serde_json::from_str::<CodexQuotaLineProbe>(line)
+        .ok()
+        .is_some_and(|probe| {
+            probe.line_type.as_deref() == Some("event_msg")
+                && probe.payload.is_some_and(|payload| {
+                    payload.payload_type.as_deref() == Some("token_count")
+                        && payload.rate_limits.is_some()
+                })
+        })
 }
 
 fn codex_line_header(line: &str) -> &str {
@@ -6999,9 +7855,20 @@ fn claude_profile_timestamp(value: &Value) -> Option<DateTime<Utc>> {
     }
 }
 
-fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
-    let auth_path = root.join("auth.json");
-    let value = std::fs::read_to_string(&auth_path).ok()?;
+#[derive(Debug)]
+struct CodexAuthClaims {
+    provider_user_id: Option<String>,
+    email: Option<String>,
+    plan_type: Option<String>,
+    auth_mode: Option<String>,
+    authenticated_at: Option<DateTime<Utc>>,
+    subscription_checked_at: Option<DateTime<Utc>>,
+    active_from: Option<DateTime<Utc>>,
+    active_until: Option<DateTime<Utc>>,
+}
+
+fn codex_auth_claims(auth_path: &Path) -> Option<CodexAuthClaims> {
+    let value = std::fs::read_to_string(auth_path).ok()?;
     let value: Value = serde_json::from_str(&value).ok()?;
     let payload = string_at_any(
         &value,
@@ -7043,37 +7910,817 @@ fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
     }
 
     let plan_type = auth.and_then(|auth| string_at_any(auth, &["chatgpt_plan_type"]));
-    let plan_name = plan_type.as_deref().map(display_codex_plan_name);
+    let auth_mode = string_at_any(&value, &["auth_mode", "authMode"]);
     let authenticated_at = payload
         .as_ref()
         .and_then(|payload| timestamp_at_any(payload, &["auth_time", "iat"]))
-        .or_else(|| file_modified_at(&auth_path));
+        .or_else(|| file_modified_at(auth_path));
     // An auth-file mtime or a fresh ID token proves a refreshed local session, not
     // that the embedded subscription claims were refreshed at the same time.
     let subscription_checked_at =
         auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_last_checked"]));
-    let verified_at = subscription_checked_at.or(authenticated_at);
-    let paid_at =
+    let active_from =
         auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_active_start"]));
-    let current_period_ends_at =
+    let active_until =
         auth.and_then(|auth| timestamp_at_any(auth, &["chatgpt_subscription_active_until"]));
-    let subscription = plan_type.as_deref().and_then(|plan_type| {
-        codex_verified_subscription(
-            plan_type,
-            paid_at,
-            current_period_ends_at,
-            subscription_checked_at,
-        )
-    });
-
-    Some(VerifiedSourceState {
+    Some(CodexAuthClaims {
         provider_user_id,
         email,
+        plan_type,
+        auth_mode,
+        authenticated_at,
+        subscription_checked_at,
+        active_from,
+        active_until,
+    })
+}
+
+fn collect_codex_account_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    checkpoints: &[AccountEvidenceCheckpointV1],
+) -> Result<AccountEvidenceScan> {
+    let mut scan = AccountEvidenceScan::default();
+    collect_codex_auth_evidence(source, root, &mut scan);
+    collect_codex_telemetry_evidence(source, root, checkpoints, &mut scan)?;
+    collect_codex_reset_history_evidence(source, root, &mut scan);
+    collect_codex_login_evidence(source, root, &mut scan)?;
+    dedupe_codex_account_evidence(&mut scan);
+    Ok(scan)
+}
+
+fn collect_codex_auth_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    scan: &mut AccountEvidenceScan,
+) {
+    push_codex_auth_snapshot(source, &root.join("auth.json"), true, scan);
+    // Multi-account setups keep the other logins next to the live one as
+    // `auth-<label>.json` and switch by swapping files. Each is a genuine auth
+    // artifact for a real past login, so it is read as a historical snapshot:
+    // it proves the source was that account when the file was written, but it
+    // is never current and its plan claims are dated, not live.
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut variant_paths = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("auth-") && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    variant_paths.sort();
+    for variant_path in variant_paths {
+        push_codex_auth_snapshot(source, &variant_path, false, scan);
+    }
+}
+
+fn push_codex_auth_snapshot(
+    source: &SourceLocation,
+    auth_path: &Path,
+    is_current: bool,
+    scan: &mut AccountEvidenceScan,
+) {
+    let Some(claims) = codex_auth_claims(auth_path) else {
+        return;
+    };
+    // A historical file with no derivable timestamp would have to be dated
+    // "now", which would assert a login that is not happening. Skip it.
+    if !is_current && claims.authenticated_at.is_none() {
+        return;
+    }
+    // Two different facts live in one file and they are not observed together.
+    // `chatgpt_subscription_last_checked` moves when the plan claims are
+    // revalidated, which can be long before the current login: signing out of
+    // A and into B rewrites the account without refreshing it. Dating the
+    // identity by that stale stamp said "this source was B" at a moment it was
+    // still A, and `ends_source_attribution` turns an AuthSnapshot into a
+    // source-wide boundary, so A's interval was truncated back to the last
+    // subscription check and every event in between lost its account.
+    let authenticated_at = claims.authenticated_at.unwrap_or_else(Utc::now);
+    let plan_observed_at = claims
+        .subscription_checked_at
+        .or(claims.authenticated_at)
+        .unwrap_or(authenticated_at);
+    let observed_at = authenticated_at;
+    let provider_account_id = provider_account_id_from_identity(
+        CODEX_PROVIDER,
+        claims.provider_user_id.as_deref(),
+        claims.email.as_deref(),
+    );
+    let artifact_path_hash = hash_text(&canonical_display(auth_path));
+    // The current file keeps its v1 fingerprint so re-scans stay idempotent;
+    // variants add their path, since two of them can carry identical claims.
+    let fingerprint_scope = if is_current {
+        String::new()
+    } else {
+        format!("{artifact_path_hash}:")
+    };
+    // A historical variant proves a real past login and its plan claims, but
+    // nothing can ever reopen an interval it would close: `ends_source_attribution`
+    // demands a kind that can also restart attribution, and a swapped-out auth
+    // file never becomes current again. Recording it as an AuthSnapshot made it
+    // a source-wide boundary that left every later event permanently
+    // unattributed, so it is recorded as the login it evidences instead.
+    let identity_kind = if is_current {
+        AccountEvidenceKind::AuthSnapshot
+    } else {
+        AccountEvidenceKind::LoginSuccess
+    };
+    let record_fingerprint = hash_text(&format!(
+        "codex-auth-evidence.v1:{fingerprint_scope}{}:{}:{}:{}:{}:{}",
+        claims.provider_user_id.as_deref().unwrap_or("none"),
+        claims.email.as_deref().unwrap_or("none"),
+        claims.plan_type.as_deref().unwrap_or("none"),
+        claims.auth_mode.as_deref().unwrap_or("none"),
+        claims
+            .active_from
+            .map_or_else(|| "none".to_string(), |value| value.to_rfc3339()),
+        claims
+            .active_until
+            .map_or_else(|| "none".to_string(), |value| value.to_rfc3339()),
+    ));
+    scan.accounts.push(ObservedProviderAccount {
+        provider_user_id: claims.provider_user_id.clone(),
+        email: claims.email.clone(),
+        plan_name: claims.plan_type.as_deref().map(normalize_plan_name),
+        observed_at,
+    });
+    scan.identity_observations
+        .push(AccountIdentityObservationV1 {
+            schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: account_identity_observation_id(
+                &source.source_id,
+                identity_kind,
+                observed_at,
+                &record_fingerprint,
+            ),
+            provider: CODEX_PROVIDER.to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: provider_account_id.clone(),
+            provider_user_id_hash: claims.provider_user_id.as_deref().map(hash_text),
+            email_hash: claims
+                .email
+                .as_deref()
+                .map(normalize_email)
+                .as_deref()
+                .map(hash_text),
+            conversation_id_hash: None,
+            turn_id_hash: None,
+            observed_at,
+            evidence_kind: identity_kind,
+            confidence: Confidence::High,
+            auth_mode: claims.auth_mode.clone(),
+            application_version: None,
+            parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+            artifact_kind: "auth_json".to_string(),
+            artifact_path_hash: artifact_path_hash.clone(),
+            record_fingerprint: record_fingerprint.clone(),
+        });
+
+    let plan_allowed = claims.auth_mode.as_deref().is_none_or(|mode| {
+        !matches!(
+            mode.trim().to_ascii_lowercase().as_str(),
+            "api" | "api_key" | "apikey"
+        )
+    });
+    if plan_allowed {
+        if let Some(raw_plan_name) = claims.plan_type {
+            let observation_id = account_plan_observation_id(
+                &source.source_id,
+                provider_account_id.as_ref(),
+                &raw_plan_name,
+                plan_observed_at,
+                AccountEvidenceKind::AuthSnapshot,
+            );
+            scan.plan_observations.push(AccountPlanObservationV1 {
+                schema_version: ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id,
+                provider: CODEX_PROVIDER.to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id,
+                plan_name: normalize_plan_name(&raw_plan_name),
+                raw_plan_name,
+                observed_at: plan_observed_at,
+                active_from: claims.active_from,
+                active_until: claims.active_until,
+                is_current_snapshot: is_current,
+                evidence_kind: AccountEvidenceKind::AuthSnapshot,
+                confidence: Confidence::High,
+                parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                artifact_path_hash,
+                record_fingerprint,
+            });
+        }
+    }
+}
+
+fn collect_codex_telemetry_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    checkpoints: &[AccountEvidenceCheckpointV1],
+    scan: &mut AccountEvidenceScan,
+) -> Result<()> {
+    let account_attribute = Regex::new(
+        r#"(?i)(?:\"?user\.account_id\"?|\"?user_account_id\"?)\s*[:=]\s*[\"']?([a-z0-9_:\-]{3,256})"#,
+    )?;
+    let email_attribute = Regex::new(
+        r#"(?i)\"?user\.email\"?\s*[:=]\s*[\"']?([a-z0-9.!#$%&'*+/=?^_`{|}~\-]+@[a-z0-9.\-]+\.[a-z]{2,})"#,
+    )?;
+    let conversation_attribute = Regex::new(
+        r#"(?i)(?:\"?conversation\.id\"?|\"?conversation_id\"?|\"?conversationId\"?)\s*[:=]\s*[\"']?([a-z0-9_:\-]{3,256})"#,
+    )?;
+    let auth_mode_attribute = Regex::new(
+        r#"(?i)(?:\"?auth\.mode\"?|\"?auth_mode\"?)\s*[:=]\s*[\"']?([a-z0-9_:\-]{2,64})"#,
+    )?;
+    let app_version_attribute = Regex::new(
+        r#"(?i)(?:\"?app\.version\"?|\"?application_version\"?|\"?cli_version\"?)\s*[:=]\s*[\"']?([a-z0-9.+_\-]{1,64})"#,
+    )?;
+    let event_name = Regex::new(r#"(?:^|\s)event\.name\s*=\s*\"([a-z0-9._-]+)\""#)?;
+    // Newer builds emit the reload line at the end of a tracing span context
+    // (`app_server.request{...}: Reloading auth for account <id>`), so the
+    // message is accepted either at the start of the body or right after a
+    // span close, and nothing may follow the account id. Requiring the id to
+    // end the body keeps quoted copies of this phrase inside logged user
+    // content from ever being read as a reload.
+    let auth_reload =
+        Regex::new(r#"(?i)(?:^\s*|\}:\s*)Reloading auth for account\s+([a-z0-9_:\-]{3,256})\s*$"#)?;
+    // Anything a user typed can reach this body verbatim inside one of these
+    // fields. Identity attributes are only read from the structured prefix that
+    // precedes the first of them, so a prompt quoting `user.account_id=...`
+    // cannot mint a binding for an account this device never used.
+    let free_text_attribute = Regex::new(
+        r#"(?i)(?:^|\s)(?:prompt|message|text|content|body|input|output|arguments|args|command|reasoning|response|error)\s*[:=]"#,
+    )?;
+
+    for database_path in [
+        root.join("logs_2.sqlite"),
+        root.join("sqlite/logs_2.sqlite"),
+    ] {
+        if !database_path.is_file() {
+            continue;
+        }
+        let Ok(connection) = open_sqlite_readonly(&database_path) else {
+            continue;
+        };
+        let Ok(has_logs_table) = sqlite_table_exists(&connection, "logs") else {
+            continue;
+        };
+        if !has_logs_table {
+            continue;
+        }
+        let Ok(maximum_row_id) =
+            connection.query_row("SELECT COALESCE(MAX(id), 0) FROM logs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        else {
+            continue;
+        };
+        let checkpoint_row_fingerprint =
+            codex_telemetry_checkpoint_row_fingerprint(&connection, maximum_row_id);
+        let current_state =
+            codex_telemetry_file_state(&database_path, maximum_row_id, checkpoint_row_fingerprint);
+        let path_hash = hash_text(&canonical_display(&database_path));
+        let previous_state = checkpoints
+            .iter()
+            .find(|checkpoint| {
+                checkpoint.source_id == source.source_id
+                    && checkpoint.artifact_path_hash == path_hash
+                    && checkpoint.parser_version == CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION
+            })
+            .map(codex_telemetry_cursor);
+        if previous_state.as_ref() == Some(&current_state) {
+            continue;
+        }
+        let database_generation_matches = previous_state.as_ref().is_some_and(|previous| {
+            previous
+                .checkpoint_row_fingerprint
+                .as_ref()
+                .is_some_and(|expected| {
+                    codex_telemetry_checkpoint_row_fingerprint(&connection, previous.maximum_row_id)
+                        .as_ref()
+                        == Some(expected)
+                })
+        });
+        let minimum_row_id = previous_state
+            .as_ref()
+            .filter(|previous| {
+                database_generation_matches
+                    && maximum_row_id > previous.maximum_row_id
+                    && current_state.database_size >= previous.database_size
+            })
+            .map_or(i64::MIN, |previous| previous.maximum_row_id);
+        let Ok(mut statement) = connection.prepare(
+            r#"
+            SELECT id, ts, ts_nanos, target, feedback_log_body
+            FROM logs
+            WHERE feedback_log_body IS NOT NULL
+              AND id > ?1
+              AND (
+                (
+                  target IN ('codex_otel.log_only', 'codex_otel.trace_safe')
+                  AND (
+                    -- Both spellings the identity regex accepts have to appear
+                    -- here. Selecting only the dotted attribute discarded rows
+                    -- that carry `user_account_id` without an email before the
+                    -- parser ever saw them, so that telemetry produced no
+                    -- evidence at all.
+                    instr(feedback_log_body, 'user.account_id') > 0
+                    OR instr(feedback_log_body, 'user_account_id') > 0
+                    OR instr(feedback_log_body, 'user.email') > 0
+                  )
+                )
+                OR (
+                  (
+                    target LIKE 'codex_core::auth%'
+                    OR target = 'codex_login::auth::manager'
+                  )
+                  AND instr(feedback_log_body, 'Reloading auth for account') > 0
+                )
+              )
+            ORDER BY id
+            "#,
+        ) else {
+            continue;
+        };
+        let Ok(rows) = statement.query_map([minimum_row_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        }) else {
+            continue;
+        };
+        let mut read_complete = true;
+        for row in rows {
+            let Ok((row_id, seconds, nanos, target, body)) = row else {
+                read_complete = false;
+                break;
+            };
+            let Some(observed_at) = Utc
+                .timestamp_opt(seconds, nanos.clamp(0, 999_999_999) as u32)
+                .single()
+            else {
+                continue;
+            };
+            // Only the structured attribute prefix is trusted; everything from
+            // the first free-text field onward is user content.
+            let attributes = free_text_attribute
+                .find(&body)
+                .map_or(body.as_str(), |free_text| &body[..free_text.start()]);
+            // A body naming the event twice is not a body this parser
+            // understands. Reading only the first match let a second, injected
+            // `event.name` sit unnoticed beside the real one.
+            let mut event_names = event_name
+                .captures_iter(attributes)
+                .filter_map(|captures| captures.get(1).map(|value| value.as_str()));
+            let declared_event_name = event_names.next();
+            // Identity is not tied to one event name: this Codex generation
+            // carries `user.account_id`/`user.email` on ordinary telemetry
+            // events (`codex.turn_ttft`, `codex.tool_decision`, ...) and emits
+            // `codex.conversation_starts` rarely or never. Any single declared
+            // `codex.*` event in the trusted prefix qualifies; the free-text
+            // cut above and the sole-attribute rule below still decide what
+            // may be read from it.
+            let structured_identity_event = matches!(
+                target.as_str(),
+                "codex_otel.log_only" | "codex_otel.trace_safe"
+            ) && declared_event_name
+                .is_some_and(|name| name.starts_with("codex."))
+                && event_names.next().is_none();
+            let reload_account_id = (target.starts_with("codex_core::auth")
+                || target == "codex_login::auth::manager")
+                .then(|| {
+                    auth_reload
+                        .captures(&body)
+                        .and_then(|captures| captures.get(1))
+                        // A reload line sitting at or past the first free-text
+                        // field is quoted content, not an auth event.
+                        .filter(|account| {
+                            free_text_attribute
+                                .find(&body)
+                                .is_none_or(|free_text| account.start() < free_text.start())
+                        })
+                        .map(|value| value.as_str().to_string())
+                })
+                .flatten();
+            // A repeated attribute is ambiguous evidence, not two facts, so an
+            // event that states an identity twice states it for nobody.
+            let sole_attribute = |pattern: &Regex| -> Option<String> {
+                let mut matches = pattern
+                    .captures_iter(attributes)
+                    .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_string()));
+                let first = matches.next()?;
+                matches.next().is_none().then_some(first)
+            };
+            let provider_user_id = reload_account_id.clone().or_else(|| {
+                structured_identity_event.then(|| sole_attribute(&account_attribute))?
+            });
+            let email = structured_identity_event
+                .then(|| sole_attribute(&email_attribute))
+                .flatten()
+                .map(|value| normalize_email(&value));
+            if provider_user_id.is_none() && email.is_none() {
+                continue;
+            }
+            let conversation_id = structured_identity_event
+                .then(|| sole_attribute(&conversation_attribute))
+                .flatten();
+            let auth_mode = structured_identity_event
+                .then(|| sole_attribute(&auth_mode_attribute))
+                .flatten();
+            let application_version = structured_identity_event
+                .then(|| sole_attribute(&app_version_attribute))
+                .flatten();
+            let provider_account_id = provider_account_id_from_identity(
+                CODEX_PROVIDER,
+                provider_user_id.as_deref(),
+                email.as_deref(),
+            );
+            let Some(provider_account_id) = provider_account_id else {
+                continue;
+            };
+            let evidence_kind = if reload_account_id.is_some() {
+                AccountEvidenceKind::AuthReload
+            } else {
+                AccountEvidenceKind::TelemetryIdentity
+            };
+            let conversation_id_hash = conversation_id.as_deref().map(hash_text);
+            let record_fingerprint = hash_text(&format!(
+                "codex-telemetry-identity.v1:{row_id}:{}:{}:{}:{}",
+                provider_user_id.as_deref().unwrap_or("none"),
+                email.as_deref().unwrap_or("none"),
+                conversation_id.as_deref().unwrap_or("none"),
+                observed_at.to_rfc3339()
+            ));
+            scan.accounts.push(ObservedProviderAccount {
+                provider_user_id: provider_user_id.clone(),
+                email: email.clone(),
+                plan_name: None,
+                observed_at,
+            });
+            scan.identity_observations
+                .push(AccountIdentityObservationV1 {
+                    schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+                    observation_id: account_identity_observation_id(
+                        &source.source_id,
+                        evidence_kind,
+                        observed_at,
+                        &record_fingerprint,
+                    ),
+                    provider: CODEX_PROVIDER.to_string(),
+                    source_id: source.source_id.clone(),
+                    provider_account_id: Some(provider_account_id.clone()),
+                    provider_user_id_hash: provider_user_id.as_deref().map(hash_text),
+                    email_hash: email.as_deref().map(hash_text),
+                    conversation_id_hash: conversation_id_hash.clone(),
+                    turn_id_hash: None,
+                    observed_at,
+                    evidence_kind,
+                    confidence: Confidence::High,
+                    auth_mode,
+                    application_version,
+                    parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                    artifact_kind: "logs_2_sqlite".to_string(),
+                    artifact_path_hash: path_hash.clone(),
+                    record_fingerprint,
+                });
+            if let Some(conversation_id_hash) = conversation_id_hash {
+                scan.conversation_bindings
+                    .push(ConversationAccountBindingV1 {
+                        schema_version: CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION.to_string(),
+                        binding_id: conversation_account_binding_id(
+                            &source.source_id,
+                            &conversation_id_hash,
+                            None,
+                            &provider_account_id,
+                        ),
+                        provider: CODEX_PROVIDER.to_string(),
+                        source_id: source.source_id.clone(),
+                        provider_account_id,
+                        conversation_id_hash,
+                        turn_id_hash: None,
+                        observed_at,
+                        evidence_kind,
+                        confidence: Confidence::High,
+                    });
+            }
+        }
+        if read_complete {
+            scan.checkpoints.push(AccountEvidenceCheckpointV1 {
+                schema_version: ACCOUNT_EVIDENCE_CHECKPOINT_SCHEMA_VERSION.to_string(),
+                source_id: source.source_id.clone(),
+                artifact_path_hash: path_hash,
+                parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                maximum_row_id: current_state.maximum_row_id,
+                checkpoint_row_fingerprint: current_state.checkpoint_row_fingerprint.clone(),
+                database_size: current_state.database_size,
+                database_modified_nanos: current_state.database_modified_nanos,
+                wal_size: current_state.wal_size,
+                wal_modified_nanos: current_state.wal_modified_nanos,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_codex_reset_history_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    scan: &mut AccountEvidenceScan,
+) {
+    let state_path = root.join(".codex-global-state.json");
+    let Some(value) = read_json_file(&state_path) else {
+        return;
+    };
+    let Some(entries) = value
+        .pointer("/electron-persisted-atom-state/codex-rate-limit-reset-history")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let artifact_path_hash = hash_text(&canonical_display(&state_path));
+    for entry in entries {
+        let Some(provider_user_id) = string_at_any(entry, &["accountId", "account_id"]) else {
+            continue;
+        };
+        let Some(conversation_id) = string_at_any(entry, &["conversationId", "conversation_id"])
+        else {
+            continue;
+        };
+        let turn_id = string_at_any(entry, &["turnId", "turn_id"]);
+        let Some(observed_at) = entry
+            .get("occurredAtMs")
+            .or_else(|| entry.get("occurred_at_ms"))
+            .and_then(timestamp_from_scalar)
+        else {
+            continue;
+        };
+        let Some(provider_account_id) =
+            provider_account_id_from_identity(CODEX_PROVIDER, Some(&provider_user_id), None)
+        else {
+            continue;
+        };
+        let conversation_id_hash = hash_text(&conversation_id);
+        let turn_id_hash = turn_id.as_deref().map(hash_text);
+        let record_fingerprint = hash_text(&format!(
+            "codex-reset-history.v1:{provider_user_id}:{conversation_id}:{}:{}",
+            turn_id.as_deref().unwrap_or("none"),
+            observed_at.to_rfc3339()
+        ));
+        scan.accounts.push(ObservedProviderAccount {
+            provider_user_id: Some(provider_user_id.clone()),
+            email: None,
+            plan_name: None,
+            observed_at,
+        });
+        scan.identity_observations
+            .push(AccountIdentityObservationV1 {
+                schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id: account_identity_observation_id(
+                    &source.source_id,
+                    AccountEvidenceKind::ResetHistory,
+                    observed_at,
+                    &record_fingerprint,
+                ),
+                provider: CODEX_PROVIDER.to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(provider_account_id.clone()),
+                provider_user_id_hash: Some(hash_text(&provider_user_id)),
+                email_hash: None,
+                conversation_id_hash: Some(conversation_id_hash.clone()),
+                turn_id_hash: turn_id_hash.clone(),
+                observed_at,
+                evidence_kind: AccountEvidenceKind::ResetHistory,
+                confidence: Confidence::High,
+                auth_mode: None,
+                application_version: None,
+                parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                artifact_kind: "global_state_reset_history".to_string(),
+                artifact_path_hash: artifact_path_hash.clone(),
+                record_fingerprint,
+            });
+        scan.conversation_bindings
+            .push(ConversationAccountBindingV1 {
+                schema_version: CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION.to_string(),
+                binding_id: conversation_account_binding_id(
+                    &source.source_id,
+                    &conversation_id_hash,
+                    turn_id_hash.as_deref(),
+                    &provider_account_id,
+                ),
+                provider: CODEX_PROVIDER.to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id,
+                conversation_id_hash,
+                turn_id_hash,
+                observed_at,
+                evidence_kind: AccountEvidenceKind::ResetHistory,
+                confidence: Confidence::High,
+            });
+    }
+}
+
+fn collect_codex_login_evidence(
+    source: &SourceLocation,
+    root: &Path,
+    scan: &mut AccountEvidenceScan,
+) -> Result<()> {
+    let log_directory = root.join("log");
+    let mut login_paths = std::fs::read_dir(&log_directory)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (name == "codex-login.log" || name.starts_with("codex-login.log."))
+                .then(|| entry.path())
+        })
+        .collect::<Vec<_>>();
+    login_paths.sort();
+    for login_path in login_paths {
+        let Ok(file) = File::open(&login_path) else {
+            continue;
+        };
+        let artifact_path_hash = hash_text(&canonical_display(&login_path));
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        loop {
+            match read_bounded_jsonl_line(&mut reader, &mut line, 64 * 1024)? {
+                BoundedLineRead::Eof => break,
+                BoundedLineRead::Oversized => continue,
+                BoundedLineRead::Complete => {}
+            }
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let lower = text.to_ascii_lowercase();
+            if ![
+                "successfully logged in",
+                "login successful",
+                "authentication successful",
+                "login completed",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+            {
+                continue;
+            }
+            let Some(timestamp) = text.split_whitespace().next() else {
+                continue;
+            };
+            let Ok(observed_at) = DateTime::parse_from_rfc3339(timestamp) else {
+                continue;
+            };
+            let observed_at = observed_at.with_timezone(&Utc);
+            // Identify the login by what it says and when, never by where it
+            // currently sits. Hashing the file and line number meant the same
+            // login was a new observation the moment `codex-login.log` rotated
+            // to `codex-login.log.1`, and these rows are append-only, so every
+            // rotation permanently doubled the login history.
+            let record_fingerprint = hash_text(&format!(
+                "codex-login-success.v1:{}:{}",
+                observed_at.to_rfc3339(),
+                text.trim()
+            ));
+            scan.identity_observations
+                .push(AccountIdentityObservationV1 {
+                    schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+                    observation_id: account_identity_observation_id(
+                        &source.source_id,
+                        AccountEvidenceKind::LoginSuccess,
+                        observed_at,
+                        &record_fingerprint,
+                    ),
+                    provider: CODEX_PROVIDER.to_string(),
+                    source_id: source.source_id.clone(),
+                    provider_account_id: None,
+                    provider_user_id_hash: None,
+                    email_hash: None,
+                    conversation_id_hash: None,
+                    turn_id_hash: None,
+                    observed_at,
+                    evidence_kind: AccountEvidenceKind::LoginSuccess,
+                    confidence: Confidence::Low,
+                    auth_mode: None,
+                    application_version: None,
+                    parser_version: CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION.to_string(),
+                    artifact_kind: "codex_login_log".to_string(),
+                    artifact_path_hash: artifact_path_hash.clone(),
+                    record_fingerprint,
+                });
+        }
+    }
+    Ok(())
+}
+
+fn dedupe_codex_account_evidence(scan: &mut AccountEvidenceScan) {
+    let mut account_keys = HashSet::new();
+    scan.accounts.retain(|account| {
+        account_keys.insert((account.provider_user_id.clone(), account.email.clone()))
+    });
+    let mut identity_ids = HashSet::new();
+    scan.identity_observations
+        .retain(|observation| identity_ids.insert(observation.observation_id.clone()));
+    collapse_codex_identity_observation_runs(scan);
+    let mut plan_ids = HashSet::new();
+    scan.plan_observations
+        .retain(|observation| plan_ids.insert(observation.observation_id.clone()));
+    let mut binding_ids = HashSet::new();
+    scan.conversation_bindings
+        .retain(|binding| binding_ids.insert(binding.binding_id.clone()));
+}
+
+/// Collapse consecutive telemetry/reload observations of the same identity.
+///
+/// A single conversation emits hundreds of telemetry events naming the same
+/// account, and each one became a ledger row. The ledger is read back in full
+/// on every reconcile, so that redundancy is paid for on every scan forever.
+/// Only the run's endpoints carry information: the first observation is the
+/// boundary and the last is the freshest confirmation. Everything between two
+/// identical neighbours restates them. Runs are collapsed in time order, so
+/// every alternation — the actual account-switch signal — survives exactly.
+fn collapse_codex_identity_observation_runs(scan: &mut AccountEvidenceScan) {
+    scan.identity_observations.sort_by(|left, right| {
+        left.observed_at
+            .cmp(&right.observed_at)
+            .then_with(|| left.observation_id.cmp(&right.observation_id))
+    });
+    // Deliberately conversation-blind: parallel conversations interleave in
+    // time, and a per-conversation key would break every run they straddle.
+    // Per-conversation identity is carried by the bindings collection; the
+    // ledger only has to preserve *which account, when*.
+    let run_key = |observation: &AccountIdentityObservationV1| {
+        (
+            observation.evidence_kind,
+            observation.provider_account_id.clone(),
+            observation.email_hash.clone(),
+        )
+    };
+    let collapsible = |observation: &AccountIdentityObservationV1| {
+        matches!(
+            observation.evidence_kind,
+            AccountEvidenceKind::TelemetryIdentity | AccountEvidenceKind::AuthReload
+        )
+    };
+    let mut keep = vec![true; scan.identity_observations.len()];
+    let mut run_start: Option<usize> = None;
+    for index in 0..=scan.identity_observations.len() {
+        let continues_run = run_start.is_some_and(|start| {
+            scan.identity_observations
+                .get(index)
+                .is_some_and(|observation| {
+                    collapsible(observation)
+                        && run_key(observation) == run_key(&scan.identity_observations[start])
+                })
+        });
+        if continues_run {
+            continue;
+        }
+        if let Some(start) = run_start.take() {
+            // The run covers `start..index`; keep its first and last rows.
+            let last = (index - 1).max(start + 1);
+            for middle in &mut keep[start + 1..last] {
+                *middle = false;
+            }
+        }
+        if scan
+            .identity_observations
+            .get(index)
+            .is_some_and(collapsible)
+        {
+            run_start = Some(index);
+        }
+    }
+    let mut index = 0;
+    scan.identity_observations.retain(|_| {
+        let retained = keep[index];
+        index += 1;
+        retained
+    });
+}
+
+fn codex_auth_snapshot(root: &Path) -> Option<VerifiedSourceState> {
+    let claims = codex_auth_claims(&root.join("auth.json"))?;
+    let plan_name = claims.plan_type.as_deref().map(display_codex_plan_name);
+    let verified_at = claims.subscription_checked_at.or(claims.authenticated_at);
+    Some(VerifiedSourceState {
+        provider_user_id: claims.provider_user_id,
+        email: claims.email,
         account_label: None,
         plan_name,
-        authenticated_at,
+        authenticated_at: claims.authenticated_at,
         verified_at,
-        subscription,
+        // Provider plan detection is intentionally separate from user-entered billing facts.
+        subscription: None,
     })
 }
 
@@ -7143,32 +8790,6 @@ fn display_codex_plan_name(plan_type: &str) -> String {
             .collect::<Vec<_>>()
             .join(" "),
     }
-}
-
-fn codex_verified_subscription(
-    plan_type: &str,
-    paid_at: Option<DateTime<Utc>>,
-    current_period_ends_at: Option<DateTime<Utc>>,
-    verified_at: Option<DateTime<Utc>>,
-) -> Option<VerifiedSubscriptionState> {
-    let started_at = paid_at?;
-    let (plan_name, price) = match plan_type.trim().to_ascii_lowercase().as_str() {
-        "plus" => ("Plus".to_string(), 2000),
-        "pro" => ("Pro".to_string(), 20000),
-        _ => return None,
-    };
-    Some(VerifiedSubscriptionState {
-        plan_name,
-        price,
-        currency: "USD".to_string(),
-        billing_period: BillingPeriod::Monthly,
-        paid_at,
-        started_at,
-        ended_at: None,
-        current_period_ends_at,
-        status: SubscriptionStatus::Active,
-        verified_at,
-    })
 }
 
 fn jwt_payload_value(token: &str) -> Option<Value> {
@@ -7355,6 +8976,233 @@ mod tests {
 
         assert_eq!(source.provider, CODEX_PROVIDER);
         assert_eq!(source.path_label.as_deref(), Some("/tmp/codex-home"));
+    }
+
+    #[test]
+    fn codex_quota_parser_is_anchored_and_preserves_modern_status_fields() {
+        let adapter = CodexAdapter;
+        let source = codex_source_for_root(
+            &adapter,
+            Path::new("/tmp/codex-home"),
+            LocationOrigin::Configured,
+        );
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+        let value = serde_json::json!({
+            "timestamp": observed_at,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"last_token_usage": {"total_tokens": 0}},
+                "rate_limits": {
+                    "limit_id": "codex_subscription",
+                    "plan_type": "pro",
+                    "individual_limit": null,
+                    "spend_control_state": "allowed",
+                    "reached_type": "weekly",
+                    "primary": {
+                        "used_percent": 12.5,
+                        "window_minutes": 10080,
+                        "resets_at": 1787832000
+                    },
+                    "credits": {
+                        "has_credits": true,
+                        "unlimited": false,
+                        "balance": "0012.5000"
+                    }
+                }
+            }
+        });
+        let record = codex_quota_observation(
+            &source,
+            Path::new("/tmp/codex-home/sessions/thread.jsonl"),
+            7,
+            observed_at,
+            Some(UsageCounts::default()),
+            &value,
+        )
+        .expect("quota observation");
+
+        assert_eq!(record.windows.len(), 1);
+        assert_eq!(record.windows[0].provider_slot, "primary");
+        assert_eq!(record.windows[0].window_minutes, 10_080);
+        assert_eq!(
+            record.windows[0].limit_id.as_deref(),
+            Some("codex_subscription")
+        );
+        assert_eq!(record.observation.status.plan_type.as_deref(), Some("pro"));
+        assert_eq!(
+            record.observation.status.credits.balance.as_deref(),
+            Some("12.5")
+        );
+        assert_eq!(
+            record.observation.status.credits.balance_raw,
+            Some(Value::String("0012.5000".to_string()))
+        );
+        assert_eq!(record.observation.usage_link_kind, QuotaUsageLinkKind::None);
+
+        let nested_as_text = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": value.to_string()
+            }
+        });
+        assert!(codex_quota_observation(
+            &source,
+            Path::new("/tmp/thread.jsonl"),
+            1,
+            observed_at,
+            None,
+            &nested_as_text,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_quota_parser_requires_integer_reset_epochs_and_leniently_reads_balances() {
+        let adapter = CodexAdapter;
+        let source = codex_source_for_root(
+            &adapter,
+            Path::new("/tmp/codex-home"),
+            LocationOrigin::Configured,
+        );
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+        for (balance, normalized) in [
+            (serde_json::json!(14.25), Some("14.25")),
+            (serde_json::json!("1.25e-3"), Some("0.00125")),
+            (Value::Null, None),
+        ] {
+            let value = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 1,
+                            "window_minutes": 300,
+                            "resets_at": "1787832000"
+                        },
+                        "credits": {"balance": balance}
+                    }
+                }
+            });
+            let record = codex_quota_observation(
+                &source,
+                Path::new("/tmp/thread.jsonl"),
+                1,
+                observed_at,
+                None,
+                &value,
+            )
+            .expect("structural quota payload");
+            assert!(record.windows.is_empty(), "string epochs are invalid");
+            assert_eq!(
+                record.observation.status.credits.balance.as_deref(),
+                normalized
+            );
+        }
+        assert!(codex_quota_observation(
+            &source,
+            Path::new("/tmp/thread.jsonl"),
+            1,
+            observed_at,
+            None,
+            &serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "token_count", "rate_limits": "malformed"}
+            }),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_quota_links_consumed_samples_to_turn_events_and_preserves_zero_samples() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("codex");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let path = sessions.join("thread.jsonl");
+        let mut fixture = File::create(&path).expect("fixture");
+        for value in [
+            serde_json::json!({
+                "timestamp": "2026-08-20T12:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T12:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"input_tokens": 10, "output_tokens": 5},
+                        "total_token_usage": {"input_tokens": 10, "output_tokens": 5}
+                    },
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 10,
+                            "window_minutes": 10080,
+                            "resets_at": 1787832000
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T12:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T12:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"total_tokens": 0},
+                        "total_token_usage": {"input_tokens": 10, "output_tokens": 5}
+                    },
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 11,
+                            "window_minutes": 10080,
+                            "resets_at": 1787832000
+                        }
+                    }
+                }
+            }),
+        ] {
+            writeln!(fixture, "{value}").expect("write fixture");
+        }
+        drop(fixture);
+        let source = codex_source_for_root(&CodexAdapter, &root, LocationOrigin::Configured);
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.quota_observations.len(), 2);
+        assert_eq!(
+            scan.quota_observations[0].observation.usage_link_kind,
+            QuotaUsageLinkKind::TurnEvent
+        );
+        assert_eq!(
+            scan.quota_observations[0].observation.usage_event_id,
+            Some(scan.events[0].event_id.clone())
+        );
+        assert_eq!(
+            scan.quota_observations[1]
+                .observation
+                .usage_sample
+                .as_ref()
+                .map(UsageCounts::computed_total),
+            Some(0)
+        );
+        assert_eq!(
+            scan.quota_observations[1].observation.usage_link_kind,
+            QuotaUsageLinkKind::None
+        );
+        assert!(scan.quota_observations[1]
+            .observation
+            .usage_event_id
+            .is_none());
     }
 
     #[test]
@@ -8925,6 +10773,14 @@ mod tests {
             codex_line_kind(user_message),
             CodexLineKind::ResponseItemMessage
         );
+
+        let unrelated_event = r#"{"timestamp":"2026-06-03T09:36:26.000Z","type":"event_msg","payload":{"type":"agent_message","model":"gpt-incorrect"}}"#;
+        assert_eq!(codex_line_kind(unrelated_event), CodexLineKind::Irrelevant);
+        assert!(!is_codex_quota_line_structurally(reasoning));
+
+        let reordered_quota = r#"{"payload": {"rate_limits": {"primary": {"used_percent": 1, "window_minutes": 300, "resets_at": 1787832000}}, "type": "token_count"}, "type": "event_msg"}"#;
+        assert_eq!(codex_line_kind(reordered_quota), CodexLineKind::Irrelevant);
+        assert!(is_codex_quota_line_structurally(reordered_quota));
     }
 
     #[test]
@@ -9267,7 +11123,10 @@ mod tests {
 
         assert_eq!(scan.task_spans.len(), 1);
         assert_eq!(scan.task_spans[0].thread_id.as_deref(), Some("thread-123"));
-        assert_eq!(scan.task_spans[0].session_id.as_deref(), Some("session"));
+        // The declared session id is the session identity now: it is the same
+        // UUID telemetry calls `conversation.id`, so usage, tasks, and
+        // account bindings all meet on one key instead of a file path.
+        assert_eq!(scan.task_spans[0].session_id.as_deref(), Some("thread-123"));
         assert_eq!(scan.task_spans[0].title, "Fix parser bug");
     }
 
@@ -10033,7 +11892,17 @@ mod tests {
         assert!(revision_number(CODEX_SCAN_CACHE_PARSER_REVISION) > 25);
         assert!(revision_number(CLAUDE_SCAN_CACHE_PARSER_REVISION) > 15);
         assert!(revision_number(OPENCODE_SCAN_CACHE_PARSER_REVISION) > 14);
-        assert!(revision_number(GROK_BUILD_SCAN_CACHE_PARSER_REVISION) > 16);
+        assert!(revision_number(GROK_BUILD_SCAN_CACHE_PARSER_REVISION) > 19);
+    }
+
+    #[test]
+    fn grok_request_level_pricing_upgrade_advances_parser_revision() {
+        let revision = GROK_BUILD_SCAN_CACHE_PARSER_REVISION
+            .rsplit_once(".v")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .expect("Grok parser revision");
+
+        assert!(revision > 19);
     }
 
     #[test]
@@ -11096,20 +12965,21 @@ mod tests {
             verified.verified_at.map(|value| value.to_rfc3339()),
             Some("2026-05-29T10:14:56.058278+00:00".to_string())
         );
-        let subscription = verified.subscription.as_ref().expect("subscription");
-        assert_eq!(subscription.plan_name, "Plus");
-        assert_eq!(subscription.price, 2000);
+        assert!(verified.subscription.is_none());
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+        let plan = evidence.plan_observations.first().expect("plan evidence");
+        assert_eq!(plan.raw_plan_name, "plus");
+        assert_eq!(plan.plan_name, "Plus");
         assert_eq!(
-            subscription.started_at.to_rfc3339(),
+            plan.active_from.expect("active from").to_rfc3339(),
             "2026-05-29T10:12:43+00:00"
         );
         assert_eq!(
-            subscription
-                .current_period_ends_at
-                .map(|value| value.to_rfc3339()),
+            plan.active_until.map(|value| value.to_rfc3339()),
             Some("2026-06-29T10:12:43+00:00".to_string())
         );
-        assert_eq!(subscription.ended_at, None);
         assert_eq!(scan.events[0].provider_account_id, None);
         assert_ne!(
             scan.events[0]
@@ -11118,6 +12988,50 @@ mod tests {
                 .map(|evidence| evidence.account_identity_source.clone()),
             Some(IdentitySource::LocalAuth)
         );
+    }
+
+    #[test]
+    fn codex_auth_identity_is_dated_by_the_login_not_the_subscription_check() {
+        // `auth_time` is 2026-06-10; the embedded subscription claims were last
+        // revalidated on 2026-05-01. Signing into a different account rewrites
+        // the account id without touching that older stamp, so dating the
+        // identity by it would claim this source was already `acct-b` five
+        // weeks before the login — and `AuthSnapshot` ends a source's account
+        // interval, so the previous account would lose those five weeks.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            serde_json::json!({
+                "tokens": {
+                    "id_token": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6InBlcnNvbkBleGFtcGxlLmNvbSIsImF1dGhfdGltZSI6MTc4MTA0OTYwMCwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3QtYiIsImNoYXRncHRfcGxhbl90eXBlIjoicGx1cyIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2xhc3RfY2hlY2tlZCI6IjIwMjYtMDUtMDFUMDA6MDA6MDArMDA6MDAifX0."
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let identity = evidence
+            .identity_observations
+            .iter()
+            .find(|item| item.evidence_kind == AccountEvidenceKind::AuthSnapshot)
+            .expect("auth snapshot identity");
+        assert_eq!(
+            identity.observed_at.to_rfc3339(),
+            "2026-06-10T00:00:00+00:00"
+        );
+        let plan = evidence.plan_observations.first().expect("plan evidence");
+        assert_eq!(plan.observed_at.to_rfc3339(), "2026-05-01T00:00:00+00:00");
     }
 
     #[test]
@@ -11134,7 +13048,7 @@ mod tests {
                     "id_token": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ImV4aXN0aW5nQGV4YW1wbGUuY29tIiwiaWF0IjoxNzQ4NTEzNTYzLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1yZWFsIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIiwiY2hhdGdwdF9zdWJzY3JpcHRpb25fYWN0aXZlX3N0YXJ0IjoiMjAyNi0wNS0yOVQxMDoxMjo0MyswMDowMCIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6IjIwMjYtMDYtMjlUMTA6MTI6NDMrMDA6MDAiLCJjaGF0Z3B0X3N1YnNjcmlwdGlvbl9sYXN0X2NoZWNrZWQiOiIyMDI2LTA1LTI5VDEwOjE0OjU2LjA1ODI3OCswMDowMCJ9fQ.",
                     "access_token": "unused",
                     "refresh_token": "unused",
-                    "account_id": "41412a8c-6e19-4d33-9b67-6fb4b4dc0734"
+                    "account_id": "00000000-0000-4000-8000-000000000001"
                 },
                 "last_refresh": "2026-05-19T19:56:03.481816Z"
             })
@@ -11169,20 +13083,20 @@ mod tests {
             verified.verified_at.map(|value| value.to_rfc3339()),
             Some("2026-05-29T10:14:56.058278+00:00".to_string())
         );
-        let subscription = verified.subscription.as_ref().expect("subscription");
-        assert_eq!(subscription.plan_name, "Plus");
-        assert_eq!(subscription.price, 2000);
+        assert!(verified.subscription.is_none());
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+        let plan = evidence.plan_observations.first().expect("plan evidence");
+        assert_eq!(plan.raw_plan_name, "plus");
         assert_eq!(
-            subscription.started_at.to_rfc3339(),
+            plan.active_from.expect("active from").to_rfc3339(),
             "2026-05-29T10:12:43+00:00"
         );
         assert_eq!(
-            subscription
-                .current_period_ends_at
-                .map(|value| value.to_rfc3339()),
+            plan.active_until.map(|value| value.to_rfc3339()),
             Some("2026-06-29T10:12:43+00:00".to_string())
         );
-        assert_eq!(subscription.ended_at, None);
         assert_eq!(scan.events[0].provider_account_id, None);
     }
 
@@ -11219,8 +13133,780 @@ mod tests {
         };
 
         assert!(verified.verified_at.is_some());
-        let subscription = verified.subscription.expect("subscription");
-        assert_eq!(subscription.verified_at, None);
+        assert!(verified.subscription.is_none());
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+        assert_eq!(evidence.plan_observations.len(), 1);
+        assert!(evidence.plan_observations[0].is_current_snapshot);
+        assert_eq!(
+            evidence.plan_observations[0]
+                .active_until
+                .map(|value| value.to_rfc3339()),
+            Some("2026-06-29T10:12:43+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_collects_allowlisted_telemetry_reset_and_login_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_path = dir.path().join("logs_2.sqlite");
+        let connection = Connection::open(&database_path).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    1,
+                    1_787_227_200_i64,
+                    123_i64,
+                    "codex_otel.log_only",
+                    "event.name=\"codex.conversation_starts\" user.account_id=acct-telemetry user.email=owner@example.test conversation.id=conversation-1 auth.mode=chatgpt app.version=1.2.3"
+                ],
+            )
+            .expect("telemetry row");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    2,
+                    1_787_227_201_i64,
+                    0_i64,
+                    "codex_core::auth",
+                    "Reloading auth for account acct-reloaded"
+                ],
+            )
+            .expect("reload row");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    3,
+                    1_787_227_202_i64,
+                    0_i64,
+                    "codex_otel.log_only",
+                    "event.name=\"codex.user_prompt\" prompt=\"Please discuss user.account_id=acct-prompt user.email=prompt@example.test conversation.id=conversation-prompt\""
+                ],
+            )
+            .expect("arbitrary text row");
+        drop(connection);
+
+        std::fs::write(
+            dir.path().join(".codex-global-state.json"),
+            serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "codex-rate-limit-reset-history": [{
+                        "accountId": "acct-reset",
+                        "conversationId": "conversation-reset",
+                        "turnId": "turn-reset",
+                        "occurredAtMs": 1_787_227_203_000_i64
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("global state");
+        std::fs::create_dir_all(dir.path().join("log")).expect("log directory");
+        std::fs::write(
+            dir.path().join("log/codex-login.log.1"),
+            "2026-08-20T12:00:04Z login successful for arbitrary@example.test acct-visible-only-in-body\n",
+        )
+        .expect("rotated login log");
+        std::fs::write(
+            dir.path().join("log/codex-login.log"),
+            "2026-08-20T12:00:05Z unrelated message\n2026-08-20T12:00:06Z login completed\n",
+        )
+        .expect("login log");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        assert_eq!(
+            evidence
+                .identity_observations
+                .iter()
+                .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+                .count(),
+            1
+        );
+        assert_eq!(
+            evidence
+                .identity_observations
+                .iter()
+                .filter(|item| item.evidence_kind == AccountEvidenceKind::AuthReload)
+                .count(),
+            1
+        );
+        assert_eq!(
+            evidence
+                .identity_observations
+                .iter()
+                .filter(|item| item.evidence_kind == AccountEvidenceKind::ResetHistory)
+                .count(),
+            1
+        );
+        let login_observations = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::LoginSuccess)
+            .collect::<Vec<_>>();
+        assert_eq!(login_observations.len(), 2);
+        assert!(login_observations.iter().all(|item| {
+            item.provider_account_id.is_none()
+                && item.provider_user_id_hash.is_none()
+                && item.email_hash.is_none()
+        }));
+        assert_eq!(evidence.conversation_bindings.len(), 2);
+        assert!(evidence
+            .conversation_bindings
+            .iter()
+            .all(|binding| binding.conversation_id_hash.len() == 64));
+        assert!(evidence
+            .conversation_bindings
+            .iter()
+            .all(|binding| binding.conversation_id_hash != "conversation-1"));
+
+        let retry_before_ack = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("retry account evidence before acknowledgement");
+        assert_eq!(
+            retry_before_ack
+                .identity_observations
+                .iter()
+                .filter(|item| matches!(
+                    item.evidence_kind,
+                    AccountEvidenceKind::TelemetryIdentity | AccountEvidenceKind::AuthReload
+                ))
+                .count(),
+            2,
+            "telemetry must remain retryable until the caller commits the evidence"
+        );
+        let committed_checkpoints = evidence.checkpoints.clone();
+
+        let repeated = CodexAdapter
+            .collect_account_evidence(&source, &committed_checkpoints)
+            .expect("repeat account evidence after checkpoint commit");
+        assert_eq!(
+            repeated
+                .identity_observations
+                .iter()
+                .filter(|item| matches!(
+                    item.evidence_kind,
+                    AccountEvidenceKind::TelemetryIdentity | AccountEvidenceKind::AuthReload
+                ))
+                .count(),
+            0,
+            "an unchanged telemetry database must not be rescanned"
+        );
+
+        let connection = Connection::open(&database_path).expect("reopen logs database");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    4,
+                    1_787_227_204_i64,
+                    0_i64,
+                    "codex_otel.trace_safe",
+                    "event.name=\"codex.conversation_starts\" user.account_id=acct-appended"
+                ],
+            )
+            .expect("append telemetry row");
+        drop(connection);
+        let appended = CodexAdapter
+            .collect_account_evidence(&source, &committed_checkpoints)
+            .expect("incremental account evidence");
+        assert_eq!(
+            appended
+                .identity_observations
+                .iter()
+                .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+                .count(),
+            1,
+            "only the appended telemetry range should be parsed"
+        );
+        assert_eq!(appended.checkpoints.len(), 1);
+
+        std::fs::rename(&database_path, dir.path().join("logs_2.previous.sqlite"))
+            .expect("archive replaced telemetry database");
+        let mut replacement = Connection::open(&database_path).expect("replacement logs database");
+        replacement
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("replacement logs schema");
+        let transaction = replacement.transaction().expect("replacement transaction");
+        for row_id in 1..=100_i64 {
+            let body = match row_id {
+                1 => "event.name=\"codex.conversation_starts\" user.account_id=acct-replacement-early".to_string(),
+                100 => "event.name=\"codex.conversation_starts\" user.account_id=acct-replacement-late".to_string(),
+                _ => format!("replacement filler row {row_id} {}", "x".repeat(256)),
+            };
+            transaction
+                .execute(
+                    "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        row_id,
+                        1_787_227_300_i64 + row_id,
+                        0_i64,
+                        "codex_otel.log_only",
+                        body
+                    ],
+                )
+                .expect("replacement telemetry row");
+        }
+        transaction.commit().expect("commit replacement telemetry");
+        drop(replacement);
+
+        let replacement_scan = CodexAdapter
+            .collect_account_evidence(&source, &appended.checkpoints)
+            .expect("replacement telemetry evidence");
+        let replacement_accounts = replacement_scan
+            .accounts
+            .iter()
+            .filter_map(|account| account.provider_user_id.as_deref())
+            .collect::<HashSet<_>>();
+        assert!(replacement_accounts.contains("acct-replacement-early"));
+        assert!(replacement_accounts.contains("acct-replacement-late"));
+        assert_eq!(replacement_scan.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn codex_reads_identity_from_ordinary_telemetry_and_modern_auth_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_path = dir.path().join("logs_2.sqlite");
+        let connection = Connection::open(&database_path).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        let rows: [(i64, &str, &str); 4] = [
+            // The generation that never emits `codex.conversation_starts`:
+            // identity rides on ordinary telemetry events at the end of a span
+            // context.
+            (
+                1,
+                "codex_otel.trace_safe",
+                "session_loop{thread_id=t-1}:turn{otel.name=\"session_task.turn\" model=gpt-5.4}: event.name=\"codex.turn_ttft\" duration_ms=250 conversation.id=conversation-ttft app.version=0.140.0 auth_mode=\"Chatgpt\" user.account_id=\"acct-ttft\" user.email=\"owner@example.test\" model=gpt-5.4",
+            ),
+            // The renamed reload target, with the message after the span close.
+            (
+                2,
+                "codex_login::auth::manager",
+                "app_server.request{otel.kind=\"server\" otel.name=\"getAuthStatus\" rpc.method=\"getAuthStatus\" rpc.request_id=desktop-auth:751da426}: Reloading auth for account acct-live-reload",
+            ),
+            // Quoted copies of the reload phrase must stay inert: one shadowed
+            // by a free-text field, one with trailing content after the id.
+            (
+                3,
+                "codex_login::auth::manager",
+                "prompt=\"quoted\"}: Reloading auth for account acct-evil",
+            ),
+            (
+                4,
+                "codex_login::auth::manager",
+                "app_server.request{otel.kind=\"server\"}: Reloading auth for account acct-evil trailing=1",
+            ),
+        ];
+        for (row_id, target, body) in rows {
+            connection
+                .execute(
+                    "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![row_id, 1_787_227_200_i64 + row_id, 0_i64, target, body],
+                )
+                .expect("telemetry row");
+        }
+        drop(connection);
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let telemetry = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+            .collect::<Vec<_>>();
+        assert_eq!(telemetry.len(), 1);
+        assert_eq!(
+            telemetry[0].provider_user_id_hash.as_deref(),
+            Some(hash_text("acct-ttft").as_str())
+        );
+        assert_eq!(telemetry[0].auth_mode.as_deref(), Some("Chatgpt"));
+        assert_eq!(evidence.conversation_bindings.len(), 1);
+        let reloads = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::AuthReload)
+            .collect::<Vec<_>>();
+        assert_eq!(reloads.len(), 1);
+        assert_eq!(
+            reloads[0].provider_user_id_hash.as_deref(),
+            Some(hash_text("acct-live-reload").as_str())
+        );
+        assert!(evidence.identity_observations.iter().all(|item| {
+            item.provider_user_id_hash.as_deref() != Some(hash_text("acct-evil").as_str())
+        }));
+    }
+
+    #[test]
+    fn codex_reads_underscored_account_attribute_without_an_email() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_path = dir.path().join("logs_2.sqlite");
+        let connection = Connection::open(&database_path).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    1_i64,
+                    1_787_227_200_i64,
+                    0_i64,
+                    "codex_otel.trace_safe",
+                    "event.name=\"codex.turn_ttft\" duration_ms=250 conversation.id=conversation-underscored user_account_id=\"acct-underscored\""
+                ],
+            )
+            .expect("telemetry row");
+        drop(connection);
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let telemetry = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            telemetry.len(),
+            1,
+            "the row-selection filter must accept every account attribute spelling the parser reads"
+        );
+        assert_eq!(
+            telemetry[0].provider_user_id_hash.as_deref(),
+            Some(hash_text("acct-underscored").as_str())
+        );
+        assert_eq!(evidence.conversation_bindings.len(), 1);
+    }
+
+    #[test]
+    fn codex_collapses_repeated_telemetry_identity_runs_to_endpoints() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_path = dir.path().join("logs_2.sqlite");
+        let connection = Connection::open(&database_path).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        // A(x5), B(x1), A(x2): the collapse must keep A's first and last on
+        // each side of B — the alternation is the account-switch signal. A's
+        // rows alternate between two parallel conversations to pin down that
+        // the collapse is conversation-blind: interleaving must not split runs.
+        let rows = [
+            ("a", "one"),
+            ("a", "two"),
+            ("a", "one"),
+            ("a", "two"),
+            ("a", "one"),
+            ("b", "three"),
+            ("a", "two"),
+            ("a", "one"),
+        ];
+        for (offset, (account, conversation)) in rows.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        offset as i64 + 1,
+                        1_787_227_200_i64 + offset as i64,
+                        0_i64,
+                        "codex_otel.log_only",
+                        format!(
+                            "event.name=\"codex.turn_ttft\" duration_ms=1 conversation.id=conversation-{conversation} user.account_id=\"acct-{account}\""
+                        )
+                    ],
+                )
+                .expect("telemetry row");
+        }
+        drop(connection);
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let telemetry_accounts = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+            .map(|item| item.provider_user_id_hash.clone().expect("account hash"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            telemetry_accounts,
+            vec![
+                hash_text("acct-a"),
+                hash_text("acct-a"),
+                hash_text("acct-b"),
+                hash_text("acct-a"),
+                hash_text("acct-a"),
+            ],
+            "each run keeps exactly its first and last observation"
+        );
+    }
+
+    #[test]
+    fn codex_reads_historical_auth_file_variants_as_dated_snapshots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ImV4aXN0aW5nQGV4YW1wbGUuY29tIiwiaWF0IjoxNzQ4NTEzNTYzLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1yZWFsIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIiwiY2hhdGdwdF9zdWJzY3JpcHRpb25fYWN0aXZlX3N0YXJ0IjoiMjAyNi0wNS0yOVQxMDoxMjo0MyswMDowMCIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6IjIwMjYtMDYtMjlUMTA6MTI6NDMrMDA6MDAiLCJjaGF0Z3B0X3N1YnNjcmlwdGlvbl9sYXN0X2NoZWNrZWQiOiIyMDI2LTA1LTI5VDEwOjE0OjU2LjA1ODI3OCswMDowMCJ9fQ."
+                }
+            })
+            .to_string(),
+        )
+        .expect("current auth");
+        // A swapped-out login kept beside the live one; its claims date to the
+        // moment that account was last authenticated here.
+        std::fs::write(
+            dir.path().join("auth-previous.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6InByZXZpb3VzQGV4YW1wbGUudGVzdCIsImF1dGhfdGltZSI6MTc3OTc4MjQwMCwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3QtcHJldmlvdXMiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X3N1YnNjcmlwdGlvbl9hY3RpdmVfc3RhcnQiOiIyMDI2LTA0LTI2VDAwOjAwOjAwKzAwOjAwIiwiY2hhdGdwdF9zdWJzY3JpcHRpb25fYWN0aXZlX3VudGlsIjoiMjAyNi0wNS0yNlQwMDowMDowMCswMDowMCIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2xhc3RfY2hlY2tlZCI6IjIwMjYtMDUtMjZUMDk6MDA6MDArMDA6MDAifX0."
+                }
+            })
+            .to_string(),
+        )
+        .expect("historical auth");
+        std::fs::write(dir.path().join("auth-broken.json"), "not json").expect("broken variant");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        // Only the live auth.json may act as a source-wide auth state; the
+        // swapped-out variant is a dated login that must never close an
+        // interval nothing can reopen.
+        let snapshots = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::AuthSnapshot)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].provider_user_id_hash.as_deref(),
+            Some(hash_text("acct-real").as_str())
+        );
+        let previous_identity = evidence
+            .identity_observations
+            .iter()
+            .find(|item| {
+                item.provider_user_id_hash.as_deref() == Some(hash_text("acct-previous").as_str())
+            })
+            .expect("historical snapshot identity");
+        assert_eq!(
+            previous_identity.evidence_kind,
+            AccountEvidenceKind::LoginSuccess
+        );
+        assert!(!previous_identity.evidence_kind.ends_source_attribution());
+        assert_eq!(
+            previous_identity.observed_at.to_rfc3339(),
+            "2026-05-26T08:00:00+00:00"
+        );
+        let current_plan = evidence
+            .plan_observations
+            .iter()
+            .find(|item| item.is_current_snapshot)
+            .expect("current plan claim");
+        assert_eq!(current_plan.source_id, source.source_id);
+        let historical_plan = evidence
+            .plan_observations
+            .iter()
+            .find(|item| !item.is_current_snapshot)
+            .expect("historical plan claim");
+        assert_eq!(
+            historical_plan.observed_at.to_rfc3339(),
+            "2026-05-26T09:00:00+00:00"
+        );
+        assert_eq!(
+            historical_plan.active_until.map(|value| value.to_rfc3339()),
+            Some("2026-05-26T00:00:00+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_skips_malformed_or_locked_telemetry_databases() {
+        let malformed = tempfile::tempdir().expect("malformed tempdir");
+        let malformed_connection =
+            Connection::open(malformed.path().join("logs_2.sqlite")).expect("malformed database");
+        malformed_connection
+            .execute_batch("CREATE TABLE logs (id INTEGER PRIMARY KEY, unexpected TEXT);")
+            .expect("malformed schema");
+        drop(malformed_connection);
+        let malformed_source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            malformed.path(),
+            LocationOrigin::Configured,
+        );
+        assert!(CodexAdapter
+            .collect_account_evidence(&malformed_source, &[])
+            .expect("malformed database is non-fatal")
+            .identity_observations
+            .is_empty());
+
+        let locked = tempfile::tempdir().expect("locked tempdir");
+        let locked_connection =
+            Connection::open(locked.path().join("logs_2.sqlite")).expect("locked database");
+        locked_connection
+            .execute_batch(
+                "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, feedback_log_body TEXT); PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;",
+            )
+            .expect("exclusive lock");
+        let locked_source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            locked.path(),
+            LocationOrigin::Configured,
+        );
+        assert!(CodexAdapter
+            .collect_account_evidence(&locked_source, &[])
+            .expect("locked database is non-fatal")
+            .identity_observations
+            .is_empty());
+        locked_connection
+            .execute_batch("ROLLBACK")
+            .expect("unlock database");
+    }
+
+    #[test]
+    fn codex_telemetry_identity_ignores_attributes_quoted_inside_user_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let connection = Connection::open(dir.path().join("logs_2.sqlite")).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        for (row_id, body) in [
+            // The injected attributes lead the body, so reading the first match
+            // anywhere accepted them as the event's own identity.
+            (
+                1_i64,
+                "prompt=\"please run event.name=\\\"codex.conversation_starts\\\" user.account_id=acct-attacker user.email=attacker@example.test\" event.name=\"codex.user_prompt\"",
+            ),
+            // A genuine event whose free text repeats the marker afterwards.
+            (
+                2,
+                "event.name=\"codex.conversation_starts\" user.account_id=acct-real prompt=\"see event.name=\\\"codex.conversation_starts\\\" user.account_id=acct-attacker\"",
+            ),
+            // Two structured identities in one body name nobody.
+            (
+                3,
+                "event.name=\"codex.conversation_starts\" user.account_id=acct-one user.account_id=acct-two",
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        row_id,
+                        1_787_227_200_i64 + row_id,
+                        0_i64,
+                        "codex_otel.log_only",
+                        body
+                    ],
+                )
+                .expect("telemetry row");
+        }
+        drop(connection);
+
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let identified = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identified.len(),
+            1,
+            "only the genuine structured attribute prefix identifies an account"
+        );
+        let expected = provider_account_id_from_identity(CODEX_PROVIDER, Some("acct-real"), None)
+            .expect("account id");
+        assert_eq!(identified[0].provider_account_id.as_ref(), Some(&expected));
+        let attacker =
+            provider_account_id_from_identity(CODEX_PROVIDER, Some("acct-attacker"), None)
+                .expect("account id");
+        assert!(
+            evidence
+                .conversation_bindings
+                .iter()
+                .all(|binding| binding.provider_account_id != attacker),
+            "prompt text must never bind a conversation to an unused account"
+        );
+        assert!(evidence
+            .accounts
+            .iter()
+            .all(|account| account.provider_user_id.as_deref() != Some("acct-attacker")));
+    }
+
+    #[test]
+    fn codex_login_evidence_survives_log_rotation_without_duplicating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_directory = dir.path().join("log");
+        std::fs::create_dir_all(&log_directory).expect("log directory");
+        let entry = "2026-08-20T12:00:00Z successfully logged in\n";
+        std::fs::write(log_directory.join("codex-login.log"), entry).expect("login log");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let before = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("evidence before rotation");
+        let before_ids = before
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::LoginSuccess)
+            .map(|item| item.observation_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(before_ids.len(), 1);
+
+        // The same login, now one generation older, plus a fresh empty log.
+        std::fs::rename(
+            log_directory.join("codex-login.log"),
+            log_directory.join("codex-login.log.1"),
+        )
+        .expect("rotate login log");
+        std::fs::write(log_directory.join("codex-login.log"), "").expect("fresh login log");
+
+        let after = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("evidence after rotation");
+        let after_ids = after
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::LoginSuccess)
+            .map(|item| item.observation_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after_ids, before_ids,
+            "rotation moves a login between files; it is not a second login"
+        );
     }
 
     #[test]
@@ -11719,6 +14405,47 @@ mod tests {
                 .as_ref()
                 .and_then(|model| model.reasoning_level_raw.as_deref()),
             Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn codex_non_usage_event_messages_do_not_override_turn_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let mut file = File::create(sessions.join("model.jsonl")).expect("fixture");
+        file.write_all(
+            br#"{"timestamp":"2026-05-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4"}}
+"#,
+        )
+        .expect("write context");
+        file.write_all(
+            br#"{"timestamp":"2026-05-01T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","model":"gpt-incorrect"}}
+"#,
+        )
+        .expect("write unrelated event");
+        file.write_all(
+            br#"{"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":80,"output_tokens":40,"total_tokens":120},"total_token_usage":{"input_tokens":80,"output_tokens":40,"total_tokens":120}}}}
+"#,
+        )
+        .expect("write usage");
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(
+            scan.events[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("gpt-5.4")
         );
     }
 
@@ -13951,6 +16678,767 @@ mod tests {
 
         assert_eq!(before_a.cache_signature, after_a.cache_signature);
         assert_ne!(before_b.cache_signature, after_b.cache_signature);
+    }
+
+    #[test]
+    fn grok_build_prices_unified_log_inferences_independently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-mixed");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-mixed", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6-build",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:52.141Z",
+                    "sid": "session-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 100_000,
+                        "cached_prompt_tokens": 40_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:03.314Z",
+                    "sid": "session-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 200_000,
+                        "cached_prompt_tokens": 80_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        let model = summary.model.as_ref().expect("model");
+        assert_eq!(model.name.as_deref(), Some("grok-4.6-build"));
+        assert_eq!(model.normalized_name.as_deref(), Some("grok-4.6"));
+        assert_eq!(summary.usage.input_tokens, Some(180_000));
+        assert_eq!(summary.usage.cache_read_tokens, Some(120_000));
+        assert_eq!(summary.usage.output_tokens, Some(20_000));
+        assert_eq!(summary.usage.reasoning_tokens, None);
+        assert_eq!(summary.usage.requests, Some(2));
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(880_000)
+        );
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(88));
+        assert_eq!(summary.cost.confidence, Confidence::Medium);
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6:unified_log_inference_usage")
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .summary_version
+                .as_deref()
+                .map(|value| value.contains("inference_rows=2;usage_source=unified_log")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn grok_build_prices_mixed_model_session_from_prompt_model_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-mixed-models");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-mixed-models", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6-build",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "modelsUsed": ["grok-4.5", "grok-4.6"],
+                "primaryModelId": "grok-4.6",
+                "turnCount": 2
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        std::fs::write(
+            session.join("updates.jsonl"),
+            [
+                serde_json::json!({
+                    "timestamp": 1_786_905_120,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-mixed-models",
+                        "update": {
+                            "sessionUpdate": "user_message",
+                            "content": {"type": "text", "text": "first"},
+                            "_meta": {"modelId": "grok-4.5", "promptIndex": 0}
+                        },
+                        "_meta": {
+                            "eventId": "prompt-0",
+                            "agentTimestampMs": 1_786_905_120_000i64
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp": 1_786_905_130,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-mixed-models",
+                        "update": {
+                            "sessionUpdate": "assistant_chunk",
+                            "content": {"type": "text", "text": "working"}
+                        },
+                        "_meta": {
+                            "promptId": "req-4.5",
+                            "totalTokens": 100_000,
+                            "agentTimestampMs": 1_786_905_130_000i64
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp": 1_786_905_180,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-mixed-models",
+                        "update": {
+                            "sessionUpdate": "user_message",
+                            "content": {"type": "text", "text": "/model grok-4.6"},
+                            "_meta": {"modelId": "grok-4.6", "promptIndex": 1}
+                        },
+                        "_meta": {
+                            "eventId": "prompt-1",
+                            "agentTimestampMs": 1_786_905_180_000i64
+                        }
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp": 1_786_905_200,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-mixed-models",
+                        "update": {
+                            "sessionUpdate": "assistant_chunk",
+                            "content": {"type": "text", "text": "switched"}
+                        },
+                        "_meta": {
+                            "promptId": "req-4.6",
+                            "totalTokens": 200_000,
+                            "agentTimestampMs": 1_786_905_200_000i64
+                        }
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("updates");
+        std::fs::write(
+            session.join("events.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:00Z",
+                    "type": "turn_started",
+                    "model_id": "grok-4.5",
+                    "turn_number": 0
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:00.100Z",
+                    "type": "loop_started",
+                    "loop_index": 0
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:00Z",
+                    "type": "turn_started",
+                    "model_id": "grok-4.6",
+                    "turn_number": 1
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("events");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:10Z",
+                    "sid": "session-mixed-models",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "loop_index": 1,
+                        "prompt_tokens": 100_000,
+                        "cached_prompt_tokens": 40_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:20Z",
+                    "sid": "session-mixed-models",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "loop_index": 1,
+                        "prompt_tokens": 200_000,
+                        "cached_prompt_tokens": 80_000,
+                        "completion_tokens": 10_000,
+                        "reasoning_tokens": 0
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        let model = summary.model.as_ref().expect("model");
+        assert_eq!(model.name.as_deref(), Some("grok-4.6-build"));
+        assert_eq!(model.normalized_name.as_deref(), Some("grok-4.6"));
+        assert_eq!(summary.usage.input_tokens, Some(180_000));
+        assert_eq!(summary.usage.cache_read_tokens, Some(120_000));
+        assert_eq!(summary.usage.output_tokens, Some(20_000));
+        assert_eq!(summary.usage.requests, Some(2));
+        // grok-4.5 short (60k/40k/10k @ $2/$0.30/$6) + grok-4.6 long (120k/80k/10k
+        // @ $4/$1/$12) = $0.192 + $0.680. Pricing both as current_model_id (4.6)
+        // would be $0.880.
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(872_000)
+        );
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, Some(87));
+        assert_eq!(summary.cost.confidence, Confidence::Medium);
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:mixed:unified_log_inference_usage")
+        );
+    }
+
+    #[test]
+    fn grok_build_keeps_unresolved_mixed_models_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-mixed-unknown");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-mixed-unknown", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6-build",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "modelsUsed": ["grok-4.5", "grok-4.6"],
+                "primaryModelId": "grok-4.6",
+                "turnCount": 2
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:10Z",
+                    "sid": "session-mixed-unknown",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 100_000,
+                        "cached_prompt_tokens": 40_000,
+                        "completion_tokens": 10_000
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:20Z",
+                    "sid": "session-mixed-unknown",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "prompt_tokens": 200_000,
+                        "cached_prompt_tokens": 80_000,
+                        "completion_tokens": 10_000
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.name.as_deref()),
+            Some("grok-4.6-build")
+        );
+        assert_eq!(summary.usage.requests, Some(2));
+        assert_eq!(summary.cost.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, None);
+        assert_eq!(summary.cost.pricing_source.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn grok_build_keeps_partial_observation_mixed_models_used_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-partial-mixed");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-partial-mixed", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6-build",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "modelsUsed": ["grok-4.5", "grok-4.6"],
+                "primaryModelId": "grok-4.6",
+                "turnCount": 2
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        std::fs::write(
+            session.join("updates.jsonl"),
+            serde_json::json!({
+                "timestamp": 1_786_905_120,
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-partial-mixed",
+                    "update": {
+                        "sessionUpdate": "user_message",
+                        "content": {"type": "text", "text": "first"},
+                        "_meta": {"modelId": "grok-4.5", "promptIndex": 0}
+                    },
+                    "_meta": {
+                        "eventId": "prompt-0",
+                        "agentTimestampMs": 1_786_905_120_000i64
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("updates");
+        std::fs::write(
+            session.join("events.jsonl"),
+            serde_json::json!({
+                "ts": "2026-08-16T18:32:00Z",
+                "type": "turn_started",
+                "model_id": "grok-4.5",
+                "turn_number": 0
+            })
+            .to_string(),
+        )
+        .expect("events");
+        std::fs::write(
+            dir.path().join("logs/unified.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "2026-08-16T18:32:10Z",
+                    "sid": "session-partial-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "loop_index": 1,
+                        "prompt_tokens": 100_000,
+                        "cached_prompt_tokens": 40_000,
+                        "completion_tokens": 10_000
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "ts": "2026-08-16T18:33:20Z",
+                    "sid": "session-partial-mixed",
+                    "msg": "shell.turn.inference_done",
+                    "ctx": {
+                        "loop_index": 2,
+                        "prompt_tokens": 200_000,
+                        "cached_prompt_tokens": 80_000,
+                        "completion_tokens": 10_000
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("unified log");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.name.as_deref()),
+            Some("grok-4.6-build")
+        );
+        assert_eq!(summary.usage.requests, Some(2));
+        // A sole grok-4.5 prompt/turn observation must not price the second
+        // request as 4.5 when modelsUsed also reports grok-4.6 (that would be
+        // $0.840). Attribution is incomplete, so cost stays unknown.
+        assert_eq!(summary.cost.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(summary.cost.estimated_api_equivalent_usd, None);
+        assert_eq!(summary.cost.pricing_source.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn grok_build_keeps_aggregate_prompt_context_conservative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir
+            .path()
+            .join("sessions")
+            .join("%2Fworkspace")
+            .join("session-aggregate");
+        std::fs::create_dir_all(&session).expect("session dir");
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "session-aggregate", "cwd": dir.path()},
+                "updated_at": "2026-08-16T18:39:58Z",
+                "current_model_id": "grok-4.6",
+                "chat_format_version": 1
+            })
+            .to_string(),
+        )
+        .expect("summary");
+        std::fs::write(
+            session.join("signals.json"),
+            serde_json::json!({
+                "turnCount": 2,
+                "contextTokensUsed": 300_000
+            })
+            .to_string(),
+        )
+        .expect("signals");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("grok-4.6")
+        );
+        assert_eq!(summary.usage.input_tokens, Some(300_000));
+        assert_eq!(summary.usage.requests, Some(2));
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(600_000)
+        );
+        assert_eq!(summary.cost.confidence, Confidence::Low);
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6:prompt_context_token_footprint")
+        );
+    }
+
+    #[test]
+    fn grok_fixture_session_keeps_grok_4_6_identity_and_is_priced() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok/basic");
+        let source = SourceLocation::local_adapter(
+            GROK_BUILD_PROVIDER,
+            "test",
+            "0",
+            &root,
+            LocationOrigin::Configured,
+        );
+
+        let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+
+        assert_eq!(scan.summaries.len(), 1);
+        let summary = &scan.summaries[0];
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.name.as_deref()),
+            Some("grok-4.6")
+        );
+        assert_eq!(
+            summary
+                .model
+                .as_ref()
+                .and_then(|model| model.normalized_name.as_deref()),
+            Some("grok-4.6")
+        );
+        assert_eq!(summary.usage.input_tokens, Some(15_534));
+        assert_eq!(summary.usage.cache_read_tokens, Some(42_624));
+        assert_eq!(summary.usage.output_tokens, Some(917));
+        assert_eq!(summary.usage.reasoning_tokens, Some(508));
+        assert_eq!(summary.usage.requests, Some(3));
+        assert_eq!(
+            summary.cost.estimated_api_equivalent_micro_usd,
+            Some(60_930)
+        );
+        assert_eq!(
+            summary.cost.pricing_source.as_deref(),
+            Some("xai_api_pricing:grok-4.6:unified_log_inference_usage")
+        );
+    }
+
+    #[test]
+    fn grok_inference_sample_costs_stay_unknown_when_unpriced() {
+        let observed_at = Utc::now();
+        let sample = GrokInferenceSample {
+            usage: UsageCounts {
+                input_tokens: Some(1_000),
+                output_tokens: Some(100),
+                requests: Some(1),
+                ..UsageCounts::default()
+            },
+            observed_at: Some(observed_at),
+        };
+
+        let missing_model = estimate_grok_inference_sample_costs(
+            GROK_BUILD_PROVIDER,
+            None,
+            std::slice::from_ref(&sample),
+            &[],
+            &[],
+            &[],
+            &observed_at,
+        );
+        let empty = estimate_grok_inference_sample_costs(
+            GROK_BUILD_PROVIDER,
+            Some(&ModelInfo {
+                name: Some("grok-4.6".to_string()),
+                normalized_name: Some("grok-4.6".to_string()),
+                provider_model_id: Some("grok-4.6".to_string()),
+                speed: None,
+                reasoning_level: None,
+                reasoning_level_raw: None,
+            }),
+            &[],
+            &[],
+            &[],
+            &[],
+            &observed_at,
+        );
+
+        assert_eq!(missing_model.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(missing_model.estimated_api_equivalent_usd, None);
+        assert_eq!(missing_model.pricing_source.as_deref(), Some("unknown"));
+        assert_eq!(empty.estimated_api_equivalent_micro_usd, None);
+        assert_eq!(empty.pricing_source.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn grok_inference_model_resolution_joins_prompt_model_id_by_timestamp() {
+        let first = DateTime::parse_from_rfc3339("2026-08-16T18:32:10Z")
+            .expect("first")
+            .with_timezone(&Utc);
+        let second = DateTime::parse_from_rfc3339("2026-08-16T18:33:20Z")
+            .expect("second")
+            .with_timezone(&Utc);
+        let prompt_models = [
+            GrokModelObservation {
+                model_id: "grok-4.5".to_string(),
+                observed_at: Some(
+                    DateTime::parse_from_rfc3339("2026-08-16T18:32:00Z")
+                        .expect("prompt 0")
+                        .with_timezone(&Utc),
+                ),
+            },
+            GrokModelObservation {
+                model_id: "grok-4.6".to_string(),
+                observed_at: Some(
+                    DateTime::parse_from_rfc3339("2026-08-16T18:33:00Z")
+                        .expect("prompt 1")
+                        .with_timezone(&Utc),
+                ),
+            },
+        ];
+        let current = model_info("grok-4.6-build");
+
+        let first_model = resolve_grok_inference_sample_model(
+            &GrokInferenceSample {
+                usage: UsageCounts::default(),
+                observed_at: Some(first),
+            },
+            &prompt_models,
+            &[],
+            &["grok-4.5".to_string(), "grok-4.6".to_string()],
+            Some(&current),
+        )
+        .expect("first model");
+        let second_model = resolve_grok_inference_sample_model(
+            &GrokInferenceSample {
+                usage: UsageCounts::default(),
+                observed_at: Some(second),
+            },
+            &prompt_models,
+            &[],
+            &["grok-4.5".to_string(), "grok-4.6".to_string()],
+            Some(&current),
+        )
+        .expect("second model");
+        let unresolved = resolve_grok_inference_sample_model(
+            &GrokInferenceSample {
+                usage: UsageCounts::default(),
+                observed_at: Some(first),
+            },
+            &[],
+            &[],
+            &["grok-4.5".to_string(), "grok-4.6".to_string()],
+            Some(&current),
+        );
+
+        assert_eq!(first_model.name.as_deref(), Some("grok-4.5"));
+        assert_eq!(first_model.normalized_name.as_deref(), Some("grok-4.5"));
+        assert_eq!(second_model.name.as_deref(), Some("grok-4.6"));
+        assert_eq!(second_model.normalized_name.as_deref(), Some("grok-4.6"));
+        assert_eq!(unresolved, None);
+    }
+
+    #[test]
+    fn grok_inference_model_resolution_rejects_partial_observation_when_models_used_is_mixed() {
+        let observed_at = DateTime::parse_from_rfc3339("2026-08-16T18:32:10Z")
+            .expect("observed")
+            .with_timezone(&Utc);
+        let sample = GrokInferenceSample {
+            usage: UsageCounts::default(),
+            observed_at: Some(observed_at),
+        };
+        let prompt_models = [GrokModelObservation {
+            model_id: "grok-4.5".to_string(),
+            observed_at: Some(
+                DateTime::parse_from_rfc3339("2026-08-16T18:32:00Z")
+                    .expect("prompt")
+                    .with_timezone(&Utc),
+            ),
+        }];
+        let current = model_info("grok-4.6-build");
+
+        let mixed = resolve_grok_inference_sample_model(
+            &sample,
+            &prompt_models,
+            &[],
+            &["grok-4.5".to_string(), "grok-4.6".to_string()],
+            Some(&current),
+        );
+        let matching = resolve_grok_inference_sample_model(
+            &sample,
+            &prompt_models,
+            &[],
+            &["grok-4.5".to_string()],
+            Some(&current),
+        )
+        .expect("matching modelsUsed");
+        let empty_used =
+            resolve_grok_inference_sample_model(&sample, &prompt_models, &[], &[], Some(&current))
+                .expect("empty modelsUsed");
+
+        assert_eq!(mixed, None);
+        assert_eq!(matching.name.as_deref(), Some("grok-4.5"));
+        assert_eq!(empty_used.name.as_deref(), Some("grok-4.5"));
     }
 }
 mod archive;

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 17;
+pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -136,6 +136,11 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         15 => apply_migration_015(conn),
         16 => apply_migration_016(conn),
         17 => apply_migration_017(conn),
+        18 => apply_migration_018(conn),
+        19 => apply_migration_019(conn),
+        20 => apply_migration_020(conn),
+        21 => apply_migration_021(conn),
+        22 => apply_migration_022(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -702,6 +707,155 @@ fn apply_migration_017(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn apply_migration_018(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS quota_payloads (
+          payload_hash TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS quota_observations (
+          observation_id TEXT PRIMARY KEY,
+          semantic_fingerprint TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          provider_account_id TEXT,
+          observed_at TEXT NOT NULL,
+          source_file_path_hash TEXT NOT NULL,
+          source_record_id TEXT NOT NULL,
+          usage_event_id TEXT,
+          usage_link_kind TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          FOREIGN KEY (payload_hash) REFERENCES quota_payloads(payload_hash)
+        );
+        CREATE INDEX IF NOT EXISTS quota_observations_scope_idx
+          ON quota_observations (provider, provider_account_id, observed_at, observation_id);
+        CREATE INDEX IF NOT EXISTS quota_observations_source_idx
+          ON quota_observations (source_id, source_file_path_hash, observed_at, observation_id);
+        CREATE INDEX IF NOT EXISTS quota_observations_semantic_idx
+          ON quota_observations (semantic_fingerprint, observation_id);
+
+        CREATE TABLE IF NOT EXISTS quota_window_observations (
+          window_observation_id TEXT PRIMARY KEY,
+          observation_id TEXT NOT NULL,
+          provider_slot TEXT NOT NULL,
+          limit_id TEXT,
+          window_minutes INTEGER NOT NULL,
+          used_percent REAL NOT NULL,
+          resets_at INTEGER NOT NULL,
+          payload TEXT NOT NULL,
+          FOREIGN KEY (observation_id) REFERENCES quota_observations(observation_id)
+            ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS quota_window_observations_reconstruct_idx
+          ON quota_window_observations (window_minutes, limit_id, resets_at, observation_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn apply_migration_019(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS account_identity_observations (
+          observation_id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          provider_account_id TEXT,
+          observed_at TEXT NOT NULL,
+          evidence_kind TEXT NOT NULL,
+          conversation_id_hash TEXT,
+          payload TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS account_identity_observations_source_idx
+          ON account_identity_observations (source_id, observed_at, observation_id);
+        CREATE INDEX IF NOT EXISTS account_identity_observations_account_idx
+          ON account_identity_observations
+             (provider, provider_account_id, observed_at, observation_id);
+
+        CREATE TABLE IF NOT EXISTS account_plan_observations (
+          observation_id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          provider_account_id TEXT,
+          observed_at TEXT NOT NULL,
+          active_from TEXT,
+          active_until TEXT,
+          plan_name TEXT NOT NULL,
+          evidence_kind TEXT NOT NULL,
+          payload TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS account_plan_observations_account_idx
+          ON account_plan_observations
+             (provider, provider_account_id, observed_at, observation_id);
+        CREATE INDEX IF NOT EXISTS account_plan_observations_source_idx
+          ON account_plan_observations (source_id, observed_at, observation_id);
+
+        CREATE TABLE IF NOT EXISTS conversation_account_bindings (
+          binding_id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          provider_account_id TEXT NOT NULL,
+          conversation_id_hash TEXT NOT NULL,
+          turn_id_hash TEXT,
+          observed_at TEXT NOT NULL,
+          payload TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS conversation_account_bindings_lookup_idx
+          ON conversation_account_bindings
+             (source_id, conversation_id_hash, turn_id_hash, observed_at);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn apply_migration_020(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS account_evidence_checkpoints (
+          source_id TEXT NOT NULL,
+          artifact_path_hash TEXT NOT NULL,
+          parser_version TEXT NOT NULL,
+          maximum_row_id INTEGER NOT NULL,
+          database_size INTEGER NOT NULL,
+          database_modified_nanos INTEGER NOT NULL,
+          wal_size INTEGER NOT NULL,
+          wal_modified_nanos INTEGER NOT NULL,
+          payload TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (source_id, artifact_path_hash, parser_version)
+        );
+        CREATE INDEX IF NOT EXISTS account_evidence_checkpoints_source_idx
+          ON account_evidence_checkpoints (source_id, artifact_path_hash, parser_version);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn apply_migration_021(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "account_evidence_checkpoints",
+        "checkpoint_row_fingerprint",
+        "TEXT",
+    )
+}
+
+fn apply_migration_022(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS quota_window_observations_observation_idx
+          ON quota_window_observations
+             (observation_id, resets_at, window_observation_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -862,6 +1016,19 @@ mod tests {
         assert!(table_exists(&conn, "code_git_identities"));
         assert!(table_exists(&conn, "code_change_matches"));
         assert!(table_exists(&conn, "code_change_metrics"));
+        assert!(table_exists(&conn, "account_identity_observations"));
+        assert!(table_exists(&conn, "account_plan_observations"));
+        assert!(table_exists(&conn, "conversation_account_bindings"));
+        assert!(table_exists(&conn, "account_evidence_checkpoints"));
+        assert!(column_exists(
+            &conn,
+            "account_evidence_checkpoints",
+            "checkpoint_row_fingerprint"
+        ));
+        assert!(index_exists(
+            &conn,
+            "quota_window_observations_observation_idx"
+        ));
     }
 
     #[test]
@@ -874,20 +1041,20 @@ mod tests {
               applied_at TEXT NOT NULL
             );
             INSERT INTO schema_migrations (version, applied_at)
-            VALUES (18, '2026-08-19T00:00:00Z');
+            VALUES (23, '2026-08-23T00:00:00Z');
             "#,
         )
         .expect("create future schema marker");
 
-        let error = migrate(&conn).expect_err("schema 18 must be rejected by schema 17 binary");
+        let error = migrate(&conn).expect_err("schema 23 must be rejected by schema 22 binary");
 
         assert_eq!(
             error.to_string(),
-            "database schema version 18 is newer than this StatsAI binary supports (17); upgrade StatsAI or use a compatible database"
+            "database schema version 23 is newer than this StatsAI binary supports (22); upgrade StatsAI or use a compatible database"
         );
         assert_eq!(
             current_schema_version(&conn).expect("read unchanged version"),
-            18
+            23
         );
     }
 
@@ -904,6 +1071,33 @@ mod tests {
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
         assert!(table_exists(&conn, "task_bucket_sync_state"));
         assert!(column_exists(&conn, "scan_file_state", "tasks_collected"));
+    }
+
+    #[test]
+    fn migration_twenty_one_retries_after_column_was_added_without_history() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        ensure_migrations_table(&conn).expect("ensure migrations table");
+        for version in 1..=20 {
+            apply_migration(&conn, version).expect("apply migration");
+            record_migration(&conn, version).expect("record migration");
+        }
+        apply_migration_021(&conn).expect("interrupted migration schema change");
+        assert_eq!(
+            current_schema_version(&conn).expect("version before retry"),
+            20
+        );
+
+        migrate(&conn).expect("retry migration");
+
+        assert_eq!(
+            schema_version(&conn).expect("version after retry"),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert!(column_exists(
+            &conn,
+            "account_evidence_checkpoints",
+            "checkpoint_row_fingerprint"
+        ));
     }
 
     #[test]

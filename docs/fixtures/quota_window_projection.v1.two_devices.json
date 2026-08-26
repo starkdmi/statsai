@@ -1,0 +1,90 @@
+[
+  {
+    "schema_version": "quota_window_sync_projection.v1",
+    "projection_id": "quota_projection_device_a",
+    "device_id": "device-a",
+    "provider": "codex",
+    "provider_account_id": "acct_stable",
+    "limit_id": "subscription",
+    "window_minutes": 10080,
+    "inferred_start": "2026-08-17T12:00:00Z",
+    "representative_reset": "2026-08-24T12:00:00Z",
+    "representative_reset_epoch_seconds": 1787572800,
+    "reset_min": "2026-08-24T12:00:00Z",
+    "reset_min_epoch_seconds": 1787572800,
+    "reset_max": "2026-08-24T12:02:00Z",
+    "reset_max_epoch_seconds": 1787572920,
+    "first_observed_at": "2026-08-20T09:00:00Z",
+    "last_observed_at": "2026-08-20T10:00:00Z",
+    "sample_count": 2,
+    "first_used_percent": 10.0,
+    "latest_used_percent": 15.0,
+    "minimum_used_percent": 10.0,
+    "maximum_used_percent": 15.0,
+    "change_points": [
+      {
+        "observed_at": "2026-08-20T09:00:00Z",
+        "used_percent": 10.0,
+        "resets_at": "2026-08-24T12:00:00Z",
+        "resets_at_epoch_seconds": 1787572800,
+        "point_fingerprint": "point_shared_10",
+        "provider_slot": "primary"
+      }
+    ],
+    "latest_status": {
+      "plan_type": "pro",
+      "individual_limit": null,
+      "spend_control_state": null,
+      "reached_type": null,
+      "credits": {
+        "has_credits": true,
+        "unlimited": false,
+        "balance": "10.5"
+      }
+    }
+  },
+  {
+    "schema_version": "quota_window_sync_projection.v1",
+    "projection_id": "quota_projection_device_b",
+    "device_id": "device-b",
+    "provider": "codex",
+    "provider_account_id": "acct_stable",
+    "limit_id": "subscription",
+    "window_minutes": 10080,
+    "inferred_start": "2026-08-17T12:03:00Z",
+    "representative_reset": "2026-08-24T12:03:00Z",
+    "representative_reset_epoch_seconds": 1787572980,
+    "reset_min": "2026-08-24T12:03:00Z",
+    "reset_min_epoch_seconds": 1787572980,
+    "reset_max": "2026-08-24T12:03:00Z",
+    "reset_max_epoch_seconds": 1787572980,
+    "first_observed_at": "2026-08-20T09:00:00Z",
+    "last_observed_at": "2026-08-20T11:00:00Z",
+    "sample_count": 2,
+    "first_used_percent": 10.0,
+    "latest_used_percent": 18.0,
+    "minimum_used_percent": 10.0,
+    "maximum_used_percent": 18.0,
+    "change_points": [
+      {
+        "observed_at": "2026-08-20T09:00:00Z",
+        "used_percent": 10.0,
+        "resets_at": "2026-08-24T12:00:00Z",
+        "resets_at_epoch_seconds": 1787572800,
+        "point_fingerprint": "point_shared_10",
+        "provider_slot": "secondary"
+      }
+    ],
+    "latest_status": {
+      "plan_type": "pro",
+      "individual_limit": null,
+      "spend_control_state": null,
+      "reached_type": null,
+      "credits": {
+        "has_credits": true,
+        "unlimited": false,
+        "balance": "10.5"
+      }
+    }
+  }
+]

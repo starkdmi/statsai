@@ -1,36 +1,38 @@
-use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use anyhow::{bail, ensure, Context, Result};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
 use statsai_adapters::VerifiedSubscriptionState;
 use statsai_adapters::{
-    adapter_for_provider, default_adapters, ProviderAdapter, ScanCandidateFile, ScanDiagnostics,
-    ScanOptions, VerifiedSourceObservation,
+    adapter_for_provider, default_adapters, remap_account_evidence_account_ids,
+    retain_accounts_referenced_by_account_evidence, AccountEvidenceScan, ArchiveScan,
+    ProviderAdapter, ScanCandidateFile, ScanDiagnostics, ScanOptions, VerifiedSourceObservation,
 };
 #[cfg(test)]
 use statsai_adapters::{SourceIdentityInference, VerifiedSourceState};
+#[cfg(test)]
+use statsai_core::{
+    account_plan_observation_id, conversation_account_binding_id, micro_usd_to_cents_rounded,
+    provider_account_id, summary_id, Confidence, CostInfo, EventSource, PrivacyInfo, PrivacyMode,
+    SummaryMetadata, UsageCounts, USAGE_SUMMARY_SCHEMA_VERSION,
+};
 use statsai_core::{
     build_usage_report, display_account_identity, expand_home_path, hash_text, home_dir,
     normalize_email, normalize_provider_user_id, path_hash, periods_overlap,
-    project_contains_file_paths, project_has_stable_identity, report_period_from_range,
-    sanitize_code_change_metric_for_sync, sanitize_task_bucket_for_sync,
+    project_contains_file_paths, project_has_stable_identity, provider_account_id_from_identity,
+    report_period_from_range, sanitize_code_change_metric_for_sync, sanitize_task_bucket_for_sync,
     source_account_assignment_id, source_id as statsai_source_id, subscription_id,
     timestamp_in_period, ArchiveContentKind, ArchiveConversation, BillingPeriod, EventId,
-    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId, ReportPeriod,
+    IdentitySource, LocationOrigin, ProjectInfo, ProviderAccount, ProviderAccountId,
+    QuotaObservationRecordV1, QuotaWindowSyncProjectionV1, QuotaWindowV1, ReportPeriod,
     SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
     SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus,
     SyncAuthoritativeSnapshot, SyncBatch, TaskBucketSnapshot, TaskSpan, TaskStatus, TaskVerdict,
     TaskVerification, TaskVerificationAction, TaskVerificationCursor, UsageEvent, UsageReport,
     UsageSummary, UsageTotals, WorkItem, WorkItemId, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
     SUBSCRIPTION_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION,
-};
-#[cfg(test)]
-use statsai_core::{
-    micro_usd_to_cents_rounded, provider_account_id, provider_account_id_from_identity, summary_id,
-    Confidence, CostInfo, EventSource, PrivacyInfo, PrivacyMode, SummaryMetadata, UsageCounts,
-    USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_sdk::{
     build_reported_usage_summary, ReportedUsageSummaryInput, ReportedUsageSummaryRecord,
@@ -41,7 +43,7 @@ use statsai_store::{apply_verified_source_state, verified_source_state_hash};
 use statsai_store::{
     close_active_verified_source_linkages, derive_task_work_items, find_existing_provider_account,
     reconcile_verified_source_state, upsert_provider_account, verified_source_observation_hash,
-    ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
+    QuotaQuery, ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
     UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION,
 };
 use statsai_sync::{
@@ -58,6 +60,7 @@ use statsai::{auth, default_device_id, default_store_path, service, snapshot};
 const HTTP_ROLLUP_SUMMARIES_PER_BATCH: usize = 25;
 const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
 const HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH: usize = 1_000;
+const HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH: usize = 100;
 const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 const HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE: usize = 90;
 const HTTP_ROLLUP_DAILY_ROLLUP_ROWS_PER_QUERY: usize = 7;
@@ -108,6 +111,8 @@ enum Command {
     Task(TaskCommand),
     #[command(about = "Collect and explore durable local conversation archives")]
     Conversation(ConversationCommand),
+    #[command(about = "Inspect reconstructed provider quota history")]
+    Quota(QuotaCommand),
     #[command(about = "Build and inspect the local privacy-filtered dataset")]
     Privacy(statsai::privacy_cli::PrivacyCommand),
     #[command(about = "Export a sync batch to a sink")]
@@ -212,6 +217,67 @@ struct TaskCommand {
 struct ConversationCommand {
     #[command(subcommand)]
     command: ConversationSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct QuotaCommand {
+    #[command(subcommand)]
+    command: QuotaSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum QuotaSubcommand {
+    #[command(about = "Show quota collection and account-attribution coverage")]
+    Status {
+        #[arg(long, help = "Account id, email, provider id, or label")]
+        account: Option<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Show the newest activated quota window")]
+    Current {
+        #[arg(long, help = "Account id, email, provider id, or label")]
+        account: Option<String>,
+        #[arg(long, help = "Include shorter quota scopes")]
+        all_scopes: bool,
+        #[arg(long, help = "Include older epochs that overlap the selected window")]
+        include_overlaps: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "List reconstructed quota windows")]
+    Windows {
+        #[arg(long, help = "Provider filter")]
+        provider: Option<String>,
+        #[arg(long, help = "Account id, email, provider id, or label")]
+        account: Option<String>,
+        #[arg(long, help = "Observation range start (date or RFC 3339)")]
+        from: Option<String>,
+        #[arg(long, help = "Observation range end (date or RFC 3339)")]
+        to: Option<String>,
+        #[arg(long, help = "Provider limit identity")]
+        limit_id: Option<String>,
+        #[arg(long, default_value_t = 50, help = "Maximum windows to return")]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Show quota change points for one reconstructed window")]
+    History {
+        #[arg(long, help = "Reconstructed quota window id; newest when omitted")]
+        window_id: Option<String>,
+        #[arg(long, help = "Include source observations and raw provider payloads")]
+        raw: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Export quota observations, windows, or weekly sync projections")]
+    Export {
+        #[arg(long, value_parser = ["observations", "windows", "sync-windows"])]
+        level: String,
+        #[arg(long, value_parser = ["csv", "json", "jsonl"])]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -530,6 +596,18 @@ struct AccountCommand {
 enum AccountSubcommand {
     #[command(about = "List canonical provider accounts")]
     List,
+    #[command(about = "Show detected plan evidence per account")]
+    Plans {
+        #[arg(long, help = "Provider name (claude_code, codex)")]
+        provider: Option<String>,
+        #[arg(
+            long,
+            help = "Account identity to show (label, email, provider user id, or provider account id)"
+        )]
+        account: Option<String>,
+        #[arg(long, help = "Include every stored observation, not just the newest")]
+        all: bool,
+    },
     #[command(about = "Merge a legacy/manual account into an existing canonical account")]
     Merge {
         #[arg(long, help = "Provider name (claude_code, codex)")]
@@ -860,8 +938,10 @@ enum StoreAdminSubcommand {
 
 #[derive(Debug, Subcommand)]
 enum SchemaSubcommand {
-    #[command(about = "Print the sync_batch.v3 JSON Schema")]
+    #[command(about = "Print the sync_batch.v4 JSON Schema")]
     SyncBatch,
+    #[command(about = "Print the quota_window_sync_projection.v1 JSON Schema")]
+    QuotaWindowProjection,
 }
 
 #[derive(Debug, Args)]
@@ -906,6 +986,7 @@ fn main() -> Result<()> {
                 Command::Export(command) => export(command, &store),
                 Command::Task(command) => task(command, &store),
                 Command::Conversation(command) => conversation(command, &store, &device_id),
+                Command::Quota(command) => quota(command, &store, &device_id),
                 Command::Privacy(command) => {
                     statsai::privacy_cli::run(command, &store, &store_path)
                 }
@@ -995,6 +1076,7 @@ fn scan_with_adapters(
     let mut event_count = 0u64;
     let mut summary_count = 0u64;
     let mut task_span_count = 0u64;
+    let mut quota_observation_count = 0u64;
     let mut inserted_count = 0u64;
     let mut summary_written_count = 0u64;
     let mut task_span_written_count = 0u64;
@@ -1025,6 +1107,36 @@ fn scan_with_adapters(
             if source.path_label.is_none() {
                 source.path_label = path_label_from_hashless_source(&source);
             }
+            let verification_mode = source_verification_mode(&source);
+            let account_evidence_enabled =
+                matches!(verification_mode, SourceVerificationMode::Auto);
+            let mut account_evidence = AccountEvidenceScan::default();
+            if account_evidence_enabled {
+                let account_evidence_checkpoints =
+                    store.account_evidence_checkpoints(&source.source_id)?;
+                account_evidence =
+                    adapter.collect_account_evidence(&source, &account_evidence_checkpoints)?;
+                let known_account_aliases = canonicalize_known_account_evidence(
+                    store,
+                    adapter.provider(),
+                    &mut account_evidence,
+                )?;
+                store.retain_unseen_account_evidence(
+                    &source.source_id,
+                    &mut account_evidence.identity_observations,
+                    &mut account_evidence.plan_observations,
+                    &mut account_evidence.conversation_bindings,
+                )?;
+                retain_accounts_referenced_by_account_evidence(
+                    adapter.provider(),
+                    &known_account_aliases,
+                    &mut account_evidence,
+                );
+            }
+            let account_evidence_count = account_evidence.identity_observations.len()
+                + account_evidence.plan_observations.len()
+                + account_evidence.conversation_bindings.len();
+            let account_evidence_checkpoint_count = account_evidence.checkpoints.len();
             let cache_candidates = adapter.scan_candidates(&source)?;
             let compatible_scan_signatures =
                 scan_candidate_compatible_signatures(&cache_candidates);
@@ -1058,6 +1170,10 @@ fn scan_with_adapters(
                 pending_file_entries.len(),
                 needs_legacy_full_reconcile,
             );
+            let replace_all_source_quota_records = should_replace_all_source_quota_records(
+                command.replace,
+                needs_legacy_full_reconcile,
+            );
             let should_run_adapter_scan = if replace_source_records {
                 !file_cache_entries.is_empty()
             } else {
@@ -1076,7 +1192,6 @@ fn scan_with_adapters(
                             .collect()
                     }),
             };
-            let verification_mode = source_verification_mode(&source);
             let probed_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
                     VerifiedSourceObservation::Unavailable
@@ -1143,22 +1258,29 @@ fn scan_with_adapters(
             let source_event_count = scan.events.len() as u64;
             let source_summary_count = scan.summaries.len() as u64;
             let source_task_span_count = scan.task_spans.len() as u64;
+            let source_quota_observation_count = scan.quota_observations.len() as u64;
             let has_scan_activity = touched_files
                 || (has_cache_entry_upgrades && !command.preview)
                 || source_event_count > 0
                 || source_summary_count > 0
                 || source_task_span_count > 0
+                || source_quota_observation_count > 0
                 || scan.diagnostics.files_scanned > 0
                 || scan.diagnostics.files_skipped_unchanged > 0
                 || log_rows > 0
+                || account_evidence_count > 0
+                || account_evidence_checkpoint_count > 0
                 || verified_state_changed;
             let suppress_source_processing = !command.verbose
                 && !command.explain
                 && source_event_count == 0
                 && source_summary_count == 0
                 && source_task_span_count == 0
+                && source_quota_observation_count == 0
                 && !touched_files
                 && !has_cache_entry_upgrades
+                && account_evidence_count == 0
+                && account_evidence_checkpoint_count == 0
                 && !verified_state_changed;
 
             if !has_scan_activity {
@@ -1170,6 +1292,7 @@ fn scan_with_adapters(
             event_count += source_event_count;
             summary_count += source_summary_count;
             task_span_count += source_task_span_count;
+            quota_observation_count += source_quota_observation_count;
             total_usage.add_totals(&source_usage);
             total_summary_usage.add_totals(&source_summary_usage);
             add_diagnostics(&mut total_diagnostics, &scan.diagnostics);
@@ -1200,6 +1323,7 @@ fn scan_with_adapters(
                     usage: &source_usage,
                     summaries: source_summary_count,
                     task_spans: source_task_span_count,
+                    quota_observations: source_quota_observation_count,
                     summary_usage: &source_summary_usage,
                     diagnostics: &scan.diagnostics,
                     verbose: command.verbose || command.explain,
@@ -1214,12 +1338,32 @@ fn scan_with_adapters(
                     next_verified_state_hash,
                 )?;
                 persist_source_after_preview(store, &source)?;
+                if account_evidence_enabled {
+                    canonicalize_account_evidence(
+                        store,
+                        adapter.provider(),
+                        &mut account_evidence,
+                    )?;
+                    store.upsert_account_identity_observations(
+                        &account_evidence.identity_observations,
+                    )?;
+                    store.upsert_account_plan_observations(&account_evidence.plan_observations)?;
+                    store.reconcile_source_account_evidence_assignments(&source.source_id)?;
+                    store.upsert_conversation_account_bindings(
+                        &account_evidence.conversation_bindings,
+                    )?;
+                    store.reattribute_conversation_bound_events(&source.source_id)?;
+                }
                 apply_source_account_resolution(
                     store,
                     &source,
                     &mut scan.events,
                     &mut scan.summaries,
                 )?;
+                if account_evidence_enabled {
+                    store
+                        .apply_conversation_account_bindings(&source.source_id, &mut scan.events)?;
+                }
                 let mut affected_project_buckets = if command.include_tasks {
                     scan.task_spans
                         .iter()
@@ -1235,6 +1379,11 @@ fn scan_with_adapters(
                         store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
                     removed_summary_count += store
                         .delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
+                    if replace_all_source_quota_records {
+                        store.delete_quota_observations_for_sources(std::slice::from_ref(
+                            &source.source_id,
+                        ))?;
+                    }
                     if command.include_tasks {
                         let deleted = store.delete_task_spans_for_sources(std::slice::from_ref(
                             &source.source_id,
@@ -1259,6 +1408,10 @@ fn scan_with_adapters(
                         &source.source_id,
                         &reconciled_file_hashes,
                     )?;
+                    store.delete_quota_observations_for_source_file_hashes(
+                        &source.source_id,
+                        &reconciled_file_hashes,
+                    )?;
                     if command.include_tasks {
                         let deleted = store.delete_task_spans_for_source_file_hashes(
                             &source.source_id,
@@ -1275,6 +1428,33 @@ fn scan_with_adapters(
                 let insert_result = store.insert_events_with_resolution(&scan.events)?;
                 inserted_count += insert_result.inserted;
                 insert_events_duration_ms += insert_started_at.elapsed().as_millis() as u64;
+                rewrite_quota_usage_event_ids(
+                    &mut scan.quota_observations,
+                    &insert_result.canonical_event_ids,
+                );
+                if replace_source_records && !replace_all_source_quota_records {
+                    let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
+                        &file_cache_entries,
+                        &removed_file_entries,
+                    );
+                    store.replace_quota_observations_for_source_files(
+                        &source.source_id,
+                        &reconciled_file_hashes,
+                        &scan.quota_observations,
+                    )?;
+                    // Every file was rescanned, so anything still carrying a hash outside that set
+                    // belongs to a file that is gone, or predates file hashes entirely. Nothing
+                    // later in this scan revisits it, so it is retired here rather than surviving
+                    // as a row no source file explains.
+                    store.delete_quota_observations_for_source_outside_file_hashes(
+                        &source.source_id,
+                        &reconciled_file_hashes,
+                    )?;
+                } else {
+                    store.upsert_quota_observations(&scan.quota_observations)?;
+                }
+                store.rebuild_quota_plan_observations_for_source(&source.source_id)?;
+                store.clear_orphaned_quota_usage_links()?;
                 if command.include_tasks {
                     rewrite_task_span_linked_event_ids(
                         &mut scan.task_spans,
@@ -1322,6 +1502,9 @@ fn scan_with_adapters(
                     .upgrade_scan_file_entries(&source.source_id, &compatible_entries_to_upgrade)?;
                 let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
                 store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
+                if account_evidence_enabled {
+                    store.upsert_account_evidence_checkpoints(&account_evidence.checkpoints)?;
+                }
 
                 if command.include_tasks
                     && !rebuild_project_buckets.is_empty()
@@ -1348,10 +1531,11 @@ fn scan_with_adapters(
     if command.preview {
         if command.verbose {
             println!(
-                "preview total: sources={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={} written=0",
+                "preview total: sources={} usage_events={} summaries={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={} written=0",
                 format_u64(total_sources),
                 format_u64(event_count),
                 format_u64(summary_count),
+                format_u64(quota_observation_count),
                 format_u64(total_usage.input_tokens),
                 format_u64(total_usage.cache_creation_tokens),
                 format_u64(total_usage.cached_input_tokens),
@@ -1376,10 +1560,11 @@ fn scan_with_adapters(
             print_scan_diagnostics_total(&total_diagnostics);
         } else {
             println!(
-                "preview total: sources={} usage_events={} summaries={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} written=0",
+                "preview total: sources={} usage_events={} summaries={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} written=0",
                 format_u64(total_sources),
                 format_u64(event_count),
                 format_u64(summary_count),
+                format_u64(quota_observation_count),
                 format_u64(total_usage.input_tokens),
                 format_u64(total_usage.cache_creation_tokens),
                 format_u64(total_usage.cached_input_tokens),
@@ -1397,7 +1582,7 @@ fn scan_with_adapters(
         }
     } else {
         println!(
-            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} task_spans={} task_spans_written={} work_items_rebuilt={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={}",
+            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} task_spans={} task_spans_written={} quota_observations={} work_items_rebuilt={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={}",
             format_u64(total_sources),
             format_u64(event_count),
             format_u64(inserted_count),
@@ -1405,6 +1590,7 @@ fn scan_with_adapters(
             format_u64(summary_written_count),
             format_u64(task_span_count),
             format_u64(task_span_written_count),
+            format_u64(quota_observation_count),
             format_u64(rebuilt_work_item_count),
             format_u64(total_usage.input_tokens),
             format_u64(total_usage.cache_creation_tokens),
@@ -1653,6 +1839,19 @@ fn source(command: SourceCommand, store: &Store, device_id: &str) -> Result<()> 
             } else {
                 Default::default()
             };
+            let deleted_quota_observations = if delete_data {
+                store.delete_quota_observations_for_sources(std::slice::from_ref(&source_id))?
+            } else {
+                0
+            };
+            let deleted_account_evidence = if delete_data {
+                store.delete_account_evidence_for_sources(std::slice::from_ref(&source_id))?
+            } else {
+                0
+            };
+            if delete_data {
+                store.clear_orphaned_quota_usage_links()?;
+            }
             let deleted_trace_edits = if delete_data {
                 store.delete_archive_import_for_sources(std::slice::from_ref(&source_id))?
             } else {
@@ -1689,6 +1888,8 @@ fn source(command: SourceCommand, store: &Store, device_id: &str) -> Result<()> 
                     "deleted_summaries": deleted_summaries,
                     "deleted_scan_cache_entries": deleted_scan_entries,
                     "deleted_task_spans": deleted_task_spans.deleted,
+                    "deleted_quota_observations": deleted_quota_observations,
+                    "deleted_account_evidence": deleted_account_evidence,
                     "deleted_code_change_traces": deleted_trace_edits,
                     "work_items_rebuilt": rebuilt_work_items,
                     "code_change_metrics_rebuilt": rebuilt_code_change_metrics,
@@ -1747,6 +1948,10 @@ fn source(command: SourceCommand, store: &Store, device_id: &str) -> Result<()> 
             }
             if matches!(source.verification_mode, SourceVerificationMode::Disabled) {
                 close_active_verified_source_linkages(store, &source.source_id, Utc::now())?;
+            }
+            if !matches!(source.verification_mode, SourceVerificationMode::Auto) {
+                store
+                    .delete_account_evidence_for_sources(std::slice::from_ref(&source.source_id))?;
             }
             source.updated_at = Utc::now();
             store.upsert_source(&source)?;
@@ -2458,6 +2663,32 @@ fn account(command: AccountCommand, store: &Store) -> Result<()> {
         AccountSubcommand::List => {
             println!("{}", serde_json::to_string_pretty(&store.list_accounts()?)?);
         }
+        AccountSubcommand::Plans {
+            provider,
+            account,
+            all,
+        } => {
+            let provider = provider.as_deref().map(canonical_provider).transpose()?;
+            let selected_account = match (account.as_deref(), provider.as_deref()) {
+                (Some(selector), Some(provider)) => Some(
+                    resolve_existing_provider_account_selector(store, provider, selector)?
+                        .provider_account_id,
+                ),
+                (Some(_), None) => {
+                    bail!("--account needs --provider so the selector resolves in one provider")
+                }
+                (None, _) => None,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&account_plan_evidence_report(
+                    store,
+                    provider.as_deref(),
+                    selected_account.as_ref(),
+                    all,
+                )?)?
+            );
+        }
         AccountSubcommand::Merge {
             provider,
             from,
@@ -2496,11 +2727,22 @@ struct AccountReferenceCounts {
     subscriptions: usize,
     events: usize,
     summaries: usize,
+    quota_observations: usize,
+    identity_observations: usize,
+    plan_observations: usize,
+    conversation_bindings: usize,
 }
 
 impl AccountReferenceCounts {
     fn total(&self) -> usize {
-        self.source_account_assignments + self.subscriptions + self.events + self.summaries
+        self.source_account_assignments
+            + self.subscriptions
+            + self.events
+            + self.summaries
+            + self.quota_observations
+            + self.identity_observations
+            + self.plan_observations
+            + self.conversation_bindings
     }
 }
 
@@ -2515,6 +2757,9 @@ struct AccountMergeReport {
     moved_subscriptions: usize,
     moved_events: usize,
     moved_summaries: usize,
+    moved_identity_observations: usize,
+    moved_plan_observations: usize,
+    moved_conversation_bindings: usize,
     deleted_source_account: bool,
     remaining_references: AccountReferenceCounts,
     reset_local_sync_tracking: bool,
@@ -2569,6 +2814,8 @@ fn merge_provider_accounts(
         .filter(|summary| summary.provider == provider)
         .filter(|summary| summary.provider_account_id.as_ref() == Some(&from.provider_account_id))
         .count();
+    let evidence_to_move =
+        store.account_evidence_reference_counts(provider, &from.provider_account_id)?;
 
     if !dry_run {
         for assignment in &assignments_to_move {
@@ -2617,6 +2864,9 @@ fn merge_provider_accounts(
         moved_subscriptions: subscriptions_to_move.len(),
         moved_events: direct_events_to_move,
         moved_summaries: direct_summaries_to_move,
+        moved_identity_observations: evidence_to_move.identity_observations,
+        moved_plan_observations: evidence_to_move.plan_observations,
+        moved_conversation_bindings: evidence_to_move.conversation_bindings,
         deleted_source_account,
         remaining_references,
         reset_local_sync_tracking: !dry_run,
@@ -2635,12 +2885,16 @@ fn remove_orphan_provider_account(
         account_reference_counts(store, &account.provider_account_id, Some(provider))?;
     if remaining_references.total() > 0 {
         bail!(
-            "account {} still has references: {} source assignments, {} subscriptions, {} events, {} summaries",
+            "account {} still has references: {} source assignments, {} subscriptions, {} events, {} summaries, {} quota observations, {} identity observations, {} plan observations, {} conversation bindings",
             display_account_identity(&account),
             remaining_references.source_account_assignments,
             remaining_references.subscriptions,
             remaining_references.events,
-            remaining_references.summaries
+            remaining_references.summaries,
+            remaining_references.quota_observations,
+            remaining_references.identity_observations,
+            remaining_references.plan_observations,
+            remaining_references.conversation_bindings
         );
     }
     let deleted = if dry_run {
@@ -2661,6 +2915,102 @@ fn remove_orphan_provider_account(
         reset_local_sync_tracking: !dry_run,
         dry_run,
     })
+}
+
+/// Groups stored plan observations by account so the CLI can show detected plans.
+///
+/// The dashboard derives a plan *timeline* from these rows -- segments, gaps, and a current plan --
+/// and that derivation lives in the hosted API. Reimplementing it here would create a second
+/// answer to the same question that could disagree with the first, so this reports what is stored
+/// instead: the newest observation per account, and every observation behind `--all`. The field is
+/// named `latest_observation` rather than `current_plan` for exactly that reason -- it is the most
+/// recent thing this machine recorded, not a derived verdict about what the account is on now.
+fn account_plan_evidence_report(
+    store: &Store,
+    provider: Option<&str>,
+    provider_account_id: Option<&ProviderAccountId>,
+    include_all_observations: bool,
+) -> Result<Vec<Value>> {
+    let accounts = store
+        .list_accounts()?
+        .into_iter()
+        .map(|account| (account.provider_account_id.clone(), account))
+        .collect::<HashMap<_, _>>();
+    let mut grouped: BTreeMap<
+        (String, Option<String>),
+        Vec<statsai_core::AccountPlanObservationV1>,
+    > = BTreeMap::new();
+    for observation in store.account_plan_observations()? {
+        // Stored observations do not all carry the canonical spelling: the legacy subscription
+        // migration matches `codex` case-insensitively and then copies the subscription's own
+        // provider string through, and nothing normalizes a payload on read. Comparing and
+        // grouping on the raw value would hide a `Codex` row from `--provider codex` and list its
+        // account a second time under its own heading.
+        // `canonical_provider_name` matches exact lowercase aliases, so the stored value is folded
+        // before the lookup. A provider this build does not recognize keeps its stored spelling
+        // rather than being silently relabelled.
+        let canonical_provider =
+            canonical_provider_name(&observation.provider.to_ascii_lowercase())
+                .map(str::to_string)
+                .unwrap_or_else(|| observation.provider.clone());
+        if provider.is_some_and(|provider| !canonical_provider.eq_ignore_ascii_case(provider)) {
+            continue;
+        }
+        if provider_account_id
+            .is_some_and(|account_id| observation.provider_account_id.as_ref() != Some(account_id))
+        {
+            continue;
+        }
+        let key = (
+            canonical_provider,
+            observation
+                .provider_account_id
+                .as_ref()
+                .map(|account_id| account_id.0.clone()),
+        );
+        grouped.entry(key).or_default().push(observation);
+    }
+
+    let describe = |observation: &statsai_core::AccountPlanObservationV1| {
+        serde_json::json!({
+            "plan_name": observation.plan_name,
+            "raw_plan_name": observation.raw_plan_name,
+            "observed_at": observation.observed_at,
+            "active_from": observation.active_from,
+            "active_until": observation.active_until,
+            "is_current_snapshot": observation.is_current_snapshot,
+            "evidence_kind": observation.evidence_kind,
+            "confidence": observation.confidence,
+            "source_id": observation.source_id,
+        })
+    };
+
+    let mut report = Vec::new();
+    for ((provider, account_id), mut observations) in grouped {
+        // Newest last, with the id breaking ties so two observations sharing a timestamp -- which
+        // happens when one artifact yields both a snapshot and a login -- always order the same way.
+        observations.sort_by(|left, right| {
+            left.observed_at
+                .cmp(&right.observed_at)
+                .then_with(|| left.observation_id.cmp(&right.observation_id))
+        });
+        let account = account_id
+            .as_ref()
+            .and_then(|account_id| accounts.get(&ProviderAccountId(account_id.clone())));
+        let mut entry = serde_json::json!({
+            "provider": provider,
+            "provider_account_id": account_id,
+            "email": account.and_then(|account| account.email.clone()),
+            "account_label": account.and_then(|account| account.account_label.clone()),
+            "observation_count": observations.len(),
+            "latest_observation": observations.last().map(&describe),
+        });
+        if include_all_observations {
+            entry["observations"] = Value::Array(observations.iter().map(&describe).collect());
+        }
+        report.push(entry);
+    }
+    Ok(report)
 }
 
 fn resolve_existing_provider_account_selector(
@@ -2803,6 +3153,12 @@ fn move_direct_account_records(
         store.rewrite_summaries(&summaries_to_move)?;
     }
 
+    store.rekey_account_evidence(
+        provider,
+        from_provider_account_id,
+        target_provider_account_id,
+    )?;
+
     Ok(())
 }
 
@@ -2837,12 +3193,52 @@ fn account_reference_counts(
         .filter(|summary| summary.provider_account_id.as_ref() == Some(provider_account_id))
         .filter(|summary| provider_matches(&summary.provider))
         .count();
+    let quota_observations = store
+        .quota_observations(&QuotaQuery::default(), false)?
+        .into_iter()
+        .filter(|record| {
+            record.observation.provider_account_id.as_ref() == Some(provider_account_id)
+        })
+        .filter(|record| provider_matches(&record.observation.provider))
+        .count();
+    let evidence = if let Some(provider) = provider {
+        store.account_evidence_reference_counts(provider, provider_account_id)?
+    } else {
+        let identity_observations = store
+            .account_identity_observations(None)?
+            .into_iter()
+            .filter(|observation| {
+                observation.provider_account_id.as_ref() == Some(provider_account_id)
+            })
+            .count();
+        let plan_observations = store
+            .account_plan_observations()?
+            .into_iter()
+            .filter(|observation| {
+                observation.provider_account_id.as_ref() == Some(provider_account_id)
+            })
+            .count();
+        let conversation_bindings = store
+            .conversation_account_bindings(None)?
+            .into_iter()
+            .filter(|binding| binding.provider_account_id == *provider_account_id)
+            .count();
+        statsai_store::AccountEvidenceReferenceCounts {
+            identity_observations,
+            plan_observations,
+            conversation_bindings,
+        }
+    };
 
     Ok(AccountReferenceCounts {
         source_account_assignments,
         subscriptions,
         events,
         summaries,
+        quota_observations,
+        identity_observations: evidence.identity_observations,
+        plan_observations: evidence.plan_observations,
+        conversation_bindings: evidence.conversation_bindings,
     })
 }
 
@@ -3936,8 +4332,11 @@ fn build_sync_batch_with_identity_key(
     let all_subscriptions: Vec<_> = store
         .list_subscriptions()?
         .into_iter()
+        .filter(|subscription| subscription.record_source != IdentitySource::LocalAuth)
         .map(sanitize_subscription_for_sync)
         .collect();
+    let all_account_plan_observations = store.account_plan_projections(device_id)?;
+    let all_account_evidence_summaries = store.account_evidence_summaries(device_id)?;
     let snapshot_source_ids = all_sources
         .iter()
         .map(|source| source.source_id.clone())
@@ -3953,6 +4352,14 @@ fn build_sync_batch_with_identity_key(
     let snapshot_subscription_ids = all_subscriptions
         .iter()
         .map(|subscription| subscription.subscription_id.clone())
+        .collect::<Vec<_>>();
+    let snapshot_account_plan_observation_ids = all_account_plan_observations
+        .iter()
+        .map(|observation| observation.projection_id.clone())
+        .collect::<Vec<_>>();
+    let snapshot_account_evidence_summary_ids = all_account_evidence_summaries
+        .iter()
+        .map(|summary| summary.summary_id.clone())
         .collect::<Vec<_>>();
     let mut authoritative_snapshot = None;
     let sources = if payload_mode == SyncPayloadMode::Rollups {
@@ -3978,6 +4385,24 @@ fn build_sync_batch_with_identity_key(
         store.pending_subscriptions_for_sync(&command.sink, target, &all_subscriptions)?
     } else {
         all_subscriptions
+    };
+    let account_plan_observations = if payload_mode == SyncPayloadMode::Rollups {
+        store.pending_account_plan_projections_for_sync(
+            &command.sink,
+            target,
+            &all_account_plan_observations,
+        )?
+    } else {
+        all_account_plan_observations
+    };
+    let account_evidence_summaries = if payload_mode == SyncPayloadMode::Rollups {
+        store.pending_account_evidence_summaries_for_sync(
+            &command.sink,
+            target,
+            &all_account_evidence_summaries,
+        )?
+    } else {
+        all_account_evidence_summaries
     };
     let (task_buckets, task_verifications) = if sync_preferences.include_tasks {
         let task_verification_cursor = if command.sink == "http" || command.since_last {
@@ -4032,6 +4457,21 @@ fn build_sync_batch_with_identity_key(
         .iter()
         .map(|metric| metric.metric_id.clone())
         .collect::<Vec<_>>();
+    let all_quota_cycle_contributions =
+        store.quota_cycle_contributions(&QuotaQuery::default(), device_id)?;
+    let quota_cycle_contributions = if command.full || state.is_none() {
+        all_quota_cycle_contributions.clone()
+    } else {
+        store.pending_quota_cycle_contributions_for_sync(
+            &command.sink,
+            target,
+            &all_quota_cycle_contributions,
+        )?
+    };
+    let all_quota_cycle_contribution_ids = all_quota_cycle_contributions
+        .iter()
+        .map(|contribution| contribution.contribution_id.clone())
+        .collect::<Vec<_>>();
 
     if payload_mode == SyncPayloadMode::Rollups {
         let label = rollup_mode_label(command);
@@ -4071,6 +4511,9 @@ fn build_sync_batch_with_identity_key(
                 .map(|summary| summary.summary_id.clone())
                 .collect(),
             code_change_metric_ids: all_code_change_metric_ids,
+            quota_cycle_contribution_ids: all_quota_cycle_contribution_ids,
+            account_plan_observation_ids: snapshot_account_plan_observation_ids,
+            account_evidence_summary_ids: snapshot_account_evidence_summary_ids,
         };
         let failed_without_resume = state.as_ref().is_some_and(|state| {
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()
@@ -4128,11 +4571,14 @@ fn build_sync_batch_with_identity_key(
             accounts,
             source_account_assignments,
             subscriptions,
+            account_plan_observations,
+            account_evidence_summaries,
             events,
             summaries,
             task_buckets,
             task_verifications,
             code_change_metrics,
+            quota_cycle_contributions,
             authoritative_snapshot,
             created_at,
         },
@@ -4171,6 +4617,17 @@ fn record_rollup_sync_chunk_success(
             .map(|metric| metric.metric_id.clone())
             .collect::<Vec<_>>(),
     )?;
+    store.record_quota_cycle_contributions_synced(
+        sink,
+        target,
+        &batch.quota_cycle_contributions,
+    )?;
+    store.record_account_plan_projections_synced(sink, target, &batch.account_plan_observations)?;
+    store.record_account_evidence_summaries_synced(
+        sink,
+        target,
+        &batch.account_evidence_summaries,
+    )?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
 }
@@ -4198,6 +4655,17 @@ fn record_sync_batch_success(
     )?;
     store.record_task_verifications_synced(sink, target, &batch.task_verifications)?;
     store.record_code_change_metrics_synced(sink, target, &batch.code_change_metrics)?;
+    store.record_account_plan_projections_synced(sink, target, &batch.account_plan_observations)?;
+    store.record_account_evidence_summaries_synced(
+        sink,
+        target,
+        &batch.account_evidence_summaries,
+    )?;
+    store.record_quota_cycle_contributions_synced(
+        sink,
+        target,
+        &batch.quota_cycle_contributions,
+    )?;
     store.mark_code_change_metrics_synced(
         &batch
             .code_change_metrics
@@ -4520,12 +4988,16 @@ fn should_retry_http_rollup_chunk_after_error(chunk: &SyncBatch, error: &anyhow:
         || chunk.accounts.len() > 1
         || chunk.source_account_assignments.len() > 1
         || chunk.subscriptions.len() > 1
+        || chunk.account_plan_observations.len() > 1
+        || chunk.account_evidence_summaries.len() > 1
         || chunk.task_buckets.len() > 1
         || chunk.task_verifications.len() > 1
         || chunk.code_change_metrics.len() > 1
+        || chunk.quota_cycle_contributions.len() > 1
         || (!chunk.task_buckets.is_empty() && !chunk.task_verifications.is_empty())
         || (http_rollup_metadata_count(chunk) > 0 && !chunk.summaries.is_empty())
         || (!chunk.code_change_metrics.is_empty() && has_non_code_change_payload(chunk))
+        || (!chunk.quota_cycle_contributions.is_empty() && has_non_quota_cycle_payload(chunk))
 }
 
 fn http_rollup_retry_error_label(error: &anyhow::Error) -> &'static str {
@@ -4602,8 +5074,11 @@ fn split_authoritative_snapshot(
         provider_account_ids: Vec::new(),
         source_account_assignment_ids: Vec::new(),
         subscription_ids: Vec::new(),
+        account_plan_observation_ids: Vec::new(),
+        account_evidence_summary_ids: Vec::new(),
         summary_ids: Vec::new(),
         code_change_metric_ids: Vec::new(),
+        quota_cycle_contribution_ids: Vec::new(),
     };
     let mut parts = Vec::new();
     let mut current = empty_part();
@@ -4626,8 +5101,20 @@ fn split_authoritative_snapshot(
         source_account_assignment_ids
     );
     append_ids!(snapshot.subscription_ids, subscription_ids);
+    append_ids!(
+        snapshot.account_plan_observation_ids,
+        account_plan_observation_ids
+    );
+    append_ids!(
+        snapshot.account_evidence_summary_ids,
+        account_evidence_summary_ids
+    );
     append_ids!(snapshot.summary_ids, summary_ids);
     append_ids!(snapshot.code_change_metric_ids, code_change_metric_ids);
+    append_ids!(
+        snapshot.quota_cycle_contribution_ids,
+        quota_cycle_contribution_ids
+    );
     if authoritative_snapshot_id_count(&current) > 0 || parts.is_empty() {
         parts.push(current);
     }
@@ -4644,8 +5131,11 @@ fn authoritative_snapshot_id_count(snapshot: &SyncAuthoritativeSnapshot) -> usiz
         + snapshot.provider_account_ids.len()
         + snapshot.source_account_assignment_ids.len()
         + snapshot.subscription_ids.len()
+        + snapshot.account_plan_observation_ids.len()
+        + snapshot.account_evidence_summary_ids.len()
         + snapshot.summary_ids.len()
         + snapshot.code_change_metric_ids.len()
+        + snapshot.quota_cycle_contribution_ids.len()
 }
 
 fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<SyncBatch> {
@@ -4656,11 +5146,14 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
     );
     let has_task_payload = !task_chunks.is_empty();
     let metadata_count = http_rollup_metadata_count(batch);
-    let has_rollup_payload =
-        metadata_count > 0 || !batch.summaries.is_empty() || !batch.code_change_metrics.is_empty();
+    let has_rollup_payload = metadata_count > 0
+        || !batch.summaries.is_empty()
+        || !batch.code_change_metrics.is_empty()
+        || !batch.quota_cycle_contributions.is_empty();
     if !has_task_payload
         && batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
         && batch.code_change_metrics.len() <= HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH
+        && batch.quota_cycle_contributions.len() <= HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH
         && metadata_count <= HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH
     {
         return fit_http_rollup_batches_to_d1_budget(vec![batch.clone()]);
@@ -4678,8 +5171,17 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
         .code_change_metrics
         .len()
         .div_ceil(HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH);
-    let mut chunks =
-        Vec::with_capacity(total_chunks + metadata_chunks + code_change_chunks + task_chunks.len());
+    let quota_cycle_chunks = batch
+        .quota_cycle_contributions
+        .len()
+        .div_ceil(HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH);
+    let mut chunks = Vec::with_capacity(
+        total_chunks
+            + metadata_chunks
+            + code_change_chunks
+            + quota_cycle_chunks
+            + task_chunks.len(),
+    );
 
     chunks.extend(split_http_rollup_metadata_chunks(
         batch,
@@ -4690,6 +5192,10 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
         batch,
         HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH,
     ));
+    chunks.extend(split_http_quota_cycle_contribution_chunks(
+        batch,
+        HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH,
+    ));
     chunks.extend(split_http_rollup_summary_chunks(
         batch,
         HTTP_ROLLUP_SUMMARIES_PER_BATCH,
@@ -4699,6 +5205,24 @@ fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<Syn
 }
 
 fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<SyncBatch> {
+    if !batch.quota_cycle_contributions.is_empty() && has_non_quota_cycle_payload(batch) {
+        let mut without_quota = batch.clone();
+        without_quota.quota_cycle_contributions.clear();
+        let mut chunks = split_http_quota_cycle_contribution_chunks(
+            batch,
+            batch.quota_cycle_contributions.len(),
+        );
+        chunks.extend(split_http_rollup_sync_batch_after_budget_error(
+            &without_quota,
+        ));
+        return chunks;
+    }
+    if batch.quota_cycle_contributions.len() > 1 {
+        return split_http_quota_cycle_contribution_chunks(
+            batch,
+            batch.quota_cycle_contributions.len().div_ceil(2),
+        );
+    }
     if !batch.code_change_metrics.is_empty() && has_non_code_change_payload(batch) {
         let mut without_code_changes = batch.clone();
         without_code_changes.code_change_metrics.clear();
@@ -4769,6 +5293,18 @@ fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<Syn
     if batch.subscriptions.len() > 1 {
         return split_http_rollup_metadata_chunks(batch, batch.subscriptions.len().div_ceil(2));
     }
+    if batch.account_plan_observations.len() > 1 {
+        return split_http_rollup_metadata_chunks(
+            batch,
+            batch.account_plan_observations.len().div_ceil(2),
+        );
+    }
+    if batch.account_evidence_summaries.len() > 1 {
+        return split_http_rollup_metadata_chunks(
+            batch,
+            batch.account_evidence_summaries.len().div_ceil(2),
+        );
+    }
     vec![batch.clone()]
 }
 
@@ -4778,13 +5314,32 @@ fn has_non_code_change_payload(batch: &SyncBatch) -> bool {
         || !batch.summaries.is_empty()
         || !batch.task_buckets.is_empty()
         || !batch.task_verifications.is_empty()
+        || !batch.quota_cycle_contributions.is_empty()
 }
 
+fn has_non_quota_cycle_payload(batch: &SyncBatch) -> bool {
+    http_rollup_metadata_count(batch) > 0
+        || !batch.events.is_empty()
+        || !batch.summaries.is_empty()
+        || !batch.task_buckets.is_empty()
+        || !batch.task_verifications.is_empty()
+        || !batch.code_change_metrics.is_empty()
+}
+
+/// Records the backend writes one statement per row for.
+///
+/// Quota cycles are deliberately absent. They travel on their own splitting
+/// path and the backend upserts the whole collection in a single statement, so
+/// counting them here both charged them twice against the budget and made
+/// `has_non_quota_cycle_payload` true for a batch that holds nothing else —
+/// which returned the same quota chunk from every split and retried it forever.
 fn http_rollup_metadata_count(batch: &SyncBatch) -> usize {
     batch.sources.len()
         + batch.accounts.len()
         + batch.source_account_assignments.len()
         + batch.subscriptions.len()
+        + batch.account_plan_observations.len()
+        + batch.account_evidence_summaries.len()
 }
 
 fn split_http_rollup_task_chunks(
@@ -4836,6 +5391,22 @@ fn split_http_code_change_metric_chunks(batch: &SyncBatch, chunk_size: usize) ->
         .collect()
 }
 
+fn split_http_quota_cycle_contribution_chunks(
+    batch: &SyncBatch,
+    chunk_size: usize,
+) -> Vec<SyncBatch> {
+    batch
+        .quota_cycle_contributions
+        .chunks(chunk_size.max(1))
+        .enumerate()
+        .map(|(index, contributions)| {
+            let mut chunk = empty_http_rollup_chunk(batch, &format!("quota_cycles_{}", index + 1));
+            chunk.quota_cycle_contributions = contributions.to_vec();
+            chunk
+        })
+        .collect()
+}
+
 fn fit_http_rollup_batches_to_d1_budget(chunks: Vec<SyncBatch>) -> Vec<SyncBatch> {
     let mut fitted = Vec::new();
     for chunk in chunks {
@@ -4862,6 +5433,12 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     let existing_batch_lookup_queries = 1;
     let final_sync_bookkeeping_queries = 2;
     let account_alias_lookup_queries = usize::from(!batch.accounts.is_empty());
+    // The backend reads existing ownership for every non-empty plan batch and
+    // may spend one more query deleting a fingerprint the device repointed.
+    // The client cannot know whether that cleanup will be needed until the
+    // server reads its ownership state, so reserve the worst case here.
+    let account_plan_ownership_queries =
+        usize::from(!batch.account_plan_observations.is_empty()) * 2;
     let semantic_lookup_queries =
         http_rollup_query_chunks(
             unique_non_empty_provider_account_ids(
@@ -4887,6 +5464,21 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
             }))
             .len(),
             HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE,
+        ) + http_rollup_query_chunks(
+            unique_non_empty_provider_account_ids(
+                batch
+                    .account_plan_observations
+                    .iter()
+                    .map(|observation| observation.provider_account_id.0.as_str())
+                    .chain(
+                        batch
+                            .account_evidence_summaries
+                            .iter()
+                            .map(|summary| summary.provider_account_id.0.as_str()),
+                    ),
+            )
+            .len(),
+            HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE,
         );
     let existing_summary_state_queries =
         http_rollup_query_chunks(batch.summaries.len(), HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE);
@@ -4897,7 +5489,9 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     let metadata_write_queries = batch.sources.len()
         + batch.accounts.len()
         + batch.source_account_assignments.len()
-        + batch.subscriptions.len();
+        + batch.subscriptions.len()
+        + batch.account_plan_observations.len()
+        + batch.account_evidence_summaries.len();
     let project_write_queries =
         http_rollup_project_count(batch) + http_rollup_project_location_count(batch);
     let daily_rollup_write_queries = http_rollup_query_chunks(
@@ -4909,6 +5503,8 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     // The backend batches metrics into one json_each upsert and one ownership
     // statement regardless of metric count.
     let code_change_metric_queries = usize::from(!batch.code_change_metrics.is_empty()) * 2;
+    let quota_cycle_contribution_queries =
+        usize::from(!batch.quota_cycle_contributions.is_empty()) * 2;
     let code_change_owner_metadata_refresh_queries = usize::from(
         batch.schema_version == SYNC_BATCH_SCHEMA_VERSION
             && batch
@@ -4922,6 +5518,7 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     authenticated_device_queries
         + existing_batch_lookup_queries
         + account_alias_lookup_queries
+        + account_plan_ownership_queries
         + semantic_lookup_queries
         + existing_summary_state_queries
         + project_location_lookup_queries
@@ -4931,6 +5528,7 @@ fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
         + monthly_rollup_queries
         + dashboard_snapshot_queries
         + code_change_metric_queries
+        + quota_cycle_contribution_queries
         + code_change_owner_metadata_refresh_queries
         + estimate_http_rollup_task_queries(batch)
         + final_sync_bookkeeping_queries
@@ -5228,6 +5826,16 @@ fn split_http_rollup_metadata_chunks(batch: &SyncBatch, chunk_size: usize) -> Ve
         "subscriptions",
         chunk_size,
     ));
+    chunks.extend(split_http_rollup_single_metadata_kind(
+        batch,
+        "account_plans",
+        chunk_size,
+    ));
+    chunks.extend(split_http_rollup_single_metadata_kind(
+        batch,
+        "account_evidence",
+        chunk_size,
+    ));
     chunks
 }
 
@@ -5280,6 +5888,28 @@ fn split_http_rollup_single_metadata_kind(
                 chunk
             })
             .collect(),
+        "account_plans" => batch
+            .account_plan_observations
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(index, records)| {
+                let mut chunk =
+                    empty_http_rollup_chunk(batch, &format!("account_plans_{}", index + 1));
+                chunk.account_plan_observations = records.to_vec();
+                chunk
+            })
+            .collect(),
+        "account_evidence" => batch
+            .account_evidence_summaries
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(index, records)| {
+                let mut chunk =
+                    empty_http_rollup_chunk(batch, &format!("account_evidence_{}", index + 1));
+                chunk.account_evidence_summaries = records.to_vec();
+                chunk
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -5298,11 +5928,14 @@ fn split_http_rollup_summary_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec
             chunk.accounts.clear();
             chunk.source_account_assignments.clear();
             chunk.subscriptions.clear();
+            chunk.account_plan_observations.clear();
+            chunk.account_evidence_summaries.clear();
             chunk.events.clear();
             chunk.summaries = summaries.to_vec();
             chunk.task_buckets.clear();
             chunk.task_verifications.clear();
             chunk.code_change_metrics.clear();
+            chunk.quota_cycle_contributions.clear();
             chunk.authoritative_snapshot = None;
             chunk
         })
@@ -5316,11 +5949,14 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
     chunk.accounts.clear();
     chunk.source_account_assignments.clear();
     chunk.subscriptions.clear();
+    chunk.account_plan_observations.clear();
+    chunk.account_evidence_summaries.clear();
     chunk.events.clear();
     chunk.summaries.clear();
     chunk.task_buckets.clear();
     chunk.task_verifications.clear();
     chunk.code_change_metrics.clear();
+    chunk.quota_cycle_contributions.clear();
     chunk.authoritative_snapshot = None;
     chunk
 }
@@ -5958,6 +6594,670 @@ fn schema(command: SchemaCommand) -> Result<()> {
             let schema = schemars::schema_for!(SyncBatch);
             println!("{}", serde_json::to_string_pretty(&schema)?);
         }
+        SchemaSubcommand::QuotaWindowProjection => {
+            let schema = schemars::schema_for!(QuotaWindowSyncProjectionV1);
+            println!("{}", serde_json::to_string_pretty(&schema)?);
+        }
+    }
+    Ok(())
+}
+
+fn quota(command: QuotaCommand, store: &Store, device_id: &str) -> Result<()> {
+    match command.command {
+        QuotaSubcommand::Status { account, json } => {
+            let query = quota_query(store, None, account.as_deref(), None, None, None)?;
+            let status = store.quota_status(&query)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "quota observations: {}",
+                    format_u64(status.total_observations)
+                );
+                println!(
+                    "distinct: {} ({} copied duplicates collapsed)",
+                    format_u64(status.distinct_observations),
+                    format_u64(status.duplicate_observations)
+                );
+                println!(
+                    "attributed: {}  range: {}",
+                    format_u64(status.attributed_observations),
+                    format_quota_range(status.attributed_range.as_ref())
+                );
+                println!(
+                    "unattributed: {}  range: {}",
+                    format_u64(status.unattributed_observations),
+                    format_quota_range(status.unattributed_range.as_ref())
+                );
+                println!(
+                    "weekly sync coverage: {}/{} ({:.1}%)",
+                    format_u64(status.weekly_sync_eligible_observations),
+                    format_u64(status.weekly_observations),
+                    status.weekly_sync_eligible_coverage_percent
+                );
+                let discarded = &status.discarded;
+                println!(
+                    "reconstruction discarded: {} replayed observations, {} unused windows, {} bracketed schedules",
+                    format_u64(discarded.replayed_observations),
+                    format_u64(discarded.unused_windows),
+                    format_u64(discarded.bracketed_schedules)
+                );
+                if status.unattributed_observations > 0 {
+                    eprintln!(
+                        "warning: historical quota observations remain unassigned; backdate a source connection with `statsai source connect --started-at ...`"
+                    );
+                }
+                for warning in status.assignment_overlap_warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+        }
+        QuotaSubcommand::Current {
+            account,
+            all_scopes,
+            include_overlaps,
+            json,
+        } => {
+            let query = quota_query(store, None, account.as_deref(), None, None, None)?;
+            let mut windows = select_current_quota_windows(
+                store.quota_windows_without_usage_totals(&query)?,
+                all_scopes,
+                include_overlaps,
+            );
+            store.enrich_quota_window_usage_totals(&mut windows)?;
+            print_quota_windows(&windows, json)?;
+        }
+        QuotaSubcommand::Windows {
+            provider,
+            account,
+            from,
+            to,
+            limit_id,
+            limit,
+            json,
+        } => {
+            let query = quota_query(
+                store,
+                provider.as_deref(),
+                account.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                limit_id,
+            )?;
+            let mut windows = store.quota_windows_without_usage_totals(&query)?;
+            windows.truncate(limit.min(10_000));
+            store.enrich_quota_window_usage_totals(&mut windows)?;
+            print_quota_windows(&windows, json)?;
+        }
+        QuotaSubcommand::History {
+            window_id,
+            raw,
+            json,
+        } => {
+            let query = QuotaQuery::default();
+            let windows = store.quota_windows_without_usage_totals(&query)?;
+            let window = window_id
+                .as_deref()
+                .map(|id| windows.iter().find(|window| window.window_id == id))
+                .unwrap_or_else(|| windows.first())
+                .with_context(|| {
+                    window_id.map_or_else(
+                        || "no quota windows found".to_string(),
+                        |id| format!("quota window not found: {id}"),
+                    )
+                })?;
+            if raw {
+                let observations =
+                    raw_observations_for_window(store.quota_observations(&query, false)?, window);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "schema_version": "quota_history.v1",
+                            "window_id": window.window_id,
+                            "raw": true,
+                            "observations": observations,
+                        }))?
+                    );
+                } else {
+                    for record in observations {
+                        println!("{}", serde_json::to_string_pretty(&record)?);
+                    }
+                }
+            } else if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": "quota_history.v1",
+                        "window_id": window.window_id,
+                        "raw": false,
+                        "change_points": window.change_points,
+                    }))?
+                );
+            } else {
+                println!("{}", quota_window_heading(window));
+                for point in &window.change_points {
+                    println!(
+                        "  {}  {:>6.2}%  reset {}  slot={}",
+                        format_local_timestamp(point.observed_at),
+                        point.used_percent,
+                        format_local_timestamp(point.resets_at),
+                        point.provider_slot,
+                    );
+                }
+            }
+        }
+        QuotaSubcommand::Export { level, format } => {
+            let query = QuotaQuery::default();
+            match level.as_str() {
+                "observations" => {
+                    export_quota_observations(&store.quota_observations(&query, false)?, &format)?
+                }
+                "windows" => export_quota_windows(&store.quota_windows(&query)?, &format)?,
+                "sync-windows" => {
+                    let status = store.quota_status(&query)?;
+                    if status.weekly_sync_eligible_observations < status.weekly_observations {
+                        eprintln!(
+                            "warning: only {}/{} weekly observations are attributed and eligible for sync projection export",
+                            status.weekly_sync_eligible_observations,
+                            status.weekly_observations
+                        );
+                    }
+                    export_quota_projections(
+                        &store.quota_sync_projections(&query, device_id)?,
+                        &format,
+                    )?;
+                }
+                _ => unreachable!("clap validates quota export level"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn quota_query(
+    store: &Store,
+    provider: Option<&str>,
+    account: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    limit_id: Option<String>,
+) -> Result<QuotaQuery> {
+    let provider = provider.map(canonical_provider).transpose()?;
+    let provider_account_id = account
+        .map(|selector| resolve_quota_account_selector(store, provider.as_deref(), selector))
+        .transpose()?
+        .map(|account| account.provider_account_id);
+    Ok(QuotaQuery {
+        provider,
+        provider_account_id,
+        source_id: None,
+        from: from.map(parse_date).transpose()?,
+        to: to.map(parse_quota_range_end).transpose()?,
+        limit_id,
+    })
+}
+
+fn parse_quota_range_end(value: &str) -> Result<DateTime<Utc>> {
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+        return Ok(timestamp.with_timezone(&Utc));
+    }
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")?;
+    let next_day = date
+        .succ_opt()
+        .context("quota range end is outside the supported calendar")?;
+    Ok(next_day
+        .and_hms_opt(0, 0, 0)
+        .context("failed to build quota range end")?
+        .and_utc()
+        - Duration::nanoseconds(1))
+}
+
+fn resolve_quota_account_selector(
+    store: &Store,
+    provider: Option<&str>,
+    selector: &str,
+) -> Result<ProviderAccount> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("account selector cannot be empty");
+    }
+    let normalized_email = normalize_email(selector);
+    let normalized_provider_user_id = normalize_provider_user_id(selector);
+    let normalized_label = selector.to_ascii_lowercase();
+    let mut matches = store
+        .list_accounts()?
+        .into_iter()
+        .filter(|account| provider.is_none_or(|provider| account.provider == provider))
+        .filter(|account| {
+            account.provider_account_id.0 == selector
+                || account.email.as_deref().map(normalize_email).as_deref()
+                    == Some(normalized_email.as_str())
+                || account
+                    .provider_user_id
+                    .as_deref()
+                    .map(normalize_provider_user_id)
+                    .as_deref()
+                    == Some(normalized_provider_user_id.as_str())
+                || account
+                    .account_label
+                    .as_deref()
+                    .map(|label| label.trim().to_ascii_lowercase())
+                    .as_deref()
+                    == Some(normalized_label.as_str())
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|account| account.provider_account_id.0.clone());
+    matches.dedup_by(|left, right| left.provider_account_id == right.provider_account_id);
+    match matches.len() {
+        0 => bail!("no account matched '{selector}'"),
+        1 => Ok(matches.remove(0)),
+        _ => bail!(
+            "multiple provider accounts matched '{selector}'; use a stable provider account id"
+        ),
+    }
+}
+
+fn select_current_quota_windows(
+    windows: Vec<QuotaWindowV1>,
+    all_scopes: bool,
+    include_overlaps: bool,
+) -> Vec<QuotaWindowV1> {
+    let mut by_scope = BTreeMap::<
+        (String, Option<String>, Option<String>, Option<String>, u64),
+        Vec<QuotaWindowV1>,
+    >::new();
+    for window in windows {
+        by_scope
+            .entry((
+                window.provider.clone(),
+                window.provider_account_id.as_ref().map(|id| id.0.clone()),
+                window.source_id.as_ref().map(|id| id.0.clone()),
+                window.limit_id.clone(),
+                window.window_minutes,
+            ))
+            .or_default()
+            .push(window);
+    }
+    let mut selected = Vec::new();
+    for mut scope_windows in by_scope.into_values() {
+        scope_windows.sort_by_key(|window| window.first_observed_at);
+        let newest = scope_windows.pop().expect("scope contains a window");
+        if include_overlaps {
+            selected.extend(scope_windows.into_iter().filter(|older| {
+                older.inferred_start < newest.representative_reset
+                    && older.representative_reset > newest.inferred_start
+            }));
+        }
+        selected.push(newest);
+    }
+    if !all_scopes {
+        let mut longest =
+            BTreeMap::<(String, Option<String>, Option<String>, Option<String>), u64>::new();
+        for window in &selected {
+            let key = (
+                window.provider.clone(),
+                window.provider_account_id.as_ref().map(|id| id.0.clone()),
+                window.source_id.as_ref().map(|id| id.0.clone()),
+                window.limit_id.clone(),
+            );
+            longest
+                .entry(key)
+                .and_modify(|duration| *duration = (*duration).max(window.window_minutes))
+                .or_insert(window.window_minutes);
+        }
+        selected.retain(|window| {
+            longest.get(&(
+                window.provider.clone(),
+                window.provider_account_id.as_ref().map(|id| id.0.clone()),
+                window.source_id.as_ref().map(|id| id.0.clone()),
+                window.limit_id.clone(),
+            )) == Some(&window.window_minutes)
+        });
+    }
+    selected.sort_by(|left, right| {
+        right
+            .window_minutes
+            .cmp(&left.window_minutes)
+            .then_with(|| right.first_observed_at.cmp(&left.first_observed_at))
+    });
+    selected
+}
+
+fn print_quota_windows(windows: &[QuotaWindowV1], json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(windows)?);
+        return Ok(());
+    }
+    if windows.is_empty() {
+        println!("no quota windows");
+        return Ok(());
+    }
+    for window in windows {
+        println!("{}", quota_window_heading(window));
+        println!(
+            "  observed {} to {}; samples={} transition={:?}",
+            format_local_timestamp(window.first_observed_at),
+            format_local_timestamp(window.last_observed_at),
+            format_u64(window.sample_count),
+            window.transition,
+        );
+        if let Some(usage_totals) = &window.usage_totals {
+            println!(
+                "  usage events={} tokens={} cost_micro_usd={}",
+                format_u64(usage_totals.event_count),
+                format_u64(usage_totals.total_tokens),
+                usage_totals
+                    .estimated_cost_micro_usd
+                    .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            );
+        } else {
+            println!("  usage unavailable until the quota history is attributed to an account");
+        }
+        if window.has_schedule_overlap {
+            eprintln!(
+                "warning: {} overlaps another reconstructed epoch in the same quota scope",
+                window.window_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn quota_window_heading(window: &QuotaWindowV1) -> String {
+    let identity = window.provider_account_id.as_ref().map_or_else(
+        || {
+            window.source_id.as_ref().map_or_else(
+                || "unassigned".to_string(),
+                |id| format!("unassigned@{}", id.0),
+            )
+        },
+        |id| id.0.clone(),
+    );
+    format!(
+        "{}  {}  {}m  {:.2}%  reset {}  id={}",
+        window.provider,
+        identity,
+        window.window_minutes,
+        window.latest_used_percent,
+        format_local_timestamp(window.representative_reset),
+        window.window_id,
+    )
+}
+
+fn format_local_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
+}
+
+fn format_quota_range(range: Option<&statsai_store::QuotaDateRange>) -> String {
+    range.map_or_else(
+        || "none".to_string(),
+        |range| {
+            format!(
+                "{} to {}",
+                format_local_timestamp(range.first),
+                format_local_timestamp(range.last)
+            )
+        },
+    )
+}
+
+fn raw_observations_for_window(
+    records: Vec<QuotaObservationRecordV1>,
+    window: &QuotaWindowV1,
+) -> Vec<QuotaObservationRecordV1> {
+    records
+        .into_iter()
+        .filter(|record| {
+            record.observation.provider == window.provider
+                && record.observation.provider_account_id == window.provider_account_id
+                && window
+                    .source_id
+                    .as_ref()
+                    .is_none_or(|source_id| &record.observation.source_id == source_id)
+                && record.windows.iter().any(|candidate| {
+                    candidate.limit_id == window.limit_id
+                        && candidate.window_minutes == window.window_minutes
+                        && candidate.resets_at_epoch_seconds >= window.reset_min_epoch_seconds
+                        && candidate.resets_at_epoch_seconds <= window.reset_max_epoch_seconds
+                })
+        })
+        .collect()
+}
+
+fn export_quota_observations(records: &[QuotaObservationRecordV1], format: &str) -> Result<()> {
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(records)?),
+        "jsonl" => print_json_lines(records)?,
+        "csv" => {
+            let mut writer = csv::Writer::from_writer(std::io::stdout());
+            writer.write_record([
+                "schema_version",
+                "observation_id",
+                "semantic_fingerprint",
+                "provider",
+                "source_id",
+                "provider_account_id",
+                "observed_at",
+                "source_file_path_hash",
+                "source_record_id",
+                "usage_event_id",
+                "usage_link_kind",
+                "payload_hash",
+                "usage_total_tokens",
+                "provider_slot",
+                "limit_id",
+                "window_minutes",
+                "used_percent",
+                "resets_at",
+                "resets_at_epoch_seconds",
+            ])?;
+            for record in records {
+                let observation = &record.observation;
+                let base = vec![
+                    observation.schema_version.clone(),
+                    observation.observation_id.clone(),
+                    observation.semantic_fingerprint.clone(),
+                    observation.provider.clone(),
+                    observation.source_id.0.clone(),
+                    observation
+                        .provider_account_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default(),
+                    observation.observed_at.to_rfc3339(),
+                    observation.source_file_path_hash.clone(),
+                    observation.source_record_id.clone(),
+                    observation
+                        .usage_event_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default(),
+                    serde_json::to_value(observation.usage_link_kind)?
+                        .as_str()
+                        .unwrap_or("none")
+                        .to_string(),
+                    observation.payload_hash.clone(),
+                    observation
+                        .usage_sample
+                        .as_ref()
+                        .map(|usage| usage.computed_total().to_string())
+                        .unwrap_or_default(),
+                ];
+                if record.windows.is_empty() {
+                    let mut row = base;
+                    row.extend(std::iter::repeat_n(String::new(), 6));
+                    writer.write_record(row)?;
+                    continue;
+                }
+                for window in &record.windows {
+                    let mut row = base.clone();
+                    row.extend([
+                        window.provider_slot.clone(),
+                        window.limit_id.clone().unwrap_or_default(),
+                        window.window_minutes.to_string(),
+                        window.used_percent.to_string(),
+                        window.resets_at.to_rfc3339(),
+                        window.resets_at_epoch_seconds.to_string(),
+                    ]);
+                    writer.write_record(row)?;
+                }
+            }
+            writer.flush()?;
+        }
+        _ => unreachable!("clap validates quota export format"),
+    }
+    Ok(())
+}
+
+fn export_quota_windows(windows: &[QuotaWindowV1], format: &str) -> Result<()> {
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(windows)?),
+        "jsonl" => print_json_lines(windows)?,
+        "csv" => {
+            let mut writer = csv::Writer::from_writer(std::io::stdout());
+            writer.write_record([
+                "schema_version",
+                "window_id",
+                "provider",
+                "provider_account_id",
+                "source_id",
+                "limit_id",
+                "window_minutes",
+                "inferred_start",
+                "representative_reset",
+                "representative_reset_epoch_seconds",
+                "reset_min_epoch_seconds",
+                "reset_max_epoch_seconds",
+                "first_observed_at",
+                "last_observed_at",
+                "sample_count",
+                "first_used_percent",
+                "latest_used_percent",
+                "minimum_used_percent",
+                "maximum_used_percent",
+                "event_count",
+                "total_tokens",
+                "estimated_cost_micro_usd",
+            ])?;
+            for window in windows {
+                writer.write_record([
+                    window.schema_version.clone(),
+                    window.window_id.clone(),
+                    window.provider.clone(),
+                    window
+                        .provider_account_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default(),
+                    window
+                        .source_id
+                        .as_ref()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default(),
+                    window.limit_id.clone().unwrap_or_default(),
+                    window.window_minutes.to_string(),
+                    window.inferred_start.to_rfc3339(),
+                    window.representative_reset.to_rfc3339(),
+                    window.representative_reset_epoch_seconds.to_string(),
+                    window.reset_min_epoch_seconds.to_string(),
+                    window.reset_max_epoch_seconds.to_string(),
+                    window.first_observed_at.to_rfc3339(),
+                    window.last_observed_at.to_rfc3339(),
+                    window.sample_count.to_string(),
+                    window.first_used_percent.to_string(),
+                    window.latest_used_percent.to_string(),
+                    window.minimum_used_percent.to_string(),
+                    window.maximum_used_percent.to_string(),
+                    window
+                        .usage_totals
+                        .as_ref()
+                        .map(|totals| totals.event_count.to_string())
+                        .unwrap_or_default(),
+                    window
+                        .usage_totals
+                        .as_ref()
+                        .map(|totals| totals.total_tokens.to_string())
+                        .unwrap_or_default(),
+                    window
+                        .usage_totals
+                        .as_ref()
+                        .and_then(|totals| totals.estimated_cost_micro_usd)
+                        .map(|cost| cost.to_string())
+                        .unwrap_or_default(),
+                ])?;
+            }
+            writer.flush()?;
+        }
+        _ => unreachable!("clap validates quota export format"),
+    }
+    Ok(())
+}
+
+fn export_quota_projections(
+    projections: &[QuotaWindowSyncProjectionV1],
+    format: &str,
+) -> Result<()> {
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(projections)?),
+        "jsonl" => print_json_lines(projections)?,
+        "csv" => {
+            let mut writer = csv::Writer::from_writer(std::io::stdout());
+            writer.write_record([
+                "schema_version",
+                "projection_id",
+                "device_id",
+                "provider",
+                "provider_account_id",
+                "limit_id",
+                "window_minutes",
+                "inferred_start",
+                "representative_reset",
+                "representative_reset_epoch_seconds",
+                "reset_min_epoch_seconds",
+                "reset_max_epoch_seconds",
+                "first_observed_at",
+                "last_observed_at",
+                "sample_count",
+                "latest_used_percent",
+                "change_points_json",
+                "status_json",
+            ])?;
+            for projection in projections {
+                writer.write_record([
+                    projection.schema_version.clone(),
+                    projection.projection_id.clone(),
+                    projection.device_id.clone(),
+                    projection.provider.clone(),
+                    projection.provider_account_id.0.clone(),
+                    projection.limit_id.clone().unwrap_or_default(),
+                    projection.window_minutes.to_string(),
+                    projection.inferred_start.to_rfc3339(),
+                    projection.representative_reset.to_rfc3339(),
+                    projection.representative_reset_epoch_seconds.to_string(),
+                    projection.reset_min_epoch_seconds.to_string(),
+                    projection.reset_max_epoch_seconds.to_string(),
+                    projection.first_observed_at.to_rfc3339(),
+                    projection.last_observed_at.to_rfc3339(),
+                    projection.sample_count.to_string(),
+                    projection.latest_used_percent.to_string(),
+                    serde_json::to_string(&projection.change_points)?,
+                    serde_json::to_string(&projection.latest_status)?,
+                ])?;
+            }
+            writer.flush()?;
+        }
+        _ => unreachable!("clap validates quota export format"),
+    }
+    Ok(())
+}
+
+fn print_json_lines<T: Serialize>(values: &[T]) -> Result<()> {
+    for value in values {
+        println!("{}", serde_json::to_string(value)?);
     }
     Ok(())
 }
@@ -6095,18 +7395,71 @@ fn collect_conversations(
 ) -> Result<()> {
     let canonical_provider_filter = canonical_conversation_provider_filter(provider_filter)?;
     let configured_sources = store.list_sources()?;
-    let mut sources_collected = 0u64;
-    let mut total_conversations = 0u64;
-    let mut total_items = 0u64;
-    let mut total_parts = 0u64;
-    let mut total_binary_bytes = 0u64;
-    let mut total_missing = 0u64;
+    // Reduced durability covers the imports and nothing after them. An import
+    // rebuilds from the provider's own files, so a commit lost to a power cut
+    // costs a re-collect. The code-change refresh that follows carries metrics
+    // forward for commits too old for Git to be rescanned for, and writes them
+    // across several transactions, so it keeps the store's normal durability.
+    // Anything added below belongs after this block unless it is as reproducible
+    // as an import.
+    let totals = {
+        let _durability = store.relax_durability_for_bulk_import()?;
+        collect_archive_sources(
+            store,
+            canonical_provider_filter,
+            &configured_sources,
+            no_cache,
+            verbose,
+        )?
+    };
+    println!(
+        "archive collection: sources={} conversations={} items={} parts={} binary_bytes={} missing={}",
+        totals.sources,
+        totals.conversations,
+        totals.items,
+        totals.parts,
+        totals.binary_bytes,
+        totals.missing,
+    );
+    let code_changes = store.refresh_code_changes(device_id)?;
+    println!(
+        "code changes: trace_edits={} repositories={} commits={} trace_matched={} metrics={} trace_coverage={:?} git_coverage={:?}",
+        code_changes.trace_edits,
+        code_changes.repositories,
+        code_changes.commits,
+        code_changes.matches,
+        code_changes.metrics,
+        code_changes.trace_coverage,
+        code_changes.git_coverage,
+    );
+    Ok(())
+}
 
+/// What one `conversation collect` run imported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ArchiveCollectionTotals {
+    sources: u64,
+    conversations: u64,
+    items: u64,
+    parts: u64,
+    binary_bytes: u64,
+    missing: u64,
+}
+
+/// Imports every archive source the filter admits.
+fn collect_archive_sources(
+    store: &Store,
+    canonical_provider_filter: Option<&str>,
+    configured_sources: &[SourceLocation],
+    no_cache: bool,
+    verbose: bool,
+) -> Result<ArchiveCollectionTotals> {
+    let mut totals = ArchiveCollectionTotals::default();
     for adapter in default_adapters() {
         if canonical_provider_filter.is_some_and(|provider| provider != adapter.provider()) {
             continue;
         }
-        for source in scan_sources_for_adapter(adapter.as_ref(), &configured_sources) {
+        for source in scan_sources_for_adapter(adapter.as_ref(), configured_sources) {
             let candidates = adapter.archive_scan_candidates(&source)?;
             let entries = scan_file_state_entries(&candidates);
             // An empty candidate list from an unreachable root — an unmounted
@@ -6151,12 +7504,12 @@ fn collect_conversations(
                 &pending,
                 verbose,
             )?;
-            sources_collected += 1;
-            total_conversations += collected.conversations;
-            total_items += collected.items;
-            total_parts += collected.parts;
-            total_binary_bytes += collected.binary_bytes;
-            total_missing += collected.missing;
+            totals.sources += 1;
+            totals.conversations += collected.conversations;
+            totals.items += collected.items;
+            totals.parts += collected.parts;
+            totals.binary_bytes += collected.binary_bytes;
+            totals.missing += collected.missing;
             if verbose {
                 println!(
                     "{} {}: files={} conversations={} items={} parts={} binary_bytes={} missing={} invalid_records={}",
@@ -6173,27 +7526,7 @@ fn collect_conversations(
             }
         }
     }
-    println!(
-        "archive collection: sources={} conversations={} items={} parts={} binary_bytes={} missing={}",
-        sources_collected,
-        total_conversations,
-        total_items,
-        total_parts,
-        total_binary_bytes,
-        total_missing,
-    );
-    let code_changes = store.refresh_code_changes(device_id)?;
-    println!(
-        "code changes: trace_edits={} repositories={} commits={} trace_matched={} metrics={} trace_coverage={:?} git_coverage={:?}",
-        code_changes.trace_edits,
-        code_changes.repositories,
-        code_changes.commits,
-        code_changes.matches,
-        code_changes.metrics,
-        code_changes.trace_coverage,
-        code_changes.git_coverage,
-    );
-    Ok(())
+    Ok(totals)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -6219,63 +7552,236 @@ fn collect_archive_source_entries(
         .iter()
         .map(|candidate| (candidate.cache_key.as_str(), candidate))
         .collect::<HashMap<_, _>>();
+    // Sized once: grouping and the reconstruction budget both ask for this, and
+    // a source can hold thousands of files.
+    let source_bytes = pending
+        .iter()
+        .map(|entry| {
+            candidates_by_key
+                .get(entry.cache_key.as_str())
+                .and_then(|candidate| std::fs::metadata(&candidate.path).ok())
+                .map_or(0, |metadata| metadata.len())
+        })
+        .collect::<Vec<_>>();
     let mut collected = ArchiveSourceCollection::default();
-    for (index, entry) in pending.iter().enumerate() {
-        let candidate = candidates_by_key.get(entry.cache_key.as_str()).copied();
-        let candidate_bytes = candidate
-            .and_then(|candidate| std::fs::metadata(&candidate.path).ok())
-            .map_or(0, |metadata| metadata.len());
-        let report_candidate =
-            verbose && (index == 0 || (index + 1) % 25 == 0 || candidate_bytes >= 16 * 1024 * 1024);
-        if report_candidate {
-            println!(
-                "{} {}: collecting file {}/{} ({} bytes) {}",
-                adapter.provider(),
-                preview_path_label(source),
-                index + 1,
-                pending.len(),
-                candidate_bytes,
-                candidate
-                    .and_then(|candidate| candidate.path.file_name())
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(entry.cache_key.as_str()),
-            );
-        }
+    let mut index = 0;
+    while index < pending.len() {
+        let group = archive_collection_group(&source_bytes, index);
+        let group_entries = &pending[index..index + group];
 
+        // Reading and reconstructing a transcript is independent per file and
+        // is what the wall clock is mostly spent on, so the group is parsed on
+        // several threads. The results are written in file order on this
+        // thread: two files can describe the same conversation, and the record
+        // that wins must not depend on which thread finished first.
         let collect_started = Instant::now();
-        let selected = HashSet::from([entry.cache_key.clone()]);
-        let scan = adapter.collect_archive(source, Some(&selected))?;
+        let scans = parse_archive_group(
+            adapter,
+            source,
+            group_entries,
+            &source_bytes[index..index + group],
+        );
         let collect_elapsed = collect_started.elapsed();
+        // Reconstruction stops early when it is already holding enough content,
+        // so the run advances by what came back rather than what was offered.
+        // Advancing by anything else would step over a file that was never
+        // stored, and a run that reconstructed nothing has to say so rather
+        // than skip the file or ask for it forever.
+        let group = scans.len();
+        ensure!(
+            group > 0,
+            "reconstructed no archive files from {} at file {}",
+            preview_path_label(source),
+            index + 1,
+        );
+
         let store_started = Instant::now();
-        let write = store.store_archive_scan_with_code_changes(
-            &source.source_id,
-            &scan.conversations,
-            std::slice::from_ref(entry),
-            &scan.artifact_dependencies,
-            &scan.trace_edits,
-            scan.trace_coverage,
-        )?;
+        // One transaction per file: a file's rows and the cache entry that
+        // records it are committed together, and a file that fails stops the
+        // run only after every file before it has been stored.
+        for (entry, scan) in group_entries.iter().zip(scans) {
+            let scan = scan?;
+            let write = store.store_archive_scan_with_code_changes(
+                &source.source_id,
+                &scan.conversations,
+                std::slice::from_ref(entry),
+                &scan.artifact_dependencies,
+                &scan.trace_edits,
+                scan.trace_coverage,
+                &scan.quota_observations,
+            )?;
+            collected.files += scan.diagnostics.files_scanned;
+            collected.conversations += write.conversations;
+            collected.items += write.items;
+            collected.parts += write.content_parts;
+            collected.binary_bytes += write.binary_bytes;
+            collected.missing += scan.diagnostics.missing_content;
+            collected.invalid_records += scan.diagnostics.invalid_records;
+        }
         let store_elapsed = store_started.elapsed();
-        collected.files += scan.diagnostics.files_scanned;
-        collected.conversations += write.conversations;
-        collected.items += write.items;
-        collected.parts += write.content_parts;
-        collected.binary_bytes += write.binary_bytes;
-        collected.missing += scan.diagnostics.missing_content;
-        collected.invalid_records += scan.diagnostics.invalid_records;
-        if report_candidate {
+        if verbose {
             println!(
-                "{} {}: completed file {}/{} collect={:.1}s store={:.1}s",
+                "{} {}: collected files {}-{}/{} collect={:.1}s store={:.1}s",
                 adapter.provider(),
                 preview_path_label(source),
                 index + 1,
+                index + group,
                 pending.len(),
                 collect_elapsed.as_secs_f64(),
                 store_elapsed.as_secs_f64(),
             );
         }
+        index += group;
     }
     Ok(collected)
+}
+
+/// Files parsed together before their results are written.
+const ARCHIVE_COLLECTION_GROUP_FILES: usize = 16;
+/// Source bytes a group stops growing at.
+///
+/// A group is held in memory in full, and one transcript can be tens of
+/// megabytes that expand further once reconstructed, so the bound is on the
+/// input size rather than the file count alone.
+const ARCHIVE_COLLECTION_GROUP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Number of files to take for the group starting at `index`, always at least
+/// one so that a single oversized file still makes progress.
+fn archive_collection_group(source_bytes: &[u64], index: usize) -> usize {
+    let mut group = 0;
+    let mut bytes = 0u64;
+    while index + group < source_bytes.len() && group < ARCHIVE_COLLECTION_GROUP_FILES {
+        bytes = bytes.saturating_add(source_bytes[index + group]);
+        group += 1;
+        if bytes >= ARCHIVE_COLLECTION_GROUP_BYTES {
+            break;
+        }
+    }
+    group.max(1)
+}
+
+/// Reconstructed content a group holds before its results are stored.
+///
+/// Source size does not predict this: a one-line transcript can name a local
+/// artifact of tens of megabytes, which is materialized and carried as base64.
+/// Workers therefore stop taking new files once the group has this much
+/// outstanding, and the files they did not reach are simply the next group.
+const ARCHIVE_COLLECTION_RETAINED_BYTES: usize = 192 * 1024 * 1024;
+/// Files reconstructed at once.
+///
+/// A file's real cost is only known once it has been read: a one-line
+/// transcript may name artifacts many times its own size, so no estimate taken
+/// beforehand can bound it. What can be bounded is how many files are being
+/// read at once, which is what keeps the worst case a small multiple of the
+/// largest single file rather than a multiple of the core count.
+const ARCHIVE_COLLECTION_IN_FLIGHT: usize = 4;
+/// Least a file is charged against the budget while it is being reconstructed.
+///
+/// Set so that the budget alone admits [`ARCHIVE_COLLECTION_IN_FLIGHT`] files
+/// of unknown size, and fewer once one of them is known to be large.
+const ARCHIVE_COLLECTION_FILE_RESERVE: usize =
+    ARCHIVE_COLLECTION_RETAINED_BYTES / ARCHIVE_COLLECTION_IN_FLIGHT;
+
+/// How much of the budget a group has outstanding, and which file is next.
+///
+/// Both move together under one lock: a worker that decided to take a file
+/// having seen the budget empty, while its peers were deciding the same thing,
+/// is how a bound on retained content stops being one.
+struct ArchiveGroupClaim {
+    next: usize,
+    retained: usize,
+}
+
+/// Reconstructs a leading run of `entries`, in parallel, preserving their order.
+///
+/// Returns one result per file reconstructed, which may be fewer than were
+/// offered; the caller advances by however many came back. A file that cannot
+/// be read is reported in its own position rather than aborting the run, so the
+/// caller can still store every file that precedes it. Collection is resumable
+/// precisely because a file that was stored stays stored when a later one
+/// fails.
+fn parse_archive_group(
+    adapter: &dyn ProviderAdapter,
+    source: &SourceLocation,
+    entries: &[ScanFileStateEntry],
+    source_bytes: &[u64],
+) -> Vec<Result<ArchiveScan>> {
+    let collect_one = |entry: &ScanFileStateEntry| {
+        let selected = HashSet::from([entry.cache_key.clone()]);
+        adapter.collect_archive(source, Some(&selected))
+    };
+    if entries.len() == 1 {
+        return vec![collect_one(&entries[0])];
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(ARCHIVE_COLLECTION_IN_FLIGHT, std::num::NonZeroUsize::get)
+        .min(entries.len())
+        .min(ARCHIVE_COLLECTION_IN_FLIGHT);
+    let claim = std::sync::Mutex::new(ArchiveGroupClaim {
+        next: 0,
+        retained: 0,
+    });
+    let results = (0..entries.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let (index, reserved) = {
+                    let mut claim = claim.lock().expect("archive group claim");
+                    let index = claim.next;
+                    if index >= entries.len() {
+                        return;
+                    }
+                    let reserved = usize::try_from(source_bytes.get(index).copied().unwrap_or(0))
+                        .unwrap_or(usize::MAX)
+                        .max(ARCHIVE_COLLECTION_FILE_RESERVE);
+                    // The first file is always taken, so one file larger than
+                    // the whole budget still makes progress.
+                    if index > 0
+                        && claim.retained.saturating_add(reserved)
+                            > ARCHIVE_COLLECTION_RETAINED_BYTES
+                    {
+                        return;
+                    }
+                    claim.next = index + 1;
+                    claim.retained = claim.retained.saturating_add(reserved);
+                    (index, reserved)
+                };
+                let scan = collect_one(&entries[index]);
+                // What the file actually costs replaces what it was charged.
+                let actual = scan.as_ref().map_or(0, archive_scan_retained_bytes);
+                {
+                    let mut claim = claim.lock().expect("archive group claim");
+                    claim.retained = claim
+                        .retained
+                        .saturating_sub(reserved)
+                        .saturating_add(actual);
+                }
+                *results[index].lock().expect("archive scan slot") = Some(scan);
+            });
+        }
+    });
+    // Indices are handed out in order and every one handed out is reconstructed,
+    // so the results form a leading run. Stopping at the first gap keeps that
+    // true whatever the workers did.
+    results
+        .into_iter()
+        .map_while(|slot| slot.into_inner().expect("archive scan slot"))
+        .collect()
+}
+
+/// Reconstructed content a scan is holding in memory.
+fn archive_scan_retained_bytes(scan: &ArchiveScan) -> usize {
+    scan.conversations
+        .iter()
+        .flat_map(|conversation| &conversation.items)
+        .flat_map(|item| &item.parts)
+        .map(|part| {
+            part.text.as_ref().map_or(0, String::len)
+                + part.data_base64.as_ref().map_or(0, String::len)
+        })
+        .sum()
 }
 
 fn canonical_conversation_provider_filter(provider: Option<&str>) -> Result<Option<&'static str>> {
@@ -7578,7 +9084,70 @@ fn reattribute_source_records(store: &Store, source_id: &SourceId) -> Result<()>
     }
     store.rewrite_events(&events)?;
     store.rewrite_summaries(&summaries)?;
+    store.reattribute_quota_observations(source_id)?;
+    store.rebuild_quota_plan_observations_for_source(source_id)?;
     Ok(())
+}
+
+fn canonicalize_account_evidence(
+    store: &Store,
+    provider: &str,
+    evidence: &mut AccountEvidenceScan,
+) -> Result<()> {
+    let mut canonical_ids = HashMap::new();
+    for observed in &evidence.accounts {
+        let Some(detected_id) = provider_account_id_from_identity(
+            provider,
+            observed.provider_user_id.as_deref(),
+            observed.email.as_deref(),
+        ) else {
+            continue;
+        };
+        let account = upsert_provider_account(
+            store,
+            UpsertProviderAccountInput {
+                provider,
+                provider_user_id: observed.provider_user_id.as_deref(),
+                email: observed.email.as_deref(),
+                label: None,
+                // Plan evidence has its own history and must not mutate billing/account facts.
+                plan_name: None,
+                identity_source: Some(IdentitySource::LocalAuth),
+                verified_at: Some(observed.observed_at),
+            },
+        )?;
+        canonical_ids.insert(detected_id, account.provider_account_id);
+    }
+
+    remap_account_evidence_account_ids(evidence, &canonical_ids);
+    Ok(())
+}
+
+fn canonicalize_known_account_evidence(
+    store: &Store,
+    provider: &str,
+    evidence: &mut AccountEvidenceScan,
+) -> Result<HashMap<ProviderAccountId, ProviderAccountId>> {
+    let mut canonical_ids = HashMap::new();
+    for observed in &evidence.accounts {
+        let Some(detected_id) = provider_account_id_from_identity(
+            provider,
+            observed.provider_user_id.as_deref(),
+            observed.email.as_deref(),
+        ) else {
+            continue;
+        };
+        if let Some(account) = find_existing_provider_account(
+            store,
+            provider,
+            observed.provider_user_id.as_deref(),
+            observed.email.as_deref(),
+        )? {
+            canonical_ids.insert(detected_id, account.provider_account_id);
+        }
+    }
+    remap_account_evidence_account_ids(evidence, &canonical_ids);
+    Ok(canonical_ids)
 }
 
 fn apply_source_account_resolution(
@@ -7805,6 +9374,7 @@ struct ScanPreviewLine<'a> {
     usage: &'a UsageTotals,
     summaries: u64,
     task_spans: u64,
+    quota_observations: u64,
     summary_usage: &'a UsageTotals,
     diagnostics: &'a ScanDiagnostics,
     verbose: bool,
@@ -7813,12 +9383,13 @@ struct ScanPreviewLine<'a> {
 fn print_scan_preview_line(line: ScanPreviewLine<'_>) {
     if line.verbose {
         println!(
-            "{} path={} usage_events={} summaries={} task_spans={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
+            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
             line.source.provider,
             preview_path_label(line.source),
             line.usage_events,
             line.summaries,
             line.task_spans,
+            line.quota_observations,
             format_u64(line.usage.input_tokens),
             format_u64(line.usage.cache_creation_tokens),
             format_u64(line.usage.cached_input_tokens),
@@ -7841,12 +9412,13 @@ fn print_scan_preview_line(line: ScanPreviewLine<'_>) {
         );
     } else {
         println!(
-            "{} path={} usage_events={} summaries={} task_spans={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={}",
+            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={}",
             line.source.provider,
             preview_path_label(line.source),
             line.usage_events,
             line.summaries,
             line.task_spans,
+            line.quota_observations,
             format_u64(line.usage.input_tokens),
             format_u64(line.usage.cache_creation_tokens),
             format_u64(line.usage.cached_input_tokens),
@@ -8013,6 +9585,22 @@ fn should_replace_source_records_for_scan(
         || (candidate_count > 0 && pending_count == candidate_count)
 }
 
+/// Whether this scan must delete every quota row the source owns before reinserting.
+///
+/// `--no-cache` used to be here. It reparses every file, so file-level reconciliation already
+/// covers everything it rewrites, and the only rows the file path could miss are those no current
+/// file accounts for -- which `delete_quota_observations_for_source_outside_file_hashes` retires
+/// directly. Deleting the whole source to reach them walked every observation, every window, and
+/// the payload table, and on a multi-gigabyte store that ran for tens of minutes. `--replace` keeps
+/// the blanket delete: it is documented as a destructive rebuild, and a caller asking for one is
+/// asking for exactly that.
+fn should_replace_all_source_quota_records(
+    explicit_replace: bool,
+    legacy_full_reconcile: bool,
+) -> bool {
+    explicit_replace || legacy_full_reconcile
+}
+
 fn scan_file_hashes_for_reconciliation(
     pending_entries: &[ScanFileStateEntry],
     removed_entries: &[ScanFileStateEntry],
@@ -8053,6 +9641,20 @@ fn rewrite_task_span_linked_event_ids(
             }
         }
         span.linked_event_ids = rewritten;
+    }
+}
+
+fn rewrite_quota_usage_event_ids(
+    observations: &mut [QuotaObservationRecordV1],
+    canonical_event_ids: &HashMap<EventId, EventId>,
+) {
+    for record in observations {
+        let Some(event_id) = record.observation.usage_event_id.as_ref() else {
+            continue;
+        };
+        if let Some(canonical) = canonical_event_ids.get(event_id) {
+            record.observation.usage_event_id = Some(canonical.clone());
+        }
     }
 }
 
@@ -8408,6 +10010,13 @@ fn sanitize_account_for_sync(mut account: ProviderAccount) -> ProviderAccount {
     if !matches!(account.identity_source, IdentitySource::UserConfigured) {
         account.account_label = None;
     }
+    // The email and provider user id stay. They are how a person tells one of
+    // their own accounts from another in the dashboard, which is the whole
+    // point of syncing accounts at all; stripping them left every account
+    // showing as a bare `acct_` hash. The new evidence types are the ones that
+    // must never carry them -- those travel as hashes and are covered by their
+    // own contracts. `plan_name` still goes, because a plan is now evidence
+    // rather than an account attribute.
     account.plan_name = None;
     account
 }
@@ -8796,6 +10405,435 @@ mod tests {
         }
     }
 
+    struct AccountEvidenceTrackingAdapter {
+        source: SourceLocation,
+        candidate: ScanCandidateFile,
+        event: UsageEvent,
+        collect_calls: Arc<Mutex<u64>>,
+    }
+
+    impl ProviderAdapter for AccountEvidenceTrackingAdapter {
+        fn id(&self) -> &'static str {
+            "test-account-evidence"
+        }
+
+        fn version(&self) -> &'static str {
+            "0"
+        }
+
+        fn provider(&self) -> &'static str {
+            "codex"
+        }
+
+        fn discover(&self) -> Vec<SourceLocation> {
+            vec![self.source.clone()]
+        }
+
+        fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+            Ok(vec![self.candidate.clone()])
+        }
+
+        fn collect_account_evidence(
+            &self,
+            _source: &SourceLocation,
+            _checkpoints: &[statsai_core::AccountEvidenceCheckpointV1],
+        ) -> Result<AccountEvidenceScan> {
+            *self.collect_calls.lock().expect("collect calls") += 1;
+            Ok(AccountEvidenceScan::default())
+        }
+
+        fn scan(
+            &self,
+            _source: &SourceLocation,
+            _options: &ScanOptions,
+        ) -> Result<statsai_adapters::AdapterScan> {
+            Ok(statsai_adapters::AdapterScan {
+                events: vec![self.event.clone()],
+                ..statsai_adapters::AdapterScan::default()
+            })
+        }
+    }
+
+    fn seed_test_account_evidence(
+        store: &Store,
+        source: &SourceLocation,
+        observed_at: DateTime<Utc>,
+    ) {
+        let account_id = ProviderAccountId("account-source-cleanup".to_string());
+        store
+            .upsert_account_identity_observations(&[statsai_core::AccountIdentityObservationV1 {
+                schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                    .to_string(),
+                observation_id: "identity-source-cleanup".to_string(),
+                provider: source.provider.clone(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(account_id.clone()),
+                provider_user_id_hash: Some("a".repeat(64)),
+                email_hash: None,
+                conversation_id_hash: Some("b".repeat(64)),
+                turn_id_hash: None,
+                observed_at,
+                evidence_kind: statsai_core::AccountEvidenceKind::TelemetryIdentity,
+                confidence: Confidence::High,
+                auth_mode: Some("chatgpt".to_string()),
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "test".to_string(),
+                artifact_path_hash: "c".repeat(64),
+                record_fingerprint: "d".repeat(64),
+            }])
+            .expect("identity evidence");
+        store
+            .upsert_account_plan_observations(&[statsai_core::AccountPlanObservationV1 {
+                schema_version: statsai_core::ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id: "plan-source-cleanup".to_string(),
+                provider: source.provider.clone(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(account_id.clone()),
+                raw_plan_name: "pro".to_string(),
+                plan_name: "Pro".to_string(),
+                observed_at,
+                active_from: None,
+                active_until: None,
+                is_current_snapshot: false,
+                evidence_kind: statsai_core::AccountEvidenceKind::QuotaStatus,
+                confidence: Confidence::High,
+                parser_version: "test.v1".to_string(),
+                artifact_path_hash: "c".repeat(64),
+                record_fingerprint: "e".repeat(64),
+            }])
+            .expect("plan evidence");
+        store
+            .upsert_conversation_account_bindings(&[statsai_core::ConversationAccountBindingV1 {
+                schema_version: statsai_core::CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION
+                    .to_string(),
+                binding_id: "binding-source-cleanup".to_string(),
+                provider: source.provider.clone(),
+                source_id: source.source_id.clone(),
+                provider_account_id: account_id,
+                conversation_id_hash: "b".repeat(64),
+                turn_id_hash: None,
+                observed_at,
+                evidence_kind: statsai_core::AccountEvidenceKind::ResetHistory,
+                confidence: Confidence::High,
+            }])
+            .expect("conversation evidence");
+    }
+
+    #[test]
+    fn canonicalization_skips_accounts_without_surviving_evidence() {
+        let store = Store::in_memory().expect("store");
+        let mut evidence = AccountEvidenceScan::default();
+        evidence
+            .accounts
+            .push(statsai_adapters::ObservedProviderAccount {
+                provider_user_id: Some("unchanged-provider-user".to_string()),
+                email: Some("unchanged@example.test".to_string()),
+                plan_name: None,
+                observed_at: Utc
+                    .with_ymd_and_hms(2026, 8, 23, 10, 12, 43)
+                    .single()
+                    .expect("date"),
+            });
+
+        retain_accounts_referenced_by_account_evidence("codex", &HashMap::new(), &mut evidence);
+        canonicalize_account_evidence(&store, "codex", &mut evidence)
+            .expect("canonicalize account evidence");
+
+        assert!(evidence.accounts.is_empty());
+        assert!(store.list_accounts().expect("accounts").is_empty());
+    }
+
+    fn plan_observation_fixture(
+        source_id: &SourceId,
+        account_id: Option<&ProviderAccountId>,
+        plan: &str,
+        observed_at: DateTime<Utc>,
+        evidence_kind: statsai_core::AccountEvidenceKind,
+    ) -> statsai_core::AccountPlanObservationV1 {
+        statsai_core::AccountPlanObservationV1 {
+            schema_version: statsai_core::ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: account_plan_observation_id(
+                source_id,
+                account_id,
+                plan,
+                observed_at,
+                evidence_kind,
+            ),
+            provider: "codex".to_string(),
+            source_id: source_id.clone(),
+            provider_account_id: account_id.cloned(),
+            raw_plan_name: plan.to_ascii_lowercase(),
+            plan_name: plan.to_string(),
+            observed_at,
+            active_from: None,
+            active_until: None,
+            is_current_snapshot: false,
+            evidence_kind,
+            confidence: Confidence::High,
+            parser_version: "test.v1".to_string(),
+            artifact_path_hash: "a".repeat(64),
+            record_fingerprint: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn account_plans_report_the_newest_observation_per_account() {
+        let store = Store::in_memory().expect("store");
+        let source_id = SourceId("plans-source".to_string());
+        let first = ProviderAccountId("acct-first".to_string());
+        let second = ProviderAccountId("acct-second".to_string());
+        let at = |day: u32| {
+            Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0)
+                .single()
+                .expect("date")
+        };
+        // An older snapshot that still claims to be current: the newest observation must win over
+        // it, which is the whole reason this reports `latest_observation` and not a derived plan.
+        let mut stale_current_snapshot = plan_observation_fixture(
+            &source_id,
+            Some(&first),
+            "Free",
+            at(1),
+            statsai_core::AccountEvidenceKind::AuthSnapshot,
+        );
+        stale_current_snapshot.is_current_snapshot = true;
+        // A legacy row that kept the subscription's own provider casing.
+        let mut non_canonical_provider = plan_observation_fixture(
+            &source_id,
+            Some(&second),
+            "Pro",
+            at(5),
+            statsai_core::AccountEvidenceKind::LegacyLocalAuth,
+        );
+        non_canonical_provider.provider = "Codex".to_string();
+        store
+            .upsert_account_plan_observations(&[
+                stale_current_snapshot,
+                plan_observation_fixture(
+                    &source_id,
+                    Some(&first),
+                    "Plus",
+                    at(9),
+                    statsai_core::AccountEvidenceKind::QuotaStatus,
+                ),
+                non_canonical_provider,
+                // Evidence that never resolved to an account still has to be visible: dropping it
+                // would hide plan history the operator can still act on.
+                plan_observation_fixture(
+                    &source_id,
+                    None,
+                    "Team",
+                    at(3),
+                    statsai_core::AccountEvidenceKind::AuthSnapshot,
+                ),
+            ])
+            .expect("seed plan observations");
+
+        let report =
+            account_plan_evidence_report(&store, Some("codex"), None, false).expect("plan report");
+
+        assert_eq!(report.len(), 3);
+        let plan_for = |account: Option<&str>| {
+            report
+                .iter()
+                .find(|entry| entry["provider_account_id"].as_str() == account)
+                .map(|entry| entry["latest_observation"]["plan_name"].as_str().unwrap())
+        };
+        // The newest observation wins over an older one that still claims to be the current
+        // snapshot, which is what `latest_observation` promises and a derived plan would not.
+        assert_eq!(plan_for(Some("acct-first")), Some("Plus"));
+        // Reached only through case-insensitive matching: this account's sole observation is
+        // stored as `Codex`.
+        assert_eq!(plan_for(Some("acct-second")), Some("Pro"));
+        assert_eq!(plan_for(None), Some("Team"));
+        let second_entry = report
+            .iter()
+            .find(|entry| entry["provider_account_id"] == "acct-second")
+            .expect("second account entry");
+        assert_eq!(
+            second_entry["provider"], "codex",
+            "a non-canonical stored provider is reported under its canonical name"
+        );
+        assert_eq!(
+            second_entry["observation_count"], 1,
+            "the case variant groups with its canonical provider rather than forming its own entry"
+        );
+        let first_entry = report
+            .iter()
+            .find(|entry| entry["provider_account_id"] == "acct-first")
+            .expect("first account entry");
+        assert_eq!(first_entry["observation_count"], 2);
+        // Without `--all` the payload stays a summary.
+        assert!(first_entry.get("observations").is_none());
+
+        let detailed = account_plan_evidence_report(&store, Some("codex"), Some(&first), true)
+            .expect("detailed plan report");
+        assert_eq!(detailed.len(), 1, "the account filter selects one account");
+        let observations = detailed[0]["observations"]
+            .as_array()
+            .expect("observations array");
+        assert_eq!(observations.len(), 2);
+        // Oldest first, so the newest is what `latest_observation` reports.
+        assert_eq!(observations[0]["plan_name"], "Free");
+        assert_eq!(observations[1]["plan_name"], "Plus");
+
+        assert!(
+            account_plan_evidence_report(&store, Some("claude_code"), None, false)
+                .expect("other provider")
+                .is_empty(),
+            "the provider filter excludes other providers"
+        );
+    }
+
+    #[test]
+    fn known_account_aliases_are_applied_before_evidence_deduplication() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 23, 10, 12, 43)
+            .single()
+            .expect("date");
+        upsert_provider_account(
+            &store,
+            UpsertProviderAccountInput {
+                provider: "codex",
+                provider_user_id: None,
+                email: Some("owner@example.test"),
+                label: None,
+                plan_name: None,
+                identity_source: Some(IdentitySource::LocalAuth),
+                verified_at: Some(observed_at),
+            },
+        )
+        .expect("email-only account");
+        let source_id = SourceId("alias-dedup-source".to_string());
+        let raw_account_id = provider_account_id_from_identity(
+            "codex",
+            Some("provider-user-1"),
+            Some("owner@example.test"),
+        )
+        .expect("detected account id");
+        let raw_plan = statsai_core::AccountPlanObservationV1 {
+            schema_version: statsai_core::ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: account_plan_observation_id(
+                &source_id,
+                Some(&raw_account_id),
+                "plus",
+                observed_at,
+                statsai_core::AccountEvidenceKind::AuthSnapshot,
+            ),
+            provider: "codex".to_string(),
+            source_id: source_id.clone(),
+            provider_account_id: Some(raw_account_id.clone()),
+            raw_plan_name: "plus".to_string(),
+            plan_name: "Plus".to_string(),
+            observed_at,
+            active_from: None,
+            active_until: None,
+            is_current_snapshot: true,
+            evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+            confidence: Confidence::High,
+            parser_version: "test.v1".to_string(),
+            artifact_path_hash: "a".repeat(64),
+            record_fingerprint: "b".repeat(64),
+        };
+        let raw_binding = statsai_core::ConversationAccountBindingV1 {
+            schema_version: statsai_core::CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION.to_string(),
+            binding_id: conversation_account_binding_id(
+                &source_id,
+                &"c".repeat(64),
+                None,
+                &raw_account_id,
+            ),
+            provider: "codex".to_string(),
+            source_id: source_id.clone(),
+            provider_account_id: raw_account_id,
+            conversation_id_hash: "c".repeat(64),
+            turn_id_hash: None,
+            observed_at,
+            evidence_kind: statsai_core::AccountEvidenceKind::ResetHistory,
+            confidence: Confidence::High,
+        };
+        let raw_scan = AccountEvidenceScan {
+            accounts: vec![statsai_adapters::ObservedProviderAccount {
+                provider_user_id: Some("provider-user-1".to_string()),
+                email: Some("owner@example.test".to_string()),
+                plan_name: None,
+                observed_at,
+            }],
+            plan_observations: vec![raw_plan],
+            conversation_bindings: vec![raw_binding],
+            ..AccountEvidenceScan::default()
+        };
+
+        let mut first_scan = raw_scan.clone();
+        canonicalize_account_evidence(&store, "codex", &mut first_scan)
+            .expect("canonicalize first scan");
+        store
+            .upsert_account_plan_observations(&first_scan.plan_observations)
+            .expect("store canonical plan");
+        store
+            .upsert_conversation_account_bindings(&first_scan.conversation_bindings)
+            .expect("store canonical binding");
+
+        let mut repeated_scan = raw_scan;
+        let known_account_aliases =
+            canonicalize_known_account_evidence(&store, "codex", &mut repeated_scan)
+                .expect("canonicalize known aliases");
+        store
+            .retain_unseen_account_evidence(
+                &source_id,
+                &mut repeated_scan.identity_observations,
+                &mut repeated_scan.plan_observations,
+                &mut repeated_scan.conversation_bindings,
+            )
+            .expect("filter canonical evidence");
+        assert!(repeated_scan.plan_observations.is_empty());
+        assert!(repeated_scan.conversation_bindings.is_empty());
+
+        repeated_scan
+            .identity_observations
+            .push(statsai_core::AccountIdentityObservationV1 {
+                schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                    .to_string(),
+                observation_id: "identity-provider-user-enrichment".to_string(),
+                provider: "codex".to_string(),
+                source_id,
+                provider_account_id: known_account_aliases.values().next().cloned(),
+                provider_user_id_hash: Some("provider-user-hash".to_string()),
+                email_hash: Some("email-hash".to_string()),
+                conversation_id_hash: None,
+                turn_id_hash: None,
+                observed_at,
+                evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+                confidence: Confidence::High,
+                auth_mode: Some("chatgpt".to_string()),
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "auth_json".to_string(),
+                artifact_path_hash: "d".repeat(64),
+                record_fingerprint: "e".repeat(64),
+            });
+        retain_accounts_referenced_by_account_evidence(
+            "codex",
+            &known_account_aliases,
+            &mut repeated_scan,
+        );
+        assert_eq!(
+            repeated_scan.accounts.len(),
+            1,
+            "the account carrying a newly learned provider ID must survive canonical alias remapping"
+        );
+        canonicalize_account_evidence(&store, "codex", &mut repeated_scan)
+            .expect("enrich canonical account");
+        let accounts = store.list_accounts().expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(
+            accounts[0].provider_user_id.as_deref(),
+            Some("provider-user-1")
+        );
+    }
+
     #[derive(Clone)]
     struct AttributionBlockedTestAdapter {
         provider: &'static str,
@@ -8977,6 +11015,197 @@ mod tests {
             .pending_archive_import_entries(&source.source_id, &entries)
             .expect("pending archive entries");
         assert_eq!(pending, vec![entries[1].clone()]);
+    }
+
+    /// Files are reconstructed on several threads but must be handed back in
+    /// the order they were listed: two files can describe the same
+    /// conversation, and which record wins must not depend on scheduling.
+    #[test]
+    fn archive_group_parsing_preserves_file_order() {
+        struct OrderedArchiveAdapter;
+
+        impl ProviderAdapter for OrderedArchiveAdapter {
+            fn id(&self) -> &'static str {
+                "ordered-archive-test"
+            }
+            fn version(&self) -> &'static str {
+                "0"
+            }
+            fn provider(&self) -> &'static str {
+                "archive_test"
+            }
+            fn discover(&self) -> Vec<SourceLocation> {
+                Vec::new()
+            }
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(Vec::new())
+            }
+            fn scan(
+                &self,
+                _source: &SourceLocation,
+                _options: &ScanOptions,
+            ) -> Result<statsai_adapters::AdapterScan> {
+                Ok(statsai_adapters::AdapterScan::default())
+            }
+            fn collect_archive(
+                &self,
+                _source: &SourceLocation,
+                selected_cache_keys: Option<&HashSet<String>>,
+            ) -> Result<statsai_adapters::ArchiveScan> {
+                let selected = selected_cache_keys
+                    .and_then(|keys| keys.iter().next())
+                    .context("selected archive cache key")?;
+                // The earlier files are the slow ones, so a run that returned
+                // results as they arrived would reorder them.
+                let index: u64 = selected.parse().context("cache key index")?;
+                std::thread::sleep(std::time::Duration::from_millis(40 - index * 4));
+                let mut scan = statsai_adapters::ArchiveScan::default();
+                scan.diagnostics.files_scanned = index;
+                Ok(scan)
+            }
+        }
+
+        let source = SourceLocation::local_adapter(
+            "archive_test",
+            "ordered-archive-test",
+            "0",
+            Path::new("/tmp/archive-order-test"),
+            LocationOrigin::Configured,
+        );
+        let entries = (0..10)
+            .map(|index| ScanFileStateEntry {
+                cache_key: index.to_string(),
+                cache_signature: format!("signature-{index}"),
+            })
+            .collect::<Vec<_>>();
+
+        let scans = parse_archive_group(
+            &OrderedArchiveAdapter,
+            &source,
+            &entries,
+            &vec![0; entries.len()],
+        );
+
+        let order = scans
+            .into_iter()
+            .map(|scan| scan.expect("collected archive").diagnostics.files_scanned)
+            .collect::<Vec<_>>();
+        assert_eq!(order, (0..10).collect::<Vec<_>>());
+    }
+
+    /// A transcript's size on disk says nothing about how much content it
+    /// materializes, so reconstruction stops taking new files once it is
+    /// holding enough. The files it did not reach must come back for the
+    /// caller to collect next, never be reported as done.
+    #[test]
+    fn archive_group_parsing_stops_before_holding_too_much_content() {
+        struct HeavyArchiveAdapter;
+
+        impl ProviderAdapter for HeavyArchiveAdapter {
+            fn id(&self) -> &'static str {
+                "heavy-archive-test"
+            }
+            fn version(&self) -> &'static str {
+                "0"
+            }
+            fn provider(&self) -> &'static str {
+                "archive_test"
+            }
+            fn discover(&self) -> Vec<SourceLocation> {
+                Vec::new()
+            }
+            fn scan_candidates(&self, _source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+                Ok(Vec::new())
+            }
+            fn scan(
+                &self,
+                _source: &SourceLocation,
+                _options: &ScanOptions,
+            ) -> Result<statsai_adapters::AdapterScan> {
+                Ok(statsai_adapters::AdapterScan::default())
+            }
+            fn collect_archive(
+                &self,
+                _source: &SourceLocation,
+                _selected_cache_keys: Option<&HashSet<String>>,
+            ) -> Result<statsai_adapters::ArchiveScan> {
+                // A tiny record naming an artifact that materializes far
+                // larger than the file it came from.
+                let mut conversation = ArchiveConversation {
+                    schema_version: statsai_core::ARCHIVE_CONVERSATION_SCHEMA_VERSION.to_string(),
+                    conversation_id: "conv_heavy".to_string(),
+                    provider: "archive_test".to_string(),
+                    source_id: statsai_core::SourceId("heavy".to_string()),
+                    native_conversation_id: "heavy".to_string(),
+                    title: None,
+                    project: None,
+                    started_at: None,
+                    updated_at: None,
+                    completeness: statsai_core::ArchiveCompleteness::Complete,
+                    missing_content_count: 0,
+                    missing_content_scope_id: None,
+                    discarded_source_record_ids: Vec::new(),
+                    superseded_conversation_ids: Vec::new(),
+                    items: Vec::new(),
+                };
+                let item_id = "item_heavy".to_string();
+                conversation.items.push(statsai_core::ArchiveItem {
+                    item_id: item_id.clone(),
+                    native_item_id: None,
+                    source_record_id: None,
+                    ordinal: 0,
+                    kind: statsai_core::ArchiveItemKind::Message,
+                    role: None,
+                    created_at: None,
+                    model: None,
+                    tool_name: None,
+                    tool_call_id: None,
+                    status: None,
+                    usage: None,
+                    parts_authoritative: true,
+                    parts: vec![statsai_core::ArchiveContentPart::text(
+                        statsai_core::archive_content_id(&item_id, 0),
+                        0,
+                        ArchiveContentKind::Text,
+                        "x".repeat(ARCHIVE_COLLECTION_RETAINED_BYTES / 4),
+                    )],
+                });
+                // Held long enough that every worker has tried to claim before
+                // any capacity is released.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let mut scan = statsai_adapters::ArchiveScan::default();
+                scan.conversations.push(conversation);
+                Ok(scan)
+            }
+        }
+
+        let source = SourceLocation::local_adapter(
+            "archive_test",
+            "heavy-archive-test",
+            "0",
+            Path::new("/tmp/archive-heavy-test"),
+            LocationOrigin::Configured,
+        );
+        let entries = (0..ARCHIVE_COLLECTION_GROUP_FILES)
+            .map(|index| ScanFileStateEntry {
+                cache_key: index.to_string(),
+                cache_signature: format!("signature-{index}"),
+            })
+            .collect::<Vec<_>>();
+        // A quarter of the budget each, so only a few may be outstanding.
+        let source_bytes =
+            vec![ARCHIVE_COLLECTION_RETAINED_BYTES as u64 / 4; ARCHIVE_COLLECTION_GROUP_FILES];
+
+        let scans = parse_archive_group(&HeavyArchiveAdapter, &source, &entries, &source_bytes);
+
+        // Every worker reaches the budget before any of them finishes, which is
+        // exactly when a check that does not reserve lets all of them through.
+        assert!(!scans.is_empty(), "no file was reconstructed");
+        assert!(
+            scans.len() <= 4,
+            "budget did not gate concurrent claims: {} files were taken",
+            scans.len()
+        );
     }
 
     #[test]
@@ -10090,6 +12319,78 @@ mod tests {
     }
 
     #[test]
+    fn manual_source_reassignment_rebuilds_quota_plan_evidence() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-quota-plan-reassignment"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let mut quota = test_unattributed_quota_record(&source.source_id.0);
+        quota.observation.status.plan_type = Some("pro".to_string());
+        store
+            .upsert_quota_observations(&[quota])
+            .expect("quota observation");
+        let first_start = Utc
+            .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
+            .single()
+            .expect("first start");
+        let second_start = Utc
+            .with_ymd_and_hms(2026, 8, 15, 0, 0, 0)
+            .single()
+            .expect("second start");
+
+        let first = connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("first-quota@example.com"),
+                label: None,
+                started_at: first_start,
+                ended_at: None,
+            },
+        )
+        .expect("first connection");
+        store
+            .rebuild_quota_plan_observations_for_source(&source.source_id)
+            .expect("seed quota plan evidence");
+        assert_eq!(
+            store.account_plan_observations().expect("initial plan")[0].provider_account_id,
+            Some(first.provider_account_id)
+        );
+
+        let second = connect_source_to_account(
+            &store,
+            ConnectSourceToAccountInput {
+                source_id: &source.source_id,
+                provider_account_id_value: None,
+                provider_user_id: None,
+                email: Some("second-quota@example.com"),
+                label: None,
+                started_at: second_start,
+                ended_at: None,
+            },
+        )
+        .expect("second connection");
+
+        let observations = store.account_plan_observations().expect("reassigned plan");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].provider_account_id,
+            Some(second.provider_account_id)
+        );
+        assert_eq!(
+            observations[0].evidence_kind,
+            statsai_core::AccountEvidenceKind::QuotaStatus
+        );
+    }
+
+    #[test]
     fn connect_source_to_account_preserves_tail_when_replacing_finite_window() {
         let store = Store::in_memory().expect("store");
         let source = SourceLocation::local_adapter(
@@ -10354,7 +12655,7 @@ mod tests {
             accounts[0].provider_user_id.as_deref(),
             Some("chatgpt-account-123")
         );
-        assert_eq!(accounts[0].plan_name.as_deref(), Some("Plus"));
+        assert_eq!(accounts[0].plan_name, None);
         assert_eq!(accounts[0].verified_at, Some(verified_at));
 
         let assignments = store
@@ -10368,18 +12669,10 @@ mod tests {
         assert_eq!(assignments[0].record_source, IdentitySource::LocalAuth);
         assert_eq!(assignments[0].verified_at, Some(verified_at));
 
-        let subscriptions = store.list_subscriptions().expect("subscriptions");
-        assert_eq!(subscriptions.len(), 1);
-        assert_eq!(
-            subscriptions[0].provider_account_id,
-            existing.provider_account_id
-        );
-        assert_eq!(subscriptions[0].record_source, IdentitySource::LocalAuth);
-        assert_eq!(
-            subscriptions[0].current_period_ends_at,
-            Some(current_period_ends_at)
-        );
-        assert_eq!(subscriptions[0].ended_at, None);
+        assert!(store
+            .list_subscriptions()
+            .expect("subscriptions")
+            .is_empty());
     }
 
     #[test]
@@ -10660,7 +12953,7 @@ mod tests {
         assert!(accounts.iter().any(|account| {
             account.provider_account_id == expected_account_id
                 && account.email.as_deref() == Some("verified@example.com")
-                && account.plan_name.as_deref() == Some("Plus")
+                && account.plan_name.is_none()
         }));
 
         let assignments = store
@@ -10672,15 +12965,10 @@ mod tests {
         assert_eq!(assignments[0].provider_account_id, expected_account_id);
         assert_eq!(assignments[0].record_source, IdentitySource::LocalAuth);
 
-        let subscriptions = store.list_subscriptions().expect("subscriptions");
-        assert_eq!(subscriptions.len(), 1);
-        assert_eq!(subscriptions[0].provider_account_id, expected_account_id);
-        assert_eq!(subscriptions[0].record_source, IdentitySource::LocalAuth);
-        assert_eq!(subscriptions[0].ended_at, None);
-        assert_eq!(
-            subscriptions[0].current_period_ends_at,
-            Some(current_period_ends_at)
-        );
+        assert!(store
+            .list_subscriptions()
+            .expect("subscriptions")
+            .is_empty());
         let stored_source = store
             .source(&source.source_id)
             .expect("source row")
@@ -11461,6 +13749,62 @@ mod tests {
     }
 
     #[test]
+    fn manual_only_source_does_not_collect_or_apply_account_evidence() {
+        let store = Store::in_memory().expect("store");
+        let source_root = "/tmp/codex-manual-only-evidence";
+        let file_path = "/tmp/codex-manual-only-evidence/session.jsonl";
+        let mut source = SourceLocation::local_adapter(
+            "codex",
+            "test-account-evidence",
+            "0",
+            Path::new(source_root),
+            LocationOrigin::Configured,
+        );
+        source.verification_mode = SourceVerificationMode::ManualOnly;
+        store.upsert_source(&source).expect("source");
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 23, 10, 0, 0)
+            .single()
+            .expect("observed at");
+        seed_test_account_evidence(&store, &source, observed_at);
+
+        let mut event = test_scan_event(&source, file_path, observed_at, "manual-event", 100);
+        event.session.local_session_id_hash = Some("b".repeat(64));
+        let collect_calls = Arc::new(Mutex::new(0));
+        let adapter = AccountEvidenceTrackingAdapter {
+            source: source.clone(),
+            candidate: test_scan_candidate(file_path, "manual-evidence-v1"),
+            event,
+            collect_calls: Arc::clone(&collect_calls),
+        };
+
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+
+        assert_eq!(*collect_calls.lock().expect("collect calls"), 0);
+        let stored_event = store
+            .events()
+            .expect("events")
+            .into_iter()
+            .find(|item| item.source.source_record_id.as_deref() == Some("manual-event"))
+            .expect("manual event");
+        assert_eq!(stored_event.provider_account_id, None);
+    }
+
+    #[test]
     fn disabled_source_mode_closes_verified_linkages() {
         let store = Store::in_memory().expect("store");
         let mut source_location = SourceLocation::local_adapter(
@@ -11531,6 +13875,7 @@ mod tests {
                 notes: None,
             })
             .expect("subscription");
+        seed_test_account_evidence(&store, &source_location, started_at);
 
         source(
             SourceCommand {
@@ -11560,6 +13905,18 @@ mod tests {
         assert!(assignments[0].ended_at.is_some());
         assert_eq!(subscriptions.len(), 1);
         assert!(subscriptions[0].ended_at.is_some());
+        assert!(store
+            .account_identity_observations(Some(&source.source_id))
+            .expect("identity evidence")
+            .is_empty());
+        assert!(store
+            .account_plan_observations()
+            .expect("plan evidence")
+            .is_empty());
+        assert!(store
+            .conversation_account_bindings(Some(&source.source_id))
+            .expect("conversation evidence")
+            .is_empty());
     }
 
     #[test]
@@ -11670,6 +14027,7 @@ mod tests {
             .with_ymd_and_hms(2026, 6, 1, 10, 0, 0)
             .single()
             .expect("now");
+        seed_test_account_evidence(&store, &committed_source, now);
         let mut summary = test_summary("codex", &committed_source, now, 100, None);
         summary.project = Some(ProjectInfo {
             project_id: "project-committed-only".to_string(),
@@ -11714,6 +14072,18 @@ mod tests {
         assert!(store
             .list_code_change_metrics(false)
             .expect("metrics after")
+            .is_empty());
+        assert!(store
+            .account_identity_observations(Some(&committed_source.source_id))
+            .expect("identity evidence after")
+            .is_empty());
+        assert!(store
+            .account_plan_observations()
+            .expect("plan evidence after")
+            .is_empty());
+        assert!(store
+            .conversation_account_bindings(Some(&committed_source.source_id))
+            .expect("conversation evidence after")
             .is_empty());
     }
 
@@ -11850,6 +14220,7 @@ mod tests {
                     &[],
                     &edits,
                     statsai_core::CoverageStatus::Complete,
+                    &[],
                 )
                 .expect("seed trace edits");
         }
@@ -13279,11 +15650,14 @@ mod tests {
             accounts: vec![],
             source_account_assignments: vec![],
             subscriptions: vec![],
+            account_plan_observations: vec![],
+            account_evidence_summaries: vec![],
             events: vec![],
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -13327,11 +15701,14 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
                 source_ids: vec![source.source_id.clone()],
                 ..SyncAuthoritativeSnapshot::default()
@@ -13378,11 +15755,14 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
                 summary_ids,
                 ..SyncAuthoritativeSnapshot::default()
@@ -13497,11 +15877,14 @@ mod tests {
             accounts,
             source_account_assignments: assignments,
             subscriptions,
+            account_plan_observations: vec![],
+            account_evidence_summaries: vec![],
             events: vec![],
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -13564,11 +15947,14 @@ mod tests {
             accounts: vec![],
             source_account_assignments: vec![],
             subscriptions: vec![],
+            account_plan_observations: vec![],
+            account_evidence_summaries: vec![],
             events: vec![],
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -13656,11 +16042,14 @@ mod tests {
             accounts: vec![],
             source_account_assignments: vec![],
             subscriptions: vec![],
+            account_plan_observations: vec![],
+            account_evidence_summaries: vec![],
             events: vec![],
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -14012,11 +16401,14 @@ mod tests {
             accounts: accounts.clone(),
             source_account_assignments: vec![],
             subscriptions: vec![],
+            account_plan_observations: vec![],
+            account_evidence_summaries: vec![],
             events: vec![],
             summaries: vec![],
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -14046,6 +16438,116 @@ mod tests {
         assert!(chunks.iter().all(|chunk| chunk.events.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.sources.is_empty()));
         assert!(chunks.iter().any(|chunk| !chunk.accounts.is_empty()));
+    }
+
+    fn test_quota_cycle_contributions(
+        now: DateTime<Utc>,
+        count: usize,
+    ) -> Vec<statsai_core::QuotaCycleContributionV1> {
+        (0..count)
+            .map(|index| {
+                let reset = now + chrono::Duration::days(7 * index as i64);
+                statsai_core::QuotaCycleContributionV1 {
+                    schema_version: statsai_core::QUOTA_CYCLE_CONTRIBUTION_SCHEMA_VERSION
+                        .to_string(),
+                    contribution_id: format!("quota_cycle_{index:032}"),
+                    provider: "codex".to_string(),
+                    provider_account_id: ProviderAccountId("acct".to_string()),
+                    limit_id: Some("weekly".to_string()),
+                    window_minutes: 10_080,
+                    representative_reset: reset,
+                    representative_reset_epoch_seconds: reset.timestamp(),
+                    has_schedule_overlap: false,
+                    daily_envelopes: Vec::new(),
+                    boundary_slices: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    fn test_quota_only_sync_batch(now: DateTime<Utc>, count: usize) -> SyncBatch {
+        SyncBatch {
+            schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+            batch_id: "batch_quota_only".to_string(),
+            device_id: "device".to_string(),
+            sources: vec![],
+            accounts: vec![],
+            source_account_assignments: vec![],
+            subscriptions: vec![],
+            account_plan_observations: vec![],
+            account_evidence_summaries: vec![],
+            events: vec![],
+            summaries: vec![],
+            task_buckets: vec![],
+            task_verifications: vec![],
+            code_change_metrics: vec![],
+            quota_cycle_contributions: test_quota_cycle_contributions(now, count),
+            authoritative_snapshot: None,
+            created_at: now,
+        }
+    }
+
+    #[test]
+    fn a_quota_only_batch_splits_into_strictly_smaller_chunks() {
+        // Quota cycles carry nothing else, so the split has to make progress on
+        // the quota collection itself. Counting them as metadata made
+        // `has_non_quota_cycle_payload` true for this batch, so the splitter
+        // peeled the quota off "the rest" and handed back the identical chunk
+        // beside an empty one — which `should_retry_http_rollup_chunk_after_error`
+        // then retried and split the same way, forever.
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let batch = test_quota_only_sync_batch(now, 4);
+
+        let chunks = split_http_rollup_sync_batch_after_budget_error(&batch);
+
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.quota_cycle_contributions.len()
+                < batch.quota_cycle_contributions.len()));
+        assert!(chunks
+            .iter()
+            .all(|chunk| !chunk.quota_cycle_contributions.is_empty()));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.quota_cycle_contributions.len())
+                .sum::<usize>(),
+            batch.quota_cycle_contributions.len()
+        );
+    }
+
+    #[test]
+    fn splitting_sends_each_quota_cycle_exactly_once() {
+        // Enough cycles to cross the metadata-per-batch limit once they were
+        // wrongly counted as metadata. Past that point the metadata splitter
+        // and the dedicated quota splitter both ran over the same batch, so
+        // every contribution went out twice.
+        let now = Utc
+            .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+            .single()
+            .expect("date");
+        let mut batch =
+            test_quota_only_sync_batch(now, HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH + 10);
+        batch.sources = vec![SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-quota-once"),
+            LocationOrigin::Configured,
+        )];
+
+        let sent = split_http_rollup_sync_batches(&batch)
+            .iter()
+            .flat_map(|chunk| chunk.quota_cycle_contributions.clone())
+            .map(|contribution| contribution.contribution_id)
+            .collect::<Vec<_>>();
+
+        let unique = sent.iter().collect::<BTreeSet<_>>();
+        assert_eq!(sent.len(), unique.len(), "sent: {sent:?}");
+        assert_eq!(unique.len(), batch.quota_cycle_contributions.len());
     }
 
     #[test]
@@ -14357,11 +16859,14 @@ mod tests {
             accounts: vec![],
             source_account_assignments: vec![],
             subscriptions: vec![],
+            account_plan_observations: vec![],
+            account_evidence_summaries: vec![],
             events: vec![],
             summaries: vec![],
             task_buckets: test_task_only_sync_batch(now, 1, 0).task_buckets,
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -14441,11 +16946,14 @@ mod tests {
             accounts: vec![],
             source_account_assignments: vec![],
             subscriptions: vec![],
+            account_plan_observations: vec![],
+            account_evidence_summaries: vec![],
             events: vec![],
             summaries,
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -14490,6 +16998,53 @@ mod tests {
         assert_eq!(
             estimate_http_rollup_d1_queries(&many_metrics),
             estimate_http_rollup_d1_queries(&one_metric)
+        );
+    }
+
+    #[test]
+    fn v4_account_evidence_d1_estimate_includes_alias_lookup() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 23, 10, 12, 43)
+            .single()
+            .expect("date");
+        let mut batch = test_task_only_sync_batch(now, 0, 0);
+        let baseline = estimate_http_rollup_d1_queries(&batch);
+        let account_id = ProviderAccountId("account-plan-estimate".to_string());
+        batch.account_plan_observations = vec![statsai_core::AccountPlanProjectionV1 {
+            schema_version: statsai_core::ACCOUNT_PLAN_PROJECTION_SCHEMA_VERSION.to_string(),
+            projection_id: "projection-plan-estimate".to_string(),
+            semantic_fingerprint: "a".repeat(64),
+            device_id: batch.device_id.clone(),
+            provider: "codex".to_string(),
+            provider_account_id: account_id.clone(),
+            raw_plan_name: "plus".to_string(),
+            plan_name: "Plus".to_string(),
+            observed_at: now,
+            active_from: None,
+            active_until: None,
+            is_current_snapshot: true,
+            evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+            confidence: Confidence::High,
+        }];
+        batch.account_evidence_summaries = vec![statsai_core::AccountEvidenceSummaryV1 {
+            schema_version: statsai_core::ACCOUNT_EVIDENCE_SUMMARY_SCHEMA_VERSION.to_string(),
+            summary_id: "evidence-summary-estimate".to_string(),
+            device_id: batch.device_id.clone(),
+            provider: "codex".to_string(),
+            provider_account_id: account_id,
+            first_strong_observed_at: Some(now),
+            last_strong_observed_at: Some(now),
+            strong_observation_count: 1,
+            directly_bound_conversations: 0,
+            uncovered_gap_count: 0,
+            conflict_count: 0,
+            evidence_kinds: vec![statsai_core::AccountEvidenceKind::AuthSnapshot],
+        }];
+
+        assert_eq!(
+            estimate_http_rollup_d1_queries(&batch),
+            baseline + 5,
+            "metadata, evidence-alias, ownership lookup, and possible cleanup must be budgeted"
         );
     }
 
@@ -14542,11 +17097,14 @@ mod tests {
             accounts: vec![],
             source_account_assignments: vec![],
             subscriptions: vec![],
+            account_plan_observations: vec![],
+            account_evidence_summaries: vec![],
             events: vec![],
             summaries: vec![summary],
             task_buckets: vec![],
             task_verifications: vec![],
             code_change_metrics: vec![],
+            quota_cycle_contributions: vec![],
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -14689,11 +17247,14 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets,
             task_verifications,
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         }
@@ -14801,6 +17362,8 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets: vec![TaskBucketSnapshot {
@@ -14847,6 +17410,7 @@ mod tests {
             }],
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         }
@@ -15000,11 +17564,14 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets,
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         }
@@ -15346,9 +17913,7 @@ mod tests {
                 &local_verify
             )
             .as_deref(),
-            Some(
-                "sources 0!=1, accounts 0!=1, source_account_assignments 0!=1, subscriptions 0!=1"
-            )
+            Some("sources 0!=1, accounts 0!=1, source_account_assignments 0!=1")
         );
 
         store
@@ -15360,7 +17925,7 @@ mod tests {
         assert_eq!(batch.sources.len(), 1);
         assert_eq!(batch.accounts.len(), 1);
         assert_eq!(batch.source_account_assignments.len(), 1);
-        assert_eq!(batch.subscriptions.len(), 1);
+        assert!(batch.subscriptions.is_empty());
         assert_eq!(batch.summaries.len(), 1);
         assert!(is_daily_rollup_summary(&batch.summaries[0]));
     }
@@ -15631,6 +18196,28 @@ mod tests {
         assert!(!should_replace_source_records_for_scan(
             false, false, 0, 0, false
         ));
+    }
+
+    #[test]
+    fn cache_invalidation_reconciles_quota_records_by_file() {
+        assert!(!should_replace_all_source_quota_records(false, false));
+        assert!(should_replace_all_source_quota_records(true, false));
+        assert!(should_replace_all_source_quota_records(false, true));
+    }
+
+    #[test]
+    fn no_cache_rescan_reconciles_quota_records_instead_of_deleting_the_source() {
+        // `--no-cache` rereads every file, so the file-level path already rewrites everything it
+        // produces. Deleting the source first walked every observation and window on a store with
+        // six figures of rows, which is the stall a documented flag must not have.
+        assert!(!should_replace_all_source_quota_records(false, false));
+        // The full reread still replaces the source's records, so the reconciliation branch --
+        // the one that also retires rows outside the rescanned file set -- is the branch it takes.
+        assert!(should_replace_source_records_for_scan(
+            false, true, 0, 0, false
+        ));
+        // An explicit destructive rebuild keeps the blanket delete.
+        assert!(should_replace_all_source_quota_records(true, false));
     }
 
     #[test]
@@ -17792,11 +20379,14 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: Utc
                 .with_ymd_and_hms(2026, 6, 14, 13, 0, 0)
@@ -18460,16 +21050,164 @@ mod tests {
     }
 
     #[test]
+    fn quota_contributions_reach_the_batch_and_its_authoritative_ids() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-quota-v4-sync"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .expect("observed at");
+        let account_id = ProviderAccountId("account-quota-sync".to_string());
+        store
+            .upsert_source_account_assignment(&SourceAccountAssignment {
+                schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                assignment_id: SourceAccountAssignmentId("assignment-quota-sync".to_string()),
+                source_id: source.source_id.clone(),
+                provider: "codex".to_string(),
+                provider_account_id: account_id,
+                started_at: observed_at - Duration::days(1),
+                ended_at: None,
+                record_source: IdentitySource::UserConfigured,
+                verified_at: Some(observed_at),
+                created_at: observed_at,
+                updated_at: observed_at,
+            })
+            .expect("assignment");
+        let reset_at = observed_at + Duration::days(7);
+        let quota_record: QuotaObservationRecordV1 = serde_json::from_value(json!({
+            "observation": {
+                "schema_version": "quota_observation.v1",
+                "observation_id": "quota-observation-sync",
+                "semantic_fingerprint": "quota-semantic-sync",
+                "provider": "codex",
+                "source_id": source.source_id,
+                "provider_account_id": null,
+                "observed_at": observed_at,
+                "source_file_path_hash": "file-hash",
+                "source_record_id": "record-id",
+                "source_line_number": 1,
+                "payload_hash": "payload-hash",
+                "usage_sample": null,
+                "usage_event_id": null,
+                "usage_link_kind": "none",
+                "status": {
+                    "plan_type": "pro",
+                    "individual_limit": {
+                        "account_email": "private@example.com",
+                        "nested": {"token": "provider-secret"}
+                    },
+                    "spend_control_state": null,
+                    "reached_type": null,
+                    "credits": {
+                        "has_credits": false,
+                        "unlimited": false,
+                        "balance": null,
+                        "balance_raw": null
+                    }
+                }
+            },
+            "windows": [{
+                "schema_version": "quota_window_observation.v1",
+                "window_observation_id": "quota-window-sync",
+                "observation_id": "quota-observation-sync",
+                "provider_slot": "primary",
+                "limit_id": "subscription",
+                "window_minutes": 10080,
+                "used_percent": 25.0,
+                "resets_at": reset_at,
+                "resets_at_epoch_seconds": reset_at.timestamp()
+            }],
+            "raw_rate_limits": {"primary": {"used_percent": 25.0}}
+        }))
+        .expect("quota record");
+        store
+            .upsert_quota_observations(&[quota_record])
+            .expect("quota observation");
+
+        let command = SyncCommand {
+            dry_run: true,
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        let target = sync_target(&command).expect("target");
+        let (batch, _) =
+            build_sync_batch(&command, &store, "device-quota", &target).expect("v4 quota batch");
+
+        assert_eq!(
+            batch.schema_version,
+            statsai_core::SYNC_BATCH_V5_SCHEMA_VERSION
+        );
+        assert_eq!(batch.quota_cycle_contributions.len(), 1);
+        // The uploaded contribution carries no provider status at all, so the
+        // plan, credits, and `individual_limit` blob a window observation holds
+        // cannot reach the backend even by accident.
+        let uploaded = serde_json::to_value(&batch.quota_cycle_contributions[0])
+            .expect("serialize contribution");
+        assert_eq!(uploaded.get("latest_status"), None);
+        let contribution_id = batch.quota_cycle_contributions[0].contribution_id.clone();
+        assert_eq!(
+            batch
+                .authoritative_snapshot
+                .as_ref()
+                .expect("authoritative snapshot")
+                .quota_cycle_contribution_ids,
+            vec![contribution_id.clone()]
+        );
+        let chunks = split_http_rollup_sync_batches(&batch);
+        assert!(chunks.iter().any(|chunk| {
+            chunk
+                .quota_cycle_contributions
+                .iter()
+                .any(|contribution| contribution.contribution_id == contribution_id)
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk
+                .authoritative_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot
+                        .quota_cycle_contribution_ids
+                        .contains(&contribution_id)
+                })
+        }));
+
+        record_rollup_sync_success(&store, "http", &target, &batch)
+            .expect("record initial quota sync");
+        let (unchanged, _) = build_sync_batch(&command, &store, "device-quota", &target)
+            .expect("unchanged quota batch");
+        assert!(unchanged.quota_cycle_contributions.is_empty());
+        assert!(unchanged.authoritative_snapshot.is_none());
+
+        store
+            .delete_quota_observations_for_sources(std::slice::from_ref(&source.source_id))
+            .expect("delete quota evidence");
+        let (retirement, _) = build_sync_batch(&command, &store, "device-quota", &target)
+            .expect("quota retirement batch");
+        assert!(retirement.quota_cycle_contributions.is_empty());
+        assert!(retirement
+            .authoritative_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.quota_cycle_contribution_ids.is_empty()));
+    }
+
+    #[test]
     fn sanitize_account_for_sync_preserves_user_configured_label() {
         let account = ProviderAccount {
             schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
             provider_account_id: provider_account_id("codex", "personal"),
             provider: "codex".to_string(),
             identity_source: IdentitySource::UserConfigured,
-            provider_user_id: None,
-            provider_user_id_hash: None,
-            email: None,
-            email_hash: None,
+            provider_user_id: Some("provider-user-secret".to_string()),
+            provider_user_id_hash: Some("a".repeat(64)),
+            email: Some("private@example.com".to_string()),
+            email_hash: Some("b".repeat(64)),
             org_id_hash: None,
             account_label: Some("personal".to_string()),
             plan_name: Some("Pro".to_string()),
@@ -18481,6 +21219,23 @@ mod tests {
 
         let sanitized = sanitize_account_for_sync(account);
         assert_eq!(sanitized.account_label.as_deref(), Some("personal"));
+        // The account's own identity travels: without it the dashboard can
+        // only name an account by its `acct_` hash, and telling your own
+        // accounts apart is why they sync in the first place.
+        assert_eq!(
+            sanitized.provider_user_id.as_deref(),
+            Some("provider-user-secret")
+        );
+        assert_eq!(sanitized.email.as_deref(), Some("private@example.com"));
+        assert_eq!(
+            sanitized.provider_user_id_hash.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            sanitized.email_hash.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        // A plan is evidence now, not an account attribute.
         assert_eq!(sanitized.plan_name, None);
     }
 
@@ -18637,6 +21392,76 @@ mod tests {
         });
         store.insert_event(&event).expect("event");
         store.upsert_summary(&summary).expect("summary");
+        let identity = statsai_core::AccountIdentityObservationV1 {
+            schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: "identity-merge-alias".to_string(),
+            provider: "codex".to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: Some(alias.provider_account_id.clone()),
+            provider_user_id_hash: Some("a".repeat(64)),
+            email_hash: None,
+            conversation_id_hash: Some("b".repeat(64)),
+            turn_id_hash: None,
+            observed_at: now,
+            evidence_kind: statsai_core::AccountEvidenceKind::TelemetryIdentity,
+            confidence: Confidence::High,
+            auth_mode: Some("chatgpt".to_string()),
+            application_version: None,
+            parser_version: "test.v1".to_string(),
+            artifact_kind: "test".to_string(),
+            artifact_path_hash: "c".repeat(64),
+            record_fingerprint: "d".repeat(64),
+        };
+        let plan = statsai_core::AccountPlanObservationV1 {
+            schema_version: statsai_core::ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: account_plan_observation_id(
+                &source.source_id,
+                Some(&alias.provider_account_id),
+                "plus",
+                now,
+                statsai_core::AccountEvidenceKind::AuthSnapshot,
+            ),
+            provider: "codex".to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: Some(alias.provider_account_id.clone()),
+            raw_plan_name: "plus".to_string(),
+            plan_name: "Plus".to_string(),
+            observed_at: now,
+            active_from: None,
+            active_until: None,
+            is_current_snapshot: true,
+            evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+            confidence: Confidence::High,
+            parser_version: "test.v1".to_string(),
+            artifact_path_hash: "c".repeat(64),
+            record_fingerprint: "e".repeat(64),
+        };
+        let binding = statsai_core::ConversationAccountBindingV1 {
+            schema_version: statsai_core::CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION.to_string(),
+            binding_id: conversation_account_binding_id(
+                &source.source_id,
+                &"b".repeat(64),
+                None,
+                &alias.provider_account_id,
+            ),
+            provider: "codex".to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: alias.provider_account_id.clone(),
+            conversation_id_hash: "b".repeat(64),
+            turn_id_hash: None,
+            observed_at: now,
+            evidence_kind: statsai_core::AccountEvidenceKind::ResetHistory,
+            confidence: Confidence::High,
+        };
+        store
+            .upsert_account_identity_observations(std::slice::from_ref(&identity))
+            .expect("identity evidence");
+        store
+            .upsert_account_plan_observations(std::slice::from_ref(&plan))
+            .expect("plan evidence");
+        store
+            .upsert_conversation_account_bindings(std::slice::from_ref(&binding))
+            .expect("conversation binding");
 
         let target = "https://api.example.com/api/sync/batches";
         store
@@ -18673,6 +21498,9 @@ mod tests {
         assert_eq!(report.moved_subscriptions, 0);
         assert_eq!(report.moved_events, 1);
         assert_eq!(report.moved_summaries, 1);
+        assert_eq!(report.moved_identity_observations, 1);
+        assert_eq!(report.moved_plan_observations, 1);
+        assert_eq!(report.moved_conversation_bindings, 1);
         assert!(report.deleted_source_account);
         assert!(report.reset_local_sync_tracking);
         assert_eq!(report.remaining_references.total(), 0);
@@ -18706,6 +21534,29 @@ mod tests {
             summaries[0].provider_account_id,
             Some(canonical.provider_account_id.clone())
         );
+        assert!(store
+            .account_identity_observations(None)
+            .expect("identity evidence")
+            .iter()
+            .all(|observation| {
+                observation.provider_account_id.as_ref() == Some(&canonical.provider_account_id)
+            }));
+        let plans = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].provider_account_id.as_ref(),
+            Some(&canonical.provider_account_id)
+        );
+        assert_ne!(plans[0].observation_id, plan.observation_id);
+        let bindings = store
+            .conversation_account_bindings(None)
+            .expect("conversation bindings");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].provider_account_id,
+            canonical.provider_account_id
+        );
+        assert_ne!(bindings[0].binding_id, binding.binding_id);
 
         assert!(store.list_sync_states().expect("sync states").is_empty());
         let sync_accounts: Vec<_> = store
@@ -19986,5 +22837,117 @@ mod tests {
 
         assert_eq!(value["price"], json!(20.0));
         assert_eq!(value["price_cents"], json!(2000));
+    }
+
+    fn test_unattributed_quota_window(source_id: &str, window_id: &str) -> QuotaWindowV1 {
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .expect("observed at");
+        let reset = observed_at + Duration::days(7);
+        QuotaWindowV1 {
+            schema_version: "quota_window.v1".to_string(),
+            window_id: window_id.to_string(),
+            provider: "codex".to_string(),
+            provider_account_id: None,
+            source_id: Some(SourceId(source_id.to_string())),
+            limit_id: Some("subscription".to_string()),
+            window_minutes: 10_080,
+            inferred_start: reset - Duration::days(7),
+            representative_reset: reset,
+            representative_reset_epoch_seconds: reset.timestamp(),
+            reset_min: reset,
+            reset_min_epoch_seconds: reset.timestamp(),
+            reset_max: reset,
+            reset_max_epoch_seconds: reset.timestamp(),
+            first_observed_at: observed_at,
+            last_observed_at: observed_at,
+            sample_count: 1,
+            first_used_percent: 20.0,
+            latest_used_percent: 20.0,
+            minimum_used_percent: 20.0,
+            maximum_used_percent: 20.0,
+            transition: statsai_core::QuotaTransitionKind::Initial,
+            has_schedule_overlap: false,
+            change_points: Vec::new(),
+            latest_status: statsai_core::QuotaStatusV1::default(),
+            usage_totals: None,
+        }
+    }
+
+    fn test_unattributed_quota_record(source_id: &str) -> QuotaObservationRecordV1 {
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .expect("observed at");
+        let reset = observed_at + Duration::days(7);
+        QuotaObservationRecordV1 {
+            observation: statsai_core::QuotaObservationV1 {
+                schema_version: "quota_observation.v1".to_string(),
+                observation_id: format!("observation-{source_id}"),
+                semantic_fingerprint: format!("semantic-{source_id}"),
+                provider: "codex".to_string(),
+                source_id: SourceId(source_id.to_string()),
+                provider_account_id: None,
+                observed_at,
+                source_file_path_hash: format!("file-{source_id}"),
+                source_record_id: format!("record-{source_id}"),
+                source_line_number: 1,
+                payload_hash: format!("payload-{source_id}"),
+                usage_sample: None,
+                usage_event_id: None,
+                usage_link_kind: statsai_core::QuotaUsageLinkKind::None,
+                status: statsai_core::QuotaStatusV1::default(),
+            },
+            windows: vec![statsai_core::QuotaWindowObservationV1 {
+                schema_version: "quota_window_observation.v1".to_string(),
+                window_observation_id: format!("window-observation-{source_id}"),
+                observation_id: format!("observation-{source_id}"),
+                provider_slot: "primary".to_string(),
+                limit_id: Some("subscription".to_string()),
+                window_minutes: 10_080,
+                used_percent: 20.0,
+                resets_at: reset,
+                resets_at_epoch_seconds: reset.timestamp(),
+            }],
+            raw_rate_limits: json!({}),
+        }
+    }
+
+    #[test]
+    fn current_quota_windows_keep_unattributed_source_scopes_separate() {
+        let selected = select_current_quota_windows(
+            vec![
+                test_unattributed_quota_window("source-a", "window-a"),
+                test_unattributed_quota_window("source-b", "window-b"),
+            ],
+            false,
+            false,
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected
+                .iter()
+                .filter_map(|window| window.source_id.as_ref())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn raw_quota_history_isolated_to_unattributed_window_source() {
+        let window = test_unattributed_quota_window("source-a", "window-a");
+        let observations = raw_observations_for_window(
+            vec![
+                test_unattributed_quota_record("source-a"),
+                test_unattributed_quota_record("source-b"),
+            ],
+            &window,
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].observation.source_id.0, "source-a");
     }
 }

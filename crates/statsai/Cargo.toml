@@ -41,6 +41,7 @@ statsai-privacy.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+csv.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

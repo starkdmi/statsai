@@ -1,23 +1,26 @@
 //! Local SQLite storage for `statsai`.
 
+mod account_plan;
 mod archive;
 mod code_changes;
 mod migrations;
 mod pricing;
 mod privacy;
+mod quota;
 mod snapshot;
 mod tasks;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use statsai_core::{
-    hash_text, micro_usd_to_cents_rounded, normalize_email, normalize_provider_user_id,
-    periods_overlap, project_bucket_key, project_contains_file_paths, project_has_stable_identity,
-    provider_account_id, provider_account_id_from_identity, sanitize_code_change_metric_for_sync,
-    sanitize_summary_for_sync, semantic_event_fingerprint, source_account_assignment_id,
-    subscription_id, summary_id, timestamp_in_period, BillingPeriod, CodeChangeMetric, Confidence,
+    daily_rollup_project_key, hash_text, micro_usd_to_cents_rounded, normalize_email,
+    normalize_provider_user_id, periods_overlap, project_contains_file_paths,
+    project_has_stable_identity, provider_account_id, provider_account_id_from_identity,
+    sanitize_code_change_metric_for_sync, sanitize_summary_for_sync, semantic_event_fingerprint,
+    source_account_assignment_id, subscription_id, summary_id, timestamp_in_period,
+    AccountEvidenceSummaryV1, AccountPlanProjectionV1, BillingPeriod, CodeChangeMetric, Confidence,
     CostAccumulator, CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource,
     MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
     SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
@@ -32,6 +35,7 @@ use statsai_core::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+pub use account_plan::AccountEvidenceReferenceCounts;
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use pricing::{
     RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY, APPLIED_PRICING_RULESET_VERSION_KEY,
@@ -56,14 +60,18 @@ pub use privacy::{
     FilteredConversationMetadata, FilteredConversationRecord, PrivacyDatasetStatus,
     PrivacyFailureRecord, PrivacyFindingRecord,
 };
+pub use quota::{QuotaDateRange, QuotaQuery, QuotaStatus};
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
 };
 
-const SYNC_ROLLUP_SUMMARY_VERSION: &str = "12";
+// 13: project identity dropped the git remote, so every bucket that carries a
+// path has to be rebuilt for a repository rename to stop splitting a day.
+const SYNC_ROLLUP_SUMMARY_VERSION: &str = "13";
 const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
 const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
+const LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY: &str = "migration.legacy_codex_plan_evidence.v1";
 const SQLITE_BUSY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(50)
 } else {
@@ -113,6 +121,7 @@ pub struct PendingSyncSummaryCounts {
     pub rollups: u64,
     pub passthrough_summaries: u64,
     pub retired_entities: u64,
+    pub quota_cycle_contributions: u64,
     pub total: u64,
     pub days: u64,
 }
@@ -466,6 +475,25 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Restores the store's commit durability when dropped.
+///
+/// Held for the length of a bulk import. Restoring on drop rather than at the
+/// end of the import keeps a failed import from leaving a long-lived process
+/// writing everything else at reduced durability.
+pub struct BulkImportDurability<'a> {
+    store: &'a Store,
+    restore_to: i64,
+}
+
+impl Drop for BulkImportDurability<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .store
+            .conn
+            .execute_batch(&format!("PRAGMA synchronous = {}", self.restore_to));
+    }
+}
+
 impl Store {
     /// Opens a store and applies migrations.
     ///
@@ -486,8 +514,39 @@ impl Store {
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         let store = Self { conn };
         store.migrate()?;
+        store.configure_connection()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
+    }
+
+    /// Applies the per-connection settings the write paths rely on.
+    ///
+    /// Commit durability is deliberately left alone: this connection also
+    /// writes state that exists nowhere else — verifications a person entered,
+    /// subscriptions, account assignments, privacy identity — and none of that
+    /// can be collected again from local files. Relaxing durability is scoped
+    /// to the imports that can, in [`Store::relax_durability_for_bulk_import`].
+    ///
+    /// The page cache is raised because these archives are far larger than the
+    /// 2MB default, which turns index maintenance into a stream of single-page
+    /// reads.
+    fn configure_connection(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "PRAGMA cache_size = -65536;
+             PRAGMA temp_store = MEMORY;
+             CREATE TEMP TABLE IF NOT EXISTS incoming_records (
+               source_record_id TEXT,
+               item_id TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS incoming_records_source_idx
+               ON incoming_records (source_record_id);
+             CREATE INDEX IF NOT EXISTS incoming_records_item_idx
+               ON incoming_records (item_id);",
+        )?;
+        // Batched writes issue one statement per batch size, and the archive
+        // paths alternate between a handful of them.
+        self.conn.set_prepared_statement_cache_capacity(64);
+        Ok(())
     }
 
     /// Opens an independent connection to the same file-backed store.
@@ -529,8 +588,37 @@ impl Store {
         };
         store.conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         store.migrate()?;
+        store.configure_connection()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
+    }
+
+    /// Relaxes commit durability until the returned guard is dropped.
+    ///
+    /// In WAL mode `synchronous = NORMAL` cannot corrupt the database; it only
+    /// means a power loss may cost the most recently committed transactions.
+    /// That is an acceptable trade for importing a provider's archive, because
+    /// each file's rows and the cache entry recording it commit together, so a
+    /// lost commit is collected again on the next run rather than going
+    /// silently missing.
+    ///
+    /// It is not an acceptable trade for the rest of the store, which holds
+    /// state that no local file can reproduce, so the relaxation is scoped to
+    /// the import rather than applied to the connection for good.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite rejects the durability change.
+    pub fn relax_durability_for_bulk_import(&self) -> Result<BulkImportDurability<'_>> {
+        let restore_to = self
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .context("read commit durability")?;
+        self.conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        Ok(BulkImportDurability {
+            store: self,
+            restore_to,
+        })
     }
 
     fn with_immediate_transaction<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -646,7 +734,26 @@ impl Store {
     }
 
     pub fn migrate(&self) -> Result<()> {
-        migrations::migrate(&self.conn)
+        migrations::migrate(&self.conn)?;
+        if self
+            .metadata_value(LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY)?
+            .as_deref()
+            != Some("1")
+        {
+            self.with_immediate_transaction(|| {
+                if self
+                    .metadata_value(LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY)?
+                    .as_deref()
+                    == Some("1")
+                {
+                    return Ok(());
+                }
+                self.migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()?;
+                self.set_metadata_value(LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY, "1")?;
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -2452,6 +2559,25 @@ impl Store {
                 target,
                 &batch.code_change_metrics,
             )?;
+            self.record_quota_cycle_contributions_synced_in_transaction(
+                sink,
+                target,
+                &batch.quota_cycle_contributions,
+            )?;
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "account_plan_observation",
+                &batch.account_plan_observations,
+                |projection| projection.projection_id.as_str(),
+            )?;
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "account_evidence_summary",
+                &batch.account_evidence_summaries,
+                |summary| summary.summary_id.as_str(),
+            )?;
             self.record_task_bucket_snapshots_synced_in_transaction(
                 sink,
                 target,
@@ -2765,6 +2891,60 @@ impl Store {
         Ok(changed)
     }
 
+    fn pending_serialized_entities_for_sync<T: Clone + Serialize>(
+        &self,
+        sink: &str,
+        target: &str,
+        entity_kind: &str,
+        entities: &[T],
+        entity_id: impl Fn(&T) -> &str,
+    ) -> Result<Vec<T>> {
+        let mut changed = Vec::new();
+        for entity in entities {
+            let payload = serde_json::to_string(entity)?;
+            if self.entity_requires_sync(
+                sink,
+                target,
+                entity_kind,
+                entity_id(entity),
+                &hash_text(&payload),
+            )? {
+                changed.push(entity.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn pending_account_plan_projections_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        projections: &[AccountPlanProjectionV1],
+    ) -> Result<Vec<AccountPlanProjectionV1>> {
+        self.pending_serialized_entities_for_sync(
+            sink,
+            target,
+            "account_plan_observation",
+            projections,
+            |projection| projection.projection_id.as_str(),
+        )
+    }
+
+    pub fn pending_account_evidence_summaries_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        summaries: &[AccountEvidenceSummaryV1],
+    ) -> Result<Vec<AccountEvidenceSummaryV1>> {
+        self.pending_serialized_entities_for_sync(
+            sink,
+            target,
+            "account_evidence_summary",
+            summaries,
+            |summary| summary.summary_id.as_str(),
+        )
+    }
+
     pub fn pending_summaries_for_sync(
         &self,
         sink: &str,
@@ -2878,6 +3058,30 @@ impl Store {
                     .map(String::as_str)
                     .collect::<BTreeSet<_>>(),
             ),
+            (
+                "quota_cycle_contribution",
+                snapshot
+                    .quota_cycle_contribution_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                "account_plan_observation",
+                snapshot
+                    .account_plan_observation_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                "account_evidence_summary",
+                snapshot
+                    .account_evidence_summary_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+            ),
         ]);
         let mut statement = self.conn.prepare(
             r#"
@@ -2886,7 +3090,8 @@ impl Store {
             WHERE sink = ?1 AND target = ?2
               AND entity_kind IN (
                 'source', 'account', 'source_account_assignment', 'subscription', 'summary',
-                'code_change_metric'
+                'code_change_metric', 'quota_cycle_contribution',
+                'account_plan_observation', 'account_evidence_summary'
               )
             "#,
         )?;
@@ -2961,10 +3166,39 @@ impl Store {
             target,
             &current_code_change_metrics,
         )?;
+        let current_quota_cycle_contributions =
+            self.quota_cycle_contributions(&QuotaQuery::default(), device_id)?;
+        let current_account_plan_observations = self.account_plan_projections(device_id)?;
+        let account_plan_observations = self.pending_account_plan_projections_for_sync(
+            "http",
+            target,
+            &current_account_plan_observations,
+        )?;
+        let current_account_evidence_summaries = self.account_evidence_summaries(device_id)?;
+        let account_evidence_summaries = self.pending_account_evidence_summaries_for_sync(
+            "http",
+            target,
+            &current_account_evidence_summaries,
+        )?;
         let current_snapshot = self.current_http_sync_authoritative_snapshot(
             &current_rollups,
             &current_passthrough_summaries,
             &current_code_change_metrics,
+            &current_quota_cycle_contributions
+                .iter()
+                .map(|contribution| contribution.contribution_id.clone())
+                .collect::<Vec<_>>(),
+            &current_account_plan_observations,
+            &current_account_evidence_summaries,
+        )?;
+        // A quota cycle can change without any summary changing: a reset moves,
+        // or an observation carries no tokens. Counting only the summary-shaped
+        // entities left those uploads invisible, so the menubar reported nothing
+        // pending while a sync would still have sent them.
+        let quota_cycle_contributions = self.pending_quota_cycle_contributions_for_sync(
+            "http",
+            target,
+            &current_quota_cycle_contributions,
         )?;
         let retired_entities = self
             .retired_sync_entity_ids("http", target, &current_snapshot)?
@@ -2976,10 +3210,14 @@ impl Store {
             rollups: rollups.len() as u64,
             passthrough_summaries: passthrough_summaries.len() as u64,
             retired_entities: retired_entities as u64,
+            quota_cycle_contributions: quota_cycle_contributions.len() as u64,
             total: rollups
                 .len()
                 .saturating_add(passthrough_summaries.len())
                 .saturating_add(code_change_metrics.len())
+                .saturating_add(quota_cycle_contributions.len())
+                .saturating_add(account_plan_observations.len())
+                .saturating_add(account_evidence_summaries.len())
                 .saturating_add(retired_entities) as u64,
             days: days.len() as u64,
         })
@@ -2990,6 +3228,9 @@ impl Store {
         rollups: &[UsageSummary],
         passthrough_summaries: &[UsageSummary],
         code_change_metrics: &[CodeChangeMetric],
+        quota_cycle_contribution_ids: &[String],
+        account_plan_observations: &[AccountPlanProjectionV1],
+        account_evidence_summaries: &[AccountEvidenceSummaryV1],
     ) -> Result<SyncAuthoritativeSnapshot> {
         Ok(SyncAuthoritativeSnapshot {
             snapshot_id: String::new(),
@@ -3023,6 +3264,15 @@ impl Store {
             code_change_metric_ids: code_change_metrics
                 .iter()
                 .map(|metric| metric.metric_id.clone())
+                .collect(),
+            quota_cycle_contribution_ids: quota_cycle_contribution_ids.to_vec(),
+            account_plan_observation_ids: account_plan_observations
+                .iter()
+                .map(|observation| observation.projection_id.clone())
+                .collect(),
+            account_evidence_summary_ids: account_evidence_summaries
+                .iter()
+                .map(|summary| summary.summary_id.clone())
                 .collect(),
         })
     }
@@ -3437,6 +3687,100 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    pub fn record_quota_cycle_contributions_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        contributions: &[statsai_core::QuotaCycleContributionV1],
+    ) -> Result<()> {
+        if contributions.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_quota_cycle_contributions_synced_in_transaction(sink, target, contributions)
+        })
+    }
+
+    fn record_quota_cycle_contributions_synced_in_transaction(
+        &self,
+        sink: &str,
+        target: &str,
+        contributions: &[statsai_core::QuotaCycleContributionV1],
+    ) -> Result<()> {
+        for contribution in contributions {
+            let payload = serde_json::to_string(contribution)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                "quota_cycle_contribution",
+                &contribution.contribution_id,
+                &hash_text(&payload),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn record_serialized_entities_synced_in_transaction<T: Serialize>(
+        &self,
+        sink: &str,
+        target: &str,
+        entity_kind: &str,
+        entities: &[T],
+        entity_id: impl Fn(&T) -> &str,
+    ) -> Result<()> {
+        for entity in entities {
+            let payload = serde_json::to_string(entity)?;
+            self.record_entity_synced(
+                sink,
+                target,
+                entity_kind,
+                entity_id(entity),
+                &hash_text(&payload),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn record_account_plan_projections_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        projections: &[AccountPlanProjectionV1],
+    ) -> Result<()> {
+        if projections.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "account_plan_observation",
+                projections,
+                |projection| projection.projection_id.as_str(),
+            )
+        })
+    }
+
+    pub fn record_account_evidence_summaries_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        summaries: &[AccountEvidenceSummaryV1],
+    ) -> Result<()> {
+        if summaries.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "account_evidence_summary",
+                summaries,
+                |summary| summary.summary_id.as_str(),
+            )
+        })
     }
 
     pub fn compute_daily_rollup(&self, date: &str, device_id: &str) -> Result<DailyRollup> {
@@ -4070,7 +4414,9 @@ fn apply_verified_source_state_with_recovery_boundary(
             provider_user_id: verified_state.provider_user_id.as_deref(),
             email: verified_state.email.as_deref(),
             label: verified_state.account_label.clone(),
-            plan_name: verified_state.plan_name.clone(),
+            plan_name: (!source.provider.eq_ignore_ascii_case("codex"))
+                .then(|| verified_state.plan_name.clone())
+                .flatten(),
             identity_source: Some(record_source.clone()),
             verified_at: verified_state.verified_at,
         },
@@ -4256,11 +4602,16 @@ fn upsert_verified_source_assignment(
             created_at: existing.created_at,
             updated_at: Utc::now(),
         };
+        let attribution_changed = merged.assignment_id != existing.assignment_id
+            || merged.started_at != existing.started_at
+            || merged.ended_at != existing.ended_at;
         if merged.assignment_id != existing.assignment_id {
             store.delete_source_account_assignment(&existing.assignment_id)?;
         }
         store.upsert_source_account_assignment(&merged)?;
-        reattribute_source_records(store, &source.source_id)?;
+        if attribution_changed {
+            reattribute_source_records(store, &source.source_id)?;
+        }
         return Ok(());
     }
 
@@ -4477,6 +4828,11 @@ fn upsert_verified_subscription(
     provider_account_id: &ProviderAccountId,
     verified: &VerifiedSubscriptionState,
 ) -> Result<()> {
+    // Codex authentication exposes provider plan state, not user billing facts. Its adapter
+    // persists that information through the plan-evidence ledger instead of this billing table.
+    if provider.eq_ignore_ascii_case("codex") {
+        return Ok(());
+    }
     validate_time_window(verified.started_at, None, "subscription")?;
     let subscriptions: Vec<_> = store
         .list_subscriptions()?
@@ -4757,16 +5113,46 @@ fn reattribute_source_records(store: &Store, source_id: &SourceId) -> Result<()>
         return Ok(());
     }
     let assignments = store.list_source_account_assignments_for_source(source_id)?;
-    let mut events = store.events_for_source(source_id)?;
-    let mut summaries = store.summaries_for_source(source_id)?;
-    for event in &mut events {
-        apply_account_resolution_to_event(&assignments, event);
+    let mut changed_events = Vec::new();
+    for mut event in store.events_for_source(source_id)? {
+        let previous_account = event.provider_account_id.clone();
+        let previous_identity_source = event
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| evidence.account_identity_source.clone());
+        apply_account_resolution_to_event(&assignments, &mut event);
+        let identity_source = event
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| evidence.account_identity_source.clone());
+        if event.provider_account_id != previous_account
+            || identity_source != previous_identity_source
+        {
+            changed_events.push(event);
+        }
     }
-    for summary in &mut summaries {
-        apply_account_resolution_to_summary(&assignments, summary);
+    let mut changed_summaries = Vec::new();
+    for mut summary in store.summaries_for_source(source_id)? {
+        let previous_account = summary.provider_account_id.clone();
+        let previous_identity_source = summary
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| evidence.account_identity_source.clone());
+        apply_account_resolution_to_summary(&assignments, &mut summary);
+        let identity_source = summary
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| evidence.account_identity_source.clone());
+        if summary.provider_account_id != previous_account
+            || identity_source != previous_identity_source
+        {
+            changed_summaries.push(summary);
+        }
     }
-    store.rewrite_events(&events)?;
-    store.rewrite_summaries(&summaries)?;
+    store.rewrite_events(&changed_events)?;
+    store.rewrite_summaries(&changed_summaries)?;
+    store.reattribute_quota_observations(source_id)?;
+    store.rebuild_quota_plan_observations_for_source(source_id)?;
     Ok(())
 }
 
@@ -4934,7 +5320,7 @@ fn sync_rollup_summary_id(key: &SyncRollupBucketKey) -> SummaryId {
 }
 
 fn sync_rollup_project_key(project: Option<&statsai_core::ProjectInfo>) -> String {
-    project_bucket_key(project)
+    daily_rollup_project_key(project)
 }
 
 fn event_with_valid_project(event: &UsageEvent) -> UsageEvent {
@@ -4951,6 +5337,11 @@ fn event_with_valid_project(event: &UsageEvent) -> UsageEvent {
 
 fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let first = events.first().expect("rollup bucket must contain events");
+    // Events arrive oldest first. A bucket can now span a repository rename, so
+    // project metadata comes from the newest event: it names the remote the
+    // checkout has now, which is what lets the backend move this location onto
+    // the renamed project instead of waiting for the next day of usage.
+    let newest = events.last().unwrap_or(first);
     let mut total_input = 0u64;
     let mut total_output = 0u64;
     let mut total_cache_creation = 0u64;
@@ -5260,7 +5651,7 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             confidence: Confidence::Medium,
         },
         parse_evidence: None,
-        project: first
+        project: newest
             .project
             .as_ref()
             .filter(|project| project_has_stable_identity(project))
@@ -5269,7 +5660,7 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             mode: PrivacyMode::MetadataOnly,
             contains_prompt_text: false,
             contains_response_text: false,
-            contains_file_paths: project_contains_file_paths(first.project.as_ref()),
+            contains_file_paths: project_contains_file_paths(newest.project.as_ref()),
         },
         metrics: summary_metrics,
         period_start: Some(period_start),
@@ -5713,7 +6104,9 @@ fn uses_path_independent_codex_dedupe(event: &UsageEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Task spans still key on the remote-inclusive bucket; rollups do not.
     use chrono::{TimeZone, Utc};
+    use statsai_core::project_bucket_key;
     use statsai_core::{
         event_id, summary_id, Confidence, CostInfo, EventSource, LocationOrigin, ModelInfo,
         ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, SessionInfo,
@@ -5721,6 +6114,40 @@ mod tests {
         USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
     };
     use std::path::Path;
+
+    /// Importing an archive may trade durability for speed because a lost
+    /// commit is simply collected again. The rest of the store holds work that
+    /// no local file can reproduce, so the trade must not outlive the import.
+    #[test]
+    fn relaxed_durability_is_scoped_to_the_bulk_import() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&dir.path().join("statsai.sqlite")).expect("store");
+        let durability = || {
+            store
+                .conn
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .expect("read durability")
+        };
+
+        let opened_with = durability();
+        assert_ne!(
+            opened_with, 0,
+            "a store must never open with durability disabled"
+        );
+
+        {
+            let _relaxed = store
+                .relax_durability_for_bulk_import()
+                .expect("relax durability");
+            assert_eq!(durability(), 1, "the import did not get NORMAL durability");
+        }
+
+        assert_eq!(
+            durability(),
+            opened_with,
+            "durability stayed relaxed after the import"
+        );
+    }
 
     #[test]
     #[cfg(unix)]
@@ -6589,6 +7016,455 @@ mod tests {
     }
 
     #[test]
+    fn migrates_only_codex_local_auth_subscriptions_into_plan_evidence() {
+        let store = Store::in_memory().expect("store");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("started_at");
+        let active_until = Utc
+            .with_ymd_and_hms(2026, 7, 1, 0, 0, 0)
+            .single()
+            .expect("active_until");
+        let account_id = provider_account_id("codex", "provider-user");
+        let synthetic = Subscription {
+            schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+            subscription_id: SubscriptionId("synthetic-codex-plan".to_string()),
+            provider: "codex".to_string(),
+            provider_account_id: account_id.clone(),
+            plan_name: "future_ultra".to_string(),
+            price: 20_00,
+            currency: "USD".to_string(),
+            billing_period: BillingPeriod::Monthly,
+            paid_at: Some(started_at),
+            renewal_day: Some(1),
+            started_at,
+            ended_at: None,
+            current_period_ends_at: Some(active_until),
+            status: SubscriptionStatus::Active,
+            record_source: IdentitySource::LocalAuth,
+            verified_at: Some(started_at),
+            notes: None,
+        };
+        let manual = Subscription {
+            subscription_id: SubscriptionId("manual-codex-billing".to_string()),
+            record_source: IdentitySource::UserConfigured,
+            price: 12_34,
+            ..synthetic.clone()
+        };
+        store.upsert_subscription(&synthetic).expect("synthetic");
+        store.upsert_subscription(&manual).expect("manual");
+
+        assert_eq!(
+            store
+                .migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()
+                .expect("migration"),
+            1
+        );
+        assert_eq!(
+            store
+                .migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()
+                .expect("repeat migration"),
+            0
+        );
+
+        assert_eq!(store.list_subscriptions().expect("billing"), vec![manual]);
+        let observations = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].provider_account_id, Some(account_id));
+        assert_eq!(observations[0].raw_plan_name, "future_ultra");
+        assert_eq!(observations[0].plan_name, "Future Ultra");
+        assert_eq!(observations[0].active_from, Some(started_at));
+        assert_eq!(observations[0].active_until, Some(active_until));
+        assert_eq!(
+            observations[0].evidence_kind,
+            statsai_core::AccountEvidenceKind::LegacyLocalAuth
+        );
+    }
+
+    #[test]
+    fn an_unreadable_legacy_payload_does_not_make_the_store_unopenable() {
+        let path = tempfile::tempdir()
+            .expect("tempdir")
+            .keep()
+            .join("store.db");
+        {
+            let store = Store::open(&path).expect("initial store");
+            store
+                .conn
+                .execute(
+                    "INSERT INTO subscriptions
+                       (subscription_id, provider, provider_account_id, payload)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        "corrupt-subscription",
+                        "codex",
+                        "codex:corrupt",
+                        "{ this is not json",
+                    ],
+                )
+                .expect("corrupt subscription row");
+            store
+                .conn
+                .execute(
+                    "INSERT INTO provider_accounts
+                       (provider_account_id, provider, payload, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        "codex:corrupt-account",
+                        "codex",
+                        "{ also not json",
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .expect("corrupt account row");
+            store
+                .conn
+                .execute(
+                    "DELETE FROM local_metadata WHERE key = ?1",
+                    params![LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY],
+                )
+                .expect("clear conversion flag");
+        }
+
+        // The conversion runs inside `migrate`, so a hard error here would roll
+        // back before the completion flag is written and fail every later open.
+        let reopened = Store::open(&path).expect("a corrupt legacy row must not brick the store");
+        assert_eq!(
+            reopened
+                .metadata_value(LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY)
+                .expect("conversion flag")
+                .as_deref(),
+            Some("1"),
+            "the one-shot conversion must be recorded as done, not retried forever"
+        );
+        Store::open(&path).expect("a second open still succeeds");
+    }
+
+    #[test]
+    fn migrates_legacy_codex_account_plan_without_subscription() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("observed at");
+        let account_id = provider_account_id("codex", "legacy-plan-account");
+        store
+            .upsert_account(&ProviderAccount {
+                schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+                provider_account_id: account_id.clone(),
+                provider: "codex".to_string(),
+                identity_source: IdentitySource::LocalAuth,
+                provider_user_id: None,
+                provider_user_id_hash: Some("a".repeat(64)),
+                email: None,
+                email_hash: None,
+                org_id_hash: None,
+                account_label: Some("Codex account".to_string()),
+                plan_name: Some("future_ultra".to_string()),
+                confidence: Confidence::High,
+                verified_at: Some(observed_at),
+                created_at: observed_at,
+                updated_at: observed_at,
+            })
+            .expect("legacy account");
+
+        assert_eq!(
+            store
+                .migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()
+                .expect("migration"),
+            0
+        );
+
+        let account = store
+            .account(&account_id)
+            .expect("account")
+            .expect("exists");
+        assert_eq!(account.plan_name, None);
+        assert_eq!(account.account_label.as_deref(), Some("Codex account"));
+        let observations = store.account_plan_observations().expect("plan evidence");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].provider_account_id, Some(account_id));
+        assert_eq!(observations[0].raw_plan_name, "future_ultra");
+        assert_eq!(observations[0].plan_name, "Future Ultra");
+        assert_eq!(observations[0].active_from, None);
+        assert_eq!(observations[0].active_until, None);
+        assert_eq!(
+            observations[0].evidence_kind,
+            statsai_core::AccountEvidenceKind::LegacyLocalAuth
+        );
+        assert_eq!(
+            store
+                .migrate_legacy_codex_local_auth_subscriptions_to_plan_evidence()
+                .expect("repeat migration"),
+            0
+        );
+        assert_eq!(
+            store
+                .account_plan_observations()
+                .expect("repeated plan evidence")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn completed_legacy_plan_conversion_is_not_repeated_on_migrate() {
+        let store = Store::in_memory().expect("store");
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO account_plan_observations (
+                  observation_id, provider, source_id, provider_account_id,
+                  observed_at, active_from, active_until, plan_name, evidence_kind, payload
+                ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, ?5, ?6, ?7)
+                "#,
+                params![
+                    "post-conversion-malformed-observation",
+                    "codex",
+                    "source-after-conversion",
+                    "2026-08-23T00:00:00Z",
+                    "Pro",
+                    "quota_status",
+                    "not-json"
+                ],
+            )
+            .expect("insert evidence that must not be rescanned");
+
+        store.migrate().expect("completed conversion stays skipped");
+    }
+
+    #[test]
+    fn direct_conversation_evidence_overrides_only_that_event_and_preserves_manual_interval() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-direct-account-binding"),
+            LocationOrigin::Configured,
+        );
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
+            .single()
+            .expect("observed_at");
+        let manual_account = ProviderAccountId("manual-account".to_string());
+        let directly_bound_account = ProviderAccountId("direct-account".to_string());
+        store.upsert_source(&source).expect("source");
+        let manual_assignment = SourceAccountAssignment {
+            schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+            assignment_id: SourceAccountAssignmentId("manual-assignment".to_string()),
+            source_id: source.source_id.clone(),
+            provider: "codex".to_string(),
+            provider_account_id: manual_account.clone(),
+            started_at: observed_at - chrono::Duration::days(1),
+            ended_at: None,
+            record_source: IdentitySource::UserConfigured,
+            verified_at: None,
+            created_at: observed_at,
+            updated_at: observed_at,
+        };
+        store
+            .upsert_source_account_assignment(&manual_assignment)
+            .expect("manual assignment");
+        let direct_binding = statsai_core::ConversationAccountBindingV1 {
+            schema_version: statsai_core::CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION.to_string(),
+            binding_id: "direct-binding".to_string(),
+            provider: "codex".to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: directly_bound_account.clone(),
+            conversation_id_hash: "same-session".to_string(),
+            turn_id_hash: None,
+            observed_at,
+            evidence_kind: statsai_core::AccountEvidenceKind::ResetHistory,
+            confidence: Confidence::High,
+        };
+        assert_eq!(
+            store
+                .upsert_conversation_account_bindings(std::slice::from_ref(&direct_binding))
+                .expect("direct binding"),
+            1
+        );
+        assert_eq!(
+            store
+                .upsert_conversation_account_bindings(&[direct_binding])
+                .expect("repeat direct binding"),
+            0
+        );
+        store
+            .upsert_account_identity_observations(&[statsai_core::AccountIdentityObservationV1 {
+                schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                    .to_string(),
+                observation_id: "direct-identity".to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(directly_bound_account.clone()),
+                provider_user_id_hash: Some("provider-id-hash".to_string()),
+                email_hash: None,
+                conversation_id_hash: Some("same-session".to_string()),
+                turn_id_hash: None,
+                observed_at,
+                evidence_kind: statsai_core::AccountEvidenceKind::ResetHistory,
+                confidence: Confidence::High,
+                auth_mode: None,
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "test".to_string(),
+                artifact_path_hash: "path-hash".to_string(),
+                record_fingerprint: "record-hash".to_string(),
+            }])
+            .expect("identity observation");
+        let mut directly_bound = test_store_event(&source, observed_at, "direct");
+        directly_bound.provider_account_id = Some(manual_account.clone());
+        let mut unrelated = test_store_event(&source, observed_at, "unrelated");
+        unrelated.session.local_session_id_hash = Some("other-session".to_string());
+        unrelated.provider_account_id = Some(manual_account.clone());
+        let mut events = vec![directly_bound, unrelated];
+
+        store
+            .apply_conversation_account_bindings(&source.source_id, &mut events)
+            .expect("apply binding");
+
+        assert_eq!(events[0].provider_account_id, Some(directly_bound_account));
+        assert_eq!(events[1].provider_account_id, Some(manual_account.clone()));
+        assert_eq!(
+            store
+                .list_source_account_assignments_for_source(&source.source_id)
+                .expect("manual interval"),
+            vec![manual_assignment]
+        );
+        let summaries = store
+            .account_evidence_summaries("device")
+            .expect("evidence summary");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].directly_bound_conversations, 1);
+        assert_eq!(summaries[0].uncovered_gap_count, 0);
+        assert_eq!(summaries[0].conflict_count, 1);
+    }
+
+    #[test]
+    fn confirmed_auth_reload_boundaries_repair_switches_conservatively() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-account-evidence-switch"),
+            LocationOrigin::Configured,
+        );
+        let base = Utc
+            .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
+            .single()
+            .expect("base");
+        let account_a = ProviderAccountId("account-a".to_string());
+        let account_b = ProviderAccountId("account-b".to_string());
+        store.upsert_source(&source).expect("source");
+        store
+            .upsert_source_account_assignment(&SourceAccountAssignment {
+                schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+                assignment_id: SourceAccountAssignmentId("broad-account-a".to_string()),
+                source_id: source.source_id.clone(),
+                provider: "codex".to_string(),
+                provider_account_id: account_a.clone(),
+                started_at: base,
+                ended_at: None,
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(base),
+                created_at: base,
+                updated_at: base,
+            })
+            .expect("broad assignment");
+        let observation = |id: &str,
+                           account: ProviderAccountId,
+                           observed_at: chrono::DateTime<Utc>,
+                           kind: statsai_core::AccountEvidenceKind| {
+            statsai_core::AccountIdentityObservationV1 {
+                schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                    .to_string(),
+                observation_id: id.to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(account),
+                provider_user_id_hash: Some(format!("hash-{id}")),
+                email_hash: None,
+                conversation_id_hash: None,
+                turn_id_hash: None,
+                observed_at,
+                evidence_kind: kind,
+                confidence: Confidence::High,
+                auth_mode: Some("chatgpt".to_string()),
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "test".to_string(),
+                artifact_path_hash: "path-hash".to_string(),
+                record_fingerprint: format!("fingerprint-{id}"),
+            }
+        };
+        let account_a_reload = base + chrono::Duration::days(1);
+        let account_a_confirmation = base + chrono::Duration::days(2);
+        let account_b_reload = base + chrono::Duration::days(3);
+        let account_b_confirmation = base + chrono::Duration::days(4);
+        store
+            .upsert_account_identity_observations(&[
+                observation(
+                    "a-reload",
+                    account_a.clone(),
+                    account_a_reload,
+                    statsai_core::AccountEvidenceKind::AuthReload,
+                ),
+                observation(
+                    "a-confirm",
+                    account_a.clone(),
+                    account_a_confirmation,
+                    statsai_core::AccountEvidenceKind::TelemetryIdentity,
+                ),
+                observation(
+                    "b-reload",
+                    account_b.clone(),
+                    account_b_reload,
+                    statsai_core::AccountEvidenceKind::AuthReload,
+                ),
+                observation(
+                    "b-confirm",
+                    account_b.clone(),
+                    account_b_confirmation,
+                    statsai_core::AccountEvidenceKind::AuthSnapshot,
+                ),
+            ])
+            .expect("identity evidence");
+
+        assert!(
+            store
+                .reconcile_source_account_evidence_assignments(&source.source_id)
+                .expect("repair intervals")
+                > 0
+        );
+        assert_eq!(
+            store
+                .reconcile_source_account_evidence_assignments(&source.source_id)
+                .expect("repeat repair"),
+            0
+        );
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 2);
+        let repaired_a = assignments
+            .iter()
+            .find(|assignment| assignment.provider_account_id == account_a)
+            .expect("account a interval");
+        assert_eq!(repaired_a.started_at, base);
+        assert_eq!(repaired_a.ended_at, Some(account_b_reload));
+        let repaired_b = assignments
+            .iter()
+            .find(|assignment| assignment.provider_account_id == account_b)
+            .expect("account b interval");
+        assert_eq!(repaired_b.started_at, account_b_reload);
+        assert_eq!(repaired_b.ended_at, None);
+    }
+
+    #[test]
     fn inserts_events_idempotently() {
         let store = Store::in_memory().expect("store");
         let source = statsai_core::SourceLocation::local_adapter(
@@ -6709,6 +7585,64 @@ mod tests {
         let rollups = store.dirty_sync_rollup_summaries().expect("rollups");
         assert_eq!(rollups.len(), 1);
         assert_eq!(rollups[0].project, None);
+    }
+
+    #[test]
+    fn renaming_a_repository_keeps_one_rollup_for_the_day() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-repo-rename"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let day = Utc
+            .with_ymd_and_hms(2026, 6, 5, 9, 0, 0)
+            .single()
+            .expect("day");
+        let account_id = statsai_core::provider_account_id("codex", "personal");
+
+        let checkout = |remote: &str, label: &str| ProjectInfo {
+            project_id: format!("project-{remote}"),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some(remote.to_string()),
+            repo_label: Some(label.to_string()),
+            branch_hash: Some("branch-main".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-checkout".to_string()),
+            path_label: Some("/work/ai-stats".to_string()),
+        };
+
+        // Same checkout, same branch, same day — the remote was renamed midway.
+        let mut before = test_store_event(&source, day, "before-rename");
+        before.provider_account_id = Some(account_id.clone());
+        before.usage.total_tokens = Some(10);
+        before.project = Some(checkout("remote-before", "owner/ai-stats"));
+
+        let mut after = test_store_event(&source, day + chrono::Duration::hours(1), "after-rename");
+        after.provider_account_id = Some(account_id);
+        after.usage.total_tokens = Some(20);
+        after.project = Some(checkout("remote-after", "owner/statsai"));
+
+        assert!(store.insert_event(&before).expect("insert before"));
+        assert!(store.insert_event(&after).expect("insert after"));
+
+        let dirty = store.dirty_sync_rollup_summaries().expect("dirty rollups");
+        assert_eq!(dirty.len(), 1, "a rename must not split the day in two");
+        let rollup = &dirty[0];
+        assert_eq!(rollup.usage.total_tokens, Some(30));
+
+        // The remote still travels with the rollup, so the backend can key the
+        // project on it and relink this location's history across the rename.
+        let project = rollup.project.as_ref().expect("project metadata");
+        assert_eq!(project.path_hash.as_deref(), Some("path-checkout"));
+        assert_eq!(
+            project.repo_label.as_deref(),
+            Some("owner/statsai"),
+            "the newest event names the remote the checkout has now"
+        );
     }
 
     #[test]
@@ -8531,11 +9465,14 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: summaries.clone(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: now,
         };
@@ -9712,6 +10649,7 @@ mod tests {
                 rollups: 0,
                 passthrough_summaries: 2,
                 retired_entities: 0,
+                quota_cycle_contributions: 0,
                 total: 2,
                 days: 5,
             }
@@ -9773,6 +10711,7 @@ mod tests {
                 rollups: 0,
                 passthrough_summaries: 1,
                 retired_entities: 0,
+                quota_cycle_contributions: 0,
                 total: 1,
                 days: 1,
             }
@@ -9990,6 +10929,98 @@ mod tests {
     }
 
     #[test]
+    fn pending_http_sync_summary_counts_include_account_plan_and_evidence_only_uploads() {
+        let store = Store::in_memory().expect("store");
+        let target = "https://api.example.com/api/sync/batches";
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
+            .single()
+            .expect("observed at");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-pending-account-evidence"),
+            LocationOrigin::Configured,
+        );
+        let account_id = ProviderAccountId("pending-account".to_string());
+        store.upsert_source(&source).expect("source");
+        store
+            .upsert_account_identity_observations(&[statsai_core::AccountIdentityObservationV1 {
+                schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                    .to_string(),
+                observation_id: "pending-identity".to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(account_id.clone()),
+                provider_user_id_hash: Some("provider-id-hash".to_string()),
+                email_hash: None,
+                conversation_id_hash: None,
+                turn_id_hash: None,
+                observed_at,
+                evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+                confidence: Confidence::High,
+                auth_mode: Some("chatgpt".to_string()),
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "auth_json".to_string(),
+                artifact_path_hash: "path-hash".to_string(),
+                record_fingerprint: "identity-fingerprint".to_string(),
+            }])
+            .expect("identity evidence");
+        store
+            .upsert_account_plan_observations(&[statsai_core::AccountPlanObservationV1 {
+                schema_version: statsai_core::ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id: "pending-plan".to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id,
+                provider_account_id: Some(account_id),
+                raw_plan_name: "plus".to_string(),
+                plan_name: "Plus".to_string(),
+                observed_at,
+                active_from: None,
+                active_until: None,
+                is_current_snapshot: true,
+                evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+                confidence: Confidence::High,
+                parser_version: "test.v1".to_string(),
+                artifact_path_hash: "path-hash".to_string(),
+                record_fingerprint: "plan-fingerprint".to_string(),
+            }])
+            .expect("plan evidence");
+
+        let plans = store
+            .account_plan_projections("device")
+            .expect("plan projections");
+        let evidence = store
+            .account_evidence_summaries("device")
+            .expect("evidence summaries");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts(target, "device")
+                .expect("pending counts")
+                .total,
+            2
+        );
+
+        store
+            .record_account_plan_projections_synced("http", target, &plans)
+            .expect("record plan synced");
+        store
+            .record_account_evidence_summaries_synced("http", target, &evidence)
+            .expect("record evidence synced");
+        assert_eq!(
+            store
+                .pending_http_sync_summary_counts(target, "device")
+                .expect("settled counts")
+                .total,
+            0
+        );
+    }
+
+    #[test]
     fn sync_preferences_round_trip_and_normalize_tasks() {
         let store = Store::in_memory().expect("store");
 
@@ -10054,6 +11085,325 @@ mod tests {
             .events_in_period(Some(DateTime::<Utc>::UNIX_EPOCH), until)
             .expect("epoch floor");
         assert!(epoch_floor.is_empty());
+    }
+
+    #[test]
+    fn conflicting_bindings_keep_a_manual_account_assignment() {
+        let store = Store::in_memory().expect("store");
+        let now = Utc::now();
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            std::path::Path::new("/tmp/binding-conflict"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let manual = ProviderAccountId("account-manual".to_string());
+
+        // The same conversation is bound to two different accounts.
+        for (index, account) in ["account-one", "account-two"].iter().enumerate() {
+            store
+                .upsert_conversation_account_bindings(&[
+                    statsai_core::ConversationAccountBindingV1 {
+                        schema_version: statsai_core::CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION
+                            .to_string(),
+                        binding_id: format!("binding-{index}"),
+                        provider: "codex".to_string(),
+                        source_id: source.source_id.clone(),
+                        provider_account_id: ProviderAccountId((*account).to_string()),
+                        conversation_id_hash: "same-session".to_string(),
+                        turn_id_hash: None,
+                        observed_at: now,
+                        evidence_kind: statsai_core::AccountEvidenceKind::TelemetryIdentity,
+                        confidence: Confidence::High,
+                    },
+                ])
+                .expect("binding");
+        }
+
+        let mut manual_event = test_store_event(&source, now, "manual-record");
+        manual_event.provider_account_id = Some(manual.clone());
+        manual_event.parse_evidence = Some(ParseEvidence {
+            event_key_version: "test".to_string(),
+            source_file_path_hash: None,
+            source_line_number: None,
+            source_record_id: None,
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: IdentitySource::UserConfigured,
+        });
+        let mut derived_event = test_store_event(&source, now, "derived-record");
+        derived_event.provider_account_id = Some(ProviderAccountId("account-one".to_string()));
+        derived_event.parse_evidence = Some(ParseEvidence {
+            account_identity_source: IdentitySource::LocalAuth,
+            ..manual_event
+                .parse_evidence
+                .clone()
+                .expect("evidence template")
+        });
+
+        let mut events = vec![manual_event, derived_event];
+        store
+            .apply_conversation_account_bindings(&source.source_id, &mut events)
+            .expect("apply bindings");
+
+        assert_eq!(
+            events[0].provider_account_id.as_ref(),
+            Some(&manual),
+            "a conflict between derived bindings must not discard a manual assignment"
+        );
+        assert_eq!(
+            events[0]
+                .parse_evidence
+                .as_ref()
+                .map(|evidence| &evidence.account_identity_source),
+            Some(&IdentitySource::UserConfigured),
+            "the recorded identity source must still describe the account on the event"
+        );
+        assert_eq!(
+            events[1].provider_account_id, None,
+            "a derived attribution is still cleared by a genuine conflict"
+        );
+    }
+
+    #[test]
+    fn reset_history_alone_does_not_truncate_a_source_assignment() {
+        let store = Store::in_memory().expect("store");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("started at");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            std::path::Path::new("/tmp/reset-history-truncation"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let bound = ProviderAccountId("account-bound".to_string());
+        let assignment = statsai_core::SourceAccountAssignment {
+            schema_version: statsai_core::SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+            assignment_id: statsai_core::SourceAccountAssignmentId("assignment-1".to_string()),
+            source_id: source.source_id.clone(),
+            provider: "codex".to_string(),
+            provider_account_id: bound.clone(),
+            started_at,
+            ended_at: None,
+            record_source: IdentitySource::LocalAuth,
+            verified_at: Some(started_at),
+            created_at: started_at,
+            updated_at: started_at,
+        };
+        store
+            .upsert_source_account_assignment(&assignment)
+            .expect("assignment");
+
+        // An auth snapshot corroborates the assignment, then a single
+        // conversation-scoped reset-history entry names a different account.
+        for (index, (kind, account, offset_days)) in [
+            (
+                statsai_core::AccountEvidenceKind::AuthSnapshot,
+                "account-bound",
+                1_i64,
+            ),
+            (
+                statsai_core::AccountEvidenceKind::ResetHistory,
+                "account-other",
+                2,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .upsert_account_identity_observations(&[
+                    statsai_core::AccountIdentityObservationV1 {
+                        schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                            .to_string(),
+                        observation_id: format!("identity-{index}"),
+                        provider: "codex".to_string(),
+                        source_id: source.source_id.clone(),
+                        provider_account_id: Some(ProviderAccountId(account.to_string())),
+                        provider_user_id_hash: None,
+                        email_hash: None,
+                        conversation_id_hash: Some("f".repeat(64)),
+                        turn_id_hash: Some("a".repeat(64)),
+                        observed_at: started_at + chrono::Duration::days(offset_days),
+                        evidence_kind: kind,
+                        confidence: Confidence::High,
+                        auth_mode: None,
+                        application_version: None,
+                        parser_version: "test.v1".to_string(),
+                        artifact_kind: "test".to_string(),
+                        artifact_path_hash: "c".repeat(64),
+                        record_fingerprint: format!("{index}").repeat(64),
+                    },
+                ])
+                .expect("identity observation");
+        }
+
+        store
+            .reconcile_source_account_evidence_assignments(&source.source_id)
+            .expect("reconcile");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].provider_account_id, bound);
+        assert_eq!(
+            assignments[0].ended_at, None,
+            "a per-conversation reset-history entry cannot end a source-wide assignment, \
+             because nothing downstream is able to reopen one"
+        );
+    }
+
+    #[test]
+    fn reset_history_does_not_bound_a_reopened_auth_reload_interval() {
+        let store = Store::in_memory().expect("store");
+        let base = Utc
+            .with_ymd_and_hms(2026, 6, 1, 0, 0, 0)
+            .single()
+            .expect("base");
+        let source = statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            std::path::Path::new("/tmp/reload-interval-bounds"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let reloaded = ProviderAccountId("account-reloaded".to_string());
+
+        // reload A, telemetry A, then a turn-scoped reset-history entry naming B.
+        for (index, (kind, account, offset_days)) in [
+            (
+                statsai_core::AccountEvidenceKind::AuthReload,
+                "account-reloaded",
+                1_i64,
+            ),
+            (
+                statsai_core::AccountEvidenceKind::TelemetryIdentity,
+                "account-reloaded",
+                2,
+            ),
+            (
+                statsai_core::AccountEvidenceKind::ResetHistory,
+                "account-other",
+                3,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .upsert_account_identity_observations(&[
+                    statsai_core::AccountIdentityObservationV1 {
+                        schema_version: statsai_core::ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION
+                            .to_string(),
+                        observation_id: format!("reload-identity-{index}"),
+                        provider: "codex".to_string(),
+                        source_id: source.source_id.clone(),
+                        provider_account_id: Some(ProviderAccountId(account.to_string())),
+                        provider_user_id_hash: None,
+                        email_hash: None,
+                        conversation_id_hash: Some("f".repeat(64)),
+                        turn_id_hash: Some("a".repeat(64)),
+                        observed_at: base + chrono::Duration::days(offset_days),
+                        evidence_kind: kind,
+                        confidence: Confidence::High,
+                        auth_mode: None,
+                        application_version: None,
+                        parser_version: "test.v1".to_string(),
+                        artifact_kind: "test".to_string(),
+                        artifact_path_hash: "c".repeat(64),
+                        record_fingerprint: format!("{index}").repeat(64),
+                    },
+                ])
+                .expect("identity observation");
+        }
+
+        store
+            .reconcile_source_account_evidence_assignments(&source.source_id)
+            .expect("reconcile");
+
+        let assignments = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].provider_account_id, reloaded);
+        assert_eq!(
+            assignments[0].ended_at, None,
+            "reset history must not close the interval an auth reload opened"
+        );
+    }
+
+    #[test]
+    fn refreshing_verified_at_does_not_rewrite_unchanged_source_records() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/verified-at-only-refresh"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let account_id = ProviderAccountId("account-verified".to_string());
+        let authenticated_at = Utc::now() - chrono::Duration::days(1);
+        upsert_verified_source_assignment(
+            &store,
+            &source,
+            &account_id,
+            authenticated_at,
+            Some(authenticated_at),
+            None,
+            IdentitySource::LocalAuth,
+        )
+        .expect("initial verification");
+        let mut event = test_store_event(&source, authenticated_at, "verified-event");
+        event.provider_account_id = Some(account_id.clone());
+        store.insert_events(&[event]).expect("event");
+        store
+            .conn
+            .execute_batch(
+                r#"
+                CREATE TABLE event_update_audit (count INTEGER NOT NULL);
+                INSERT INTO event_update_audit VALUES (0);
+                CREATE TRIGGER count_event_updates
+                AFTER UPDATE ON usage_events
+                BEGIN
+                  UPDATE event_update_audit SET count = count + 1;
+                END;
+                "#,
+            )
+            .expect("audit trigger");
+
+        let refreshed_at = authenticated_at + chrono::Duration::hours(1);
+        upsert_verified_source_assignment(
+            &store,
+            &source,
+            &account_id,
+            authenticated_at,
+            Some(refreshed_at),
+            None,
+            IdentitySource::LocalAuth,
+        )
+        .expect("refresh verification");
+
+        let update_count: i64 = store
+            .conn
+            .query_row("SELECT count FROM event_update_audit", [], |row| row.get(0))
+            .expect("audit count");
+        assert_eq!(update_count, 0);
+        let assignment = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignment")
+            .pop()
+            .expect("verified assignment");
+        assert_eq!(assignment.verified_at, Some(refreshed_at));
     }
 
     fn test_store_event(

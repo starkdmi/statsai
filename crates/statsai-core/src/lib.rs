@@ -1,7 +1,9 @@
 //! Core schemas and ID helpers for `statsai`.
 
+mod account_plan;
 mod archive;
 mod code_changes;
+mod quota;
 mod tasks;
 
 use chrono::{DateTime, Utc};
@@ -10,8 +12,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+pub use account_plan::*;
 pub use archive::*;
 pub use code_changes::*;
+pub use quota::*;
 pub use tasks::*;
 
 pub const USAGE_EVENT_SCHEMA_VERSION: &str = "usage_event.v1";
@@ -25,17 +29,25 @@ pub const DAILY_ROLLUP_SCHEMA_VERSION: &str = "daily_rollup.v1";
 pub const SYNC_BATCH_V1_SCHEMA_VERSION: &str = "sync_batch.v1";
 pub const SYNC_BATCH_V2_SCHEMA_VERSION: &str = "sync_batch.v2";
 pub const SYNC_BATCH_V3_SCHEMA_VERSION: &str = "sync_batch.v3";
+pub const SYNC_BATCH_V4_SCHEMA_VERSION: &str = "sync_batch.v4";
+pub const SYNC_BATCH_V5_SCHEMA_VERSION: &str = "sync_batch.v5";
 pub const SYNC_ACK_V1_SCHEMA_VERSION: &str = "sync_ack.v1";
 pub const SYNC_ACK_V2_SCHEMA_VERSION: &str = "sync_ack.v2";
 pub const SYNC_ACK_V3_SCHEMA_VERSION: &str = "sync_ack.v3";
-pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V3_SCHEMA_VERSION;
-pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V3_SCHEMA_VERSION;
+pub const SYNC_ACK_V4_SCHEMA_VERSION: &str = "sync_ack.v4";
+pub const SYNC_ACK_V5_SCHEMA_VERSION: &str = "sync_ack.v5";
+pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V5_SCHEMA_VERSION;
+pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V5_SCHEMA_VERSION;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct SourceId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ProviderAccountId(pub String);
 
@@ -602,6 +614,10 @@ pub fn project_contains_file_paths(project: Option<&ProjectInfo>) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 #[must_use]
 pub fn project_bucket_key(project: Option<&ProjectInfo>) -> String {
     let Some(project) = project else {
@@ -622,6 +638,46 @@ pub fn project_bucket_key(project: Option<&ProjectInfo>) -> String {
         );
     }
     project.project_id.clone()
+}
+
+/// The checkout a daily rollup bucket belongs to.
+///
+/// A daily rollup answers "how much work happened here on this day", and "here"
+/// is a working directory on a branch. The git remote is not part of that: a
+/// repository rename leaves the same checkout in the same place doing the same
+/// work, and keying on it split one day into two records that the backend then
+/// matched on location and collapsed, dropping one side's tokens.
+///
+/// Deliberately separate from [`project_bucket_key`], which also keys persisted
+/// task spans. Those are already stored under the remote-inclusive key, so
+/// changing it underneath them would split task history between spans scanned
+/// before and after an upgrade.
+///
+/// This is also narrower than project identity. Projects are keyed on the
+/// remote and own many locations, and the backend already moves a location
+/// (with its history) between projects when its remote changes. That is what
+/// keeps a rename and a folder move attributed to one project; this key only
+/// decides which rollup rows exist.
+#[must_use]
+pub fn daily_rollup_project_key(project: Option<&ProjectInfo>) -> String {
+    let Some(project) = project else {
+        return "none".to_string();
+    };
+    if !project_has_stable_identity(project) {
+        return "none".to_string();
+    }
+    let checkout = non_empty(project.path_hash.as_deref())
+        .map(|path_hash| format!("path:{path_hash}"))
+        .or_else(|| {
+            non_empty(project.repo_remote_hash.as_deref()).map(|remote| format!("repo:{remote}"))
+        });
+    match checkout {
+        Some(checkout) => format!(
+            "{checkout}|branch:{}",
+            project.branch_hash.as_deref().unwrap_or("none")
+        ),
+        None => project.project_id.clone(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -721,6 +777,19 @@ pub struct SyncBatch {
     /// arguments, and commit messages are deliberately absent from this type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_change_metrics: Vec<CodeChangeMetric>,
+    /// Attributed quota-cycle contributions. Local quota records, payloads,
+    /// plans, credits, and sample counts are deliberately absent from this type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_cycle_contributions: Vec<QuotaCycleContributionV1>,
+    /// Plan labels carrying only the canonical account reference, provider bounds,
+    /// and evidence grade. Emails, provider user IDs, conversation and turn IDs,
+    /// artifact paths, and raw provenance are deliberately absent from this type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_plan_observations: Vec<AccountPlanProjectionV1>,
+    /// Aggregate coverage and conflict counts describing how well each account is
+    /// evidenced. Individual observations never leave the device through this type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_evidence_summaries: Vec<AccountEvidenceSummaryV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoritative_snapshot: Option<SyncAuthoritativeSnapshot>,
     pub created_at: DateTime<Utc>,
@@ -743,6 +812,12 @@ pub struct SyncAuthoritativeSnapshot {
     pub summary_ids: Vec<SummaryId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_change_metric_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_cycle_contribution_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_plan_observation_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_evidence_summary_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -790,6 +865,12 @@ pub struct SyncEntityCounts {
     pub task_verifications: u64,
     #[serde(default, skip_serializing_if = "sync_count_is_zero")]
     pub code_change_metrics: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub quota_cycle_contributions: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub account_plan_observations: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub account_evidence_summaries: u64,
 }
 
 fn sync_count_is_zero(value: &u64) -> bool {
@@ -2132,6 +2213,9 @@ mod tests {
                 task_buckets: 0,
                 task_verifications: 0,
                 code_change_metrics: 0,
+                quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             duplicates: SyncEntityCounts {
                 sources: 0,
@@ -2143,6 +2227,9 @@ mod tests {
                 task_buckets: 0,
                 task_verifications: 0,
                 code_change_metrics: 0,
+                quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             rejected: Vec::new(),
         };
@@ -2160,7 +2247,7 @@ mod tests {
     #[test]
     fn sync_ack_v3_keeps_nonzero_task_and_code_change_counters() {
         let ack = SyncAck {
-            schema_version: SYNC_ACK_SCHEMA_VERSION.to_string(),
+            schema_version: SYNC_ACK_V3_SCHEMA_VERSION.to_string(),
             batch_id: "batch-2".to_string(),
             accepted: SyncEntityCounts {
                 sources: 0,
@@ -2172,6 +2259,9 @@ mod tests {
                 task_buckets: 3,
                 task_verifications: 1,
                 code_change_metrics: 2,
+                quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             duplicates: SyncEntityCounts {
                 sources: 0,
@@ -2183,6 +2273,9 @@ mod tests {
                 task_buckets: 0,
                 task_verifications: 0,
                 code_change_metrics: 0,
+                quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
             },
             rejected: Vec::new(),
         };
@@ -2192,6 +2285,66 @@ mod tests {
         assert_eq!(json["accepted"]["task_buckets"], 3);
         assert_eq!(json["accepted"]["task_verifications"], 1);
         assert_eq!(json["accepted"]["code_change_metrics"], 2);
+        assert!(json["accepted"].get("quota_cycle_contributions").is_none());
+        assert!(json["accepted"].get("account_plan_observations").is_none());
+        assert!(json["accepted"].get("account_evidence_summaries").is_none());
+    }
+
+    #[test]
+    fn sync_ack_v4_keeps_nonzero_quota_cycle_counters() {
+        let ack = SyncAck {
+            schema_version: SYNC_ACK_V4_SCHEMA_VERSION.to_string(),
+            batch_id: "batch-quota".to_string(),
+            accepted: SyncEntityCounts {
+                sources: 0,
+                accounts: 0,
+                source_account_assignments: 0,
+                subscriptions: 0,
+                events: 0,
+                summaries: 0,
+                task_buckets: 0,
+                task_verifications: 0,
+                code_change_metrics: 1,
+                quota_cycle_contributions: 4,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
+            },
+            duplicates: SyncEntityCounts {
+                sources: 0,
+                accounts: 0,
+                source_account_assignments: 0,
+                subscriptions: 0,
+                events: 0,
+                summaries: 0,
+                task_buckets: 0,
+                task_verifications: 0,
+                code_change_metrics: 0,
+                quota_cycle_contributions: 0,
+                account_plan_observations: 0,
+                account_evidence_summaries: 0,
+            },
+            rejected: Vec::new(),
+        };
+
+        let json = serde_json::to_value(&ack).expect("ack should serialize");
+        assert_eq!(json["schema_version"], SYNC_ACK_V4_SCHEMA_VERSION);
+        assert_eq!(json["accepted"]["code_change_metrics"], 1);
+        assert_eq!(json["accepted"]["quota_cycle_contributions"], 4);
+    }
+
+    #[test]
+    fn sync_batch_v3_without_quota_contributions_remains_backward_compatible() {
+        let batch: SyncBatch = serde_json::from_value(serde_json::json!({
+            "schema_version": SYNC_BATCH_V3_SCHEMA_VERSION,
+            "batch_id": "batch-legacy-v3",
+            "device_id": "device-1",
+            "created_at": "2026-05-31T10:00:00Z"
+        }))
+        .expect("legacy v3 batch should deserialize");
+
+        assert!(batch.quota_cycle_contributions.is_empty());
+        let serialized = serde_json::to_value(batch).expect("batch should serialize");
+        assert!(serialized.get("quota_cycle_contributions").is_none());
     }
 
     fn test_source(provider: &str, path: &str) -> SourceLocation {
@@ -3159,6 +3312,83 @@ mod tests {
         let h1 = path_hash(p);
         let h2 = path_hash(p);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn renaming_a_repository_keeps_one_rollup_bucket() {
+        let before = ProjectInfo {
+            project_id: "project_before".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("remote_before".to_string()),
+            repo_label: Some("owner/ai-stats".to_string()),
+            branch_hash: Some("branch_main".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path_checkout".to_string()),
+            path_label: Some("/work/ai-stats".to_string()),
+        };
+        let after = ProjectInfo {
+            project_id: "project_after".to_string(),
+            repo_remote_hash: Some("remote_after".to_string()),
+            repo_label: Some("owner/statsai".to_string()),
+            ..before.clone()
+        };
+
+        // Same checkout, same branch: the rename must not split the bucket.
+        assert_eq!(
+            daily_rollup_project_key(Some(&before)),
+            daily_rollup_project_key(Some(&after))
+        );
+        // The remote itself is untouched, so the backend can still key the
+        // project on it and move the location's history across the rename.
+        assert_ne!(before.repo_remote_hash, after.repo_remote_hash);
+
+        // Task spans are already persisted under the remote-inclusive key, so
+        // it has to keep telling the two apart or their history splits at the
+        // upgrade instead of at the rename.
+        assert_ne!(
+            project_bucket_key(Some(&before)),
+            project_bucket_key(Some(&after))
+        );
+
+        // A different checkout of the same repository keeps its own bucket, the
+        // way a worktree is its own location under one project.
+        let elsewhere = ProjectInfo {
+            path_hash: Some("path_worktree".to_string()),
+            ..before.clone()
+        };
+        assert_ne!(
+            daily_rollup_project_key(Some(&before)),
+            daily_rollup_project_key(Some(&elsewhere))
+        );
+
+        // So does the same checkout on another branch.
+        let other_branch = ProjectInfo {
+            branch_hash: Some("branch_release".to_string()),
+            ..before.clone()
+        };
+        assert_ne!(
+            daily_rollup_project_key(Some(&before)),
+            daily_rollup_project_key(Some(&other_branch))
+        );
+    }
+
+    #[test]
+    fn remote_only_attribution_still_buckets_by_repository() {
+        let project = ProjectInfo {
+            project_id: "project_remote_only".to_string(),
+            project_label: Some("statsai".to_string()),
+            repo_remote_hash: Some("remote_only".to_string()),
+            repo_label: Some("owner/statsai".to_string()),
+            branch_hash: None,
+            branch_label: None,
+            path_hash: None,
+            path_label: None,
+        };
+
+        assert_eq!(
+            daily_rollup_project_key(Some(&project)),
+            "repo:remote_only|branch:none"
+        );
     }
 
     #[test]

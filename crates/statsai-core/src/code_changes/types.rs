@@ -207,6 +207,27 @@ pub struct TraceEdit {
     pub deleted_line_fingerprints: Vec<String>,
 }
 
+impl TraceEdit {
+    /// Re-files this edit under the conversation that received its items.
+    ///
+    /// A transcript can reveal the conversation it belongs to only once the
+    /// whole file is read — a resumed session records its parent's identifier
+    /// before its own — so an edit is reconstructed against the identity that
+    /// was current at the time and re-bound here. Without this the edit
+    /// references a conversation that is never written, and the store rejects
+    /// it. The new identifier is derived from the old one, so it stays
+    /// deterministic: re-importing the same file replaces the edit instead of
+    /// duplicating it.
+    pub fn rebind_conversation(&mut self, conversation_id: &str) {
+        if self.conversation_id == conversation_id {
+            return;
+        }
+        let fingerprint = crate::hash_text(&format!("{}:{}", self.trace_edit_id, conversation_id));
+        self.trace_edit_id = format!("edit_{}", &fingerprint[..24]);
+        self.conversation_id = conversation_id.to_string();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMutation {
     pub edits: Vec<TraceEdit>,

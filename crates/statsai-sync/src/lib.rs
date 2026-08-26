@@ -3,8 +3,9 @@
 use anyhow::{bail, Context, Result};
 use statsai_core::{
     SyncAck, SyncBatch, SYNC_ACK_V1_SCHEMA_VERSION, SYNC_ACK_V2_SCHEMA_VERSION,
-    SYNC_ACK_V3_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
-    SYNC_BATCH_V3_SCHEMA_VERSION,
+    SYNC_ACK_V3_SCHEMA_VERSION, SYNC_ACK_V4_SCHEMA_VERSION, SYNC_ACK_V5_SCHEMA_VERSION,
+    SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION,
+    SYNC_BATCH_V4_SCHEMA_VERSION, SYNC_BATCH_V5_SCHEMA_VERSION,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -91,6 +92,9 @@ impl HttpSink {
             Ok(response) => response,
             Err(ureq::Error::Status(code, response)) => {
                 let body = response.into_string().unwrap_or_default();
+                if let Some(detail) = unrecognized_field_detail(&body) {
+                    bail!("sync endpoint returned HTTP {code}: {detail}");
+                }
                 bail!(
                     "sync endpoint returned HTTP {}: {}",
                     code,
@@ -148,11 +152,36 @@ impl SyncSink for HttpSink {
     }
 }
 
+/// Renders a refused batch field into an actionable message.
+///
+/// The endpoint refuses any record carrying a field it does not recognize. That
+/// happens for two reasons worth telling apart: a collector sending data the
+/// contract excludes, and a collector newer than the deployment it syncs to.
+/// Only the field name crosses the wire, never its value.
+fn unrecognized_field_detail(body: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let first = parsed.get("rejected")?.as_array()?.first()?;
+    let field = first
+        .get("reason")?
+        .as_str()?
+        .strip_prefix("unknown_field:")?;
+    let kind = first
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("record");
+    Some(format!(
+        "endpoint does not recognize `{field}` on {kind}. \
+         Deploy the API before upgrading collectors, or stop sending the field."
+    ))
+}
+
 fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
     let expected_ack_schema = match batch.schema_version.as_str() {
         SYNC_BATCH_V1_SCHEMA_VERSION => SYNC_ACK_V1_SCHEMA_VERSION,
         SYNC_BATCH_V2_SCHEMA_VERSION => SYNC_ACK_V2_SCHEMA_VERSION,
         SYNC_BATCH_V3_SCHEMA_VERSION => SYNC_ACK_V3_SCHEMA_VERSION,
+        SYNC_BATCH_V4_SCHEMA_VERSION => SYNC_ACK_V4_SCHEMA_VERSION,
+        SYNC_BATCH_V5_SCHEMA_VERSION => SYNC_ACK_V5_SCHEMA_VERSION,
         other => bail!("unsupported sync batch schema {other}"),
     };
     if ack.schema_version != expected_ack_schema {
@@ -206,6 +235,24 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         ack.duplicates.subscriptions,
     )?;
     validate_sync_ack_counts(
+        "account_plan_observations",
+        batch.account_plan_observations.len() as u64,
+        ack.accepted.account_plan_observations,
+        ack.duplicates.account_plan_observations,
+    )?;
+    validate_sync_ack_counts(
+        "account_evidence_summaries",
+        batch.account_evidence_summaries.len() as u64,
+        ack.accepted.account_evidence_summaries,
+        ack.duplicates.account_evidence_summaries,
+    )?;
+    validate_sync_ack_counts(
+        "quota_cycle_contributions",
+        batch.quota_cycle_contributions.len() as u64,
+        ack.accepted.quota_cycle_contributions,
+        ack.duplicates.quota_cycle_contributions,
+    )?;
+    validate_sync_ack_counts(
         "events",
         batch.events.len() as u64,
         ack.accepted.events,
@@ -234,6 +281,24 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         batch.code_change_metrics.len() as u64,
         ack.accepted.code_change_metrics,
         ack.duplicates.code_change_metrics,
+    )?;
+    validate_sync_ack_counts(
+        "quota_cycle_contributions",
+        batch.quota_cycle_contributions.len() as u64,
+        ack.accepted.quota_cycle_contributions,
+        ack.duplicates.quota_cycle_contributions,
+    )?;
+    validate_sync_ack_counts(
+        "account_plan_observations",
+        batch.account_plan_observations.len() as u64,
+        ack.accepted.account_plan_observations,
+        ack.duplicates.account_plan_observations,
+    )?;
+    validate_sync_ack_counts(
+        "account_evidence_summaries",
+        batch.account_evidence_summaries.len() as u64,
+        ack.accepted.account_evidence_summaries,
+        ack.duplicates.account_evidence_summaries,
     )?;
     Ok(())
 }
@@ -319,6 +384,31 @@ mod tests {
     use std::sync::mpsc;
     use tiny_http::{Header, Method, Response, Server};
 
+    #[test]
+    fn unrecognized_field_refusals_name_the_field_and_the_remedy() {
+        let detail = unrecognized_field_detail(
+            r#"{"error":"invalid_sync_batch","rejected":[{"kind":"quota_cycle_contributions","id":"quota_cycle_aaaa","reason":"unknown_field:has_schedule_overlap"}]}"#,
+        )
+        .expect("refusal detail");
+        assert!(detail.contains("has_schedule_overlap"));
+        assert!(detail.contains("quota_cycle_contributions"));
+        assert!(detail.contains("Deploy the API before upgrading collectors"));
+
+        let nested = unrecognized_field_detail(
+            r#"{"error":"invalid_sync_batch","rejected":[{"kind":"quota_cycle_contributions","id":null,"reason":"unknown_field:boundary_slices.working_directory"}]}"#,
+        )
+        .expect("nested refusal detail");
+        assert!(nested.contains("boundary_slices.working_directory"));
+
+        // Anything that is not a field refusal falls back to the raw body.
+        assert!(unrecognized_field_detail(r#"{"error":"invalid_sync_batch"}"#).is_none());
+        assert!(unrecognized_field_detail(
+            r#"{"rejected":[{"kind":"events","id":null,"reason":"raw_event_cloud_sync_disabled"}]}"#
+        )
+        .is_none());
+        assert!(unrecognized_field_detail("upstream timeout").is_none());
+    }
+
     fn empty_batch() -> SyncBatch {
         SyncBatch {
             schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
@@ -328,11 +418,14 @@ mod tests {
             accounts: Vec::new(),
             source_account_assignments: Vec::new(),
             subscriptions: Vec::new(),
+            account_plan_observations: Vec::new(),
+            account_evidence_summaries: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets: Vec::new(),
             task_verifications: Vec::new(),
             code_change_metrics: Vec::new(),
+            quota_cycle_contributions: Vec::new(),
             authoritative_snapshot: None,
             created_at: Utc::now(),
         }
@@ -434,7 +527,7 @@ mod tests {
         let (auth, content_type, body) = rx.recv().expect("request body");
         assert_eq!(auth.as_deref(), Some("Bearer token_123"));
         assert_eq!(content_type.as_deref(), Some("application/json"));
-        assert!(body.contains("\"schema_version\":\"sync_batch.v3\""));
+        assert!(body.contains("\"schema_version\":\"sync_batch.v5\""));
         assert!(body.contains("\"batch_id\":\"batch_1\""));
     }
 
@@ -533,8 +626,8 @@ mod tests {
         ))
         .expect("v1 ack");
 
-        let error = validate_sync_ack(&batch, &ack).expect_err("v3 batch with v1 ack");
-        assert!(error.to_string().contains("requires sync_ack.v3"));
+        let error = validate_sync_ack(&batch, &ack).expect_err("v5 batch with v1 ack");
+        assert!(error.to_string().contains("requires sync_ack.v5"));
 
         batch.schema_version = SYNC_BATCH_V1_SCHEMA_VERSION.to_string();
         ack.schema_version = SYNC_ACK_V2_SCHEMA_VERSION.to_string();
@@ -547,6 +640,14 @@ mod tests {
         batch.schema_version = SYNC_BATCH_V3_SCHEMA_VERSION.to_string();
         ack.schema_version = SYNC_ACK_V3_SCHEMA_VERSION.to_string();
         validate_sync_ack(&batch, &ack).expect("matching v3 schemas");
+
+        batch.schema_version = SYNC_BATCH_V4_SCHEMA_VERSION.to_string();
+        ack.schema_version = SYNC_ACK_V4_SCHEMA_VERSION.to_string();
+        validate_sync_ack(&batch, &ack).expect("matching v4 schemas");
+
+        batch.schema_version = SYNC_BATCH_V5_SCHEMA_VERSION.to_string();
+        ack.schema_version = SYNC_ACK_V5_SCHEMA_VERSION.to_string();
+        validate_sync_ack(&batch, &ack).expect("matching v5 schemas");
     }
 
     #[test]
