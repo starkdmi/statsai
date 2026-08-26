@@ -70,7 +70,13 @@ const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 ];
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
-const CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION: &str = "codex-account-evidence.v2";
+// v3 widened the telemetry row filter to the `user_account_id` spelling. A
+// checkpoint only replays rows past its cursor, so devices that already skipped
+// those rows would never see them again; changing the version retires those
+// checkpoints and re-reads each telemetry database once. Observation ids do not
+// carry the parser version, so the replay re-derives the same ids and upserts
+// over itself instead of duplicating evidence.
+const CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION: &str = "codex-account-evidence.v3";
 pub(crate) const MAX_JSONL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8224,7 +8230,13 @@ fn collect_codex_telemetry_evidence(
                 (
                   target IN ('codex_otel.log_only', 'codex_otel.trace_safe')
                   AND (
+                    -- Both spellings the identity regex accepts have to appear
+                    -- here. Selecting only the dotted attribute discarded rows
+                    -- that carry `user_account_id` without an email before the
+                    -- parser ever saw them, so that telemetry produced no
+                    -- evidence at all.
                     instr(feedback_log_body, 'user.account_id') > 0
+                    OR instr(feedback_log_body, 'user_account_id') > 0
                     OR instr(feedback_log_body, 'user.email') > 0
                   )
                 )
@@ -13485,6 +13497,66 @@ mod tests {
         assert!(evidence.identity_observations.iter().all(|item| {
             item.provider_user_id_hash.as_deref() != Some(hash_text("acct-evil").as_str())
         }));
+    }
+
+    #[test]
+    fn codex_reads_underscored_account_attribute_without_an_email() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_path = dir.path().join("logs_2.sqlite");
+        let connection = Connection::open(&database_path).expect("logs database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE logs (
+                  id INTEGER PRIMARY KEY,
+                  ts INTEGER,
+                  ts_nanos INTEGER,
+                  target TEXT NOT NULL,
+                  feedback_log_body TEXT
+                );
+                "#,
+            )
+            .expect("logs schema");
+        connection
+            .execute(
+                "INSERT INTO logs (id, ts, ts_nanos, target, feedback_log_body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    1_i64,
+                    1_787_227_200_i64,
+                    0_i64,
+                    "codex_otel.trace_safe",
+                    "event.name=\"codex.turn_ttft\" duration_ms=250 conversation.id=conversation-underscored user_account_id=\"acct-underscored\""
+                ],
+            )
+            .expect("telemetry row");
+        drop(connection);
+        let source = SourceLocation::local_adapter(
+            CODEX_PROVIDER,
+            "test",
+            "0",
+            dir.path(),
+            LocationOrigin::Configured,
+        );
+
+        let evidence = CodexAdapter
+            .collect_account_evidence(&source, &[])
+            .expect("account evidence");
+
+        let telemetry = evidence
+            .identity_observations
+            .iter()
+            .filter(|item| item.evidence_kind == AccountEvidenceKind::TelemetryIdentity)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            telemetry.len(),
+            1,
+            "the row-selection filter must accept every account attribute spelling the parser reads"
+        );
+        assert_eq!(
+            telemetry[0].provider_user_id_hash.as_deref(),
+            Some(hash_text("acct-underscored").as_str())
+        );
+        assert_eq!(evidence.conversation_bindings.len(), 1);
     }
 
     #[test]
