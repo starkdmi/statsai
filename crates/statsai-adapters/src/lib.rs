@@ -70,13 +70,7 @@ const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 ];
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
-// v3 widened the telemetry row filter to the `user_account_id` spelling. A
-// checkpoint only replays rows past its cursor, so devices that already skipped
-// those rows would never see them again; changing the version retires those
-// checkpoints and re-reads each telemetry database once. Observation ids do not
-// carry the parser version, so the replay re-derives the same ids and upserts
-// over itself instead of duplicating evidence.
-const CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION: &str = "codex-account-evidence.v3";
+const CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION: &str = "codex-account-evidence.v2";
 pub(crate) const MAX_JSONL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13054,7 +13048,7 @@ mod tests {
                     "id_token": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ImV4aXN0aW5nQGV4YW1wbGUuY29tIiwiaWF0IjoxNzQ4NTEzNTYzLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1yZWFsIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIiwiY2hhdGdwdF9zdWJzY3JpcHRpb25fYWN0aXZlX3N0YXJ0IjoiMjAyNi0wNS0yOVQxMDoxMjo0MyswMDowMCIsImNoYXRncHRfc3Vic2NyaXB0aW9uX2FjdGl2ZV91bnRpbCI6IjIwMjYtMDYtMjlUMTA6MTI6NDMrMDA6MDAiLCJjaGF0Z3B0X3N1YnNjcmlwdGlvbl9sYXN0X2NoZWNrZWQiOiIyMDI2LTA1LTI5VDEwOjE0OjU2LjA1ODI3OCswMDowMCJ9fQ.",
                     "access_token": "unused",
                     "refresh_token": "unused",
-                    "account_id": "41412a8c-6e19-4d33-9b67-6fb4b4dc0734"
+                    "account_id": "00000000-0000-4000-8000-000000000001"
                 },
                 "last_refresh": "2026-05-19T19:56:03.481816Z"
             })
