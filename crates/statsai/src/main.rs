@@ -596,6 +596,18 @@ struct AccountCommand {
 enum AccountSubcommand {
     #[command(about = "List canonical provider accounts")]
     List,
+    #[command(about = "Show detected plan evidence per account")]
+    Plans {
+        #[arg(long, help = "Provider name (claude_code, codex)")]
+        provider: Option<String>,
+        #[arg(
+            long,
+            help = "Account identity to show (label, email, provider user id, or provider account id)"
+        )]
+        account: Option<String>,
+        #[arg(long, help = "Include every stored observation, not just the newest")]
+        all: bool,
+    },
     #[command(about = "Merge a legacy/manual account into an existing canonical account")]
     Merge {
         #[arg(long, help = "Provider name (claude_code, codex)")]
@@ -2645,6 +2657,32 @@ fn account(command: AccountCommand, store: &Store) -> Result<()> {
         AccountSubcommand::List => {
             println!("{}", serde_json::to_string_pretty(&store.list_accounts()?)?);
         }
+        AccountSubcommand::Plans {
+            provider,
+            account,
+            all,
+        } => {
+            let provider = provider.as_deref().map(canonical_provider).transpose()?;
+            let selected_account = match (account.as_deref(), provider.as_deref()) {
+                (Some(selector), Some(provider)) => Some(
+                    resolve_existing_provider_account_selector(store, provider, selector)?
+                        .provider_account_id,
+                ),
+                (Some(_), None) => {
+                    bail!("--account needs --provider so the selector resolves in one provider")
+                }
+                (None, _) => None,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&account_plan_evidence_report(
+                    store,
+                    provider.as_deref(),
+                    selected_account.as_ref(),
+                    all,
+                )?)?
+            );
+        }
         AccountSubcommand::Merge {
             provider,
             from,
@@ -2871,6 +2909,102 @@ fn remove_orphan_provider_account(
         reset_local_sync_tracking: !dry_run,
         dry_run,
     })
+}
+
+/// Groups stored plan observations by account so the CLI can show detected plans.
+///
+/// The dashboard derives a plan *timeline* from these rows -- segments, gaps, and a current plan --
+/// and that derivation lives in the hosted API. Reimplementing it here would create a second
+/// answer to the same question that could disagree with the first, so this reports what is stored
+/// instead: the newest observation per account, and every observation behind `--all`. The field is
+/// named `latest_observation` rather than `current_plan` for exactly that reason -- it is the most
+/// recent thing this machine recorded, not a derived verdict about what the account is on now.
+fn account_plan_evidence_report(
+    store: &Store,
+    provider: Option<&str>,
+    provider_account_id: Option<&ProviderAccountId>,
+    include_all_observations: bool,
+) -> Result<Vec<Value>> {
+    let accounts = store
+        .list_accounts()?
+        .into_iter()
+        .map(|account| (account.provider_account_id.clone(), account))
+        .collect::<HashMap<_, _>>();
+    let mut grouped: BTreeMap<
+        (String, Option<String>),
+        Vec<statsai_core::AccountPlanObservationV1>,
+    > = BTreeMap::new();
+    for observation in store.account_plan_observations()? {
+        // Stored observations do not all carry the canonical spelling: the legacy subscription
+        // migration matches `codex` case-insensitively and then copies the subscription's own
+        // provider string through, and nothing normalizes a payload on read. Comparing and
+        // grouping on the raw value would hide a `Codex` row from `--provider codex` and list its
+        // account a second time under its own heading.
+        // `canonical_provider_name` matches exact lowercase aliases, so the stored value is folded
+        // before the lookup. A provider this build does not recognize keeps its stored spelling
+        // rather than being silently relabelled.
+        let canonical_provider =
+            canonical_provider_name(&observation.provider.to_ascii_lowercase())
+                .map(str::to_string)
+                .unwrap_or_else(|| observation.provider.clone());
+        if provider.is_some_and(|provider| !canonical_provider.eq_ignore_ascii_case(provider)) {
+            continue;
+        }
+        if provider_account_id
+            .is_some_and(|account_id| observation.provider_account_id.as_ref() != Some(account_id))
+        {
+            continue;
+        }
+        let key = (
+            canonical_provider,
+            observation
+                .provider_account_id
+                .as_ref()
+                .map(|account_id| account_id.0.clone()),
+        );
+        grouped.entry(key).or_default().push(observation);
+    }
+
+    let describe = |observation: &statsai_core::AccountPlanObservationV1| {
+        serde_json::json!({
+            "plan_name": observation.plan_name,
+            "raw_plan_name": observation.raw_plan_name,
+            "observed_at": observation.observed_at,
+            "active_from": observation.active_from,
+            "active_until": observation.active_until,
+            "is_current_snapshot": observation.is_current_snapshot,
+            "evidence_kind": observation.evidence_kind,
+            "confidence": observation.confidence,
+            "source_id": observation.source_id,
+        })
+    };
+
+    let mut report = Vec::new();
+    for ((provider, account_id), mut observations) in grouped {
+        // Newest last, with the id breaking ties so two observations sharing a timestamp -- which
+        // happens when one artifact yields both a snapshot and a login -- always order the same way.
+        observations.sort_by(|left, right| {
+            left.observed_at
+                .cmp(&right.observed_at)
+                .then_with(|| left.observation_id.cmp(&right.observation_id))
+        });
+        let account = account_id
+            .as_ref()
+            .and_then(|account_id| accounts.get(&ProviderAccountId(account_id.clone())));
+        let mut entry = serde_json::json!({
+            "provider": provider,
+            "provider_account_id": account_id,
+            "email": account.and_then(|account| account.email.clone()),
+            "account_label": account.and_then(|account| account.account_label.clone()),
+            "observation_count": observations.len(),
+            "latest_observation": observations.last().map(&describe),
+        });
+        if include_all_observations {
+            entry["observations"] = Value::Array(observations.iter().map(&describe).collect());
+        }
+        report.push(entry);
+    }
+    Ok(report)
 }
 
 fn resolve_existing_provider_account_selector(
@@ -10402,6 +10536,148 @@ mod tests {
 
         assert!(evidence.accounts.is_empty());
         assert!(store.list_accounts().expect("accounts").is_empty());
+    }
+
+    fn plan_observation_fixture(
+        source_id: &SourceId,
+        account_id: Option<&ProviderAccountId>,
+        plan: &str,
+        observed_at: DateTime<Utc>,
+        evidence_kind: statsai_core::AccountEvidenceKind,
+    ) -> statsai_core::AccountPlanObservationV1 {
+        statsai_core::AccountPlanObservationV1 {
+            schema_version: statsai_core::ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: account_plan_observation_id(
+                source_id,
+                account_id,
+                plan,
+                observed_at,
+                evidence_kind,
+            ),
+            provider: "codex".to_string(),
+            source_id: source_id.clone(),
+            provider_account_id: account_id.cloned(),
+            raw_plan_name: plan.to_ascii_lowercase(),
+            plan_name: plan.to_string(),
+            observed_at,
+            active_from: None,
+            active_until: None,
+            is_current_snapshot: false,
+            evidence_kind,
+            confidence: Confidence::High,
+            parser_version: "test.v1".to_string(),
+            artifact_path_hash: "a".repeat(64),
+            record_fingerprint: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn account_plans_report_the_newest_observation_per_account() {
+        let store = Store::in_memory().expect("store");
+        let source_id = SourceId("plans-source".to_string());
+        let first = ProviderAccountId("acct-first".to_string());
+        let second = ProviderAccountId("acct-second".to_string());
+        let at = |day: u32| {
+            Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0)
+                .single()
+                .expect("date")
+        };
+        // An older snapshot that still claims to be current: the newest observation must win over
+        // it, which is the whole reason this reports `latest_observation` and not a derived plan.
+        let mut stale_current_snapshot = plan_observation_fixture(
+            &source_id,
+            Some(&first),
+            "Free",
+            at(1),
+            statsai_core::AccountEvidenceKind::AuthSnapshot,
+        );
+        stale_current_snapshot.is_current_snapshot = true;
+        // A legacy row that kept the subscription's own provider casing.
+        let mut non_canonical_provider = plan_observation_fixture(
+            &source_id,
+            Some(&second),
+            "Pro",
+            at(5),
+            statsai_core::AccountEvidenceKind::LegacyLocalAuth,
+        );
+        non_canonical_provider.provider = "Codex".to_string();
+        store
+            .upsert_account_plan_observations(&[
+                stale_current_snapshot,
+                plan_observation_fixture(
+                    &source_id,
+                    Some(&first),
+                    "Plus",
+                    at(9),
+                    statsai_core::AccountEvidenceKind::QuotaStatus,
+                ),
+                non_canonical_provider,
+                // Evidence that never resolved to an account still has to be visible: dropping it
+                // would hide plan history the operator can still act on.
+                plan_observation_fixture(
+                    &source_id,
+                    None,
+                    "Team",
+                    at(3),
+                    statsai_core::AccountEvidenceKind::AuthSnapshot,
+                ),
+            ])
+            .expect("seed plan observations");
+
+        let report =
+            account_plan_evidence_report(&store, Some("codex"), None, false).expect("plan report");
+
+        assert_eq!(report.len(), 3);
+        let plan_for = |account: Option<&str>| {
+            report
+                .iter()
+                .find(|entry| entry["provider_account_id"].as_str() == account)
+                .map(|entry| entry["latest_observation"]["plan_name"].as_str().unwrap())
+        };
+        // The newest observation wins over an older one that still claims to be the current
+        // snapshot, which is what `latest_observation` promises and a derived plan would not.
+        assert_eq!(plan_for(Some("acct-first")), Some("Plus"));
+        // Reached only through case-insensitive matching: this account's sole observation is
+        // stored as `Codex`.
+        assert_eq!(plan_for(Some("acct-second")), Some("Pro"));
+        assert_eq!(plan_for(None), Some("Team"));
+        let second_entry = report
+            .iter()
+            .find(|entry| entry["provider_account_id"] == "acct-second")
+            .expect("second account entry");
+        assert_eq!(
+            second_entry["provider"], "codex",
+            "a non-canonical stored provider is reported under its canonical name"
+        );
+        assert_eq!(
+            second_entry["observation_count"], 1,
+            "the case variant groups with its canonical provider rather than forming its own entry"
+        );
+        let first_entry = report
+            .iter()
+            .find(|entry| entry["provider_account_id"] == "acct-first")
+            .expect("first account entry");
+        assert_eq!(first_entry["observation_count"], 2);
+        // Without `--all` the payload stays a summary.
+        assert!(first_entry.get("observations").is_none());
+
+        let detailed = account_plan_evidence_report(&store, Some("codex"), Some(&first), true)
+            .expect("detailed plan report");
+        assert_eq!(detailed.len(), 1, "the account filter selects one account");
+        let observations = detailed[0]["observations"]
+            .as_array()
+            .expect("observations array");
+        assert_eq!(observations.len(), 2);
+        // Oldest first, so the newest is what `latest_observation` reports.
+        assert_eq!(observations[0]["plan_name"], "Free");
+        assert_eq!(observations[1]["plan_name"], "Plus");
+
+        assert!(
+            account_plan_evidence_report(&store, Some("claude_code"), None, false)
+                .expect("other provider")
+                .is_empty(),
+            "the provider filter excludes other providers"
+        );
     }
 
     #[test]
