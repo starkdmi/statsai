@@ -1222,7 +1222,9 @@ mod tests {
         assert_eq!(before, after);
         let events = store.events().expect("events");
         assert_eq!(events[0].cost, expected_review_cost(started_at));
-        assert_eq!(CURRENT_SCHEMA_VERSION, 17);
+        // Pin: bump this when CURRENT_SCHEMA_VERSION changes, after confirming
+        // the daily_rollups table is still unused by report/sync/snapshot.
+        assert_eq!(CURRENT_SCHEMA_VERSION, 22);
     }
 
     #[test]
