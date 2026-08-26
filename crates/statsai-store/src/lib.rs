@@ -14,14 +14,14 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use statsai_core::{
-    hash_text, micro_usd_to_cents_rounded, normalize_email, normalize_provider_user_id,
-    periods_overlap, project_bucket_key, project_contains_file_paths, project_has_stable_identity,
-    provider_account_id, provider_account_id_from_identity, sanitize_code_change_metric_for_sync,
-    sanitize_summary_for_sync, semantic_event_fingerprint, source_account_assignment_id,
-    subscription_id, summary_id, timestamp_in_period, AccountEvidenceSummaryV1,
-    AccountPlanProjectionV1, BillingPeriod, CodeChangeMetric, Confidence, CostAccumulator,
-    CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource, MetricStats,
-    ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
+    daily_rollup_project_key, hash_text, micro_usd_to_cents_rounded, normalize_email,
+    normalize_provider_user_id, periods_overlap, project_contains_file_paths,
+    project_has_stable_identity, provider_account_id, provider_account_id_from_identity,
+    sanitize_code_change_metric_for_sync, sanitize_summary_for_sync, semantic_event_fingerprint,
+    source_account_assignment_id, subscription_id, summary_id, timestamp_in_period,
+    AccountEvidenceSummaryV1, AccountPlanProjectionV1, BillingPeriod, CodeChangeMetric, Confidence,
+    CostAccumulator, CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource,
+    MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
     SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
     SourceKind, SourceLocation, SourceVerificationMode, Subscription, SubscriptionId,
     SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetricTotals, SummaryMetrics,
@@ -58,7 +58,9 @@ pub use tasks::{
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
 };
 
-const SYNC_ROLLUP_SUMMARY_VERSION: &str = "12";
+// 13: project identity dropped the git remote, so every bucket that carries a
+// path has to be rebuilt for a repository rename to stop splitting a day.
+const SYNC_ROLLUP_SUMMARY_VERSION: &str = "13";
 const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
 const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
 const LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY: &str = "migration.legacy_codex_plan_evidence.v1";
@@ -5285,7 +5287,7 @@ fn sync_rollup_summary_id(key: &SyncRollupBucketKey) -> SummaryId {
 }
 
 fn sync_rollup_project_key(project: Option<&statsai_core::ProjectInfo>) -> String {
-    project_bucket_key(project)
+    daily_rollup_project_key(project)
 }
 
 fn event_with_valid_project(event: &UsageEvent) -> UsageEvent {
@@ -5302,6 +5304,11 @@ fn event_with_valid_project(event: &UsageEvent) -> UsageEvent {
 
 fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let first = events.first().expect("rollup bucket must contain events");
+    // Events arrive oldest first. A bucket can now span a repository rename, so
+    // project metadata comes from the newest event: it names the remote the
+    // checkout has now, which is what lets the backend move this location onto
+    // the renamed project instead of waiting for the next day of usage.
+    let newest = events.last().unwrap_or(first);
     let mut total_input = 0u64;
     let mut total_output = 0u64;
     let mut total_cache_creation = 0u64;
@@ -5611,7 +5618,7 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             confidence: Confidence::Medium,
         },
         parse_evidence: None,
-        project: first
+        project: newest
             .project
             .as_ref()
             .filter(|project| project_has_stable_identity(project))
@@ -5620,7 +5627,7 @@ fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             mode: PrivacyMode::MetadataOnly,
             contains_prompt_text: false,
             contains_response_text: false,
-            contains_file_paths: project_contains_file_paths(first.project.as_ref()),
+            contains_file_paths: project_contains_file_paths(newest.project.as_ref()),
         },
         metrics: summary_metrics,
         period_start: Some(period_start),
@@ -6064,7 +6071,9 @@ fn uses_path_independent_codex_dedupe(event: &UsageEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Task spans still key on the remote-inclusive bucket; rollups do not.
     use chrono::{TimeZone, Utc};
+    use statsai_core::project_bucket_key;
     use statsai_core::{
         event_id, summary_id, Confidence, CostInfo, EventSource, LocationOrigin, ModelInfo,
         ParseEvidence, PrivacyInfo, PrivacyMode, ProjectInfo, ReasoningLevel, SessionInfo,
@@ -7543,6 +7552,64 @@ mod tests {
         let rollups = store.dirty_sync_rollup_summaries().expect("rollups");
         assert_eq!(rollups.len(), 1);
         assert_eq!(rollups[0].project, None);
+    }
+
+    #[test]
+    fn renaming_a_repository_keeps_one_rollup_for_the_day() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-repo-rename"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let day = Utc
+            .with_ymd_and_hms(2026, 6, 5, 9, 0, 0)
+            .single()
+            .expect("day");
+        let account_id = statsai_core::provider_account_id("codex", "personal");
+
+        let checkout = |remote: &str, label: &str| ProjectInfo {
+            project_id: format!("project-{remote}"),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some(remote.to_string()),
+            repo_label: Some(label.to_string()),
+            branch_hash: Some("branch-main".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path-checkout".to_string()),
+            path_label: Some("/work/ai-stats".to_string()),
+        };
+
+        // Same checkout, same branch, same day — the remote was renamed midway.
+        let mut before = test_store_event(&source, day, "before-rename");
+        before.provider_account_id = Some(account_id.clone());
+        before.usage.total_tokens = Some(10);
+        before.project = Some(checkout("remote-before", "owner/ai-stats"));
+
+        let mut after = test_store_event(&source, day + chrono::Duration::hours(1), "after-rename");
+        after.provider_account_id = Some(account_id);
+        after.usage.total_tokens = Some(20);
+        after.project = Some(checkout("remote-after", "owner/statsai"));
+
+        assert!(store.insert_event(&before).expect("insert before"));
+        assert!(store.insert_event(&after).expect("insert after"));
+
+        let dirty = store.dirty_sync_rollup_summaries().expect("dirty rollups");
+        assert_eq!(dirty.len(), 1, "a rename must not split the day in two");
+        let rollup = &dirty[0];
+        assert_eq!(rollup.usage.total_tokens, Some(30));
+
+        // The remote still travels with the rollup, so the backend can key the
+        // project on it and relink this location's history across the rename.
+        let project = rollup.project.as_ref().expect("project metadata");
+        assert_eq!(project.path_hash.as_deref(), Some("path-checkout"));
+        assert_eq!(
+            project.repo_label.as_deref(),
+            Some("owner/statsai"),
+            "the newest event names the remote the checkout has now"
+        );
     }
 
     #[test]

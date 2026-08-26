@@ -614,6 +614,10 @@ pub fn project_contains_file_paths(project: Option<&ProjectInfo>) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 #[must_use]
 pub fn project_bucket_key(project: Option<&ProjectInfo>) -> String {
     let Some(project) = project else {
@@ -634,6 +638,46 @@ pub fn project_bucket_key(project: Option<&ProjectInfo>) -> String {
         );
     }
     project.project_id.clone()
+}
+
+/// The checkout a daily rollup bucket belongs to.
+///
+/// A daily rollup answers "how much work happened here on this day", and "here"
+/// is a working directory on a branch. The git remote is not part of that: a
+/// repository rename leaves the same checkout in the same place doing the same
+/// work, and keying on it split one day into two records that the backend then
+/// matched on location and collapsed, dropping one side's tokens.
+///
+/// Deliberately separate from [`project_bucket_key`], which also keys persisted
+/// task spans. Those are already stored under the remote-inclusive key, so
+/// changing it underneath them would split task history between spans scanned
+/// before and after an upgrade.
+///
+/// This is also narrower than project identity. Projects are keyed on the
+/// remote and own many locations, and the backend already moves a location
+/// (with its history) between projects when its remote changes. That is what
+/// keeps a rename and a folder move attributed to one project; this key only
+/// decides which rollup rows exist.
+#[must_use]
+pub fn daily_rollup_project_key(project: Option<&ProjectInfo>) -> String {
+    let Some(project) = project else {
+        return "none".to_string();
+    };
+    if !project_has_stable_identity(project) {
+        return "none".to_string();
+    }
+    let checkout = non_empty(project.path_hash.as_deref())
+        .map(|path_hash| format!("path:{path_hash}"))
+        .or_else(|| {
+            non_empty(project.repo_remote_hash.as_deref()).map(|remote| format!("repo:{remote}"))
+        });
+    match checkout {
+        Some(checkout) => format!(
+            "{checkout}|branch:{}",
+            project.branch_hash.as_deref().unwrap_or("none")
+        ),
+        None => project.project_id.clone(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -3268,6 +3312,83 @@ mod tests {
         let h1 = path_hash(p);
         let h2 = path_hash(p);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn renaming_a_repository_keeps_one_rollup_bucket() {
+        let before = ProjectInfo {
+            project_id: "project_before".to_string(),
+            project_label: Some("ai-stats".to_string()),
+            repo_remote_hash: Some("remote_before".to_string()),
+            repo_label: Some("owner/ai-stats".to_string()),
+            branch_hash: Some("branch_main".to_string()),
+            branch_label: Some("main".to_string()),
+            path_hash: Some("path_checkout".to_string()),
+            path_label: Some("/work/ai-stats".to_string()),
+        };
+        let after = ProjectInfo {
+            project_id: "project_after".to_string(),
+            repo_remote_hash: Some("remote_after".to_string()),
+            repo_label: Some("owner/statsai".to_string()),
+            ..before.clone()
+        };
+
+        // Same checkout, same branch: the rename must not split the bucket.
+        assert_eq!(
+            daily_rollup_project_key(Some(&before)),
+            daily_rollup_project_key(Some(&after))
+        );
+        // The remote itself is untouched, so the backend can still key the
+        // project on it and move the location's history across the rename.
+        assert_ne!(before.repo_remote_hash, after.repo_remote_hash);
+
+        // Task spans are already persisted under the remote-inclusive key, so
+        // it has to keep telling the two apart or their history splits at the
+        // upgrade instead of at the rename.
+        assert_ne!(
+            project_bucket_key(Some(&before)),
+            project_bucket_key(Some(&after))
+        );
+
+        // A different checkout of the same repository keeps its own bucket, the
+        // way a worktree is its own location under one project.
+        let elsewhere = ProjectInfo {
+            path_hash: Some("path_worktree".to_string()),
+            ..before.clone()
+        };
+        assert_ne!(
+            daily_rollup_project_key(Some(&before)),
+            daily_rollup_project_key(Some(&elsewhere))
+        );
+
+        // So does the same checkout on another branch.
+        let other_branch = ProjectInfo {
+            branch_hash: Some("branch_release".to_string()),
+            ..before.clone()
+        };
+        assert_ne!(
+            daily_rollup_project_key(Some(&before)),
+            daily_rollup_project_key(Some(&other_branch))
+        );
+    }
+
+    #[test]
+    fn remote_only_attribution_still_buckets_by_repository() {
+        let project = ProjectInfo {
+            project_id: "project_remote_only".to_string(),
+            project_label: Some("statsai".to_string()),
+            repo_remote_hash: Some("remote_only".to_string()),
+            repo_label: Some("owner/statsai".to_string()),
+            branch_hash: None,
+            branch_label: None,
+            path_hash: None,
+            path_label: None,
+        };
+
+        assert_eq!(
+            daily_rollup_project_key(Some(&project)),
+            "repo:remote_only|branch:none"
+        );
     }
 
     #[test]
