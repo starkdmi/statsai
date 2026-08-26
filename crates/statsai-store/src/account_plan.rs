@@ -765,6 +765,12 @@ impl Store {
         if observations.is_empty() {
             return Ok(0);
         }
+        let mut ordered: Vec<&AccountIdentityObservationV1> = observations.iter().collect();
+        ordered.sort_by(|left, right| {
+            left.observed_at
+                .cmp(&right.observed_at)
+                .then_with(|| left.observation_id.cmp(&right.observation_id))
+        });
         self.with_immediate_transaction(|| {
             let mut written = 0u64;
             let mut statement = self.conn.prepare(
@@ -777,7 +783,23 @@ impl Store {
                 ON CONFLICT(observation_id) DO NOTHING
                 "#,
             )?;
-            for observation in observations {
+            for observation in ordered {
+                // Adapters collapse a run of same-identity telemetry/reload rows
+                // to its endpoints, but an incremental scan only sees rows past
+                // its checkpoint: each daemon pass would append a fresh pair and
+                // the ledger would still grow with every scan. When the newest
+                // persisted rows for the source already form a run of this
+                // observation's identity, the incoming row is the run's new last
+                // point, so it replaces the persisted endpoint instead of
+                // stacking behind it. The run's first row is never touched and
+                // an alternation always has a differing newest row, so every
+                // switch survives.
+                if let Some(superseded) = self.identity_run_endpoint_superseded_by(observation)? {
+                    self.conn.execute(
+                        "DELETE FROM account_identity_observations WHERE observation_id = ?1",
+                        [&superseded],
+                    )?;
+                }
                 written += statement.execute(params![
                     &observation.observation_id,
                     &observation.provider,
@@ -794,6 +816,59 @@ impl Store {
             }
             Ok(written)
         })
+    }
+
+    /// Returns the persisted run endpoint an incoming observation supersedes, if any.
+    ///
+    /// The two newest persisted observations for the source must both continue the
+    /// incoming observation's run — same collapsible kind, account, and email — and
+    /// must not be newer than it. Requiring two matching rows keeps a run's first
+    /// point in place, and any interleaved different identity breaks the match, so
+    /// alternations are never collapsed away.
+    fn identity_run_endpoint_superseded_by(
+        &self,
+        observation: &AccountIdentityObservationV1,
+    ) -> Result<Option<String>> {
+        if !matches!(
+            observation.evidence_kind,
+            AccountEvidenceKind::TelemetryIdentity | AccountEvidenceKind::AuthReload
+        ) {
+            return Ok(None);
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_identity_observations WHERE observation_id = ?1)",
+            [&observation.observation_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            // A replayed row (full rescan) is already an endpoint; treating it
+            // as a continuation would delete the endpoint it duplicates.
+            return Ok(None);
+        }
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT payload FROM account_identity_observations
+            WHERE source_id = ?1
+            ORDER BY observed_at DESC, observation_id DESC
+            LIMIT 2
+            "#,
+        )?;
+        let newest = statement
+            .query_map([&observation.source_id.0], |row| row.get::<_, String>(0))?
+            .map(|payload| {
+                Ok(serde_json::from_str::<AccountIdentityObservationV1>(
+                    &payload?,
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let continues_run = newest.len() == 2
+            && newest.iter().all(|persisted| {
+                persisted.evidence_kind == observation.evidence_kind
+                    && persisted.provider_account_id == observation.provider_account_id
+                    && persisted.email_hash == observation.email_hash
+                    && persisted.observed_at <= observation.observed_at
+            });
+        Ok(continues_run.then(|| newest[0].observation_id.clone()))
     }
 
     pub fn account_identity_observations(
@@ -1293,6 +1368,95 @@ mod tests {
             .account_evidence_checkpoints(&source.source_id)
             .expect("checkpoints")
             .is_empty());
+    }
+
+    #[test]
+    fn incremental_identity_upserts_slide_run_endpoints_across_scans() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/account-evidence-endpoint-slide"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let base = Utc::now();
+        let make = |id: &str, minutes: i64, account: &str, kind: AccountEvidenceKind| {
+            AccountIdentityObservationV1 {
+                schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id: id.to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(ProviderAccountId(account.to_string())),
+                provider_user_id_hash: None,
+                email_hash: None,
+                conversation_id_hash: None,
+                turn_id_hash: None,
+                observed_at: base + chrono::Duration::minutes(minutes),
+                evidence_kind: kind,
+                confidence: Confidence::High,
+                auth_mode: None,
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "test".to_string(),
+                artifact_path_hash: "c".repeat(64),
+                record_fingerprint: id.to_string(),
+            }
+        };
+        let ledger_ids = || {
+            let mut observations = store
+                .account_identity_observations(Some(&source.source_id))
+                .expect("identities");
+            observations.sort_by_key(|observation| observation.observed_at);
+            observations
+                .into_iter()
+                .map(|observation| observation.observation_id)
+                .collect::<Vec<_>>()
+        };
+        let telemetry = AccountEvidenceKind::TelemetryIdentity;
+
+        // First scan persists a collapsed run's endpoints.
+        store
+            .upsert_account_identity_observations(&[
+                make("a-0", 0, "acct-a", telemetry),
+                make("a-10", 10, "acct-a", telemetry),
+            ])
+            .expect("first scan");
+        // Each later incremental scan sees only rows past its checkpoint; the
+        // new point must replace the persisted endpoint, not stack behind it.
+        store
+            .upsert_account_identity_observations(&[make("a-20", 20, "acct-a", telemetry)])
+            .expect("second scan");
+        assert_eq!(ledger_ids(), vec!["a-0", "a-20"]);
+
+        // An account switch always survives: the differing row breaks the run.
+        store
+            .upsert_account_identity_observations(&[
+                make("a-30", 30, "acct-a", telemetry),
+                make("b-40", 40, "acct-b", telemetry),
+                make("b-50", 50, "acct-b", telemetry),
+            ])
+            .expect("third scan");
+        store
+            .upsert_account_identity_observations(&[make("b-60", 60, "acct-b", telemetry)])
+            .expect("fourth scan");
+        assert_eq!(ledger_ids(), vec!["a-0", "a-30", "b-40", "b-60"]);
+
+        // Replaying a persisted endpoint (full rescan) must not consume it.
+        store
+            .upsert_account_identity_observations(&[make("b-60", 60, "acct-b", telemetry)])
+            .expect("replayed endpoint");
+        // Non-collapsible evidence never slides an endpoint.
+        store
+            .upsert_account_identity_observations(&[make(
+                "snap-70",
+                70,
+                "acct-b",
+                AccountEvidenceKind::AuthSnapshot,
+            )])
+            .expect("auth snapshot");
+        assert_eq!(ledger_ids(), vec!["a-0", "a-30", "b-40", "b-60", "snap-70"]);
     }
 
     #[test]

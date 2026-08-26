@@ -18,6 +18,8 @@ publish-jobs = ["homebrew"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 allow-dirty = ["ci"]
+# Releases happen only from version tags; PRs must not run release CI at all.
+pr-run-mode = "skip"
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program

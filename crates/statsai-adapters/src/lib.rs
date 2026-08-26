@@ -8020,6 +8020,17 @@ fn push_codex_auth_snapshot(
     } else {
         format!("{artifact_path_hash}:")
     };
+    // A historical variant proves a real past login and its plan claims, but
+    // nothing can ever reopen an interval it would close: `ends_source_attribution`
+    // demands a kind that can also restart attribution, and a swapped-out auth
+    // file never becomes current again. Recording it as an AuthSnapshot made it
+    // a source-wide boundary that left every later event permanently
+    // unattributed, so it is recorded as the login it evidences instead.
+    let identity_kind = if is_current {
+        AccountEvidenceKind::AuthSnapshot
+    } else {
+        AccountEvidenceKind::LoginSuccess
+    };
     let record_fingerprint = hash_text(&format!(
         "codex-auth-evidence.v1:{fingerprint_scope}{}:{}:{}:{}:{}:{}",
         claims.provider_user_id.as_deref().unwrap_or("none"),
@@ -8044,7 +8055,7 @@ fn push_codex_auth_snapshot(
             schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
             observation_id: account_identity_observation_id(
                 &source.source_id,
-                AccountEvidenceKind::AuthSnapshot,
+                identity_kind,
                 observed_at,
                 &record_fingerprint,
             ),
@@ -8061,7 +8072,7 @@ fn push_codex_auth_snapshot(
             conversation_id_hash: None,
             turn_id_hash: None,
             observed_at,
-            evidence_kind: AccountEvidenceKind::AuthSnapshot,
+            evidence_kind: identity_kind,
             confidence: Confidence::High,
             auth_mode: claims.auth_mode.clone(),
             application_version: None,
@@ -13596,18 +13607,31 @@ mod tests {
             .collect_account_evidence(&source, &[])
             .expect("account evidence");
 
+        // Only the live auth.json may act as a source-wide auth state; the
+        // swapped-out variant is a dated login that must never close an
+        // interval nothing can reopen.
         let snapshots = evidence
             .identity_observations
             .iter()
             .filter(|item| item.evidence_kind == AccountEvidenceKind::AuthSnapshot)
             .collect::<Vec<_>>();
-        assert_eq!(snapshots.len(), 2);
-        let previous_identity = snapshots
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].provider_user_id_hash.as_deref(),
+            Some(hash_text("acct-real").as_str())
+        );
+        let previous_identity = evidence
+            .identity_observations
             .iter()
             .find(|item| {
                 item.provider_user_id_hash.as_deref() == Some(hash_text("acct-previous").as_str())
             })
             .expect("historical snapshot identity");
+        assert_eq!(
+            previous_identity.evidence_kind,
+            AccountEvidenceKind::LoginSuccess
+        );
+        assert!(!previous_identity.evidence_kind.ends_source_attribution());
         assert_eq!(
             previous_identity.observed_at.to_rfc3339(),
             "2026-05-26T08:00:00+00:00"
