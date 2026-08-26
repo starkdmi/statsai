@@ -1154,7 +1154,6 @@ fn scan_with_adapters(
             );
             let replace_all_source_quota_records = should_replace_all_source_quota_records(
                 command.replace,
-                command.no_cache,
                 needs_legacy_full_reconcile,
             );
             let should_run_adapter_scan = if replace_source_records {
@@ -1424,6 +1423,14 @@ fn scan_with_adapters(
                         &source.source_id,
                         &reconciled_file_hashes,
                         &scan.quota_observations,
+                    )?;
+                    // Every file was rescanned, so anything still carrying a hash outside that set
+                    // belongs to a file that is gone, or predates file hashes entirely. Nothing
+                    // later in this scan revisits it, so it is retired here rather than surviving
+                    // as a row no source file explains.
+                    store.delete_quota_observations_for_source_outside_file_hashes(
+                        &source.source_id,
+                        &reconciled_file_hashes,
                     )?;
                 } else {
                     store.upsert_quota_observations(&scan.quota_observations)?;
@@ -9438,12 +9445,20 @@ fn should_replace_source_records_for_scan(
         || (candidate_count > 0 && pending_count == candidate_count)
 }
 
+/// Whether this scan must delete every quota row the source owns before reinserting.
+///
+/// `--no-cache` used to be here. It reparses every file, so file-level reconciliation already
+/// covers everything it rewrites, and the only rows the file path could miss are those no current
+/// file accounts for -- which `delete_quota_observations_for_source_outside_file_hashes` retires
+/// directly. Deleting the whole source to reach them walked every observation, every window, and
+/// the payload table, and on a multi-gigabyte store that ran for tens of minutes. `--replace` keeps
+/// the blanket delete: it is documented as a destructive rebuild, and a caller asking for one is
+/// asking for exactly that.
 fn should_replace_all_source_quota_records(
     explicit_replace: bool,
-    no_cache: bool,
     legacy_full_reconcile: bool,
 ) -> bool {
-    explicit_replace || no_cache || legacy_full_reconcile
+    explicit_replace || legacy_full_reconcile
 }
 
 fn scan_file_hashes_for_reconciliation(
@@ -17730,12 +17745,24 @@ mod tests {
 
     #[test]
     fn cache_invalidation_reconciles_quota_records_by_file() {
-        assert!(!should_replace_all_source_quota_records(
-            false, false, false
+        assert!(!should_replace_all_source_quota_records(false, false));
+        assert!(should_replace_all_source_quota_records(true, false));
+        assert!(should_replace_all_source_quota_records(false, true));
+    }
+
+    #[test]
+    fn no_cache_rescan_reconciles_quota_records_instead_of_deleting_the_source() {
+        // `--no-cache` rereads every file, so the file-level path already rewrites everything it
+        // produces. Deleting the source first walked every observation and window on a store with
+        // six figures of rows, which is the stall a documented flag must not have.
+        assert!(!should_replace_all_source_quota_records(false, false));
+        // The full reread still replaces the source's records, so the reconciliation branch --
+        // the one that also retires rows outside the rescanned file set -- is the branch it takes.
+        assert!(should_replace_source_records_for_scan(
+            false, true, 0, 0, false
         ));
-        assert!(should_replace_all_source_quota_records(true, false, false));
-        assert!(should_replace_all_source_quota_records(false, true, false));
-        assert!(should_replace_all_source_quota_records(false, false, true));
+        // An explicit destructive rebuild keeps the blanket delete.
+        assert!(should_replace_all_source_quota_records(true, false));
     }
 
     #[test]

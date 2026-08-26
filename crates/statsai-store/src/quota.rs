@@ -492,6 +492,58 @@ impl Store {
         })
     }
 
+    /// Deletes this source's quota rows that no file in `source_file_path_hashes` accounts for.
+    ///
+    /// A full rescan replaces every file it can see, but `replace_quota_observations_for_source_files`
+    /// only reconciles the hashes handed to it, so rows written for a file that has since disappeared
+    /// -- and legacy rows stored before file hashes were recorded -- outlive the scan that should have
+    /// retired them. Deleting the whole source instead would retire them, and that is what `--no-cache`
+    /// used to do: on a store with six figures of observations it walked every row, every window, and
+    /// the payload table, which is the stall this replaces. The unmatched set is normally empty, and the
+    /// source index covers the lookup, so the common case reads an index range and writes nothing.
+    pub fn delete_quota_observations_for_source_outside_file_hashes(
+        &self,
+        source_id: &SourceId,
+        source_file_path_hashes: &[String],
+    ) -> Result<u64> {
+        self.with_immediate_transaction(|| {
+            let retained = source_file_path_hashes
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let mut statement = self.conn.prepare(
+                "SELECT observation_id, source_file_path_hash FROM quota_observations
+                 WHERE source_id = ?1",
+            )?;
+            let orphaned = statement
+                .query_map([&source_id.0], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(_, file_hash)| !retained.contains(file_hash.as_str()))
+                .map(|(observation_id, _)| observation_id)
+                .collect::<Vec<_>>();
+            drop(statement);
+            if orphaned.is_empty() {
+                return Ok(0);
+            }
+            let mut deleted = 0u64;
+            for observation_id in orphaned {
+                self.conn.execute(
+                    "DELETE FROM quota_window_observations WHERE observation_id = ?1",
+                    [&observation_id],
+                )?;
+                deleted = deleted.saturating_add(self.conn.execute(
+                    "DELETE FROM quota_observations WHERE observation_id = ?1",
+                    [&observation_id],
+                )? as u64);
+            }
+            self.delete_unreferenced_quota_payloads()?;
+            Ok(deleted)
+        })
+    }
+
     fn delete_unreferenced_quota_payloads(&self) -> Result<()> {
         self.conn.execute(
             "DELETE FROM quota_payloads WHERE payload_hash NOT IN (SELECT payload_hash FROM quota_observations)",
@@ -1853,6 +1905,67 @@ mod tests {
             .expect("read target source only");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].observation.observation_id, "quota-target");
+    }
+
+    #[test]
+    fn orphan_purge_retires_only_rows_no_rescanned_file_explains() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let source_id = SourceId("quota-orphan-source".to_string());
+        let other_source_id = SourceId("quota-other-source".to_string());
+        let record = |source: SourceId, id: &str| {
+            sample_record(
+                source,
+                id,
+                &format!("{id}-v1"),
+                observed_at,
+                (observed_at + Duration::days(7)).timestamp(),
+                "primary",
+                10_080,
+                25.0,
+            )
+        };
+        let kept = record(source_id.clone(), "kept");
+        let orphaned = record(source_id.clone(), "orphaned");
+        let untouched = record(other_source_id.clone(), "other");
+        store
+            .upsert_quota_observations(&[kept, orphaned, untouched])
+            .expect("seed quota rows");
+
+        // What a full rescan sees: only `kept`'s file still exists.
+        let deleted = store
+            .delete_quota_observations_for_source_outside_file_hashes(
+                &source_id,
+                &["file-kept".to_string()],
+            )
+            .expect("purge orphaned quota rows");
+
+        assert_eq!(deleted, 1, "only the row without a current file is retired");
+        let remaining = store
+            .quota_observations_for_source(&source_id)
+            .expect("read source quota rows")
+            .into_iter()
+            .map(|record| record.observation.observation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec!["kept".to_string()]);
+        let orphaned_windows: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM quota_window_observations WHERE observation_id = 'orphaned'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count orphaned windows");
+        assert_eq!(orphaned_windows, 0, "windows follow their observation");
+        // A hash absent from one source's rescan says nothing about another source.
+        assert_eq!(
+            store
+                .quota_observations_for_source(&other_source_id)
+                .expect("read other source")
+                .len(),
+            1,
+            "the purge is scoped to the rescanned source"
+        );
     }
 
     #[test]
