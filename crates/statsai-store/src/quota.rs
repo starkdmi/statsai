@@ -165,7 +165,7 @@ impl Store {
                 ],
             )?;
             let observation_payload = serde_json::to_string(&record.observation)?;
-            self.conn.execute(
+            let observation_changed = self.conn.execute(
                 r#"
                     INSERT INTO quota_observations (
                       observation_id, semantic_fingerprint, provider, source_id,
@@ -184,6 +184,17 @@ impl Store {
                       usage_link_kind = excluded.usage_link_kind,
                       payload_hash = excluded.payload_hash,
                       payload = excluded.payload
+                    WHERE quota_observations.semantic_fingerprint IS NOT excluded.semantic_fingerprint
+                       OR quota_observations.provider IS NOT excluded.provider
+                       OR quota_observations.source_id IS NOT excluded.source_id
+                       OR quota_observations.provider_account_id IS NOT excluded.provider_account_id
+                       OR quota_observations.observed_at IS NOT excluded.observed_at
+                       OR quota_observations.source_file_path_hash IS NOT excluded.source_file_path_hash
+                       OR quota_observations.source_record_id IS NOT excluded.source_record_id
+                       OR quota_observations.usage_event_id IS NOT excluded.usage_event_id
+                       OR quota_observations.usage_link_kind IS NOT excluded.usage_link_kind
+                       OR quota_observations.payload_hash IS NOT excluded.payload_hash
+                       OR quota_observations.payload IS NOT excluded.payload
                     "#,
                 params![
                     &record.observation.observation_id,
@@ -207,30 +218,62 @@ impl Store {
                     &record.observation.payload_hash,
                     observation_payload,
                 ],
-            )?;
-            self.conn.execute(
-                "DELETE FROM quota_window_observations WHERE observation_id = ?1",
-                [&record.observation.observation_id],
-            )?;
-            for window in &record.windows {
+            )? > 0;
+            let mut incoming_windows = record
+                .windows
+                .iter()
+                .map(|window| Ok((window, serde_json::to_string(window)?)))
+                .collect::<Result<Vec<_>>>()?;
+            incoming_windows.sort_by_key(|(window, _)| window.window_observation_id.as_str());
+            let stored_windows = if observation_changed {
+                Vec::new()
+            } else {
+                let mut statement = self.conn.prepare(
+                    "SELECT window_observation_id, payload
+                     FROM quota_window_observations
+                     WHERE observation_id = ?1
+                     ORDER BY window_observation_id",
+                )?;
+                let windows = statement
+                    .query_map([&record.observation.observation_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                windows
+            };
+            let windows_changed = observation_changed
+                || incoming_windows.len() != stored_windows.len()
+                || incoming_windows.iter().zip(&stored_windows).any(
+                    |((incoming_window, incoming_payload), (stored_id, stored_payload))| {
+                        incoming_window.window_observation_id != *stored_id
+                            || incoming_payload != stored_payload
+                    },
+                );
+            if windows_changed {
                 self.conn.execute(
-                    r#"
+                    "DELETE FROM quota_window_observations WHERE observation_id = ?1",
+                    [&record.observation.observation_id],
+                )?;
+                for (window, payload) in &incoming_windows {
+                    self.conn.execute(
+                        r#"
                         INSERT INTO quota_window_observations (
                           window_observation_id, observation_id, provider_slot, limit_id,
                           window_minutes, used_percent, resets_at, payload
                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                         "#,
-                    params![
-                        &window.window_observation_id,
-                        &window.observation_id,
-                        &window.provider_slot,
-                        window.limit_id.as_deref(),
-                        i64::try_from(window.window_minutes).unwrap_or(i64::MAX),
-                        window.used_percent,
-                        window.resets_at_epoch_seconds,
-                        serde_json::to_string(window)?,
-                    ],
-                )?;
+                        params![
+                            &window.window_observation_id,
+                            &window.observation_id,
+                            &window.provider_slot,
+                            window.limit_id.as_deref(),
+                            i64::try_from(window.window_minutes).unwrap_or(i64::MAX),
+                            window.used_percent,
+                            window.resets_at_epoch_seconds,
+                            payload,
+                        ],
+                    )?;
+                }
             }
             written = written.saturating_add(1);
         }
@@ -243,11 +286,16 @@ impl Store {
         source_file_path_hashes: &[String],
         records: &[QuotaObservationRecordV1],
     ) -> Result<u64> {
+        let source_file_path_hashes = source_file_path_hashes
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
         let retained_observation_ids = records
             .iter()
             .filter(|record| {
                 record.observation.source_id == *source_id
-                    && source_file_path_hashes.contains(&record.observation.source_file_path_hash)
+                    && source_file_path_hashes
+                        .contains(record.observation.source_file_path_hash.as_str())
             })
             .map(|record| record.observation.observation_id.as_str())
             .collect::<HashSet<_>>();
@@ -284,32 +332,58 @@ impl Store {
         Ok(written)
     }
 
+    pub fn replace_quota_observations_for_source_files(
+        &self,
+        source_id: &SourceId,
+        source_file_path_hashes: &[String],
+        records: &[QuotaObservationRecordV1],
+    ) -> Result<u64> {
+        self.with_immediate_transaction(|| {
+            self.replace_quota_observations_for_source_files_inner(
+                source_id,
+                source_file_path_hashes,
+                records,
+            )
+        })
+    }
+
     pub fn quota_observations(
         &self,
         query: &QuotaQuery,
         collapse_duplicates: bool,
     ) -> Result<Vec<QuotaObservationRecordV1>> {
         let mut observations = BTreeMap::<String, QuotaObservationRecordV1>::new();
-        let mut statement = self.conn.prepare(
+        let observation_sql = if query.source_id.is_some() {
+            r#"
+            SELECT q.payload, q.provider_account_id, q.usage_event_id, q.usage_link_kind,
+                   p.payload
+            FROM quota_observations q
+            JOIN quota_payloads p ON p.payload_hash = q.payload_hash
+            WHERE q.source_id = ?1
+            ORDER BY q.observed_at, q.observation_id
+            "#
+        } else {
             r#"
             SELECT q.payload, q.provider_account_id, q.usage_event_id, q.usage_link_kind,
                    p.payload
             FROM quota_observations q
             JOIN quota_payloads p ON p.payload_hash = q.payload_hash
             ORDER BY q.observed_at, q.observation_id
-            "#,
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (payload, account_id, usage_event_id, usage_link_kind, raw_payload) = row?;
+            "#
+        };
+        let source_bindings = query
+            .source_id
+            .as_ref()
+            .map(|source_id| source_id.0.as_str())
+            .into_iter();
+        let mut statement = self.conn.prepare(observation_sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(source_bindings))?;
+        while let Some(row) = rows.next()? {
+            let payload = row.get::<_, String>(0)?;
+            let account_id = row.get::<_, Option<String>>(1)?;
+            let usage_event_id = row.get::<_, Option<String>>(2)?;
+            let usage_link_kind = row.get::<_, String>(3)?;
+            let raw_payload = row.get::<_, String>(4)?;
             let mut observation: QuotaObservationV1 = serde_json::from_str(&payload)?;
             observation.provider_account_id = account_id.map(ProviderAccountId);
             observation.usage_event_id = usage_event_id.map(EventId);
@@ -326,16 +400,31 @@ impl Store {
                 },
             );
         }
+        drop(rows);
         drop(statement);
 
-        let mut statement = self.conn.prepare(
-            "SELECT observation_id, payload FROM quota_window_observations ORDER BY resets_at, window_observation_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (observation_id, payload) = row?;
+        let window_sql = if query.source_id.is_some() {
+            r#"
+            SELECT window.observation_id, window.payload
+            FROM quota_observations observation INDEXED BY quota_observations_source_idx
+            CROSS JOIN quota_window_observations window
+              ON window.observation_id = observation.observation_id
+            WHERE observation.source_id = ?1
+            ORDER BY window.resets_at, window.window_observation_id
+            "#
+        } else {
+            "SELECT observation_id, payload FROM quota_window_observations ORDER BY resets_at, window_observation_id"
+        };
+        let source_bindings = query
+            .source_id
+            .as_ref()
+            .map(|source_id| source_id.0.as_str())
+            .into_iter();
+        let mut statement = self.conn.prepare(window_sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(source_bindings))?;
+        while let Some(row) = rows.next()? {
+            let observation_id = row.get::<_, String>(0)?;
+            let payload = row.get::<_, String>(1)?;
             let Some(record) = observations.get_mut(&observation_id) else {
                 continue;
             };
@@ -1719,6 +1808,130 @@ mod tests {
         // Still no invented billing period.
         assert_eq!(plans[0].active_from, None);
         assert_eq!(plans[0].active_until, None);
+    }
+
+    #[test]
+    fn source_quota_reads_do_not_deserialize_unrelated_rows() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let target = SourceId("quota-target".to_string());
+        let unrelated = SourceId("quota-unrelated".to_string());
+        store
+            .upsert_quota_observations(&[
+                sample_record(
+                    target.clone(),
+                    "quota-target",
+                    "quota-target-v1",
+                    observed_at,
+                    (observed_at + Duration::days(7)).timestamp(),
+                    "primary",
+                    10_080,
+                    25.0,
+                ),
+                sample_record(
+                    unrelated,
+                    "quota-unrelated",
+                    "quota-unrelated-v1",
+                    observed_at,
+                    (observed_at + Duration::days(7)).timestamp(),
+                    "primary",
+                    10_080,
+                    50.0,
+                ),
+            ])
+            .expect("quota rows");
+        store
+            .conn
+            .execute(
+                "UPDATE quota_observations SET payload = 'not-json' WHERE observation_id = 'quota-unrelated'",
+                [],
+            )
+            .expect("corrupt unrelated row");
+
+        let records = store
+            .quota_observations_for_source(&target)
+            .expect("read target source only");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].observation.observation_id, "quota-target");
+    }
+
+    #[test]
+    fn file_reconciliation_does_not_rewrite_retained_quota_rows() {
+        let store = Store::in_memory().expect("store");
+        let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
+        let source_id = SourceId("quota-retained".to_string());
+        let mut record = sample_record(
+            source_id.clone(),
+            "quota-retained",
+            "quota-retained-v1",
+            observed_at,
+            (observed_at + Duration::days(7)).timestamp(),
+            "primary",
+            10_080,
+            25.0,
+        );
+        record.windows[0].window_observation_id = "z-window".to_string();
+        record.windows[0].provider_slot = "secondary".to_string();
+        let mut earlier_window = record.windows[0].clone();
+        earlier_window.window_observation_id = "a-window".to_string();
+        earlier_window.provider_slot = "primary".to_string();
+        record.windows.push(earlier_window);
+        store
+            .upsert_quota_observations(std::slice::from_ref(&record))
+            .expect("initial quota row");
+        store
+            .conn
+            .execute_batch(
+                r#"
+                CREATE TABLE quota_write_audit (
+                  observation_updates INTEGER NOT NULL,
+                  window_deletes INTEGER NOT NULL,
+                  window_inserts INTEGER NOT NULL
+                );
+                INSERT INTO quota_write_audit VALUES (0, 0, 0);
+                CREATE TRIGGER count_quota_observation_updates
+                AFTER UPDATE ON quota_observations
+                BEGIN
+                  UPDATE quota_write_audit
+                  SET observation_updates = observation_updates + 1;
+                END;
+                CREATE TRIGGER count_quota_window_deletes
+                AFTER DELETE ON quota_window_observations
+                BEGIN
+                  UPDATE quota_write_audit SET window_deletes = window_deletes + 1;
+                END;
+                CREATE TRIGGER count_quota_window_inserts
+                AFTER INSERT ON quota_window_observations
+                BEGIN
+                  UPDATE quota_write_audit SET window_inserts = window_inserts + 1;
+                END;
+                "#,
+            )
+            .expect("audit triggers");
+
+        store
+            .replace_quota_observations_for_source_files(
+                &source_id,
+                std::slice::from_ref(&record.observation.source_file_path_hash),
+                std::slice::from_ref(&record),
+            )
+            .expect("reconcile retained quota row");
+
+        let writes = store
+            .conn
+            .query_row(
+                "SELECT observation_updates, window_deletes, window_inserts FROM quota_write_audit",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .expect("audit counts");
+        assert_eq!(writes, (0, 0, 0));
     }
 
     #[test]

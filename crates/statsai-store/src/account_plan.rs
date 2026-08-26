@@ -517,22 +517,22 @@ impl Store {
                     .provider_account_id
                     .as_ref()
                     .expect("filtered account identity");
-                let later_source_evidence = || {
-                    strong[index + 1..]
-                        .iter()
-                        .filter(|observation| observation.evidence_kind.ends_source_attribution())
-                };
-                let confirmation = later_source_evidence().find(|observation| {
-                    observation.provider_account_id.as_ref() == Some(account_id)
-                });
+                let mut confirmation = None;
+                let mut ended_at = None;
+                for observation in strong[index + 1..]
+                    .iter()
+                    .filter(|observation| observation.evidence_kind.ends_source_attribution())
+                {
+                    if observation.provider_account_id.as_ref() == Some(account_id) {
+                        confirmation = Some(observation);
+                    } else {
+                        ended_at = Some(observation.observed_at);
+                        break;
+                    }
+                }
                 let Some(confirmation) = confirmation else {
                     continue;
                 };
-                let ended_at = later_source_evidence()
-                    .find(|observation| {
-                        observation.provider_account_id.as_ref() != Some(account_id)
-                    })
-                    .map(|observation| observation.observed_at);
                 let assignments = self.list_source_account_assignments_for_source(source_id)?;
                 if assignments.iter().any(|assignment| {
                     assignment.record_source == IdentitySource::UserConfigured
@@ -1456,6 +1456,65 @@ mod tests {
             )])
             .expect("auth snapshot");
         assert_eq!(ledger_ids(), vec!["a-0", "a-30", "b-40", "b-60", "snap-70"]);
+    }
+
+    #[test]
+    fn auth_reload_confirmation_cannot_cross_an_account_boundary() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/account-evidence-boundary-confirmation"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let base = Utc::now();
+        let make = |id: &str, minutes: i64, account: &str, evidence_kind: AccountEvidenceKind| {
+            AccountIdentityObservationV1 {
+                schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id: id.to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: Some(ProviderAccountId(account.to_string())),
+                provider_user_id_hash: None,
+                email_hash: None,
+                conversation_id_hash: None,
+                turn_id_hash: None,
+                observed_at: base + chrono::Duration::minutes(minutes),
+                evidence_kind,
+                confidence: Confidence::High,
+                auth_mode: None,
+                application_version: None,
+                parser_version: "test.v1".to_string(),
+                artifact_kind: "test".to_string(),
+                artifact_path_hash: "path".to_string(),
+                record_fingerprint: id.to_string(),
+            }
+        };
+        store
+            .upsert_account_identity_observations(&[
+                make("reload-a", 1, "account-a", AccountEvidenceKind::AuthReload),
+                make("reload-b", 2, "account-b", AccountEvidenceKind::AuthReload),
+                make(
+                    "telemetry-a",
+                    3,
+                    "account-a",
+                    AccountEvidenceKind::TelemetryIdentity,
+                ),
+            ])
+            .expect("identity evidence");
+
+        assert_eq!(
+            store
+                .reconcile_source_account_evidence_assignments(&source.source_id)
+                .expect("reconcile evidence"),
+            0
+        );
+        assert!(store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments")
+            .is_empty());
     }
 
     #[test]

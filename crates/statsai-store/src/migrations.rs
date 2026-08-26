@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 21;
+pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -140,6 +140,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         19 => apply_migration_019(conn),
         20 => apply_migration_020(conn),
         21 => apply_migration_021(conn),
+        22 => apply_migration_022(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -844,6 +845,17 @@ fn apply_migration_021(conn: &Connection) -> Result<()> {
     )
 }
 
+fn apply_migration_022(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS quota_window_observations_observation_idx
+          ON quota_window_observations
+             (observation_id, resets_at, window_observation_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_local_task_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -1013,6 +1025,10 @@ mod tests {
             "account_evidence_checkpoints",
             "checkpoint_row_fingerprint"
         ));
+        assert!(index_exists(
+            &conn,
+            "quota_window_observations_observation_idx"
+        ));
     }
 
     #[test]
@@ -1025,20 +1041,20 @@ mod tests {
               applied_at TEXT NOT NULL
             );
             INSERT INTO schema_migrations (version, applied_at)
-            VALUES (22, '2026-08-23T00:00:00Z');
+            VALUES (23, '2026-08-23T00:00:00Z');
             "#,
         )
         .expect("create future schema marker");
 
-        let error = migrate(&conn).expect_err("schema 22 must be rejected by schema 21 binary");
+        let error = migrate(&conn).expect_err("schema 23 must be rejected by schema 22 binary");
 
         assert_eq!(
             error.to_string(),
-            "database schema version 22 is newer than this StatsAI binary supports (21); upgrade StatsAI or use a compatible database"
+            "database schema version 23 is newer than this StatsAI binary supports (22); upgrade StatsAI or use a compatible database"
         );
         assert_eq!(
             current_schema_version(&conn).expect("read unchanged version"),
-            22
+            23
         );
     }
 
@@ -1073,7 +1089,10 @@ mod tests {
 
         migrate(&conn).expect("retry migration");
 
-        assert_eq!(schema_version(&conn).expect("version after retry"), 21);
+        assert_eq!(
+            schema_version(&conn).expect("version after retry"),
+            CURRENT_SCHEMA_VERSION
+        );
         assert!(column_exists(
             &conn,
             "account_evidence_checkpoints",

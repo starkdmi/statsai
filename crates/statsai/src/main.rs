@@ -1152,6 +1152,11 @@ fn scan_with_adapters(
                 pending_file_entries.len(),
                 needs_legacy_full_reconcile,
             );
+            let replace_all_source_quota_records = should_replace_all_source_quota_records(
+                command.replace,
+                command.no_cache,
+                needs_legacy_full_reconcile,
+            );
             let should_run_adapter_scan = if replace_source_records {
                 !file_cache_entries.is_empty()
             } else {
@@ -1357,9 +1362,11 @@ fn scan_with_adapters(
                         store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
                     removed_summary_count += store
                         .delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
-                    store.delete_quota_observations_for_sources(std::slice::from_ref(
-                        &source.source_id,
-                    ))?;
+                    if replace_all_source_quota_records {
+                        store.delete_quota_observations_for_sources(std::slice::from_ref(
+                            &source.source_id,
+                        ))?;
+                    }
                     if command.include_tasks {
                         let deleted = store.delete_task_spans_for_sources(std::slice::from_ref(
                             &source.source_id,
@@ -1408,7 +1415,19 @@ fn scan_with_adapters(
                     &mut scan.quota_observations,
                     &insert_result.canonical_event_ids,
                 );
-                store.upsert_quota_observations(&scan.quota_observations)?;
+                if replace_source_records && !replace_all_source_quota_records {
+                    let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
+                        &file_cache_entries,
+                        &removed_file_entries,
+                    );
+                    store.replace_quota_observations_for_source_files(
+                        &source.source_id,
+                        &reconciled_file_hashes,
+                        &scan.quota_observations,
+                    )?;
+                } else {
+                    store.upsert_quota_observations(&scan.quota_observations)?;
+                }
                 store.rebuild_quota_plan_observations_for_source(&source.source_id)?;
                 store.clear_orphaned_quota_usage_links()?;
                 if command.include_tasks {
@@ -9417,6 +9436,14 @@ fn should_replace_source_records_for_scan(
         || no_cache
         || legacy_full_reconcile
         || (candidate_count > 0 && pending_count == candidate_count)
+}
+
+fn should_replace_all_source_quota_records(
+    explicit_replace: bool,
+    no_cache: bool,
+    legacy_full_reconcile: bool,
+) -> bool {
+    explicit_replace || no_cache || legacy_full_reconcile
 }
 
 fn scan_file_hashes_for_reconciliation(
@@ -17699,6 +17726,16 @@ mod tests {
         assert!(!should_replace_source_records_for_scan(
             false, false, 0, 0, false
         ));
+    }
+
+    #[test]
+    fn cache_invalidation_reconciles_quota_records_by_file() {
+        assert!(!should_replace_all_source_quota_records(
+            false, false, false
+        ));
+        assert!(should_replace_all_source_quota_records(true, false, false));
+        assert!(should_replace_all_source_quota_records(false, true, false));
+        assert!(should_replace_all_source_quota_records(false, false, true));
     }
 
     #[test]

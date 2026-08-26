@@ -4567,11 +4567,16 @@ fn upsert_verified_source_assignment(
             created_at: existing.created_at,
             updated_at: Utc::now(),
         };
+        let attribution_changed = merged.assignment_id != existing.assignment_id
+            || merged.started_at != existing.started_at
+            || merged.ended_at != existing.ended_at;
         if merged.assignment_id != existing.assignment_id {
             store.delete_source_account_assignment(&existing.assignment_id)?;
         }
         store.upsert_source_account_assignment(&merged)?;
-        reattribute_source_records(store, &source.source_id)?;
+        if attribution_changed {
+            reattribute_source_records(store, &source.source_id)?;
+        }
         return Ok(());
     }
 
@@ -5073,16 +5078,44 @@ fn reattribute_source_records(store: &Store, source_id: &SourceId) -> Result<()>
         return Ok(());
     }
     let assignments = store.list_source_account_assignments_for_source(source_id)?;
-    let mut events = store.events_for_source(source_id)?;
-    let mut summaries = store.summaries_for_source(source_id)?;
-    for event in &mut events {
-        apply_account_resolution_to_event(&assignments, event);
+    let mut changed_events = Vec::new();
+    for mut event in store.events_for_source(source_id)? {
+        let previous_account = event.provider_account_id.clone();
+        let previous_identity_source = event
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| evidence.account_identity_source.clone());
+        apply_account_resolution_to_event(&assignments, &mut event);
+        let identity_source = event
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| evidence.account_identity_source.clone());
+        if event.provider_account_id != previous_account
+            || identity_source != previous_identity_source
+        {
+            changed_events.push(event);
+        }
     }
-    for summary in &mut summaries {
-        apply_account_resolution_to_summary(&assignments, summary);
+    let mut changed_summaries = Vec::new();
+    for mut summary in store.summaries_for_source(source_id)? {
+        let previous_account = summary.provider_account_id.clone();
+        let previous_identity_source = summary
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| evidence.account_identity_source.clone());
+        apply_account_resolution_to_summary(&assignments, &mut summary);
+        let identity_source = summary
+            .parse_evidence
+            .as_ref()
+            .map(|evidence| evidence.account_identity_source.clone());
+        if summary.provider_account_id != previous_account
+            || identity_source != previous_identity_source
+        {
+            changed_summaries.push(summary);
+        }
     }
-    store.rewrite_events(&events)?;
-    store.rewrite_summaries(&summaries)?;
+    store.rewrite_events(&changed_events)?;
+    store.rewrite_summaries(&changed_summaries)?;
     store.reattribute_quota_observations(source_id)?;
     store.rebuild_quota_plan_observations_for_source(source_id)?;
     Ok(())
@@ -11205,6 +11238,72 @@ mod tests {
             assignments[0].ended_at, None,
             "reset history must not close the interval an auth reload opened"
         );
+    }
+
+    #[test]
+    fn refreshing_verified_at_does_not_rewrite_unchanged_source_records() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/verified-at-only-refresh"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let account_id = ProviderAccountId("account-verified".to_string());
+        let authenticated_at = Utc::now() - chrono::Duration::days(1);
+        upsert_verified_source_assignment(
+            &store,
+            &source,
+            &account_id,
+            authenticated_at,
+            Some(authenticated_at),
+            None,
+            IdentitySource::LocalAuth,
+        )
+        .expect("initial verification");
+        let mut event = test_store_event(&source, authenticated_at, "verified-event");
+        event.provider_account_id = Some(account_id.clone());
+        store.insert_events(&[event]).expect("event");
+        store
+            .conn
+            .execute_batch(
+                r#"
+                CREATE TABLE event_update_audit (count INTEGER NOT NULL);
+                INSERT INTO event_update_audit VALUES (0);
+                CREATE TRIGGER count_event_updates
+                AFTER UPDATE ON usage_events
+                BEGIN
+                  UPDATE event_update_audit SET count = count + 1;
+                END;
+                "#,
+            )
+            .expect("audit trigger");
+
+        let refreshed_at = authenticated_at + chrono::Duration::hours(1);
+        upsert_verified_source_assignment(
+            &store,
+            &source,
+            &account_id,
+            authenticated_at,
+            Some(refreshed_at),
+            None,
+            IdentitySource::LocalAuth,
+        )
+        .expect("refresh verification");
+
+        let update_count: i64 = store
+            .conn
+            .query_row("SELECT count FROM event_update_audit", [], |row| row.get(0))
+            .expect("audit count");
+        assert_eq!(update_count, 0);
+        let assignment = store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignment")
+            .pop()
+            .expect("verified assignment");
+        assert_eq!(assignment.verified_at, Some(refreshed_at));
     }
 
     fn test_store_event(
