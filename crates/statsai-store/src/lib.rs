@@ -38,7 +38,8 @@ use std::path::Path;
 pub use account_plan::AccountEvidenceReferenceCounts;
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use pricing::{
-    RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY, APPLIED_PRICING_RULESET_VERSION_KEY,
+    apply_current_estimated_pricing, RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY,
+    APPLIED_PRICING_RULESET_VERSION_KEY,
 };
 pub use snapshot::{
     clone_database_to, database_applied_pricing_ruleset_version, database_schema_version,

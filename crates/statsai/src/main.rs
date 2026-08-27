@@ -38,14 +38,15 @@ use statsai_sdk::{
     build_reported_usage_summary, ReportedUsageSummaryInput, ReportedUsageSummaryRecord,
     REPORTED_USAGE_IMPORT_ADAPTER_ID,
 };
+use statsai_store::{
+    apply_current_estimated_pricing, close_active_verified_source_linkages, derive_task_work_items,
+    find_existing_provider_account, reconcile_verified_source_state, upsert_provider_account,
+    verified_source_observation_hash, QuotaQuery, ScanFileStateEntry, Store, SyncPreferences,
+    SyncState, TaskRebuildReport, UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION,
+    PRICING_CATALOG_VERSION, PRICING_RULESET_VERSION,
+};
 #[cfg(test)]
 use statsai_store::{apply_verified_source_state, verified_source_state_hash};
-use statsai_store::{
-    close_active_verified_source_linkages, derive_task_work_items, find_existing_provider_account,
-    reconcile_verified_source_state, upsert_provider_account, verified_source_observation_hash,
-    QuotaQuery, ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
-    UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION,
-};
 use statsai_sync::{
     validate_authenticated_http_endpoint, FileSink, HttpSink, StdoutSink, SyncSink,
 };
@@ -3831,7 +3832,11 @@ fn build_reported_import_record(
     device_id: &str,
 ) -> Result<ReportedImportRecord> {
     let legacy_replacement_source_ids = legacy_alias_replacement_source_ids(&input);
-    let record = build_reported_usage_summary(input, device_id)?;
+    let mut record = build_reported_usage_summary(input, device_id)?;
+    // Overlay before upsert so a store already at this ruleset cannot keep an
+    // imported estimated-only figure from an older catalog. A later
+    // ensure_current_pricing pass would no-op.
+    record.summary = apply_current_estimated_pricing(record.summary);
     Ok(ReportedImportRecord {
         record,
         legacy_replacement_source_ids,
@@ -11834,6 +11839,115 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].summary_id, canonical_summary_id);
         assert_eq!(summaries[0].metadata.summary_format, "manual_daily");
+    }
+
+    #[test]
+    fn import_overlays_estimated_cost_when_store_ruleset_is_already_current() {
+        let store = Store::in_memory().expect("store");
+        store
+            .ensure_current_pricing()
+            .expect("apply current ruleset");
+        let noop = store.ensure_current_pricing().expect("already current");
+        assert!(noop.already_current);
+
+        let period_end = Utc
+            .with_ymd_and_hms(2026, 7, 29, 23, 59, 59)
+            .single()
+            .expect("end");
+        let input = ReportedUsageSummaryInput {
+            schema_version: "reported_usage_summary_input.v1".to_string(),
+            provider: "codex".to_string(),
+            provider_account_id: None,
+            provider_user_id: None,
+            email: None,
+            account_label: None,
+            source_kind: SourceKind::ExternalReport,
+            source_name: "legacy_catalog_export".to_string(),
+            evidence_id: Some("legacy-catalog:2026-07-29".to_string()),
+            evidence_path: None,
+            report_format: "manual_period_summary".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2026, 7, 29, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(period_end),
+            observed_at: None,
+            model: Some(ModelInfo {
+                name: Some("codex-auto-review".to_string()),
+                normalized_name: Some("codex-auto-review".to_string()),
+                provider_model_id: Some("codex-auto-review".to_string()),
+                speed: None,
+                reasoning_level: None,
+                reasoning_level_raw: None,
+            }),
+            usage: UsageCounts {
+                input_tokens: Some(1_000_000),
+                cache_creation_tokens: Some(1_000_000),
+                cache_read_tokens: Some(1_000_000),
+                output_tokens: Some(1_000_000),
+                total_tokens: Some(4_000_000),
+                ..UsageCounts::default()
+            },
+            cost: Some(CostInfo {
+                currency: "USD".to_string(),
+                estimated_api_equivalent_usd: Some(1),
+                provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: Some(10_000),
+                provider_reported_micro_usd: None,
+                pricing_source: Some("official:stale".to_string()),
+                pricing_version: Some("official:stale".to_string()),
+                confidence: Confidence::Low,
+            }),
+            confidence: Some(Confidence::Medium),
+        };
+
+        let incoming = build_reported_import_record(input, "device").expect("incoming");
+        assert_ne!(
+            incoming.record.summary.cost.estimated_api_equivalent_usd,
+            Some(1)
+        );
+        assert_eq!(
+            incoming.record.summary.cost.pricing_version.as_deref(),
+            Some(PRICING_CATALOG_VERSION)
+        );
+        assert!(incoming
+            .record
+            .summary
+            .cost
+            .estimated_api_equivalent_usd
+            .is_some());
+        let expected_usd = incoming.record.summary.cost.estimated_api_equivalent_usd;
+
+        import_reported_summary_records(
+            &store,
+            &[ReportedImportReport {
+                path: PathBuf::from("legacy-catalog.json"),
+                records: vec![incoming],
+                warnings: Vec::new(),
+            }],
+            false,
+            false,
+            false,
+        )
+        .expect("import");
+
+        let stored = store.summaries().expect("summaries");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].cost.estimated_api_equivalent_usd, expected_usd);
+        assert_eq!(
+            stored[0].cost.pricing_version.as_deref(),
+            Some(PRICING_CATALOG_VERSION)
+        );
+        let still_current = store.ensure_current_pricing().expect("still current");
+        assert!(still_current.already_current);
+        assert_eq!(
+            store.summaries().expect("unchanged")[0]
+                .cost
+                .estimated_api_equivalent_usd,
+            expected_usd
+        );
     }
 
     #[test]
