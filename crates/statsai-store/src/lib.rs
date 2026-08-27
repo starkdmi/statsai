@@ -4079,7 +4079,9 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )?;
             for row in rows {
-                events.push(serde_json::from_str(&row?)?);
+                if let Ok(event) = serde_json::from_str(&row?) {
+                    events.push(event);
+                }
             }
         } else {
             let rows = stmt.query_map(
@@ -4087,7 +4089,9 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )?;
             for row in rows {
-                events.push(serde_json::from_str(&row?)?);
+                if let Ok(event) = serde_json::from_str(&row?) {
+                    events.push(event);
+                }
             }
         }
         events.retain(|event| sync_rollup_project_key(event.project.as_ref()) == key.project_key);

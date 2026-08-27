@@ -1443,6 +1443,7 @@ mod tests {
         assert_eq!(report.skipped_unreadable_events, 1);
         assert_eq!(report.skipped_unreadable_summaries, 1);
         assert_eq!(report.changed_events, 1);
+        assert_eq!(report.refreshed_rollups, 1);
         assert_eq!(
             stored_event(&store, &event.event_id.0).cost,
             expected_review_cost(started_at)
