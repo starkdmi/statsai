@@ -13,8 +13,8 @@ use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-/// Opens a store for a normal StatsAI command and applies the compiled pricing
-/// ruleset before price-derived data is read or written.
+/// Opens a store for a command that reads or publishes price-derived data and
+/// applies the compiled pricing ruleset first.
 pub fn open_operational_store(path: &Path) -> Result<Store> {
     let store = Store::open(path)?;
     let report = store.ensure_current_pricing()?;
@@ -272,6 +272,119 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn open_operational_store_reprices_a_legacy_store() {
+        use chrono::TimeZone;
+        use statsai_core::{
+            event_id, Confidence, CostInfo, EventSource, LocationOrigin, ModelInfo, PrivacyInfo,
+            PrivacyMode, SessionInfo, SourceKind, SourceLocation, UsageCounts, UsageEvent,
+            USAGE_EVENT_SCHEMA_VERSION,
+        };
+        use statsai_store::PRICING_RULESET_VERSION;
+        use std::path::Path;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("statsai.sqlite");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 7, 29, 12, 0, 0)
+            .single()
+            .expect("started_at");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-open-operational-reprice"),
+            LocationOrigin::Configured,
+        );
+        {
+            let store = Store::open(&path).expect("create store");
+            store.upsert_source(&source).expect("source");
+            let event = UsageEvent {
+                schema_version: USAGE_EVENT_SCHEMA_VERSION.to_string(),
+                event_id: event_id(
+                    "codex",
+                    &source.source_id,
+                    "legacy-review",
+                    None,
+                    started_at,
+                ),
+                device_id: "device".to_string(),
+                provider: "codex".to_string(),
+                source_id: source.source_id.clone(),
+                provider_account_id: None,
+                subscription_id: None,
+                source: EventSource {
+                    adapter_id: "test".to_string(),
+                    adapter_version: "0".to_string(),
+                    source_kind: SourceKind::LocalAdapter,
+                    location_origin: Some(LocationOrigin::Configured),
+                    source_type: "jsonl".to_string(),
+                    source_path_hash: source.path_hash.clone(),
+                    source_record_id: Some("legacy-review".to_string()),
+                    parse_confidence: Confidence::High,
+                },
+                session: SessionInfo {
+                    session_id: "session".to_string(),
+                    local_session_id_hash: Some("same-session".to_string()),
+                    title: None,
+                    started_at,
+                    ended_at: None,
+                    duration_seconds: None,
+                },
+                model: Some(ModelInfo {
+                    name: Some("codex-auto-review".to_string()),
+                    normalized_name: Some("codex-auto-review".to_string()),
+                    provider_model_id: Some("codex-auto-review".to_string()),
+                    speed: None,
+                    reasoning_level: None,
+                    reasoning_level_raw: None,
+                }),
+                usage: UsageCounts {
+                    input_tokens: Some(1_000_000),
+                    cache_creation_tokens: Some(1_000_000),
+                    cache_read_tokens: Some(1_000_000),
+                    output_tokens: Some(1_000_000),
+                    total_tokens: Some(4_000_000),
+                    ..UsageCounts::default()
+                },
+                runtime: None,
+                cost: CostInfo {
+                    currency: "USD".to_string(),
+                    estimated_api_equivalent_usd: None,
+                    provider_reported_usd: None,
+                    estimated_api_equivalent_micro_usd: None,
+                    provider_reported_micro_usd: None,
+                    pricing_source: Some("unknown".to_string()),
+                    pricing_version: None,
+                    confidence: Confidence::Low,
+                },
+                parse_evidence: None,
+                project: None,
+                git: None,
+                privacy: PrivacyInfo {
+                    mode: PrivacyMode::MetadataOnly,
+                    contains_prompt_text: false,
+                    contains_response_text: false,
+                    contains_file_paths: false,
+                },
+                created_at: started_at,
+                imported_at: started_at,
+            };
+            store.insert_event(&event).expect("legacy event");
+            assert_eq!(store.applied_pricing_ruleset_version().expect("meta"), None);
+            drop(store);
+        }
+
+        let store = open_operational_store(&path).expect("operational open");
+        assert_eq!(
+            store.applied_pricing_ruleset_version().expect("applied"),
+            Some(PRICING_RULESET_VERSION)
+        );
+        let stored = store.events().expect("events");
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].cost.estimated_api_equivalent_usd.is_some());
     }
 
     #[test]

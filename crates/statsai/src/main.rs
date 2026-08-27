@@ -975,7 +975,11 @@ fn main() -> Result<()> {
         Command::Service(command) => service(command),
         Command::Snapshot(command) => snapshot::run(command, &store_path, &device_id),
         command => {
-            let store = statsai::open_operational_store(&store_path)?;
+            let store = if command_reprices_persisted_usage(&command) {
+                statsai::open_operational_store(&store_path)?
+            } else {
+                Store::open(&store_path)?
+            };
             match command {
                 Command::Scan(command) => scan(command, &store, &device_id),
                 Command::Report(command) => report(command, &store),
@@ -1004,6 +1008,19 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn command_reprices_persisted_usage(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Scan(_)
+            | Command::Report(_)
+            | Command::Import(_)
+            | Command::Export(_)
+            | Command::Task(_)
+            | Command::Sync(_)
+            | Command::Daemon(_)
+    )
 }
 
 fn store_admin(command: StoreAdminCommand, source: &Path) -> Result<()> {
@@ -7923,7 +7940,7 @@ fn doctor(store_path: &Path) -> Result<()> {
     if let Ok(value) = std::env::var("CODEX_HOME") {
         println!("env CODEX_HOME: {}", value);
     }
-    let store = statsai::open_operational_store(store_path)?;
+    let store = Store::open(store_path)?;
     let configured = store.list_sources()?;
     for adapter in default_adapters() {
         let sources = scan_sources_for_adapter(adapter.as_ref(), &configured);
@@ -21802,6 +21819,26 @@ mod tests {
         )
         .expect("print supported pricing ruleset");
         assert!(!store_path.exists());
+    }
+
+    #[test]
+    fn price_derived_commands_reprice_and_diagnostic_commands_do_not() {
+        let reprice = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parse");
+            command_reprices_persisted_usage(&cli.command)
+        };
+        assert!(reprice(&["statsai", "scan"]));
+        assert!(reprice(&["statsai", "report", "monthly"]));
+        assert!(reprice(&["statsai", "sync"]));
+        assert!(reprice(&["statsai", "export", "--json"]));
+        assert!(reprice(&["statsai", "task", "list"]));
+        assert!(!reprice(&["statsai", "status"]));
+        assert!(!reprice(&["statsai", "quota", "status"]));
+        assert!(!reprice(&["statsai", "conversation", "list"]));
+        assert!(!reprice(&["statsai", "account", "list"]));
+        assert!(!reprice(&["statsai", "source", "list"]));
+        let doctor = Cli::try_parse_from(["statsai", "doctor"]).expect("parse doctor");
+        assert!(!command_reprices_persisted_usage(&doctor.command));
     }
 
     #[test]

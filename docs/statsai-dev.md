@@ -195,7 +195,8 @@ PR.
 
 Ordinary isolated `statsai-dev` stores are opened by the selected exact-SHA
 `statsai` binary. That binary applies its own pricing ruleset automatically
-before scan, report, sync, and other operational commands. A pricing catalog
+before scan, report, sync, snapshot, and other price-derived commands. Status,
+doctor, quota, and conversation do not trigger a reprice. A pricing catalog
 change does not require a raw rescan; a later incremental sync publishes
 corrected dirty rollups.
 

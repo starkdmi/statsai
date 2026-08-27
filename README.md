@@ -438,11 +438,14 @@ values, and leaves cost unknown when a source does not prove the billable model.
 
 Pricing updates are version-driven and automatic. The selected `statsai` binary
 reprices persisted normalized events when its compiled ruleset is newer than
-the store's last applied ruleset. A raw provider rescan (`--no-cache`) is not
-required. Ordinary incremental `statsai sync --sink http` then uploads the
-corrected dirty rollups; `--rebuild-rollups` and `--full` are unnecessary just
-because prices changed. A store already processed by a newer ruleset is
-refused rather than silently repriced backward.
+the store's last applied ruleset, before scan, report, sync, snapshot, task,
+export, import, or daemon use price-derived data. Diagnostic commands such as
+`status`, `doctor`, `quota`, `conversation`, and `account` do not trigger that
+pass. A raw provider rescan (`--no-cache`) is not required. Ordinary incremental
+`statsai sync --sink http` then uploads the corrected dirty rollups;
+`--rebuild-rollups` and `--full` are unnecessary just because prices changed. A
+store already processed by a newer ruleset is refused rather than silently
+repriced backward.
 
 ## Develop locally
 
