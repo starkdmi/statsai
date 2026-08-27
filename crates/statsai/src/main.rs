@@ -38,14 +38,15 @@ use statsai_sdk::{
     build_reported_usage_summary, ReportedUsageSummaryInput, ReportedUsageSummaryRecord,
     REPORTED_USAGE_IMPORT_ADAPTER_ID,
 };
+use statsai_store::{
+    apply_current_estimated_pricing, close_active_verified_source_linkages, derive_task_work_items,
+    find_existing_provider_account, reconcile_verified_source_state, upsert_provider_account,
+    verified_source_observation_hash, QuotaQuery, ScanFileStateEntry, Store, SyncPreferences,
+    SyncState, TaskRebuildReport, UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION,
+    PRICING_RULESET_VERSION,
+};
 #[cfg(test)]
 use statsai_store::{apply_verified_source_state, verified_source_state_hash};
-use statsai_store::{
-    close_active_verified_source_linkages, derive_task_work_items, find_existing_provider_account,
-    reconcile_verified_source_state, upsert_provider_account, verified_source_observation_hash,
-    QuotaQuery, ScanFileStateEntry, Store, SyncPreferences, SyncState, TaskRebuildReport,
-    UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION,
-};
 use statsai_sync::{
     validate_authenticated_http_endpoint, FileSink, HttpSink, StdoutSink, SyncSink,
 };
@@ -932,6 +933,8 @@ enum StoreAdminSubcommand {
     },
     #[command(about = "Print the store schema version supported by this binary")]
     SupportedSchemaVersion,
+    #[command(about = "Print the pricing ruleset version supported by this binary")]
+    SupportedPricingRulesetVersion,
 }
 
 #[derive(Debug, Subcommand)]
@@ -973,7 +976,11 @@ fn main() -> Result<()> {
         Command::Service(command) => service(command),
         Command::Snapshot(command) => snapshot::run(command, &store_path, &device_id),
         command => {
-            let store = Store::open(&store_path)?;
+            let store = if command_reprices_persisted_usage(&command) {
+                statsai::open_operational_store(&store_path)?
+            } else {
+                Store::open(&store_path)?
+            };
             match command {
                 Command::Scan(command) => scan(command, &store, &device_id),
                 Command::Report(command) => report(command, &store),
@@ -1004,6 +1011,19 @@ fn main() -> Result<()> {
     }
 }
 
+fn command_reprices_persisted_usage(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Scan(_)
+            | Command::Report(_)
+            | Command::Import(_)
+            | Command::Export(_)
+            | Command::Task(_)
+            | Command::Sync(_)
+            | Command::Daemon(_)
+    )
+}
+
 fn store_admin(command: StoreAdminCommand, source: &Path) -> Result<()> {
     match command.command {
         StoreAdminSubcommand::CloneTo { destination } => {
@@ -1019,6 +1039,10 @@ fn store_admin(command: StoreAdminCommand, source: &Path) -> Result<()> {
         }
         StoreAdminSubcommand::SupportedSchemaVersion => {
             println!("{CURRENT_SCHEMA_VERSION}");
+            Ok(())
+        }
+        StoreAdminSubcommand::SupportedPricingRulesetVersion => {
+            println!("{PRICING_RULESET_VERSION}");
             Ok(())
         }
     }
@@ -3808,7 +3832,11 @@ fn build_reported_import_record(
     device_id: &str,
 ) -> Result<ReportedImportRecord> {
     let legacy_replacement_source_ids = legacy_alias_replacement_source_ids(&input);
-    let record = build_reported_usage_summary(input, device_id)?;
+    let mut record = build_reported_usage_summary(input, device_id)?;
+    // Overlay before upsert so a store already at this ruleset cannot keep an
+    // imported estimated-only figure from an older catalog. A later
+    // ensure_current_pricing pass would no-op.
+    record.summary = apply_current_estimated_pricing(record.summary);
     Ok(ReportedImportRecord {
         record,
         legacy_replacement_source_ids,
@@ -11814,6 +11842,115 @@ mod tests {
     }
 
     #[test]
+    fn import_overlays_estimated_cost_when_store_ruleset_is_already_current() {
+        let store = Store::in_memory().expect("store");
+        store
+            .ensure_current_pricing()
+            .expect("apply current ruleset");
+        let noop = store.ensure_current_pricing().expect("already current");
+        assert!(noop.already_current);
+
+        let period_end = Utc
+            .with_ymd_and_hms(2026, 7, 29, 23, 59, 59)
+            .single()
+            .expect("end");
+        let input = ReportedUsageSummaryInput {
+            schema_version: "reported_usage_summary_input.v1".to_string(),
+            provider: "codex".to_string(),
+            provider_account_id: None,
+            provider_user_id: None,
+            email: None,
+            account_label: None,
+            source_kind: SourceKind::ExternalReport,
+            source_name: "legacy_catalog_export".to_string(),
+            evidence_id: Some("legacy-catalog:2026-07-29".to_string()),
+            evidence_path: None,
+            report_format: "manual_period_summary".to_string(),
+            report_version: Some("manual.v1".to_string()),
+            period_start: Some(
+                Utc.with_ymd_and_hms(2026, 7, 29, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+            ),
+            period_end: Some(period_end),
+            observed_at: None,
+            model: Some(ModelInfo {
+                name: Some("codex-auto-review".to_string()),
+                normalized_name: Some("codex-auto-review".to_string()),
+                provider_model_id: Some("codex-auto-review".to_string()),
+                speed: None,
+                reasoning_level: None,
+                reasoning_level_raw: None,
+            }),
+            usage: UsageCounts {
+                input_tokens: Some(1_000_000),
+                cache_creation_tokens: Some(1_000_000),
+                cache_read_tokens: Some(1_000_000),
+                output_tokens: Some(1_000_000),
+                total_tokens: Some(4_000_000),
+                ..UsageCounts::default()
+            },
+            cost: Some(CostInfo {
+                currency: "USD".to_string(),
+                estimated_api_equivalent_usd: Some(1),
+                provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: Some(10_000),
+                provider_reported_micro_usd: None,
+                pricing_source: Some("official:stale".to_string()),
+                pricing_version: Some("official:stale".to_string()),
+                confidence: Confidence::Low,
+            }),
+            confidence: Some(Confidence::Medium),
+        };
+
+        let incoming = build_reported_import_record(input, "device").expect("incoming");
+        assert_ne!(
+            incoming.record.summary.cost.estimated_api_equivalent_usd,
+            Some(1)
+        );
+        assert_eq!(
+            incoming.record.summary.cost.pricing_version.as_deref(),
+            Some(statsai_store::PRICING_CATALOG_VERSION)
+        );
+        assert!(incoming
+            .record
+            .summary
+            .cost
+            .estimated_api_equivalent_usd
+            .is_some());
+        let expected_usd = incoming.record.summary.cost.estimated_api_equivalent_usd;
+
+        import_reported_summary_records(
+            &store,
+            &[ReportedImportReport {
+                path: PathBuf::from("legacy-catalog.json"),
+                records: vec![incoming],
+                warnings: Vec::new(),
+            }],
+            false,
+            false,
+            false,
+        )
+        .expect("import");
+
+        let stored = store.summaries().expect("summaries");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].cost.estimated_api_equivalent_usd, expected_usd);
+        assert_eq!(
+            stored[0].cost.pricing_version.as_deref(),
+            Some(statsai_store::PRICING_CATALOG_VERSION)
+        );
+        let still_current = store.ensure_current_pricing().expect("still current");
+        assert!(still_current.already_current);
+        assert_eq!(
+            store.summaries().expect("unchanged")[0]
+                .cost
+                .estimated_api_equivalent_usd,
+            expected_usd
+        );
+    }
+
+    #[test]
     fn configured_claude_projects_path_normalizes_to_config_root() {
         let dir = tempfile::tempdir().expect("tempdir");
         let projects = dir.path().join("projects");
@@ -15160,6 +15297,179 @@ mod tests {
         assert!(batch.events.is_empty());
         assert_eq!(batch.summaries.len(), 1);
         assert!(is_daily_rollup_summary(&batch.summaries[0]));
+    }
+
+    #[test]
+    fn incremental_http_sync_includes_repriced_rollups_without_full() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-reprice-sync"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 7, 29, 12, 0, 0)
+            .single()
+            .expect("started_at");
+        let mut event = test_event(
+            "codex",
+            &source,
+            started_at,
+            None,
+            TokenParts {
+                input: 1_000_000,
+                cached_input: 1_000_000,
+                output: 1_000_000,
+                reasoning: 0,
+                total: 4_000_000,
+                cost: None,
+            },
+        );
+        event.model = Some(ModelInfo {
+            name: Some("codex-auto-review".to_string()),
+            normalized_name: Some("codex-auto-review".to_string()),
+            provider_model_id: Some("codex-auto-review".to_string()),
+            speed: None,
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        });
+        store.insert_event(&event).expect("legacy unpriced event");
+        store.rebuild_sync_rollups().expect("rebuild");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        assert!(!command.full);
+        assert!(!command.rebuild_rollups);
+        let target = sync_target(&command).expect("target");
+        let (initial_batch, initial_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("initial batch");
+        assert_eq!(initial_mode, SyncPayloadMode::Rollups);
+        assert_eq!(initial_batch.summaries.len(), 1);
+        assert!(initial_batch.summaries[0]
+            .cost
+            .estimated_api_equivalent_usd
+            .is_none());
+        record_rollup_sync_success(&store, "http", &target, &initial_batch)
+            .expect("record initial sync");
+
+        let (repeat_batch, _) =
+            build_sync_batch(&command, &store, "device", &target).expect("repeat batch");
+        assert!(
+            repeat_batch.summaries.is_empty(),
+            "synced rollups must stay unpublished until pricing changes them"
+        );
+
+        let report = store.ensure_current_pricing().expect("automatic reprice");
+        assert_eq!(report.changed_events, 1);
+        assert_eq!(report.refreshed_rollups, 1);
+
+        let (incremental_batch, incremental_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("incremental batch");
+        assert_eq!(incremental_mode, SyncPayloadMode::Rollups);
+        assert_eq!(incremental_batch.summaries.len(), 1);
+        assert!(is_daily_rollup_summary(&incremental_batch.summaries[0]));
+        assert_eq!(
+            incremental_batch.summaries[0]
+                .cost
+                .estimated_api_equivalent_usd,
+            store
+                .events()
+                .expect("repriced events")
+                .into_iter()
+                .next()
+                .expect("one event")
+                .cost
+                .estimated_api_equivalent_usd
+        );
+        assert!(incremental_batch.summaries[0]
+            .cost
+            .estimated_api_equivalent_usd
+            .is_some());
+    }
+
+    #[test]
+    fn incremental_http_sync_includes_repriced_passthrough_summaries_without_full() {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-http-reprice-passthrough"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 7, 28, 0, 0, 0)
+            .single()
+            .expect("start");
+        let end = Utc
+            .with_ymd_and_hms(2026, 7, 29, 23, 59, 59)
+            .single()
+            .expect("end");
+        let mut summary = test_summary("codex", &source, end, 4_000_000, None);
+        summary.source.source_kind = SourceKind::LocalAdapter;
+        summary.source.source_type = "build-session.json".to_string();
+        summary.metadata.summary_format = "grok_build_session_summary".to_string();
+        summary.period_start = Some(start);
+        summary.period_end = Some(end);
+        summary.model = Some(ModelInfo {
+            name: Some("codex-auto-review".to_string()),
+            normalized_name: Some("codex-auto-review".to_string()),
+            provider_model_id: Some("codex-auto-review".to_string()),
+            speed: None,
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        });
+        summary.usage = UsageCounts {
+            input_tokens: Some(1_000_000),
+            cache_creation_tokens: Some(1_000_000),
+            cache_read_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            total_tokens: Some(4_000_000),
+            ..UsageCounts::default()
+        };
+        store.upsert_summary(&summary).expect("passthrough summary");
+
+        let command = SyncCommand {
+            endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+            ..test_sync_command("http")
+        };
+        assert!(!command.full);
+        let target = sync_target(&command).expect("target");
+        let (initial_batch, _) =
+            build_sync_batch(&command, &store, "device", &target).expect("initial batch");
+        assert_eq!(initial_batch.summaries.len(), 1);
+        assert!(!is_daily_rollup_summary(&initial_batch.summaries[0]));
+        assert!(initial_batch.summaries[0]
+            .cost
+            .estimated_api_equivalent_usd
+            .is_none());
+        record_rollup_sync_success(&store, "http", &target, &initial_batch)
+            .expect("record initial sync");
+
+        let (repeat_batch, _) =
+            build_sync_batch(&command, &store, "device", &target).expect("repeat batch");
+        assert!(repeat_batch.summaries.is_empty());
+
+        let report = store.ensure_current_pricing().expect("automatic reprice");
+        assert_eq!(report.changed_summaries, 1);
+
+        let (incremental_batch, incremental_mode) =
+            build_sync_batch(&command, &store, "device", &target).expect("incremental batch");
+        assert_eq!(incremental_mode, SyncPayloadMode::Rollups);
+        assert_eq!(incremental_batch.summaries.len(), 1);
+        assert!(!is_daily_rollup_summary(&incremental_batch.summaries[0]));
+        assert!(incremental_batch.summaries[0]
+            .cost
+            .estimated_api_equivalent_usd
+            .is_some());
     }
 
     #[test]
@@ -21599,6 +21909,50 @@ mod tests {
         )
         .expect("print supported schema");
         assert!(!store_path.exists());
+    }
+
+    #[test]
+    fn supported_pricing_ruleset_version_is_available_without_opening_a_store() {
+        let cli = Cli::try_parse_from(["statsai", "store", "supported-pricing-ruleset-version"])
+            .expect("parse supported pricing query");
+
+        assert!(matches!(
+            cli.command,
+            Command::Store(StoreAdminCommand {
+                command: StoreAdminSubcommand::SupportedPricingRulesetVersion,
+            })
+        ));
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store_path = directory.path().join("must-not-be-created.sqlite");
+        store_admin(
+            StoreAdminCommand {
+                command: StoreAdminSubcommand::SupportedPricingRulesetVersion,
+            },
+            &store_path,
+        )
+        .expect("print supported pricing ruleset");
+        assert!(!store_path.exists());
+    }
+
+    #[test]
+    fn price_derived_commands_reprice_and_diagnostic_commands_do_not() {
+        let reprice = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parse");
+            command_reprices_persisted_usage(&cli.command)
+        };
+        assert!(reprice(&["statsai", "scan"]));
+        assert!(reprice(&["statsai", "report", "monthly"]));
+        assert!(reprice(&["statsai", "sync"]));
+        assert!(reprice(&["statsai", "export", "--json"]));
+        assert!(reprice(&["statsai", "task", "list"]));
+        assert!(!reprice(&["statsai", "status"]));
+        assert!(!reprice(&["statsai", "quota", "status"]));
+        assert!(!reprice(&["statsai", "conversation", "list"]));
+        assert!(!reprice(&["statsai", "account", "list"]));
+        assert!(!reprice(&["statsai", "source", "list"]));
+        let doctor = Cli::try_parse_from(["statsai", "doctor"]).expect("parse doctor");
+        assert!(!command_reprices_persisted_usage(&doctor.command));
     }
 
     #[test]

@@ -88,7 +88,7 @@ pub struct SnapshotSourceStatus {
 }
 
 pub fn run(command: SnapshotCommand, store_path: &Path, device_id: &str) -> Result<()> {
-    let store = Store::open(store_path)?;
+    let store = crate::open_operational_store(store_path)?;
     let snapshot = collect_for_device(&store, device_id)?;
 
     if command.json {

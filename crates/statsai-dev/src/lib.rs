@@ -617,7 +617,7 @@ mod tests {
     fn installed_build(paths: &Paths, sha: &str) -> InstalledBuild {
         InstalledBuild {
             manifest: BuildManifest {
-                schema: 1,
+                schema: 2,
                 repository: github::REPOSITORY.to_string(),
                 sha: sha.to_string(),
                 target: TARGET.to_string(),
@@ -625,6 +625,7 @@ mod tests {
                 workflow_run_id: 104,
                 workflow_attempt: 1,
                 store_schema_version: 17,
+                pricing_ruleset_version: 1,
             },
             binary_sha256: "b".repeat(64),
             binary_path: paths.builds_dir.join(sha).join("statsai"),

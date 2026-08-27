@@ -2,11 +2,25 @@
 //!
 //! Provides static model pricing lookup and cost estimation
 //! decoupled from any specific adapter.
+//!
+//! [`PRICING_RULESET_VERSION`] is the monotonic numeric identity of the compiled
+//! pricing rules. Increment it on every semantic pricing-rule change: new
+//! models, rate changes, date-boundary mappings, multiplier logic, or anything
+//! else that can change an estimated cost. Do not order
+//! [`PRICING_CATALOG_VERSION`] strings lexicographically.
 
 use chrono::{DateTime, Datelike, Utc};
 use statsai_core::{micro_usd_to_cents_rounded, Confidence, CostInfo, ModelInfo, UsageCounts};
 
-const PRICING_CATALOG_VERSION: &str = "official:2026-08-19";
+/// Monotonic numeric identity of the compiled pricing ruleset.
+///
+/// Increment this constant on every semantic pricing-rule change so persisted
+/// stores can reprice automatically. The descriptive catalog string is not an
+/// ordering key.
+pub const PRICING_RULESET_VERSION: u64 = 1;
+
+/// Descriptive identifier for the compiled price list. Not an ordering key.
+pub const PRICING_CATALOG_VERSION: &str = "official:2026-08-19";
 const MICRO_USD_PER_USD: i128 = 1_000_000;
 const TOKENS_PER_MILLION: i128 = 1_000_000;
 const MULTIPLIER_SCALE: i128 = 10_000;
@@ -619,6 +633,40 @@ pub fn unknown_cost() -> CostInfo {
         pricing_source: Some("unknown".to_string()),
         pricing_version: None,
         confidence: Confidence::Low,
+    }
+}
+
+/// Overlays a freshly estimated cost onto a persisted [`CostInfo`].
+///
+/// Provider-reported amounts are never replaced. When a provider-reported
+/// value is present, its provenance and confidence are preserved and only the
+/// estimated fields and catalog version are updated.
+#[must_use]
+pub fn overlay_estimated_cost(existing: &CostInfo, estimated: CostInfo) -> CostInfo {
+    let has_provider_reported =
+        existing.provider_reported_usd.is_some() || existing.provider_reported_micro_usd.is_some();
+    if has_provider_reported {
+        CostInfo {
+            currency: existing.currency.clone(),
+            estimated_api_equivalent_usd: estimated.estimated_api_equivalent_usd,
+            provider_reported_usd: existing.provider_reported_usd,
+            estimated_api_equivalent_micro_usd: estimated.estimated_api_equivalent_micro_usd,
+            provider_reported_micro_usd: existing.provider_reported_micro_usd,
+            pricing_source: existing.pricing_source.clone(),
+            pricing_version: estimated.pricing_version,
+            confidence: existing.confidence.clone(),
+        }
+    } else {
+        CostInfo {
+            currency: estimated.currency,
+            estimated_api_equivalent_usd: estimated.estimated_api_equivalent_usd,
+            provider_reported_usd: existing.provider_reported_usd,
+            estimated_api_equivalent_micro_usd: estimated.estimated_api_equivalent_micro_usd,
+            provider_reported_micro_usd: existing.provider_reported_micro_usd,
+            pricing_source: estimated.pricing_source,
+            pricing_version: estimated.pricing_version,
+            confidence: estimated.confidence,
+        }
     }
 }
 
@@ -1640,6 +1688,76 @@ mod tests {
         assert_eq!(luna_cut.estimated_api_equivalent_usd, Some(167));
         assert_eq!(terra.estimated_api_equivalent_usd, Some(2_088));
         assert_eq!(terra_cut.estimated_api_equivalent_usd, Some(1_670));
+    }
+
+    #[test]
+    fn overlay_preserves_provider_reported_provenance() {
+        let existing = CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: Some(10),
+            provider_reported_usd: Some(42),
+            estimated_api_equivalent_micro_usd: Some(100_000),
+            provider_reported_micro_usd: Some(420_000),
+            pricing_source: Some("claude_stats_cache:costUSD".to_string()),
+            pricing_version: Some("legacy".to_string()),
+            confidence: Confidence::High,
+        };
+        let estimated = estimate_cost(
+            "codex",
+            Some(&test_model("gpt-5")),
+            &UsageCounts {
+                input_tokens: Some(1_000_000),
+                output_tokens: Some(500_000),
+                ..UsageCounts::default()
+            },
+        );
+
+        let overlaid = overlay_estimated_cost(&existing, estimated.clone());
+
+        assert_eq!(overlaid.provider_reported_usd, Some(42));
+        assert_eq!(overlaid.provider_reported_micro_usd, Some(420_000));
+        assert_eq!(
+            overlaid.estimated_api_equivalent_usd,
+            estimated.estimated_api_equivalent_usd
+        );
+        assert_eq!(
+            overlaid.estimated_api_equivalent_micro_usd,
+            estimated.estimated_api_equivalent_micro_usd
+        );
+        assert_eq!(
+            overlaid.pricing_source.as_deref(),
+            Some("claude_stats_cache:costUSD")
+        );
+        assert_eq!(
+            overlaid.pricing_version.as_deref(),
+            Some(PRICING_CATALOG_VERSION)
+        );
+        assert_eq!(overlaid.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn overlay_replaces_estimated_only_cost() {
+        let existing = unknown_cost();
+        let estimated = estimate_cost(
+            "codex",
+            Some(&test_model("gpt-5")),
+            &UsageCounts {
+                input_tokens: Some(1_000_000),
+                ..UsageCounts::default()
+            },
+        );
+
+        let overlaid = overlay_estimated_cost(&existing, estimated.clone());
+
+        assert_eq!(overlaid, estimated);
+        assert!(overlaid.provider_reported_usd.is_none());
+    }
+
+    #[test]
+    fn ruleset_version_is_numeric_and_catalog_is_descriptive() {
+        const { assert!(PRICING_RULESET_VERSION >= 1) };
+        assert!(PRICING_CATALOG_VERSION.contains(':'));
+        assert_ne!(PRICING_RULESET_VERSION.to_string(), PRICING_CATALOG_VERSION);
     }
 
     #[test]

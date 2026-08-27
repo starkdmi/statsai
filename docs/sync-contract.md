@@ -228,6 +228,12 @@ Cost payloads may include `provider_reported_micro_usd`,
 `estimated_cost_micro_usd`. Receivers prefer these integer micro-USD values and
 fall back to legacy rounded-cent fields when they are absent.
 
+When a local pricing ruleset advances, StatsAI reprices persisted normalized
+events and refreshes the affected `sync_rollups` in place. Changed rollups are
+marked dirty so a later incremental HTTP sync publishes the corrected values
+without `--rebuild-rollups` or `--full`. Provider-reported cost fields are
+never replaced by estimates.
+
 User-defined aliases are still retained in `ProviderAccount.account_label` for
 display, but they are no longer the primary account key.
 

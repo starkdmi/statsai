@@ -4,6 +4,7 @@ mod account_plan;
 mod archive;
 mod code_changes;
 mod migrations;
+mod pricing;
 mod privacy;
 mod quota;
 mod snapshot;
@@ -36,7 +37,15 @@ use std::path::Path;
 
 pub use account_plan::AccountEvidenceReferenceCounts;
 pub use migrations::CURRENT_SCHEMA_VERSION;
-pub use snapshot::{clone_database_to, database_schema_version, DatabaseClone};
+pub use pricing::{
+    apply_current_estimated_pricing, RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY,
+    APPLIED_PRICING_RULESET_VERSION_KEY,
+};
+pub use snapshot::{
+    clone_database_to, database_applied_pricing_ruleset_version, database_schema_version,
+    DatabaseClone,
+};
+pub use statsai_pricing::{PRICING_CATALOG_VERSION, PRICING_RULESET_VERSION};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -337,7 +346,7 @@ fn sanitize_summary_for_default_http_sync(summary: UsageSummary) -> UsageSummary
     sanitize_summary_for_http_sync(summary, false)
 }
 
-fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
+pub(crate) fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
     summary.metadata.summary_format == "daily_rollup.v1"
 }
 
@@ -364,7 +373,7 @@ fn summary_sync_day(summary: &UsageSummary) -> NaiveDate {
         .unwrap_or_else(|| summary.observed_at.date_naive())
 }
 
-fn summary_period_bounds(summary: &UsageSummary) -> (DateTime<Utc>, DateTime<Utc>) {
+pub(crate) fn summary_period_bounds(summary: &UsageSummary) -> (DateTime<Utc>, DateTime<Utc>) {
     let start = summary
         .period_start
         .or(summary.period_end)
@@ -1703,10 +1712,30 @@ impl Store {
         })
     }
 
-    fn update_event_payload(&self, event: &UsageEvent) -> Result<BTreeSet<SyncRollupBucketKey>> {
+    pub(crate) fn update_event_payload(
+        &self,
+        event: &UsageEvent,
+    ) -> Result<BTreeSet<SyncRollupBucketKey>> {
         let existing_bucket = self
             .event_by_id(&event.event_id.0)?
             .map(|existing| sync_rollup_bucket_key(&existing));
+        let bucket = self.update_event_cost_payload(event)?;
+        let mut dirty_keys = BTreeSet::new();
+        if let Some(existing_bucket) = existing_bucket {
+            dirty_keys.insert(existing_bucket);
+        }
+        dirty_keys.insert(bucket);
+        Ok(dirty_keys)
+    }
+
+    /// Updates a persisted event's payload without re-reading it.
+    ///
+    /// Repricing only changes estimated cost, so the sync-rollup bucket is the
+    /// in-memory event's bucket.
+    pub(crate) fn update_event_cost_payload(
+        &self,
+        event: &UsageEvent,
+    ) -> Result<SyncRollupBucketKey> {
         let payload = serde_json::to_string(event)?;
         let fingerprint = event_fingerprint(event);
         self.conn.execute(
@@ -1732,12 +1761,7 @@ impl Store {
                 &payload
             ],
         )?;
-        let mut dirty_keys = BTreeSet::new();
-        if let Some(existing_bucket) = existing_bucket {
-            dirty_keys.insert(existing_bucket);
-        }
-        dirty_keys.insert(sync_rollup_bucket_key(event));
-        Ok(dirty_keys)
+        Ok(sync_rollup_bucket_key(event))
     }
 
     fn insert_event_in_batch(
@@ -3908,7 +3932,7 @@ impl Store {
         Ok(deleted)
     }
 
-    fn event_by_id(&self, event_id: &str) -> Result<Option<UsageEvent>> {
+    pub(crate) fn event_by_id(&self, event_id: &str) -> Result<Option<UsageEvent>> {
         self.conn
             .query_row(
                 "SELECT payload FROM usage_events WHERE event_id = ?1",
@@ -3931,20 +3955,30 @@ impl Store {
     }
 
     fn refresh_sync_rollups_for_keys(&self, keys: &BTreeSet<SyncRollupBucketKey>) -> Result<()> {
-        for key in keys {
-            self.refresh_sync_rollup_for_key(key)?;
-        }
-        Ok(())
+        self.refresh_sync_rollups_for_keys_counted(keys).map(|_| ())
     }
 
-    fn refresh_sync_rollup_for_key(&self, key: &SyncRollupBucketKey) -> Result<()> {
+    pub(crate) fn refresh_sync_rollups_for_keys_counted(
+        &self,
+        keys: &BTreeSet<SyncRollupBucketKey>,
+    ) -> Result<u64> {
+        let mut refreshed = 0u64;
+        for key in keys {
+            if self.refresh_sync_rollup_for_key(key)? {
+                refreshed += 1;
+            }
+        }
+        Ok(refreshed)
+    }
+
+    fn refresh_sync_rollup_for_key(&self, key: &SyncRollupBucketKey) -> Result<bool> {
         let events = self.sync_rollup_events(key)?;
         if events.is_empty() {
-            self.conn.execute(
+            let deleted = self.conn.execute(
                 "DELETE FROM sync_rollups WHERE summary_id = ?1",
                 params![sync_rollup_summary_id(key).0],
             )?;
-            return Ok(());
+            return Ok(deleted > 0);
         }
 
         let summary = build_sync_rollup_summary(&events);
@@ -3963,7 +3997,7 @@ impl Store {
             .as_ref()
             .is_some_and(|(existing_hash, _)| existing_hash == &payload_hash)
         {
-            return Ok(());
+            return Ok(false);
         }
 
         let dirty = existing.as_ref().map_or(1, |(_, dirty)| (*dirty).max(1));
@@ -3998,7 +4032,7 @@ impl Store {
                 &payload,
             ],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     fn sync_rollup_events(&self, key: &SyncRollupBucketKey) -> Result<Vec<UsageEvent>> {
@@ -4046,7 +4080,9 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )?;
             for row in rows {
-                events.push(serde_json::from_str(&row?)?);
+                if let Ok(event) = serde_json::from_str(&row?) {
+                    events.push(event);
+                }
             }
         } else {
             let rows = stmt.query_map(
@@ -4054,7 +4090,9 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )?;
             for row in rows {
-                events.push(serde_json::from_str(&row?)?);
+                if let Ok(event) = serde_json::from_str(&row?) {
+                    events.push(event);
+                }
             }
         }
         events.retain(|event| sync_rollup_project_key(event.project.as_ref()) == key.project_key);
@@ -5248,7 +5286,7 @@ fn assignment_for_timestamp(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct SyncRollupBucketKey {
+pub(crate) struct SyncRollupBucketKey {
     provider: String,
     source_id: String,
     provider_account_id: Option<String>,
@@ -5263,7 +5301,7 @@ struct EventInsertOutcome {
     dirty_keys: BTreeSet<SyncRollupBucketKey>,
 }
 
-fn sync_rollup_bucket_key(event: &UsageEvent) -> SyncRollupBucketKey {
+pub(crate) fn sync_rollup_bucket_key(event: &UsageEvent) -> SyncRollupBucketKey {
     SyncRollupBucketKey {
         provider: event.provider.clone(),
         source_id: event.source_id.0.clone(),
