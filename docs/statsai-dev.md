@@ -190,7 +190,7 @@ through to the selected build unchanged.
 
 `env prod` selects the backend URLs only and never changes which database is
 used; `--prod-data` selects the database for exactly one command and never
-changes the backend. This choice is never persisted.
+changes the backend. `--prod-data` is never persisted.
 
 The escape hatch is allowed only when the production database schema **and**
 applied pricing ruleset exactly match the versions supported by the selected

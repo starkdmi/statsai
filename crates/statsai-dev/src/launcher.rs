@@ -310,7 +310,12 @@ mod tests {
         let error = validate_forward_arguments(&arguments(&["report", "monthly", "--prod-data"]))
             .expect_err("trailing --prod-data must not reach the inner binary");
         assert!(error.to_string().contains("must precede"));
-        assert!(validate_forward_arguments(&arguments(&["scan", "--prod"])).is_err());
+        let equals = validate_forward_arguments(&arguments(&["scan", "--prod-data=true"]))
+            .expect_err("trailing --prod-data= must not reach the inner binary");
+        assert!(equals.to_string().contains("must precede"));
+        let near_miss = validate_forward_arguments(&arguments(&["scan", "--prod"]))
+            .expect_err("trailing --prod must not reach the inner binary");
+        assert!(near_miss.to_string().contains("must precede"));
         assert!(validate_forward_arguments(&arguments(&["report", "monthly"])).is_ok());
     }
 
