@@ -149,6 +149,17 @@ fn validate_forward_arguments(arguments: &[OsString]) -> Result<()> {
             "`--store` cannot be forwarded through statsai-dev; use the isolated dev database or the one-shot `--prod-data` flag"
         );
     }
+    if arguments.iter().any(|argument| {
+        argument == OsStr::new("--prod-data")
+            || argument == OsStr::new("--prod")
+            || argument
+                .to_str()
+                .is_some_and(|value| value.starts_with("--prod-data="))
+    }) {
+        bail!(
+            "`--prod-data` must precede the forwarded command: `statsai-dev --prod-data <command>`"
+        );
+    }
 
     let semantic_arguments = without_global_device_id(arguments)?;
     match semantic_arguments.first().and_then(|argument| argument.to_str()) {
@@ -291,6 +302,15 @@ mod tests {
         ]))
         .is_err());
         assert!(validate_forward_arguments(&arguments(&["scan", "--store", "/tmp/db"])).is_err());
+        assert!(validate_forward_arguments(&arguments(&["report", "monthly"])).is_ok());
+    }
+
+    #[test]
+    fn misplaced_prod_data_flag_is_rejected() {
+        let error = validate_forward_arguments(&arguments(&["report", "monthly", "--prod-data"]))
+            .expect_err("trailing --prod-data must not reach the inner binary");
+        assert!(error.to_string().contains("must precede"));
+        assert!(validate_forward_arguments(&arguments(&["scan", "--prod"])).is_err());
         assert!(validate_forward_arguments(&arguments(&["report", "monthly"])).is_ok());
     }
 
