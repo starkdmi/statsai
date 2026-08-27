@@ -3,6 +3,7 @@
 use super::{is_daily_rollup_summary, summary_period_bounds, Store, SyncRollupBucketKey};
 use anyhow::Result;
 use rusqlite::params;
+use serde::de::DeserializeOwned;
 use statsai_core::{CostAccumulator, CostInfo, ModelInfo, UsageEvent, UsageSummary};
 use statsai_pricing::{
     estimate_cost_at, overlay_estimated_cost, pricing_changes_between, unknown_cost,
@@ -23,10 +24,13 @@ const TASK_SPAN_PAGE_SIZE: usize = 128;
 pub struct RepricingReport {
     pub examined_events: u64,
     pub changed_events: u64,
+    pub skipped_unreadable_events: u64,
     pub examined_summaries: u64,
     pub changed_summaries: u64,
+    pub skipped_unreadable_summaries: u64,
     pub refreshed_rollups: u64,
     pub changed_task_spans: u64,
+    pub skipped_unreadable_spans: u64,
     pub rebuilt_work_items: u64,
     pub already_current: bool,
 }
@@ -52,12 +56,24 @@ impl fmt::Display for RepricingReport {
         }
         write!(
             formatter,
-            "repriced store to ruleset {PRICING_RULESET_VERSION} ({PRICING_CATALOG_VERSION}): examined_events={} changed_events={} changed_summaries={} refreshed_rollups={}",
+            "repriced store to ruleset {PRICING_RULESET_VERSION} ({PRICING_CATALOG_VERSION}): examined_events={} changed_events={} skipped_unreadable_events={} changed_summaries={} refreshed_rollups={}",
             self.examined_events,
             self.changed_events,
+            self.skipped_unreadable_events,
             self.changed_summaries,
             self.refreshed_rollups
-        )
+        )?;
+        let skipped_other = self
+            .skipped_unreadable_summaries
+            .saturating_add(self.skipped_unreadable_spans);
+        if skipped_other > 0 {
+            write!(
+                formatter,
+                " skipped_unreadable_summaries={} skipped_unreadable_spans={}",
+                self.skipped_unreadable_summaries, self.skipped_unreadable_spans
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -135,6 +151,34 @@ fn forward_pricing_version_error(applied: u64, supported: u64) -> anyhow::Error 
     )
 }
 
+struct RepricePage<T> {
+    items: Vec<T>,
+    last_id: Option<String>,
+    fetched: usize,
+    skipped: u64,
+}
+
+fn decode_id_payload_page<T: DeserializeOwned>(
+    rows: impl Iterator<Item = rusqlite::Result<(String, String)>>,
+) -> Result<RepricePage<T>> {
+    let mut page = RepricePage {
+        items: Vec::new(),
+        last_id: None,
+        fetched: 0,
+        skipped: 0,
+    };
+    for row in rows {
+        let (id, payload) = row?;
+        page.fetched += 1;
+        page.last_id = Some(id);
+        match serde_json::from_str(&payload) {
+            Ok(item) => page.items.push(item),
+            Err(_) => page.skipped += 1,
+        }
+    }
+    Ok(page)
+}
+
 impl Store {
     fn reprice_events_in_tx(
         &self,
@@ -144,11 +188,12 @@ impl Store {
         let mut after: Option<String> = None;
         loop {
             let page = self.event_page_after(after.as_deref(), EVENT_PAGE_SIZE)?;
-            if page.is_empty() {
+            if page.fetched == 0 {
                 break;
             }
-            after = page.last().map(|event| event.event_id.0.clone());
-            for event in page {
+            after = page.last_id;
+            report.skipped_unreadable_events += page.skipped;
+            for event in page.items {
                 report.examined_events += 1;
                 maybe_fail_after_event_writes(report.changed_events)?;
                 if let Some(updated) = reprice_event(&event) {
@@ -156,42 +201,47 @@ impl Store {
                     report.changed_events += 1;
                 }
             }
+            if page.fetched < EVENT_PAGE_SIZE {
+                break;
+            }
         }
         Ok(())
     }
 
-    fn event_page_after(&self, after: Option<&str>, limit: usize) -> Result<Vec<UsageEvent>> {
-        let mut events = Vec::new();
+    fn event_page_after(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<RepricePage<UsageEvent>> {
         if let Some(after) = after {
             let mut statement = self.conn.prepare(
-                "SELECT payload FROM usage_events WHERE event_id > ?1 ORDER BY event_id LIMIT ?2",
+                "SELECT event_id, payload FROM usage_events WHERE event_id > ?1 ORDER BY event_id LIMIT ?2",
             )?;
-            let rows =
-                statement.query_map(params![after, limit as i64], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                events.push(serde_json::from_str(&row?)?);
-            }
+            let rows = statement.query_map(params![after, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            decode_id_payload_page(rows)
         } else {
             let mut statement = self
                 .conn
-                .prepare("SELECT payload FROM usage_events ORDER BY event_id LIMIT ?1")?;
-            let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                events.push(serde_json::from_str(&row?)?);
-            }
+                .prepare("SELECT event_id, payload FROM usage_events ORDER BY event_id LIMIT ?1")?;
+            let rows = statement.query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            decode_id_payload_page(rows)
         }
-        Ok(events)
     }
 
     fn reprice_summaries_in_tx(&self, report: &mut RepricingReport) -> Result<()> {
         let mut after: Option<String> = None;
         loop {
             let page = self.summary_page_after(after.as_deref(), SUMMARY_PAGE_SIZE)?;
-            if page.is_empty() {
+            if page.fetched == 0 {
                 break;
             }
-            after = page.last().map(|summary| summary.summary_id.0.clone());
-            for summary in page {
+            after = page.last_id;
+            report.skipped_unreadable_summaries += page.skipped;
+            for summary in page.items {
                 report.examined_summaries += 1;
                 if is_daily_rollup_summary(&summary) {
                     continue;
@@ -201,31 +251,35 @@ impl Store {
                     report.changed_summaries += 1;
                 }
             }
+            if page.fetched < SUMMARY_PAGE_SIZE {
+                break;
+            }
         }
         Ok(())
     }
 
-    fn summary_page_after(&self, after: Option<&str>, limit: usize) -> Result<Vec<UsageSummary>> {
-        let mut summaries = Vec::new();
+    fn summary_page_after(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<RepricePage<UsageSummary>> {
         if let Some(after) = after {
             let mut statement = self.conn.prepare(
-                "SELECT payload FROM usage_summaries WHERE summary_id > ?1 ORDER BY summary_id LIMIT ?2",
+                "SELECT summary_id, payload FROM usage_summaries WHERE summary_id > ?1 ORDER BY summary_id LIMIT ?2",
             )?;
-            let rows =
-                statement.query_map(params![after, limit as i64], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                summaries.push(serde_json::from_str(&row?)?);
-            }
+            let rows = statement.query_map(params![after, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            decode_id_payload_page(rows)
         } else {
-            let mut statement = self
-                .conn
-                .prepare("SELECT payload FROM usage_summaries ORDER BY summary_id LIMIT ?1")?;
-            let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                summaries.push(serde_json::from_str(&row?)?);
-            }
+            let mut statement = self.conn.prepare(
+                "SELECT summary_id, payload FROM usage_summaries ORDER BY summary_id LIMIT ?1",
+            )?;
+            let rows = statement.query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            decode_id_payload_page(rows)
         }
-        Ok(summaries)
     }
 
     fn reprice_task_spans_in_tx(&self, report: &mut RepricingReport) -> Result<()> {
@@ -233,11 +287,13 @@ impl Store {
         let mut changed_buckets = BTreeSet::new();
         loop {
             let page = self.linked_task_span_page_after(after.as_deref(), TASK_SPAN_PAGE_SIZE)?;
-            if page.is_empty() {
+            if page.fetched == 0 {
                 break;
             }
-            after = page.last().map(|span| span.span_id.0.clone());
+            after = page.last_id;
+            report.skipped_unreadable_spans += page.skipped;
             let event_ids = page
+                .items
                 .iter()
                 .flat_map(|span| {
                     span.linked_event_ids
@@ -247,7 +303,7 @@ impl Store {
                 .collect::<BTreeSet<_>>();
             let events = self.events_by_ids(&event_ids)?;
             let mut updated_spans = Vec::new();
-            for mut span in page {
+            for mut span in page.items {
                 let Some((cents, micro)) =
                     estimated_cost_for_loaded_events(&span.linked_event_ids, &events)
                 else {
@@ -264,6 +320,9 @@ impl Store {
             if !updated_spans.is_empty() {
                 self.upsert_task_spans_in_tx(&updated_spans)?;
             }
+            if page.fetched < TASK_SPAN_PAGE_SIZE {
+                break;
+            }
         }
         if !changed_buckets.is_empty() {
             report.rebuilt_work_items =
@@ -276,37 +335,34 @@ impl Store {
         &self,
         after: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<statsai_core::TaskSpan>> {
+    ) -> Result<RepricePage<statsai_core::TaskSpan>> {
         let sql = if after.is_some() {
-            "SELECT payload FROM task_spans
+            "SELECT span_id, payload FROM task_spans
              WHERE span_id > ?1
                AND EXISTS (
                  SELECT 1 FROM task_span_event_links WHERE span_id = task_spans.span_id
                )
              ORDER BY span_id LIMIT ?2"
         } else {
-            "SELECT payload FROM task_spans
+            "SELECT span_id, payload FROM task_spans
              WHERE EXISTS (
                SELECT 1 FROM task_span_event_links WHERE span_id = task_spans.span_id
              )
              ORDER BY span_id LIMIT ?1"
         };
-        let mut spans = Vec::new();
         if let Some(after) = after {
             let mut statement = self.conn.prepare(sql)?;
-            let rows =
-                statement.query_map(params![after, limit as i64], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                spans.push(serde_json::from_str(&row?)?);
-            }
+            let rows = statement.query_map(params![after, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            decode_id_payload_page(rows)
         } else {
             let mut statement = self.conn.prepare(sql)?;
-            let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                spans.push(serde_json::from_str(&row?)?);
-            }
+            let rows = statement.query_map(params![limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            decode_id_payload_page(rows)
         }
-        Ok(spans)
     }
 
     fn events_by_ids(&self, event_ids: &BTreeSet<String>) -> Result<HashMap<String, UsageEvent>> {
@@ -330,7 +386,9 @@ impl Store {
             })?;
             for row in rows {
                 let (event_id, payload) = row?;
-                events.insert(event_id, serde_json::from_str(&payload)?);
+                if let Ok(event) = serde_json::from_str(&payload) {
+                    events.insert(event_id, event);
+                }
             }
         }
         Ok(events)
@@ -345,14 +403,17 @@ fn estimated_cost_for_loaded_events(
         return None;
     }
     let mut estimated = CostAccumulator::default();
-    let mut found = false;
+    let mut found = 0usize;
     for event_id in event_ids {
         if let Some(event) = events.get(&event_id.0) {
             estimated.add_estimated(&event.cost);
-            found = true;
+            found += 1;
         }
     }
-    found.then_some((estimated.cents_rounded(), estimated.micro_usd()))
+    if found == 0 {
+        return Some((None, None));
+    }
+    Some((estimated.cents_rounded(), estimated.micro_usd()))
 }
 
 fn reprice_event(event: &UsageEvent) -> Option<UsageEvent> {
@@ -1330,6 +1391,113 @@ mod tests {
         assert_eq!(report.changed_task_spans, 0);
         assert_eq!(stored[0].estimated_cost_usd, Some(0));
         assert_eq!(stored[0].estimated_cost_micro_usd, Some(0));
+    }
+
+    #[test]
+    fn unreadable_usage_payloads_are_skipped_without_blocking_repricing() {
+        let (store, source) = store_with_source("/tmp/codex-corrupt-usage-payload");
+        let started_at = parse_utc("2026-07-29T12:00:00Z");
+        let event = test_event(
+            &source,
+            started_at,
+            "legacy-review",
+            "codex-auto-review",
+            million_token_usage(),
+            missing_cost(),
+        );
+        store.insert_event(&event).expect("insert");
+        store
+            .conn
+            .execute(
+                "INSERT INTO usage_events (
+                   event_id, provider, source_id, started_at, total_tokens, payload
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "aaa-corrupt-event",
+                    "codex",
+                    source.source_id.0.as_str(),
+                    started_at.to_rfc3339(),
+                    0,
+                    "{ this is not json",
+                ],
+            )
+            .expect("corrupt event");
+        store
+            .conn
+            .execute(
+                "INSERT INTO usage_summaries (
+                   summary_id, provider, source_id, observed_at, total_tokens, payload
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "aaa-corrupt-summary",
+                    "codex",
+                    source.source_id.0.as_str(),
+                    started_at.to_rfc3339(),
+                    0,
+                    "{ also not json",
+                ],
+            )
+            .expect("corrupt summary");
+
+        let report = store.ensure_current_pricing().expect("reprice");
+        assert_eq!(report.skipped_unreadable_events, 1);
+        assert_eq!(report.skipped_unreadable_summaries, 1);
+        assert_eq!(report.changed_events, 1);
+        assert_eq!(
+            stored_event(&store, &event.event_id.0).cost,
+            expected_review_cost(started_at)
+        );
+        assert_eq!(
+            store.applied_pricing_ruleset_version().expect("applied"),
+            Some(PRICING_RULESET_VERSION)
+        );
+        let corrupt = store
+            .conn
+            .query_row(
+                "SELECT payload FROM usage_events WHERE event_id = ?1",
+                ["aaa-corrupt-event"],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("corrupt row remains");
+        assert_eq!(corrupt, "{ this is not json");
+    }
+
+    #[test]
+    fn dangling_task_span_links_clear_stale_cost() {
+        let (store, source) = store_with_source("/tmp/codex-dangling-span-link");
+        let started_at = parse_utc("2026-07-29T12:00:00Z");
+        let event = test_event(
+            &source,
+            started_at,
+            "missing-later",
+            "codex-auto-review",
+            million_token_usage(),
+            expected_review_cost(started_at),
+        );
+        store.insert_event(&event).expect("insert");
+        store
+            .upsert_task_spans(&[test_span(
+                &source,
+                started_at,
+                "dangling",
+                vec![event.event_id.clone()],
+                Some(99),
+                Some(990_000),
+            )])
+            .expect("span");
+        store
+            .conn
+            .execute(
+                "DELETE FROM usage_events WHERE event_id = ?1",
+                [&event.event_id.0],
+            )
+            .expect("drop linked event");
+
+        let report = store.ensure_current_pricing().expect("reprice");
+        let stored = store.task_spans().expect("spans");
+        assert_eq!(report.changed_task_spans, 1);
+        assert!(stored[0].estimated_cost_usd.is_none());
+        assert!(stored[0].estimated_cost_micro_usd.is_none());
     }
 
     #[test]
