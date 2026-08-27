@@ -43,7 +43,7 @@ use statsai_store::{
     find_existing_provider_account, reconcile_verified_source_state, upsert_provider_account,
     verified_source_observation_hash, QuotaQuery, ScanFileStateEntry, Store, SyncPreferences,
     SyncState, TaskRebuildReport, UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION,
-    PRICING_CATALOG_VERSION, PRICING_RULESET_VERSION,
+    PRICING_RULESET_VERSION,
 };
 #[cfg(test)]
 use statsai_store::{apply_verified_source_state, verified_source_state_hash};
@@ -11910,7 +11910,7 @@ mod tests {
         );
         assert_eq!(
             incoming.record.summary.cost.pricing_version.as_deref(),
-            Some(PRICING_CATALOG_VERSION)
+            Some(statsai_store::PRICING_CATALOG_VERSION)
         );
         assert!(incoming
             .record
@@ -11938,7 +11938,7 @@ mod tests {
         assert_eq!(stored[0].cost.estimated_api_equivalent_usd, expected_usd);
         assert_eq!(
             stored[0].cost.pricing_version.as_deref(),
-            Some(PRICING_CATALOG_VERSION)
+            Some(statsai_store::PRICING_CATALOG_VERSION)
         );
         let still_current = store.ensure_current_pricing().expect("still current");
         assert!(still_current.already_current);
