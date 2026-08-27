@@ -184,7 +184,13 @@ data escape hatch is available and prints a warning:
 statsai-dev --prod-data report monthly
 ```
 
-This choice is never persisted.
+The flag must come before the forwarded command. `statsai-dev report monthly
+--prod-data` is rejected, because everything after the command name is passed
+through to the selected build unchanged.
+
+`env prod` selects the backend URLs only and never changes which database is
+used; `--prod-data` selects the database for exactly one command and never
+changes the backend. `--prod-data` is never persisted.
 
 The escape hatch is allowed only when the production database schema **and**
 applied pricing ruleset exactly match the versions supported by the selected
