@@ -7,3 +7,4 @@ pub(super) mod schema;
 pub(super) mod service;
 pub(super) mod status;
 pub(super) mod store_admin;
+pub(super) mod task;
