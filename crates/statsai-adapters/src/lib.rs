@@ -8,23 +8,21 @@ use serde::Deserialize;
 use serde_json::Value;
 use statsai_core::{
     account_identity_observation_id, account_plan_observation_id, branch_family, canonical_display,
-    conversation_account_binding_id, display_path, expand_home_path, extract_issue_keys, hash_text,
-    home_dir, normalize_email, normalize_git_remote, normalize_plan_name, normalize_task_title,
-    path_hash, project_bucket_key, provider_account_id_from_identity, semantic_event_id,
-    summarize_task_text, summary_id, task_preview_from_prompt, task_span_id,
-    task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
+    conversation_account_binding_id, expand_home_path, extract_issue_keys, hash_text, home_dir,
+    normalize_email, normalize_plan_name, normalize_task_title, project_bucket_key,
+    provider_account_id_from_identity, summarize_task_text, summary_id, task_preview_from_prompt,
+    task_span_id, task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
     task_title_signal_score, title_topic_tokens, AccountEvidenceCheckpointV1, AccountEvidenceKind,
     AccountIdentityObservationV1, AccountPlanObservationV1, Confidence,
     ConversationAccountBindingV1, CostAccumulator, CostInfo, EventId, EventSource, IdentitySource,
-    LatencySource, LocationOrigin, MetricStats, ModelInfo, ParseEvidence, PrivacyInfo, PrivacyMode,
-    ProjectInfo, ProviderAccountId, QuotaCreditsV1, QuotaObservationRecordV1, QuotaObservationV1,
-    QuotaStatusV1, QuotaUsageLinkKind, QuotaWindowObservationV1, ReasoningLevel, RuntimeInfo,
-    SessionInfo, SourceKind, SourceLocation, SummaryMetadata, SummaryMetrics, TaskSpan,
-    UsageCounts, UsageEvent, UsageSummary, ACCOUNT_EVIDENCE_CHECKPOINT_SCHEMA_VERSION,
-    ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION, ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION,
-    CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION, QUOTA_OBSERVATION_SCHEMA_VERSION,
-    QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION,
-    USAGE_SUMMARY_SCHEMA_VERSION,
+    LatencySource, LocationOrigin, ModelInfo, ParseEvidence, ProjectInfo, ProviderAccountId,
+    QuotaCreditsV1, QuotaObservationRecordV1, QuotaObservationV1, QuotaStatusV1,
+    QuotaUsageLinkKind, QuotaWindowObservationV1, RuntimeInfo, SourceKind, SourceLocation,
+    SummaryMetadata, SummaryMetrics, TaskSpan, UsageCounts, UsageEvent, UsageSummary,
+    ACCOUNT_EVIDENCE_CHECKPOINT_SCHEMA_VERSION, ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION,
+    ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION, CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION,
+    QUOTA_OBSERVATION_SCHEMA_VERSION, QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION,
+    TASK_SPAN_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{
     estimate_cost_at, normalize_model_name, pricing_changes_between, unknown_cost,
@@ -40,18 +38,38 @@ use walkdir::WalkDir;
 
 mod archive;
 mod cache;
+mod event;
 mod json;
+mod model;
+mod project;
 mod sqlite;
 
 pub(crate) use cache::{
     file_metadata_signature, scan_cache_namespaces, scan_candidate,
     scan_candidate_with_compatible_dependencies, ScanCacheNamespaces,
 };
+pub(crate) use event::{
+    infer_missing_output, merge_adapter_scan, metadata_only_privacy, metadata_summary,
+    metric_from_samples, metric_single_sample, push_deduped, subtract_usage_counts,
+    sum_usage_counts, usage_event, usd_to_micro_usd, EventDeduplication, MetadataSummaryParts,
+    ProviderEventParts,
+};
 pub(crate) use json::{
     file_modified_timestamp, number_at_any, read_bounded_jsonl_line, read_json_file,
     stats_cache_date_end, timestamp_from_millis, timestamp_from_nested_value,
     timestamp_from_number, timestamp_from_scalar, value_as_u64, BoundedLineRead,
     MAX_JSONL_RECORD_BYTES,
+};
+pub(crate) use model::{
+    apply_reasoning_state, claude_reasoning_state_from_value, claude_speed_from_usage,
+    codex_reasoning_state_from_value, model_from_nested_value, model_info,
+    model_info_with_reasoning, opencode_message_has_variant, opencode_message_model_info,
+    opencode_model_info, reasoning_state_from_model, same_model_identity, with_model_metadata,
+    with_reasoning_state, ModelReasoningState,
+};
+pub(crate) use project::{
+    project_context_from_path_fallback, resolve_project_context, resolve_project_context_cached,
+    ProjectContextCache,
 };
 pub(crate) use sqlite::{
     open_sqlite_readonly, sqlite_column_exists, sqlite_nonzero_u64, sqlite_table_exists,
@@ -61,9 +79,6 @@ pub const CLAUDE_CODE_PROVIDER: &str = "claude_code";
 pub const CODEX_PROVIDER: &str = "codex";
 pub const OPENCODE_PROVIDER: &str = "opencode";
 pub const GROK_BUILD_PROVIDER: &str = "grok_build";
-const SESSION_SCOPED_EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
-const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v4";
-const PROVIDER_RECORD_EVENT_KEY_VERSION: &str = "provider_record_usage_event.v1";
 const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -158,26 +173,11 @@ fn codex_telemetry_checkpoint_row_fingerprint(
     )))
 }
 
-fn usd_to_micro_usd(usd: f64) -> Option<i64> {
-    let micro_usd = usd * 1_000_000.0;
-    usd.is_finite()
-        .then_some(micro_usd)
-        .filter(|value| *value >= 0.0 && *value <= i64::MAX as f64)
-        .map(|value| value.round() as i64)
-}
-
 pub use archive::{ArchiveScan, ArchiveScanDiagnostics};
 pub use statsai_core::{
     SourceIdentityInference, VerifiedSourceObservation, VerifiedSourceState,
     VerifiedSubscriptionState,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EventDeduplication {
-    SessionScoped,
-    PathIndependent,
-    ProviderRecord(String),
-}
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -2213,9 +2213,6 @@ struct ClaudeSessionProjectMetadata {
     git_branch: Option<String>,
 }
 
-type ProjectContextCacheKey = (Option<PathBuf>, Option<String>, Option<String>);
-type ProjectContextCache = HashMap<ProjectContextCacheKey, Option<ProjectInfo>>;
-
 #[derive(Debug, Clone)]
 struct ClaudeTaskEntry {
     session_id: String,
@@ -2226,42 +2223,6 @@ struct ClaudeTaskEntry {
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
     source_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ProjectContext {
-    project_label: Option<String>,
-    repo_remote_hash: Option<String>,
-    repo_label: Option<String>,
-    branch_hash: Option<String>,
-    branch_label: Option<String>,
-    path_hash: Option<String>,
-    path_label: Option<String>,
-}
-
-impl ProjectContext {
-    fn into_project_info(self) -> Option<ProjectInfo> {
-        let identity_key = if let Some(path_hash) = self.path_hash.as_deref() {
-            format!(
-                "path:{path_hash}:repo:{}",
-                self.repo_remote_hash.as_deref().unwrap_or("none")
-            )
-        } else {
-            let repo_remote_hash = self.repo_remote_hash.as_deref()?;
-            format!("repo:{repo_remote_hash}")
-        };
-
-        Some(ProjectInfo {
-            project_id: format!("project_{}", &hash_text(&identity_key)[..24]),
-            project_label: self.project_label,
-            repo_remote_hash: self.repo_remote_hash,
-            repo_label: self.repo_label,
-            branch_hash: self.branch_hash,
-            branch_label: self.branch_label,
-            path_hash: self.path_hash,
-            path_label: self.path_label,
-        })
-    }
 }
 
 fn parse_claude_file(
@@ -3849,369 +3810,6 @@ struct ActiveCodexTurn {
     project: Option<ProjectInfo>,
 }
 
-fn push_deduped(scan: &mut AdapterScan, seen: &mut HashSet<String>, event: UsageEvent) {
-    let key = event
-        .parse_evidence
-        .as_ref()
-        .and_then(|evidence| evidence.source_record_id.clone())
-        .unwrap_or_else(|| event.event_id.0.clone());
-    if seen.insert(key) {
-        scan.events.push(event);
-    } else {
-        scan.diagnostics.duplicate_events += 1;
-    }
-}
-
-fn merge_adapter_scan(
-    target: &mut AdapterScan,
-    seen: &mut HashSet<String>,
-    mut source: AdapterScan,
-) {
-    for event in source.events.drain(..) {
-        push_deduped(target, seen, event);
-    }
-    target.summaries.append(&mut source.summaries);
-    target.task_spans.append(&mut source.task_spans);
-    target
-        .quota_observations
-        .append(&mut source.quota_observations);
-    target.diagnostics.files_scanned = target
-        .diagnostics
-        .files_scanned
-        .saturating_add(source.diagnostics.files_scanned);
-    target.diagnostics.files_skipped_unchanged = target
-        .diagnostics
-        .files_skipped_unchanged
-        .saturating_add(source.diagnostics.files_skipped_unchanged);
-    target.diagnostics.raw_rows = target
-        .diagnostics
-        .raw_rows
-        .saturating_add(source.diagnostics.raw_rows);
-    target.diagnostics.candidate_usage_rows = target
-        .diagnostics
-        .candidate_usage_rows
-        .saturating_add(source.diagnostics.candidate_usage_rows);
-    target.diagnostics.duplicate_events = target
-        .diagnostics
-        .duplicate_events
-        .saturating_add(source.diagnostics.duplicate_events);
-    target.diagnostics.skipped_zero_events = target
-        .diagnostics
-        .skipped_zero_events
-        .saturating_add(source.diagnostics.skipped_zero_events);
-    target.diagnostics.invalid_rows = target
-        .diagnostics
-        .invalid_rows
-        .saturating_add(source.diagnostics.invalid_rows);
-    target.diagnostics.timestamp_fallbacks = target
-        .diagnostics
-        .timestamp_fallbacks
-        .saturating_add(source.diagnostics.timestamp_fallbacks);
-    target.diagnostics.model_fallbacks = target
-        .diagnostics
-        .model_fallbacks
-        .saturating_add(source.diagnostics.model_fallbacks);
-}
-
-struct ProviderEventParts<'a> {
-    timestamp: DateTime<Utc>,
-    session_started_at: Option<DateTime<Utc>>,
-    session_ended_at: Option<DateTime<Utc>>,
-    duration_seconds: Option<u64>,
-    model: Option<ModelInfo>,
-    usage: UsageCounts,
-    runtime: Option<RuntimeInfo>,
-    session_raw: String,
-    project: Option<ProjectInfo>,
-    event_kind: &'static str,
-    source_file: &'a Path,
-    source_line_number: Option<usize>,
-    source_type: &'static str,
-    model_inferred: bool,
-    timestamp_inferred: bool,
-    deduplication: EventDeduplication,
-    dedupe_salt: Option<String>,
-}
-
-fn usage_event<A: ProviderAdapter + ?Sized>(
-    adapter: &A,
-    source: &SourceLocation,
-    options: &ScanOptions,
-    parts: ProviderEventParts<'_>,
-) -> UsageEvent {
-    let session_hash = hash_text(&parts.session_raw);
-    let session_started_at = parts.session_started_at.unwrap_or(parts.timestamp);
-    let session_ended_at = parts.session_ended_at.unwrap_or(parts.timestamp);
-    let project_key = project_bucket_key(parts.project.as_ref());
-    let model_key = parts
-        .model
-        .as_ref()
-        .and_then(|model| model.normalized_name.as_deref().or(model.name.as_deref()))
-        .unwrap_or("unknown");
-    let event_kind_key = parts
-        .dedupe_salt
-        .as_deref()
-        .map(|salt| format!("{}:{salt}", parts.event_kind))
-        .unwrap_or_else(|| parts.event_kind.to_string());
-    let (event_key_version, semantic_key) = match parts.deduplication {
-        EventDeduplication::ProviderRecord(provider_record_id) => (
-            PROVIDER_RECORD_EVENT_KEY_VERSION,
-            format!(
-                "{PROVIDER_RECORD_EVENT_KEY_VERSION}:{event_kind_key}:{}",
-                hash_text(&provider_record_id)
-            ),
-        ),
-        EventDeduplication::SessionScoped => (
-            SESSION_SCOPED_EVENT_KEY_VERSION,
-            if parts.session_started_at.is_some() || parts.session_ended_at.is_some() {
-                format!(
-                    "{SESSION_SCOPED_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    event_kind_key,
-                    session_hash,
-                    session_started_at.timestamp_millis(),
-                    session_ended_at.timestamp_millis(),
-                    model_key,
-                    parts.usage.input_tokens.unwrap_or(0),
-                    parts.usage.cache_read_tokens.unwrap_or(0),
-                    parts.usage.output_tokens.unwrap_or(0),
-                    parts.usage.reasoning_tokens.unwrap_or(0),
-                    parts.usage.computed_total()
-                )
-            } else {
-                format!(
-                    "{SESSION_SCOPED_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    event_kind_key,
-                    session_hash,
-                    parts.timestamp.timestamp_millis(),
-                    model_key,
-                    parts.usage.input_tokens.unwrap_or(0),
-                    parts.usage.cache_read_tokens.unwrap_or(0),
-                    parts.usage.output_tokens.unwrap_or(0),
-                    parts.usage.reasoning_tokens.unwrap_or(0),
-                    parts.usage.computed_total()
-                )
-            },
-        ),
-        EventDeduplication::PathIndependent => (
-            PATH_INDEPENDENT_EVENT_KEY_VERSION,
-            if parts.session_started_at.is_some() || parts.session_ended_at.is_some() {
-                format!(
-                    "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    event_kind_key,
-                    project_key,
-                    session_started_at.timestamp_millis(),
-                    session_ended_at.timestamp_millis(),
-                    model_key,
-                    parts.usage.input_tokens.unwrap_or(0),
-                    parts.usage.cache_read_tokens.unwrap_or(0),
-                    parts.usage.output_tokens.unwrap_or(0),
-                    parts.usage.reasoning_tokens.unwrap_or(0),
-                    parts.usage.computed_total()
-                )
-            } else {
-                format!(
-                    "{PATH_INDEPENDENT_EVENT_KEY_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    event_kind_key,
-                    project_key,
-                    parts.timestamp.timestamp_millis(),
-                    model_key,
-                    parts.usage.input_tokens.unwrap_or(0),
-                    parts.usage.cache_read_tokens.unwrap_or(0),
-                    parts.usage.output_tokens.unwrap_or(0),
-                    parts.usage.reasoning_tokens.unwrap_or(0),
-                    parts.usage.computed_total()
-                )
-            },
-        ),
-    };
-    let event_id = semantic_event_id(adapter.provider(), &source.source_id, &semantic_key);
-    let file_path_hash = hash_text(&canonical_display(parts.source_file));
-    let source_record_id = format!("usage_key_{}", &hash_text(&semantic_key)[..32]);
-    let cost = estimate_cost_at(
-        adapter.provider(),
-        parts.model.as_ref(),
-        &parts.usage,
-        &parts.timestamp,
-    );
-
-    UsageEvent {
-        schema_version: USAGE_EVENT_SCHEMA_VERSION.to_string(),
-        event_id,
-        device_id: options.device_id.clone(),
-        provider: adapter.provider().to_string(),
-        source_id: source.source_id.clone(),
-        provider_account_id: None,
-        subscription_id: None,
-        source: EventSource {
-            adapter_id: adapter.id().to_string(),
-            adapter_version: adapter.version().to_string(),
-            source_kind: source.source_kind.clone(),
-            location_origin: Some(source.location_origin.clone()),
-            source_type: parts.source_type.to_string(),
-            source_path_hash: source.path_hash.clone(),
-            source_record_id: Some(source_record_id.clone()),
-            parse_confidence: if parts.model_inferred || parts.timestamp_inferred {
-                Confidence::Medium
-            } else {
-                Confidence::High
-            },
-        },
-        session: SessionInfo {
-            session_id: format!("session_{}", &session_hash[..24]),
-            local_session_id_hash: Some(session_hash),
-            title: None,
-            started_at: session_started_at,
-            ended_at: parts.session_ended_at,
-            duration_seconds: parts.duration_seconds,
-        },
-        model: parts.model,
-        runtime: parts.runtime,
-        cost,
-        parse_evidence: Some(ParseEvidence {
-            event_key_version: event_key_version.to_string(),
-            source_file_path_hash: Some(file_path_hash),
-            source_line_number: parts.source_line_number.map(|value| value as u64),
-            source_record_id: Some(semantic_key),
-            model_inferred: parts.model_inferred,
-            timestamp_inferred: parts.timestamp_inferred,
-            account_identity_source: IdentitySource::Unresolved,
-        }),
-        usage: parts.usage,
-        project: parts.project,
-        git: None,
-        privacy: metadata_only_privacy(),
-        created_at: parts.timestamp,
-        imported_at: Utc::now(),
-    }
-}
-
-struct MetadataSummaryParts<'a> {
-    source_file: &'a Path,
-    summary_format: &'a str,
-    semantic_key: &'a str,
-    observed_at: DateTime<Utc>,
-    metadata: SummaryMetadata,
-    model: Option<ModelInfo>,
-    runtime: Option<RuntimeInfo>,
-    project: Option<ProjectInfo>,
-}
-
-fn metadata_summary<A: ProviderAdapter + ?Sized>(
-    adapter: &A,
-    source: &SourceLocation,
-    options: &ScanOptions,
-    parts: MetadataSummaryParts<'_>,
-) -> UsageSummary {
-    let file_path_hash = hash_text(&canonical_display(parts.source_file));
-    let usage = UsageCounts::default();
-    UsageSummary {
-        schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
-        summary_id: summary_id(adapter.provider(), &source.source_id, parts.semantic_key),
-        device_id: options.device_id.clone(),
-        provider: adapter.provider().to_string(),
-        source_id: source.source_id.clone(),
-        provider_account_id: None,
-        source: EventSource {
-            adapter_id: adapter.id().to_string(),
-            adapter_version: adapter.version().to_string(),
-            source_kind: source.source_kind.clone(),
-            location_origin: Some(source.location_origin.clone()),
-            source_type: parts.summary_format.to_string(),
-            source_path_hash: source.path_hash.clone(),
-            source_record_id: Some(format!(
-                "summary_key_{}",
-                &hash_text(parts.semantic_key)[..32]
-            )),
-            parse_confidence: Confidence::Medium,
-        },
-        model: parts.model.clone(),
-        models: Vec::new(),
-        usage: usage.clone(),
-        cost: estimate_cost_at(
-            adapter.provider(),
-            parts.model.as_ref(),
-            &usage,
-            &parts.observed_at,
-        ),
-        parse_evidence: Some(ParseEvidence {
-            event_key_version: "metadata_summary.v1".to_string(),
-            source_file_path_hash: Some(file_path_hash),
-            source_line_number: None,
-            source_record_id: Some(parts.semantic_key.to_string()),
-            model_inferred: parts.model.is_none(),
-            timestamp_inferred: false,
-            account_identity_source: IdentitySource::Unresolved,
-        }),
-        project: parts.project,
-        privacy: metadata_only_privacy(),
-        metrics: parts.runtime.map(runtime_to_summary_metrics),
-        period_start: None,
-        period_end: None,
-        observed_at: parts.observed_at,
-        metadata: parts.metadata,
-        imported_at: Utc::now(),
-    }
-}
-
-fn runtime_to_summary_metrics(runtime: RuntimeInfo) -> SummaryMetrics {
-    SummaryMetrics {
-        active_seconds: runtime.latency_ms.map(|value| value as f64 / 1000.0),
-        tracked_requests: runtime.total_messages,
-        tracked_output_tokens: None,
-        tracked_reasoning_tokens: None,
-        latency_ms: runtime.latency_ms.map(metric_single_sample),
-        time_to_first_token_ms: runtime.time_to_first_token_ms.map(metric_single_sample),
-        generated_tps: None,
-        visible_tps: None,
-        overall_generated_tps: None,
-        overall_visible_tps: None,
-        cache_hit_ratio: None,
-        reasoning_share: None,
-        total_messages: runtime.total_messages,
-        user_messages: runtime.user_messages,
-        assistant_messages: runtime.assistant_messages,
-        developer_messages: runtime.developer_messages,
-    }
-}
-
-fn metric_single_sample(value: u64) -> MetricStats {
-    let value = value as f64;
-    MetricStats {
-        samples: 1,
-        avg: Some(value),
-        min: Some(value),
-        max: Some(value),
-        p50: Some(value),
-        p95: Some(value),
-        sum: Some(value),
-    }
-}
-
-fn metric_from_samples(samples: &[u64]) -> Option<MetricStats> {
-    if samples.is_empty() {
-        return None;
-    }
-    let mut sorted = samples
-        .iter()
-        .map(|value| *value as f64)
-        .collect::<Vec<_>>();
-    sorted.sort_by(f64::total_cmp);
-    let sum = sorted.iter().sum::<f64>();
-    let percentile = |percent: f64| -> f64 {
-        let index = ((sorted.len() - 1) as f64 * percent).round() as usize;
-        sorted[index]
-    };
-    Some(MetricStats {
-        samples: sorted.len() as u64,
-        avg: Some(sum / sorted.len() as f64),
-        min: sorted.first().copied(),
-        max: sorted.last().copied(),
-        p50: Some(percentile(0.50)),
-        p95: Some(percentile(0.95)),
-        sum: Some(sum),
-    })
-}
-
 #[derive(Debug, Clone, Default)]
 struct GrokSessionStats {
     chat_rows: u64,
@@ -5314,55 +4912,6 @@ fn codex_usage_counts_from_value(value: &Value) -> UsageCounts {
     )
 }
 
-fn infer_missing_output(
-    total: Option<u64>,
-    input: Option<u64>,
-    cache_creation: Option<u64>,
-    cache_read: Option<u64>,
-    reasoning: Option<u64>,
-) -> Option<u64> {
-    total.and_then(|total| {
-        let known = input.unwrap_or(0)
-            + cache_creation.unwrap_or(0)
-            + cache_read.unwrap_or(0)
-            + reasoning.unwrap_or(0);
-        (total > known).then_some(total - known)
-    })
-}
-
-fn sum_usage_counts(left: &UsageCounts, right: &UsageCounts) -> UsageCounts {
-    fn sum_field(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-        if left.is_some() || right.is_some() {
-            Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0)))
-        } else {
-            None
-        }
-    }
-
-    UsageCounts {
-        input_tokens: sum_field(left.input_tokens, right.input_tokens),
-        output_tokens: sum_field(left.output_tokens, right.output_tokens),
-        cache_creation_tokens: sum_field(left.cache_creation_tokens, right.cache_creation_tokens),
-        cache_creation_5m_tokens: sum_field(
-            left.cache_creation_5m_tokens,
-            right.cache_creation_5m_tokens,
-        ),
-        cache_creation_1h_tokens: sum_field(
-            left.cache_creation_1h_tokens,
-            right.cache_creation_1h_tokens,
-        ),
-        cache_read_tokens: sum_field(left.cache_read_tokens, right.cache_read_tokens),
-        reasoning_tokens: sum_field(left.reasoning_tokens, right.reasoning_tokens),
-        total_tokens: sum_field(left.total_tokens, right.total_tokens),
-        requests: sum_field(left.requests, right.requests),
-        local_prompt_eval_tokens: sum_field(
-            left.local_prompt_eval_tokens,
-            right.local_prompt_eval_tokens,
-        ),
-        local_eval_tokens: sum_field(left.local_eval_tokens, right.local_eval_tokens),
-    }
-}
-
 // Codex reports cached input and reasoning output as subsets of the top-level
 // input/output counters. Normalize that inclusive provider shape into the
 // additive contract used everywhere else in statsai.
@@ -5423,316 +4972,6 @@ fn normalize_codex_usage_counts(
         local_prompt_eval_tokens: None,
         local_eval_tokens: None,
     }
-}
-
-fn subtract_usage_counts(current: &UsageCounts, previous: Option<&UsageCounts>) -> UsageCounts {
-    let subtract = |left: Option<u64>, right: Option<u64>| {
-        let value = left.unwrap_or(0).saturating_sub(right.unwrap_or(0));
-        (value > 0).then_some(value)
-    };
-    UsageCounts {
-        input_tokens: subtract(
-            current.input_tokens,
-            previous.and_then(|usage| usage.input_tokens),
-        ),
-        output_tokens: subtract(
-            current.output_tokens,
-            previous.and_then(|usage| usage.output_tokens),
-        ),
-        cache_creation_tokens: subtract(
-            current.cache_creation_tokens,
-            previous.and_then(|usage| usage.cache_creation_tokens),
-        ),
-        cache_creation_5m_tokens: subtract(
-            current.cache_creation_5m_tokens,
-            previous.and_then(|usage| usage.cache_creation_5m_tokens),
-        ),
-        cache_creation_1h_tokens: subtract(
-            current.cache_creation_1h_tokens,
-            previous.and_then(|usage| usage.cache_creation_1h_tokens),
-        ),
-        cache_read_tokens: subtract(
-            current.cache_read_tokens,
-            previous.and_then(|usage| usage.cache_read_tokens),
-        ),
-        reasoning_tokens: subtract(
-            current.reasoning_tokens,
-            previous.and_then(|usage| usage.reasoning_tokens),
-        ),
-        total_tokens: subtract(
-            current.total_tokens,
-            previous.and_then(|usage| usage.total_tokens),
-        ),
-        requests: Some(1),
-        local_prompt_eval_tokens: None,
-        local_eval_tokens: None,
-    }
-}
-
-fn model_from_nested_value(value: &Value, fallback: Option<&str>) -> Option<ModelInfo> {
-    let model = [
-        value.get("model"),
-        value.get("model_name"),
-        value.pointer("/metadata/model"),
-        value.pointer("/message/model"),
-        value.pointer("/usage/model"),
-        value.pointer("/request/model"),
-        value.pointer("/data/model"),
-        value.pointer("/data/model_name"),
-        value.pointer("/data/metadata/model"),
-        value.pointer("/result/model"),
-        value.pointer("/result/model_name"),
-        value.pointer("/result/metadata/model"),
-        value.pointer("/response/model"),
-        value.pointer("/response/model_name"),
-        value.pointer("/response/metadata/model"),
-        value.pointer("/payload/model"),
-        value.pointer("/payload/model_name"),
-        value.pointer("/payload/metadata/model"),
-        value.pointer("/payload/info/model"),
-        value.pointer("/payload/info/model_name"),
-        value.pointer("/payload/info/metadata/model"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(Value::as_str)
-    .or(fallback)?;
-    Some(model_info(model))
-}
-
-fn claude_reasoning_state_from_value(value: &Value) -> ModelReasoningState {
-    let effort = value
-        .get("effort")
-        .or_else(|| value.pointer("/message/effort"))
-        .and_then(Value::as_str);
-    if effort.is_some() {
-        return ModelReasoningState::from_raw(effort);
-    }
-
-    let max_thinking_tokens = [
-        value.pointer("/thinkingMetadata/maxThinkingTokens"),
-        value.pointer("/thinking_metadata/maxThinkingTokens"),
-        value.pointer("/thinking_metadata/max_thinking_tokens"),
-        value.pointer("/message/thinkingMetadata/maxThinkingTokens"),
-        value.pointer("/message/thinking_metadata/maxThinkingTokens"),
-        value.pointer("/message/thinking_metadata/max_thinking_tokens"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(value_as_u64);
-
-    ModelReasoningState {
-        level: None,
-        raw: max_thinking_tokens.map(|value| value.to_string()),
-    }
-}
-
-fn claude_speed_from_usage(usage: &Value) -> Option<&str> {
-    usage
-        .get("speed")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|speed| !speed.is_empty())
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ModelReasoningState {
-    level: Option<ReasoningLevel>,
-    raw: Option<String>,
-}
-
-impl ModelReasoningState {
-    fn from_raw(value: Option<&str>) -> Self {
-        let raw = value
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        Self {
-            level: raw.as_deref().and_then(ReasoningLevel::parse),
-            raw,
-        }
-    }
-}
-
-fn apply_reasoning_state(model: &mut ModelInfo, reasoning: &ModelReasoningState) {
-    if model.reasoning_level.is_none() {
-        model.reasoning_level = reasoning.level;
-    }
-    if model.reasoning_level_raw.is_none() {
-        model.reasoning_level_raw = reasoning.raw.clone();
-    }
-}
-
-fn model_info_with_reasoning(model: &str, reasoning: &ModelReasoningState) -> ModelInfo {
-    let mut info = model_info(model);
-    apply_reasoning_state(&mut info, reasoning);
-    info
-}
-
-fn with_reasoning_state(
-    model: Option<ModelInfo>,
-    reasoning: &ModelReasoningState,
-) -> Option<ModelInfo> {
-    model.map(|mut model| {
-        apply_reasoning_state(&mut model, reasoning);
-        model
-    })
-}
-
-fn with_model_metadata(
-    model: Option<ModelInfo>,
-    reasoning: &ModelReasoningState,
-    speed: Option<&str>,
-) -> Option<ModelInfo> {
-    with_reasoning_state(model, reasoning).map(|mut model| {
-        model.speed = speed.map(ToOwned::to_owned);
-        model
-    })
-}
-
-fn reasoning_state_from_model(model: &ModelInfo) -> ModelReasoningState {
-    ModelReasoningState {
-        level: model.reasoning_level,
-        raw: model.reasoning_level_raw.clone(),
-    }
-}
-
-fn same_model_identity(left: Option<&ModelInfo>, right: &ModelInfo) -> bool {
-    left.and_then(|model| model.provider_model_id.as_deref()) == right.provider_model_id.as_deref()
-}
-
-fn model_info(model: &str) -> ModelInfo {
-    let normalized = normalize_model_name(model);
-    ModelInfo {
-        name: Some(model.to_string()),
-        normalized_name: Some(normalized),
-        provider_model_id: Some(model.to_string()),
-        speed: None,
-        reasoning_level: None,
-        reasoning_level_raw: None,
-    }
-}
-
-fn opencode_model_info(value: &str) -> Option<ModelInfo> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
-        return opencode_model_info_from_value(&json).or_else(|| {
-            Some(opencode_named_model_info(
-                trimmed,
-                &ModelReasoningState::default(),
-            ))
-        });
-    }
-    Some(opencode_named_model_info(
-        trimmed,
-        &ModelReasoningState::default(),
-    ))
-}
-
-fn normalize_provider_qualified_model_name(label: &str) -> String {
-    label
-        .rsplit_once('/')
-        .map(|(_, model)| normalize_model_name(model))
-        .unwrap_or_else(|| normalize_model_name(label))
-}
-
-fn opencode_model_info_from_value(value: &Value) -> Option<ModelInfo> {
-    let label = opencode_model_label_from_value(value)?;
-    let reasoning = opencode_reasoning_state_from_value(value);
-    Some(opencode_named_model_info(&label, &reasoning))
-}
-
-fn opencode_named_model_info(label: &str, reasoning: &ModelReasoningState) -> ModelInfo {
-    ModelInfo {
-        name: Some(label.to_string()),
-        normalized_name: Some(normalize_provider_qualified_model_name(label)),
-        provider_model_id: Some(label.to_string()),
-        speed: None,
-        reasoning_level: reasoning.level,
-        reasoning_level_raw: reasoning.raw.clone(),
-    }
-}
-
-fn opencode_model_label_from_value(value: &Value) -> Option<String> {
-    let provider = opencode_provider_id_from_value(value);
-    let model = opencode_model_id_from_value(value)?;
-    Some(
-        provider
-            .map(|provider| format!("{provider}/{model}"))
-            .unwrap_or(model),
-    )
-}
-
-fn opencode_message_model_info(value: &Value) -> Option<ModelInfo> {
-    opencode_model_info_from_value(value)
-}
-
-fn opencode_provider_id_from_value(value: &Value) -> Option<&str> {
-    value
-        .get("providerID")
-        .or_else(|| value.get("provider_id"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            value.get("model").and_then(|model| {
-                model
-                    .get("providerID")
-                    .or_else(|| model.get("provider_id"))
-                    .and_then(Value::as_str)
-            })
-        })
-}
-
-fn opencode_model_id_from_value(value: &Value) -> Option<String> {
-    value
-        .get("modelID")
-        .or_else(|| value.get("id"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            value
-                .get("model")
-                .and_then(opencode_model_id_from_model_value)
-        })
-        .or_else(|| {
-            value
-                .get("model")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-}
-
-fn opencode_model_id_from_model_value(value: &Value) -> Option<String> {
-    value
-        .get("modelID")
-        .or_else(|| value.get("id"))
-        .or_else(|| value.get("model"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn opencode_reasoning_state_from_value(value: &Value) -> ModelReasoningState {
-    ModelReasoningState::from_raw(value.get("variant").and_then(Value::as_str).or_else(|| {
-        value
-            .get("model")
-            .and_then(|model| model.get("variant"))
-            .and_then(Value::as_str)
-    }))
-}
-
-fn opencode_message_has_variant(value: &Value) -> bool {
-    opencode_reasoning_state_from_value(value).raw.is_some()
-}
-
-fn codex_reasoning_state_from_value(value: &Value) -> ModelReasoningState {
-    ModelReasoningState::from_raw(
-        value
-            .pointer("/payload/collaboration_mode/settings/reasoning_effort")
-            .and_then(Value::as_str)
-            .or_else(|| value.pointer("/payload/effort").and_then(Value::as_str)),
-    )
 }
 
 fn opencode_message_usage_counts(value: &Value) -> UsageCounts {
@@ -6524,226 +5763,6 @@ fn codex_project_context_from_value(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     resolve_project_context_cached(project_path, repository_url, branch, cache)
-}
-
-fn resolve_project_context_cached(
-    project_path: Option<PathBuf>,
-    repository_url: Option<String>,
-    branch: Option<String>,
-    cache: &mut ProjectContextCache,
-) -> Option<ProjectInfo> {
-    let cache_key = (project_path.clone(), repository_url.clone(), branch.clone());
-    if let Some(project) = cache.get(&cache_key) {
-        return project.clone();
-    }
-    let project = resolve_project_context(project_path, repository_url, branch);
-    cache.insert(cache_key, project.clone());
-    project
-}
-
-fn resolve_project_context(
-    project_path: Option<PathBuf>,
-    repository_url: Option<String>,
-    branch: Option<String>,
-) -> Option<ProjectInfo> {
-    let git = project_path
-        .as_deref()
-        .and_then(read_git_repository_metadata);
-    let normalized_remote = repository_url
-        .as_deref()
-        .and_then(normalize_git_remote)
-        .or_else(|| {
-            git.as_ref()
-                .and_then(|metadata| metadata.normalized_remote.clone())
-        });
-    let repo_remote_hash = normalized_remote.as_ref().map(|remote| hash_text(remote));
-    let repo_label = normalized_remote
-        .as_deref()
-        .map(repo_label_from_normalized_remote)
-        .or_else(|| {
-            git.as_ref()
-                .and_then(|metadata| metadata.repo_label.clone())
-        });
-    let branch_label = branch.or_else(|| {
-        git.as_ref()
-            .and_then(|metadata| metadata.branch_label.clone())
-    });
-    let branch_hash = branch_label.as_ref().map(|branch| hash_text(branch));
-    let project_label = project_path
-        .as_deref()
-        .and_then(project_label_from_path)
-        .or_else(|| repo_label.clone());
-    let path_hash_value = project_path.as_deref().map(path_hash);
-    let path_label = project_path.as_deref().map(display_path);
-
-    ProjectContext {
-        project_label,
-        repo_remote_hash,
-        repo_label,
-        branch_hash,
-        branch_label,
-        path_hash: path_hash_value,
-        path_label,
-    }
-    .into_project_info()
-}
-
-fn project_context_from_path_fallback(root: &Path, path: &Path) -> Option<ProjectInfo> {
-    let project_key = project_key_from_path(root, path)?;
-    if matches!(project_key.as_str(), "sessions" | "archived_sessions") {
-        return None;
-    }
-    let project_path = root.join(&project_key);
-    ProjectContext {
-        project_label: Some(project_key),
-        path_hash: Some(path_hash(&project_path)),
-        path_label: Some(display_path(&project_path)),
-        ..ProjectContext::default()
-    }
-    .into_project_info()
-}
-
-#[derive(Debug, Clone, Default)]
-struct GitRepositoryMetadata {
-    normalized_remote: Option<String>,
-    repo_label: Option<String>,
-    branch_label: Option<String>,
-}
-
-fn read_git_repository_metadata(path: &Path) -> Option<GitRepositoryMetadata> {
-    let repo_root = find_git_repo_root(path)?;
-    let git_dir = git_dir_for_repo_root(&repo_root)?;
-    let common_dir = git_common_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
-    let config_path = if git_dir.join("config").is_file() {
-        git_dir.join("config")
-    } else {
-        common_dir.join("config")
-    };
-    let remote = read_git_remote_url(&config_path);
-    let normalized_remote = remote.as_deref().and_then(normalize_git_remote);
-    let repo_label = normalized_remote
-        .as_deref()
-        .map(repo_label_from_normalized_remote)
-        .or_else(|| project_label_from_path(&repo_root));
-
-    Some(GitRepositoryMetadata {
-        normalized_remote,
-        repo_label,
-        branch_label: read_git_head_branch(&git_dir),
-    })
-}
-
-fn find_git_repo_root(path: &Path) -> Option<PathBuf> {
-    let mut current = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent()?.to_path_buf()
-    };
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
-fn git_dir_for_repo_root(repo_root: &Path) -> Option<PathBuf> {
-    let dot_git = repo_root.join(".git");
-    if dot_git.is_dir() {
-        return Some(dot_git);
-    }
-    let text = std::fs::read_to_string(dot_git).ok()?;
-    let gitdir = text.trim().strip_prefix("gitdir:")?.trim();
-    let path = PathBuf::from(gitdir);
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        Some(repo_root.join(path))
-    }
-}
-
-fn git_common_dir(git_dir: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
-    let value = text.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        Some(git_dir.join(path))
-    }
-}
-
-fn read_git_remote_url(config_path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(config_path).ok()?;
-    let mut current_remote: Option<String> = None;
-    let mut first_remote_url: Option<String> = None;
-    let mut origin_remote_url: Option<String> = None;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("[remote \"") && trimmed.ends_with("\"]") {
-            current_remote = trimmed
-                .trim_start_matches("[remote \"")
-                .trim_end_matches("\"]")
-                .split('"')
-                .next()
-                .map(ToOwned::to_owned);
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            current_remote = None;
-            continue;
-        }
-        let Some(remote_name) = current_remote.as_deref() else {
-            continue;
-        };
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "url" {
-            continue;
-        }
-        let url = value.trim().to_string();
-        if first_remote_url.is_none() {
-            first_remote_url = Some(url.clone());
-        }
-        if remote_name == "origin" {
-            origin_remote_url = Some(url);
-        }
-    }
-
-    origin_remote_url.or(first_remote_url)
-}
-
-fn read_git_head_branch(git_dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head = text.trim();
-    head.strip_prefix("ref: refs/heads/").map(ToOwned::to_owned)
-}
-
-fn repo_label_from_normalized_remote(remote: &str) -> String {
-    let parts: Vec<&str> = remote.split('/').filter(|part| !part.is_empty()).collect();
-    if parts.len() >= 3 {
-        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
-    } else {
-        remote.to_string()
-    }
-}
-
-fn project_label_from_path(path: &Path) -> Option<String> {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            let display = display_path(path);
-            (!display.is_empty()).then_some(display)
-        })
 }
 
 #[derive(Deserialize)]
@@ -8548,25 +7567,6 @@ fn codex_session_id(usage_root: &Path, path: &Path) -> String {
         .join("/")
 }
 
-fn project_key_from_path(root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root).ok()?;
-    relative
-        .components()
-        .next()
-        .and_then(|component| component.as_os_str().to_str())
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn metadata_only_privacy() -> PrivacyInfo {
-    PrivacyInfo {
-        mode: PrivacyMode::MetadataOnly,
-        contains_prompt_text: false,
-        contains_response_text: false,
-        contains_file_paths: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8575,6 +7575,7 @@ mod tests {
         CODEX_SCAN_CACHE_PARSER_REVISION, GROK_BUILD_SCAN_CACHE_PARSER_REVISION,
         OPENCODE_SCAN_CACHE_PARSER_REVISION, SCAN_CACHE_SIGNATURE_VERSION,
     };
+    use statsai_core::{display_path, normalize_git_remote, path_hash, ReasoningLevel};
     use std::io::Write;
 
     fn options() -> ScanOptions {
@@ -9909,17 +8910,6 @@ mod tests {
             normalize_git_remote("ssh://git@github.com/Owner/Repo.git"),
             Some("github.com/owner/repo".to_string())
         );
-    }
-
-    #[test]
-    fn project_context_requires_path_or_repo_identity() {
-        let project = ProjectContext {
-            project_label: Some("scratch".to_string()),
-            ..ProjectContext::default()
-        }
-        .into_project_info();
-
-        assert_eq!(project, None);
     }
 
     #[test]
@@ -13645,28 +12635,6 @@ mod tests {
     }
 
     #[test]
-    fn summed_usage_counts_preserve_cache_creation_lifetimes() {
-        let left = UsageCounts {
-            cache_creation_tokens: Some(10),
-            cache_creation_5m_tokens: Some(7),
-            cache_creation_1h_tokens: Some(3),
-            ..UsageCounts::default()
-        };
-        let right = UsageCounts {
-            cache_creation_tokens: Some(20),
-            cache_creation_5m_tokens: Some(11),
-            cache_creation_1h_tokens: Some(9),
-            ..UsageCounts::default()
-        };
-
-        let usage = sum_usage_counts(&left, &right);
-
-        assert_eq!(usage.cache_creation_tokens, Some(30));
-        assert_eq!(usage.cache_creation_5m_tokens, Some(18));
-        assert_eq!(usage.cache_creation_1h_tokens, Some(12));
-    }
-
-    #[test]
     fn codex_usage_counts_normalize_inclusive_subtotals() {
         let value: Value = serde_json::json!({
             "input_tokens": 100,
@@ -15707,51 +14675,6 @@ mod tests {
                 .and_then(|model| model.reasoning_level_raw.as_deref()),
             None
         );
-    }
-
-    #[test]
-    fn opencode_model_info_uses_model_name_for_stats_and_preserves_provider_identity() {
-        let foo = opencode_model_info(r#"{"id":"model-x","providerID":"foo"}"#).expect("foo");
-        let bar = opencode_model_info(r#"{"id":"model-x","providerID":"bar"}"#).expect("bar");
-
-        assert_eq!(foo.name.as_deref(), Some("foo/model-x"));
-        assert_eq!(bar.name.as_deref(), Some("bar/model-x"));
-        assert_eq!(foo.provider_model_id.as_deref(), Some("foo/model-x"));
-        assert_eq!(bar.provider_model_id.as_deref(), Some("bar/model-x"));
-        assert_eq!(foo.normalized_name.as_deref(), Some("model-x"));
-        assert_eq!(bar.normalized_name.as_deref(), Some("model-x"));
-        assert_eq!(foo.reasoning_level, None);
-        assert_eq!(bar.reasoning_level_raw, None);
-    }
-
-    #[test]
-    fn opencode_model_info_maps_variant_to_reasoning_fields() {
-        let model =
-            opencode_model_info(r#"{"providerID":"openai","modelID":"gpt-5.5","variant":"xhigh"}"#)
-                .expect("model");
-
-        assert_eq!(model.provider_model_id.as_deref(), Some("openai/gpt-5.5"));
-        assert_eq!(model.reasoning_level, Some(ReasoningLevel::Xhigh));
-        assert_eq!(model.reasoning_level_raw.as_deref(), Some("xhigh"));
-    }
-
-    #[test]
-    fn opencode_model_info_normalizes_provider_qualified_known_aliases() {
-        let deepseek = opencode_model_info("opencode-go/deepseek-v4-pro").expect("deepseek");
-        let grok = opencode_model_info(r#"{"id":"grok-build","providerID":"xai"}"#).expect("grok");
-
-        assert_eq!(
-            deepseek.name.as_deref(),
-            Some("opencode-go/deepseek-v4-pro")
-        );
-        assert_eq!(
-            deepseek.provider_model_id.as_deref(),
-            Some("opencode-go/deepseek-v4-pro")
-        );
-        assert_eq!(deepseek.normalized_name.as_deref(), Some("deepseek-v4-pro"));
-        assert_eq!(grok.name.as_deref(), Some("xai/grok-build"));
-        assert_eq!(grok.provider_model_id.as_deref(), Some("xai/grok-build"));
-        assert_eq!(grok.normalized_name.as_deref(), Some("grok-build-0.1"));
     }
 
     #[test]
