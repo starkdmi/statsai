@@ -20,7 +20,7 @@ mod sync_state;
 mod tasks;
 mod verified;
 
-use accounts::deserialize_subscription_payload;
+pub(crate) use accounts::deserialize_subscription_payload;
 pub(crate) use rollups::{
     collect_pending_summary_days, event_with_valid_project, is_daily_rollup_summary,
     is_http_rollup_passthrough_summary, sanitize_summary_for_http_sync, summary_period_bounds,
