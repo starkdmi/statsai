@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use super::args::{SourceCommand, SourceSubcommand};
 use super::format::{abbreviate_home, parse_date};
 
-use crate::{active_subscription, validate_time_window};
+use super::subscription::{active_subscription, validate_time_window};
 
 pub(crate) fn source(command: SourceCommand, store: &Store, device_id: &str) -> Result<()> {
     match command.command {

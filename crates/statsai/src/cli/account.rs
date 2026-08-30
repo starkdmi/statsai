@@ -14,7 +14,7 @@ use super::source::{
     canonical_provider, canonical_provider_name, connect_source_to_account,
     ConnectSourceToAccountInput,
 };
-use crate::validate_subscription_overlap;
+use super::subscription::validate_subscription_overlap;
 
 pub(crate) fn account(command: AccountCommand, store: &Store) -> Result<()> {
     match command.command {
