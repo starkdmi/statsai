@@ -42,8 +42,7 @@ use statsai_store::{
     apply_current_estimated_pricing, close_active_verified_source_linkages, derive_task_work_items,
     find_existing_provider_account, reconcile_verified_source_state, upsert_provider_account,
     verified_source_observation_hash, QuotaQuery, ScanFileStateEntry, Store, SyncPreferences,
-    SyncState, TaskRebuildReport, UpsertProviderAccountInput, CURRENT_SCHEMA_VERSION,
-    PRICING_RULESET_VERSION,
+    SyncState, TaskRebuildReport, UpsertProviderAccountInput,
 };
 #[cfg(test)]
 use statsai_store::{apply_verified_source_state, verified_source_state_hash};
@@ -52,13 +51,14 @@ use statsai_sync::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
-use statsai::{auth, default_device_id, default_store_path, service, snapshot};
+use statsai::{auth, default_device_id, default_store_path, snapshot};
 
 mod cli;
 use cli::args::*;
+use cli::auth::auth;
+use cli::daemon::daemon;
 #[cfg(test)]
 use cli::format::subscription_json_value;
 use cli::format::{
@@ -66,6 +66,10 @@ use cli::format::{
     format_subscription_price, format_u64, major_unit_amount, parse_date, print_json_lines,
     print_subscription_json, subscription_status_label, truncate_label, usd_amount_json,
 };
+use cli::schema::schema;
+use cli::service::service;
+use cli::status::{doctor, status};
+use cli::store_admin::store_admin;
 
 const HTTP_ROLLUP_SUMMARIES_PER_BATCH: usize = 25;
 const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
@@ -150,52 +154,6 @@ fn command_reprices_persisted_usage(command: &Command) -> bool {
             | Command::Sync(_)
             | Command::Daemon(_)
     )
-}
-
-fn store_admin(command: StoreAdminCommand, source: &Path) -> Result<()> {
-    match command.command {
-        StoreAdminSubcommand::CloneTo { destination } => {
-            let cloned = statsai_store::clone_database_to(source, &destination)?;
-            println!(
-                "Cloned {} to {} (schema {}, {} logical bytes)",
-                source.display(),
-                destination.display(),
-                cloned.schema_version,
-                cloned.logical_size
-            );
-            Ok(())
-        }
-        StoreAdminSubcommand::SupportedSchemaVersion => {
-            println!("{CURRENT_SCHEMA_VERSION}");
-            Ok(())
-        }
-        StoreAdminSubcommand::SupportedPricingRulesetVersion => {
-            println!("{PRICING_RULESET_VERSION}");
-            Ok(())
-        }
-    }
-}
-
-fn service(command: ServiceCommand) -> Result<()> {
-    use service::ServiceAction;
-
-    match command.command {
-        ServiceSubcommand::Install => service::service(ServiceAction::Install),
-        ServiceSubcommand::Uninstall => service::service(ServiceAction::Uninstall),
-        ServiceSubcommand::Status => service::service(ServiceAction::Status),
-    }
-}
-
-fn auth(command: AuthCommand) -> Result<()> {
-    match command.command {
-        AuthSubcommand::Login {
-            no_open,
-            headless,
-            device_name,
-        } => auth::login(no_open, headless, device_name),
-        AuthSubcommand::Status => auth::status(),
-        AuthSubcommand::Logout => auth::logout(),
-    }
 }
 
 fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Result<()> {
@@ -5731,20 +5689,6 @@ fn sync_state_report(state: &statsai_store::SyncState) -> SyncStateReport {
     }
 }
 
-fn schema(command: SchemaCommand) -> Result<()> {
-    match command.command {
-        SchemaSubcommand::SyncBatch => {
-            let schema = schemars::schema_for!(SyncBatch);
-            println!("{}", serde_json::to_string_pretty(&schema)?);
-        }
-        SchemaSubcommand::QuotaWindowProjection => {
-            let schema = schemars::schema_for!(QuotaWindowSyncProjectionV1);
-            println!("{}", serde_json::to_string_pretty(&schema)?);
-        }
-    }
-    Ok(())
-}
-
 fn quota(command: QuotaCommand, store: &Store, device_id: &str) -> Result<()> {
     match command.command {
         QuotaSubcommand::Status { account, json } => {
@@ -6391,16 +6335,6 @@ fn export_quota_projections(
     Ok(())
 }
 
-fn daemon(command: DaemonCommand, store: Store, device_id: &str) -> Result<()> {
-    let store = Arc::new(Mutex::new(store));
-    let auth_token = statsai::default_daemon_auth_token()?;
-    if command.watch {
-        statsai_daemon::watch_and_serve(&command.api, store, device_id, &auth_token)
-    } else {
-        statsai_daemon::run(&command.api, store, &auth_token)
-    }
-}
-
 fn conversation(command: ConversationCommand, store: &Store, device_id: &str) -> Result<()> {
     match command.command {
         ConversationSubcommand::Collect {
@@ -7032,89 +6966,6 @@ fn compact_archive_preview(value: &str, max_chars: usize) -> String {
         return compact;
     }
     compact.chars().take(max_chars).collect::<String>() + "..."
-}
-
-fn status(store: &Store) -> Result<()> {
-    println!("stored all-time events: {}", store.event_count()?);
-    println!("stored all-time tokens: {}", store.token_total()?);
-    println!("stored usage summaries: {}", store.summary_count()?);
-    let archive = store.archive_stats()?;
-    println!("archived conversations: {}", archive.conversations);
-    println!("archived conversation items: {}", archive.items);
-    Ok(())
-}
-
-fn doctor(store_path: &Path) -> Result<()> {
-    println!("store: {}", store_path.display());
-    if let Ok(value) = std::env::var("CLAUDE_CONFIG_DIR") {
-        println!("env CLAUDE_CONFIG_DIR: {}", value);
-    }
-    if let Ok(value) = std::env::var("CODEX_HOME") {
-        println!("env CODEX_HOME: {}", value);
-    }
-    let store = Store::open(store_path)?;
-    let configured = store.list_sources()?;
-    for adapter in default_adapters() {
-        let sources = scan_sources_for_adapter(adapter.as_ref(), &configured);
-        let empty = sources
-            .iter()
-            .filter(|source| {
-                source
-                    .path_label
-                    .as_deref()
-                    .map(|path| !PathBuf::from(path).exists())
-                    .unwrap_or(true)
-            })
-            .count();
-        println!(
-            "{} sources: {} configured/discovered, {} missing paths",
-            adapter.provider(),
-            sources.len(),
-            empty
-        );
-        for source in sources {
-            let candidates = adapter.scan_candidates(&source)?;
-            let compatible_scan_signatures = scan_candidate_compatible_signatures(&candidates);
-            let file_cache_entries = scan_file_state_entries(&candidates);
-            let pending = store.pending_scan_file_entries_with_compatibility(
-                &source.source_id,
-                &file_cache_entries,
-                &compatible_scan_signatures,
-            )?;
-            let pending_keys: BTreeSet<_> = pending
-                .iter()
-                .map(|entry| entry.cache_key.as_str())
-                .collect();
-            let cached: Vec<_> = candidates
-                .iter()
-                .filter(|candidate| !pending_keys.contains(candidate.cache_key.as_str()))
-                .collect();
-            println!(
-                "  - {} origin={} files={} pending={} cached={}",
-                preview_path_label(&source),
-                location_origin_label(&source.location_origin),
-                candidates.len(),
-                pending.len(),
-                cached.len()
-            );
-            if !pending.is_empty() {
-                println!(
-                    "    pending sample: {}",
-                    format_cache_key_sample(pending.iter().map(|entry| entry.cache_key.as_str()))
-                );
-            }
-            if !cached.is_empty() {
-                println!(
-                    "    cached sample: {}",
-                    format_cache_key_sample(
-                        cached.iter().map(|candidate| candidate.cache_key.as_str())
-                    )
-                );
-            }
-        }
-    }
-    println!("status: ok");
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -9371,6 +9222,7 @@ mod tests {
         USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
     };
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn privacy_filter_preview_is_exposed_by_the_cli() {
