@@ -1,3 +1,9 @@
+mod git;
+mod ids;
+
+pub(crate) use git::*;
+pub(crate) use ids::*;
+
 use super::Store;
 use anyhow::{Context, Result};
 use chrono::{NaiveDate, Utc};
@@ -1011,84 +1017,6 @@ impl Store {
             Ok(())
         })
     }
-}
-
-fn upsert_git_commit(conn: &rusqlite::Connection, commit: &GitCommitChange) -> Result<()> {
-    conn.execute(
-        r#"
-        INSERT INTO code_git_commits
-          (deduplication_id, repository_hash, commit_hash, committed_at, project_id, payload)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ON CONFLICT(deduplication_id) DO UPDATE SET
-          committed_at = excluded.committed_at,
-          project_id = excluded.project_id,
-          payload = excluded.payload
-        "#,
-        params![
-            &commit.deduplication_id,
-            &commit.repository_hash,
-            &commit.commit_hash,
-            commit.committed_at.to_rfc3339(),
-            &commit.project_id,
-            serde_json::to_string(commit)?,
-        ],
-    )?;
-    Ok(())
-}
-
-fn coverage_name(coverage: CoverageStatus) -> &'static str {
-    match coverage {
-        CoverageStatus::Complete => "complete",
-        CoverageStatus::Partial => "partial",
-        CoverageStatus::Unavailable => "unavailable",
-    }
-}
-
-fn parse_coverage(value: &str) -> CoverageStatus {
-    match value {
-        "complete" => CoverageStatus::Complete,
-        "partial" => CoverageStatus::Partial,
-        _ => CoverageStatus::Unavailable,
-    }
-}
-
-fn confidence_name(confidence: AttributionConfidence) -> &'static str {
-    match confidence {
-        AttributionConfidence::High => "high",
-        AttributionConfidence::Medium => "medium",
-    }
-}
-
-fn metric_kind_name(kind: CodeChangeMetricKind) -> &'static str {
-    match kind {
-        CodeChangeMetricKind::AgentEdit => "agent_edit",
-        CodeChangeMetricKind::Committed => "committed",
-        CodeChangeMetricKind::TraceMatchedCommitted => "trace_matched_committed",
-    }
-}
-
-fn new_opaque_committed_metric_id() -> Result<String> {
-    let mut random = [0_u8; 32];
-    getrandom::getrandom(&mut random).context("generate opaque committed metric id")?;
-    Ok(format!("ccm_{}", hex::encode(random)))
-}
-
-fn blinded_committed_metric_id(
-    identity_key: &[u8; 32],
-    repository_hash: &str,
-    commit_hash: &str,
-) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(identity_key)
-        .expect("HMAC accepts fixed-length identity keys");
-    mac.update(b"statsai.committed-metric.v1\0");
-    update_hmac_field(&mut mac, repository_hash);
-    update_hmac_field(&mut mac, commit_hash);
-    format!("ccm_{}", hex::encode(mac.finalize().into_bytes()))
-}
-
-fn update_hmac_field(mac: &mut Hmac<Sha256>, value: &str) {
-    mac.update(&(value.len() as u64).to_be_bytes());
-    mac.update(value.as_bytes());
 }
 
 #[cfg(test)]
