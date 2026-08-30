@@ -8,6 +8,7 @@ pub(super) mod report;
 pub(super) mod scan;
 pub(super) mod schema;
 pub(super) mod service;
+pub(super) mod source;
 pub(super) mod status;
 pub(super) mod store_admin;
 pub(super) mod task;

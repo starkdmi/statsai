@@ -10,10 +10,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::args::{AccountCommand, AccountSubcommand};
 
-use crate::{
+use super::source::{
     canonical_provider, canonical_provider_name, connect_source_to_account,
-    validate_subscription_overlap, ConnectSourceToAccountInput,
+    ConnectSourceToAccountInput,
 };
+use crate::validate_subscription_overlap;
 
 pub(crate) fn account(command: AccountCommand, store: &Store) -> Result<()> {
     match command.command {

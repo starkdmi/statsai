@@ -18,7 +18,7 @@ use std::time::Instant;
 use super::args::ScanCommand;
 use super::format::{abbreviate_home, format_cost, format_u64};
 
-use crate::{
+use super::source::{
     apply_source_account_resolution, canonicalize_account_evidence,
     canonicalize_known_account_evidence, dedupe_overlapping_sources, location_origin_label,
     path_label_from_hashless_source, persist_source_after_preview, preview_path_label,
