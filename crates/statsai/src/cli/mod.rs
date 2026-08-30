@@ -3,6 +3,7 @@ pub(super) mod args;
 pub(super) mod auth;
 pub(super) mod daemon;
 pub(super) mod format;
+pub(super) mod import;
 pub(super) mod report;
 pub(super) mod scan;
 pub(super) mod schema;
