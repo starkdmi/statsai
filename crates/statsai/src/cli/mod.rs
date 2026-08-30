@@ -14,4 +14,5 @@ pub(super) mod source;
 pub(super) mod status;
 pub(super) mod store_admin;
 pub(super) mod subscription;
+pub(super) mod sync;
 pub(super) mod task;
