@@ -1,5 +1,5 @@
 use anyhow::{bail, ensure, Context, Result};
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -57,6 +57,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
 use statsai::{auth, default_device_id, default_store_path, service, snapshot};
+
+mod cli;
+#[cfg(test)]
+use cli::format::subscription_json_value;
+use cli::format::{
+    abbreviate_home, format_cost, format_cursor, format_local_timestamp, format_ratio,
+    format_subscription_price, format_u64, major_unit_amount, parse_date, print_json_lines,
+    print_subscription_json, subscription_status_label, truncate_label, usd_amount_json,
+};
 
 const HTTP_ROLLUP_SUMMARIES_PER_BATCH: usize = 25;
 const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
@@ -6603,13 +6612,6 @@ fn sync_state_report(state: &statsai_store::SyncState) -> SyncStateReport {
     }
 }
 
-fn format_cursor(date: Option<String>, id: Option<&str>) -> String {
-    match (date, id) {
-        (Some(date), Some(id)) => format!("{date}/{id}"),
-        _ => "none".to_string(),
-    }
-}
-
 fn schema(command: SchemaCommand) -> Result<()> {
     match command.command {
         SchemaSubcommand::SyncBatch => {
@@ -7007,13 +7009,6 @@ fn quota_window_heading(window: &QuotaWindowV1) -> String {
     )
 }
 
-fn format_local_timestamp(timestamp: DateTime<Utc>) -> String {
-    timestamp
-        .with_timezone(&Local)
-        .format("%Y-%m-%d %H:%M:%S %Z")
-        .to_string()
-}
-
 fn format_quota_range(range: Option<&statsai_store::QuotaDateRange>) -> String {
     range.map_or_else(
         || "none".to_string(),
@@ -7273,13 +7268,6 @@ fn export_quota_projections(
             writer.flush()?;
         }
         _ => unreachable!("clap validates quota export format"),
-    }
-    Ok(())
-}
-
-fn print_json_lines<T: Serialize>(values: &[T]) -> Result<()> {
-    for value in values {
-        println!("{}", serde_json::to_string(value)?);
     }
     Ok(())
 }
@@ -8008,17 +7996,6 @@ fn doctor(store_path: &Path) -> Result<()> {
     }
     println!("status: ok");
     Ok(())
-}
-
-fn parse_date(value: &str) -> Result<DateTime<Utc>> {
-    if let Ok(date) = DateTime::parse_from_rfc3339(value) {
-        return Ok(date.with_timezone(&Utc));
-    }
-    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")?;
-    let datetime = date
-        .and_hms_opt(0, 0, 0)
-        .context("failed to build midnight timestamp")?;
-    Ok(datetime.and_utc())
 }
 
 #[derive(Debug, Clone)]
@@ -9934,93 +9911,6 @@ fn preview_path_label(source: &SourceLocation) -> String {
         .as_deref()
         .map(abbreviate_home)
         .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn abbreviate_home(path: &str) -> String {
-    let Some(home) = home_dir() else {
-        return path.to_string();
-    };
-    let home = home.to_string_lossy();
-    path.strip_prefix(home.as_ref())
-        .map(|rest| format!("~{rest}"))
-        .unwrap_or_else(|| path.to_string())
-}
-
-fn format_u64(value: u64) -> String {
-    let text = value.to_string();
-    let mut out = String::with_capacity(text.len() + text.len() / 3);
-    for (index, ch) in text.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out.chars().rev().collect()
-}
-
-fn major_unit_amount(cents: i64) -> f64 {
-    cents as f64 / 100.0
-}
-
-fn usd_amount_json(cost: Option<i64>) -> Value {
-    cost.map_or(Value::Null, |cents| json!(major_unit_amount(cents)))
-}
-
-fn format_cost(cost: Option<i64>) -> String {
-    cost.map(|cents| {
-        let dollars = major_unit_amount(cents);
-        format!("${dollars:.2}")
-    })
-    .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn format_subscription_price(price_cents: i64, currency: &str) -> String {
-    let price = major_unit_amount(price_cents);
-    if currency.eq_ignore_ascii_case("USD") {
-        format!("${price:.2}")
-    } else {
-        format!("{price:.2} {currency}")
-    }
-}
-
-fn subscription_json_value(subscription: &Subscription) -> Value {
-    let mut value = serde_json::to_value(subscription).expect("serialize subscription");
-    value["price_cents"] = json!(subscription.price);
-    value["price"] = json!(major_unit_amount(subscription.price));
-    value
-}
-
-fn print_subscription_json(subscription: &Subscription) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&subscription_json_value(subscription))?
-    );
-    Ok(())
-}
-
-fn format_ratio(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.2}x"))
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn truncate_label(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
-        return value.to_string();
-    }
-    value
-        .chars()
-        .take(width.saturating_sub(1))
-        .collect::<String>()
-        + "…"
-}
-
-fn subscription_status_label(status: &SubscriptionStatus) -> &'static str {
-    match status {
-        SubscriptionStatus::Active => "active",
-        SubscriptionStatus::Paused => "paused",
-        SubscriptionStatus::Cancelled => "cancelled",
-    }
 }
 
 fn sanitize_source_for_sync(mut source: SourceLocation) -> SourceLocation {
