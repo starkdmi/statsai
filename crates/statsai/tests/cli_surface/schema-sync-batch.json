@@ -1,0 +1,2809 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SyncBatch",
+  "type": "object",
+  "required": [
+    "batch_id",
+    "created_at",
+    "device_id",
+    "schema_version"
+  ],
+  "properties": {
+    "account_evidence_summaries": {
+      "description": "Aggregate coverage and conflict counts describing how well each account is evidenced. Individual observations never leave the device through this type.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/AccountEvidenceSummaryV1"
+      }
+    },
+    "account_plan_observations": {
+      "description": "Plan labels carrying only the canonical account reference, provider bounds, and evidence grade. Emails, provider user IDs, conversation and turn IDs, artifact paths, and raw provenance are deliberately absent from this type.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/AccountPlanProjectionV1"
+      }
+    },
+    "accounts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ProviderAccount"
+      }
+    },
+    "authoritative_snapshot": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SyncAuthoritativeSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "batch_id": {
+      "type": "string"
+    },
+    "code_change_metrics": {
+      "description": "Privacy-safe numeric code-change metrics. Paths, diffs, source text, tool arguments, and commit messages are deliberately absent from this type.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CodeChangeMetric"
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UsageEvent"
+      }
+    },
+    "quota_cycle_contributions": {
+      "description": "Attributed quota-cycle contributions. Local quota records, payloads, plans, credits, and sample counts are deliberately absent from this type.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/QuotaCycleContributionV1"
+      }
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "source_account_assignments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SourceAccountAssignment"
+      }
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SourceLocation"
+      }
+    },
+    "subscriptions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Subscription"
+      }
+    },
+    "summaries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UsageSummary"
+      }
+    },
+    "task_buckets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskBucketSnapshot"
+      }
+    },
+    "task_verifications": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskVerification"
+      }
+    }
+  },
+  "definitions": {
+    "AccountEvidenceKind": {
+      "type": "string",
+      "enum": [
+        "auth_snapshot",
+        "telemetry_identity",
+        "auth_reload",
+        "reset_history",
+        "login_success",
+        "quota_status",
+        "legacy_local_auth"
+      ]
+    },
+    "AccountEvidenceSummaryV1": {
+      "type": "object",
+      "required": [
+        "conflict_count",
+        "device_id",
+        "directly_bound_conversations",
+        "evidence_kinds",
+        "provider",
+        "provider_account_id",
+        "schema_version",
+        "strong_observation_count",
+        "summary_id",
+        "uncovered_gap_count"
+      ],
+      "properties": {
+        "conflict_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "directly_bound_conversations": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "evidence_kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AccountEvidenceKind"
+          }
+        },
+        "first_strong_observed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_strong_observed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "strong_observation_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "summary_id": {
+          "type": "string"
+        },
+        "uncovered_gap_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "AccountPlanProjectionV1": {
+      "description": "Privacy-safe device contribution sent to the hosted service.",
+      "type": "object",
+      "required": [
+        "confidence",
+        "device_id",
+        "evidence_kind",
+        "is_current_snapshot",
+        "observed_at",
+        "plan_name",
+        "projection_id",
+        "provider",
+        "provider_account_id",
+        "raw_plan_name",
+        "schema_version",
+        "semantic_fingerprint"
+      ],
+      "properties": {
+        "active_from": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "active_until": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "confidence": {
+          "$ref": "#/definitions/Confidence"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "evidence_kind": {
+          "$ref": "#/definitions/AccountEvidenceKind"
+        },
+        "is_current_snapshot": {
+          "type": "boolean"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "plan_name": {
+          "type": "string"
+        },
+        "projection_id": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": "string"
+        },
+        "raw_plan_name": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "semantic_fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "AttributionConfidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium"
+      ]
+    },
+    "BillingPeriod": {
+      "type": "string",
+      "enum": [
+        "monthly",
+        "annual",
+        "custom"
+      ]
+    },
+    "CodeChangeMetric": {
+      "type": "object",
+      "required": [
+        "counts",
+        "day",
+        "device_id",
+        "git_coverage",
+        "kind",
+        "metric_id",
+        "schema_version",
+        "trace_coverage"
+      ],
+      "properties": {
+        "attribution_confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AttributionConfidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "counts": {
+          "$ref": "#/definitions/CodeLineCounts"
+        },
+        "day": {
+          "type": "string",
+          "format": "date"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "git_coverage": {
+          "$ref": "#/definitions/CoverageStatus"
+        },
+        "kind": {
+          "$ref": "#/definitions/CodeChangeMetricKind"
+        },
+        "metric_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "trace_coverage": {
+          "$ref": "#/definitions/CoverageStatus"
+        }
+      }
+    },
+    "CodeChangeMetricKind": {
+      "type": "string",
+      "enum": [
+        "agent_edit",
+        "committed",
+        "trace_matched_committed"
+      ]
+    },
+    "CodeLineCounts": {
+      "type": "object",
+      "required": [
+        "source_additions",
+        "source_deletions",
+        "test_additions",
+        "test_deletions",
+        "unclassified_lines_written"
+      ],
+      "properties": {
+        "source_additions": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "source_deletions": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "test_additions": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "test_deletions": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unclassified_lines_written": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Confidence": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "CostInfo": {
+      "type": "object",
+      "required": [
+        "confidence",
+        "currency"
+      ],
+      "properties": {
+        "confidence": {
+          "$ref": "#/definitions/Confidence"
+        },
+        "currency": {
+          "type": "string"
+        },
+        "estimated_api_equivalent_micro_usd": {
+          "description": "Exact estimated cost in millionths of a USD. New producers populate this alongside the legacy cent field so older consumers remain compatible.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "estimated_api_equivalent_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "pricing_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pricing_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_reported_micro_usd": {
+          "description": "Exact provider-reported cost in millionths of a USD, when available.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "provider_reported_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "CoverageStatus": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "unavailable"
+      ]
+    },
+    "EventSource": {
+      "type": "object",
+      "required": [
+        "adapter_id",
+        "adapter_version",
+        "parse_confidence",
+        "source_kind",
+        "source_type"
+      ],
+      "properties": {
+        "adapter_id": {
+          "type": "string"
+        },
+        "adapter_version": {
+          "type": "string"
+        },
+        "location_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LocationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parse_confidence": {
+          "$ref": "#/definitions/Confidence"
+        },
+        "source_kind": {
+          "$ref": "#/definitions/SourceKind"
+        },
+        "source_path_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_record_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_type": {
+          "type": "string"
+        }
+      }
+    },
+    "GitInfo": {
+      "type": "object",
+      "required": [
+        "nearby_commit_hashes",
+        "nearby_commit_messages"
+      ],
+      "properties": {
+        "correlation_confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Confidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "nearby_commit_hashes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "nearby_commit_messages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "IdentitySource": {
+      "type": "string",
+      "enum": [
+        "provider_auth",
+        "provider_api",
+        "cli_probe",
+        "source_config",
+        "user_configured",
+        "manual_hint",
+        "local_auth",
+        "cookie_oauth",
+        "unresolved",
+        "unknown"
+      ]
+    },
+    "LatencySource": {
+      "type": "string",
+      "enum": [
+        "explicit",
+        "inferred"
+      ]
+    },
+    "LocationOrigin": {
+      "type": "string",
+      "enum": [
+        "default",
+        "configured",
+        "env",
+        "discovered"
+      ]
+    },
+    "MetricStats": {
+      "type": "object",
+      "required": [
+        "samples"
+      ],
+      "properties": {
+        "avg": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "max": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "min": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p50": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p95": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "sum": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
+    },
+    "ModelInfo": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "normalized_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_level": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reasoning_level_raw": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "speed": {
+          "description": "Provider-reported inference speed, such as Claude's `standard` or `fast`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ParseEvidence": {
+      "type": "object",
+      "required": [
+        "account_identity_source",
+        "event_key_version",
+        "model_inferred",
+        "timestamp_inferred"
+      ],
+      "properties": {
+        "account_identity_source": {
+          "$ref": "#/definitions/IdentitySource"
+        },
+        "event_key_version": {
+          "type": "string"
+        },
+        "model_inferred": {
+          "type": "boolean"
+        },
+        "source_file_path_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_line_number": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "source_record_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp_inferred": {
+          "type": "boolean"
+        }
+      }
+    },
+    "PrivacyInfo": {
+      "type": "object",
+      "required": [
+        "contains_file_paths",
+        "contains_prompt_text",
+        "contains_response_text",
+        "mode"
+      ],
+      "properties": {
+        "contains_file_paths": {
+          "type": "boolean"
+        },
+        "contains_prompt_text": {
+          "type": "boolean"
+        },
+        "contains_response_text": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/definitions/PrivacyMode"
+        }
+      }
+    },
+    "PrivacyMode": {
+      "type": "string",
+      "enum": [
+        "metadata_only",
+        "titles_labels",
+        "enriched_summaries"
+      ]
+    },
+    "ProjectInfo": {
+      "type": "object",
+      "required": [
+        "project_id"
+      ],
+      "properties": {
+        "branch_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branch_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "project_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo_remote_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ProviderAccount": {
+      "type": "object",
+      "required": [
+        "confidence",
+        "created_at",
+        "identity_source",
+        "provider",
+        "provider_account_id",
+        "schema_version",
+        "updated_at"
+      ],
+      "properties": {
+        "account_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "confidence": {
+          "$ref": "#/definitions/Confidence"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "email_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "identity_source": {
+          "$ref": "#/definitions/IdentitySource"
+        },
+        "org_id_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": "string"
+        },
+        "provider_user_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_user_id_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "verified_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "QuotaCycleContributionV1": {
+      "description": "Hosted device contribution for one attributed quota cycle. Omits raw events, paths, source IDs, payloads, plans, credits, slots, fingerprints, and sample counts.",
+      "type": "object",
+      "required": [
+        "contribution_id",
+        "provider",
+        "provider_account_id",
+        "representative_reset",
+        "representative_reset_epoch_seconds",
+        "schema_version",
+        "window_minutes"
+      ],
+      "properties": {
+        "boundary_slices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/QuotaUsageSliceV1"
+          }
+        },
+        "contribution_id": {
+          "description": "Deterministic device contribution ID, not a logical account-cycle ID.",
+          "type": "string"
+        },
+        "daily_envelopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/QuotaDailyEnvelopeV1"
+          }
+        },
+        "has_schedule_overlap": {
+          "description": "True when this device locally reconstructed another cycle for the same scope whose schedule overlaps this one. Codex weekly cycles start lazily at first use, so a corroborated overlap means the neighbouring cycle was reset early (banked or server-granted), not that the data conflicts.",
+          "default": false,
+          "type": "boolean"
+        },
+        "limit_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": "string"
+        },
+        "representative_reset": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "representative_reset_epoch_seconds": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "window_minutes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "QuotaDailyEnvelopeV1": {
+      "description": "Timestamped first/last/min/max percentages observed on one UTC day.",
+      "type": "object",
+      "required": [
+        "day",
+        "first_observed_at",
+        "first_used_percent",
+        "last_observed_at",
+        "last_used_percent",
+        "maximum_used_percent",
+        "minimum_used_percent"
+      ],
+      "properties": {
+        "day": {
+          "type": "string"
+        },
+        "first_observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "first_used_percent": {
+          "type": "number",
+          "format": "double"
+        },
+        "last_observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "last_used_percent": {
+          "type": "number",
+          "format": "double"
+        },
+        "maximum_used_percent": {
+          "type": "number",
+          "format": "double"
+        },
+        "minimum_used_percent": {
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "QuotaUsageSliceV1": {
+      "description": "Exact usage for a partial UTC day at a cycle or schedule-transition boundary.",
+      "type": "object",
+      "required": [
+        "cache_creation_tokens",
+        "cache_read_tokens",
+        "estimated_cost_micro_usd",
+        "input_tokens",
+        "output_tokens",
+        "period_end",
+        "period_start",
+        "reasoning_tokens",
+        "total_tokens"
+      ],
+      "properties": {
+        "cache_creation_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_read_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "estimated_cost_micro_usd": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "period_end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "period_start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reasoning_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ReasoningLevel": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultracode"
+      ]
+    },
+    "RuntimeInfo": {
+      "type": "object",
+      "properties": {
+        "assistant_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "developer_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "eval_duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "host_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "latency_ms": {
+          "description": "End-to-end request or turn duration, not time to first token.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "latency_source": {
+          "description": "Provenance of latency_ms when the adapter can distinguish it.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LatencySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prompt_eval_duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "runtime_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_to_first_token_ms": {
+          "description": "Time from request start until the first visible token arrives.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "user_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SessionInfo": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "started_at"
+      ],
+      "properties": {
+        "duration_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "local_session_id_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SourceAccountAssignment": {
+      "type": "object",
+      "required": [
+        "assignment_id",
+        "created_at",
+        "provider",
+        "provider_account_id",
+        "schema_version",
+        "source_id",
+        "started_at",
+        "updated_at"
+      ],
+      "properties": {
+        "assignment_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": "string"
+        },
+        "record_source": {
+          "default": "unknown",
+          "allOf": [
+            {
+              "$ref": "#/definitions/IdentitySource"
+            }
+          ]
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "verified_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "SourceKind": {
+      "type": "string",
+      "enum": [
+        "local_adapter",
+        "local_summary",
+        "local_api",
+        "provider_api",
+        "cli_probe",
+        "sdk_instrumented",
+        "external_report",
+        "manual"
+      ]
+    },
+    "SourceLocation": {
+      "type": "object",
+      "required": [
+        "created_at",
+        "enabled",
+        "location_origin",
+        "provider",
+        "schema_version",
+        "source_id",
+        "source_kind",
+        "updated_at"
+      ],
+      "properties": {
+        "adapter_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "adapter_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "location_origin": {
+          "$ref": "#/definitions/LocationOrigin"
+        },
+        "path_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_kind": {
+          "$ref": "#/definitions/SourceKind"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "verification_mode": {
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceVerificationMode"
+            }
+          ]
+        },
+        "verified_state_hash": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SourceVerificationMode": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "manual_only",
+        "disabled"
+      ]
+    },
+    "Subscription": {
+      "type": "object",
+      "required": [
+        "billing_period",
+        "currency",
+        "plan_name",
+        "price",
+        "provider",
+        "provider_account_id",
+        "schema_version",
+        "started_at",
+        "status",
+        "subscription_id"
+      ],
+      "properties": {
+        "billing_period": {
+          "$ref": "#/definitions/BillingPeriod"
+        },
+        "currency": {
+          "type": "string"
+        },
+        "current_period_ends_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paid_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "plan_name": {
+          "type": "string"
+        },
+        "price": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": "string"
+        },
+        "record_source": {
+          "default": "unknown",
+          "allOf": [
+            {
+              "$ref": "#/definitions/IdentitySource"
+            }
+          ]
+        },
+        "renewal_day": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "$ref": "#/definitions/SubscriptionStatus"
+        },
+        "subscription_id": {
+          "type": "string"
+        },
+        "verified_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "SubscriptionStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "paused",
+        "cancelled"
+      ]
+    },
+    "SummaryMetadata": {
+      "type": "object",
+      "required": [
+        "summary_format"
+      ],
+      "properties": {
+        "last_computed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "summary_format": {
+          "type": "string"
+        },
+        "summary_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_sessions": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SummaryMetricTotals": {
+      "type": "object",
+      "required": [
+        "samples",
+        "sum"
+      ],
+      "properties": {
+        "samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "sum": {
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "SummaryMetrics": {
+      "type": "object",
+      "properties": {
+        "active_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "assistant_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_hit_ratio": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MetricStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "developer_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "generated_tps": {
+          "description": "Per-turn generated throughput distribution across tracked turns.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MetricStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "latency_ms": {
+          "description": "Aggregated end-to-end request or turn duration, not TTFT.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MetricStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "overall_generated_tps": {
+          "description": "Overall generated throughput across tracked active time.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "overall_visible_tps": {
+          "description": "Overall visible throughput across tracked active time.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "reasoning_share": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MetricStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_to_first_token_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MetricStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "total_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tracked_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tracked_reasoning_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tracked_requests": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "user_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "visible_tps": {
+          "description": "Per-turn visible throughput distribution across tracked turns.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MetricStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "SummaryModelMetrics": {
+      "type": "object",
+      "properties": {
+        "generated_tps": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SummaryMetricTotals"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "SummaryModelUsage": {
+      "type": "object",
+      "required": [
+        "cost",
+        "model",
+        "usage"
+      ],
+      "properties": {
+        "cost": {
+          "$ref": "#/definitions/CostInfo"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SummaryModelMetrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "$ref": "#/definitions/ModelInfo"
+        },
+        "usage": {
+          "$ref": "#/definitions/UsageCounts"
+        }
+      }
+    },
+    "SyncAuthoritativeSnapshot": {
+      "type": "object",
+      "required": [
+        "part_count",
+        "part_index",
+        "snapshot_id"
+      ],
+      "properties": {
+        "account_evidence_summary_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "account_plan_observation_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "code_change_metric_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "part_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "part_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "provider_account_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "quota_cycle_contribution_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "snapshot_id": {
+          "type": "string"
+        },
+        "source_account_assignment_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "subscription_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "summary_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "TaskBucketSnapshot": {
+      "type": "object",
+      "required": [
+        "generated_at",
+        "project_bucket"
+      ],
+      "properties": {
+        "applied_verification_cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskVerificationCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorkItemMember"
+          }
+        },
+        "project_bucket": {
+          "type": "string"
+        },
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskSpan"
+          }
+        },
+        "work_items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorkItem"
+          }
+        }
+      }
+    },
+    "TaskSpan": {
+      "type": "object",
+      "required": [
+        "confidence",
+        "is_meta",
+        "normalized_title",
+        "project_bucket",
+        "provider",
+        "schema_version",
+        "source_id",
+        "span_id",
+        "span_kind",
+        "started_at",
+        "title",
+        "usage"
+      ],
+      "properties": {
+        "assistant_messages": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "branch_family": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "confidence": {
+          "$ref": "#/definitions/Confidence"
+        },
+        "developer_messages": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "duration_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "estimated_cost_micro_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "estimated_cost_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "event_count": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "git": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GitInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "has_usage_evidence": {
+          "default": false,
+          "type": "boolean"
+        },
+        "is_meta": {
+          "type": "boolean"
+        },
+        "issue_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "linked_event_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "normalized_title": {
+          "type": "string"
+        },
+        "project": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProjectInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "project_bucket": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_file_path_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_record_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "span_id": {
+          "type": "string"
+        },
+        "span_kind": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "summary_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary_preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "title_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "todo_excerpt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_messages": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "usage": {
+          "$ref": "#/definitions/UsageCounts"
+        },
+        "user_messages": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "TaskStatus": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "needs_review",
+        "verified",
+        "rejected_meta"
+      ]
+    },
+    "TaskVerdict": {
+      "type": "string",
+      "enum": [
+        "meta",
+        "system",
+        "noise"
+      ]
+    },
+    "TaskVerification": {
+      "type": "object",
+      "required": [
+        "action",
+        "action_key",
+        "created_at",
+        "schema_version",
+        "updated_at",
+        "verification_id"
+      ],
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/TaskVerificationAction"
+        },
+        "action_key": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "verification_id": {
+          "type": "string"
+        }
+      }
+    },
+    "TaskVerificationAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "anchor_span_id",
+            "type",
+            "work_item_id"
+          ],
+          "properties": {
+            "anchor_span_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "accept"
+              ]
+            },
+            "work_item_id": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "anchor_span_id",
+            "reason",
+            "type",
+            "work_item_id"
+          ],
+          "properties": {
+            "anchor_span_id": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/definitions/TaskVerdict"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "reject"
+              ]
+            },
+            "work_item_id": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "anchor_span_id",
+            "title",
+            "type",
+            "work_item_id"
+          ],
+          "properties": {
+            "anchor_span_id": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "rename"
+              ]
+            },
+            "work_item_id": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "after_span_id",
+            "type"
+          ],
+          "properties": {
+            "after_span_id": {
+              "type": "string"
+            },
+            "before_span_id": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "left_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "right_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "split"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "left_anchor_span_id",
+            "left_work_item_id",
+            "right_anchor_span_id",
+            "right_work_item_id",
+            "type"
+          ],
+          "properties": {
+            "left_anchor_span_id": {
+              "type": "string"
+            },
+            "left_work_item_id": {
+              "type": "string"
+            },
+            "right_anchor_span_id": {
+              "type": "string"
+            },
+            "right_work_item_id": {
+              "type": "string"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "merge"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "TaskVerificationCursor": {
+      "type": "object",
+      "required": [
+        "updated_at",
+        "verification_id"
+      ],
+      "properties": {
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "verification_id": {
+          "type": "string"
+        }
+      }
+    },
+    "UsageCounts": {
+      "type": "object",
+      "properties": {
+        "cache_creation_1h_tokens": {
+          "description": "Anthropic cache writes using the extended one-hour lifetime.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_creation_5m_tokens": {
+          "description": "Anthropic cache writes using the default five-minute lifetime.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_creation_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_read_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "local_eval_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "local_prompt_eval_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "reasoning_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UsageEvent": {
+      "type": "object",
+      "required": [
+        "cost",
+        "created_at",
+        "device_id",
+        "event_id",
+        "imported_at",
+        "privacy",
+        "provider",
+        "schema_version",
+        "session",
+        "source",
+        "source_id",
+        "usage"
+      ],
+      "properties": {
+        "cost": {
+          "$ref": "#/definitions/CostInfo"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "git": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GitInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "imported_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parse_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ParseEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "privacy": {
+          "$ref": "#/definitions/PrivacyInfo"
+        },
+        "project": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProjectInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RuntimeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/definitions/SessionInfo"
+        },
+        "source": {
+          "$ref": "#/definitions/EventSource"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "subscription_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "usage": {
+          "$ref": "#/definitions/UsageCounts"
+        }
+      }
+    },
+    "UsageSummary": {
+      "type": "object",
+      "required": [
+        "cost",
+        "device_id",
+        "imported_at",
+        "metadata",
+        "observed_at",
+        "privacy",
+        "provider",
+        "schema_version",
+        "source",
+        "source_id",
+        "summary_id",
+        "usage"
+      ],
+      "properties": {
+        "cost": {
+          "$ref": "#/definitions/CostInfo"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "imported_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "metadata": {
+          "$ref": "#/definitions/SummaryMetadata"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SummaryMetrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SummaryModelUsage"
+          }
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "parse_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ParseEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "period_end": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "period_start": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "privacy": {
+          "$ref": "#/definitions/PrivacyInfo"
+        },
+        "project": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProjectInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/EventSource"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "summary_id": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/definitions/UsageCounts"
+        }
+      }
+    },
+    "WorkItem": {
+      "type": "object",
+      "required": [
+        "anchor_span_id",
+        "confidence",
+        "cross_provider",
+        "ended_at",
+        "event_count",
+        "no_git",
+        "normalized_title",
+        "project_bucket",
+        "schema_version",
+        "span_count",
+        "started_at",
+        "status",
+        "tail_span_id",
+        "title",
+        "total_cache_creation_tokens",
+        "total_cache_read_tokens",
+        "total_input_tokens",
+        "total_output_tokens",
+        "total_reasoning_tokens",
+        "total_tokens",
+        "work_item_id"
+      ],
+      "properties": {
+        "anchor_span_id": {
+          "type": "string"
+        },
+        "branch_labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "confidence": {
+          "$ref": "#/definitions/Confidence"
+        },
+        "continuation_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cross_provider": {
+          "type": "boolean"
+        },
+        "duration_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "estimated_cost_micro_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "estimated_cost_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "event_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "issue_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "no_git": {
+          "type": "boolean"
+        },
+        "normalized_title": {
+          "type": "string"
+        },
+        "path_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_bucket": {
+          "type": "string"
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "repo_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "review_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "span_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "$ref": "#/definitions/TaskStatus"
+        },
+        "summary_preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tail_span_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "todo_excerpt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_cache_creation_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_cache_read_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_reasoning_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "work_item_id": {
+          "type": "string"
+        }
+      }
+    },
+    "WorkItemMember": {
+      "type": "object",
+      "required": [
+        "ordinal",
+        "span_id",
+        "work_item_id"
+      ],
+      "properties": {
+        "ordinal": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "span_id": {
+          "type": "string"
+        },
+        "work_item_id": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

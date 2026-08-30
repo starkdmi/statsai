@@ -1,0 +1,214 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "QuotaWindowSyncProjectionV1",
+  "type": "object",
+  "required": [
+    "change_points",
+    "device_id",
+    "first_observed_at",
+    "first_used_percent",
+    "inferred_start",
+    "last_observed_at",
+    "latest_status",
+    "latest_used_percent",
+    "maximum_used_percent",
+    "minimum_used_percent",
+    "projection_id",
+    "provider",
+    "provider_account_id",
+    "representative_reset",
+    "representative_reset_epoch_seconds",
+    "reset_max",
+    "reset_max_epoch_seconds",
+    "reset_min",
+    "reset_min_epoch_seconds",
+    "sample_count",
+    "schema_version",
+    "window_minutes"
+  ],
+  "properties": {
+    "change_points": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/QuotaChangePointV1"
+      }
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "first_observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "first_used_percent": {
+      "type": "number",
+      "format": "double"
+    },
+    "inferred_start": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "latest_status": {
+      "$ref": "#/definitions/QuotaProjectionStatusV1"
+    },
+    "latest_used_percent": {
+      "type": "number",
+      "format": "double"
+    },
+    "limit_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "maximum_used_percent": {
+      "type": "number",
+      "format": "double"
+    },
+    "minimum_used_percent": {
+      "type": "number",
+      "format": "double"
+    },
+    "projection_id": {
+      "description": "A deterministic device contribution, not a logical account-window ID.",
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "provider_account_id": {
+      "type": "string"
+    },
+    "representative_reset": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "representative_reset_epoch_seconds": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "reset_max": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "reset_max_epoch_seconds": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "reset_min": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "reset_min_epoch_seconds": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "sample_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "window_minutes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "QuotaChangePointV1": {
+      "type": "object",
+      "required": [
+        "observed_at",
+        "point_fingerprint",
+        "provider_slot",
+        "resets_at",
+        "resets_at_epoch_seconds",
+        "used_percent"
+      ],
+      "properties": {
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "point_fingerprint": {
+          "type": "string"
+        },
+        "provider_slot": {
+          "type": "string"
+        },
+        "resets_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "resets_at_epoch_seconds": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "used_percent": {
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "QuotaProjectionCreditsV1": {
+      "type": "object",
+      "properties": {
+        "balance": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "has_credits": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "unlimited": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "QuotaProjectionStatusV1": {
+      "type": "object",
+      "required": [
+        "credits"
+      ],
+      "properties": {
+        "credits": {
+          "$ref": "#/definitions/QuotaProjectionCreditsV1"
+        },
+        "individual_limit": true,
+        "plan_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reached_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spend_control_state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}
