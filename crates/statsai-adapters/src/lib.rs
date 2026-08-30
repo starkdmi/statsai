@@ -1,9 +1,9 @@
 //! Provider adapters for local AI usage sources.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
 use statsai_core::{
@@ -32,11 +32,30 @@ use statsai_pricing::{
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use url::Url;
 use walkdir::WalkDir;
+
+mod archive;
+mod cache;
+mod json;
+mod sqlite;
+
+pub(crate) use cache::{
+    file_metadata_signature, scan_cache_namespaces, scan_candidate,
+    scan_candidate_with_compatible_dependencies, ScanCacheNamespaces,
+};
+pub(crate) use json::{
+    file_modified_timestamp, number_at_any, read_bounded_jsonl_line, read_json_file,
+    stats_cache_date_end, timestamp_from_millis, timestamp_from_nested_value,
+    timestamp_from_number, timestamp_from_scalar, value_as_u64, BoundedLineRead,
+    MAX_JSONL_RECORD_BYTES,
+};
+pub(crate) use sqlite::{
+    open_sqlite_readonly, sqlite_column_exists, sqlite_nonzero_u64, sqlite_table_exists,
+};
 
 pub const CLAUDE_CODE_PROVIDER: &str = "claude_code";
 pub const CODEX_PROVIDER: &str = "codex";
@@ -45,16 +64,6 @@ pub const GROK_BUILD_PROVIDER: &str = "grok_build";
 const SESSION_SCOPED_EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
 const PATH_INDEPENDENT_EVENT_KEY_VERSION: &str = "semantic_usage_event.v4";
 const PROVIDER_RECORD_EVENT_KEY_VERSION: &str = "provider_record_usage_event.v1";
-const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
-// Invalidate unchanged-file scan cache entries whenever provider parsing semantics change,
-// so historical sessions get rescanned for runtime, pricing, and project context updates.
-// session-identity.v28: usage events adopt the session_meta id (the telemetry
-// `conversation.id`) as their session identity; cached files must reparse or
-// conversation-to-account bindings can never reach previously scanned events.
-const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "session-identity.v28";
-const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v23";
-const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
-const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v20";
 const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -71,7 +80,6 @@ const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
 ];
 const CODEX_TASK_PREVIEW_RAW_BYTES: usize = 24 * 1024;
 const CODEX_ACCOUNT_EVIDENCE_PARSER_VERSION: &str = "codex-account-evidence.v2";
-pub(crate) const MAX_JSONL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexTelemetryCursor {
@@ -148,75 +156,6 @@ fn codex_telemetry_checkpoint_row_fingerprint(
         body.as_deref()
             .map_or_else(|| "none".to_string(), hash_text,)
     )))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BoundedLineRead {
-    Eof,
-    Complete,
-    Oversized,
-}
-
-pub(crate) fn read_bounded_jsonl_line(
-    reader: &mut impl BufRead,
-    line: &mut Vec<u8>,
-    max_bytes: usize,
-) -> std::io::Result<BoundedLineRead> {
-    line.clear();
-    let mut oversized = false;
-    let mut saw_bytes = false;
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            if !saw_bytes {
-                return Ok(BoundedLineRead::Eof);
-            }
-            if oversized || line.len() > max_bytes {
-                line.clear();
-                return Ok(BoundedLineRead::Oversized);
-            }
-            return Ok(BoundedLineRead::Complete);
-        }
-        let consumed = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
-        let ended = available.get(consumed.saturating_sub(1)) == Some(&b'\n');
-        saw_bytes = true;
-        if !oversized {
-            let delimiter_bytes = if ended {
-                let preceding_byte = if consumed >= 2 {
-                    available.get(consumed - 2)
-                } else {
-                    line.last()
-                };
-                1 + usize::from(preceding_byte == Some(&b'\r'))
-            } else {
-                0
-            };
-            let record_bytes = line
-                .len()
-                .saturating_add(consumed)
-                .saturating_sub(delimiter_bytes);
-            let deferred_cr = !ended
-                && record_bytes == max_bytes.saturating_add(1)
-                && available.get(consumed - 1) == Some(&b'\r');
-            if record_bytes <= max_bytes || deferred_cr {
-                line.extend_from_slice(&available[..consumed]);
-            } else {
-                line.clear();
-                oversized = true;
-            }
-        }
-        reader.consume(consumed);
-        if ended {
-            return Ok(if oversized {
-                BoundedLineRead::Oversized
-            } else {
-                BoundedLineRead::Complete
-            });
-        }
-    }
 }
 
 fn usd_to_micro_usd(usd: f64) -> Option<i64> {
@@ -2254,139 +2193,6 @@ fn codex_usage_root_for_file(root: &Path, path: &Path) -> PathBuf {
         }
     }
     root.to_path_buf()
-}
-
-fn scan_candidate(
-    path: PathBuf,
-    dependency_signature: Option<&str>,
-    cache_namespaces: &ScanCacheNamespaces,
-) -> ScanCandidateFile {
-    scan_candidate_with_compatible_dependencies(path, dependency_signature, &[], cache_namespaces)
-}
-
-fn scan_candidate_with_compatible_dependencies(
-    path: PathBuf,
-    dependency_signature: Option<&str>,
-    compatible_dependency_signatures: &[String],
-    cache_namespaces: &ScanCacheNamespaces,
-) -> ScanCandidateFile {
-    let cache_key = canonical_display(&path);
-    let file_signature = file_metadata_signature(&path);
-    let cache_signature = build_scan_cache_signature(
-        &cache_namespaces.current,
-        &file_signature,
-        dependency_signature,
-    );
-    let mut compatible_cache_signatures = Vec::new();
-    for dependency in compatible_dependency_signatures {
-        push_compatible_cache_signature(
-            &mut compatible_cache_signatures,
-            &cache_signature,
-            build_scan_cache_signature(
-                &cache_namespaces.current,
-                &file_signature,
-                Some(dependency.as_str()),
-            ),
-        );
-    }
-    for namespace in &cache_namespaces.compatible {
-        push_compatible_cache_signature(
-            &mut compatible_cache_signatures,
-            &cache_signature,
-            build_scan_cache_signature(namespace, &file_signature, dependency_signature),
-        );
-        for dependency in compatible_dependency_signatures {
-            push_compatible_cache_signature(
-                &mut compatible_cache_signatures,
-                &cache_signature,
-                build_scan_cache_signature(namespace, &file_signature, Some(dependency.as_str())),
-            );
-        }
-    }
-    ScanCandidateFile {
-        path,
-        cache_key,
-        cache_signature,
-        compatible_cache_signatures,
-    }
-}
-
-fn push_compatible_cache_signature(compatible: &mut Vec<String>, current: &str, candidate: String) {
-    if candidate != current && !compatible.contains(&candidate) {
-        compatible.push(candidate);
-    }
-}
-
-fn build_scan_cache_signature(
-    cache_namespace: &str,
-    file_signature: &str,
-    dependency_signature: Option<&str>,
-) -> String {
-    dependency_signature
-        .map(|dependency| hash_text(&format!("{cache_namespace}:{file_signature}:{dependency}")))
-        .unwrap_or_else(|| hash_text(&format!("{cache_namespace}:{file_signature}")))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ScanCacheNamespaces {
-    current: String,
-    compatible: Vec<String>,
-}
-
-fn scan_cache_namespaces(source: &SourceLocation, adapter_version: &str) -> ScanCacheNamespaces {
-    let adapter_id = source.adapter_id.as_deref().unwrap_or("");
-    let path_hash = source.path_hash.as_deref().unwrap_or("");
-    let parser_revision = scan_cache_parser_revision(source);
-    let current = hash_text(&format!(
-        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{path_hash}:{parser_revision}",
-        source.provider, source.source_kind,
-    ));
-    let versioned = hash_text(&format!(
-        "{SCAN_CACHE_SIGNATURE_VERSION}:{}:{:?}:{adapter_id}:{adapter_version}:{path_hash}:{parser_revision}",
-        source.provider, source.source_kind,
-    ));
-    ScanCacheNamespaces {
-        current,
-        compatible: vec![versioned],
-    }
-}
-
-fn scan_cache_parser_revision(source: &SourceLocation) -> &'static str {
-    match source.provider.as_str() {
-        CODEX_PROVIDER => CODEX_SCAN_CACHE_PARSER_REVISION,
-        CLAUDE_CODE_PROVIDER => CLAUDE_SCAN_CACHE_PARSER_REVISION,
-        OPENCODE_PROVIDER => OPENCODE_SCAN_CACHE_PARSER_REVISION,
-        GROK_BUILD_PROVIDER => GROK_BUILD_SCAN_CACHE_PARSER_REVISION,
-        _ => "default",
-    }
-}
-
-fn file_metadata_signature(path: &Path) -> String {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return "missing".to_string();
-    };
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok());
-    let (seconds, nanos) = modified
-        .map(|value| (value.as_secs(), value.subsec_nanos()))
-        .unwrap_or((0, 0));
-    let created = metadata
-        .created()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok());
-    let (created_seconds, created_nanos) = created
-        .map(|value| (value.as_secs(), value.subsec_nanos()))
-        .unwrap_or((0, 0));
-    hash_text(&format!(
-        "meta.v2:{}:{}:{}:{}:{}",
-        metadata.len(),
-        seconds,
-        nanos,
-        created_seconds,
-        created_nanos
-    ))
 }
 
 fn codex_legacy_auth_dependency_signature(root: &Path) -> String {
@@ -5663,121 +5469,6 @@ fn subtract_usage_counts(current: &UsageCounts, previous: Option<&UsageCounts>) 
     }
 }
 
-fn number_at_any(value: &Value, keys: &[&str]) -> Option<u64> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(value_as_u64))
-}
-
-fn value_as_u64(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| {
-            value
-                .as_i64()
-                .and_then(|value| (value >= 0).then_some(value as u64))
-        })
-        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
-}
-
-fn timestamp_from_nested_value(value: &Value) -> Option<DateTime<Utc>> {
-    for candidate in [
-        value.get("timestamp"),
-        value.get("created_at"),
-        value.get("createdAt"),
-        value.get("time"),
-        value.pointer("/message/timestamp"),
-        value.pointer("/data/timestamp"),
-        value.pointer("/result/timestamp"),
-        value.pointer("/response/timestamp"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(timestamp) = timestamp_from_scalar(candidate) {
-            return Some(timestamp);
-        }
-    }
-    None
-}
-
-fn timestamp_from_scalar(value: &Value) -> Option<DateTime<Utc>> {
-    if let Some(text) = value.as_str() {
-        if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
-            return Some(parsed.with_timezone(&Utc));
-        }
-        if let Ok(millis) = text.parse::<i64>() {
-            return timestamp_from_number(millis);
-        }
-    }
-    value.as_i64().and_then(timestamp_from_number)
-}
-
-fn stats_cache_date_end(value: &Value) -> Option<DateTime<Utc>> {
-    timestamp_from_scalar(value).or_else(|| {
-        let text = value.as_str()?;
-        let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
-        Some(date.and_hms_opt(23, 59, 59)?.and_utc())
-    })
-}
-
-fn timestamp_from_number(value: i64) -> Option<DateTime<Utc>> {
-    if value > 10_000_000_000 {
-        Utc.timestamp_millis_opt(value).single()
-    } else {
-        Utc.timestamp_opt(value, 0).single()
-    }
-}
-
-fn timestamp_from_millis(value: i64) -> Option<DateTime<Utc>> {
-    Utc.timestamp_millis_opt(value).single()
-}
-
-fn file_modified_timestamp(path: &Path) -> Option<DateTime<Utc>> {
-    path.metadata()
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .map(DateTime::<Utc>::from)
-}
-
-fn read_json_file(path: &Path) -> Option<Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-fn open_sqlite_readonly(path: &Path) -> Result<Connection> {
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("open sqlite {}", path.display()))
-}
-
-fn sqlite_table_exists(connection: &Connection, table: &str) -> Result<bool> {
-    Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [table],
-        |row| row.get(0),
-    )?)
-}
-
-fn sqlite_column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn sqlite_nonzero_u64(value: i64) -> Option<u64> {
-    (value > 0).then_some(value as u64)
-}
-
 fn model_from_nested_value(value: &Value, fallback: Option<&str>) -> Option<ModelInfo> {
     let model = [
         value.get("model"),
@@ -8879,61 +8570,12 @@ fn metadata_only_privacy() -> PrivacyInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufReader, Cursor, Write};
-
-    #[test]
-    fn bounded_jsonl_reader_discards_an_oversized_record_and_recovers_next_line() {
-        let input = format!("{}\n{{\"ok\":true}}\n", "x".repeat(9));
-        let mut reader = BufReader::new(Cursor::new(input.into_bytes()));
-        let mut line = Vec::new();
-
-        assert_eq!(
-            read_bounded_jsonl_line(&mut reader, &mut line, 8).expect("oversized line"),
-            BoundedLineRead::Oversized
-        );
-        assert!(line.is_empty());
-        assert_eq!(
-            read_bounded_jsonl_line(&mut reader, &mut line, 32).expect("next line"),
-            BoundedLineRead::Complete
-        );
-        assert_eq!(line, b"{\"ok\":true}\n");
-    }
-
-    #[test]
-    fn bounded_jsonl_reader_excludes_eof_lf_and_crlf_delimiters_from_the_limit() {
-        for input in [b"12345678".as_slice(), b"12345678\n", b"12345678\r\n"] {
-            let mut reader = BufReader::new(Cursor::new(input));
-            let mut line = Vec::new();
-
-            assert_eq!(
-                read_bounded_jsonl_line(&mut reader, &mut line, 8).expect("boundary line"),
-                BoundedLineRead::Complete,
-                "input {input:?}"
-            );
-            assert_eq!(line, input, "input {input:?}");
-        }
-    }
-
-    #[test]
-    fn bounded_jsonl_reader_handles_crlf_split_across_buffers_at_the_limit() {
-        let input = b"12345678\r\n";
-        let mut reader = BufReader::with_capacity(9, Cursor::new(input));
-        let mut line = Vec::new();
-
-        assert_eq!(
-            read_bounded_jsonl_line(&mut reader, &mut line, 8).expect("split CRLF line"),
-            BoundedLineRead::Complete
-        );
-        assert_eq!(line, input);
-
-        let mut unterminated_reader = BufReader::new(Cursor::new(b"12345678\r"));
-        assert_eq!(
-            read_bounded_jsonl_line(&mut unterminated_reader, &mut line, 8)
-                .expect("unterminated trailing CR"),
-            BoundedLineRead::Oversized
-        );
-        assert!(line.is_empty());
-    }
+    use crate::cache::{
+        build_scan_cache_signature, CLAUDE_SCAN_CACHE_PARSER_REVISION,
+        CODEX_SCAN_CACHE_PARSER_REVISION, GROK_BUILD_SCAN_CACHE_PARSER_REVISION,
+        OPENCODE_SCAN_CACHE_PARSER_REVISION, SCAN_CACHE_SIGNATURE_VERSION,
+    };
+    use std::io::Write;
 
     fn options() -> ScanOptions {
         ScanOptions {
@@ -17441,4 +17083,3 @@ mod tests {
         assert_eq!(empty_used.name.as_deref(), Some("grok-4.5"));
     }
 }
-mod archive;
