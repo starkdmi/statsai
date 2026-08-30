@@ -1,6 +1,7 @@
 pub(super) mod account;
 pub(super) mod args;
 pub(super) mod auth;
+pub(super) mod conversation;
 pub(super) mod daemon;
 pub(super) mod format;
 pub(super) mod import;
