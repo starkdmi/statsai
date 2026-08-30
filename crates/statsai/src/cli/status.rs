@@ -4,10 +4,11 @@ use statsai_store::Store;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::{
-    format_cache_key_sample, location_origin_label, preview_path_label,
-    scan_candidate_compatible_signatures, scan_file_state_entries, scan_sources_for_adapter,
+use super::scan::{
+    format_cache_key_sample, scan_candidate_compatible_signatures, scan_file_state_entries,
+    scan_sources_for_adapter,
 };
+use crate::{location_origin_label, preview_path_label};
 
 pub(crate) fn status(store: &Store) -> Result<()> {
     println!("stored all-time events: {}", store.event_count()?);
