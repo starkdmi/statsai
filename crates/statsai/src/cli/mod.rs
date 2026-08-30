@@ -1,3 +1,4 @@
+pub(super) mod account;
 pub(super) mod args;
 pub(super) mod auth;
 pub(super) mod daemon;
