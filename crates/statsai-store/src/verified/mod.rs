@@ -8,14 +8,14 @@ pub use accounts::{
     find_existing_provider_account, upsert_provider_account, verified_source_observation_hash,
     verified_source_state_hash, UpsertProviderAccountInput,
 };
+pub(crate) use assignments::is_verified_source_assignment;
+#[cfg(test)]
+pub(crate) use assignments::upsert_verified_source_assignment;
 pub use assignments::{
     apply_source_account_resolution, apply_verified_source_state,
     close_active_verified_source_assignments, close_active_verified_source_linkages,
     reconcile_verified_source_state,
 };
-pub(crate) use assignments::is_verified_source_assignment;
-#[cfg(test)]
-pub(crate) use assignments::upsert_verified_source_assignment;
 
 pub(crate) fn upsert_verified_subscription(
     store: &Store,
