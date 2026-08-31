@@ -1,5 +1,9 @@
 use super::*;
 
+mod placeholders;
+
+pub(crate) use placeholders::*;
+
 pub(crate) fn restrict_dir_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

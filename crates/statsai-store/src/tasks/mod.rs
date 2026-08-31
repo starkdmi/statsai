@@ -18,6 +18,7 @@ mod titles;
 mod verification;
 mod work_items;
 
+pub(crate) use super::{sqlite_in_clause_placeholders, sqlite_string_params};
 pub(crate) use benchmark::*;
 pub(crate) use grouping::*;
 pub(crate) use titles::*;
@@ -105,17 +106,6 @@ pub struct TaskStats {
     pub cross_provider_percentage: f64,
     pub rejected_meta_percentage: f64,
     pub average_spans_per_work_item: f64,
-}
-
-pub(crate) fn sqlite_in_clause_placeholders(count: usize) -> String {
-    (0..count).map(|_| "?").collect::<Vec<_>>().join(",")
-}
-
-pub(crate) fn sqlite_string_params(values: &[String]) -> Vec<&dyn rusqlite::types::ToSql> {
-    values
-        .iter()
-        .map(|value| value as &dyn rusqlite::types::ToSql)
-        .collect()
 }
 
 #[derive(Debug, Clone)]

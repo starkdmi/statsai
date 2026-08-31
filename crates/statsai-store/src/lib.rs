@@ -29,7 +29,8 @@ pub(crate) use rollups::{
 };
 pub(crate) use sql::{
     begin_immediate_transaction_with_retry, commit_transaction, restrict_dir_permissions,
-    restrict_file_permissions, rollback, safe_u64_to_i64, sync_state_from_row,
+    restrict_file_permissions, rollback, safe_u64_to_i64, sqlite_in_clause_placeholders,
+    sqlite_string_params, sync_state_from_row,
 };
 pub use verified::{
     apply_source_account_resolution, apply_verified_source_state,
