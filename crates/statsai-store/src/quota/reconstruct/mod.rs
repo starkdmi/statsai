@@ -1,5 +1,7 @@
 use super::*;
 
+mod store;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct WindowScope {
     pub(crate) provider: String,
