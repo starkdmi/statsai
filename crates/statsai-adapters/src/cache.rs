@@ -12,7 +12,11 @@ pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // `conversation.id`) as their session identity; cached files must reparse or
 // conversation-to-account bindings can never reach previously scanned events.
 pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "session-identity.v28";
-pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v23";
+// streaming-usage-snapshot.v24: repeated Claude records for one provider request
+// keep the final cumulative usage snapshot instead of the first partial one, so
+// unchanged historical JSONL files must be reparsed to correct undercounted
+// output tokens and estimated cost.
+pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "streaming-usage-snapshot.v24";
 pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
 pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v20";
 

@@ -418,6 +418,124 @@ fn claude_deduplicates_repeated_usage_by_message_and_request_id() {
 }
 
 #[test]
+fn claude_streaming_snapshots_keep_the_final_usage_for_one_request() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session");
+
+    for (timestamp, uuid, output) in [
+        ("2026-08-05T14:51:09.702Z", "record-1", 100),
+        ("2026-08-05T14:51:09.710Z", "record-2", 180),
+        ("2026-08-05T14:51:11.102Z", "record-3", 240),
+    ] {
+        writeln!(
+            file,
+            r#"{{"timestamp":"{timestamp}","sessionId":"session-1","uuid":"{uuid}","requestId":"request-1","message":{{"id":"message-1","model":"claude-opus-5","usage":{{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":8000,"output_tokens":{output}}}}}}}"#
+        )
+        .expect("streaming snapshot");
+    }
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-08-05T14:51:14.209Z","sessionId":"session-1","uuid":"record-4","requestId":"request-2","message":{{"id":"message-1","model":"claude-opus-5","usage":{{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":8000,"output_tokens":90}}}}}}"#
+    )
+    .expect("distinct request");
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.events.len(), 2);
+    assert_eq!(scan.diagnostics.duplicate_events, 2);
+
+    let streamed = &scan.events[0];
+    assert_eq!(streamed.usage.input_tokens, Some(2));
+    assert_eq!(streamed.usage.cache_creation_tokens, Some(1000));
+    assert_eq!(streamed.usage.cache_read_tokens, Some(8000));
+    assert_eq!(streamed.usage.output_tokens, Some(240));
+    assert_eq!(streamed.usage.computed_total(), 9242);
+    assert_eq!(
+        streamed
+            .parse_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.source_line_number),
+        Some(3)
+    );
+    let expected_cost = statsai_pricing::estimate_cost_at(
+        CLAUDE_CODE_PROVIDER,
+        streamed.model.as_ref(),
+        &streamed.usage,
+        &streamed.created_at,
+    );
+    assert_eq!(
+        streamed.cost.estimated_api_equivalent_micro_usd,
+        expected_cost.estimated_api_equivalent_micro_usd
+    );
+    assert!(streamed
+        .cost
+        .estimated_api_equivalent_micro_usd
+        .is_some_and(|micro_usd| micro_usd > 0));
+    assert_eq!(
+        streamed.cost.estimated_api_equivalent_usd,
+        expected_cost.estimated_api_equivalent_usd
+    );
+
+    let distinct_request = &scan.events[1];
+    assert_ne!(distinct_request.event_id, streamed.event_id);
+    assert_eq!(distinct_request.usage.output_tokens, Some(90));
+    assert_eq!(
+        scan.events
+            .iter()
+            .map(|event| event.usage.computed_total())
+            .sum::<u64>(),
+        9242 + 9092
+    );
+}
+
+#[test]
+fn claude_streaming_snapshots_with_equal_timestamps_resolve_by_source_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session");
+
+    for (uuid, output) in [("record-1", 100), ("record-2", 180), ("record-3", 240)] {
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-08-05T14:51:09.702Z","sessionId":"session-1","uuid":"{uuid}","requestId":"request-1","message":{{"id":"message-1","model":"claude-opus-5","usage":{{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":8000,"output_tokens":{output}}}}}}}"#
+        )
+        .expect("streaming snapshot");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.diagnostics.duplicate_events, 2);
+    assert_eq!(scan.events[0].usage.output_tokens, Some(240));
+    assert_eq!(
+        scan.events[0]
+            .parse_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.source_line_number),
+        Some(3)
+    );
+}
+
+#[test]
 fn claude_stats_cache_is_parsed_as_summary_not_events() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("projects")).expect("projects");

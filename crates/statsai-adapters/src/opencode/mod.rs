@@ -81,7 +81,7 @@ pub(crate) fn scan_opencode_source(
          FROM session"
     ))?;
     let mut rows = statement.query([])?;
-    let mut seen = HashSet::new();
+    let mut seen = EventDedupIndex::new();
     while let Some(row) = rows.next()? {
         scan.diagnostics.raw_rows += 1;
         let session_id: String = row.get(0)?;
@@ -238,7 +238,7 @@ pub(crate) fn scan_opencode_source(
             event.cost.pricing_source = Some("opencode.session.cost".to_string());
             event.cost.confidence = Confidence::High;
         }
-        push_deduped(&mut scan, &mut seen, event);
+        push_deduped(&mut scan, &mut seen, event, DuplicateSelection::KeepFirst);
     }
     if !reconstructed_session_ids.is_empty() {
         let reconstructed_usage = emit_opencode_message_events(
@@ -341,7 +341,7 @@ pub(crate) fn scan_opencode_source(
                 event.cost.pricing_source = Some("opencode.session.cost".to_string());
                 event.cost.confidence = Confidence::High;
             }
-            push_deduped(&mut scan, &mut seen, event);
+            push_deduped(&mut scan, &mut seen, event, DuplicateSelection::KeepFirst);
         }
     }
     if options.should_collect_tasks() {
@@ -602,7 +602,7 @@ pub(crate) struct OpenCodeMessageEventContext<'a> {
     pub(crate) source: &'a SourceLocation,
     pub(crate) options: &'a ScanOptions,
     pub(crate) scan: &'a mut AdapterScan,
-    pub(crate) seen: &'a mut HashSet<String>,
+    pub(crate) seen: &'a mut EventDedupIndex,
 }
 
 pub(crate) fn opencode_usage_fully_reconstructed(
@@ -738,7 +738,7 @@ pub(crate) fn emit_opencode_message_events(
                     .provider_reported_micro_usd_value()
                     .unwrap_or(0),
             });
-        push_deduped(ctx.scan, ctx.seen, event);
+        push_deduped(ctx.scan, ctx.seen, event, DuplicateSelection::KeepFirst);
     }
     Ok(reconstructed_usage)
 }

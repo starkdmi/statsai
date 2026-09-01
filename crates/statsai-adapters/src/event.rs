@@ -8,7 +8,8 @@ use statsai_core::{
     USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::estimate_cost_at;
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::Path;
 
 pub(crate) const SESSION_SCOPED_EVENT_KEY_VERSION: &str = "semantic_usage_event.v1";
@@ -30,26 +31,107 @@ pub(crate) enum EventDeduplication {
     ProviderRecord(String),
 }
 
-pub(crate) fn push_deduped(scan: &mut AdapterScan, seen: &mut HashSet<String>, event: UsageEvent) {
+/// How a repeated event key is resolved.
+///
+/// Providers repeat records for two different reasons, and they need opposite
+/// answers: a copied history or an archived session repeats an already complete
+/// record, while Claude rewrites one streamed response several times with a
+/// growing cumulative usage snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DuplicateSelection {
+    /// Keep the first accepted event and discard every later record.
+    KeepFirst,
+    /// Replace the accepted event when a later provider snapshot arrives, so the
+    /// canonical event carries the final provider-reported usage.
+    KeepLatestSnapshot,
+}
+
+/// Tracks which event keys a scan already accepted, and where each accepted
+/// event sits in `AdapterScan::events` so a later snapshot can replace it.
+#[derive(Debug, Default)]
+pub(crate) struct EventDedupIndex {
+    positions: HashMap<String, usize>,
+}
+
+impl EventDedupIndex {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+pub(crate) fn push_deduped(
+    scan: &mut AdapterScan,
+    index: &mut EventDedupIndex,
+    event: UsageEvent,
+    selection: DuplicateSelection,
+) {
     let key = event
         .parse_evidence
         .as_ref()
         .and_then(|evidence| evidence.source_record_id.clone())
         .unwrap_or_else(|| event.event_id.0.clone());
-    if seen.insert(key) {
+    let Some(position) = index.positions.get(&key).copied() else {
+        index.positions.insert(key, scan.events.len());
         scan.events.push(event);
-    } else {
-        scan.diagnostics.duplicate_events += 1;
+        return;
+    };
+
+    scan.diagnostics.duplicate_events += 1;
+    if selection == DuplicateSelection::KeepFirst {
+        return;
     }
+    // The provider-record identity is stable across snapshots, so replacing the
+    // whole event keeps usage, cost, model metadata, and evidence consistent
+    // without creating a second logical event.
+    if scan.events[position].is_superseded_by(&event) {
+        scan.events[position] = event;
+    }
+}
+
+trait UsageSnapshotOrder {
+    fn is_superseded_by(&self, incoming: &UsageEvent) -> bool;
+}
+
+impl UsageSnapshotOrder for UsageEvent {
+    fn is_superseded_by(&self, incoming: &UsageEvent) -> bool {
+        match incoming.created_at.cmp(&self.created_at) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
+        if let Some(order) = same_file_line_order(self, incoming) {
+            match order {
+                Ordering::Greater => return true,
+                Ordering::Less => return false,
+                Ordering::Equal => {}
+            }
+        }
+        incoming.usage.computed_total() > self.usage.computed_total()
+    }
+}
+
+/// Orders two snapshots by source line, but only when both were read from the
+/// same file: line numbers from different files are not comparable.
+fn same_file_line_order(existing: &UsageEvent, incoming: &UsageEvent) -> Option<Ordering> {
+    let existing = existing.parse_evidence.as_ref()?;
+    let incoming = incoming.parse_evidence.as_ref()?;
+    if existing.source_file_path_hash != incoming.source_file_path_hash {
+        return None;
+    }
+    Some(
+        incoming
+            .source_line_number?
+            .cmp(&existing.source_line_number?),
+    )
 }
 
 pub(crate) fn merge_adapter_scan(
     target: &mut AdapterScan,
-    seen: &mut HashSet<String>,
+    index: &mut EventDedupIndex,
     mut source: AdapterScan,
 ) {
     for event in source.events.drain(..) {
-        push_deduped(target, seen, event);
+        push_deduped(target, index, event, DuplicateSelection::KeepFirst);
     }
     target.summaries.append(&mut source.summaries);
     target.task_spans.append(&mut source.task_spans);

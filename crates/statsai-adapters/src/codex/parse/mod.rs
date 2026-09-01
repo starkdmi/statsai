@@ -745,7 +745,7 @@ pub(crate) fn parse_codex_file(
             } else {
                 None
             };
-            push_deduped(ctx.scan, ctx.seen, event);
+            push_deduped(ctx.scan, ctx.seen, event, DuplicateSelection::KeepFirst);
             if let Some(task_span) = task_span {
                 ctx.scan.task_spans.push(task_span);
             }
@@ -881,7 +881,7 @@ pub(crate) fn parse_codex_file(
             &event.event_id,
             QuotaUsageLinkKind::RecordEvent,
         );
-        push_deduped(ctx.scan, ctx.seen, event);
+        push_deduped(ctx.scan, ctx.seen, event, DuplicateSelection::KeepFirst);
     }
 
     Ok(())

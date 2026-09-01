@@ -51,8 +51,8 @@ pub(crate) use cache::{
 pub(crate) use event::{
     infer_missing_output, merge_adapter_scan, metadata_only_privacy, metadata_summary,
     metric_from_samples, metric_single_sample, push_deduped, subtract_usage_counts,
-    sum_usage_counts, usage_event, usd_to_micro_usd, EventDeduplication, MetadataSummaryParts,
-    ProviderEventParts,
+    sum_usage_counts, usage_event, usd_to_micro_usd, DuplicateSelection, EventDedupIndex,
+    EventDeduplication, MetadataSummaryParts, ProviderEventParts,
 };
 pub(crate) use json::{
     file_modified_timestamp, number_at_any, read_bounded_jsonl_line, read_json_file,
@@ -459,7 +459,7 @@ pub(crate) struct FileParseContext<'a, A: ProviderAdapter + ?Sized> {
     pub(crate) source: &'a SourceLocation,
     pub(crate) options: &'a ScanOptions,
     pub(crate) scan: &'a mut AdapterScan,
-    pub(crate) seen: &'a mut HashSet<String>,
+    pub(crate) seen: &'a mut EventDedupIndex,
 }
 
 pub(crate) fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
@@ -629,6 +629,18 @@ pub(crate) mod tests {
             .expect("Claude parser revision");
 
         assert!(revision > 22);
+    }
+
+    #[test]
+    fn streaming_usage_snapshot_selection_advances_claude_parser_revision() {
+        let revision = CLAUDE_SCAN_CACHE_PARSER_REVISION
+            .rsplit_once(".v")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .expect("Claude parser revision");
+
+        // Historical Claude JSONL files were parsed with first-wins snapshot
+        // selection and undercount streamed output, so they must be reparsed.
+        assert!(revision > 23);
     }
 
     #[test]

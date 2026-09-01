@@ -8,9 +8,9 @@ pub(crate) use tasks::*;
 
 use crate::{
     collect_jsonl_files, file_metadata_signature, scan_cache_namespaces, scan_candidate,
-    session_event_rollups, source_root_path, split_paths, AdapterScan, FileParseContext,
-    ProviderAdapter, ScanCacheNamespaces, ScanCandidateFile, ScanOptions, SessionEventRollup,
-    CLAUDE_CODE_PROVIDER,
+    session_event_rollups, source_root_path, split_paths, AdapterScan, EventDedupIndex,
+    FileParseContext, ProviderAdapter, ScanCacheNamespaces, ScanCandidateFile, ScanOptions,
+    SessionEventRollup, CLAUDE_CODE_PROVIDER,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -185,7 +185,7 @@ pub(crate) fn scan_claude_source(
     let cache_namespaces = scan_cache_namespaces(source, adapter.version());
     let event_files = claude_jsonl_candidates(&projects, &cache_namespaces)?;
     let mut scanned_event_cache_keys = HashSet::new();
-    let mut seen = HashSet::new();
+    let mut seen = EventDedupIndex::new();
     {
         let mut ctx = FileParseContext {
             adapter,
