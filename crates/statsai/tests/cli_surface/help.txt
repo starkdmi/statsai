@@ -1,0 +1,1179 @@
+===== statsai --help =====
+Local-first AI usage stats CLI/SDK/daemon.
+
+Usage: statsai [OPTIONS] <COMMAND>
+
+Commands:
+  scan          Scan local provider sources for usage events
+  report        Show usage reports (weekly, monthly, all-time, or a date range)
+  source        Manage configured source paths
+  account       List canonical provider accounts
+  subscription  Manage subscription periods
+  import        Import external usage summaries
+  export        Export stored events as JSON
+  task          Review and rebuild local work items
+  conversation  Collect and explore durable local conversation archives
+  quota         Inspect reconstructed provider quota history
+  privacy       Build and inspect the local privacy-filtered dataset
+  sync          Export a sync batch to a sink
+  schema        Print JSON schemas for backend-facing contracts
+  store         Manage the local SQLite store
+  daemon        Start the loopback API daemon
+  status        Show stored event and token counts
+  doctor        Check environment and source paths
+  auth          Authenticate with the hosted sync backend
+  service       Install or manage the background daemon service
+  snapshot      Show link, sync, and background collection status
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+  -V, --version                Print version
+===== statsai scan --help =====
+Scan local provider sources for usage events
+
+Usage: statsai scan [OPTIONS]
+
+Options:
+      --provider <PROVIDER>    Scan only this provider
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --include-tasks          Collect local task spans and rebuild work items
+      --preview                Preview without persisting to the store
+      --no-cache               Ignore the scan file cache and reparse all candidate files
+      --replace                Replace existing events for scanned sources before inserting
+      --verbose                Show detailed per-source diagnostics
+      --explain                Show parse evidence for each event
+  -h, --help                   Print help
+===== statsai report --help =====
+Show usage reports (weekly, monthly, all-time, or a date range)
+
+Usage: statsai report [OPTIONS] <COMMAND>
+
+Commands:
+  weekly    Show usage for the last 7 days
+  monthly   Show usage for the last 30 days
+  all-time  Show all stored usage
+  range     Show usage for an explicit date range
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai report weekly --help =====
+Show usage for the last 7 days
+
+Usage: statsai report weekly [OPTIONS]
+
+Options:
+      --json                   Output as JSON
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --verbose                Show source paths and reasoning tokens
+      --subscriptions          Include subscription-value rows
+  -h, --help                   Print help
+===== statsai report monthly --help =====
+Show usage for the last 30 days
+
+Usage: statsai report monthly [OPTIONS]
+
+Options:
+      --json                   Output as JSON
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --verbose                Show source paths and reasoning tokens
+      --subscriptions          Include subscription-value rows
+  -h, --help                   Print help
+===== statsai report all-time --help =====
+Show all stored usage
+
+Usage: statsai report all-time [OPTIONS]
+
+Options:
+      --json                   Output as JSON
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --verbose                Show source paths and reasoning tokens
+      --subscriptions          Include subscription-value rows
+  -h, --help                   Print help
+===== statsai report range --help =====
+Show usage for an explicit date range
+
+Usage: statsai report range [OPTIONS]
+
+Options:
+      --from <FROM>            Range start (YYYY-MM-DD or RFC3339). Date-only values are UTC calendar days starting at 00:00:00 UTC
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --to <TO>                Range end (YYYY-MM-DD or RFC3339). Date-only values are UTC calendar days through 23:59:59 UTC. Defaults to now
+      --json                   Output as JSON
+      --verbose                Show source paths and reasoning tokens
+      --subscriptions          Include subscription-value rows
+  -h, --help                   Print help
+===== statsai source --help =====
+Manage configured source paths
+
+Usage: statsai source [OPTIONS] <COMMAND>
+
+Commands:
+  add         Register a manual source path for a provider
+  enable      Enable a configured source
+  disable     Disable a configured source
+  remove      Remove a configured source
+  list        List all configured sources
+  connect     Connect a source to an account for a time period
+  history     Show source-to-account connection history
+  mode        Set auth verification mode for a source
+  unassign    End the active source connection and leave future usage unassigned
+  explain     Explain how a source is currently attributed
+  disconnect  End the active source-to-account connection
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai source add --help =====
+Register a manual source path for a provider
+
+Usage: statsai source add [OPTIONS] --provider <PROVIDER> --path <PATH>
+
+Options:
+      --provider <PROVIDER>    Provider name
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --path <PATH>            Path to the provider's local data directory
+  -h, --help                   Print help
+===== statsai source enable --help =====
+Enable a configured source
+
+Usage: statsai source enable [OPTIONS] --source-id <SOURCE_ID>
+
+Options:
+      --source-id <SOURCE_ID>  Source identifier to enable
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai source disable --help =====
+Disable a configured source
+
+Usage: statsai source disable [OPTIONS] --source-id <SOURCE_ID>
+
+Options:
+      --source-id <SOURCE_ID>  Source identifier to disable
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai source remove --help =====
+Remove a configured source
+
+Usage: statsai source remove [OPTIONS] --source-id <SOURCE_ID>
+
+Options:
+      --source-id <SOURCE_ID>  Source identifier to remove
+      --store <STORE>          Path to SQLite store
+      --delete-data            Delete local events, summaries, rollups, and scan cache for this source
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai source list --help =====
+List all configured sources
+
+Usage: statsai source list [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai source connect --help =====
+Connect a source to an account for a time period
+
+Usage: statsai source connect [OPTIONS] --started-at <STARTED_AT>
+
+Options:
+      --source-id <SOURCE_ID>
+          Source identifier to attach
+      --store <STORE>
+          Path to SQLite store
+      --device-id <DEVICE_ID>
+          Device identifier for multi-device sync
+      --path <PATH>
+          Local source path to attach
+      --provider-account-id <PROVIDER_ACCOUNT_ID>
+          Existing provider account identifier
+      --provider-user-id <PROVIDER_USER_ID>
+          Canonical provider user/account identifier
+      --email <EMAIL>
+          Provider email for this account
+      --label <LABEL>
+          Display label for this account
+      --started-at <STARTED_AT>
+          Assignment start date/time (YYYY-MM-DD or RFC 3339)
+      --ended-at <ENDED_AT>
+          Assignment end date/time (exclusive)
+  -h, --help
+          Print help
+===== statsai source history --help =====
+Show source-to-account connection history
+
+Usage: statsai source history [OPTIONS]
+
+Options:
+      --source-id <SOURCE_ID>  Optional source identifier filter
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --path <PATH>            Optional local source path filter
+  -h, --help                   Print help
+===== statsai source mode --help =====
+Set auth verification mode for a source
+
+Usage: statsai source mode [OPTIONS] --mode <MODE>
+
+Options:
+      --source-id <SOURCE_ID>  Source identifier to update
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --path <PATH>            Local source path to update
+      --mode <MODE>            Verification mode (auto, manual_only, disabled)
+  -h, --help                   Print help
+===== statsai source unassign --help =====
+End the active source connection and leave future usage unassigned
+
+Usage: statsai source unassign [OPTIONS]
+
+Options:
+      --source-id <SOURCE_ID>  Source identifier to unassign
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --path <PATH>            Local source path to unassign
+      --at <AT>                Unassign from this timestamp forward (defaults to now)
+  -h, --help                   Print help
+===== statsai source explain --help =====
+Explain how a source is currently attributed
+
+Usage: statsai source explain [OPTIONS]
+
+Options:
+      --source-id <SOURCE_ID>  Source identifier to inspect
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --path <PATH>            Local source path to inspect
+  -h, --help                   Print help
+===== statsai source disconnect --help =====
+End the active source-to-account connection
+
+Usage: statsai source disconnect [OPTIONS] --ended-at <ENDED_AT>
+
+Options:
+      --source-id <SOURCE_ID>
+          Source identifier to disconnect
+      --store <STORE>
+          Path to SQLite store
+      --device-id <DEVICE_ID>
+          Device identifier for multi-device sync
+      --path <PATH>
+          Local source path to disconnect
+      --provider-account-id <PROVIDER_ACCOUNT_ID>
+          Existing provider account identifier
+      --provider-user-id <PROVIDER_USER_ID>
+          Canonical provider user/account identifier
+      --email <EMAIL>
+          Provider email for this account
+      --ended-at <ENDED_AT>
+          End the current connection at this timestamp (exclusive)
+  -h, --help
+          Print help
+===== statsai account --help =====
+List canonical provider accounts
+
+Usage: statsai account [OPTIONS] <COMMAND>
+
+Commands:
+  list    List canonical provider accounts
+  plans   Show detected plan evidence per account
+  merge   Merge a legacy/manual account into an existing canonical account
+  remove  Remove an unreferenced account row
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai account list --help =====
+List canonical provider accounts
+
+Usage: statsai account list [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai account plans --help =====
+Show detected plan evidence per account
+
+Usage: statsai account plans [OPTIONS]
+
+Options:
+      --provider <PROVIDER>    Provider name (claude_code, codex)
+      --store <STORE>          Path to SQLite store
+      --account <ACCOUNT>      Account identity to show (label, email, provider user id, or provider account id)
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --all                    Include every stored observation, not just the newest
+  -h, --help                   Print help
+===== statsai account merge --help =====
+Merge a legacy/manual account into an existing canonical account
+
+Usage: statsai account merge [OPTIONS] --provider <PROVIDER> --from <FROM> --to <TO>
+
+Options:
+      --provider <PROVIDER>    Provider name (claude_code, codex)
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --from <FROM>            Source account identity (label, email, provider user id, or provider account id)
+      --to <TO>                Destination account identity (label, email, provider user id, or provider account id)
+      --dry-run                Preview the cleanup without writing
+  -h, --help                   Print help
+===== statsai account remove --help =====
+Remove an unreferenced account row
+
+Usage: statsai account remove [OPTIONS] --provider <PROVIDER> --account <ACCOUNT>
+
+Options:
+      --provider <PROVIDER>    Provider name (claude_code, codex)
+      --store <STORE>          Path to SQLite store
+      --account <ACCOUNT>      Account identity to delete (label, email, provider user id, or provider account id)
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --dry-run                Preview the cleanup without writing
+  -h, --help                   Print help
+===== statsai subscription --help =====
+Manage subscription periods
+
+Usage: statsai subscription [OPTIONS] <COMMAND>
+
+Commands:
+  add     Register a subscription period
+  change  Change to a new subscription period and close the current one
+  end     End the active subscription period
+  remove  Remove a subscription period
+  list    List all registered subscriptions
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai subscription add --help =====
+Register a subscription period
+
+Usage: statsai subscription add [OPTIONS] --provider <PROVIDER> --plan <PLAN> --price <PRICE> --started-at <STARTED_AT>
+
+Options:
+      --provider <PROVIDER>
+          Provider name (claude_code, codex)
+      --store <STORE>
+          Path to SQLite store
+      --device-id <DEVICE_ID>
+          Device identifier for multi-device sync
+      --provider-account-id <PROVIDER_ACCOUNT_ID>
+          Existing provider account identifier
+      --provider-user-id <PROVIDER_USER_ID>
+          Canonical provider user/account identifier
+      --email <EMAIL>
+          Provider email for this account
+      --label <LABEL>
+          Display label for this account
+      --plan <PLAN>
+          Plan name (e.g. Pro, Max, Team)
+      --price <PRICE>
+          Non-negative decimal subscription price (maximum 1000000.00)
+      --currency <CURRENCY>
+          Three-letter currency code [default: USD]
+      --paid-at <PAID_AT>
+          Date the subscription was paid (YYYY-MM-DD or RFC 3339)
+      --started-at <STARTED_AT>
+          Subscription period start (YYYY-MM-DD or RFC 3339)
+      --ended-at <ENDED_AT>
+          Subscription period end (exclusive)
+  -h, --help
+          Print help
+===== statsai subscription change --help =====
+Change to a new subscription period and close the current one
+
+Usage: statsai subscription change [OPTIONS] --provider <PROVIDER> --plan <PLAN> --price <PRICE> --started-at <STARTED_AT>
+
+Options:
+      --provider <PROVIDER>
+          Provider name (claude_code, codex)
+      --store <STORE>
+          Path to SQLite store
+      --device-id <DEVICE_ID>
+          Device identifier for multi-device sync
+      --provider-account-id <PROVIDER_ACCOUNT_ID>
+          Existing provider account identifier
+      --provider-user-id <PROVIDER_USER_ID>
+          Canonical provider user/account identifier
+      --email <EMAIL>
+          Provider email for this account
+      --label <LABEL>
+          Display label for this account
+      --plan <PLAN>
+          Plan name (e.g. Pro, Max, Team)
+      --price <PRICE>
+          Non-negative decimal subscription price (maximum 1000000.00)
+      --currency <CURRENCY>
+          Three-letter currency code [default: USD]
+      --paid-at <PAID_AT>
+          Date the subscription was paid (YYYY-MM-DD or RFC 3339)
+      --started-at <STARTED_AT>
+          New subscription period start (YYYY-MM-DD or RFC 3339)
+  -h, --help
+          Print help
+===== statsai subscription end --help =====
+End the active subscription period
+
+Usage: statsai subscription end [OPTIONS] --provider <PROVIDER>
+
+Options:
+      --provider <PROVIDER>
+          Provider name (claude_code, codex)
+      --store <STORE>
+          Path to SQLite store
+      --device-id <DEVICE_ID>
+          Device identifier for multi-device sync
+      --provider-account-id <PROVIDER_ACCOUNT_ID>
+          Existing provider account identifier
+      --provider-user-id <PROVIDER_USER_ID>
+          Canonical provider user/account identifier
+      --email <EMAIL>
+          Provider email for this account
+      --ended-at <ENDED_AT>
+          Subscription period end (exclusive, defaults to now)
+  -h, --help
+          Print help
+===== statsai subscription remove --help =====
+Remove a subscription period
+
+Usage: statsai subscription remove [OPTIONS] --provider <PROVIDER>
+
+Options:
+      --provider <PROVIDER>
+          Provider name (claude_code, codex)
+      --store <STORE>
+          Path to SQLite store
+      --device-id <DEVICE_ID>
+          Device identifier for multi-device sync
+      --provider-account-id <PROVIDER_ACCOUNT_ID>
+          Existing provider account identifier
+      --provider-user-id <PROVIDER_USER_ID>
+          Canonical provider user/account identifier
+      --email <EMAIL>
+          Provider email for this account
+      --plan <PLAN>
+          Plan name (e.g. Pro, Max, Team)
+      --started-at <STARTED_AT>
+          Subscription period start (YYYY-MM-DD or RFC 3339)
+      --current
+          Remove the active subscription period
+  -h, --help
+          Print help
+===== statsai subscription list --help =====
+List all registered subscriptions
+
+Usage: statsai subscription list [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai import --help =====
+Import external usage summaries
+
+Usage: statsai import [OPTIONS] <COMMAND>
+
+Commands:
+  summary  Import a reported usage summary JSON file
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai import summary --help =====
+Import a reported usage summary JSON file
+
+Usage: statsai import summary [OPTIONS] --path <PATH>
+
+Options:
+      --path <PATH>            Path to reported_usage_summary_input JSON file
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --replace                Replace existing matching summaries before import
+      --dry-run                Preview without persisting
+      --verbose                Show per-file import details
+  -h, --help                   Print help
+===== statsai export --help =====
+Export stored events as JSON
+
+Usage: statsai export [OPTIONS]
+
+Options:
+      --json                   Export all events as JSON
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai task --help =====
+Review and rebuild local work items
+
+Usage: statsai task [OPTIONS] <COMMAND>
+
+Commands:
+  list       List derived work items
+  show       Show one derived work item
+  verify     Record manual verification constraints
+  stats      Show local task collection stats
+  benchmark  Benchmark the current grouper against simple baselines
+  export     Export local task spans or work items
+  rebuild    Rebuild derived work items from stored task spans
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai task list --help =====
+List derived work items
+
+Usage: statsai task list [OPTIONS]
+
+Options:
+      --provider <PROVIDER>    Optional provider filter
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --status <STATUS>        Optional status filter
+      --json                   Output as JSON
+  -h, --help                   Print help
+===== statsai task show --help =====
+Show one derived work item
+
+Usage: statsai task show [OPTIONS] <WORK_ITEM_ID>
+
+Arguments:
+  <WORK_ITEM_ID>  Work item identifier
+
+Options:
+      --include-evidence       Include member spans and evidence
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --json                   Output as JSON
+  -h, --help                   Print help
+===== statsai task verify --help =====
+Record manual verification constraints
+
+Usage: statsai task verify [OPTIONS] <COMMAND>
+
+Commands:
+  accept  Accept the current grouping for a work item
+  reject  Reject a work item as meta/system/noise
+  split   Split a work item after a specific span
+  merge   Merge two work items
+  rename  Rename a work item
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai task verify accept --help =====
+Accept the current grouping for a work item
+
+Usage: statsai task verify accept [OPTIONS] <WORK_ITEM_ID>
+
+Arguments:
+  <WORK_ITEM_ID>  Work item identifier
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai task verify reject --help =====
+Reject a work item as meta/system/noise
+
+Usage: statsai task verify reject [OPTIONS] --reason <REASON> <WORK_ITEM_ID>
+
+Arguments:
+  <WORK_ITEM_ID>  Work item identifier
+
+Options:
+      --reason <REASON>        Reject reason: meta, system, or noise
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai task verify split --help =====
+Split a work item after a specific span
+
+Usage: statsai task verify split [OPTIONS] --after-span <AFTER_SPAN> <WORK_ITEM_ID>
+
+Arguments:
+  <WORK_ITEM_ID>  Work item identifier
+
+Options:
+      --after-span <AFTER_SPAN>    Split boundary after this span
+      --store <STORE>              Path to SQLite store
+      --device-id <DEVICE_ID>      Device identifier for multi-device sync
+      --left-title <LEFT_TITLE>    Optional title for the left work item
+      --right-title <RIGHT_TITLE>  Optional title for the right work item
+  -h, --help                       Print help
+===== statsai task verify merge --help =====
+Merge two work items
+
+Usage: statsai task verify merge [OPTIONS] <LEFT_WORK_ITEM_ID> <RIGHT_WORK_ITEM_ID>
+
+Arguments:
+  <LEFT_WORK_ITEM_ID>   Left work item identifier
+  <RIGHT_WORK_ITEM_ID>  Right work item identifier
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --title <TITLE>          Optional merged title override
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai task verify rename --help =====
+Rename a work item
+
+Usage: statsai task verify rename [OPTIONS] --title <TITLE> <WORK_ITEM_ID>
+
+Arguments:
+  <WORK_ITEM_ID>  Work item identifier
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --title <TITLE>          Canonical title override
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai task stats --help =====
+Show local task collection stats
+
+Usage: statsai task stats [OPTIONS]
+
+Options:
+      --json                   Output as JSON
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai task benchmark --help =====
+Benchmark the current grouper against simple baselines
+
+Usage: statsai task benchmark [OPTIONS]
+
+Options:
+      --json                   Output as JSON
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai task export --help =====
+Export local task spans or work items
+
+Usage: statsai task export [OPTIONS]
+
+Options:
+      --level <LEVEL>          Export level [default: work-item]
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --format <FORMAT>        Export format [default: json]
+  -h, --help                   Print help
+===== statsai task rebuild --help =====
+Rebuild derived work items from stored task spans
+
+Usage: statsai task rebuild [OPTIONS]
+
+Options:
+      --provider <PROVIDER>    Optional provider filter
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --source-id <SOURCE_ID>  Optional source identifier filter
+      --all                    Rebuild every project bucket
+  -h, --help                   Print help
+===== statsai conversation --help =====
+Collect and explore durable local conversation archives
+
+Usage: statsai conversation [OPTIONS] <COMMAND>
+
+Commands:
+  collect  Collect new or changed conversations from local provider sources
+  list     List archived conversations
+  show     Read one archived conversation
+  search   Search archived conversation text using SQLite FTS5
+  stats    Show local archive coverage and storage statistics
+  export   Export one conversation with complete artifact payloads
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai conversation collect --help =====
+Collect new or changed conversations from local provider sources
+
+Usage: statsai conversation collect [OPTIONS]
+
+Options:
+      --provider <PROVIDER>    Collect only this provider
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --no-cache               Ignore the archive collection cache
+      --verbose                Show per-source collection diagnostics
+  -h, --help                   Print help
+===== statsai conversation list --help =====
+List archived conversations
+
+Usage: statsai conversation list [OPTIONS]
+
+Options:
+      --provider <PROVIDER>    Optional provider filter
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --limit <LIMIT>          Maximum conversations to return [default: 50]
+      --json                   Output as JSON
+  -h, --help                   Print help
+===== statsai conversation show --help =====
+Read one archived conversation
+
+Usage: statsai conversation show [OPTIONS] <CONVERSATION_ID>
+
+Arguments:
+  <CONVERSATION_ID>  Canonical conversation identifier
+
+Options:
+      --json                   Output complete JSON, including base64 artifacts
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai conversation search --help =====
+Search archived conversation text using SQLite FTS5
+
+Usage: statsai conversation search [OPTIONS] <QUERY>
+
+Arguments:
+  <QUERY>  FTS5 search expression
+
+Options:
+      --limit <LIMIT>          Maximum matches to return [default: 50]
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --json                   Output as JSON
+  -h, --help                   Print help
+===== statsai conversation stats --help =====
+Show local archive coverage and storage statistics
+
+Usage: statsai conversation stats [OPTIONS]
+
+Options:
+      --json                   Output as JSON
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai conversation export --help =====
+Export one conversation with complete artifact payloads
+
+Usage: statsai conversation export [OPTIONS] <CONVERSATION_ID>
+
+Arguments:
+  <CONVERSATION_ID>  Canonical conversation identifier
+
+Options:
+      --format <FORMAT>        Export format: json or markdown [default: json]
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai quota --help =====
+Inspect reconstructed provider quota history
+
+Usage: statsai quota [OPTIONS] <COMMAND>
+
+Commands:
+  status   Show quota collection and account-attribution coverage
+  current  Show the newest activated quota window
+  windows  List reconstructed quota windows
+  history  Show quota change points for one reconstructed window
+  export   Export quota observations, windows, or weekly sync projections
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai quota status --help =====
+Show quota collection and account-attribution coverage
+
+Usage: statsai quota status [OPTIONS]
+
+Options:
+      --account <ACCOUNT>      Account id, email, provider id, or label
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --json                   Output as JSON
+  -h, --help                   Print help
+===== statsai quota current --help =====
+Show the newest activated quota window
+
+Usage: statsai quota current [OPTIONS]
+
+Options:
+      --account <ACCOUNT>      Account id, email, provider id, or label
+      --store <STORE>          Path to SQLite store
+      --all-scopes             Include shorter quota scopes
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --include-overlaps       Include older epochs that overlap the selected window
+      --json                   Output as JSON
+  -h, --help                   Print help
+===== statsai quota windows --help =====
+List reconstructed quota windows
+
+Usage: statsai quota windows [OPTIONS]
+
+Options:
+      --provider <PROVIDER>    Provider filter
+      --store <STORE>          Path to SQLite store
+      --account <ACCOUNT>      Account id, email, provider id, or label
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --from <FROM>            Observation range start (date or RFC 3339)
+      --to <TO>                Observation range end (date or RFC 3339)
+      --limit-id <LIMIT_ID>    Provider limit identity
+      --limit <LIMIT>          Maximum windows to return [default: 50]
+      --json                   Output as JSON
+  -h, --help                   Print help
+===== statsai quota history --help =====
+Show quota change points for one reconstructed window
+
+Usage: statsai quota history [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --window-id <WINDOW_ID>  Reconstructed quota window id; newest when omitted
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --raw                    Include source observations and raw provider payloads
+      --json                   Output as JSON
+  -h, --help                   Print help
+===== statsai quota export --help =====
+Export quota observations, windows, or weekly sync projections
+
+Usage: statsai quota export [OPTIONS] --level <LEVEL> --format <FORMAT>
+
+Options:
+      --level <LEVEL>          [possible values: observations, windows, sync-windows]
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --format <FORMAT>        [possible values: csv, json, jsonl]
+  -h, --help                   Print help
+===== statsai privacy --help =====
+Build and inspect the local privacy-filtered dataset
+
+Usage: statsai privacy [OPTIONS] <COMMAND>
+
+Commands:
+  setup   Register and verify local privacy detector assets
+  status  Show local privacy runtime and filtered-dataset coverage
+  filter  Create or preview filtered local conversation records
+  show    Show one filtered conversation
+  export  Export the complete current filtered dataset as deterministic JSONL
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai privacy setup --help =====
+Register and verify local privacy detector assets
+
+Usage: statsai privacy setup [OPTIONS] --mlx-server <MLX_SERVER> --mlx-model <MLX_MODEL> --kingfisher-helper <KINGFISHER_HELPER>
+
+Options:
+      --mlx-server <MLX_SERVER>                      
+      --store <STORE>                                Path to SQLite store
+      --device-id <DEVICE_ID>                        Device identifier for multi-device sync
+      --mlx-model <MLX_MODEL>                        
+      --kingfisher-helper <KINGFISHER_HELPER>        
+      --mlx-memory-limit-mib <MLX_MEMORY_LIMIT_MIB>  [default: 4096]
+      --mlx-cache-limit-mib <MLX_CACHE_LIMIT_MIB>    [default: 256]
+      --mlx-max-batch-tokens <MLX_MAX_BATCH_TOKENS>  [default: 4096]
+  -h, --help                                         Print help
+===== statsai privacy status --help =====
+Show local privacy runtime and filtered-dataset coverage
+
+Usage: statsai privacy status [OPTIONS]
+
+Options:
+      --json                   
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai privacy filter --help =====
+Create or preview filtered local conversation records
+
+Usage: statsai privacy filter [OPTIONS]
+
+Options:
+      --provider <PROVIDER>          
+      --store <STORE>                Path to SQLite store
+      --conversation <CONVERSATION>  
+      --device-id <DEVICE_ID>        Device identifier for multi-device sync
+      --force                        
+      --preview                      Run detectors without writing mappings or filtered records
+      --json                         
+      --verbose                      
+  -h, --help                         Print help
+===== statsai privacy show --help =====
+Show one filtered conversation
+
+Usage: statsai privacy show [OPTIONS] <CONVERSATION_ID>
+
+Arguments:
+  <CONVERSATION_ID>  
+
+Options:
+      --json                   
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai privacy export --help =====
+Export the complete current filtered dataset as deterministic JSONL
+
+Usage: statsai privacy export [OPTIONS] --output <OUTPUT>
+
+Options:
+      --format <FORMAT>        [default: jsonl]
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --output <OUTPUT>        
+      --provider <PROVIDER>    
+  -h, --help                   Print help
+===== statsai sync --help =====
+Export a sync batch to a sink
+
+Usage: statsai sync [OPTIONS]
+
+Options:
+      --sink <SINK>              Sync sink (stdout, file, http) [default: stdout]
+      --store <STORE>            Path to SQLite store
+      --device-id <DEVICE_ID>    Device identifier for multi-device sync
+      --output <OUTPUT>          Output path for file sink
+      --endpoint <ENDPOINT>      HTTP endpoint for the http sink (defaults to STATSAI_API_URL/api/sync/batches)
+      --auth-token <AUTH_TOKEN>  Bearer token override for the http sink
+      --rebuild-rollups          Rebuild local daily rollups from events and force all rollups dirty before sync
+      --full                     Force a full HTTP rollup sync even when this target was synced before
+      --since-last               Send only records after this sink target's last successful sync
+      --status                   Show recorded sync state instead of sending
+      --verify                   Inspect the resolved Cloudflare sync target and verify remote device access
+      --reset-remote             Delete mirrored hosted sync data for this paired device and clear local sync tracking (http only)
+      --yes                      Confirm destructive sync reset actions
+      --dry-run                  Build the sync batch without writing
+      --include-projects         Enable project metadata sync for this device and future syncs
+      --exclude-projects         Disable project metadata sync for this device and future syncs
+      --include-tasks            Enable hosted task sync for this device and future syncs (implies --include-projects)
+      --exclude-tasks            Disable hosted task sync for this device and future syncs
+  -h, --help                     Print help
+===== statsai schema --help =====
+Print JSON schemas for backend-facing contracts
+
+Usage: statsai schema [OPTIONS] <COMMAND>
+
+Commands:
+  sync-batch               Print the sync_batch.v4 JSON Schema
+  quota-window-projection  Print the quota_window_sync_projection.v1 JSON Schema
+  help                     Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai schema sync-batch --help =====
+Print the sync_batch.v4 JSON Schema
+
+Usage: statsai schema sync-batch [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai schema quota-window-projection --help =====
+Print the quota_window_sync_projection.v1 JSON Schema
+
+Usage: statsai schema quota-window-projection [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai store --help =====
+Manage the local SQLite store
+
+Usage: statsai store [OPTIONS] <COMMAND>
+
+Commands:
+  clone-to                           Create a consistent APFS clone of the SQLite store
+  supported-schema-version           Print the store schema version supported by this binary
+  supported-pricing-ruleset-version  Print the pricing ruleset version supported by this binary
+  help                               Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai store clone-to --help =====
+Create a consistent APFS clone of the SQLite store
+
+Usage: statsai store clone-to [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>  Destination database path
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai store supported-schema-version --help =====
+Print the store schema version supported by this binary
+
+Usage: statsai store supported-schema-version [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai store supported-pricing-ruleset-version --help =====
+Print the pricing ruleset version supported by this binary
+
+Usage: statsai store supported-pricing-ruleset-version [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai daemon --help =====
+Start the loopback API daemon
+
+Usage: statsai daemon [OPTIONS]
+
+Options:
+      --api <API>              Loopback address to bind the API [default: 127.0.0.1:8765]
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --watch                  Enable file watching for automatic rescans
+  -h, --help                   Print help
+===== statsai status --help =====
+Show stored event and token counts
+
+Usage: statsai status [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai doctor --help =====
+Check environment and source paths
+
+Usage: statsai doctor [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai auth --help =====
+Authenticate with the hosted sync backend
+
+Usage: statsai auth [OPTIONS] <COMMAND>
+
+Commands:
+  login   Log in to the hosted sync backend
+  status  Check authentication status for the Better Auth device session
+  logout  Log out and clear stored Better Auth device credentials
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai auth login --help =====
+Log in to the hosted sync backend
+
+Usage: statsai auth login [OPTIONS]
+
+Options:
+      --no-open                    Print the local-browser URL without opening it
+      --store <STORE>              Path to SQLite store
+      --device-id <DEVICE_ID>      Device identifier for multi-device sync
+      --headless                   Use cross-device login for SSH, servers, and headless shells
+      --device-name <DEVICE_NAME>  Friendly name to show for this device
+  -h, --help                       Print help
+===== statsai auth status --help =====
+Check authentication status for the Better Auth device session
+
+Usage: statsai auth status [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai auth logout --help =====
+Log out and clear stored Better Auth device credentials
+
+Usage: statsai auth logout [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai service --help =====
+Install or manage the background daemon service
+
+Usage: statsai service [OPTIONS] <COMMAND>
+
+Commands:
+  install    Install a LaunchAgent that runs statsai daemon --watch
+  uninstall  Remove the background daemon LaunchAgent
+  status     Show LaunchAgent install and run state
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai service install --help =====
+Install a LaunchAgent that runs statsai daemon --watch
+
+Usage: statsai service install [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai service uninstall --help =====
+Remove the background daemon LaunchAgent
+
+Usage: statsai service uninstall [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai service status --help =====
+Show LaunchAgent install and run state
+
+Usage: statsai service status [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai snapshot --help =====
+Show link, sync, and background collection status
+
+Usage: statsai snapshot [OPTIONS]
+
+Options:
+      --json                   Print machine-readable JSON for the menu bar app
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
