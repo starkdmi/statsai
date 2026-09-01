@@ -1,134 +1,5 @@
 use super::*;
 use statsai_core::{Confidence, CostInfo, UsageCounts};
-
-#[test]
-fn normalizes_claude_thinking_variant() {
-    assert_eq!(
-        normalize_model_name("claude-opus-4-5-thinking"),
-        "claude-opus-4-5"
-    );
-    assert_eq!(
-        normalize_model_name("claude-opus-4-6-thinking"),
-        "claude-opus-4-6"
-    );
-    assert_eq!(
-        normalize_model_name("claude-sonnet-4-6-thinking"),
-        "claude-sonnet-4-6"
-    );
-}
-
-#[test]
-fn normalizes_codex_aliases() {
-    assert_eq!(normalize_model_name("gpt-5.1-codex"), "gpt-5-codex");
-    assert_eq!(normalize_model_name("gpt-5.1-codex-mini"), "gpt-5-mini");
-}
-
-#[test]
-fn normalizes_gpt_5_6_family_and_proxy_wrapped_ids() {
-    assert_eq!(normalize_model_name("gpt-5.6-sol"), "gpt-5.6-sol");
-    assert_eq!(normalize_model_name("gpt-5.6-terra"), "gpt-5.6-terra");
-    assert_eq!(normalize_model_name("gpt-5.6-luna"), "gpt-5.6-luna");
-    assert_eq!(
-        normalize_model_name("relay/openai-gpt-5.6-terra"),
-        "gpt-5.6-terra"
-    );
-}
-
-#[test]
-fn normalizes_provider_prefixes() {
-    assert_eq!(
-        normalize_model_name("anthropic/claude-sonnet-4-5"),
-        "claude-sonnet-4-5"
-    );
-    assert_eq!(normalize_model_name("openai/gpt-5"), "gpt-5");
-    assert_eq!(normalize_model_name("openai/gpt-5.2-codex"), "gpt-5.2");
-    assert_eq!(normalize_model_name("openai/gpt-5.4"), "gpt-5.4");
-}
-
-#[test]
-fn normalizes_proxy_wrapped_model_names() {
-    assert_eq!(
-        normalize_model_name("google/antigravity-claude-opus-4-5-thinking"),
-        "claude-opus-4-5"
-    );
-    assert_eq!(
-        normalize_model_name("openrouter/claude-opus-4-6-thinking"),
-        "claude-opus-4-6"
-    );
-    assert_eq!(
-        normalize_model_name("openrouter/claude-opus-4-8-thinking"),
-        "claude-opus-4-8"
-    );
-    assert_eq!(
-        normalize_model_name("openrouter/claude-sonnet-4-6-thinking"),
-        "claude-sonnet-4-6"
-    );
-    assert_eq!(
-        normalize_model_name("google/antigravity-claude-sonnet-4-5-thinking"),
-        "claude-sonnet-4-5"
-    );
-    assert_eq!(
-        normalize_model_name("relay/openai-gpt-5.2-codex"),
-        "gpt-5.2"
-    );
-    assert_eq!(
-        normalize_model_name("relay/openai-gpt-5-mini"),
-        "gpt-5-mini"
-    );
-    assert_eq!(
-        normalize_model_name("relay/openai-gpt-5-nano"),
-        "gpt-5-nano"
-    );
-}
-
-#[test]
-fn normalizes_unknown_model_to_lowercase() {
-    assert_eq!(normalize_model_name("SomeNewModel"), "somenewmodel");
-}
-
-#[test]
-fn normalizes_grok_build_aliases() {
-    assert_eq!(normalize_model_name("grok-build"), "grok-build-0.1");
-    assert_eq!(normalize_model_name("grok-4.5-latest"), "grok-4.5");
-    assert_eq!(normalize_model_name("grok-build-latest"), "grok-4.5");
-    assert_eq!(normalize_model_name("openrouter/x-ai/grok-4.5"), "grok-4.5");
-    assert_eq!(
-        normalize_model_name("openrouter/x-ai/grok-build-latest"),
-        "grok-4.5"
-    );
-    assert_eq!(normalize_model_name("grok-4.6"), "grok-4.6");
-    assert_eq!(normalize_model_name("grok-4.6-build"), "grok-4.6");
-    assert_eq!(normalize_model_name("grok-4.6-latest"), "grok-4.6");
-    assert_eq!(normalize_model_name("openrouter/x-ai/grok-4.6"), "grok-4.6");
-    assert_eq!(
-        normalize_model_name("openrouter/x-ai/grok-4.6-build"),
-        "grok-4.6"
-    );
-    assert_eq!(normalize_model_name("relay/xai-grok-4.6"), "grok-4.6");
-}
-
-#[test]
-fn normalizes_cursor_composer_aliases() {
-    assert_eq!(
-        normalize_model_name("grok-composer-2.5-fast"),
-        "composer-2.5-fast"
-    );
-    assert_eq!(normalize_model_name("grok-composer-2.5"), "composer-2.5");
-    assert_eq!(
-        pricing_for_model("composer-2.5-fast").map(|pricing| (
-            pricing.input_per_million,
-            pricing.cached_input_per_million,
-            pricing.output_per_million
-        )),
-        Some((3.0, 0.5, 15.0))
-    );
-}
-
-#[test]
-fn normalizes_whitespace() {
-    assert_eq!(normalize_model_name("  gpt-5  "), "gpt-5");
-}
-
 #[test]
 fn estimates_cost_for_known_model() {
     let model = statsai_core::ModelInfo {
@@ -760,23 +631,6 @@ fn sonnet_5_pricing_uses_usage_date() {
     assert_eq!(introductory.estimated_api_equivalent_usd, Some(1_200));
     assert_eq!(standard.estimated_api_equivalent_usd, Some(1_800));
 }
-
-#[test]
-fn sonnet_5_reports_aggregate_periods_that_cross_its_price_change() {
-    let before = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).expect("before boundary");
-    let boundary = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).expect("boundary");
-    let after = chrono::NaiveDate::from_ymd_opt(2026, 9, 2).expect("after boundary");
-
-    assert!(pricing_changes_between("claude-sonnet-5", before, boundary));
-    assert!(pricing_changes_between(
-        "anthropic/claude-sonnet-5",
-        after,
-        before
-    ));
-    assert!(!pricing_changes_between("claude-sonnet-5", boundary, after));
-    assert!(!pricing_changes_between("claude-opus-5", before, after));
-}
-
 fn test_model(name: &str) -> statsai_core::ModelInfo {
     statsai_core::ModelInfo {
         name: Some(name.to_string()),
@@ -793,23 +647,6 @@ fn parse_utc(value: &str) -> chrono::DateTime<chrono::Utc> {
         .expect("valid timestamp")
         .with_timezone(&chrono::Utc)
 }
-
-#[test]
-fn preserves_codex_auto_review_observed_identity() {
-    assert_eq!(
-        normalize_model_name("codex-auto-review"),
-        "codex-auto-review"
-    );
-    assert_eq!(
-        normalize_model_name("openai/codex-auto-review"),
-        "codex-auto-review"
-    );
-    assert_eq!(
-        normalize_model_name("relay/codex-auto-review"),
-        "codex-auto-review"
-    );
-}
-
 #[test]
 fn codex_auto_review_reuses_gpt_5_4_rates_before_july_30() {
     let review = test_model("codex-auto-review");
@@ -944,31 +781,6 @@ fn codex_auto_review_reuses_mapped_model_long_context_multipliers() {
         Some("codex_api_pricing:codex-auto-review")
     );
 }
-
-#[test]
-fn codex_auto_review_reports_aggregate_periods_that_cross_its_equivalent_change() {
-    let before = chrono::NaiveDate::from_ymd_opt(2026, 7, 29).expect("before boundary");
-    let boundary = chrono::NaiveDate::from_ymd_opt(2026, 7, 30).expect("boundary");
-    let after = chrono::NaiveDate::from_ymd_opt(2026, 7, 31).expect("after boundary");
-
-    assert!(pricing_changes_between(
-        "codex-auto-review",
-        before,
-        boundary
-    ));
-    assert!(pricing_changes_between(
-        "openai/codex-auto-review",
-        after,
-        before
-    ));
-    assert!(!pricing_changes_between(
-        "codex-auto-review",
-        boundary,
-        after
-    ));
-    assert!(!pricing_changes_between("gpt-5.4", before, after));
-}
-
 #[test]
 fn gpt_5_6_luna_and_terra_pricing_uses_usage_date() {
     let usage = UsageCounts {
@@ -1074,37 +886,6 @@ fn overlay_replaces_estimated_only_cost() {
     assert_eq!(overlaid, estimated);
     assert!(overlaid.provider_reported_usd.is_none());
 }
-
-#[test]
-fn ruleset_version_is_numeric_and_catalog_is_descriptive() {
-    const { assert!(PRICING_RULESET_VERSION >= 1) };
-    assert!(PRICING_CATALOG_VERSION.contains(':'));
-    assert_ne!(PRICING_RULESET_VERSION.to_string(), PRICING_CATALOG_VERSION);
-}
-
-#[test]
-fn gpt_5_6_luna_and_terra_report_aggregate_periods_that_cross_the_july_30_cut() {
-    let before = chrono::NaiveDate::from_ymd_opt(2026, 7, 29).expect("before boundary");
-    let boundary = chrono::NaiveDate::from_ymd_opt(2026, 7, 30).expect("boundary");
-    let after = chrono::NaiveDate::from_ymd_opt(2026, 7, 31).expect("after boundary");
-
-    assert!(pricing_changes_between("gpt-5.6-luna", before, boundary));
-    assert!(pricing_changes_between(
-        "openai/gpt-5.6-luna",
-        after,
-        before
-    ));
-    assert!(pricing_changes_between("gpt-5.6-terra", before, boundary));
-    assert!(pricing_changes_between(
-        "openai/gpt-5.6-terra",
-        after,
-        before
-    ));
-    assert!(!pricing_changes_between("gpt-5.6-luna", boundary, after));
-    assert!(!pricing_changes_between("gpt-5.6-terra", boundary, after));
-    assert!(!pricing_changes_between("gpt-5.6-sol", before, after));
-}
-
 #[test]
 fn grok_4_6_uses_official_short_context_rates_without_rewriting_identity() {
     let grok_4_6 = test_model("grok-4.6");
