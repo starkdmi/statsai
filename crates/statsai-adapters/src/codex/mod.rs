@@ -140,7 +140,7 @@ pub(crate) fn scan_codex_source(
         indexed_candidates.push((index, candidate));
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = EventDedupIndex::new();
     if indexed_candidates.len() <= 1 {
         for (_, candidate) in indexed_candidates {
             let file_scan = scan_codex_candidate_file(
@@ -211,7 +211,7 @@ pub(crate) fn scan_codex_candidate_file(
     let usage_root = codex_usage_root_for_file(root, &candidate.path);
     let mut scan = AdapterScan::default();
     scan.diagnostics.files_scanned = 1;
-    let mut seen = HashSet::new();
+    let mut seen = EventDedupIndex::new();
     let mut ctx = FileParseContext {
         adapter,
         source,

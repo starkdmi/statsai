@@ -952,3 +952,88 @@ fn refreshes_legacy_codex_usage_shape_after_normalization_without_double_countin
     assert_eq!(events[0].usage.output_tokens, Some(5));
     assert_eq!(events[0].usage.reasoning_tokens, Some(5));
 }
+
+/// One provider request can appear in several Claude files, so a scan that
+/// re-reads only a file holding an early streaming snapshot must not shrink an
+/// event the store already holds at its final snapshot.
+fn claude_provider_record_event(
+    source: &statsai_core::SourceLocation,
+    now: chrono::DateTime<Utc>,
+    output_tokens: u64,
+) -> UsageEvent {
+    let mut event = test_store_event(source, now, "claude-provider-record");
+    event.provider = "claude_code".to_string();
+    event.usage = UsageCounts {
+        input_tokens: Some(2),
+        cache_creation_tokens: Some(1000),
+        cache_read_tokens: Some(8000),
+        output_tokens: Some(output_tokens),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    event.parse_evidence = Some(ParseEvidence {
+        event_key_version: "provider_record_usage_event.v1".to_string(),
+        source_file_path_hash: Some("file-hash".to_string()),
+        source_line_number: Some(1),
+        source_record_id: Some("provider_record_usage_event.v1:claude_message_usage:x".to_string()),
+        model_inferred: false,
+        timestamp_inferred: false,
+        account_identity_source: statsai_core::IdentitySource::Unresolved,
+    });
+    event
+}
+
+#[test]
+fn partial_claude_snapshot_does_not_shrink_a_stored_provider_record_event() {
+    let store = Store::in_memory().expect("store");
+    let source = statsai_core::SourceLocation::local_adapter(
+        "claude_code",
+        "test",
+        "0",
+        Path::new("/tmp/claude-partial-snapshot"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let now = Utc::now();
+
+    let final_snapshot = claude_provider_record_event(&source, now, 240);
+    let partial_snapshot = claude_provider_record_event(&source, now, 100);
+    assert_eq!(final_snapshot.event_id, partial_snapshot.event_id);
+
+    assert!(store.insert_event(&final_snapshot).expect("insert final"));
+    assert!(!store
+        .insert_event(&partial_snapshot)
+        .expect("partial snapshot refresh"));
+
+    let events = store.events().expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].usage.output_tokens, Some(240));
+    assert_eq!(events[0].usage.computed_total(), 9242);
+    assert_eq!(store.token_total().expect("token total"), 9242);
+}
+
+#[test]
+fn later_claude_snapshot_still_replaces_a_stored_partial_provider_record_event() {
+    let store = Store::in_memory().expect("store");
+    let source = statsai_core::SourceLocation::local_adapter(
+        "claude_code",
+        "test",
+        "0",
+        Path::new("/tmp/claude-later-snapshot"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let now = Utc::now();
+
+    assert!(store
+        .insert_event(&claude_provider_record_event(&source, now, 100))
+        .expect("insert partial"));
+    assert!(!store
+        .insert_event(&claude_provider_record_event(&source, now, 240))
+        .expect("final snapshot refresh"));
+
+    let events = store.events().expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].usage.output_tokens, Some(240));
+    assert_eq!(store.token_total().expect("token total"), 9242);
+}

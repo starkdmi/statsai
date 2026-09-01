@@ -9,8 +9,8 @@ use crate::{
     number_at_any, project_context_from_path_fallback, push_deduped, read_bounded_jsonl_line,
     resolve_project_context, resolve_project_context_cached, stats_cache_date_end,
     timestamp_from_nested_value, timestamp_from_scalar, usage_event, usd_to_micro_usd,
-    value_as_u64, AdapterScan, BoundedLineRead, EventDeduplication, FileParseContext,
-    ProjectContextCache, ProviderEventParts, ScanOptions, MAX_JSONL_RECORD_BYTES,
+    value_as_u64, AdapterScan, BoundedLineRead, DuplicateSelection, EventDeduplication,
+    FileParseContext, ProjectContextCache, ProviderEventParts, ScanOptions, MAX_JSONL_RECORD_BYTES,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -107,9 +107,21 @@ pub(crate) fn parse_claude_file(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| fallback_session_id(path));
-        let deduplication = claude_provider_record_id(&value).map_or(
-            EventDeduplication::SessionScoped,
-            EventDeduplication::ProviderRecord,
+        // Claude Code rewrites one streamed response as several records that
+        // share a provider-record identity while cumulative usage grows, so the
+        // last snapshot for that identity is the authoritative one. Records
+        // without a provider-record identity keep first-wins selection.
+        let (deduplication, duplicate_selection) = claude_provider_record_id(&value).map_or(
+            (
+                EventDeduplication::SessionScoped,
+                DuplicateSelection::KeepFirst,
+            ),
+            |record_id| {
+                (
+                    EventDeduplication::ProviderRecord(record_id),
+                    DuplicateSelection::KeepLatestSnapshot,
+                )
+            },
         );
         let event = usage_event(
             ctx.adapter,
@@ -135,7 +147,7 @@ pub(crate) fn parse_claude_file(
                 dedupe_salt: None,
             },
         );
-        push_deduped(ctx.scan, ctx.seen, event);
+        push_deduped(ctx.scan, ctx.seen, event, duplicate_selection);
     }
 
     Ok(())

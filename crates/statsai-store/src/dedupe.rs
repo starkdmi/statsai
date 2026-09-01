@@ -179,11 +179,50 @@ pub(crate) fn exact_or_semantic_conflict<'a>(
         })
 }
 
+/// Parse-evidence key version for events identified by the provider's own
+/// request identity, produced by the Claude adapter.
+const PROVIDER_RECORD_EVENT_KEY_VERSION: &str = "provider_record_usage_event.v1";
+
+/// Whether the stored event already holds a later snapshot of the same provider
+/// request than the incoming one.
+///
+/// Claude writes one streamed response as several records whose cumulative usage
+/// grows. An adapter scan reconciles those records across the files it reads,
+/// but an incremental scan can re-read only a file holding an early snapshot
+/// while the file holding the final one is skipped as unchanged. Both records
+/// share a provider-record identity, so the incoming partial snapshot would
+/// otherwise overwrite the complete one and shrink stored totals.
+///
+/// Keeping the larger snapshot pins the stored event until `scan --replace`
+/// deletes it, so a future parser change that legitimately lowers usage for one
+/// provider request needs a replacing scan to take effect.
+fn stored_snapshot_supersedes(existing: &UsageEvent, incoming: &UsageEvent) -> bool {
+    fn uses_provider_record_identity(event: &UsageEvent) -> bool {
+        event
+            .parse_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.event_key_version == PROVIDER_RECORD_EVENT_KEY_VERSION)
+    }
+
+    uses_provider_record_identity(existing)
+        && uses_provider_record_identity(incoming)
+        && incoming.usage.computed_total() < existing.usage.computed_total()
+}
+
 pub(crate) fn refreshed_duplicate_event(
     existing: Option<&UsageEvent>,
     incoming: &UsageEvent,
     existing_id: &str,
 ) -> UsageEvent {
+    // Whole-event selection keeps usage, cost, and evidence mutually consistent.
+    if let Some(existing) =
+        existing.filter(|existing| stored_snapshot_supersedes(existing, incoming))
+    {
+        let mut kept = existing.clone();
+        kept.event_id.0 = existing_id.to_string();
+        return kept;
+    }
+
     let mut refreshed = incoming.clone();
     refreshed.event_id.0 = existing_id.to_string();
 
