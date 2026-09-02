@@ -239,9 +239,10 @@ Canonical accounts are created when an identity such as `--email`,
 `work` and `personal` are display metadata, not account identity.
 
 For Claude Code sources in `auto` verification mode, StatsAI reads only
-`oauthAccount.accountUuid`, `oauthAccount.emailAddress`, and
-`oauthAccount.profileFetchedAt` from the local `.claude.json` profile. It does
-not invoke the Claude CLI or contact a service. This is reported as an
+`oauthAccount.accountUuid`, `oauthAccount.emailAddress`,
+`oauthAccount.profileFetchedAt`, `oauthAccount.organizationType`, and
+`oauthAccount.organizationRateLimitTier` from the local `.claude.json` profile.
+It does not invoke the Claude CLI or contact a service. This is reported as an
 `inferred` identity because Claude transcripts do not record per-session
 credential provenance. Durable API-key, token, cloud-provider, gateway, and
 credential-helper settings in managed, user, and project scopes suppress the
@@ -250,6 +251,17 @@ metadata when possible; otherwise attribution fails closed. One-shot environment
 overrides cannot be reconstructed by file-only collection, so `auto` is a
 best-effort source-wide policy. Use `manual_only` plus explicit source connections
 for mixed-credential history.
+
+The same cached profile also reports the Claude subscription plan — Pro, Max,
+Team, or Enterprise, with Max 5x and Max 20x named when the cached rate-limit
+tier is recognized — under `statsai account plans`. This is medium-confidence,
+point-in-time metadata dated by `profileFetchedAt`, not live billing
+verification, and the settings above suppress it exactly as they suppress
+identity. A profile that does not name a recognized plan reports nothing: Free,
+seat type, billing status, prices, and renewal dates are never inferred.
+
+Detected plans never create or modify a subscription record. `statsai
+subscription add` remains authoritative for status, price, and period.
 
 ### Understand the work behind the usage
 

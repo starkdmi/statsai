@@ -8,17 +8,17 @@ pub(crate) use tasks::*;
 
 use crate::{
     collect_jsonl_files, file_metadata_signature, scan_cache_namespaces, scan_candidate,
-    session_event_rollups, source_root_path, split_paths, AdapterScan, EventDedupIndex,
-    FileParseContext, ProviderAdapter, ScanCacheNamespaces, ScanCandidateFile, ScanOptions,
-    SessionEventRollup, CLAUDE_CODE_PROVIDER,
+    session_event_rollups, source_root_path, split_paths, AccountEvidenceScan, AdapterScan,
+    EventDedupIndex, FileParseContext, ProviderAdapter, ScanCacheNamespaces, ScanCandidateFile,
+    ScanOptions, SessionEventRollup, CLAUDE_CODE_PROVIDER,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use statsai_core::{
     branch_family, canonical_display, extract_issue_keys, hash_text, home_dir,
-    normalize_task_title, project_bucket_key, task_span_id, task_title_is_generic, Confidence,
-    LocationOrigin, ProjectInfo, SourceLocation, TaskSpan, VerifiedSourceObservation,
-    TASK_SPAN_SCHEMA_VERSION,
+    normalize_task_title, project_bucket_key, task_span_id, task_title_is_generic,
+    AccountEvidenceCheckpointV1, Confidence, LocationOrigin, ProjectInfo, SourceLocation, TaskSpan,
+    VerifiedSourceObservation, TASK_SPAN_SCHEMA_VERSION,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -130,6 +130,24 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         };
         let root = normalize_claude_config_root(&root);
         claude_verification_dependency_topology_changed(&root, changed)
+    }
+
+    fn collect_account_evidence(
+        &self,
+        source: &SourceLocation,
+        // One bounded snapshot file is re-read in full on every scan, so there is
+        // no incremental cursor to resume from.
+        _checkpoints: &[AccountEvidenceCheckpointV1],
+    ) -> Result<AccountEvidenceScan> {
+        let Some(root) = source_root_path(source) else {
+            return Ok(AccountEvidenceScan::default());
+        };
+        let root = normalize_claude_config_root(&root);
+        Ok(collect_claude_account_evidence(
+            source,
+            &root,
+            &source.location_origin,
+        ))
     }
 
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {

@@ -97,6 +97,7 @@ fn merge_provider_accounts_moves_source_records_and_prunes_alias() {
             &source.source_id,
             Some(&alias.provider_account_id),
             "plus",
+            "Plus",
             now,
             statsai_core::AccountEvidenceKind::AuthSnapshot,
         ),

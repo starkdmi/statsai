@@ -137,6 +137,7 @@ impl Store {
                     &observation.source_id,
                     Some(target_provider_account_id),
                     &observation.raw_plan_name,
+                    &observation.plan_name,
                     observation.observed_at,
                     observation.evidence_kind,
                 );
@@ -310,6 +311,7 @@ impl Store {
                         &source_id,
                         Some(&subscription.provider_account_id),
                         &subscription.plan_name,
+                        &normalize_plan_name(&subscription.plan_name),
                         observed_at,
                         AccountEvidenceKind::LegacyLocalAuth,
                     ),
@@ -375,6 +377,7 @@ impl Store {
                             &source_id,
                             Some(&account.provider_account_id),
                             &raw_plan_name,
+                            &normalize_plan_name(&raw_plan_name),
                             observed_at,
                             AccountEvidenceKind::LegacyLocalAuth,
                         ),

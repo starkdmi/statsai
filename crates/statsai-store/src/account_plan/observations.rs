@@ -100,6 +100,7 @@ impl Store {
                         &quota.source_id,
                         Some(&run.provider_account_id),
                         run.raw_plan_name,
+                        &normalize_plan_name(run.raw_plan_name),
                         run.started_at,
                         AccountEvidenceKind::QuotaStatus,
                     ),
@@ -322,10 +323,19 @@ impl Store {
         })
     }
 
+    /// Plan observations oldest first, ties broken by when they were collected.
+    ///
+    /// Two observations can share an `observed_at`: one cached artifact can be
+    /// re-read after the provider revised what it claims for that same moment,
+    /// which is exactly what the canonical plan in `account_plan_observation_id`
+    /// keeps from being discarded. Ordering those ties by `observation_id` sorted
+    /// them by hash, so the stale claim could outrank the corrected one and be
+    /// reported as the latest plan. `rowid` is insertion order, so the row read
+    /// most recently is the one that wins.
     pub fn account_plan_observations(&self) -> Result<Vec<AccountPlanObservationV1>> {
-        let mut statement = self.conn.prepare(
-            "SELECT payload FROM account_plan_observations ORDER BY observed_at, observation_id",
-        )?;
+        let mut statement = self
+            .conn
+            .prepare("SELECT payload FROM account_plan_observations ORDER BY observed_at, rowid")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }

@@ -1,6 +1,7 @@
 pub(super) use super::support::*;
 pub(crate) use super::*;
 
+mod claude_plans;
 mod merge;
 
 #[test]
@@ -39,6 +40,7 @@ fn plan_observation_fixture(
         observation_id: account_plan_observation_id(
             source_id,
             account_id,
+            &plan.to_ascii_lowercase(),
             plan,
             observed_at,
             evidence_kind,
@@ -202,6 +204,7 @@ fn known_account_aliases_are_applied_before_evidence_deduplication() {
             &source_id,
             Some(&raw_account_id),
             "plus",
+            "Plus",
             observed_at,
             statsai_core::AccountEvidenceKind::AuthSnapshot,
         ),
