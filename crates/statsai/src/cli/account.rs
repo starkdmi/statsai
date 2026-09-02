@@ -345,13 +345,12 @@ pub(crate) fn account_plan_evidence_report(
 
     let mut report = Vec::new();
     for ((provider, account_id), mut observations) in grouped {
-        // Newest last, with the id breaking ties so two observations sharing a timestamp -- which
-        // happens when one artifact yields both a snapshot and a login -- always order the same way.
-        observations.sort_by(|left, right| {
-            left.observed_at
-                .cmp(&right.observed_at)
-                .then_with(|| left.observation_id.cmp(&right.observation_id))
-        });
+        // Newest last. Two observations can share a timestamp -- one artifact yields both a
+        // snapshot and a login, or a revised claim is read for a moment already recorded -- and
+        // the store returns them in collection order, so a stable sort leaves the one collected
+        // last at the end. Breaking ties on the hashed id instead ordered them arbitrarily, which
+        // could report a superseded plan as the latest.
+        observations.sort_by_key(|observation| observation.observed_at);
         let account = account_id
             .as_ref()
             .and_then(|account_id| accounts.get(&ProviderAccountId(account_id.clone())));

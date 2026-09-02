@@ -252,3 +252,41 @@ fn claude_scan_persists_a_tier_change_that_reuses_the_cached_fetch_time() {
         "the refined plan must survive persistence, not be discarded as a duplicate"
     );
 }
+
+#[test]
+fn a_revised_plan_for_one_cached_moment_is_reported_as_the_latest() {
+    // Both claims share an `observed_at`, so nothing in the timestamp separates
+    // them: the report has to fall back on which was collected last, not on
+    // which hashed id sorts higher.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("claude-config");
+    std::fs::create_dir_all(root.join("projects")).expect("projects root");
+    let profile_path = root.join(".claude.json");
+    let fetched_at_millis = 1_786_104_000_000_i64;
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "claude_code",
+        "claude-code-local-jsonl",
+        "0",
+        &root,
+        LocationOrigin::Configured,
+    );
+
+    for tier in ["default_claude_max_5x", "default_claude_max_20x"] {
+        std::fs::write(&profile_path, claude_plan_profile(tier, fetched_at_millis))
+            .expect("claude profile");
+        scan_synthetic_claude_source(&store, &source);
+    }
+
+    let report = claude_plan_report(&store);
+    assert_eq!(report[0]["observation_count"], 2);
+    assert_eq!(
+        report[0]["latest_observation"]["plan_name"], "Max 20x",
+        "the revision collected last must win over the claim it corrects"
+    );
+    let observations = report[0]["observations"]
+        .as_array()
+        .expect("observations array");
+    assert_eq!(observations[0]["plan_name"], "Max 5x");
+    assert_eq!(observations[1]["plan_name"], "Max 20x");
+}

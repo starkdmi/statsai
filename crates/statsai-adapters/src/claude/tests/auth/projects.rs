@@ -451,3 +451,89 @@ fn claude_session_state_stub_still_checks_recovered_project_settings() {
         }
     );
 }
+
+#[test]
+fn claude_unread_transcript_records_still_block_attribution() {
+    // Each of these leaves the scan unable to say the file names no project, so
+    // the store must keep failing closed even though a sibling resolves.
+    let oversized_record = format!(
+        "{{\"cwd\":\"{}\"}}\n",
+        "x".repeat(crate::MAX_JSONL_RECORD_BYTES)
+    );
+    let late_metadata = std::iter::repeat_n(
+        serde_json::json!({"type": "mode"}).to_string(),
+        CLAUDE_PROJECT_METADATA_SCAN_LINES + 4,
+    )
+    .collect::<Vec<_>>()
+    .join("\n");
+    for (label, contents) in [
+        ("unparsable record", "{not valid json\n".to_string()),
+        ("record past the scan window", late_metadata),
+        ("record too large to read", oversized_record),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("claude-config");
+        let project_store = root.join("projects").join("unknown-workspace");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            project_store.join("session.jsonl"),
+            format!("{}\n", serde_json::json!({"cwd": workspace})),
+        )
+        .expect("resolvable sibling transcript");
+        std::fs::write(project_store.join("unreadable.jsonl"), contents).expect("transcript");
+        std::fs::write(
+            root.join(".claude.json"),
+            serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "cached-account",
+                    "emailAddress": "cached@example.com"
+                }
+            })
+            .to_string(),
+        )
+        .expect("claude profile");
+
+        assert_eq!(
+            claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None),
+            VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: None,
+            },
+            "expected a transcript with a {label} to keep failing closed"
+        );
+    }
+}
+
+#[test]
+fn claude_session_state_stub_without_a_resolvable_sibling_blocks_attribution() {
+    // Nothing else establishes the store's scope, so its settings were never
+    // checked and the stub cannot be dismissed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("claude-config");
+    let project_store = root.join("projects").join("unknown-workspace");
+    std::fs::create_dir_all(&project_store).expect("project store");
+    std::fs::write(
+        project_store.join("abandoned-session.jsonl"),
+        format!("{}\n", serde_json::json!({"type": "permission-mode"})),
+    )
+    .expect("session state stub");
+    std::fs::write(
+        root.join(".claude.json"),
+        serde_json::json!({
+            "oauthAccount": {
+                "accountUuid": "cached-account",
+                "emailAddress": "cached@example.com"
+            }
+        })
+        .to_string(),
+    )
+    .expect("claude profile");
+
+    assert_eq!(
+        claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None),
+        VerifiedSourceObservation::AttributionBlocked {
+            blocked_since: None,
+        }
+    );
+}
