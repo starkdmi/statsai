@@ -354,3 +354,100 @@ fn claude_project_local_settings_clear_user_auth_override_for_only_project() {
         Some(false)
     );
 }
+
+#[test]
+fn claude_session_state_stub_does_not_veto_a_resolvable_project_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("claude-config");
+    let project_store = root.join("projects").join("unknown-workspace");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&project_store).expect("project store");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(
+        project_store.join("session.jsonl"),
+        format!("{}\n", serde_json::json!({"cwd": workspace})),
+    )
+    .expect("transcript");
+    // A session abandoned before its first message: interface state only, so no
+    // `cwd`, no messages, and no usage. It must not veto the store its siblings
+    // already identify.
+    std::fs::write(
+        project_store.join("abandoned-session.jsonl"),
+        [
+            serde_json::json!({"type": "last-prompt", "value": ""}).to_string(),
+            serde_json::json!({"type": "mode", "value": "default"}).to_string(),
+            serde_json::json!({"type": "permission-mode", "value": "default"}).to_string(),
+        ]
+        .join("\n"),
+    )
+    .expect("session state stub");
+    std::fs::write(
+        root.join(".claude.json"),
+        serde_json::json!({
+            "oauthAccount": {
+                "accountUuid": "cached-account",
+                "emailAddress": "cached@example.com"
+            }
+        })
+        .to_string(),
+    )
+    .expect("claude profile");
+
+    let observation =
+        claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+    let VerifiedSourceObservation::Inferred {
+        identity: state, ..
+    } = observation
+    else {
+        panic!("a session-state stub must not block a store its siblings identify");
+    };
+    assert_eq!(state.provider_user_id.as_deref(), Some("cached-account"));
+}
+
+#[test]
+fn claude_session_state_stub_still_checks_recovered_project_settings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("claude-config");
+    let project_store = root.join("projects").join("unknown-workspace");
+    let workspace = dir.path().join("workspace");
+    let settings_path = workspace.join(".claude").join("settings.json");
+    std::fs::create_dir_all(&project_store).expect("project store");
+    std::fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .expect("project settings directory");
+    std::fs::write(
+        project_store.join("session.jsonl"),
+        format!("{}\n", serde_json::json!({"cwd": workspace})),
+    )
+    .expect("transcript");
+    std::fs::write(
+        project_store.join("abandoned-session.jsonl"),
+        format!("{}\n", serde_json::json!({"type": "permission-mode"})),
+    )
+    .expect("session state stub");
+    std::fs::write(
+        root.join(".claude.json"),
+        serde_json::json!({
+            "oauthAccount": {
+                "accountUuid": "cached-account",
+                "emailAddress": "cached@example.com"
+            }
+        })
+        .to_string(),
+    )
+    .expect("claude profile");
+    std::fs::write(
+        &settings_path,
+        serde_json::json!({"env": {"ANTHROPIC_API_KEY": "project-api-key"}}).to_string(),
+    )
+    .expect("project settings");
+
+    // Skipping the stub must not skip the store: the project it does resolve to
+    // is still checked for a credential that overrides subscription OAuth.
+    assert_eq!(
+        claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None),
+        VerifiedSourceObservation::AttributionBlocked {
+            blocked_since: file_modified_at(&settings_path),
+        }
+    );
+}

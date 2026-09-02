@@ -99,21 +99,36 @@ pub(crate) fn claude_project_paths_from_transcripts(project_store: &Path) -> Opt
         paths_by_transcript.insert(transcript, transcript_project_paths);
     }
 
+    // Fail closed on the *store*, not on each transcript. Claude Code names a
+    // project store after the working directory of the sessions inside it, so a
+    // transcript that never records one is covered by whatever its siblings
+    // resolve to; it cannot introduce a project scope they do not already name.
+    // Sessions that end before their first message leave a stub holding only
+    // interface state -- `last-prompt`, `mode`, `permission-mode` -- with no
+    // `cwd`, no messages, and no usage to attribute. Vetoing on that stub blocked
+    // attribution for every project in the store, and with it the whole source.
+    // A store that resolves to nothing at all is still unidentifiable and still
+    // blocks, which is the case this rule exists for.
     let mut project_paths = HashMap::new();
+    let mut unresolved_transcript = false;
     for (transcript, transcript_project_paths) in &paths_by_transcript {
         let resolved_paths = if transcript_project_paths.is_empty() {
-            let parent_transcript =
-                claude_parent_transcript_for_subagent(project_store, transcript)?;
-            paths_by_transcript.get(&parent_transcript)?
+            claude_parent_transcript_for_subagent(project_store, transcript)
+                .and_then(|parent_transcript| paths_by_transcript.get(&parent_transcript))
+                .filter(|parent_paths| !parent_paths.is_empty())
         } else {
-            transcript_project_paths
+            Some(transcript_project_paths)
         };
-        if resolved_paths.is_empty() {
-            return None;
-        }
+        let Some(resolved_paths) = resolved_paths else {
+            unresolved_transcript = true;
+            continue;
+        };
         for project_path in resolved_paths {
             insert_claude_project_path(&mut project_paths, project_path);
         }
+    }
+    if project_paths.is_empty() && unresolved_transcript {
+        return None;
     }
 
     Some(project_paths.into_values().collect())
