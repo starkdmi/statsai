@@ -1,6 +1,7 @@
 pub(crate) use super::*;
 
 mod overrides;
+mod plans;
 mod projects;
 
 #[test]

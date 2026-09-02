@@ -100,6 +100,7 @@ impl Store {
                         &quota.source_id,
                         Some(&run.provider_account_id),
                         run.raw_plan_name,
+                        &normalize_plan_name(run.raw_plan_name),
                         run.started_at,
                         AccountEvidenceKind::QuotaStatus,
                     ),

@@ -1,4 +1,6 @@
 use super::*;
+use rusqlite::params;
+use statsai_core::{account_plan_observation_id, AccountPlanObservationV1};
 
 pub(crate) fn apply_migration_012(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -381,5 +383,55 @@ pub(crate) fn apply_migration_022(conn: &Connection) -> Result<()> {
              (observation_id, resets_at, window_observation_id);
         "#,
     )?;
+    Ok(())
+}
+
+/// Re-keys stored plan observations onto the canonical-plan-aware identity.
+///
+/// `account_plan_observation_id` now hashes the canonical plan as well, so every
+/// row written by an earlier build carries an id no scanner will ever produce
+/// again. Left alone, the next scan would re-emit each observation under its new
+/// id and the ledger would show every plan twice. Ids are recomputed from the
+/// stored payload, which already holds every input.
+pub(crate) fn apply_migration_023(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut statement =
+            conn.prepare("SELECT observation_id, payload FROM account_plan_observations")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (observation_id, payload) in rows {
+        // A payload this build cannot parse is left exactly as it is: it could not
+        // have been re-keyed correctly, and failing here would make the store
+        // permanently unopenable.
+        let Ok(mut observation) = serde_json::from_str::<AccountPlanObservationV1>(&payload) else {
+            continue;
+        };
+        let recomputed = account_plan_observation_id(
+            &observation.source_id,
+            observation.provider_account_id.as_ref(),
+            &observation.raw_plan_name,
+            &observation.plan_name,
+            observation.observed_at,
+            observation.evidence_kind,
+        );
+        if recomputed == observation_id {
+            continue;
+        }
+        observation.observation_id = recomputed.clone();
+        // `OR REPLACE` covers the one case that can collide: a store that already
+        // holds both the old and the new id for the same observation.
+        conn.execute(
+            "UPDATE OR REPLACE account_plan_observations \
+             SET observation_id = ?1, payload = ?2 WHERE observation_id = ?3",
+            params![
+                &recomputed,
+                serde_json::to_string(&observation)?,
+                &observation_id
+            ],
+        )?;
+    }
     Ok(())
 }

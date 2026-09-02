@@ -1,5 +1,9 @@
 use super::support::*;
 use super::*;
+use statsai_core::{
+    account_plan_observation_id, AccountEvidenceKind, AccountPlanObservationV1,
+    ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION,
+};
 
 #[test]
 fn reads_legacy_subscription_payloads_with_missing_account_and_start() {
@@ -263,4 +267,78 @@ fn completed_legacy_plan_conversion_is_not_repeated_on_migrate() {
         .expect("insert evidence that must not be rescanned");
 
     store.migrate().expect("completed conversion stays skipped");
+}
+
+#[test]
+fn migration_rekeys_plan_observations_onto_the_canonical_plan_identity() {
+    let store = Store::in_memory().expect("store");
+    let source_id = SourceId("rekey-source".to_string());
+    let account_id = ProviderAccountId("rekey-account".to_string());
+    let observed_at = Utc
+        .with_ymd_and_hms(2026, 8, 23, 0, 0, 0)
+        .single()
+        .expect("timestamp");
+    // The identity an earlier build wrote, before the canonical plan joined it.
+    let legacy_observation_id = format!(
+        "plan_observation_{}",
+        &hash_text(&format!(
+            "account_plan_observation.v1:{}:{}:{}:{}:{:?}",
+            source_id.0,
+            account_id.0,
+            "claude_max",
+            observed_at.to_rfc3339(),
+            AccountEvidenceKind::AuthSnapshot
+        ))[..32]
+    );
+    let observation = AccountPlanObservationV1 {
+        schema_version: ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+        observation_id: legacy_observation_id.clone(),
+        provider: "claude_code".to_string(),
+        source_id: source_id.clone(),
+        provider_account_id: Some(account_id.clone()),
+        raw_plan_name: "claude_max".to_string(),
+        plan_name: "Max 20x".to_string(),
+        observed_at,
+        active_from: None,
+        active_until: None,
+        is_current_snapshot: true,
+        evidence_kind: AccountEvidenceKind::AuthSnapshot,
+        confidence: Confidence::Medium,
+        parser_version: "claude-account-evidence.v1".to_string(),
+        artifact_path_hash: "a".repeat(64),
+        record_fingerprint: "b".repeat(64),
+    };
+    store
+        .upsert_account_plan_observations(std::slice::from_ref(&observation))
+        .expect("seed legacy observation");
+
+    crate::migrations::apply_migration_023(&store.conn).expect("re-key plan observations");
+
+    let current_observation_id = account_plan_observation_id(
+        &source_id,
+        Some(&account_id),
+        &observation.raw_plan_name,
+        &observation.plan_name,
+        observed_at,
+        AccountEvidenceKind::AuthSnapshot,
+    );
+    let stored = store.account_plan_observations().expect("observations");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].observation_id, current_observation_id);
+    assert_ne!(current_observation_id, legacy_observation_id);
+
+    // The next scan re-emits the same observation under the current identity, so
+    // a migrated store must recognize it instead of appending a duplicate.
+    let mut rescanned = observation;
+    rescanned.observation_id = current_observation_id;
+    store
+        .upsert_account_plan_observations(std::slice::from_ref(&rescanned))
+        .expect("rescan");
+    assert_eq!(
+        store
+            .account_plan_observations()
+            .expect("observations")
+            .len(),
+        1
+    );
 }

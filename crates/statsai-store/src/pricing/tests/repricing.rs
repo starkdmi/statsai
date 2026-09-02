@@ -384,7 +384,7 @@ fn daily_rollups_are_unused_by_report_and_sync_paths() {
     assert_eq!(events[0].cost, expected_review_cost(started_at));
     // Pin: bump this when CURRENT_SCHEMA_VERSION changes, after confirming
     // the daily_rollups table is still unused by report/sync/snapshot.
-    assert_eq!(CURRENT_SCHEMA_VERSION, 22);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 23);
 }
 
 #[test]

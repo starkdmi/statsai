@@ -193,6 +193,7 @@ pub fn remap_account_evidence_account_ids(
                 &observation.source_id,
                 Some(canonical_id),
                 &observation.raw_plan_name,
+                &observation.plan_name,
                 observation.observed_at,
                 observation.evidence_kind,
             );

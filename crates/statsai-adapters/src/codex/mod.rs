@@ -545,10 +545,12 @@ pub(crate) fn push_codex_auth_snapshot(
     });
     if plan_allowed {
         if let Some(raw_plan_name) = claims.plan_type {
+            let plan_name = normalize_plan_name(&raw_plan_name);
             let observation_id = account_plan_observation_id(
                 &source.source_id,
                 provider_account_id.as_ref(),
                 &raw_plan_name,
+                &plan_name,
                 plan_observed_at,
                 AccountEvidenceKind::AuthSnapshot,
             );
@@ -558,7 +560,7 @@ pub(crate) fn push_codex_auth_snapshot(
                 provider: CODEX_PROVIDER.to_string(),
                 source_id: source.source_id.clone(),
                 provider_account_id,
-                plan_name: normalize_plan_name(&raw_plan_name),
+                plan_name,
                 raw_plan_name,
                 observed_at: plan_observed_at,
                 active_from: claims.active_from,

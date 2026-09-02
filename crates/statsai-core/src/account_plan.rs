@@ -201,21 +201,30 @@ pub fn account_identity_observation_id(
     )
 }
 
+/// Identifies one plan observation.
+///
+/// `plan_name` is part of the identity, not decoration: a provider can refine one
+/// raw plan family into different canonical plans from metadata outside
+/// `raw_plan_name` — Claude's `claude_max` becomes `Max 5x` or `Max 20x` from the
+/// cached rate-limit tier. The store deduplicates on this id alone, so leaving the
+/// canonical plan out silently discarded the newer of two contradicting claims.
 #[must_use]
 pub fn account_plan_observation_id(
     source_id: &SourceId,
     provider_account_id: Option<&ProviderAccountId>,
     raw_plan_name: &str,
+    plan_name: &str,
     observed_at: DateTime<Utc>,
     kind: AccountEvidenceKind,
 ) -> String {
     format!(
         "plan_observation_{}",
         &hash_text(&format!(
-            "account_plan_observation.v1:{}:{}:{}:{}:{kind:?}",
+            "account_plan_observation.v2:{}:{}:{}:{}:{}:{kind:?}",
             source_id.0,
             provider_account_id.map_or("unattributed", |id| id.0.as_str()),
             raw_plan_name.trim().to_ascii_lowercase(),
+            plan_name.trim().to_ascii_lowercase(),
             observed_at.to_rfc3339()
         ))[..32]
     )
@@ -245,11 +254,15 @@ pub fn plan_projection_from_observation(
     device_id: &str,
 ) -> Option<AccountPlanProjectionV1> {
     let provider_account_id = observation.provider_account_id.clone()?;
+    // Carries the canonical plan for the same reason `account_plan_observation_id`
+    // does: two observations that differ only in the refined plan are different
+    // facts, and a shared fingerprint would collapse them into one contribution.
     let semantic_fingerprint = hash_text(&format!(
-        "account_plan_projection.v1:{}:{}:{}:{}:{}:{}:{}:{:?}",
+        "account_plan_projection.v2:{}:{}:{}:{}:{}:{}:{}:{}:{:?}",
         observation.provider,
         provider_account_id.0,
         observation.raw_plan_name.trim().to_ascii_lowercase(),
+        observation.plan_name.trim().to_ascii_lowercase(),
         observation.observed_at.to_rfc3339(),
         observation
             .active_from
@@ -308,6 +321,7 @@ mod tests {
             &source_id,
             Some(&account_a),
             "future_ultra",
+            "Future Ultra",
             observed_at,
             AccountEvidenceKind::AuthSnapshot,
         );
@@ -315,6 +329,7 @@ mod tests {
             &source_id,
             Some(&account_a),
             "future_ultra",
+            "Future Ultra",
             observed_at,
             AccountEvidenceKind::AuthSnapshot,
         );
@@ -322,11 +337,71 @@ mod tests {
             &source_id,
             Some(&account_b),
             "future_ultra",
+            "Future Ultra",
             observed_at,
             AccountEvidenceKind::AuthSnapshot,
         );
 
         assert_eq!(first, repeat);
         assert_ne!(first, other_account);
+    }
+
+    #[test]
+    fn plan_observation_identity_separates_refined_plans_of_one_raw_family() {
+        // Claude's `claude_max` refines into Max 5x or Max 20x from metadata that
+        // never reaches `raw_plan_name`. Two such claims cached at the same moment
+        // are different observations, and the store keys on this id alone.
+        let source_id = SourceId("source".to_string());
+        let account = ProviderAccountId("account".to_string());
+        let observed_at = Utc
+            .with_ymd_and_hms(2026, 8, 23, 0, 0, 0)
+            .single()
+            .expect("timestamp");
+        let id_for = |plan_name: &str| {
+            account_plan_observation_id(
+                &source_id,
+                Some(&account),
+                "claude_max",
+                plan_name,
+                observed_at,
+                AccountEvidenceKind::AuthSnapshot,
+            )
+        };
+
+        assert_ne!(id_for("Max 5x"), id_for("Max 20x"));
+        assert_eq!(id_for("Max 5x"), id_for("max 5x"));
+    }
+
+    #[test]
+    fn plan_projections_of_refined_plans_do_not_share_a_semantic_fingerprint() {
+        let observation = AccountPlanObservationV1 {
+            schema_version: ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: "plan_observation_test".to_string(),
+            provider: "claude_code".to_string(),
+            source_id: SourceId("source".to_string()),
+            provider_account_id: Some(ProviderAccountId("account".to_string())),
+            raw_plan_name: "claude_max".to_string(),
+            plan_name: "Max 5x".to_string(),
+            observed_at: Utc
+                .with_ymd_and_hms(2026, 8, 23, 0, 0, 0)
+                .single()
+                .expect("timestamp"),
+            active_from: None,
+            active_until: None,
+            is_current_snapshot: true,
+            evidence_kind: AccountEvidenceKind::AuthSnapshot,
+            confidence: Confidence::Medium,
+            parser_version: "test.v1".to_string(),
+            artifact_path_hash: "a".repeat(64),
+            record_fingerprint: "b".repeat(64),
+        };
+        let mut upgraded = observation.clone();
+        upgraded.plan_name = "Max 20x".to_string();
+
+        let first = plan_projection_from_observation(&observation, "device").expect("projection");
+        let second = plan_projection_from_observation(&upgraded, "device").expect("projection");
+
+        assert_ne!(first.semantic_fingerprint, second.semantic_fingerprint);
+        assert_ne!(first.projection_id, second.projection_id);
     }
 }
