@@ -46,6 +46,11 @@ pub(crate) fn refresh(paths: &Paths, state: &mut State) -> Result<RefreshOutcome
     // until the new one has adopted its cursors. Publishing first would mean a
     // failure between the copy and the adoption -- a production schema this launcher
     // cannot open, say -- destroys the only copy of them, and retrying cannot help.
+    // A refresh interrupted after staging leaves the clone under the staged suffix.
+    // It holds the only copy of the dev cursors, so it is put back before anything
+    // else -- otherwise staging would discard it and the interrupted run would have
+    // cost exactly what this function exists to prevent.
+    recover_staged_clone(&paths.dev_store)?;
     let previous = stage_previous_clone(&paths.dev_store)?;
     let refreshed = (|| {
         let cloned = clone_database_to(&paths.prod_store, &paths.dev_store).with_context(|| {
@@ -82,6 +87,92 @@ pub(crate) fn refresh(paths: &Paths, state: &mut State) -> Result<RefreshOutcome
     }
 }
 
+/// Puts back a clone left under the staged suffix by an interrupted refresh.
+///
+/// Whatever sits at the live path is either missing or a freshly written clone that
+/// has not adopted anything yet, so the staged copy always wins: it is the one
+/// carrying cursors.
+fn recover_staged_clone(dev_store: &Path) -> Result<()> {
+    let staged = path_with_suffix(dev_store, ".previous");
+    // Which step was running is recorded, not inferred from which files survived it.
+    // Inference cannot work here: staging, restoring and discarding all move or delete
+    // the main file first, so a second interruption leaves file layouts they share --
+    // and the same leftover write-ahead log is precious after one of them and garbage
+    // after another.
+    if discarding_marker(&staged)
+        .try_exists()
+        .with_context(|| format!("check discard marker for {}", staged.display()))?
+    {
+        // Cleanup was under way, so everything staged belongs to a clone already
+        // finished with. Putting its write-ahead log back would rename it over the
+        // live one, which is where a freshly adopted cursor still sits.
+        discard_staged_clone(&staged);
+        return Ok(());
+    }
+
+    // Any component left behind means an interrupted refresh, not just the main file.
+    // Restoration moves the main file first, so stopping partway through it leaves the
+    // main file live and the staged write-ahead log stranded -- and in WAL mode that
+    // log holds the newest writes, so a run that looked only at the main file would
+    // walk past it and staging would then delete it.
+    let staged_anything = carrying_database_files(&staged)
+        .iter()
+        .any(|path| path.exists());
+    if !staged_anything {
+        let _ = fs::remove_file(staging_marker(&staged));
+        return Ok(());
+    }
+    let staging_completed = staging_marker(&staged)
+        .try_exists()
+        .with_context(|| format!("check staging marker for {}", staged.display()))?;
+    let staged_main_present = staged
+        .try_exists()
+        .with_context(|| format!("check staged development database {}", staged.display()))?;
+
+    eprintln!(
+        "note: recovering the development database left behind by an interrupted refresh ({})",
+        staged.display()
+    );
+    // Whether staging finished decides what the live files are. Without the marker
+    // staging stopped partway, so the files still at the live path belong to the same
+    // database as the staged ones -- in WAL mode that side can hold the newest cursor,
+    // and deleting it would throw away exactly what this recovery exists to save. With
+    // it, staging completed and anything live is a partly written clone that owns
+    // nothing.
+    //
+    // Unless the main file is already back: then a previous restoration moved it and
+    // the live files *are* the staged clone. Deleting them would destroy the very
+    // copy this function exists to put back, so only the leftovers are moved over.
+    if staging_completed && staged_main_present {
+        for path in database_files(dev_store) {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("remove incomplete development database {}", path.display())
+                    });
+                }
+            }
+        }
+    }
+    restore_staged_clone(&staged, dev_store)?;
+    let _ = fs::remove_file(staging_marker(&staged));
+    Ok(())
+}
+
+/// Written once every file has moved, so a later run can tell a completed staging
+/// from one that stopped halfway through.
+fn staging_marker(staged: &Path) -> PathBuf {
+    path_with_suffix(staged, ".complete")
+}
+
+/// Written before the staged clone starts being thrown away, so a later run can tell
+/// leftovers nobody wants from leftovers that are the only copy of a cursor.
+fn discarding_marker(staged: &Path) -> PathBuf {
+    path_with_suffix(staged, ".discarding")
+}
+
 /// Moves the existing clone out of the way, returning where it went. `None` means
 /// there was nothing to move.
 fn stage_previous_clone(dev_store: &Path) -> Result<Option<PathBuf>> {
@@ -93,9 +184,10 @@ fn stage_previous_clone(dev_store: &Path) -> Result<Option<PathBuf>> {
     }
     let staged = path_with_suffix(dev_store, ".previous");
     discard_staged_clone(&staged);
-    // A partial move is worse than not moving at all: this fails before `refresh`
-    // has anything to roll back, so whatever already moved would be stranded under
-    // the staged suffix and a retry would find no complete clone at either path.
+    // A partial move is worse than not moving at all: every failure here returns
+    // without handing `refresh` the staged path, so `refresh`'s own rollback never
+    // runs. Anything already moved would be stranded under the staged suffix with no
+    // development database at the live path at all.
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (from, to) in database_files(dev_store)
         .into_iter()
@@ -105,15 +197,29 @@ fn stage_previous_clone(dev_store: &Path) -> Result<Option<PathBuf>> {
             Ok(()) => moved.push((to, from)),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => {
-                for (staged_path, live_path) in moved.into_iter().rev() {
-                    let _ = fs::rename(staged_path, live_path);
-                }
+                undo_staging(moved);
                 return Err(error)
                     .with_context(|| format!("set aside development database {}", from.display()));
             }
         }
     }
+    // The marker is written last and is just as much a part of staging as the moves:
+    // without it a later run reads the staged clone as a staging that stopped partway.
+    // Every file has already moved by the time it is written, so failing here has to
+    // put them back like any other failed step.
+    if let Err(error) = fs::write(staging_marker(&staged), b"") {
+        undo_staging(moved);
+        return Err(error)
+            .with_context(|| format!("record staging completion for {}", staged.display()));
+    }
     Ok(Some(staged))
+}
+
+/// Puts back everything a failed staging had already moved aside.
+fn undo_staging(moved: Vec<(PathBuf, PathBuf)>) {
+    for (staged_path, live_path) in moved.into_iter().rev() {
+        let _ = fs::rename(staged_path, live_path);
+    }
 }
 
 fn restore_staged_clone(staged: &Path, dev_store: &Path) -> Result<()> {
@@ -134,9 +240,19 @@ fn restore_staged_clone(staged: &Path, dev_store: &Path) -> Result<()> {
 }
 
 fn discard_staged_clone(staged: &Path) {
+    // Nothing is removed until the intent to remove it is on disk. Deleting first and
+    // recording afterwards is what makes an interrupted cleanup indistinguishable from
+    // an interrupted staging or restoration, and those want the opposite treatment. If
+    // the intent cannot be recorded, leaving the clone alone is the recoverable
+    // outcome -- the next refresh stages over it.
+    if fs::write(discarding_marker(staged), b"").is_err() {
+        return;
+    }
+    let _ = fs::remove_file(staging_marker(staged));
     for path in database_files(staged) {
         let _ = fs::remove_file(path);
     }
+    let _ = fs::remove_file(discarding_marker(staged));
 }
 
 fn adopt_sync_tracking(dev_store: &Path, previous: &Path) -> Result<usize> {
@@ -146,22 +262,65 @@ fn adopt_sync_tracking(dev_store: &Path, previous: &Path) -> Result<usize> {
             dev_store.display()
         )
     })?;
-    // A clone that cannot be read carries nothing worth keeping, and refusing to
-    // refresh because of it would break the one command that repairs a broken clone.
-    match store.adopt_sync_tracking_from(previous) {
-        Ok(adopted) => Ok(adopted),
+    // Whether there is anything to lose, decided by reading the clone rather than by
+    // guessing from a schema number. A corrupt one fails to open, a legacy one opens
+    // and is migrated far enough for its cursors to be readable, an empty one simply
+    // has none. All three mean "nothing recoverable", and refusing to refresh over
+    // them would break the one command that repairs a broken clone.
+    // Only two things prove there is nothing to lose: a file that is not a database
+    // at all, and one with no schema. Anything else is a real database, and failing
+    // to read it does not mean it is empty -- a clone left one version ahead by a
+    // schema-changing PR is exactly the case this launcher exists for, and treating
+    // its "newer than supported" error as "no cursors" would delete the only copy.
+    match database_schema_version(previous) {
         Err(error) => {
             eprintln!(
-                "warning: could not carry sync cursors from the previous development database ({error:#}); the next sync may re-upload history"
+                "note: the previous development database at {} is unreadable ({error:#}); it had no sync cursors to carry",
+                previous.display()
             );
-            Ok(0)
+            return Ok(0);
         }
+        // Schema zero is ambiguous -- a legacy store predating `schema_migrations`,
+        // which the migration layer stamps and upgrades, or a file with nothing in
+        // it. Only reading it tells them apart, and a legacy store can hold cursors.
+        Ok(None) => return Ok(0),
+        Ok(Some(_)) => {}
     }
+    let carries_cursors = Store::open(previous)
+        .and_then(|previous_store| previous_store.list_sync_states())
+        .map(|states| !states.is_empty())
+        .with_context(|| {
+            format!(
+                "read sync cursors from the previous development database {}; \
+                 refusing to discard them. Run `statsai-dev data clean` to drop the \
+                 development database deliberately, or select a build that can open it",
+                previous.display()
+            )
+        })?;
+    if !carries_cursors {
+        return Ok(0);
+    }
+    // It does carry cursors, so failing here would discard something recoverable --
+    // the very full-history re-upload this exists to prevent. Report it and let the
+    // caller put the previous clone back.
+    store.adopt_sync_tracking_from(previous).with_context(|| {
+        format!(
+            "carry sync cursors from the previous development database {}",
+            previous.display()
+        )
+    })
 }
 
 pub(crate) fn clean(paths: &Paths, state: &mut State) -> Result<usize> {
     let mut removed = 0;
-    for path in database_files(&paths.dev_store) {
+    // Including anything an interrupted refresh left staged, which is otherwise
+    // invisible and would be recovered over the next refresh.
+    let staged = path_with_suffix(&paths.dev_store, ".previous");
+    for path in database_files(&paths.dev_store)
+        .into_iter()
+        .chain(database_files(&staged))
+        .chain([staging_marker(&staged), discarding_marker(&staged)])
+    {
         match fs::remove_file(&path) {
             Ok(()) => removed += 1,
             Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -231,6 +390,17 @@ fn database_files(database: &Path) -> [PathBuf; 4] {
         database.to_path_buf(),
         path_with_suffix(database, "-wal"),
         path_with_suffix(database, "-shm"),
+        path_with_suffix(database, "-journal"),
+    ]
+}
+
+/// The files that can hold committed data. The shared-memory index is left out: it is
+/// a rebuildable view of the write-ahead log, so one stranded on its own says nothing
+/// about whether there is a database to recover.
+fn carrying_database_files(database: &Path) -> [PathBuf; 3] {
+    [
+        database.to_path_buf(),
+        path_with_suffix(database, "-wal"),
         path_with_suffix(database, "-journal"),
     ]
 }
@@ -343,6 +513,266 @@ mod tests {
                 .expect("prod cursor")
                 .last_batch_id,
             "batch-prod-fresh"
+        );
+    }
+
+    // `clone_database_to` is APFS-only, so the refresh path cannot run elsewhere.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn refresh_still_repairs_a_corrupt_or_cursorless_clone() {
+        for (label, seed) in [("corrupt", &b"not a database"[..]), ("empty", &b""[..])] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let paths = Paths::for_test(directory.path());
+            paths.ensure_cache_dirs().expect("create cache directories");
+            drop(Store::open(&paths.prod_store).expect("create production store"));
+            fs::write(&paths.dev_store, seed).expect("write unusable clone");
+
+            let mut state = State::default();
+            let outcome = refresh(&paths, &mut state).unwrap_or_else(|error| {
+                panic!("{label} clone must still be repairable: {error:#}")
+            });
+
+            assert_eq!(outcome.restored_sync_states, 0);
+            assert!(
+                database_schema_version(&paths.dev_store)
+                    .expect("read refreshed schema")
+                    .is_some(),
+                "{label} clone should have been replaced"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_interrupted_refresh_recovers_its_staged_clone() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        drop(Store::open(&paths.prod_store).expect("create production store"));
+        let dev_target = "https://dev-api.example.test/api/sync/batches";
+
+        // What an interruption between staging and cloning leaves behind: the only
+        // copy of the cursors sits under the staged suffix.
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+        drop(Store::open(&staged).expect("create staged clone"));
+        record_cursor(&staged, dev_target, Utc::now(), "batch-dev-staged");
+
+        let mut state = State::default();
+        let outcome = refresh(&paths, &mut state).expect("refresh recovers and proceeds");
+
+        assert_eq!(outcome.restored_sync_states, 1);
+        assert_eq!(
+            cursor(&paths.dev_store, dev_target)
+                .expect("cursor survived")
+                .last_batch_id,
+            "batch-dev-staged"
+        );
+        assert!(!staged.exists(), "the staged copy is consumed");
+    }
+
+    #[test]
+    fn a_partially_staged_clone_keeps_its_live_wal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+
+        // Staging moves the main file first, so an interruption can leave the main
+        // file staged and the write-ahead log -- which in WAL mode holds the newest
+        // writes, including the newest cursor -- still at the live path. No marker
+        // was written, so staging is known to be incomplete.
+        fs::write(&staged, b"main").expect("stage the main file");
+        let live_wal = path_with_suffix(&paths.dev_store, "-wal");
+        fs::write(&live_wal, b"newest-writes").expect("leave the wal behind");
+
+        recover_staged_clone(&paths.dev_store).expect("recover the interrupted staging");
+
+        assert_eq!(
+            fs::read(&paths.dev_store).expect("main file is back"),
+            b"main"
+        );
+        assert_eq!(
+            fs::read(&live_wal).expect("wal must survive"),
+            b"newest-writes",
+            "the newest writes must not be deleted with the incomplete clone"
+        );
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn an_interrupted_restoration_finishes_instead_of_discarding_the_rest() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+
+        // Restoration moves the main file first. Stopping right after that leaves the
+        // main file live and the staged write-ahead log -- which holds the newest
+        // cursor writes -- still under the staged suffix, with the marker from the
+        // completed staging still in place.
+        fs::write(&paths.dev_store, b"main").expect("main file already restored");
+        let staged_wal = path_with_suffix(&staged, "-wal");
+        fs::write(&staged_wal, b"newest-writes").expect("strand the staged wal");
+        fs::write(staging_marker(&staged), b"").expect("staging had completed");
+
+        recover_staged_clone(&paths.dev_store).expect("finish the interrupted restoration");
+
+        assert_eq!(
+            fs::read(&paths.dev_store).expect("main file must survive"),
+            b"main",
+            "the already-restored main file must not be deleted as an incomplete clone"
+        );
+        assert_eq!(
+            fs::read(path_with_suffix(&paths.dev_store, "-wal")).expect("wal is back"),
+            b"newest-writes",
+            "the stranded wal must be carried over, not discarded by the next staging"
+        );
+        assert!(!staged_wal.exists(), "the staged copy is consumed");
+        assert!(!staging_marker(&staged).exists(), "the marker is cleared");
+    }
+
+    #[test]
+    fn an_interrupted_cleanup_discards_its_leftovers() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+
+        // A refresh that succeeded: the live clone is the new one, and its write-ahead
+        // log is where the cursors adoption just wrote still sit.
+        fs::write(&paths.dev_store, b"refreshed").expect("write the refreshed clone");
+        let live_wal = path_with_suffix(&paths.dev_store, "-wal");
+        fs::write(&live_wal, b"adopted-cursors").expect("write the adopted cursors");
+        // Throwing the old clone away stopped partway, with the intent recorded before
+        // the first deletion. What is left belongs to a database nobody wants back.
+        let staged_wal = path_with_suffix(&staged, "-wal");
+        fs::write(&staged_wal, b"superseded").expect("strand the old sidecar");
+        fs::write(discarding_marker(&staged), b"").expect("cleanup had started");
+
+        recover_staged_clone(&paths.dev_store).expect("recognise the interrupted cleanup");
+
+        assert_eq!(
+            fs::read(&live_wal).expect("the live wal must survive"),
+            b"adopted-cursors",
+            "a superseded sidecar must not be renamed over the log holding the adopted cursors"
+        );
+        assert_eq!(
+            fs::read(&paths.dev_store).expect("the refreshed clone must survive"),
+            b"refreshed"
+        );
+        assert!(
+            !staged_wal.exists(),
+            "the leftover is discarded, not restored"
+        );
+    }
+
+    #[test]
+    fn a_restoration_interrupted_after_an_incomplete_staging_keeps_its_wal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+
+        // Two interruptions in a row. Staging moved the main file and the write-ahead
+        // log but stopped before recording completion; recovery then moved the main
+        // file back and stopped before the log. The leftovers now look exactly like an
+        // interrupted cleanup -- no marker, no staged main, one stranded sidecar --
+        // but this log is the only copy of the newest cursor.
+        fs::write(&paths.dev_store, b"main").expect("main file already restored");
+        let staged_wal = path_with_suffix(&staged, "-wal");
+        fs::write(&staged_wal, b"newest-writes").expect("strand the staged wal");
+
+        recover_staged_clone(&paths.dev_store).expect("finish the interrupted restoration");
+
+        assert_eq!(
+            fs::read(path_with_suffix(&paths.dev_store, "-wal")).expect("the wal is back"),
+            b"newest-writes",
+            "only a recorded cleanup may discard a stranded log"
+        );
+        assert_eq!(
+            fs::read(&paths.dev_store).expect("main file must survive"),
+            b"main"
+        );
+        assert!(!staged_wal.exists(), "the staged copy is consumed");
+    }
+
+    #[test]
+    fn discarding_records_its_intent_and_clears_it_again() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+        fs::write(&staged, b"superseded").expect("stage a clone");
+        fs::write(path_with_suffix(&staged, "-wal"), b"log").expect("stage its log");
+        fs::write(staging_marker(&staged), b"").expect("staging had completed");
+
+        discard_staged_clone(&staged);
+
+        assert!(!staged.exists(), "the clone is gone");
+        assert!(!staging_marker(&staged).exists());
+        // A marker left behind would tell the next recovery that a cleanup was under
+        // way when none was, and it would discard a clone holding the only cursor.
+        assert!(
+            !discarding_marker(&staged).exists(),
+            "the recorded intent must be cleared once the cleanup finishes"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_that_cannot_record_its_intent_deletes_nothing() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+        fs::write(&staged, b"the only copy").expect("stage a clone");
+        let staged_wal = path_with_suffix(&staged, "-wal");
+        fs::write(&staged_wal, b"newest-writes").expect("stage its log");
+        // Nothing can be written at the marker path, while the directory around it
+        // stays writable -- so the deletions would otherwise go through.
+        fs::create_dir(discarding_marker(&staged)).expect("block the marker path");
+
+        discard_staged_clone(&staged);
+
+        // Deleting without a record of having started is what makes an interrupted
+        // cleanup look like an interrupted restoration. Leaving the clone alone is
+        // recoverable; the next refresh stages over it.
+        assert!(staged.exists(), "an unrecorded cleanup must not start");
+        assert_eq!(
+            fs::read(&staged_wal).expect("the log must survive"),
+            b"newest-writes"
+        );
+    }
+
+    #[test]
+    fn a_staging_that_cannot_record_completion_puts_the_clone_back() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        fs::write(&paths.dev_store, b"database").expect("write the clone");
+        let wal = path_with_suffix(&paths.dev_store, "-wal");
+        fs::write(&wal, b"newest-writes").expect("write its log");
+        // Nothing can be written at the completion marker's path, so staging fails
+        // after every file has already moved aside.
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+        fs::create_dir(staging_marker(&staged)).expect("block the marker path");
+
+        stage_previous_clone(&paths.dev_store)
+            .expect_err("staging must fail when it cannot record completion");
+
+        // `refresh` never receives the staged path when staging fails, so its own
+        // rollback cannot run. Leaving the files aside would leave no development
+        // database at the live path at all.
+        assert_eq!(
+            fs::read(&paths.dev_store).expect("the clone must be back"),
+            b"database"
+        );
+        assert_eq!(
+            fs::read(&wal).expect("its log must be back"),
+            b"newest-writes"
+        );
+        assert!(
+            !staged.exists(),
+            "nothing may be left under the staged suffix"
         );
     }
 
