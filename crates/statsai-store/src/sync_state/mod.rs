@@ -86,9 +86,10 @@ impl Store {
                         "entity_sync_state",
                         "sink, target, entity_kind, entity_id, payload_hash, synced_at",
                     ),
+                    // `dirty` is deliberately absent: it is written as 1 below.
                     (
                         "task_bucket_sync_state",
-                        "sink, target, device_id, project_bucket, dirty, payload_hash, updated_at",
+                        "sink, target, device_id, project_bucket, payload_hash, updated_at",
                     ),
                 ] {
                     self.conn.execute(
@@ -98,9 +99,21 @@ impl Store {
                         ),
                         [],
                     )?;
+                    // Task buckets come across dirty rather than carrying their old
+                    // flag. The refreshed database can hold buckets that changed or
+                    // disappeared since the capture, and incremental selection trusts
+                    // the flag alone -- it never compares `payload_hash` -- so an
+                    // imported `dirty = 0` would suppress both updates and deletion
+                    // tombstones. Re-sending a clean bucket costs one payload; missing
+                    // a changed one leaves the mirror wrong.
+                    let (insert_columns, select_columns) = if table == "task_bucket_sync_state" {
+                        (format!("{columns}, dirty"), format!("{columns}, 1"))
+                    } else {
+                        (columns.to_string(), columns.to_string())
+                    };
                     self.conn.execute(
                         &format!(
-                            "INSERT INTO main.{table} ({columns}) SELECT {columns} \
+                            "INSERT INTO main.{table} ({insert_columns}) SELECT {select_columns} \
                              FROM previous_store.{table} WHERE (sink, target) IN \
                              (SELECT sink, target FROM adopted_sync_targets)"
                         ),
@@ -154,44 +167,7 @@ impl Store {
                 if existing.is_some_and(|current| current >= state.last_success_at) {
                     continue;
                 }
-                self.conn.execute(
-                    r#"
-                    INSERT INTO sync_state (
-                        sink, target, last_success_at, last_batch_id, last_event_started_at,
-                        last_event_id, last_summary_observed_at, last_summary_id,
-                        last_task_verification_updated_at, last_task_verification_id,
-                        failure_count, pending_resume_batch_id
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                    ON CONFLICT(sink, target) DO UPDATE SET
-                        last_success_at = excluded.last_success_at,
-                        last_batch_id = excluded.last_batch_id,
-                        last_event_started_at = excluded.last_event_started_at,
-                        last_event_id = excluded.last_event_id,
-                        last_summary_observed_at = excluded.last_summary_observed_at,
-                        last_summary_id = excluded.last_summary_id,
-                        last_task_verification_updated_at = excluded.last_task_verification_updated_at,
-                        last_task_verification_id = excluded.last_task_verification_id,
-                        failure_count = excluded.failure_count,
-                        pending_resume_batch_id = excluded.pending_resume_batch_id
-                    "#,
-                    params![
-                        state.sink,
-                        state.target,
-                        state.last_success_at.to_rfc3339(),
-                        state.last_batch_id,
-                        state.last_event_started_at.map(|value| value.to_rfc3339()),
-                        state.last_event_id,
-                        state.last_summary_observed_at.map(|value| value.to_rfc3339()),
-                        state.last_summary_id,
-                        state
-                            .last_task_verification_updated_at
-                            .map(|value| value.to_rfc3339()),
-                        state.last_task_verification_id,
-                        state.failure_count,
-                        state.pending_resume_batch_id,
-                    ],
-                )?;
+                self.write_sync_state_in_transaction(state)?;
                 restored += 1;
             }
             Ok(restored)
@@ -223,6 +199,214 @@ impl Store {
             Ok(()) => {
                 commit_transaction(&self.conn)?;
                 Ok(())
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    /// The cursor upsert without a transaction of its own, so a caller that must
+    /// write it alongside the companion tracking tables can do both atomically.
+    fn write_sync_state_in_transaction(&self, state: &SyncState) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO sync_state (
+                sink, target, last_success_at, last_batch_id, last_event_started_at,
+                last_event_id, last_summary_observed_at, last_summary_id,
+                last_task_verification_updated_at, last_task_verification_id,
+                failure_count, pending_resume_batch_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(sink, target) DO UPDATE SET
+                last_success_at = excluded.last_success_at,
+                last_batch_id = excluded.last_batch_id,
+                last_event_started_at = excluded.last_event_started_at,
+                last_event_id = excluded.last_event_id,
+                last_summary_observed_at = excluded.last_summary_observed_at,
+                last_summary_id = excluded.last_summary_id,
+                last_task_verification_updated_at = excluded.last_task_verification_updated_at,
+                last_task_verification_id = excluded.last_task_verification_id,
+                failure_count = excluded.failure_count,
+                pending_resume_batch_id = excluded.pending_resume_batch_id
+            "#,
+            params![
+                state.sink,
+                state.target,
+                state.last_success_at.to_rfc3339(),
+                state.last_batch_id,
+                state.last_event_started_at.map(|value| value.to_rfc3339()),
+                state.last_event_id,
+                state
+                    .last_summary_observed_at
+                    .map(|value| value.to_rfc3339()),
+                state.last_summary_id,
+                state
+                    .last_task_verification_updated_at
+                    .map(|value| value.to_rfc3339()),
+                state.last_task_verification_id,
+                state.failure_count,
+                state.pending_resume_batch_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Everything `clear_sync_tracking_for_target` would remove for one target.
+    ///
+    /// The three tables are one cursor: `sync_state` records how far the target got,
+    /// `entity_sync_state` which entities it already has, `task_bucket_sync_state`
+    /// which buckets are clean. Capturing only the first and restoring that alone
+    /// leaves every entity looking pending, which re-sends the metadata the cursor
+    /// was supposed to spare.
+    /// Captures a target's tracking and clears it in one immediate transaction.
+    ///
+    /// Doing these as two statements let a concurrent sync record an acknowledged
+    /// chunk in between, whose resume state the clear then deleted -- losing proof of
+    /// what the remote already has.
+    pub fn capture_and_clear_sync_tracking(
+        &self,
+        sink: &str,
+        target: &str,
+    ) -> Result<SyncTrackingSnapshot> {
+        begin_immediate_transaction_with_retry(&self.conn)?;
+        let result = (|| {
+            let snapshot = self.capture_sync_tracking(sink, target)?;
+            for table in ["entity_sync_state", "task_bucket_sync_state", "sync_state"] {
+                self.conn.execute(
+                    &format!("DELETE FROM {table} WHERE sink = ?1 AND target = ?2"),
+                    params![sink, target],
+                )?;
+            }
+            Ok(snapshot)
+        })();
+        match result {
+            Ok(snapshot) => {
+                commit_transaction(&self.conn)?;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                rollback(&self.conn);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn capture_sync_tracking(&self, sink: &str, target: &str) -> Result<SyncTrackingSnapshot> {
+        let state = self.sync_state(sink, target)?;
+        let mut entities = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT entity_kind, entity_id, payload_hash, synced_at \
+                 FROM entity_sync_state WHERE sink = ?1 AND target = ?2",
+            )?;
+            let rows = stmt.query_map(params![sink, target], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            for row in rows {
+                entities.push(row?);
+            }
+        }
+        let mut buckets = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                // `dirty` is deliberately absent: it is written as 1 on restoration,
+                // for the reason spelled out there.
+                "SELECT device_id, project_bucket, payload_hash, updated_at \
+                 FROM task_bucket_sync_state WHERE sink = ?1 AND target = ?2",
+            )?;
+            let rows = stmt.query_map(params![sink, target], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            for row in rows {
+                buckets.push(row?);
+            }
+        }
+        Ok(SyncTrackingSnapshot {
+            sink: sink.to_string(),
+            target: target.to_string(),
+            state,
+            entities,
+            buckets,
+        })
+    }
+
+    /// Puts a captured snapshot back, for a target whose tracking was cleared for an
+    /// operation that then did not establish new progress.
+    ///
+    /// Returns whether it restored anything. It declines when the target has moved on
+    /// since the capture -- a chunked upload records progress and a resume point as
+    /// each chunk lands, and those records describe what the remote actually has.
+    /// Overwriting them with the older snapshot would mark metadata this run never
+    /// sent as already synced, and the retry would skip it.
+    pub fn restore_sync_tracking(&self, snapshot: &SyncTrackingSnapshot) -> Result<bool> {
+        begin_immediate_transaction_with_retry(&self.conn)?;
+        let result = (|| {
+            // Inside the transaction: read outside it and a concurrent sync can
+            // acknowledge a chunk between the check and the write, which would then
+            // be rewound to the captured cursor.
+            if let Some(current) = self.sync_state(&snapshot.sink, &snapshot.target)? {
+                let captured_at = snapshot.state.as_ref().map(|state| state.last_success_at);
+                let moved_on = current.pending_resume_batch_id.is_some()
+                    || captured_at.is_some_and(|captured| current.last_success_at > captured);
+                if moved_on {
+                    return Ok(false);
+                }
+            }
+            for (entity_kind, entity_id, payload_hash, synced_at) in &snapshot.entities {
+                self.conn.execute(
+                    "INSERT INTO entity_sync_state \
+                     (sink, target, entity_kind, entity_id, payload_hash, synced_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(sink, target, entity_kind, entity_id) DO UPDATE SET \
+                       payload_hash = excluded.payload_hash, synced_at = excluded.synced_at",
+                    params![
+                        snapshot.sink,
+                        snapshot.target,
+                        entity_kind,
+                        entity_id,
+                        payload_hash,
+                        synced_at
+                    ],
+                )?;
+            }
+            // Buckets come back dirty rather than as they were captured. Between the
+            // capture and here the rows do not exist, and the only thing that records
+            // a local bucket change is an UPDATE on those rows -- so a scan that
+            // rebuilds or deletes a bucket in that window updates nothing and leaves
+            // no trace. Putting the captured `dirty = 0` back would then declare that
+            // change already synced, and nothing compares hashes afterwards to catch
+            // it: `task_bucket_is_clean_for_sync` trusts this flag alone. Re-sending
+            // the tracked buckets once costs a fraction of the re-upload restoring the
+            // cursor avoids, and adoption made the same trade for the same reason.
+            for (device_id, project_bucket, payload_hash, updated_at) in &snapshot.buckets {
+                self.conn.execute(
+                    "INSERT INTO task_bucket_sync_state \
+                     (sink, target, device_id, project_bucket, dirty, payload_hash, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6) \
+                     ON CONFLICT(sink, target, device_id, project_bucket) DO UPDATE SET \
+                       dirty = 1, payload_hash = excluded.payload_hash, \
+                       updated_at = excluded.updated_at",
+                    params![
+                        snapshot.sink,
+                        snapshot.target,
+                        device_id,
+                        project_bucket,
+                        payload_hash,
+                        updated_at
+                    ],
+                )?;
+            }
+            if let Some(state) = &snapshot.state {
+                self.write_sync_state_in_transaction(state)?;
+            }
+            Ok(true)
+        })();
+        match result {
+            Ok(restored) => {
+                commit_transaction(&self.conn)?;
+                Ok(restored)
             }
             Err(error) => {
                 rollback(&self.conn);

@@ -1142,7 +1142,7 @@ fn http_incremental_sync_sends_authoritative_snapshot_after_local_rollup_retirem
 }
 
 #[test]
-fn failed_http_sync_without_ack_keeps_next_default_sync_full_history() {
+fn failed_http_sync_without_ack_reconciles_without_re_uploading_history() {
     let store = Store::in_memory().expect("store");
     let endpoint = "https://api.example.com/api/sync/batches".to_string();
     let source = SourceLocation::local_adapter(
@@ -1193,7 +1193,19 @@ fn failed_http_sync_without_ack_keeps_next_default_sync_full_history() {
     let (retry_batch, retry_mode) =
         build_sync_batch(&command, &store, "device", &target).expect("retry batch");
     assert_eq!(retry_mode, SyncPayloadMode::Rollups);
-    assert_eq!(retry_batch.summaries.len(), 1);
+    // The failure recorded no chunk, so the cursor never moved and the already
+    // acknowledged summary stays acknowledged. Re-sending it -- and on a real
+    // account, every other summary with it -- is not what recovery requires.
+    assert!(
+        retry_batch.summaries.is_empty(),
+        "an unacknowledged failure must not re-upload acknowledged history"
+    );
+    // What it does require is the authoritative snapshot, so the server can retire
+    // anything the interrupted sync left inconsistent.
+    assert!(
+        retry_batch.authoritative_snapshot.is_some(),
+        "recovery still has to let the server reconcile the mirror"
+    );
 
     let since_last_command = SyncCommand {
         endpoint: Some(endpoint),

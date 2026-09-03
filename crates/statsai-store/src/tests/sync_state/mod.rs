@@ -498,3 +498,244 @@ fn cursor_at(target: &str, at: DateTime<Utc>, batch: &str) -> SyncState {
         pending_resume_batch_id: None,
     }
 }
+
+#[test]
+fn restoring_tracking_brings_back_entity_rows_not_just_the_cursor() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Store::open(&directory.path().join("store.sqlite")).expect("open store");
+    let target = "https://api.example.test/api/sync/batches";
+    store
+        .restore_sync_states(&[cursor_at(target, Utc::now(), "batch-local")])
+        .expect("seed cursor");
+    store
+        .record_entity_synced("http", target, "account", "account-1", "hash-1")
+        .expect("seed entity tracking");
+
+    let snapshot = store
+        .capture_sync_tracking("http", target)
+        .expect("capture tracking");
+    assert!(!snapshot.is_empty());
+    store
+        .clear_sync_tracking_for_target("http", target)
+        .expect("clear tracking");
+    assert!(
+        store
+            .entity_requires_sync("http", target, "account", "account-1", "hash-1")
+            .expect("read entity tracking"),
+        "clearing really removed the entity row"
+    );
+
+    store
+        .restore_sync_tracking(&snapshot)
+        .expect("restore tracking");
+
+    assert_eq!(
+        store
+            .sync_state("http", target)
+            .expect("read cursor")
+            .expect("cursor exists")
+            .last_batch_id,
+        "batch-local"
+    );
+    // Restoring the cursor alone would leave every entity pending, resending the
+    // metadata the cursor exists to spare.
+    assert!(
+        !store
+            .entity_requires_sync("http", target, "account", "account-1", "hash-1")
+            .expect("read restored entity tracking"),
+        "entity tracking must come back with the cursor"
+    );
+}
+
+#[test]
+fn restoring_declines_once_chunks_have_landed_since_the_capture() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Store::open(&directory.path().join("store.sqlite")).expect("open store");
+    let target = "https://api.example.test/api/sync/batches";
+    let captured_at = Utc::now() - chrono::Duration::minutes(5);
+    store
+        .restore_sync_states(&[cursor_at(target, captured_at, "batch-old")])
+        .expect("seed cursor");
+    store
+        .record_entity_synced("http", target, "account", "account-old", "hash-old")
+        .expect("seed entity tracking");
+
+    let snapshot = store
+        .capture_sync_tracking("http", target)
+        .expect("capture tracking");
+    store
+        .clear_sync_tracking_for_target("http", target)
+        .expect("clear tracking");
+
+    // A chunked upload records progress and a resume point as each chunk lands. Those
+    // records describe what the remote actually has; the snapshot predates them.
+    store
+        .restore_sync_states(&[cursor_at(target, Utc::now(), "batch-chunk-1")])
+        .expect("record chunk progress");
+    store
+        .mark_pending_sync_resume("http", target, "batch-chunk-1")
+        .expect("mark resume point");
+
+    let restored = store
+        .restore_sync_tracking(&snapshot)
+        .expect("restore is attempted");
+
+    assert!(!restored, "restoring must decline when the target moved on");
+    assert_eq!(
+        store
+            .sync_state("http", target)
+            .expect("read cursor")
+            .expect("cursor exists")
+            .last_batch_id,
+        "batch-chunk-1",
+        "chunk progress must not be rewound to the captured cursor"
+    );
+    // Re-marking the old entity as synced would make the retry skip metadata this
+    // run never actually sent.
+    assert!(
+        store
+            .entity_requires_sync("http", target, "account", "account-old", "hash-old")
+            .expect("read entity tracking"),
+        "stale entity tracking must not be reinstated over newer progress"
+    );
+}
+
+#[test]
+fn restored_task_buckets_come_back_dirty() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Store::open(&directory.path().join("store.sqlite")).expect("open store");
+    let target = "https://api.example.test/api/sync/batches";
+    store
+        .restore_sync_states(&[cursor_at(target, Utc::now(), "batch-old")])
+        .expect("seed cursor");
+    store
+        .conn
+        .execute(
+            "INSERT INTO task_bucket_sync_state \
+             (sink, target, device_id, project_bucket, dirty, payload_hash, updated_at) \
+             VALUES ('http', ?1, 'device-1', 'bucket-1', 0, 'hash-1', '2026-01-01T00:00:00Z')",
+            params![target],
+        )
+        .expect("seed a clean bucket");
+
+    let snapshot = store
+        .capture_sync_tracking("http", target)
+        .expect("capture tracking");
+    store
+        .clear_sync_tracking_for_target("http", target)
+        .expect("clear tracking");
+
+    // While the rows are gone a scan can rebuild or delete the bucket, and the only
+    // record of that is an UPDATE on the very rows that do not exist -- so it leaves
+    // no trace at all. Coming back clean would declare the change already synced.
+    store
+        .restore_sync_tracking(&snapshot)
+        .expect("restore tracking");
+
+    let dirty: i64 = store
+        .conn
+        .query_row(
+            "SELECT dirty FROM task_bucket_sync_state WHERE sink = 'http' AND target = ?1",
+            params![target],
+            |row| row.get(0),
+        )
+        .expect("read restored bucket");
+    assert_eq!(dirty, 1, "a restored bucket must not claim to be clean");
+}
+
+#[test]
+fn adopted_task_buckets_arrive_dirty() {
+    let previous_dir = tempfile::tempdir().expect("previous directory");
+    let current_dir = tempfile::tempdir().expect("current directory");
+    let previous_path = previous_dir.path().join("previous.sqlite");
+    let current_path = current_dir.path().join("current.sqlite");
+    let target = "https://dev-api.example.test/api/sync/batches";
+
+    let previous = Store::open(&previous_path).expect("open previous store");
+    previous
+        .restore_sync_states(&[cursor_at(target, Utc::now(), "batch-dev")])
+        .expect("seed cursor");
+    previous
+        .conn
+        .execute(
+            "INSERT INTO task_bucket_sync_state \
+             (sink, target, device_id, project_bucket, dirty, payload_hash, updated_at) \
+             VALUES ('http', ?1, 'device-1', 'bucket-1', 0, 'hash-1', '2026-01-01T00:00:00Z')",
+            params![target],
+        )
+        .expect("seed a clean bucket");
+    drop(previous);
+
+    let current = Store::open(&current_path).expect("open current store");
+    current
+        .adopt_sync_tracking_from(&previous_path)
+        .expect("adopt tracking");
+
+    // The refreshed database can hold buckets that changed or vanished since the
+    // capture, and incremental selection trusts the flag alone.
+    let dirty: i64 = current
+        .conn
+        .query_row(
+            "SELECT dirty FROM task_bucket_sync_state WHERE sink = 'http' AND target = ?1",
+            params![target],
+            |row| row.get(0),
+        )
+        .expect("read adopted bucket");
+    assert_eq!(dirty, 1, "a carried bucket must not claim to be clean");
+}
+
+#[test]
+fn a_newer_schema_database_reports_a_version_but_refuses_to_open() {
+    // The two facts `statsai-dev` relies on to tell "nothing to lose" apart from
+    // "cannot read it": a clone left ahead by a schema-changing PR still reports a
+    // real schema version, so it must not be mistaken for an empty or corrupt file
+    // and have its sync cursors discarded.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("newer.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).expect("create database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations (
+              version INTEGER PRIMARY KEY,
+              applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (9999, '2026-08-23T00:00:00Z');
+            "#,
+        )
+        .expect("mark a future schema");
+    }
+
+    assert_eq!(
+        crate::database_schema_version(&path).expect("probe schema"),
+        Some(9999),
+        "a newer clone is a real database, not an empty one"
+    );
+    assert!(
+        Store::open(&path).is_err(),
+        "and it cannot be opened, so its cursors are unreadable rather than absent"
+    );
+}
+
+#[test]
+fn schema_zero_does_not_mean_there_is_nothing_to_read() {
+    // `statsai-dev` routes schema zero into an open-and-read rather than writing it
+    // off as empty, because `stamp_legacy_database` upgrades a pre-`schema_migrations`
+    // store that can already hold cursors. This pins the other half: a genuinely empty
+    // file reports the same version and must still open cleanly with no cursors, so
+    // the common case is not turned into a refresh-blocking error.
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("empty.sqlite");
+    std::fs::write(&path, b"").expect("create an empty file");
+
+    assert_eq!(
+        crate::database_schema_version(&path).expect("probe schema"),
+        Some(0)
+    );
+    let store = Store::open(&path).expect("an empty file is still openable");
+    assert!(
+        store.list_sync_states().expect("read cursors").is_empty(),
+        "nothing to carry, and nothing to refuse over"
+    );
+}
