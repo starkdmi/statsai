@@ -181,7 +181,7 @@ pub struct SyncTrackingSnapshot {
     pub(crate) target: String,
     pub(crate) state: Option<SyncState>,
     pub(crate) entities: Vec<(String, String, String, String)>,
-    pub(crate) buckets: Vec<(String, String, i64, Option<String>, String)>,
+    pub(crate) buckets: Vec<(String, String, Option<String>, String)>,
 }
 
 impl SyncTrackingSnapshot {
