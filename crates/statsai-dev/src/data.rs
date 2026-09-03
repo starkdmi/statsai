@@ -1,7 +1,7 @@
 use crate::state::{save, Paths, State};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use statsai_store::{clone_database_to, database_schema_version, DatabaseClone, Store, SyncState};
+use statsai_store::{clone_database_to, database_schema_version, DatabaseClone, Store};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -35,60 +35,121 @@ pub(crate) fn refresh(paths: &Paths, state: &mut State) -> Result<RefreshOutcome
     }
     paths.ensure_cache_dirs()?;
     // The clone is the only place a dev-backend sync cursor exists: production never
-    // syncs there, so its `sync_state` has no row for it -- or a stale one from an
-    // earlier era. Letting the clone overwrite carry that in tells the next sync it
-    // is behind a server that is actually ahead, and the CLI responds by clearing
+    // syncs there, so its tracking tables have no rows for it -- or stale ones from
+    // an earlier era. Letting the clone overwrite carry that in tells the next sync
+    // it is behind a server that is actually ahead, and the CLI responds by clearing
     // tracking and re-uploading the entire account. That is a full-history sync on
     // every refresh, which is how a routine `data refresh` came to cost six figures
     // of D1 row reads.
-    let preserved = carried_sync_states(&paths.dev_store)?;
-    let cloned = clone_database_to(&paths.prod_store, &paths.dev_store).with_context(|| {
-        format!(
-            "refresh isolated development database from {}",
-            paths.prod_store.display()
-        )
-    })?;
-    let restored = restore_sync_states(&paths.dev_store, &preserved)?;
-    state.data.refreshed_at = Some(Utc::now());
-    save(paths, state)?;
-    Ok(RefreshOutcome {
-        clone: cloned,
-        restored_sync_states: restored,
-    })
+    //
+    // The outgoing clone is moved aside rather than overwritten, so it stays intact
+    // until the new one has adopted its cursors. Publishing first would mean a
+    // failure between the copy and the adoption -- a production schema this launcher
+    // cannot open, say -- destroys the only copy of them, and retrying cannot help.
+    let previous = stage_previous_clone(&paths.dev_store)?;
+    let refreshed = (|| {
+        let cloned = clone_database_to(&paths.prod_store, &paths.dev_store).with_context(|| {
+            format!(
+                "refresh isolated development database from {}",
+                paths.prod_store.display()
+            )
+        })?;
+        let adopted = match previous.as_deref() {
+            Some(previous) => adopt_sync_tracking(&paths.dev_store, previous)?,
+            None => 0,
+        };
+        Ok(RefreshOutcome {
+            clone: cloned,
+            restored_sync_states: adopted,
+        })
+    })();
+
+    match refreshed {
+        Ok(outcome) => {
+            if let Some(previous) = previous.as_deref() {
+                discard_staged_clone(previous);
+            }
+            state.data.refreshed_at = Some(Utc::now());
+            save(paths, state)?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            if let Some(previous) = previous.as_deref() {
+                restore_staged_clone(previous, &paths.dev_store)?;
+            }
+            Err(error)
+        }
+    }
 }
 
-/// The cursors the outgoing clone was carrying, or none when there is no clone yet.
-fn carried_sync_states(dev_store: &Path) -> Result<Vec<SyncState>> {
+/// Moves the existing clone out of the way, returning where it went. `None` means
+/// there was nothing to move.
+fn stage_previous_clone(dev_store: &Path) -> Result<Option<PathBuf>> {
     if !dev_store
         .try_exists()
         .with_context(|| format!("check development store path {}", dev_store.display()))?
     {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    let store = Store::open(dev_store).with_context(|| {
-        format!(
-            "read sync cursors from development database {}",
-            dev_store.display()
-        )
-    })?;
-    store
-        .list_sync_states()
-        .context("list development sync cursors")
+    let staged = path_with_suffix(dev_store, ".previous");
+    discard_staged_clone(&staged);
+    for (from, to) in database_files(dev_store)
+        .into_iter()
+        .zip(database_files(&staged))
+    {
+        match fs::rename(&from, &to) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("set aside development database {}", from.display()));
+            }
+        }
+    }
+    Ok(Some(staged))
 }
 
-fn restore_sync_states(dev_store: &Path, states: &[SyncState]) -> Result<usize> {
-    if states.is_empty() {
-        return Ok(0);
+fn restore_staged_clone(staged: &Path, dev_store: &Path) -> Result<()> {
+    for (from, to) in database_files(staged)
+        .into_iter()
+        .zip(database_files(dev_store))
+    {
+        match fs::rename(&from, &to) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("restore development database {}", to.display()));
+            }
+        }
     }
+    Ok(())
+}
+
+fn discard_staged_clone(staged: &Path) {
+    for path in database_files(staged) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn adopt_sync_tracking(dev_store: &Path, previous: &Path) -> Result<usize> {
     let store = Store::open(dev_store).with_context(|| {
         format!(
             "reopen refreshed development database {}",
             dev_store.display()
         )
     })?;
-    store
-        .restore_sync_states(states)
-        .context("restore development sync cursors")
+    // A clone that cannot be read carries nothing worth keeping, and refusing to
+    // refresh because of it would break the one command that repairs a broken clone.
+    match store.adopt_sync_tracking_from(previous) {
+        Ok(adopted) => Ok(adopted),
+        Err(error) => {
+            eprintln!(
+                "warning: could not carry sync cursors from the previous development database ({error:#}); the next sync may re-upload history"
+            );
+            Ok(0)
+        }
+    }
 }
 
 pub(crate) fn clean(paths: &Paths, state: &mut State) -> Result<usize> {
@@ -176,6 +237,8 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use statsai_store::SyncState;
 
     #[test]
     fn sizes_use_binary_units() {
@@ -184,6 +247,7 @@ mod tests {
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
     }
 
+    #[cfg(target_os = "macos")]
     fn record_cursor(path: &Path, target: &str, at: DateTime<Utc>, batch: &str) {
         let store = Store::open(path).expect("open store");
         store
@@ -204,6 +268,7 @@ mod tests {
             .expect("record cursor");
     }
 
+    #[cfg(target_os = "macos")]
     fn cursor(path: &Path, target: &str) -> Option<SyncState> {
         Store::open(path)
             .expect("open store")
@@ -211,7 +276,9 @@ mod tests {
             .expect("read cursor")
     }
 
+    // `clone_database_to` is APFS-only, so the refresh path cannot run elsewhere.
     #[test]
+    #[cfg(target_os = "macos")]
     fn refresh_keeps_the_dev_cursor_production_never_had() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = Paths::for_test(directory.path());
@@ -233,7 +300,9 @@ mod tests {
         assert_eq!(kept.last_batch_id, "batch-dev-latest");
     }
 
+    // `clone_database_to` is APFS-only, so the refresh path cannot run elsewhere.
     #[test]
+    #[cfg(target_os = "macos")]
     fn refresh_does_not_rewind_a_cursor_to_a_stale_production_one() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = Paths::for_test(directory.path());

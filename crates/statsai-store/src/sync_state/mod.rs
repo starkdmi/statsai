@@ -41,6 +41,95 @@ impl Store {
         Ok(states)
     }
 
+    /// Adopts sync tracking from a database this one is replacing, for each target
+    /// whose cursor there is newer than -- or absent from -- this one.
+    ///
+    /// All three tracking tables move together. `sync_state` alone is not a complete
+    /// cursor: `entity_sync_state` records which entities the target already has and
+    /// `task_bucket_sync_state` which buckets are clean, so carrying the batch cursor
+    /// without them leaves the next sync with a valid cursor and every entity marked
+    /// pending. `clear_sync_tracking` empties all three for the same reason.
+    pub fn adopt_sync_tracking_from(&self, previous: &Path) -> Result<usize> {
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS previous_store",
+            params![previous.to_string_lossy()],
+        )?;
+        let result = (|| {
+            begin_immediate_transaction_with_retry(&self.conn)?;
+            let outcome = (|| {
+                self.conn.execute(
+                    r#"
+                    CREATE TEMP TABLE adopted_sync_targets AS
+                    SELECT previous.sink AS sink, previous.target AS target
+                    FROM previous_store.sync_state previous
+                    LEFT JOIN main.sync_state current
+                      ON current.sink = previous.sink AND current.target = previous.target
+                    WHERE current.target IS NULL
+                       OR previous.last_success_at > current.last_success_at
+                    "#,
+                    [],
+                )?;
+                let adopted: usize =
+                    self.conn
+                        .query_row("SELECT COUNT(*) FROM adopted_sync_targets", [], |row| {
+                            row.get::<_, i64>(0)
+                        })? as usize;
+                for (table, columns) in [
+                    (
+                        "sync_state",
+                        "sink, target, last_success_at, last_batch_id, last_event_started_at, \
+                         last_event_id, last_summary_observed_at, last_summary_id, \
+                         last_task_verification_updated_at, last_task_verification_id, \
+                         failure_count, pending_resume_batch_id",
+                    ),
+                    (
+                        "entity_sync_state",
+                        "sink, target, entity_kind, entity_id, payload_hash, synced_at",
+                    ),
+                    (
+                        "task_bucket_sync_state",
+                        "sink, target, device_id, project_bucket, dirty, payload_hash, updated_at",
+                    ),
+                ] {
+                    self.conn.execute(
+                        &format!(
+                            "DELETE FROM main.{table} WHERE (sink, target) IN \
+                             (SELECT sink, target FROM adopted_sync_targets)"
+                        ),
+                        [],
+                    )?;
+                    self.conn.execute(
+                        &format!(
+                            "INSERT INTO main.{table} ({columns}) SELECT {columns} \
+                             FROM previous_store.{table} WHERE (sink, target) IN \
+                             (SELECT sink, target FROM adopted_sync_targets)"
+                        ),
+                        [],
+                    )?;
+                }
+                Ok(adopted)
+            })();
+            match outcome {
+                Ok(adopted) => {
+                    commit_transaction(&self.conn)?;
+                    Ok(adopted)
+                }
+                Err(error) => {
+                    rollback(&self.conn);
+                    Err(error)
+                }
+            }
+        })();
+        let _ = self
+            .conn
+            .execute("DROP TABLE IF EXISTS temp.adopted_sync_targets", []);
+        let detached = self.conn.execute("DETACH DATABASE previous_store", []);
+        result.and_then(|adopted| {
+            detached?;
+            Ok(adopted)
+        })
+    }
+
     /// Writes sync cursors back verbatim, for callers that have to carry them across
     /// a database being replaced. Only rows strictly newer than what is already here
     /// are written, so restoring a stale cursor cannot rewind a fresher one.
