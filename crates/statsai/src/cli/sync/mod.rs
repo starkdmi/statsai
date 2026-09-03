@@ -116,37 +116,38 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
     } else {
         None
     };
-    let code_change_identity_key = http_preflight
-        .as_ref()
-        .and_then(|preflight| preflight.remote.as_ref())
-        .map(remote_code_change_identity_key)
-        .transpose()?
-        .flatten();
-    let (mut batch, payload_mode) = build_sync_batch_with_identity_key(
-        &command,
-        store,
-        device_id,
-        &target,
-        code_change_identity_key.as_ref(),
-    )?;
-    let hosted_task_sync_enabled = maybe_disable_http_hosted_task_sync_payload(
-        &command,
-        sync_preferences,
-        http_preflight
+    let outcome = (|| -> Result<()> {
+        let code_change_identity_key = http_preflight
             .as_ref()
-            .and_then(|preflight| preflight.remote.as_ref()),
-        &mut batch,
-    )?;
-    if let Some(warning) = code_change_dedup_warning(
-        &command.sink,
-        code_change_identity_key.is_some(),
-        &batch.code_change_metrics,
-    ) {
-        eprintln!("{warning}");
-    }
+            .and_then(|preflight| preflight.remote.as_ref())
+            .map(remote_code_change_identity_key)
+            .transpose()?
+            .flatten();
+        let (mut batch, payload_mode) = build_sync_batch_with_identity_key(
+            &command,
+            store,
+            device_id,
+            &target,
+            code_change_identity_key.as_ref(),
+        )?;
+        let hosted_task_sync_enabled = maybe_disable_http_hosted_task_sync_payload(
+            &command,
+            sync_preferences,
+            http_preflight
+                .as_ref()
+                .and_then(|preflight| preflight.remote.as_ref()),
+            &mut batch,
+        )?;
+        if let Some(warning) = code_change_dedup_warning(
+            &command.sink,
+            code_change_identity_key.is_some(),
+            &batch.code_change_metrics,
+        ) {
+            eprintln!("{warning}");
+        }
 
-    if command.dry_run {
-        eprintln!(
+        if command.dry_run {
+            eprintln!(
             "dry run: sink={} mode={} include_projects={} include_tasks={} sources={} events={} summaries={} task_buckets={} task_verifications={}",
             command.sink,
             sync_payload_mode_name(payload_mode),
@@ -159,70 +160,86 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
             batch.task_buckets.len(),
             batch.task_verifications.len(),
         );
-        return Ok(());
-    }
+            return Ok(());
+        }
 
-    let persisted_sync_preferences = apply_sync_preference_overrides(store, &command)?;
-    debug_assert_eq!(persisted_sync_preferences, sync_preferences);
+        let persisted_sync_preferences = apply_sync_preference_overrides(store, &command)?;
+        debug_assert_eq!(persisted_sync_preferences, sync_preferences);
 
-    let result = (|| -> Result<()> {
-        match command.sink.as_str() {
-            "stdout" => {
-                StdoutSink.send(&batch)?;
-                record_sync_batch_success(store, &command.sink, &target, &batch)?;
-                Ok(())
+        let result = (|| -> Result<()> {
+            match command.sink.as_str() {
+                "stdout" => {
+                    StdoutSink.send(&batch)?;
+                    record_sync_batch_success(store, &command.sink, &target, &batch)?;
+                    Ok(())
+                }
+                "file" => {
+                    let output = command
+                        .output
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("statsai-sync-batch.json"));
+                    FileSink::new(output).send(&batch)?;
+                    record_sync_batch_success(store, &command.sink, &target, &batch)?;
+                    Ok(())
+                }
+                "http" => {
+                    let endpoint = http_sync_endpoint(&command)?;
+                    let auth_token = http_preflight
+                        .as_ref()
+                        .and_then(|preflight| preflight.auth_token.clone());
+                    send_http_sync_batch(
+                        store,
+                        HttpSyncBatchRequest {
+                            sink: &command.sink,
+                            target: &target,
+                            endpoint: &endpoint,
+                            auth_token,
+                            payload_mode,
+                            hosted_task_sync_enabled,
+                        },
+                        &batch,
+                    )?;
+                    Ok(())
+                }
+                other => bail!("unsupported sync sink {other}"),
             }
-            "file" => {
-                let output = command
-                    .output
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("statsai-sync-batch.json"));
-                FileSink::new(output).send(&batch)?;
-                record_sync_batch_success(store, &command.sink, &target, &batch)?;
-                Ok(())
+        })();
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // The cursor goes back before the failure is recorded, not after:
+                // `restore_sync_states` will not move a cursor backwards and
+                // `record_sync_failure` stamps a newer `last_success_at`, so restoring
+                // second would silently do nothing.
+                restore_cleared_sync_tracking(store, &cleared_tracking);
+                let _ = store.record_sync_failure(&command.sink, &target);
+                Err(error)
             }
-            "http" => {
-                let endpoint = http_sync_endpoint(&command)?;
-                let auth_token = http_preflight
-                    .as_ref()
-                    .and_then(|preflight| preflight.auth_token.clone());
-                send_http_sync_batch(
-                    store,
-                    HttpSyncBatchRequest {
-                        sink: &command.sink,
-                        target: &target,
-                        endpoint: &endpoint,
-                        auth_token,
-                        payload_mode,
-                        hosted_task_sync_enabled,
-                    },
-                    &batch,
-                )?;
-                Ok(())
-            }
-            other => bail!("unsupported sync sink {other}"),
         }
     })();
 
-    match result {
+    match outcome {
         Ok(()) => Ok(()),
         Err(error) => {
-            // An opted-in full upload that failed established no resumable progress,
-            // so the cursor it discarded goes back. Without this the next ordinary
-            // sync finds no cursor -- or the empty one `record_sync_failure` writes
-            // -- which is exactly what the guard above treats as "nothing to
-            // protect", and it would re-upload the whole history unasked.
-            //
-            // This has to run first: `restore_sync_states` will not move a cursor
-            // backwards, and `record_sync_failure` stamps a newer `last_success_at`,
-            // so restoring afterwards would silently do nothing. Recording the
-            // failure second keeps the restored batch id and only bumps the count.
-            if let Some(cleared) = cleared_tracking {
-                let _ = store.restore_sync_states(std::slice::from_ref(&cleared));
-            }
-            let _ = store.record_sync_failure(&command.sink, &target);
+            // Everything between clearing the cursor and sending can fail too --
+            // building the batch, resolving the identity key, persisting preference
+            // overrides -- and those return without recording a sync failure. The
+            // cursor still has to come back, or the next ordinary sync sees nothing
+            // to protect and re-uploads the whole history unasked. A send failure has
+            // already restored it above; repeating that here is a no-op, because the
+            // recorded failure left a newer row.
+            restore_cleared_sync_tracking(store, &cleared_tracking);
             Err(error)
         }
+    }
+}
+
+/// Puts back a cursor that `--full` discarded, when the upload it was discarded for
+/// did not get far enough to establish new progress.
+fn restore_cleared_sync_tracking(store: &Store, cleared: &Option<SyncState>) {
+    if let Some(state) = cleared {
+        let _ = store.restore_sync_states(std::slice::from_ref(state));
     }
 }
 
@@ -854,6 +871,52 @@ mod tests {
             Some(&remote),
         )
         .expect_err("the guard must still fire after a failed opted-in run");
+        assert!(error.to_string().contains("--full"));
+    }
+
+    #[test]
+    fn a_failure_before_sending_also_puts_the_cursor_back() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = "https://api.example.test/api/sync/batches";
+        let store = store_with_cursor(&directory.path().join("store.sqlite"), target);
+        let remote = json!({ "device": { "last_sync_batch_id": "batch-remote-ahead" } });
+
+        let cleared = maybe_reset_http_sync_tracking_if_remote_changed(
+            &sync_command(true),
+            &store,
+            target,
+            Some(&remote),
+        )
+        .expect("--full clears tracking")
+        .expect("the cleared cursor is handed back");
+        assert!(
+            store
+                .sync_state("http", target)
+                .expect("read cursor")
+                .is_none(),
+            "the clear really removed it"
+        );
+
+        // Building the batch, resolving the identity key and persisting preference
+        // overrides all fail without recording a sync failure, so this is the only
+        // thing that puts the cursor back on those paths.
+        restore_cleared_sync_tracking(&store, &Some(cleared));
+
+        assert_eq!(
+            store
+                .sync_state("http", target)
+                .expect("read cursor")
+                .expect("cursor exists again")
+                .last_batch_id,
+            "batch-local"
+        );
+        let error = maybe_reset_http_sync_tracking_if_remote_changed(
+            &sync_command(false),
+            &store,
+            target,
+            Some(&remote),
+        )
+        .expect_err("the guard must still fire");
         assert!(error.to_string().contains("--full"));
     }
 
