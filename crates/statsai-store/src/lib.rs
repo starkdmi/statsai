@@ -189,6 +189,11 @@ impl SyncTrackingSnapshot {
     pub fn is_empty(&self) -> bool {
         self.state.is_none() && self.entities.is_empty() && self.buckets.is_empty()
     }
+
+    /// The sync target this was captured for, for diagnostics.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

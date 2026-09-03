@@ -238,8 +238,21 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
 /// Puts back a cursor that `--full` discarded, when the upload it was discarded for
 /// did not get far enough to establish new progress.
 fn restore_cleared_sync_tracking(store: &Store, cleared: &Option<SyncTrackingSnapshot>) {
-    if let Some(snapshot) = cleared {
-        let _ = store.restore_sync_tracking(snapshot);
+    let Some(snapshot) = cleared else {
+        return;
+    };
+    match store.restore_sync_tracking(snapshot) {
+        // Declined because chunks landed after the clear. Their records describe what
+        // the remote actually has, and are newer than anything captured here.
+        Ok(_) => {}
+        // Swallowing this would leave the cursor cleared while the caller believes it
+        // is protected, and the next ordinary sync would re-upload the history the
+        // guard exists to prevent. It cannot be raised in place of the failure that
+        // brought us here, so it is reported alongside it.
+        Err(error) => eprintln!(
+            "warning: could not restore sync tracking for {} ({error:#}); the next sync may re-upload this device's history unless you investigate first",
+            snapshot.target()
+        ),
     }
 }
 

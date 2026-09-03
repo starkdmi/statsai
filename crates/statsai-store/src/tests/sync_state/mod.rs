@@ -546,3 +546,56 @@ fn restoring_tracking_brings_back_entity_rows_not_just_the_cursor() {
         "entity tracking must come back with the cursor"
     );
 }
+
+#[test]
+fn restoring_declines_once_chunks_have_landed_since_the_capture() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Store::open(&directory.path().join("store.sqlite")).expect("open store");
+    let target = "https://api.example.test/api/sync/batches";
+    let captured_at = Utc::now() - chrono::Duration::minutes(5);
+    store
+        .restore_sync_states(&[cursor_at(target, captured_at, "batch-old")])
+        .expect("seed cursor");
+    store
+        .record_entity_synced("http", target, "account", "account-old", "hash-old")
+        .expect("seed entity tracking");
+
+    let snapshot = store
+        .capture_sync_tracking("http", target)
+        .expect("capture tracking");
+    store
+        .clear_sync_tracking_for_target("http", target)
+        .expect("clear tracking");
+
+    // A chunked upload records progress and a resume point as each chunk lands. Those
+    // records describe what the remote actually has; the snapshot predates them.
+    store
+        .restore_sync_states(&[cursor_at(target, Utc::now(), "batch-chunk-1")])
+        .expect("record chunk progress");
+    store
+        .mark_pending_sync_resume("http", target, "batch-chunk-1")
+        .expect("mark resume point");
+
+    let restored = store
+        .restore_sync_tracking(&snapshot)
+        .expect("restore is attempted");
+
+    assert!(!restored, "restoring must decline when the target moved on");
+    assert_eq!(
+        store
+            .sync_state("http", target)
+            .expect("read cursor")
+            .expect("cursor exists")
+            .last_batch_id,
+        "batch-chunk-1",
+        "chunk progress must not be rewound to the captured cursor"
+    );
+    // Re-marking the old entity as synced would make the retry skip metadata this
+    // run never actually sent.
+    assert!(
+        store
+            .entity_requires_sync("http", target, "account", "account-old", "hash-old")
+            .expect("read entity tracking"),
+        "stale entity tracking must not be reinstated over newer progress"
+    );
+}

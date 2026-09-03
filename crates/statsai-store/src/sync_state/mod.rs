@@ -154,44 +154,7 @@ impl Store {
                 if existing.is_some_and(|current| current >= state.last_success_at) {
                     continue;
                 }
-                self.conn.execute(
-                    r#"
-                    INSERT INTO sync_state (
-                        sink, target, last_success_at, last_batch_id, last_event_started_at,
-                        last_event_id, last_summary_observed_at, last_summary_id,
-                        last_task_verification_updated_at, last_task_verification_id,
-                        failure_count, pending_resume_batch_id
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                    ON CONFLICT(sink, target) DO UPDATE SET
-                        last_success_at = excluded.last_success_at,
-                        last_batch_id = excluded.last_batch_id,
-                        last_event_started_at = excluded.last_event_started_at,
-                        last_event_id = excluded.last_event_id,
-                        last_summary_observed_at = excluded.last_summary_observed_at,
-                        last_summary_id = excluded.last_summary_id,
-                        last_task_verification_updated_at = excluded.last_task_verification_updated_at,
-                        last_task_verification_id = excluded.last_task_verification_id,
-                        failure_count = excluded.failure_count,
-                        pending_resume_batch_id = excluded.pending_resume_batch_id
-                    "#,
-                    params![
-                        state.sink,
-                        state.target,
-                        state.last_success_at.to_rfc3339(),
-                        state.last_batch_id,
-                        state.last_event_started_at.map(|value| value.to_rfc3339()),
-                        state.last_event_id,
-                        state.last_summary_observed_at.map(|value| value.to_rfc3339()),
-                        state.last_summary_id,
-                        state
-                            .last_task_verification_updated_at
-                            .map(|value| value.to_rfc3339()),
-                        state.last_task_verification_id,
-                        state.failure_count,
-                        state.pending_resume_batch_id,
-                    ],
-                )?;
+                self.write_sync_state_in_transaction(state)?;
                 restored += 1;
             }
             Ok(restored)
@@ -229,6 +192,52 @@ impl Store {
                 Err(error)
             }
         }
+    }
+
+    /// The cursor upsert without a transaction of its own, so a caller that must
+    /// write it alongside the companion tracking tables can do both atomically.
+    fn write_sync_state_in_transaction(&self, state: &SyncState) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO sync_state (
+                sink, target, last_success_at, last_batch_id, last_event_started_at,
+                last_event_id, last_summary_observed_at, last_summary_id,
+                last_task_verification_updated_at, last_task_verification_id,
+                failure_count, pending_resume_batch_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(sink, target) DO UPDATE SET
+                last_success_at = excluded.last_success_at,
+                last_batch_id = excluded.last_batch_id,
+                last_event_started_at = excluded.last_event_started_at,
+                last_event_id = excluded.last_event_id,
+                last_summary_observed_at = excluded.last_summary_observed_at,
+                last_summary_id = excluded.last_summary_id,
+                last_task_verification_updated_at = excluded.last_task_verification_updated_at,
+                last_task_verification_id = excluded.last_task_verification_id,
+                failure_count = excluded.failure_count,
+                pending_resume_batch_id = excluded.pending_resume_batch_id
+            "#,
+            params![
+                state.sink,
+                state.target,
+                state.last_success_at.to_rfc3339(),
+                state.last_batch_id,
+                state.last_event_started_at.map(|value| value.to_rfc3339()),
+                state.last_event_id,
+                state
+                    .last_summary_observed_at
+                    .map(|value| value.to_rfc3339()),
+                state.last_summary_id,
+                state
+                    .last_task_verification_updated_at
+                    .map(|value| value.to_rfc3339()),
+                state.last_task_verification_id,
+                state.failure_count,
+                state.pending_resume_batch_id,
+            ],
+        )?;
+        Ok(())
     }
 
     /// Everything `clear_sync_tracking_for_target` would remove for one target.
@@ -283,7 +292,21 @@ impl Store {
 
     /// Puts a captured snapshot back, for a target whose tracking was cleared for an
     /// operation that then did not establish new progress.
-    pub fn restore_sync_tracking(&self, snapshot: &SyncTrackingSnapshot) -> Result<()> {
+    ///
+    /// Returns whether it restored anything. It declines when the target has moved on
+    /// since the capture -- a chunked upload records progress and a resume point as
+    /// each chunk lands, and those records describe what the remote actually has.
+    /// Overwriting them with the older snapshot would mark metadata this run never
+    /// sent as already synced, and the retry would skip it.
+    pub fn restore_sync_tracking(&self, snapshot: &SyncTrackingSnapshot) -> Result<bool> {
+        if let Some(current) = self.sync_state(&snapshot.sink, &snapshot.target)? {
+            let captured_at = snapshot.state.as_ref().map(|state| state.last_success_at);
+            let moved_on = current.pending_resume_batch_id.is_some()
+                || captured_at.is_some_and(|captured| current.last_success_at > captured);
+            if moved_on {
+                return Ok(false);
+            }
+        }
         begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {
             for (entity_kind, entity_id, payload_hash, synced_at) in &snapshot.entities {
@@ -322,19 +345,21 @@ impl Store {
                     ],
                 )?;
             }
+            if let Some(state) = &snapshot.state {
+                self.write_sync_state_in_transaction(state)?;
+            }
             Ok(())
         })();
         match result {
-            Ok(()) => commit_transaction(&self.conn)?,
+            Ok(()) => {
+                commit_transaction(&self.conn)?;
+                Ok(true)
+            }
             Err(error) => {
                 rollback(&self.conn);
-                return Err(error);
+                Err(error)
             }
         }
-        if let Some(state) = &snapshot.state {
-            self.restore_sync_states(std::slice::from_ref(state))?;
-        }
-        Ok(())
     }
 
     pub fn clear_sync_tracking_for_target(&self, sink: &str, target: &str) -> Result<()> {
