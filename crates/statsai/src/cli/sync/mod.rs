@@ -250,6 +250,21 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
         if let Some(gap) = metadata_gap {
             reasons.push(format!("remote mirror is missing synced metadata ({gap})"));
         }
+        // Reaching here means a cursor exists and is about to be discarded, which
+        // turns the next sync into a full re-upload of the account. That is an
+        // expensive, mostly-redundant operation to start from a command that asked
+        // for an incremental one, and `--dry-run` cannot warn about it because the
+        // mismatch is only visible once the server has answered. Whatever caused the
+        // divergence, the decision to re-upload everything is the caller's.
+        if !command.full {
+            bail!(
+                "refusing to re-upload this device's full history: {}.\n\
+                 The local sync cursor for {} would have to be discarded, and every \
+                 summary re-sent. Rerun with --full to do that deliberately.",
+                reasons.join("; "),
+                target
+            );
+        }
         eprintln!(
             "http rollup mode: {}; clearing local sync tracking for target {}",
             reasons.join("; "),
@@ -705,5 +720,103 @@ fn sync_state_report(state: &statsai_store::SyncState) -> SyncStateReport {
             state.last_summary_id.as_deref(),
         ),
         failure_count: state.failure_count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use statsai_store::SyncState;
+
+    fn sync_command(full: bool) -> SyncCommand {
+        SyncCommand {
+            sink: "http".to_string(),
+            output: None,
+            endpoint: None,
+            auth_token: None,
+            rebuild_rollups: false,
+            full,
+            since_last: false,
+            status: false,
+            verify: false,
+            reset_remote: false,
+            yes: false,
+            dry_run: false,
+            include_projects: false,
+            exclude_projects: false,
+            include_tasks: false,
+            exclude_tasks: false,
+        }
+    }
+
+    fn store_with_cursor(path: &std::path::Path, target: &str) -> Store {
+        let store = Store::open(path).expect("open store");
+        store
+            .restore_sync_states(&[SyncState {
+                sink: "http".to_string(),
+                target: target.to_string(),
+                last_success_at: Utc::now(),
+                last_batch_id: "batch-local".to_string(),
+                last_event_started_at: None,
+                last_event_id: None,
+                last_summary_observed_at: None,
+                last_summary_id: None,
+                last_task_verification_updated_at: None,
+                last_task_verification_id: None,
+                failure_count: 0,
+                pending_resume_batch_id: None,
+            }])
+            .expect("seed cursor");
+        store
+    }
+
+    #[test]
+    fn a_diverged_remote_does_not_silently_re_upload_everything() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = "https://api.example.test/api/sync/batches";
+        let store = store_with_cursor(&directory.path().join("store.sqlite"), target);
+        let remote = json!({ "device": { "last_sync_batch_id": "batch-remote-ahead" } });
+
+        let error = maybe_reset_http_sync_tracking_if_remote_changed(
+            &sync_command(false),
+            &store,
+            target,
+            Some(&remote),
+        )
+        .expect_err("a diverged remote must not clear tracking on its own");
+
+        assert!(error.to_string().contains("--full"));
+        assert!(
+            store
+                .sync_state("http", target)
+                .expect("read cursor")
+                .is_some(),
+            "the cursor must survive so the sync can be retried after the cause is understood"
+        );
+    }
+
+    #[test]
+    fn full_opts_in_to_re_uploading_everything() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = "https://api.example.test/api/sync/batches";
+        let store = store_with_cursor(&directory.path().join("store.sqlite"), target);
+        let remote = json!({ "device": { "last_sync_batch_id": "batch-remote-ahead" } });
+
+        maybe_reset_http_sync_tracking_if_remote_changed(
+            &sync_command(true),
+            &store,
+            target,
+            Some(&remote),
+        )
+        .expect("--full clears tracking deliberately");
+
+        assert!(
+            store
+                .sync_state("http", target)
+                .expect("read cursor")
+                .is_none(),
+            "--full is the caller asking for the full re-upload"
+        );
     }
 }
