@@ -435,14 +435,21 @@ fn data_command(paths: &Paths, command: DataCommand) -> Result<()> {
             let _data_lock = paths.lock_data_exclusive()?;
             let _state_lock = paths.lock_state_exclusive()?;
             let mut state = state::load(paths)?;
-            let cloned = data::refresh(paths, &mut state)?;
+            let refreshed = data::refresh(paths, &mut state)?;
             println!(
                 "Refreshed {} from {} as an APFS clone (schema {}, {}).",
                 paths.display(&paths.dev_store),
                 paths.display(&paths.prod_store),
-                cloned.schema_version,
-                data::human_size(cloned.logical_size)
+                refreshed.clone.schema_version,
+                data::human_size(refreshed.clone.logical_size)
             );
+            if refreshed.restored_sync_states > 0 {
+                println!(
+                    "Kept {} sync cursor{} the clone was carrying, so the next sync stays incremental.",
+                    refreshed.restored_sync_states,
+                    if refreshed.restored_sync_states == 1 { "" } else { "s" }
+                );
+            }
             Ok(())
         }
         DataCommand::Clean => {

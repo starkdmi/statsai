@@ -408,3 +408,93 @@ fn sync_preferences_round_trip_and_normalize_tasks() {
         }
     );
 }
+
+#[test]
+fn adopting_sync_tracking_moves_all_three_tables_together() {
+    let previous_dir = tempfile::tempdir().expect("previous directory");
+    let current_dir = tempfile::tempdir().expect("current directory");
+    let previous_path = previous_dir.path().join("previous.sqlite");
+    let current_path = current_dir.path().join("current.sqlite");
+    let dev_target = "https://dev-api.example.test/api/sync/batches";
+    let stale_target = "https://api.example.test/api/sync/batches";
+    let now = Utc::now();
+
+    let previous = Store::open(&previous_path).expect("open previous store");
+    previous
+        .restore_sync_states(&[cursor_at(dev_target, now, "batch-dev-latest")])
+        .expect("seed previous dev cursor");
+    previous
+        .restore_sync_states(&[cursor_at(
+            stale_target,
+            now - chrono::Duration::hours(12),
+            "batch-stale",
+        )])
+        .expect("seed previous stale cursor");
+    // A batch cursor without its entity rows leaves every entity pending, which
+    // re-uploads most of what carrying the cursor was supposed to spare.
+    previous
+        .record_entity_synced("http", dev_target, "account", "account-1", "hash-1")
+        .expect("seed entity tracking");
+    previous
+        .record_entity_synced("http", stale_target, "account", "account-2", "hash-2")
+        .expect("seed stale entity tracking");
+    drop(previous);
+
+    let current = Store::open(&current_path).expect("open current store");
+    current
+        .restore_sync_states(&[cursor_at(stale_target, now, "batch-fresh")])
+        .expect("seed current cursor");
+
+    let adopted = current
+        .adopt_sync_tracking_from(&previous_path)
+        .expect("adopt tracking");
+
+    assert_eq!(adopted, 1, "only the target the previous store leads on");
+    assert_eq!(
+        current
+            .sync_state("http", dev_target)
+            .expect("dev cursor")
+            .expect("dev cursor exists")
+            .last_batch_id,
+        "batch-dev-latest"
+    );
+    assert!(
+        !current
+            .entity_requires_sync("http", dev_target, "account", "account-1", "hash-1")
+            .expect("read adopted entity tracking"),
+        "entity tracking must travel with the cursor it belongs to"
+    );
+    // The fresher local cursor wins, and its companion rows are left alone rather
+    // than replaced by the stale store's.
+    assert_eq!(
+        current
+            .sync_state("http", stale_target)
+            .expect("stale cursor")
+            .expect("stale cursor exists")
+            .last_batch_id,
+        "batch-fresh"
+    );
+    assert!(
+        current
+            .entity_requires_sync("http", stale_target, "account", "account-2", "hash-2")
+            .expect("read untouched entity tracking"),
+        "a losing target must not import the previous store's entity rows"
+    );
+}
+
+fn cursor_at(target: &str, at: DateTime<Utc>, batch: &str) -> SyncState {
+    SyncState {
+        sink: "http".to_string(),
+        target: target.to_string(),
+        last_success_at: at,
+        last_batch_id: batch.to_string(),
+        last_event_started_at: None,
+        last_event_id: None,
+        last_summary_observed_at: None,
+        last_summary_id: None,
+        last_task_verification_updated_at: None,
+        last_task_verification_id: None,
+        failure_count: 0,
+        pending_resume_batch_id: None,
+    }
+}
