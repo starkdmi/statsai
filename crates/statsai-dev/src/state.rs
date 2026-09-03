@@ -153,7 +153,11 @@ impl Drop for AppLock {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct State {
-    #[serde(default = "state_schema")]
+    /// A missing field means the file predates it, so it defaults to the oldest
+    /// schema rather than the current one. Defaulting to the current schema would
+    /// declare an unversioned file up to date and skip every later migration --
+    /// including the one that decides whether a stored `prod` may open production.
+    #[serde(default = "oldest_state_schema")]
     pub(crate) schema: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) build: Option<SelectedBuild>,
@@ -242,8 +246,8 @@ impl Environment {
     }
 }
 
-const fn state_schema() -> u32 {
-    STATE_SCHEMA
+const fn oldest_state_schema() -> u32 {
+    1
 }
 
 pub(crate) fn load(paths: &Paths) -> Result<State> {
@@ -378,6 +382,21 @@ mod tests {
         let reloaded = load(&paths).expect("reload migrated state");
         assert_eq!(reloaded.environment, Environment::Dev);
         assert!(!reloaded.inherited_legacy_prod);
+    }
+
+    #[test]
+    fn a_schema_less_prod_selection_is_treated_as_legacy() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_state_dir().expect("create state directory");
+        // No `schema` key at all: the file predates the field, so it cannot be
+        // assumed to already carry the current meaning of `prod`.
+        fs::write(&paths.state_file, r#"{"environment":"prod"}"#).expect("write unversioned state");
+
+        let migrated = load(&paths).expect("load unversioned state");
+
+        assert_eq!(migrated.environment, Environment::Dev);
+        assert!(migrated.inherited_legacy_prod);
     }
 
     #[test]
