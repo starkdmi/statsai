@@ -93,14 +93,21 @@ fn stage_previous_clone(dev_store: &Path) -> Result<Option<PathBuf>> {
     }
     let staged = path_with_suffix(dev_store, ".previous");
     discard_staged_clone(&staged);
+    // A partial move is worse than not moving at all: this fails before `refresh`
+    // has anything to roll back, so whatever already moved would be stranded under
+    // the staged suffix and a retry would find no complete clone at either path.
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (from, to) in database_files(dev_store)
         .into_iter()
         .zip(database_files(&staged))
     {
         match fs::rename(&from, &to) {
-            Ok(()) => {}
+            Ok(()) => moved.push((to, from)),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => {
+                for (staged_path, live_path) in moved.into_iter().rev() {
+                    let _ = fs::rename(staged_path, live_path);
+                }
                 return Err(error)
                     .with_context(|| format!("set aside development database {}", from.display()));
             }
@@ -337,6 +344,33 @@ mod tests {
                 .last_batch_id,
             "batch-prod-fresh"
         );
+    }
+
+    #[test]
+    fn a_failed_staging_leaves_the_clone_whole() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        fs::write(&paths.dev_store, b"database").expect("write database");
+        let wal = path_with_suffix(&paths.dev_store, "-wal");
+        fs::write(&wal, b"wal").expect("write wal");
+        // A directory cannot be replaced by a rename, so the second move fails after
+        // the first has already succeeded.
+        fs::create_dir(path_with_suffix(
+            &path_with_suffix(&paths.dev_store, ".previous"),
+            "-wal",
+        ))
+        .expect("block the staged wal path");
+
+        let error = stage_previous_clone(&paths.dev_store)
+            .expect_err("staging must fail when a file cannot be moved");
+        assert!(error.to_string().contains("set aside"));
+
+        assert_eq!(
+            fs::read(&paths.dev_store).expect("database stays at the live path"),
+            b"database"
+        );
+        assert_eq!(fs::read(&wal).expect("wal stays at the live path"), b"wal");
     }
 
     #[test]
