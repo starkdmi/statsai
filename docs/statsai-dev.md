@@ -140,13 +140,14 @@ statsai-dev env prod
 ```
 
 The profiles set the existing `STATSAI_API_URL` and `STATSAI_WEB_URL` variables
-for the launched process:
+for the launched process, and select the store (see
+[Forward StatsAI commands](#forward-statsai-commands)):
 
-| Profile | API | Web |
-|---|---|---|
-| `local` | `http://127.0.0.1:8787` | `http://127.0.0.1:3000` |
-| `dev` | `https://dev-api.statsai.dev` | `https://dev.statsai.dev` |
-| `prod` | StatsAI production defaults | StatsAI production defaults |
+| Profile | API | Web | Store |
+|---|---|---|---|
+| `local` | `http://127.0.0.1:8787` | `http://127.0.0.1:3000` | dev clone |
+| `dev` | `https://dev-api.statsai.dev` | `https://dev.statsai.dev` | dev clone |
+| `prod` | StatsAI production defaults | StatsAI production defaults | production |
 
 Selection and environment changes compose:
 
@@ -171,33 +172,32 @@ statsai-dev auth login
 ```
 
 Every normal command is executed as the selected binary with the selected URL
-profile and an injected:
+profile and an injected `--store`. **The environment selects the store**:
 
-```text
---store ~/.cache/statsai-dev/data/statsai.sqlite
-```
+| environment | backend | injected `--store` |
+| --- | --- | --- |
+| `local`, `dev` | local / dev API | `~/.cache/statsai-dev/data/statsai.sqlite` |
+| `prod` | production API | `~/.statsai/statsai.sqlite` |
 
-Forwarded `--store` options are rejected. A deliberate, one-command production
-data escape hatch is available and prints a warning:
+So `statsai-dev env prod` gives you the real CLI — production backend against
+production data — and `statsai-dev env dev` gives you a PR build against a
+throwaway clone. Forwarded `--store` options are rejected.
 
-```sh
-statsai-dev --prod-data report monthly
-```
+The two stores carry the same device id, so the server keys that device's
+`last_batch_id` to whichever store synced last. Crossing a backend with the other
+store therefore leaves the local sync pointer unreachable and promotes the next
+`sync` to a full-history upload of the whole account. Binding the store to the
+environment makes those two pairings unreachable.
 
-The flag must come before the forwarded command. `statsai-dev report monthly
---prod-data` is rejected, because everything after the command name is passed
-through to the selected build unchanged.
+`--prod-data` used to select the database independently of the backend and has
+been removed; `statsai-dev env prod` replaces it.
 
-`env prod` selects the backend URLs only and never changes which database is
-used; `--prod-data` selects the database for exactly one command and never
-changes the backend. `--prod-data` is never persisted.
-
-The escape hatch is allowed only when the production database schema **and**
+The prod environment is allowed only when the production database schema **and**
 applied pricing ruleset exactly match the versions supported by the selected
-build. Missing, older, or newer production pricing metadata is refused. A
-development build is never allowed to migrate or reprice production data; use
-the isolated development clone to test a schema-changing or pricing-changing
-PR.
+build; it prints a warning when it proceeds. Missing, older, or newer production
+pricing metadata is refused. A development build is never allowed to migrate or
+reprice production data, so a schema-changing or pricing-changing PR can only be
+tested under `env dev` against the isolated clone.
 
 Ordinary isolated `statsai-dev` stores are opened by the selected exact-SHA
 `statsai` binary. That binary applies its own pricing ruleset automatically

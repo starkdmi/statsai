@@ -12,11 +12,9 @@ use std::ffi::OsString;
     disable_help_subcommand = true
 )]
 pub(crate) struct Cli {
-    #[arg(
-        long,
-        global = true,
-        help = "Use the production StatsAI database for this forwarded command only"
-    )]
+    /// Accepted only so the removal reports what to use instead; clap would
+    /// otherwise answer with a bare "unexpected argument".
+    #[arg(long, global = true, hide = true)]
     pub(crate) prod_data: bool,
     #[command(subcommand)]
     pub(crate) command: Command,

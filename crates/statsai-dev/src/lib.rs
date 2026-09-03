@@ -62,8 +62,8 @@ impl PollBackoff {
 pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let paths = Paths::discover()?;
-    if cli.prod_data && !matches!(cli.command, Command::Statsai(_)) {
-        bail!("`--prod-data` is only valid with a forwarded StatsAI command");
+    if cli.prod_data {
+        bail!(launcher::PROD_DATA_REPLACED_BY_ENVIRONMENT);
     }
 
     match cli.command {
@@ -86,7 +86,7 @@ pub fn run() -> Result<ExitCode> {
         }
         Command::Statsai(arguments) => {
             let state = state::load(&paths)?;
-            launcher::forward(&paths, &state, &arguments, cli.prod_data)
+            launcher::forward(&paths, &state, &arguments)
         }
     }
 }
@@ -542,9 +542,19 @@ fn print_source_update(section: &str, build: &SelectedBuild, request: BuildReque
 fn print_data_status(paths: &Paths, state: &State) -> Result<()> {
     let status = data::inspect(paths, state)?;
     println!("Data");
-    println!("  mode:          isolated APFS dev clone");
-    println!("  source:        {}", paths.display(&paths.prod_store));
-    println!("  store:         {}", paths.display(&paths.dev_store));
+    // The environment picks the store, so reporting the clone unconditionally would
+    // describe the wrong database exactly when it matters most.
+    if matches!(state.environment, Environment::Prod) {
+        println!("  mode:          PRODUCTION database (prod environment)");
+        println!("  store:         {}", paths.display(&paths.prod_store));
+    } else {
+        println!(
+            "  mode:          isolated APFS dev clone ({} environment)",
+            state.environment.name()
+        );
+        println!("  source:        {}", paths.display(&paths.prod_store));
+        println!("  store:         {}", paths.display(&paths.dev_store));
+    }
     println!(
         "  refreshed:     {}",
         status
