@@ -503,6 +503,11 @@ fn print_status(paths: &Paths) -> Result<()> {
     println!("  profile:       {}", state.environment.name());
     println!("  API:           {}", state.environment.api_url());
     println!("  Web:           {}", state.environment.web_url());
+    if state.inherited_legacy_prod {
+        println!("  note:          a stored `prod` selection was reset to dev, because `prod`");
+        println!("                 now also selects the production database. Run");
+        println!("                 `statsai-dev env prod` to confirm the new meaning.");
+    }
     println!();
     print_data_status(paths, &state)?;
 
@@ -543,39 +548,41 @@ fn print_data_status(paths: &Paths, state: &State) -> Result<()> {
     let status = data::inspect(paths, state)?;
     println!("Data");
     // The environment picks the store, so reporting the clone unconditionally would
-    // describe the wrong database exactly when it matters most.
+    // describe the wrong database exactly when it matters most. `refreshed` and
+    // `size` always describe the clone, so they stay labelled for it rather than
+    // reading as facts about whichever store is active.
     if matches!(state.environment, Environment::Prod) {
-        println!("  mode:          PRODUCTION database (prod environment)");
-        println!("  store:         {}", paths.display(&paths.prod_store));
+        println!("  mode:             PRODUCTION database (prod environment)");
+        println!("  store:            {}", paths.display(&paths.prod_store));
     } else {
         println!(
-            "  mode:          isolated APFS dev clone ({} environment)",
+            "  mode:             isolated APFS dev clone ({} environment)",
             state.environment.name()
         );
-        println!("  source:        {}", paths.display(&paths.prod_store));
-        println!("  store:         {}", paths.display(&paths.dev_store));
+        println!("  store:            {}", paths.display(&paths.dev_store));
+        println!("  cloned from:      {}", paths.display(&paths.prod_store));
     }
     println!(
-        "  refreshed:     {}",
+        "  clone refreshed:  {}",
         status
             .refreshed_at
             .map(format_timestamp)
             .unwrap_or_else(|| "never".to_string())
     );
     println!(
-        "  prod schema:   {}",
-        schema_label(status.prod_schema, status.source_exists)
-    );
-    println!(
-        "  dev schema:    {}",
-        schema_label(status.dev_schema, status.dev_exists)
-    );
-    println!(
-        "  logical size:  {}",
+        "  clone size:       {}",
         status
             .logical_size
             .map(data::human_size)
             .unwrap_or_else(|| "—".to_string())
+    );
+    println!(
+        "  prod schema:      {}",
+        schema_label(status.prod_schema, status.source_exists)
+    );
+    println!(
+        "  clone schema:     {}",
+        schema_label(status.dev_schema, status.dev_exists)
     );
     Ok(())
 }

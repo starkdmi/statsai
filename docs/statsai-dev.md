@@ -1,9 +1,12 @@
 # Exact-SHA development workflow
 
 `statsai-dev` selects immutable StatsAI development artifacts and launches them
-against one reusable, isolated database. It is intentionally a CLI-only Apple
-Silicon workflow in v1; it never installs a development daemon or rewires the
-menu bar application.
+against the database its environment selects: a reusable, isolated APFS clone
+under `local` and `dev`, and the production database under `prod`. Isolation is
+therefore a property of the environment, not of the launcher — see
+[Forward StatsAI commands](#forward-statsai-commands). It is intentionally a
+CLI-only Apple Silicon workflow in v1; it never installs a development daemon or
+rewires the menu bar application.
 
 ## Install the launcher
 
@@ -191,6 +194,11 @@ environment makes those two pairings unreachable.
 
 `--prod-data` used to select the database independently of the backend and has
 been removed; `statsai-dev env prod` replaces it.
+
+A `prod` selection stored before this change meant "production backend, isolated
+clone". It is reset to `dev` on first read, with a note, so the old selection is
+never silently reinterpreted as permission to open the production database; run
+`statsai-dev env prod` to opt in to the new meaning.
 
 The prod environment is allowed only when the production database schema **and**
 applied pricing ruleset exactly match the versions supported by the selected

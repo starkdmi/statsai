@@ -7,7 +7,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
-const STATE_SCHEMA: u32 = 1;
+/// 2 introduced the environment selecting the store, which changed what a stored
+/// `prod` selection authorizes. Reading a schema-1 file therefore has to decide
+/// what its `prod` meant rather than trusting it.
+const STATE_SCHEMA: u32 = 2;
+const STORE_FOLLOWS_ENVIRONMENT_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
@@ -157,6 +161,12 @@ pub(crate) struct State {
     pub(crate) environment: Environment,
     #[serde(default)]
     pub(crate) data: DataState,
+    /// Set when a schema-1 `prod` selection was carried forward. Under schema 1
+    /// `prod` meant the production backend against the isolated clone, so honouring
+    /// it as written would open production data the user never asked for. Never
+    /// serialized: it describes how this state was read, not what was stored.
+    #[serde(skip)]
+    pub(crate) inherited_legacy_prod: bool,
 }
 
 impl Default for State {
@@ -166,6 +176,7 @@ impl Default for State {
             build: None,
             environment: Environment::Dev,
             data: DataState::default(),
+            inherited_legacy_prod: false,
         }
     }
 }
@@ -245,7 +256,7 @@ pub(crate) fn load(paths: &Paths) -> Result<State> {
     }
     let file = File::open(&paths.state_file)
         .with_context(|| format!("open state file {}", paths.state_file.display()))?;
-    let state: State = serde_json::from_reader(BufReader::new(file))
+    let mut state: State = serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("parse state file {}", paths.state_file.display()))?;
     if state.schema > STATE_SCHEMA {
         bail!(
@@ -253,6 +264,19 @@ pub(crate) fn load(paths: &Paths) -> Result<State> {
             state.schema
         );
     }
+    // A schema-1 `prod` selected the production backend and kept the isolated clone.
+    // Reading it as a schema-2 `prod` would silently upgrade it to permission to open
+    // the production database, so it is recorded as inherited and the caller decides
+    // rather than acting on it.
+    state.inherited_legacy_prod = state.schema < STORE_FOLLOWS_ENVIRONMENT_SCHEMA
+        && matches!(state.environment, Environment::Prod);
+    if state.inherited_legacy_prod {
+        // Downgrading here rather than at the point of use keeps every path that
+        // persists state -- `use`, `data refresh`, `data clean` -- from quietly
+        // ratifying the old selection as schema 2. Re-running `env prod` opts in.
+        state.environment = Environment::Dev;
+    }
+    state.schema = STATE_SCHEMA;
     Ok(state)
 }
 
@@ -335,14 +359,65 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_prod_selection_does_not_become_permission_to_open_production() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_state_dir().expect("create state directory");
+        fs::write(&paths.state_file, r#"{"schema":1,"environment":"prod"}"#)
+            .expect("write legacy state");
+
+        let migrated = load(&paths).expect("load legacy state");
+
+        // Under schema 1 this meant the production backend against the clone, so
+        // carrying it forward as written would open production data unasked.
+        assert_eq!(migrated.environment, Environment::Dev);
+        assert!(migrated.inherited_legacy_prod);
+
+        // Persisting the migrated state must not quietly ratify the old selection.
+        save(&paths, &migrated).expect("save migrated state");
+        let reloaded = load(&paths).expect("reload migrated state");
+        assert_eq!(reloaded.environment, Environment::Dev);
+        assert!(!reloaded.inherited_legacy_prod);
+    }
+
+    #[test]
+    fn a_legacy_non_prod_selection_survives_the_migration() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_state_dir().expect("create state directory");
+        fs::write(&paths.state_file, r#"{"schema":1,"environment":"local"}"#)
+            .expect("write legacy state");
+
+        let migrated = load(&paths).expect("load legacy state");
+
+        assert_eq!(migrated.environment, Environment::Local);
+        assert!(!migrated.inherited_legacy_prod);
+        assert_eq!(migrated.schema, STATE_SCHEMA);
+    }
+
+    #[test]
+    fn a_reselected_prod_environment_opens_production() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_state_dir().expect("create state directory");
+        fs::write(&paths.state_file, r#"{"schema":2,"environment":"prod"}"#)
+            .expect("write reselected state");
+
+        let state = load(&paths).expect("load reselected state");
+
+        assert_eq!(state.environment, Environment::Prod);
+        assert!(!state.inherited_legacy_prod);
+    }
+
+    #[test]
     fn future_state_schema_is_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = Paths::for_test(directory.path());
         paths.ensure_state_dir().expect("create state directory");
-        fs::write(&paths.state_file, r#"{"schema":2}"#).expect("write future state");
+        fs::write(&paths.state_file, r#"{"schema":3}"#).expect("write future state");
 
         let error = load(&paths).expect_err("future state must fail");
 
-        assert!(error.to_string().contains("state schema 2 is newer"));
+        assert!(error.to_string().contains("state schema 3 is newer"));
     }
 }

@@ -44,6 +44,12 @@ pub(crate) fn forward(paths: &Paths, state: &State, arguments: &[OsString]) -> R
     // whichever store synced last: pairing the dev backend with production data, or
     // production with the clone, leaves the local sync pointer unreachable and turns
     // the next sync into a full-history upload of the entire account.
+    if state.inherited_legacy_prod {
+        eprintln!(
+            "NOTE: the stored `prod` selection predates the store following the environment, when it meant the production backend against the isolated clone. Using the dev environment instead; run `statsai-dev env prod` to confirm the new meaning, which also opens {}",
+            paths.display(&paths.prod_store)
+        );
+    }
     let uses_production_data = matches!(state.environment, Environment::Prod);
     let store = if uses_production_data {
         &paths.prod_store
