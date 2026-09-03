@@ -103,9 +103,10 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
     }
 
     let target = sync_target(&command)?;
+    let mut cleared_tracking = None;
     let http_preflight = if command.sink == "http" && !command.dry_run {
         let preflight = load_http_sync_preflight(&command, &target)?;
-        maybe_reset_http_sync_tracking_if_remote_changed(
+        cleared_tracking = maybe_reset_http_sync_tracking_if_remote_changed(
             &command,
             store,
             &target,
@@ -206,27 +207,41 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
+            // An opted-in full upload that failed established no resumable progress,
+            // so the cursor it discarded goes back. Without this the next ordinary
+            // sync finds no cursor -- or the empty one `record_sync_failure` writes
+            // -- which is exactly what the guard above treats as "nothing to
+            // protect", and it would re-upload the whole history unasked.
+            //
+            // This has to run first: `restore_sync_states` will not move a cursor
+            // backwards, and `record_sync_failure` stamps a newer `last_success_at`,
+            // so restoring afterwards would silently do nothing. Recording the
+            // failure second keeps the restored batch id and only bumps the count.
+            if let Some(cleared) = cleared_tracking {
+                let _ = store.restore_sync_states(std::slice::from_ref(&cleared));
+            }
             let _ = store.record_sync_failure(&command.sink, &target);
             Err(error)
         }
     }
 }
 
+/// Returns the cursor this cleared, so a failed opted-in run can put it back.
 fn maybe_reset_http_sync_tracking_if_remote_changed(
     command: &SyncCommand,
     store: &Store,
     target: &str,
     remote: Option<&Value>,
-) -> Result<()> {
+) -> Result<Option<SyncState>> {
     let Some(local_state) = store.sync_state("http", target)? else {
-        return Ok(());
+        return Ok(None);
     };
     if local_state.last_batch_id.trim().is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(remote) = remote else {
-        return Ok(());
+        return Ok(None);
     };
     let sync_preferences = effective_sync_preferences(store, command)?;
     let local_verify = sync_local_verify(
@@ -271,9 +286,10 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
             target
         );
         store.clear_sync_tracking_for_target("http", target)?;
+        return Ok(Some(local_state));
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
@@ -794,6 +810,51 @@ mod tests {
                 .is_some(),
             "the cursor must survive so the sync can be retried after the cause is understood"
         );
+    }
+
+    #[test]
+    fn a_failed_opted_in_upload_leaves_the_guard_armed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = "https://api.example.test/api/sync/batches";
+        let store = store_with_cursor(&directory.path().join("store.sqlite"), target);
+        let remote = json!({ "device": { "last_sync_batch_id": "batch-remote-ahead" } });
+
+        let cleared = maybe_reset_http_sync_tracking_if_remote_changed(
+            &sync_command(true),
+            &store,
+            target,
+            Some(&remote),
+        )
+        .expect("--full clears tracking")
+        .expect("the cleared cursor is handed back");
+
+        // What `sync` does when the opted-in upload fails, in the order it does it.
+        store
+            .restore_sync_states(std::slice::from_ref(&cleared))
+            .expect("restore the cursor");
+        store
+            .record_sync_failure("http", target)
+            .expect("record the failure");
+
+        let restored = store
+            .sync_state("http", target)
+            .expect("read cursor")
+            .expect("cursor exists again");
+        assert_eq!(
+            restored.last_batch_id, "batch-local",
+            "recording the failure must not blank the restored cursor"
+        );
+
+        // A later ordinary sync therefore still meets the guard rather than sliding
+        // past it into an unrequested full upload.
+        let error = maybe_reset_http_sync_tracking_if_remote_changed(
+            &sync_command(false),
+            &store,
+            target,
+            Some(&remote),
+        )
+        .expect_err("the guard must still fire after a failed opted-in run");
+        assert!(error.to_string().contains("--full"));
     }
 
     #[test]
