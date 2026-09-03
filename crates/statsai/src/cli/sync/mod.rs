@@ -103,6 +103,7 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
     }
 
     let target = sync_target(&command)?;
+    let reached_send = std::cell::Cell::new(false);
     let mut cleared_tracking = None;
     let http_preflight = if command.sink == "http" && !command.dry_run {
         let preflight = load_http_sync_preflight(&command, &target)?;
@@ -166,6 +167,7 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
         let persisted_sync_preferences = apply_sync_preference_overrides(store, &command)?;
         debug_assert_eq!(persisted_sync_preferences, sync_preferences);
 
+        reached_send.set(true);
         let result = (|| -> Result<()> {
             match command.sink.as_str() {
                 "stdout" => {
@@ -205,31 +207,26 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
             }
         })();
 
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                // The cursor goes back before the failure is recorded, not after:
-                // `restore_sync_states` will not move a cursor backwards and
-                // `record_sync_failure` stamps a newer `last_success_at`, so restoring
-                // second would silently do nothing.
-                restore_cleared_sync_tracking(store, &cleared_tracking);
-                let _ = store.record_sync_failure(&command.sink, &target);
-                Err(error)
-            }
-        }
+        result
     })();
 
     match outcome {
         Ok(()) => Ok(()),
         Err(error) => {
-            // Everything between clearing the cursor and sending can fail too --
-            // building the batch, resolving the identity key, persisting preference
-            // overrides -- and those return without recording a sync failure. The
-            // cursor still has to come back, or the next ordinary sync sees nothing
-            // to protect and re-uploads the whole history unasked. A send failure has
-            // already restored it above; repeating that here is a no-op, because the
-            // recorded failure left a newer row.
+            // Every failure after the cursor was cleared lands here, whether it came
+            // from the send or from building the batch, resolving the identity key or
+            // persisting preference overrides. Restoring in one place is deliberate:
+            // `record_sync_failure` only increments `failure_count` on an existing
+            // row and leaves `last_success_at` alone, so a second restore would find
+            // an equal timestamp, accept the snapshot, and put the pre-failure count
+            // back -- losing the very signal that makes the next sync send its
+            // recovery snapshot.
             restore_cleared_sync_tracking(store, &cleared_tracking);
+            // Only a failure that reached the send records one. Earlier failures never
+            // touched the remote, so there is no divergence to recover from.
+            if reached_send.get() {
+                let _ = store.record_sync_failure(&command.sink, &target);
+            }
             Err(error)
         }
     }
@@ -315,12 +312,11 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
             reasons.join("; "),
             target
         );
-        // Captured before the clear, and all three tables: `sync_state` alone would
-        // come back with every entity looking pending, which resends the metadata
-        // the cursor exists to spare.
-        let snapshot = store.capture_sync_tracking("http", target)?;
-        store.clear_sync_tracking_for_target("http", target)?;
-        return Ok(Some(snapshot));
+        // One transaction, and all three tables: `sync_state` alone would come back
+        // with every entity looking pending, which resends the metadata the cursor
+        // exists to spare, and capturing separately from clearing would let a
+        // concurrent sync's acknowledged chunk be deleted in between.
+        return Ok(Some(store.capture_and_clear_sync_tracking("http", target)?));
     }
 
     Ok(None)
@@ -889,6 +885,52 @@ mod tests {
         )
         .expect_err("the guard must still fire after a failed opted-in run");
         assert!(error.to_string().contains("--full"));
+    }
+
+    #[test]
+    fn restoring_twice_would_erase_the_recorded_failure() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = "https://api.example.test/api/sync/batches";
+        let store = store_with_cursor(&directory.path().join("store.sqlite"), target);
+        let remote = json!({ "device": { "last_sync_batch_id": "batch-remote-ahead" } });
+
+        let cleared = maybe_reset_http_sync_tracking_if_remote_changed(
+            &sync_command(true),
+            &store,
+            target,
+            Some(&remote),
+        )
+        .expect("--full clears tracking")
+        .expect("the cleared tracking is handed back");
+
+        // The order `sync` uses on a failed send.
+        restore_cleared_sync_tracking(&store, &Some(cleared.clone()));
+        store
+            .record_sync_failure("http", target)
+            .expect("record the failure");
+        assert!(
+            store
+                .sync_state("http", target)
+                .expect("read cursor")
+                .expect("cursor exists")
+                .failure_count
+                > 0
+        );
+
+        // `record_sync_failure` leaves `last_success_at` untouched, so a second
+        // restore sees an equal timestamp, accepts the snapshot and puts the
+        // pre-failure count back. `failed_without_resume` reads that count to decide
+        // whether to send a recovery snapshot, so losing it loses the recovery.
+        restore_cleared_sync_tracking(&store, &Some(cleared));
+        assert_eq!(
+            store
+                .sync_state("http", target)
+                .expect("read cursor")
+                .expect("cursor exists")
+                .failure_count,
+            0,
+            "this documents why sync must restore exactly once"
+        );
     }
 
     #[test]
