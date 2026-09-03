@@ -308,12 +308,21 @@ pub(crate) fn build_sync_batch_with_identity_key(
             target,
             &current_authoritative_snapshot,
         )?;
-        let full_history_sync = command.full
-            || command.rebuild_rollups
-            || state.is_none()
-            || has_pending_resume
-            || (!command.since_last && failed_without_resume);
-        if full_history_sync || has_retired_entities {
+        let full_history_sync =
+            command.full || command.rebuild_rollups || state.is_none() || has_pending_resume;
+        // A failure that recorded no chunk left the cursor exactly where it was --
+        // every chunk that lands marks a resume point first -- so the summaries the
+        // unacknowledged batch carried are still pending, and an incremental sync
+        // re-sends precisely them. If that batch did reach the server after all, the
+        // resend is deduplicated there. What an incremental sync cannot do by itself
+        // is prove the mirror agrees about which entities exist, so the authoritative
+        // snapshot goes with it: that is what lets the server retire anything stale.
+        //
+        // Re-uploading the whole account did the same job by brute force. On a real
+        // account that was 422 summaries across 32 chunks for a failure that may have
+        // delivered nothing at all.
+        let unacknowledged_failure = !command.since_last && failed_without_resume;
+        if full_history_sync || has_retired_entities || unacknowledged_failure {
             authoritative_snapshot = Some(current_authoritative_snapshot);
         }
         let rollups = if full_history_sync {
