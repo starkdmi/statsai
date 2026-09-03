@@ -498,3 +498,51 @@ fn cursor_at(target: &str, at: DateTime<Utc>, batch: &str) -> SyncState {
         pending_resume_batch_id: None,
     }
 }
+
+#[test]
+fn restoring_tracking_brings_back_entity_rows_not_just_the_cursor() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Store::open(&directory.path().join("store.sqlite")).expect("open store");
+    let target = "https://api.example.test/api/sync/batches";
+    store
+        .restore_sync_states(&[cursor_at(target, Utc::now(), "batch-local")])
+        .expect("seed cursor");
+    store
+        .record_entity_synced("http", target, "account", "account-1", "hash-1")
+        .expect("seed entity tracking");
+
+    let snapshot = store
+        .capture_sync_tracking("http", target)
+        .expect("capture tracking");
+    assert!(!snapshot.is_empty());
+    store
+        .clear_sync_tracking_for_target("http", target)
+        .expect("clear tracking");
+    assert!(
+        store
+            .entity_requires_sync("http", target, "account", "account-1", "hash-1")
+            .expect("read entity tracking"),
+        "clearing really removed the entity row"
+    );
+
+    store
+        .restore_sync_tracking(&snapshot)
+        .expect("restore tracking");
+
+    assert_eq!(
+        store
+            .sync_state("http", target)
+            .expect("read cursor")
+            .expect("cursor exists")
+            .last_batch_id,
+        "batch-local"
+    );
+    // Restoring the cursor alone would leave every entity pending, resending the
+    // metadata the cursor exists to spare.
+    assert!(
+        !store
+            .entity_requires_sync("http", target, "account", "account-1", "hash-1")
+            .expect("read restored entity tracking"),
+        "entity tracking must come back with the cursor"
+    );
+}

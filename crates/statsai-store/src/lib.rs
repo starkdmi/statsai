@@ -173,6 +173,24 @@ impl SyncPreferences {
     }
 }
 
+/// Everything tracked for one sync target, so a caller that must clear it for an
+/// operation can put it back if that operation does not establish new progress.
+#[derive(Debug, Clone)]
+pub struct SyncTrackingSnapshot {
+    pub(crate) sink: String,
+    pub(crate) target: String,
+    pub(crate) state: Option<SyncState>,
+    pub(crate) entities: Vec<(String, String, String, String)>,
+    pub(crate) buckets: Vec<(String, String, i64, Option<String>, String)>,
+}
+
+impl SyncTrackingSnapshot {
+    /// Whether there was anything to preserve.
+    pub fn is_empty(&self) -> bool {
+        self.state.is_none() && self.entities.is_empty() && self.buckets.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncState {
     pub sink: String,

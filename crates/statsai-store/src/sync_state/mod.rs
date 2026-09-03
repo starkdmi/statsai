@@ -231,6 +231,112 @@ impl Store {
         }
     }
 
+    /// Everything `clear_sync_tracking_for_target` would remove for one target.
+    ///
+    /// The three tables are one cursor: `sync_state` records how far the target got,
+    /// `entity_sync_state` which entities it already has, `task_bucket_sync_state`
+    /// which buckets are clean. Capturing only the first and restoring that alone
+    /// leaves every entity looking pending, which re-sends the metadata the cursor
+    /// was supposed to spare.
+    pub fn capture_sync_tracking(&self, sink: &str, target: &str) -> Result<SyncTrackingSnapshot> {
+        let state = self.sync_state(sink, target)?;
+        let mut entities = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT entity_kind, entity_id, payload_hash, synced_at \
+                 FROM entity_sync_state WHERE sink = ?1 AND target = ?2",
+            )?;
+            let rows = stmt.query_map(params![sink, target], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            for row in rows {
+                entities.push(row?);
+            }
+        }
+        let mut buckets = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT device_id, project_bucket, dirty, payload_hash, updated_at \
+                 FROM task_bucket_sync_state WHERE sink = ?1 AND target = ?2",
+            )?;
+            let rows = stmt.query_map(params![sink, target], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            for row in rows {
+                buckets.push(row?);
+            }
+        }
+        Ok(SyncTrackingSnapshot {
+            sink: sink.to_string(),
+            target: target.to_string(),
+            state,
+            entities,
+            buckets,
+        })
+    }
+
+    /// Puts a captured snapshot back, for a target whose tracking was cleared for an
+    /// operation that then did not establish new progress.
+    pub fn restore_sync_tracking(&self, snapshot: &SyncTrackingSnapshot) -> Result<()> {
+        begin_immediate_transaction_with_retry(&self.conn)?;
+        let result = (|| {
+            for (entity_kind, entity_id, payload_hash, synced_at) in &snapshot.entities {
+                self.conn.execute(
+                    "INSERT INTO entity_sync_state \
+                     (sink, target, entity_kind, entity_id, payload_hash, synced_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(sink, target, entity_kind, entity_id) DO UPDATE SET \
+                       payload_hash = excluded.payload_hash, synced_at = excluded.synced_at",
+                    params![
+                        snapshot.sink,
+                        snapshot.target,
+                        entity_kind,
+                        entity_id,
+                        payload_hash,
+                        synced_at
+                    ],
+                )?;
+            }
+            for (device_id, project_bucket, dirty, payload_hash, updated_at) in &snapshot.buckets {
+                self.conn.execute(
+                    "INSERT INTO task_bucket_sync_state \
+                     (sink, target, device_id, project_bucket, dirty, payload_hash, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT(sink, target, device_id, project_bucket) DO UPDATE SET \
+                       dirty = excluded.dirty, payload_hash = excluded.payload_hash, \
+                       updated_at = excluded.updated_at",
+                    params![
+                        snapshot.sink,
+                        snapshot.target,
+                        device_id,
+                        project_bucket,
+                        dirty,
+                        payload_hash,
+                        updated_at
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => commit_transaction(&self.conn)?,
+            Err(error) => {
+                rollback(&self.conn);
+                return Err(error);
+            }
+        }
+        if let Some(state) = &snapshot.state {
+            self.restore_sync_states(std::slice::from_ref(state))?;
+        }
+        Ok(())
+    }
+
     pub fn clear_sync_tracking_for_target(&self, sink: &str, target: &str) -> Result<()> {
         begin_immediate_transaction_with_retry(&self.conn)?;
         let result = (|| {

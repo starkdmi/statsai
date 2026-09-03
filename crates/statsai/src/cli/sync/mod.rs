@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::Serialize;
 use serde_json::{json, Value};
 use statsai_core::SyncBatch;
-use statsai_store::{Store, SyncPreferences, SyncState};
+use statsai_store::{Store, SyncPreferences, SyncState, SyncTrackingSnapshot};
 use statsai_sync::{FileSink, StdoutSink, SyncSink};
 use std::path::PathBuf;
 
@@ -237,19 +237,19 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
 
 /// Puts back a cursor that `--full` discarded, when the upload it was discarded for
 /// did not get far enough to establish new progress.
-fn restore_cleared_sync_tracking(store: &Store, cleared: &Option<SyncState>) {
-    if let Some(state) = cleared {
-        let _ = store.restore_sync_states(std::slice::from_ref(state));
+fn restore_cleared_sync_tracking(store: &Store, cleared: &Option<SyncTrackingSnapshot>) {
+    if let Some(snapshot) = cleared {
+        let _ = store.restore_sync_tracking(snapshot);
     }
 }
 
-/// Returns the cursor this cleared, so a failed opted-in run can put it back.
+/// Returns the tracking this cleared, so a failed opted-in run can put it back.
 fn maybe_reset_http_sync_tracking_if_remote_changed(
     command: &SyncCommand,
     store: &Store,
     target: &str,
     remote: Option<&Value>,
-) -> Result<Option<SyncState>> {
+) -> Result<Option<SyncTrackingSnapshot>> {
     let Some(local_state) = store.sync_state("http", target)? else {
         return Ok(None);
     };
@@ -302,8 +302,12 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
             reasons.join("; "),
             target
         );
+        // Captured before the clear, and all three tables: `sync_state` alone would
+        // come back with every entity looking pending, which resends the metadata
+        // the cursor exists to spare.
+        let snapshot = store.capture_sync_tracking("http", target)?;
         store.clear_sync_tracking_for_target("http", target)?;
-        return Ok(Some(local_state));
+        return Ok(Some(snapshot));
     }
 
     Ok(None)
@@ -847,8 +851,8 @@ mod tests {
 
         // What `sync` does when the opted-in upload fails, in the order it does it.
         store
-            .restore_sync_states(std::slice::from_ref(&cleared))
-            .expect("restore the cursor");
+            .restore_sync_tracking(&cleared)
+            .expect("restore the tracking");
         store
             .record_sync_failure("http", target)
             .expect("record the failure");
