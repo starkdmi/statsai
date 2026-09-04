@@ -73,6 +73,13 @@ statsai-dev data clean
 
 `data clean` does not retain historical snapshots.
 
+`data refresh` writes the clone whatever environment is selected. Under `env
+prod` the clone is therefore *not* the store forwarded commands open, and the
+refresh says so. Carrying the previous clone's sync cursors also means opening
+the clone, which migrates it to the schema `statsai-dev` itself links — so the
+schema the clone ends up at can be ahead of the one it was copied with, and the
+refresh reports both.
+
 ## Select an exact build
 
 ```sh
@@ -203,9 +210,97 @@ never silently reinterpreted as permission to open the production database; run
 The prod environment is allowed only when the production database schema **and**
 applied pricing ruleset exactly match the versions supported by the selected
 build; it prints a warning when it proceeds. Missing, older, or newer production
-pricing metadata is refused. A development build is never allowed to migrate or
-reprice production data, so a schema-changing or pricing-changing PR can only be
-tested under `env dev` against the isolated clone.
+pricing metadata is refused. A development build never migrates or reprices
+production data as a side effect of a forwarded command, so a schema-changing or
+pricing-changing PR can only be tested under `env dev` against the isolated
+clone.
+
+## Upgrade production to a merged build
+
+Released `statsai` reaches Homebrew and GitHub releases on its own cadence, so
+production can sit on an older schema than `main` for as long as that takes —
+and the check above then refuses `env prod` outright. `data upgrade-prod` is the
+deliberate way across:
+
+```sh
+statsai-dev use main
+statsai-dev data upgrade-prod
+```
+
+It refuses unless GitHub reports the selected commit as `main`'s head
+(`identical` on `compare/main...<sha>`). A PR head's migrations are a proposal
+that can still be revised or dropped, and a production database stamped with a
+version that never shipped has no supported way back — so PR builds are never
+eligible, however green their CI is.
+
+Merely being *contained* in main is not enough either. A schema-changing commit
+that main later reverted stays an ancestor of main forever, so accepting
+`behind` would keep accepting a build whose migration main deliberately removed.
+Only main's head describes what main ships now, so if main has advanced, re-run
+`statsai-dev use main` and try again.
+
+The check runs twice: once up front, and again after the confirmation prompt,
+immediately before the migration. The prompt waits as long as you do, and main
+can advance — or revert this very migration — while it waits.
+
+It also refuses to move backwards: a build behind production's schema or pricing
+ruleset has nothing to offer it. A build level with production reports that
+there is nothing to do.
+
+Before migrating, it clones production to
+`~/.statsai/backups/statsai-schema<N>-<timestamp>.sqlite`. The clone is
+copy-on-write, so backing up a multi-gigabyte database costs almost no time and
+almost no space. The migration itself runs as the selected build's `statsai
+store migrate`, which applies the schema and the compiled pricing ruleset and
+nothing else.
+
+Afterwards it reads production back. A migration that exits zero without leaving
+production at the schema and pricing ruleset the build declares fails the command
+and names the backup, so a `--yes` caller that restarts the daemon or resumes
+syncing on success never does so over a half-finished upgrade.
+
+Nothing else may hold the database. Both the upgrade and the restore refuse when
+
+- the `dev.statsai.daemon` LaunchAgent is loaded,
+- anything answers on `127.0.0.1:8765`, or
+- any other process has `~/.statsai/statsai.sqlite` or its `-wal`/`-shm`/`-journal`
+  open, as reported by `lsof`,
+
+and they re-check immediately before touching the database. The third check is
+the one that matters most: `statsai daemon --api` accepts any loopback address,
+so a daemon started by hand can hold the store while the first two say nothing,
+and it is also the only check that does not depend on which binary started the
+daemon. A daemon from an older release keeps its own long-lived connection, and
+left running across an upgrade it writes events priced by its older catalog while
+the metadata now says the database is current — so nothing reprices them
+afterwards. A restore would meanwhile replace the file underneath that
+connection.
+
+A probe that cannot answer counts as a refusal, not an all-clear: `lsof` failing
+to run, and `launchctl` or `id` failing so that the LaunchAgent's state is
+unknown, both stop the command. That last one matters because a `KeepAlive`
+daemon between restarts holds neither the port nor the database, so during that
+window the LaunchAgent is the only signal that it is coming back. `--yes` skips
+the confirmation prompt, not any of these checks.
+
+```sh
+statsai service uninstall   # or: launchctl bootout gui/$(id -u)/dev.statsai.daemon
+```
+
+To roll back:
+
+```sh
+statsai-dev data restore-prod            # newest backup
+statsai-dev data restore-prod <path>     # a specific one
+```
+
+Restoring is a clone, not a `mv`. A database is more than its main file: moving
+one over `~/.statsai/statsai.sqlite` would leave production's own `-wal` and
+`-shm` beside it, and SQLite would replay frames written *after* the backup into
+the database just restored. `restore-prod` checkpoints the backup, publishes a
+sidecar-free copy atomically, and displaces the destination's sidecars as part of
+that swap. It also backs up the database it replaces first, so a rollback is
+itself reversible.
 
 Ordinary isolated `statsai-dev` stores are opened by the selected exact-SHA
 `statsai` binary. That binary applies its own pricing ruleset automatically

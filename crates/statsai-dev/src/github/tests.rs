@@ -222,3 +222,18 @@ fn transient_server_failures_retry_but_ordinary_client_errors_do_not() {
         None
     );
 }
+
+#[test]
+fn being_main_and_being_contained_in_main_are_different_answers() {
+    assert_eq!(
+        classify_main_ancestry("identical"),
+        MainAncestry::IsMainHead
+    );
+    // Contained in main, but a later commit may have reverted it.
+    assert_eq!(classify_main_ancestry("behind"), MainAncestry::BehindMain);
+    assert_eq!(classify_main_ancestry("ahead"), MainAncestry::NotOnMain);
+    assert_eq!(classify_main_ancestry("diverged"), MainAncestry::NotOnMain);
+    // An answer this code does not recognise must not be read as permission to
+    // migrate production data.
+    assert_eq!(classify_main_ancestry(""), MainAncestry::NotOnMain);
+}

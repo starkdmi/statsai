@@ -23,6 +23,10 @@ pub(crate) struct Paths {
     pub(crate) data_dir: PathBuf,
     pub(crate) dev_store: PathBuf,
     pub(crate) prod_store: PathBuf,
+    /// Backups of production live beside production rather than in the cache: a
+    /// cache is something a cleaner may reclaim, and this holds the only copy of
+    /// a database from before a migration.
+    pub(crate) prod_backups_dir: PathBuf,
     state_lock: PathBuf,
     data_lock: PathBuf,
 }
@@ -59,6 +63,11 @@ impl Paths {
 
     fn new(home: PathBuf, state_dir: PathBuf, cache_dir: PathBuf, prod_store: PathBuf) -> Self {
         let data_dir = cache_dir.join("data");
+        let prod_backups_dir = prod_store
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("backups");
         Self {
             home,
             state_file: state_dir.join("state.json"),
@@ -70,6 +79,7 @@ impl Paths {
             state_dir,
             cache_dir,
             prod_store,
+            prod_backups_dir,
         }
     }
 

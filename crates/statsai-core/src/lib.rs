@@ -3,6 +3,7 @@
 mod account_plan;
 mod archive;
 mod code_changes;
+mod daemon_presence;
 mod ids;
 mod paths;
 mod quota;
@@ -13,6 +14,7 @@ mod types;
 pub use account_plan::*;
 pub use archive::*;
 pub use code_changes::*;
+pub use daemon_presence::*;
 pub use ids::*;
 pub use paths::*;
 pub use quota::*;
