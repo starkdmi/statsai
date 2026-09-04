@@ -212,8 +212,15 @@ fn existing_store_files(store: &Path) -> Vec<PathBuf> {
 fn probe_openers(files: &[PathBuf]) -> std::io::Result<Vec<StoreOpener>> {
     // `-F pc` asks for machine-readable output: one `p<pid>` line, then a `c<command>`
     // line for each of that process's matching descriptors.
+    //
+    // Deliberately without `-w`. That flag suppresses warnings -- including the ones
+    // lsof emits when it cannot inspect a path or a process -- and warnings are the
+    // only thing separating "nothing has these files open" from "some of what I
+    // looked at would not answer me". Suppressing them turns the second into the
+    // first, silently, which is the one reading this guard must never produce. The
+    // cost is that any diagnostic at all refuses; in practice a probe over explicit
+    // paths that finds nothing says nothing.
     let output = std::process::Command::new("lsof")
-        .arg("-w")
         .args(["-F", "pc"])
         .arg("--")
         .args(files)
@@ -229,10 +236,11 @@ fn probe_openers(files: &[PathBuf]) -> std::io::Result<Vec<StoreOpener>> {
 /// Decides what one lsof run actually said.
 ///
 /// Exit status 1 with no output is lsof's way of saying "nothing has these files
-/// open". Its own failures share that status but say so on stderr, and a run killed
-/// by a signal says nothing at all -- so silence only means "no openers" when it
-/// comes with the exact status lsof uses for that answer. Every other outcome is
-/// "no answer", which this guard must never read as "no writers".
+/// open". Its own failures share that status but say so on stderr -- as errors, or
+/// as the warnings [`probe_openers`] is careful not to suppress -- and a run killed
+/// by a signal says nothing at all. So silence only means "no openers" when it comes
+/// with the exact status lsof uses for that answer. Every other outcome is "no
+/// answer", which this guard must never read as "no writers".
 fn interpret_probe(
     status: std::process::ExitStatus,
     stdout: &str,
