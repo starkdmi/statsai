@@ -510,7 +510,11 @@ pub(crate) fn sync_local_verify(
     let all_sources = store.list_sources()?;
     let all_accounts = store.list_accounts()?;
     let all_source_account_assignments = store.list_source_account_assignments()?;
-    let all_subscriptions = store.list_subscriptions()?;
+    let all_subscriptions: Vec<_> = store
+        .list_subscriptions()?
+        .into_iter()
+        .filter(is_syncable_subscription)
+        .collect();
     let sync_sources: Vec<_> = all_sources
         .iter()
         .cloned()
@@ -531,6 +535,42 @@ pub(crate) fn sync_local_verify(
         .cloned()
         .map(sanitize_subscription_for_sync)
         .collect();
+    let retired_sources = store.retired_sync_entity_count(
+        sink,
+        target,
+        "source",
+        &all_sources
+            .iter()
+            .map(|source| source.source_id.0.as_str())
+            .collect(),
+    )?;
+    let retired_accounts = store.retired_sync_entity_count(
+        sink,
+        target,
+        "account",
+        &all_accounts
+            .iter()
+            .map(|account| account.provider_account_id.0.as_str())
+            .collect(),
+    )?;
+    let retired_source_account_assignments = store.retired_sync_entity_count(
+        sink,
+        target,
+        "source_account_assignment",
+        &all_source_account_assignments
+            .iter()
+            .map(|assignment| assignment.assignment_id.0.as_str())
+            .collect(),
+    )?;
+    let retired_subscriptions = store.retired_sync_entity_count(
+        sink,
+        target,
+        "subscription",
+        &all_subscriptions
+            .iter()
+            .map(|subscription| subscription.subscription_id.0.as_str())
+            .collect(),
+    )?;
     let passthrough_summaries: Vec<_> = store
         .summaries()?
         .into_iter()
@@ -550,10 +590,12 @@ pub(crate) fn sync_local_verify(
         pending_sources: store
             .pending_sources_for_sync(sink, target, &sync_sources)?
             .len(),
+        retired_sources,
         total_accounts: all_accounts.len(),
         pending_accounts: store
             .pending_accounts_for_sync(sink, target, &sync_accounts)?
             .len(),
+        retired_accounts,
         total_source_account_assignments: all_source_account_assignments.len(),
         pending_source_account_assignments: store
             .pending_source_account_assignments_for_sync(
@@ -562,10 +604,12 @@ pub(crate) fn sync_local_verify(
                 &sync_source_account_assignments,
             )?
             .len(),
+        retired_source_account_assignments,
         total_subscriptions: all_subscriptions.len(),
         pending_subscriptions: store
             .pending_subscriptions_for_sync(sink, target, &sync_subscriptions)?
             .len(),
+        retired_subscriptions,
         total_passthrough_summaries: passthrough_summaries.len(),
         pending_passthrough_summaries: store
             .pending_summaries_for_sync(sink, target, &passthrough_summaries)?
@@ -625,12 +669,16 @@ pub(crate) struct SyncLocalVerify {
     pub(crate) total_sources: usize,
     pub(crate) enabled_sources: usize,
     pub(crate) pending_sources: usize,
+    pub(crate) retired_sources: usize,
     pub(crate) total_accounts: usize,
     pub(crate) pending_accounts: usize,
+    pub(crate) retired_accounts: usize,
     pub(crate) total_source_account_assignments: usize,
     pub(crate) pending_source_account_assignments: usize,
+    pub(crate) retired_source_account_assignments: usize,
     pub(crate) total_subscriptions: usize,
     pub(crate) pending_subscriptions: usize,
+    pub(crate) retired_subscriptions: usize,
     pub(crate) total_passthrough_summaries: usize,
     pub(crate) pending_passthrough_summaries: usize,
     pub(crate) total_rollups: usize,
@@ -694,6 +742,7 @@ pub(crate) fn remote_metadata_gap_reason(
             .and_then(Value::as_u64),
         local.total_sources,
         local.pending_sources,
+        local.retired_sources,
     );
     push_remote_metadata_gap(
         &mut reasons,
@@ -703,6 +752,7 @@ pub(crate) fn remote_metadata_gap_reason(
             .and_then(Value::as_u64),
         local.total_accounts,
         local.pending_accounts,
+        local.retired_accounts,
     );
     push_remote_metadata_gap(
         &mut reasons,
@@ -712,6 +762,7 @@ pub(crate) fn remote_metadata_gap_reason(
             .and_then(Value::as_u64),
         local.total_source_account_assignments,
         local.pending_source_account_assignments,
+        local.retired_source_account_assignments,
     );
     push_remote_metadata_gap(
         &mut reasons,
@@ -721,6 +772,7 @@ pub(crate) fn remote_metadata_gap_reason(
             .and_then(Value::as_u64),
         local.total_subscriptions,
         local.pending_subscriptions,
+        local.retired_subscriptions,
     );
 
     if reasons.is_empty() {
@@ -730,20 +782,43 @@ pub(crate) fn remote_metadata_gap_reason(
     }
 }
 
+/// Reports a mirror that is missing rows this device has already uploaded.
+///
+/// Entities the device stopped syncing but the mirror was never told to drop
+/// widen the acceptable count instead of waiving the comparison. The remote may
+/// legitimately still hold them, since only the next authoritative snapshot
+/// retires them, and it may also have dropped them already — both land on the
+/// same end state, so neither is a gap. Waiving the comparison outright would
+/// disarm the check for a whole sync, while demanding equality with the local
+/// total would force a full re-upload to clear a retirement that an ordinary
+/// incremental sync already fixes. A remote below the live total is still a lost
+/// mirror, and one above the retirement allowance is holding rows nothing local
+/// can account for.
 fn push_remote_metadata_gap(
     reasons: &mut Vec<String>,
     label: &str,
     remote_count: Option<u64>,
     local_total: usize,
     local_pending: usize,
+    local_retired: usize,
 ) {
     if local_pending > 0 {
         return;
     }
-    if let Some(remote_count) = remote_count {
-        if remote_count != local_total as u64 {
-            reasons.push(format!("{label} {remote_count}!={local_total}"));
-        }
+    let Some(remote_count) = remote_count else {
+        return;
+    };
+    let lowest_expected = local_total as u64;
+    let highest_expected = (local_total + local_retired) as u64;
+    if remote_count >= lowest_expected && remote_count <= highest_expected {
+        return;
+    }
+    if local_retired == 0 {
+        reasons.push(format!("{label} {remote_count}!={lowest_expected}"));
+    } else {
+        reasons.push(format!(
+            "{label} {remote_count}!={lowest_expected}..{highest_expected}"
+        ));
     }
 }
 
