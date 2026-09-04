@@ -404,3 +404,98 @@ fn pending_http_sync_summary_counts_include_account_plan_and_evidence_only_uploa
         0
     );
 }
+
+#[test]
+fn one_plan_fact_seen_by_two_sources_projects_once() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Store::open(&directory.path().join("store.sqlite")).expect("open store");
+    let observed_at = Utc::now();
+    let account_id = statsai_core::ProviderAccountId("account-shared".to_string());
+
+    // The same account on the same plan at the same instant, seen by two installs.
+    // A projection is per device and drops `source_id`, so these are one fact.
+    let observation =
+        |observation_id: &str, source_id: &str| statsai_core::AccountPlanObservationV1 {
+            schema_version: statsai_core::ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: observation_id.to_string(),
+            provider: "claude_code".to_string(),
+            source_id: statsai_core::SourceId(source_id.to_string()),
+            provider_account_id: Some(account_id.clone()),
+            raw_plan_name: "claude_pro".to_string(),
+            plan_name: "Pro".to_string(),
+            observed_at,
+            active_from: None,
+            active_until: None,
+            is_current_snapshot: true,
+            evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+            confidence: Confidence::Medium,
+            parser_version: "test.v1".to_string(),
+            artifact_path_hash: "path-hash".to_string(),
+            record_fingerprint: "plan-fingerprint".to_string(),
+        };
+    store
+        .upsert_account_plan_observations(&[
+            observation("plan-source-a", "source-a"),
+            observation("plan-source-b", "source-b"),
+        ])
+        .expect("plan evidence from two sources");
+
+    let plans = store
+        .account_plan_projections("device")
+        .expect("plan projections");
+
+    // Sending both copies makes the whole batch invalid at the hosted mirror, which
+    // rejects a repeated `projection_id` and fails every chunk behind it.
+    assert_eq!(plans.len(), 1, "one plan fact must project exactly once");
+}
+
+#[test]
+fn the_strongest_evidence_wins_a_projection_collision() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Store::open(&directory.path().join("store.sqlite")).expect("open store");
+    let observed_at = Utc::now();
+    let account_id = statsai_core::ProviderAccountId("account-shared".to_string());
+
+    // `projection_id` is derived from a fingerprint that omits `confidence` and
+    // compares plan names case-insensitively, so these two collide -- while carrying
+    // different payloads. Whichever row the query returned first must not decide
+    // which one reaches the mirror.
+    let observation =
+        |observation_id: &str, source_id: &str, raw_plan_name: &str, confidence: Confidence| {
+            statsai_core::AccountPlanObservationV1 {
+                schema_version: statsai_core::ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+                observation_id: observation_id.to_string(),
+                provider: "claude_code".to_string(),
+                source_id: statsai_core::SourceId(source_id.to_string()),
+                provider_account_id: Some(account_id.clone()),
+                raw_plan_name: raw_plan_name.to_string(),
+                plan_name: "Pro".to_string(),
+                observed_at,
+                active_from: None,
+                active_until: None,
+                is_current_snapshot: true,
+                evidence_kind: statsai_core::AccountEvidenceKind::AuthSnapshot,
+                confidence,
+                parser_version: "test.v1".to_string(),
+                artifact_path_hash: "path-hash".to_string(),
+                record_fingerprint: "plan-fingerprint".to_string(),
+            }
+        };
+    store
+        .upsert_account_plan_observations(&[
+            observation("plan-weak", "source-a", "CLAUDE_PRO", Confidence::Low),
+            observation("plan-strong", "source-b", "claude_pro", Confidence::High),
+        ])
+        .expect("plan evidence of differing strength");
+
+    let plans = store
+        .account_plan_projections("device")
+        .expect("plan projections");
+
+    assert_eq!(plans.len(), 1, "the collision still yields one projection");
+    assert_eq!(
+        plans[0].confidence,
+        Confidence::High,
+        "the stronger evidence must survive the collision"
+    );
+}

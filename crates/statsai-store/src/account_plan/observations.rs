@@ -1,4 +1,5 @@
 use super::*;
+use std::cmp::Reverse;
 
 impl Store {
     /// Convert an attributed quota status into plan evidence. A plan label by itself never
@@ -491,14 +492,48 @@ impl Store {
         Ok(changed)
     }
 
+    /// One projection per distinct plan fact this device observed.
+    ///
+    /// Observations are per source; a projection is per device, and drops `source_id`
+    /// along with the parser and artifact fields. Two sources that saw the same
+    /// account on the same plan at the same instant are therefore one projection with
+    /// one `projection_id`, and emitting it twice makes the whole sync batch invalid:
+    /// the hosted mirror rejects a repeated `projection_id` within a batch, which
+    /// fails every chunk behind it too.
+    ///
+    /// Colliding projections are not interchangeable, so one is chosen rather than
+    /// whichever the query happened to return first. `projection_id` is derived from
+    /// the fingerprint, which omits `confidence` and compares the plan names
+    /// case-insensitively -- yet the payload carries both verbatim. Keeping the first
+    /// row would let the strength of the evidence, and the casing that reaches the
+    /// mirror, depend on row order and on which sources are still installed.
     pub fn account_plan_projections(
         &self,
         device_id: &str,
     ) -> Result<Vec<AccountPlanProjectionV1>> {
-        Ok(self
+        let mut chosen: HashMap<String, AccountPlanProjectionV1> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for projection in self
             .account_plan_observations()?
             .iter()
             .filter_map(|observation| plan_projection_from_observation(observation, device_id))
+        {
+            let replaces = match chosen.get(&projection.projection_id) {
+                Some(existing) => {
+                    plan_projection_precedence(&projection) > plan_projection_precedence(existing)
+                }
+                None => {
+                    order.push(projection.projection_id.clone());
+                    true
+                }
+            };
+            if replaces {
+                chosen.insert(projection.projection_id.clone(), projection);
+            }
+        }
+        Ok(order
+            .into_iter()
+            .filter_map(|projection_id| chosen.remove(&projection_id))
             .collect())
     }
 
@@ -638,4 +673,25 @@ impl Store {
         }
         Ok(summaries)
     }
+}
+
+/// Ranks two projections that share a `projection_id`; greater wins.
+///
+/// Strongest evidence first, because a source reporting the same plan with higher
+/// confidence is the better record of it. Ties fall back to the smallest plan names
+/// so the winner depends only on the payloads themselves -- not on row order, and not
+/// on which of the reporting sources is still installed.
+fn plan_projection_precedence(
+    projection: &AccountPlanProjectionV1,
+) -> (u8, Reverse<&str>, Reverse<&str>) {
+    let confidence = match projection.confidence {
+        Confidence::High => 2,
+        Confidence::Medium => 1,
+        Confidence::Low => 0,
+    };
+    (
+        confidence,
+        Reverse(projection.plan_name.as_str()),
+        Reverse(projection.raw_plan_name.as_str()),
+    )
 }
