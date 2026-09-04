@@ -1,9 +1,10 @@
-use crate::artifact::load_cached;
-use crate::state::{Environment, Paths, State};
+use crate::artifact::{load_cached, InstalledBuild};
+use crate::state::{Environment, Paths, SelectedBuild, State};
 use anyhow::{bail, Context, Result};
 use statsai_store::{database_applied_pricing_ruleset_version, database_schema_version};
 use std::ffi::{OsStr, OsString};
-use std::process::{Command, ExitCode};
+use std::path::Path;
+use std::process::{Command, ExitCode, ExitStatus};
 
 /// `--prod-data` used to pick the store independently of the backend, which made
 /// the two mismatched pairings reachable. Kept as a named error so the launcher and
@@ -11,8 +12,12 @@ use std::process::{Command, ExitCode};
 pub(crate) const PROD_DATA_REPLACED_BY_ENVIRONMENT: &str =
     "`--prod-data` has been removed: the environment now selects the store. Run `statsai-dev env prod` to work against production data, or `statsai-dev env dev` for the isolated clone";
 
-pub(crate) fn forward(paths: &Paths, state: &State, arguments: &[OsString]) -> Result<ExitCode> {
-    validate_forward_arguments(arguments)?;
+/// Returns the selected build together with the cached binary it names, refusing
+/// anything the recorded selection no longer describes exactly.
+pub(crate) fn selected_installed_build<'a>(
+    paths: &Paths,
+    state: &'a State,
+) -> Result<(&'a SelectedBuild, InstalledBuild)> {
     let selected = state
         .build
         .as_ref()
@@ -37,6 +42,48 @@ pub(crate) fn forward(paths: &Paths, state: &State, arguments: &[OsString]) -> R
             selected.sha
         );
     }
+    Ok((selected, installed))
+}
+
+/// Runs the selected build's `store migrate` against `store`.
+///
+/// This is the only place a development build is allowed to change the schema of
+/// a database it did not clone, so the caller decides whether it may -- see
+/// [`crate::data::plan_prod_upgrade`].
+pub(crate) fn migrate_store(
+    installed: &InstalledBuild,
+    store: &Path,
+    environment: Environment,
+) -> Result<()> {
+    let mut command = Command::new(&installed.binary_path);
+    command.arg("--store").arg(store).args(["store", "migrate"]);
+    apply_environment(&mut command, environment);
+    let status = command.status().with_context(|| {
+        format!(
+            "run selected StatsAI build {}",
+            installed.binary_path.display()
+        )
+    })?;
+    if !status.success() {
+        bail!(
+            "`statsai store migrate` failed ({}) against {}; a build that predates `statsai store migrate` cannot upgrade a database, so select a newer main build",
+            describe_status(status),
+            store.display()
+        );
+    }
+    Ok(())
+}
+
+fn describe_status(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit status {code}"),
+        None => "terminated by a signal".to_string(),
+    }
+}
+
+pub(crate) fn forward(paths: &Paths, state: &State, arguments: &[OsString]) -> Result<ExitCode> {
+    validate_forward_arguments(arguments)?;
+    let (selected, installed) = selected_installed_build(paths, state)?;
 
     let _data_lock = paths.lock_data_shared()?;
     // The environment owns the store rather than a separate flag. Both stores carry

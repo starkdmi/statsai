@@ -1,10 +1,18 @@
 use crate::state::{save, Paths, State};
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
-use statsai_store::{clone_database_to, database_schema_version, DatabaseClone, Store};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use statsai_store::{
+    clone_database_to, database_applied_pricing_ruleset_version, database_schema_version,
+    DatabaseClone, Store,
+};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+
+/// A backup's name records the schema it was taken at and when it was taken; both
+/// are read back by [`latest_backup`], so the two halves are spelled once.
+const BACKUP_NAME_PREFIX: &str = "statsai-schema";
+const BACKUP_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 
 #[derive(Debug)]
 pub(crate) struct DataStatus {
@@ -20,6 +28,32 @@ pub(crate) struct DataStatus {
 pub(crate) struct RefreshOutcome {
     pub(crate) clone: DatabaseClone,
     pub(crate) restored_sync_states: usize,
+    /// The clone's schema once the refresh finished. Carrying sync cursors means
+    /// opening the clone, and opening a store migrates it, so this can be ahead
+    /// of the schema the clone was copied with.
+    pub(crate) schema_after: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProdVersions {
+    pub(crate) schema: i64,
+    pub(crate) pricing: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProdUpgradePlan {
+    AlreadyCurrent,
+    Upgrade {
+        from: ProdVersions,
+        schema: i64,
+        pricing: u64,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct ProdBackup {
+    pub(crate) path: PathBuf,
+    pub(crate) clone: DatabaseClone,
 }
 
 pub(crate) fn refresh(paths: &Paths, state: &mut State) -> Result<RefreshOutcome> {
@@ -63,16 +97,30 @@ pub(crate) fn refresh(paths: &Paths, state: &mut State) -> Result<RefreshOutcome
             Some(previous) => adopt_sync_tracking(&paths.dev_store, previous)?,
             None => 0,
         };
+        // Read rather than assume: adopting cursors opens the clone, and opening a
+        // store migrates it -- to *this launcher's* linked schema, which is not
+        // necessarily the selected build's. Reporting the schema the clone was
+        // copied with would then describe a database that no longer exists.
+        let schema_after =
+            database_schema_version(&paths.dev_store)?.unwrap_or(cloned.schema_version);
         Ok(RefreshOutcome {
             clone: cloned,
             restored_sync_states: adopted,
+            schema_after,
         })
     })();
 
     match refreshed {
         Ok(outcome) => {
+            // The clone is published and its cursors are adopted, and neither can be
+            // undone from here, so leftovers that refuse to be deleted are reported
+            // rather than turned into a failed refresh. Their marker survives, which
+            // is what keeps the next refresh from mistaking them for a cursor-carrying
+            // clone.
             if let Some(previous) = previous.as_deref() {
-                discard_staged_clone(previous);
+                if let Err(error) = discard_staged_clone(previous) {
+                    eprintln!("warning: {error:#}");
+                }
             }
             state.data.refreshed_at = Some(Utc::now());
             save(paths, state)?;
@@ -106,7 +154,7 @@ fn recover_staged_clone(dev_store: &Path) -> Result<()> {
         // Cleanup was under way, so everything staged belongs to a clone already
         // finished with. Putting its write-ahead log back would rename it over the
         // live one, which is where a freshly adopted cursor still sits.
-        discard_staged_clone(&staged);
+        discard_staged_clone(&staged)?;
         return Ok(());
     }
 
@@ -183,7 +231,10 @@ fn stage_previous_clone(dev_store: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let staged = path_with_suffix(dev_store, ".previous");
-    discard_staged_clone(&staged);
+    // Staging into a path that still holds someone else's leftovers would mix two
+    // clones' files, so a cleanup that cannot finish stops the refresh here -- before
+    // anything has moved.
+    discard_staged_clone(&staged)?;
     // A partial move is worse than not moving at all: every failure here returns
     // without handing `refresh` the staged path, so `refresh`'s own rollback never
     // runs. Anything already moved would be stranded under the staged suffix with no
@@ -239,20 +290,53 @@ fn restore_staged_clone(staged: &Path, dev_store: &Path) -> Result<()> {
     Ok(())
 }
 
-fn discard_staged_clone(staged: &Path) {
+fn discard_staged_clone(staged: &Path) -> Result<()> {
     // Nothing is removed until the intent to remove it is on disk. Deleting first and
     // recording afterwards is what makes an interrupted cleanup indistinguishable from
     // an interrupted staging or restoration, and those want the opposite treatment. If
     // the intent cannot be recorded, leaving the clone alone is the recoverable
     // outcome -- the next refresh stages over it.
-    if fs::write(discarding_marker(staged), b"").is_err() {
-        return;
+    fs::write(discarding_marker(staged), b"").with_context(|| {
+        format!(
+            "record the intent to discard the previous development database {}",
+            staged.display()
+        )
+    })?;
+
+    let mut failures = Vec::new();
+    for path in [staging_marker(staged)]
+        .into_iter()
+        .chain(database_files(staged))
+    {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("{}: {error}", path.display())),
+        }
     }
-    let _ = fs::remove_file(staging_marker(staged));
-    for path in database_files(staged) {
-        let _ = fs::remove_file(path);
+    // The marker outlives a cleanup that could not finish, and the caller hears about
+    // it. Clearing it while a write-ahead log is still stranded under the staged
+    // suffix would tell the next refresh that those leftovers came from an interrupted
+    // staging -- so it would move them back beside the live clone, where they belong to
+    // no database and can make it unreadable.
+    if !failures.is_empty() {
+        bail!(
+            "could not discard the previous development database {}: {}",
+            staged.display(),
+            failures.join("; ")
+        );
     }
-    let _ = fs::remove_file(discarding_marker(staged));
+    // Only reached once nothing is left to protect, so a marker that outlives this is
+    // harmless: the next refresh finds no staged files and simply clears it.
+    if let Err(error) = fs::remove_file(discarding_marker(staged)) {
+        if error.kind() != ErrorKind::NotFound {
+            eprintln!(
+                "note: discarded {} but left its marker behind ({error}); the next refresh clears it",
+                staged.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn adopt_sync_tracking(dev_store: &Path, previous: &Path) -> Result<usize> {
@@ -307,6 +391,172 @@ fn adopt_sync_tracking(dev_store: &Path, previous: &Path) -> Result<usize> {
         format!(
             "carry sync cursors from the previous development database {}",
             previous.display()
+        )
+    })
+}
+
+pub(crate) fn read_prod_versions(paths: &Paths) -> Result<ProdVersions> {
+    read_prod_versions_at(&paths.prod_store)
+}
+
+pub(crate) fn read_prod_versions_at(database: &Path) -> Result<ProdVersions> {
+    let Some(schema) = database_schema_version(database)? else {
+        bail!("StatsAI database does not exist at {}", database.display());
+    };
+    Ok(ProdVersions {
+        schema,
+        pricing: database_applied_pricing_ruleset_version(database)?,
+    })
+}
+
+/// Decides what a build may do to production data.
+///
+/// Migrations and pricing rulesets only go forward, so a build behind production
+/// has nothing to offer it and must not try. A build level with production has
+/// nothing to do. Everything else is an upgrade, including stamping a ruleset
+/// onto a database that has never recorded one.
+pub(crate) fn plan_prod_upgrade(
+    current: ProdVersions,
+    build_schema: i64,
+    build_pricing: u64,
+) -> Result<ProdUpgradePlan> {
+    if current.schema > build_schema {
+        bail!(
+            "production is at store schema {}, ahead of the selected build's {build_schema}; migrations only go forward, so select a build that supports at least schema {}",
+            current.schema,
+            current.schema
+        );
+    }
+    if let Some(pricing) = current.pricing {
+        if pricing > build_pricing {
+            bail!(
+                "production has pricing ruleset {pricing} applied, ahead of the selected build's {build_pricing}; select a build that carries at least ruleset {pricing}"
+            );
+        }
+    }
+    if current.schema == build_schema && current.pricing == Some(build_pricing) {
+        return Ok(ProdUpgradePlan::AlreadyCurrent);
+    }
+    Ok(ProdUpgradePlan::Upgrade {
+        from: current,
+        schema: build_schema,
+        pricing: build_pricing,
+    })
+}
+
+/// Clones production aside before anything migrates it.
+///
+/// The clone is copy-on-write, so a backup of a multi-gigabyte database costs
+/// almost no time and almost no space. It is taken under the same writer lock and
+/// checkpoint as any other clone, so it is a consistent database rather than a
+/// snapshot of a file mid-write. The name carries when it was taken, because the
+/// clone inherits production's modification time rather than being stamped with
+/// its own -- see [`latest_backup`].
+pub(crate) fn back_up_production(paths: &Paths, at: DateTime<Utc>) -> Result<ProdBackup> {
+    let versions = read_prod_versions(paths)?;
+    let path = paths.prod_backups_dir.join(format!(
+        "{BACKUP_NAME_PREFIX}{}-{}.sqlite",
+        versions.schema,
+        at.format(BACKUP_TIMESTAMP_FORMAT)
+    ));
+    if path.try_exists()? {
+        bail!(
+            "refusing to overwrite the existing backup {}",
+            path.display()
+        );
+    }
+    let clone = clone_database_to(&paths.prod_store, &path).with_context(|| {
+        format!(
+            "back up the production database {} to {}",
+            paths.prod_store.display(),
+            path.display()
+        )
+    })?;
+    Ok(ProdBackup { path, clone })
+}
+
+/// The most recently taken backup, if there is one.
+///
+/// Ordered by the timestamp written into the name, which is the only record of
+/// when a backup was taken. Neither of the obvious alternatives works: the name
+/// leads with the schema, so plain lexicographic order puts an older schema's
+/// backup last, and `fclonefileat` copies the *source* file's modification time
+/// onto the clone, so a backup's mtime describes when production was last written
+/// rather than when the backup was made.
+///
+/// A file whose name this cannot read is skipped rather than guessed at. Anything
+/// dropped into the directory by hand can still be restored by naming it.
+pub(crate) fn latest_backup(paths: &Paths) -> Result<Option<PathBuf>> {
+    let entries = match fs::read_dir(&paths.prod_backups_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "list production backups in {}",
+                    paths.prod_backups_dir.display()
+                )
+            });
+        }
+    };
+
+    let mut newest: Option<(NaiveDateTime, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "read production backup directory {}",
+                paths.prod_backups_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let Some(taken_at) = backup_timestamp(&path) else {
+            continue;
+        };
+        // Ties break on the name so that two backups claiming the same second still
+        // resolve the same way on every run, rather than on directory order.
+        if newest
+            .as_ref()
+            .is_none_or(|(newest_at, newest_path)| (taken_at, &path) > (*newest_at, newest_path))
+        {
+            newest = Some((taken_at, path));
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
+}
+
+/// Reads back the timestamp [`back_up_production`] wrote into a backup's name.
+fn backup_timestamp(path: &Path) -> Option<NaiveDateTime> {
+    if path.extension()? != "sqlite" {
+        return None;
+    }
+    let name = path.file_stem()?.to_str()?;
+    let (schema, taken_at) = name.strip_prefix(BACKUP_NAME_PREFIX)?.split_once('-')?;
+    if schema.is_empty() || !schema.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    NaiveDateTime::parse_from_str(taken_at, BACKUP_TIMESTAMP_FORMAT).ok()
+}
+
+/// Puts a backup back in production's place.
+///
+/// This is a clone rather than a rename for the same reason the backup was: a
+/// database is not just its main file. Renaming one over production would leave
+/// production's own `-wal` and `-shm` beside it, and SQLite would replay frames
+/// written *after* the backup into the database being restored. `clone_database_to`
+/// checkpoints the source, publishes a sidecar-free copy atomically, and displaces
+/// the destination's sidecars as part of that swap.
+pub(crate) fn restore_production(paths: &Paths, backup: &Path) -> Result<DatabaseClone> {
+    if database_schema_version(backup)
+        .with_context(|| format!("read backup {}", backup.display()))?
+        .is_none()
+    {
+        bail!("backup {} does not exist", backup.display());
+    }
+    clone_database_to(backup, &paths.prod_store).with_context(|| {
+        format!(
+            "restore the production database {} from {}",
+            paths.prod_store.display(),
+            backup.display()
         )
     })
 }
@@ -422,6 +672,176 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
+    }
+
+    fn production_at(schema: i64, pricing: Option<u64>) -> ProdVersions {
+        ProdVersions { schema, pricing }
+    }
+
+    #[test]
+    fn an_upgrade_is_planned_only_forward() {
+        assert_eq!(
+            plan_prod_upgrade(production_at(22, Some(1)), 23, 1).expect("schema upgrade"),
+            ProdUpgradePlan::Upgrade {
+                from: production_at(22, Some(1)),
+                schema: 23,
+                pricing: 1,
+            }
+        );
+        // A database that has never recorded a ruleset is upgraded rather than
+        // refused: stamping it is exactly what the missing metadata needs.
+        assert_eq!(
+            plan_prod_upgrade(production_at(23, None), 23, 1).expect("pricing upgrade"),
+            ProdUpgradePlan::Upgrade {
+                from: production_at(23, None),
+                schema: 23,
+                pricing: 1,
+            }
+        );
+        assert_eq!(
+            plan_prod_upgrade(production_at(23, Some(1)), 23, 1).expect("nothing to do"),
+            ProdUpgradePlan::AlreadyCurrent
+        );
+    }
+
+    #[test]
+    fn a_build_behind_production_may_not_touch_it() {
+        let older_schema = plan_prod_upgrade(production_at(23, Some(1)), 22, 1)
+            .expect_err("a build behind production must refuse");
+        assert!(older_schema.to_string().contains("only go forward"));
+
+        let older_pricing = plan_prod_upgrade(production_at(23, Some(2)), 23, 1)
+            .expect_err("an older ruleset must refuse");
+        assert!(older_pricing.to_string().contains("pricing ruleset 2"));
+    }
+
+    // `clone_database_to` is APFS-only, so the backup path cannot run elsewhere.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_backup_is_taken_beside_production_without_changing_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        drop(Store::open(&paths.prod_store).expect("create production store"));
+        let before = read_prod_versions(&paths).expect("read production versions");
+
+        let at = DateTime::parse_from_rfc3339("2026-09-04T18:20:31Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let backup = back_up_production(&paths, at).expect("back up production");
+
+        assert_eq!(
+            backup.path,
+            paths.prod_backups_dir.join(format!(
+                "statsai-schema{}-20260904T182031Z.sqlite",
+                before.schema
+            ))
+        );
+        assert_eq!(
+            database_schema_version(&backup.path).expect("read backup schema"),
+            Some(before.schema)
+        );
+        assert_eq!(
+            read_prod_versions(&paths).expect("production is unchanged"),
+            before
+        );
+
+        // A second backup in the same second would otherwise overwrite the first,
+        // which is the only copy of a database from before a migration.
+        let repeated = back_up_production(&paths, at).expect_err("must not overwrite a backup");
+        assert!(repeated.to_string().contains("refusing to overwrite"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn restoring_a_backup_discards_the_write_ahead_log_beside_production() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        let target = "https://api.example.test/api/sync/batches";
+        let now = Utc::now();
+        record_cursor(&paths.prod_store, target, now, "batch-before");
+        let backup = back_up_production(&paths, now).expect("back up production");
+        record_cursor(&paths.prod_store, target, now, "batch-after");
+
+        // A crashed writer, or one still holding the database, leaves sidecars
+        // behind. Renaming a backup over the main file would leave them in place,
+        // and SQLite would replay frames written *after* the backup into the
+        // database that was just restored.
+        let stale_wal = path_with_suffix(&paths.prod_store, "-wal");
+        fs::write(&stale_wal, b"frames written after the backup").expect("write a stale WAL");
+
+        restore_production(&paths, &backup.path).expect("restore production");
+
+        assert!(
+            !stale_wal.exists(),
+            "a write-ahead log from after the backup survived the restore"
+        );
+        assert_eq!(
+            cursor(&paths.prod_store, target)
+                .expect("restored cursor")
+                .last_batch_id,
+            "batch-before"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_newest_backup_is_the_one_restored_by_default() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        drop(Store::open(&paths.prod_store).expect("create production store"));
+        assert_eq!(latest_backup(&paths).expect("no backups yet"), None);
+
+        let taken = Utc::now();
+        let older = back_up_production(&paths, taken - chrono::Duration::hours(1))
+            .expect("older backup")
+            .path;
+        let newer = back_up_production(&paths, taken)
+            .expect("newer backup")
+            .path;
+
+        // An APFS clone inherits the source file's modification time, so both backups
+        // carry production's -- and a run that ranked them by mtime would be choosing
+        // between two equal values by directory order.
+        assert_eq!(
+            fs::metadata(&older)
+                .and_then(|metadata| metadata.modified())
+                .expect("older mtime"),
+            fs::metadata(&newer)
+                .and_then(|metadata| metadata.modified())
+                .expect("newer mtime")
+        );
+
+        assert_eq!(latest_backup(&paths).expect("read backups"), Some(newer));
+        assert!(older.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_newer_backup_at_an_older_schema_still_wins() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        drop(Store::open(&paths.prod_store).expect("create production store"));
+        fs::create_dir_all(&paths.prod_backups_dir).expect("create backups directory");
+
+        // Sorted by name, "schema9" lands after "schema23" and an unrelated file lands
+        // after both. Only the timestamp says which was taken last.
+        let older = paths
+            .prod_backups_dir
+            .join("statsai-schema23-20260904T180000Z.sqlite");
+        let newer = paths
+            .prod_backups_dir
+            .join("statsai-schema9-20260904T190000Z.sqlite");
+        let unnamed = paths.prod_backups_dir.join("something-else.sqlite");
+        for path in [&older, &newer, &unnamed] {
+            fs::write(path, b"backup").expect("write backup");
+        }
+
+        assert_eq!(
+            latest_backup(&paths).expect("read backups"),
+            Some(newer.clone())
+        );
+        assert_eq!(backup_timestamp(&unnamed), None);
+        assert!(backup_timestamp(&older).is_some());
     }
 
     #[cfg(target_os = "macos")]
@@ -706,7 +1126,7 @@ mod tests {
         fs::write(path_with_suffix(&staged, "-wal"), b"log").expect("stage its log");
         fs::write(staging_marker(&staged), b"").expect("staging had completed");
 
-        discard_staged_clone(&staged);
+        discard_staged_clone(&staged).expect("discard the staged clone");
 
         assert!(!staged.exists(), "the clone is gone");
         assert!(!staging_marker(&staged).exists());
@@ -715,6 +1135,30 @@ mod tests {
         assert!(
             !discarding_marker(&staged).exists(),
             "the recorded intent must be cleared once the cleanup finishes"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_that_cannot_finish_keeps_its_marker() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+        fs::write(&staged, b"superseded").expect("stage a clone");
+        // A directory cannot be removed as a file, so this is a deletion that fails
+        // after the intent to discard has been recorded.
+        let undeletable = path_with_suffix(&staged, "-shm");
+        fs::create_dir(&undeletable).expect("block one staged path");
+
+        let error = discard_staged_clone(&staged).expect_err("a failed cleanup must be reported");
+
+        assert!(error.to_string().contains("could not discard"), "{error:#}");
+        // Without the marker the next recovery reads whatever is left as an
+        // interrupted staging and moves it back beside the live clone, where those
+        // files belong to no database at all.
+        assert!(
+            discarding_marker(&staged).exists(),
+            "the marker must outlive a cleanup that could not finish"
         );
     }
 
@@ -731,7 +1175,7 @@ mod tests {
         // stays writable -- so the deletions would otherwise go through.
         fs::create_dir(discarding_marker(&staged)).expect("block the marker path");
 
-        discard_staged_clone(&staged);
+        discard_staged_clone(&staged).expect_err("an unrecorded cleanup must fail");
 
         // Deleting without a record of having started is what makes an interrupted
         // cleanup look like an interrupted restoration. Leaving the clone alone is
@@ -784,8 +1228,8 @@ mod tests {
         fs::write(&paths.dev_store, b"database").expect("write database");
         let wal = path_with_suffix(&paths.dev_store, "-wal");
         fs::write(&wal, b"wal").expect("write wal");
-        // A directory cannot be replaced by a rename, so the second move fails after
-        // the first has already succeeded.
+        // Something is in the way under the staged suffix that cannot be cleared: a
+        // directory is neither removable as a file nor replaceable by a rename.
         fs::create_dir(path_with_suffix(
             &path_with_suffix(&paths.dev_store, ".previous"),
             "-wal",
@@ -793,14 +1237,45 @@ mod tests {
         .expect("block the staged wal path");
 
         let error = stage_previous_clone(&paths.dev_store)
-            .expect_err("staging must fail when a file cannot be moved");
-        assert!(error.to_string().contains("set aside"));
+            .expect_err("staging must fail when the staged paths cannot be cleared");
+        assert!(error.to_string().contains("could not discard"), "{error:#}");
 
         assert_eq!(
             fs::read(&paths.dev_store).expect("database stays at the live path"),
             b"database"
         );
         assert_eq!(fs::read(&wal).expect("wal stays at the live path"), b"wal");
+    }
+
+    #[test]
+    fn a_partial_staging_is_undone_file_by_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        paths.ensure_cache_dirs().expect("create cache directories");
+        let staged = path_with_suffix(&paths.dev_store, ".previous");
+        fs::write(&staged, b"database").expect("stage the database");
+        let staged_wal = path_with_suffix(&staged, "-wal");
+        fs::write(&staged_wal, b"newest-writes").expect("stage its log");
+
+        // What `stage_previous_clone` does when a later move fails: everything already
+        // set aside goes back, so the live path is never left without its clone.
+        undo_staging(vec![
+            (staged.clone(), paths.dev_store.clone()),
+            (
+                staged_wal.clone(),
+                path_with_suffix(&paths.dev_store, "-wal"),
+            ),
+        ]);
+
+        assert_eq!(
+            fs::read(&paths.dev_store).expect("database is back"),
+            b"database"
+        );
+        assert_eq!(
+            fs::read(path_with_suffix(&paths.dev_store, "-wal")).expect("its log is back"),
+            b"newest-writes"
+        );
+        assert!(!staged.exists() && !staged_wal.exists());
     }
 
     #[test]

@@ -12,8 +12,12 @@ use artifact::{InstalledBuild, TARGET};
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use cli::{Cli, Command, DataCommand, UseArgs};
-use github::{short_sha, BuildLookup, BuildRequest, GitHubClient, ResolvedBuild, WorkflowRun};
+use github::{
+    short_sha, BuildLookup, BuildRequest, GitHubClient, MainAncestry, ResolvedBuild, WorkflowRun,
+};
 use state::{BuildSource, Environment, Paths, SelectedBuild, State};
+use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -450,6 +454,8 @@ fn data_command(paths: &Paths, command: DataCommand) -> Result<()> {
                     if refreshed.restored_sync_states == 1 { "" } else { "s" }
                 );
             }
+            report_clone_migration(paths, &state, &refreshed);
+            report_unused_clone(paths, &state);
             Ok(())
         }
         DataCommand::Clean => {
@@ -466,7 +472,355 @@ fn data_command(paths: &Paths, command: DataCommand) -> Result<()> {
             println!("Run `statsai-dev data refresh` before the next forwarded command.");
             Ok(())
         }
+        DataCommand::UpgradeProd(arguments) => {
+            let _data_lock = paths.lock_data_exclusive()?;
+            let state = state::load(paths)?;
+            upgrade_prod(paths, &state, arguments.yes)
+        }
+        DataCommand::RestoreProd(arguments) => {
+            let _data_lock = paths.lock_data_exclusive()?;
+            restore_prod(paths, arguments.backup, arguments.yes)
+        }
     }
+}
+
+/// The clone can arrive at a different schema than it was copied with, because
+/// carrying the previous clone's sync cursors means opening it, and opening a
+/// store migrates it. Reporting only the copied schema left `data status` looking
+/// as though it disagreed with the refresh that had just run.
+fn report_clone_migration(paths: &Paths, state: &State, refreshed: &data::RefreshOutcome) {
+    if refreshed.schema_after == refreshed.clone.schema_version {
+        return;
+    }
+    println!(
+        "statsai-dev migrated the clone from schema {} to {} when it opened the clone to carry sync cursors forward.",
+        refreshed.clone.schema_version, refreshed.schema_after
+    );
+    let Some(build) = &state.build else {
+        return;
+    };
+    // Reporting only. The refresh has already published the clone, discarded the
+    // previous one and saved state, and none of that can be undone from here, so a
+    // cache this cannot read must not turn a refresh that succeeded into a command
+    // that failed.
+    match artifact::load_cached(paths, &build.sha) {
+        Ok(Some(installed)) if installed.manifest.store_schema_version < refreshed.schema_after => {
+            println!(
+                "warning: the selected build {} supports schema {}, so it cannot open the clone. Select a build that supports schema {}.",
+                short_sha(&build.sha),
+                installed.manifest.store_schema_version,
+                refreshed.schema_after
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "warning: refreshed the clone, but could not check it against the selected build: {error:#}"
+        ),
+    }
+}
+
+/// `data refresh` writes the clone whatever environment is selected, but under
+/// `prod` the clone is not what forwarded commands open. Saying so where the
+/// refresh is reported keeps the two facts from having to be assembled from
+/// `status` after the fact.
+fn report_unused_clone(paths: &Paths, state: &State) {
+    if !matches!(state.environment, Environment::Prod) {
+        return;
+    }
+    println!(
+        "NOTE: the prod environment is selected, so forwarded commands keep using {}. This clone serves `statsai-dev env dev` and `env local`.",
+        paths.display(&paths.prod_store)
+    );
+}
+
+/// Migrates production data to the selected build, once that build is proven to be
+/// main's head.
+///
+/// A development build is otherwise never allowed to migrate production, because a
+/// schema that main does not currently carry is a proposal: it can be revised,
+/// dropped, or reverted, and a database stamped with a version that never ships has
+/// no supported way back. Main's head carries the migrations every release will
+/// apply, so the only thing separating this from waiting for a release is
+/// distribution delay -- see [`main_head_refusal`].
+fn upgrade_prod(paths: &Paths, state: &State, assume_yes: bool) -> Result<()> {
+    let (selected, installed) = launcher::selected_installed_build(paths, state)?;
+    ensure_merged_into_main(selected)?;
+    ensure_daemon_stopped("migrate", &paths.prod_store)?;
+
+    let current = data::read_prod_versions(paths)?;
+    let plan = data::plan_prod_upgrade(
+        current,
+        installed.manifest.store_schema_version,
+        installed.manifest.pricing_ruleset_version,
+    )?;
+    let data::ProdUpgradePlan::Upgrade {
+        from,
+        schema,
+        pricing,
+    } = plan
+    else {
+        println!(
+            "{} is already at store schema {} and pricing ruleset {}; nothing to migrate.",
+            paths.display(&paths.prod_store),
+            current.schema,
+            pricing_label(current.pricing)
+        );
+        return Ok(());
+    };
+
+    println!("Upgrade {}", paths.display(&paths.prod_store));
+    println!(
+        "  build:            {} @ {}",
+        selected_source_label(selected),
+        short_sha(&selected.sha)
+    );
+    println!("  store schema:     {} -> {schema}", from.schema);
+    println!(
+        "  pricing ruleset:  {} -> {pricing}",
+        pricing_label(from.pricing)
+    );
+    println!(
+        "  backup:           an APFS clone under {}",
+        paths.display(&paths.prod_backups_dir)
+    );
+    if !assume_yes {
+        confirm("upgrade")?;
+    }
+
+    let backup = data::back_up_production(paths, Utc::now())?;
+    println!(
+        "Backed up production to {} ({}).",
+        paths.display(&backup.path),
+        data::human_size(backup.clone.logical_size)
+    );
+
+    // Both gates are asked again here rather than trusted from above, because the
+    // prompt waits as long as a person takes. Main can advance while it waits --
+    // including by reverting the very migration this is about to apply, which leaves
+    // the selected build merely behind main and no longer fit to stamp production --
+    // and the LaunchAgent can be brought back. The window that matters is the one the
+    // migration runs in, so the checks sit as close to it as they can.
+    ensure_merged_into_main(selected)?;
+    ensure_daemon_stopped("migrate", &paths.prod_store)?;
+    launcher::migrate_store(&installed, &paths.prod_store, state.environment).map_err(|error| {
+        error.context(format!(
+            "production may be partially migrated; the database from before the migration is at {}",
+            paths.display(&backup.path)
+        ))
+    })?;
+
+    // The migration reported success, so what production actually holds now decides
+    // whether it did. A caller running with `--yes` has nothing else to go on before
+    // it restarts the daemon or resumes syncing, and "exited zero" is not the same
+    // claim as "production is at the version this asked for".
+    let after = data::read_prod_versions(paths)?;
+    if after.schema != schema || after.pricing != Some(pricing) {
+        bail!(
+            "`statsai store migrate` reported success, but {} is at store schema {} and pricing ruleset {} rather than the schema {schema} and ruleset {pricing} the selected build supports. The database from before the migration is at {}; `statsai-dev data restore-prod` puts it back",
+            paths.display(&paths.prod_store),
+            after.schema,
+            pricing_label(after.pricing),
+            paths.display(&backup.path)
+        );
+    }
+    println!(
+        "Production is now at store schema {} and pricing ruleset {}.",
+        after.schema,
+        pricing_label(after.pricing)
+    );
+    println!(
+        "Keep {} until the upgrade has proven itself; `statsai-dev data restore-prod` puts it back.",
+        paths.display(&backup.path)
+    );
+    Ok(())
+}
+
+/// Restores production from a backup, WAL and all.
+///
+/// The database being replaced is backed up first. A rollback is still a change
+/// to production — everything written since the upgrade lives only in the file
+/// about to be overwritten — and a copy-on-write clone costs little enough that
+/// there is no reason to make that irreversible.
+fn restore_prod(paths: &Paths, backup: Option<PathBuf>, assume_yes: bool) -> Result<()> {
+    let backup = match backup {
+        Some(backup) => backup,
+        None => data::latest_backup(paths)?.with_context(|| {
+            format!(
+                "no production backup found in {}; pass one explicitly",
+                paths.display(&paths.prod_backups_dir)
+            )
+        })?,
+    };
+    ensure_daemon_stopped("restore", &paths.prod_store)?;
+
+    let current = data::read_prod_versions(paths)?;
+    let restoring = data::read_prod_versions_at(&backup)?;
+    println!("Restore {}", paths.display(&paths.prod_store));
+    println!("  from:             {}", paths.display(&backup));
+    println!(
+        "  store schema:     {} -> {}",
+        current.schema, restoring.schema
+    );
+    println!(
+        "  pricing ruleset:  {} -> {}",
+        pricing_label(current.pricing),
+        pricing_label(restoring.pricing)
+    );
+    if !assume_yes {
+        confirm("restore")?;
+    }
+
+    let displaced = data::back_up_production(paths, Utc::now())?;
+    println!(
+        "Backed up the database being replaced to {} ({}).",
+        paths.display(&displaced.path),
+        data::human_size(displaced.clone.logical_size)
+    );
+    ensure_daemon_stopped("restore", &paths.prod_store)?;
+    let restored = data::restore_production(paths, &backup)?;
+    println!(
+        "Restored {} from {} (schema {}, {}).",
+        paths.display(&paths.prod_store),
+        paths.display(&backup),
+        restored.schema_version,
+        data::human_size(restored.logical_size)
+    );
+    Ok(())
+}
+
+/// Refuses while anything else could be writing to production.
+///
+/// A daemon started by an older binary holds its own long-lived connection. Left
+/// running across an upgrade it keeps writing events priced by the catalog it was
+/// built with, while the metadata this stamps says the database is already current
+/// — so nothing later reprices them, and the wrong numbers stay. The same
+/// connection is why a restore cannot simply swap the file underneath it. `--yes`
+/// skips the prompt, not this.
+fn ensure_daemon_stopped(action: &str, store: &std::path::Path) -> Result<()> {
+    if let Some(refusal) = daemon_refusal(action, statsai_core::daemon_presence()) {
+        bail!(refusal);
+    }
+    // Neither check above is tied to the store: `statsai daemon --api` takes any
+    // loopback address, so a daemon started by hand can hold this database open
+    // while the LaunchAgent is unloaded and 8765 is closed. Asking who has the file
+    // open is the only check that does not depend on how the daemon was started, or
+    // on which binary started it.
+    //
+    // A probe that cannot run is not an answer. Failing closed here is deliberate:
+    // reading "could not check" as "nothing is running" is exactly the mistake that
+    // lets an older daemon write through an upgrade.
+    let openers = statsai_core::store_openers(store).with_context(|| {
+        format!(
+            "check which processes have {} open before letting anything {action} it",
+            store.display()
+        )
+    })?;
+    if openers.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "refusing to {action} production while it is open by {}. Stop those processes and run this again (`lsof {}` shows the same list)",
+        openers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        store.display()
+    )
+}
+
+fn daemon_refusal(action: &str, presence: statsai_core::DaemonPresence) -> Option<String> {
+    if !presence.any() {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    match presence.launch_agent {
+        statsai_core::LaunchAgentState::Loaded => reasons.push(format!(
+            "the LaunchAgent {} is loaded",
+            statsai_core::DAEMON_LAUNCH_AGENT_LABEL
+        )),
+        // Not a formality: a KeepAlive daemon between restarts holds neither the port
+        // nor the database, so an unreadable LaunchAgent is the only thing that would
+        // have said it is coming back.
+        statsai_core::LaunchAgentState::Unknown => reasons.push(format!(
+            "whether the LaunchAgent {} is loaded could not be determined",
+            statsai_core::DAEMON_LAUNCH_AGENT_LABEL
+        )),
+        statsai_core::LaunchAgentState::NotLoaded => {}
+    }
+    if presence.reachable {
+        reasons.push(format!(
+            "something is listening on {}",
+            statsai_core::DAEMON_LOOPBACK_ADDRESS
+        ));
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing to {action} production while the background daemon may be able to write to it: {}. Stop it with `statsai service uninstall` (or `launchctl bootout {}`), then run this again",
+        reasons.join(", "),
+        statsai_core::gui_domain()
+            .map(|domain| statsai_core::launch_agent_target(&domain))
+            .unwrap_or_else(|| statsai_core::DAEMON_LAUNCH_AGENT_LABEL.to_string())
+    ))
+}
+
+fn ensure_merged_into_main(selected: &SelectedBuild) -> Result<()> {
+    let ancestry = GitHubClient::new()
+        .main_ancestry(&selected.sha)
+        .with_context(|| {
+            format!(
+                "check whether {} is main's head before letting it migrate production",
+                short_sha(&selected.sha)
+            )
+        })?;
+    match main_head_refusal(selected, ancestry) {
+        Some(refusal) => bail!(refusal),
+        None => Ok(()),
+    }
+}
+
+/// Only main's head may migrate production.
+///
+/// Being contained in main sounds like enough and is not: a schema-changing commit
+/// that main later reverted stays an ancestor of main forever, so "merged" would
+/// keep accepting a build whose migration main deliberately removed -- stamping
+/// production with a version no release will ever open. Main's head is the only
+/// commit that describes what main ships now.
+fn main_head_refusal(selected: &SelectedBuild, ancestry: MainAncestry) -> Option<String> {
+    let label = selected_source_label(selected);
+    let sha = short_sha(&selected.sha);
+    match ancestry {
+        MainAncestry::IsMainHead => None,
+        MainAncestry::BehindMain => Some(format!(
+            "refusing to migrate production with {label} @ {sha}: that commit is in main's history but is not its head, so a later commit may have reverted the migration it carries. Run `statsai-dev use main` to select main's head and try again"
+        )),
+        MainAncestry::NotOnMain => Some(format!(
+            "refusing to migrate production with {label} @ {sha}: that commit is not part of main, so the schema it would apply may still change or never ship. Run `statsai-dev use main` and try again"
+        )),
+    }
+}
+
+fn confirm(word: &str) -> Result<()> {
+    print!("Type `{word}` to continue: ");
+    std::io::stdout()
+        .flush()
+        .context("prompt for confirmation")?;
+    let mut answer = String::new();
+    let read = std::io::stdin()
+        .read_line(&mut answer)
+        .context("read confirmation")?;
+    if read == 0 || answer.trim() != word {
+        bail!("cancelled: production was not touched. Pass --yes to skip this prompt");
+    }
+    Ok(())
+}
+
+fn pricing_label(pricing: Option<u64>) -> String {
+    pricing
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn clean_build_cache(paths: &Paths) -> Result<()> {
@@ -654,6 +1008,83 @@ mod tests {
             binary_sha256: "b".repeat(64),
             binary_path: paths.builds_dir.join(sha).join("statsai"),
         }
+    }
+
+    #[test]
+    fn only_mains_head_may_migrate_production() {
+        let build = SelectedBuild {
+            source: BuildSource::Main,
+            pr: None,
+            sha: "a".repeat(40),
+            workflow_run_id: 104,
+            workflow_attempt: 1,
+            target: TARGET.to_string(),
+            binary_sha256: "b".repeat(64),
+        };
+
+        assert_eq!(main_head_refusal(&build, MainAncestry::IsMainHead), None);
+
+        // Contained in main is not the same claim: a commit that main later reverted
+        // stays an ancestor forever, and its migration is one no release will apply.
+        let behind = main_head_refusal(&build, MainAncestry::BehindMain)
+            .expect("an ancestor of main must refuse");
+        assert!(behind.contains("is not its head"), "{behind}");
+        assert!(behind.contains("statsai-dev use main"), "{behind}");
+
+        let off_main = main_head_refusal(&build, MainAncestry::NotOnMain)
+            .expect("a commit off main must refuse");
+        assert!(off_main.contains("not part of main"), "{off_main}");
+    }
+
+    #[test]
+    fn either_daemon_signal_blocks_touching_production() {
+        let absent = statsai_core::DaemonPresence {
+            launch_agent: statsai_core::LaunchAgentState::NotLoaded,
+            reachable: false,
+        };
+        assert_eq!(daemon_refusal("migrate", absent), None);
+
+        let loaded = daemon_refusal(
+            "migrate",
+            statsai_core::DaemonPresence {
+                launch_agent: statsai_core::LaunchAgentState::Loaded,
+                ..absent
+            },
+        )
+        .expect("a loaded LaunchAgent must refuse");
+        assert!(
+            loaded.contains("refusing to migrate production"),
+            "{loaded}"
+        );
+        assert!(loaded.contains("dev.statsai.daemon"), "{loaded}");
+
+        // Between a KeepAlive daemon's restarts nothing holds the port or the
+        // database, so a LaunchAgent probe that could not answer is all there is.
+        let unknown = daemon_refusal(
+            "migrate",
+            statsai_core::DaemonPresence {
+                launch_agent: statsai_core::LaunchAgentState::Unknown,
+                ..absent
+            },
+        )
+        .expect("an unreadable LaunchAgent must refuse");
+        assert!(unknown.contains("could not be determined"), "{unknown}");
+
+        // A daemon started by hand answers on the port without any LaunchAgent, and
+        // holds exactly the same long-lived connection.
+        let listening = daemon_refusal(
+            "restore",
+            statsai_core::DaemonPresence {
+                reachable: true,
+                ..absent
+            },
+        )
+        .expect("a reachable daemon must refuse");
+        assert!(
+            listening.contains("refusing to restore production"),
+            "{listening}"
+        );
+        assert!(listening.contains("127.0.0.1:8765"), "{listening}");
     }
 
     #[test]

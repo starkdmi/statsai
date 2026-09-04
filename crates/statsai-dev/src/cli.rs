@@ -3,6 +3,7 @@ use crate::state::Environment;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -26,7 +27,7 @@ pub(crate) enum Command {
     Use(UseArgs),
     #[command(about = "Select the local, dev, or prod backend profile")]
     Env(EnvArgs),
-    #[command(about = "Manage the reusable isolated development database")]
+    #[command(about = "Manage the development database and the production one it clones")]
     Data(DataArgs),
     #[command(about = "Show selected build, environment, data, and update status")]
     Status,
@@ -108,6 +109,29 @@ pub(crate) enum DataCommand {
     Refresh,
     #[command(about = "Delete the reusable development database")]
     Clean,
+    #[command(
+        about = "Migrate the production database to a merged-main build, after backing it up"
+    )]
+    UpgradeProd(UpgradeProdArgs),
+    #[command(about = "Restore the production database from a backup taken by upgrade-prod")]
+    RestoreProd(RestoreProdArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct UpgradeProdArgs {
+    #[arg(long, help = "Proceed without the interactive confirmation")]
+    pub(crate) yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RestoreProdArgs {
+    #[arg(
+        value_name = "BACKUP",
+        help = "Backup to restore; defaults to the most recent one"
+    )]
+    pub(crate) backup: Option<PathBuf>,
+    #[arg(long, help = "Proceed without the interactive confirmation")]
+    pub(crate) yes: bool,
 }
 
 #[cfg(test)]

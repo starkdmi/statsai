@@ -15,7 +15,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "macos")]
-const LAUNCH_AGENT_LABEL: &str = "dev.statsai.daemon";
+use statsai_core::{
+    daemon_reachable_at, launch_agent_loaded_in, launch_agent_target, DAEMON_LAUNCH_AGENT_LABEL,
+    DAEMON_LOOPBACK_ADDRESS,
+};
+
+#[cfg(target_os = "macos")]
+const LAUNCH_AGENT_LABEL: &str = DAEMON_LAUNCH_AGENT_LABEL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceAction {
@@ -49,9 +55,9 @@ pub fn background_service_state() -> Result<BackgroundServiceState> {
     let plist_path = launch_agent_path()?;
     let plist_installed = plist_path.exists();
     let domain = gui_domain()?;
-    let launch_agent_loaded = launch_agent_is_loaded(&domain);
-    let daemon_reachable = daemon_reachable("127.0.0.1:8765");
-    let daemon_version = daemon_health("127.0.0.1:8765").and_then(|health| health.version);
+    let launch_agent_loaded = launch_agent_loaded_in(&domain);
+    let daemon_reachable = daemon_reachable_at(DAEMON_LOOPBACK_ADDRESS);
+    let daemon_version = daemon_health(DAEMON_LOOPBACK_ADDRESS).and_then(|health| health.version);
     let stale = daemon_is_stale(
         launch_agent_loaded,
         daemon_reachable,
@@ -186,11 +192,6 @@ fn gui_domain() -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_agent_target(domain: &str) -> String {
-    format!("{domain}/{LAUNCH_AGENT_LABEL}")
-}
-
-#[cfg(target_os = "macos")]
 fn daemon_is_stale(
     launch_agent_loaded: bool,
     daemon_reachable: bool,
@@ -200,17 +201,8 @@ fn daemon_is_stale(
 }
 
 #[cfg(target_os = "macos")]
-fn launch_agent_is_loaded(domain: &str) -> bool {
-    Command::new("launchctl")
-        .args(["print", launch_agent_target(domain).as_str()])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
 fn bootout_launch_agent(domain: &str) -> Result<bool> {
-    if !launch_agent_is_loaded(domain) {
+    if !launch_agent_loaded_in(domain) {
         return Ok(false);
     }
     let target = launch_agent_target(domain);
@@ -252,7 +244,7 @@ fn install_launch_agent() -> Result<()> {
     if !status.success() {
         bail!("launchctl bootstrap failed with status {status}");
     }
-    if !launch_agent_is_loaded(&domain) {
+    if !launch_agent_loaded_in(&domain) {
         bail!("launchctl bootstrap succeeded but {LAUNCH_AGENT_LABEL} is not loaded");
     }
 
@@ -319,25 +311,9 @@ fn daemon_health(api: &str) -> Option<DaemonHealth> {
         .ok()
 }
 
-#[cfg(target_os = "macos")]
-fn daemon_reachable(api: &str) -> bool {
-    use std::net::{SocketAddr, TcpStream};
-    use std::time::Duration;
-
-    let Ok(addr) = api.parse::<SocketAddr>() else {
-        return false;
-    };
-    TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok()
-}
-
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn launch_agent_target_combines_domain_and_label() {
-        assert_eq!(launch_agent_target("gui/501"), "gui/501/dev.statsai.daemon");
-    }
 
     #[test]
     fn loaded_legacy_daemon_without_version_is_stale() {

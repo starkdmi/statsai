@@ -230,6 +230,8 @@ pub(crate) enum StoreAdminSubcommand {
     SupportedSchemaVersion,
     #[command(about = "Print the pricing ruleset version supported by this binary")]
     SupportedPricingRulesetVersion,
+    #[command(about = "Migrate the store to this binary's schema and apply its pricing ruleset")]
+    Migrate,
 }
 
 #[derive(Debug, Subcommand)]

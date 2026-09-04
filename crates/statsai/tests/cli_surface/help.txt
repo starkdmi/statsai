@@ -1015,6 +1015,7 @@ Commands:
   clone-to                           Create a consistent APFS clone of the SQLite store
   supported-schema-version           Print the store schema version supported by this binary
   supported-pricing-ruleset-version  Print the pricing ruleset version supported by this binary
+  migrate                            Migrate the store to this binary's schema and apply its pricing ruleset
   help                               Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1046,6 +1047,15 @@ Options:
 Print the pricing ruleset version supported by this binary
 
 Usage: statsai store supported-pricing-ruleset-version [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai store migrate --help =====
+Migrate the store to this binary's schema and apply its pricing ruleset
+
+Usage: statsai store migrate [OPTIONS]
 
 Options:
       --store <STORE>          Path to SQLite store

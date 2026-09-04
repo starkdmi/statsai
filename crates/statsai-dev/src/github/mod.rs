@@ -102,6 +102,28 @@ impl BuildLookup {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MainAncestry {
+    /// The commit *is* main's head, so its code is what main ships right now.
+    IsMainHead,
+    /// The commit is contained in main but is not its head. Its code was once what
+    /// main shipped, which is not the same claim: a later commit can revert it.
+    BehindMain,
+    /// The commit is ahead of main or on a branch that diverged from it.
+    NotOnMain,
+}
+
+/// GitHub answers `compare/main...<sha>` from the *head's* point of view, so a
+/// commit already contained in main reads as "behind" it, and one that is main
+/// reads as "identical". Anything else ("ahead", "diverged") is a branch.
+fn classify_main_ancestry(status: &str) -> MainAncestry {
+    match status {
+        "identical" => MainAncestry::IsMainHead,
+        "behind" => MainAncestry::BehindMain,
+        _ => MainAncestry::NotOnMain,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RetryAdvice {
     pub(crate) delay: Option<Duration>,
 }
@@ -195,6 +217,29 @@ impl GitHubClient {
             &format!("resolve PR #{number} HEAD"),
         )?;
         Ok(response.head.sha)
+    }
+
+    /// Reports how `sha` stands to main: its head, behind it, or off it entirely.
+    ///
+    /// This is the question that separates a schema which will ship from one that
+    /// may not. Being contained in main is not enough on its own -- a migration can
+    /// be reverted by a later commit, and the reverted commit stays an ancestor
+    /// forever -- so callers that stamp production insist on main's head.
+    pub(crate) fn main_ancestry(&self, sha: &str) -> Result<MainAncestry> {
+        #[derive(Deserialize)]
+        struct CompareResponse {
+            status: String,
+        }
+
+        validate_full_sha(sha)?;
+        let response: CompareResponse = self.get_json(
+            self.request(&format!(
+                "{}/repos/{}/compare/main...{sha}",
+                self.api_base, self.repository
+            )),
+            &format!("check whether {sha} is merged into main"),
+        )?;
+        Ok(classify_main_ancestry(&response.status))
     }
 
     pub(crate) fn lookup_build(&self, sha: &str) -> Result<BuildLookup> {
