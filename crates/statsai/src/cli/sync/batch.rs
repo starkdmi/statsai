@@ -113,7 +113,7 @@ pub(crate) fn build_sync_batch_with_identity_key(
     let all_subscriptions: Vec<_> = store
         .list_subscriptions()?
         .into_iter()
-        .filter(|subscription| subscription.record_source != IdentitySource::LocalAuth)
+        .filter(is_syncable_subscription)
         .map(sanitize_subscription_for_sync)
         .collect();
     let all_account_plan_observations = store.account_plan_projections(device_id)?;
@@ -803,4 +803,13 @@ pub(crate) fn is_http_rollup_passthrough_summary(summary: &UsageSummary) -> bool
 pub(crate) fn sanitize_subscription_for_sync(mut subscription: Subscription) -> Subscription {
     subscription.notes = None;
     subscription
+}
+
+/// Local-auth subscriptions are evidence this device derived for itself and are
+/// never uploaded, so every count that is compared against the remote mirror has
+/// to drop them the same way the batch does. Counting them as pending would keep
+/// the subscription mirror check permanently disabled; counting them in the total
+/// would report a gap the remote can never close.
+pub(crate) fn is_syncable_subscription(subscription: &Subscription) -> bool {
+    subscription.record_source != IdentitySource::LocalAuth
 }

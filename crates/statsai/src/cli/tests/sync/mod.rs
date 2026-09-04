@@ -619,3 +619,109 @@ fn sync_local_verify_respects_project_sync_opt_in() {
     assert_eq!(hidden.pending_rollups, 0);
     assert_eq!(opted_in.pending_rollups, 1);
 }
+
+#[test]
+fn local_auth_subscriptions_do_not_disable_the_subscription_mirror_check() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-verify-local-auth-subscription"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+
+    let account = ProviderAccount {
+        schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+        provider_account_id: provider_account_id("codex", "personal"),
+        provider: "codex".to_string(),
+        identity_source: IdentitySource::ManualHint,
+        provider_user_id: None,
+        provider_user_id_hash: None,
+        email: None,
+        email_hash: None,
+        org_id_hash: None,
+        account_label: Some("personal".to_string()),
+        plan_name: Some("Pro".to_string()),
+        confidence: Confidence::High,
+        verified_at: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    store.upsert_account(&account).expect("account");
+
+    let started_at = Utc::now();
+    let subscription = |plan: &str, record_source: IdentitySource| Subscription {
+        schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+        subscription_id: subscription_id("codex", &account.provider_account_id, plan, started_at),
+        provider: "codex".to_string(),
+        provider_account_id: account.provider_account_id.clone(),
+        plan_name: plan.to_string(),
+        price: 2000,
+        currency: "USD".to_string(),
+        billing_period: BillingPeriod::Monthly,
+        paid_at: None,
+        renewal_day: None,
+        started_at,
+        ended_at: None,
+        current_period_ends_at: None,
+        status: SubscriptionStatus::Active,
+        record_source,
+        verified_at: None,
+        notes: None,
+    };
+    let synced = subscription("Pro", IdentitySource::UserConfigured);
+    let local_auth = subscription("Max", IdentitySource::LocalAuth);
+    store.upsert_subscription(&synced).expect("subscription");
+    store
+        .upsert_subscription(&local_auth)
+        .expect("local-auth subscription");
+
+    let target = "https://api.example.com/api/sync/batches".to_string();
+    store
+        .record_sources_synced("http", &target, &[sanitize_source_for_sync(source.clone())])
+        .expect("record sources");
+    store
+        .record_accounts_synced(
+            "http",
+            &target,
+            &[sanitize_account_for_sync(account.clone())],
+        )
+        .expect("record accounts");
+    store
+        .record_subscriptions_synced(
+            "http",
+            &target,
+            &[sanitize_subscription_for_sync(synced.clone())],
+        )
+        .expect("record subscriptions");
+
+    // The local-auth row is never uploaded, so it must not appear in either count:
+    // as pending it would suppress the mirror check, and in the total it would
+    // report a gap the remote can never close.
+    let local = sync_local_verify(&store, "http", &target, None, false).expect("local verify");
+    assert_eq!(local.total_subscriptions, 1);
+    assert_eq!(local.pending_subscriptions, 0);
+
+    let mirror_counts = |subscriptions: u64| {
+        json!({
+            "mirrorCounts": {
+                "sources": 1,
+                "accounts": 1,
+                "source_account_assignments": 0,
+                "subscriptions": subscriptions
+            }
+        })
+    };
+    assert_eq!(
+        remote_metadata_gap_reason(&mirror_counts(1), &local),
+        None,
+        "a mirror holding every uploaded subscription must not report a gap"
+    );
+    assert_eq!(
+        remote_metadata_gap_reason(&mirror_counts(0), &local).as_deref(),
+        Some("subscriptions 0!=1"),
+        "a mirror that lost the uploaded subscription must still be detected"
+    );
+}

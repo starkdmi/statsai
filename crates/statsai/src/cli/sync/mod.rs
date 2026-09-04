@@ -510,7 +510,11 @@ pub(crate) fn sync_local_verify(
     let all_sources = store.list_sources()?;
     let all_accounts = store.list_accounts()?;
     let all_source_account_assignments = store.list_source_account_assignments()?;
-    let all_subscriptions = store.list_subscriptions()?;
+    let all_subscriptions: Vec<_> = store
+        .list_subscriptions()?
+        .into_iter()
+        .filter(is_syncable_subscription)
+        .collect();
     let sync_sources: Vec<_> = all_sources
         .iter()
         .cloned()
