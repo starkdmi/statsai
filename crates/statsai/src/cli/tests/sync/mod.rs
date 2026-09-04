@@ -724,4 +724,31 @@ fn local_auth_subscriptions_do_not_disable_the_subscription_mirror_check() {
         Some("subscriptions 0!=1"),
         "a mirror that lost the uploaded subscription must still be detected"
     );
+
+    // Promotion to local-auth retires an already-uploaded row. The remote keeps
+    // it until the next authoritative snapshot says otherwise, so this must stay
+    // syncable incrementally rather than demanding --full.
+    let promoted = subscription("Pro", IdentitySource::LocalAuth);
+    assert_eq!(promoted.subscription_id, synced.subscription_id);
+    store.upsert_subscription(&promoted).expect("promotion");
+
+    let retiring = sync_local_verify(&store, "http", &target, None, false).expect("local verify");
+    assert_eq!(retiring.total_subscriptions, 0);
+    assert_eq!(retiring.pending_subscriptions, 0);
+    assert_eq!(retiring.retired_subscriptions, 1);
+    assert_eq!(
+        remote_metadata_gap_reason(&mirror_counts(1), &retiring),
+        None,
+        "a mirror still holding a row awaiting retirement is not a gap"
+    );
+    assert_eq!(
+        remote_metadata_gap_reason(&mirror_counts(0), &retiring),
+        None,
+        "a mirror that already dropped the retiring row reaches the same end state"
+    );
+    assert_eq!(
+        remote_metadata_gap_reason(&mirror_counts(2), &retiring).as_deref(),
+        Some("subscriptions 2!=0..1"),
+        "rows beyond the retirement allowance are still reported"
+    );
 }

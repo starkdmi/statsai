@@ -308,6 +308,37 @@ impl Store {
             .collect())
     }
 
+    /// Counts tracked entities of one kind that this device no longer syncs.
+    ///
+    /// The remote mirror legitimately still holds these rows: they were uploaded
+    /// and acknowledged, and only the next authoritative snapshot retires them.
+    /// Anything comparing local counts against mirror counts has to allow for
+    /// them, or a pending retirement reads as a mirror that lost data.
+    pub fn retired_sync_entity_count(
+        &self,
+        sink: &str,
+        target: &str,
+        entity_kind: &str,
+        current_ids: &BTreeSet<&str>,
+    ) -> Result<usize> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT entity_id
+            FROM entity_sync_state
+            WHERE sink = ?1 AND target = ?2 AND entity_kind = ?3
+            "#,
+        )?;
+        let retired = statement
+            .query_map(params![sink, target, entity_kind], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|entity_id| !current_ids.contains(entity_id.as_str()))
+            .count();
+        Ok(retired)
+    }
+
     pub fn pending_http_sync_rollup_summaries(&self, target: &str) -> Result<Vec<UsageSummary>> {
         self.pending_http_sync_rollup_summaries_with_projects(target, false)
     }
