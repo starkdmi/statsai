@@ -206,6 +206,39 @@ statsai source list
 OpenCode and Grok Build also support `OPENCODE_DATA_DIRS`,
 `GROK_DATA_DIRS`, and `GROK_HOME` for automation.
 
+### Cursor: manual CSV import
+
+Cursor keeps no local usage detail, so it is imported from the dashboard's CSV
+export instead of being scanned. Pick a date range on
+[the usage page](https://cursor.com/dashboard/usage), click Export, then:
+
+```sh
+statsai import cursor --path ~/Downloads/usage-events-2026-09-05.csv
+```
+
+`--path` is repeatable and accepts a directory of exports. Re-importing is
+safe in any order: overlapping ranges converge rather than double-counting, so
+a 30-day export and a 7-day one can be imported either way round.
+
+Choose the widest range the dashboard offers rather than a single day. Cursor
+anchors each row to the moment a session first used a model, so a narrow window
+omits sessions that started earlier and were still running.
+
+Two things to know about the numbers:
+
+- **Days are attributed to the session that started them.** A session opening
+  at 23:50 and running until 04:00 lands entirely on the earlier day. Nothing
+  in the export allows splitting it, so Cursor daily figures are not directly
+  comparable to the per-request daily figures from other providers.
+- **Costs are API-equivalent estimates**, not charges, except on usage-based
+  rows where Cursor reports a real amount. Cursor-internal models
+  (`grok-bot-*`, `github_bugbot`, `auto`) have no published price, so their
+  tokens are counted with no cost attached. `--verbose` lists them.
+
+Estimates are also a floor rather than a midpoint: a Cursor row accumulates a
+whole session, so its prompt size is unknowable, and the large-prompt rates
+that xAI and OpenAI charge above their context thresholds are never applied.
+
 ## Go beyond token totals
 
 ### Connect accounts and subscriptions

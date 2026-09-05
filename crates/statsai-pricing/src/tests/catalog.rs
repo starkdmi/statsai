@@ -66,3 +66,17 @@ fn gpt_5_6_luna_and_terra_report_aggregate_periods_that_cross_the_july_30_cut() 
     assert!(!pricing_changes_between("gpt-5.6-terra", boundary, after));
     assert!(!pricing_changes_between("gpt-5.6-sol", before, after));
 }
+
+#[test]
+fn gpt_5_6_sol_reports_aggregate_periods_that_cross_its_promotional_cut() {
+    let before = chrono::NaiveDate::from_ymd_opt(2026, 8, 20).expect("before boundary");
+    let boundary = chrono::NaiveDate::from_ymd_opt(2026, 8, 21).expect("boundary");
+    let after = chrono::NaiveDate::from_ymd_opt(2026, 8, 22).expect("after boundary");
+
+    assert!(pricing_changes_between("gpt-5.6-sol", before, boundary));
+    assert!(pricing_changes_between("openai/gpt-5.6-sol", after, before));
+    assert!(!pricing_changes_between("gpt-5.6-sol", boundary, after));
+    // Sol's promotion is its own boundary, not the July cut the others share.
+    assert!(!pricing_changes_between("gpt-5.6-luna", before, after));
+    assert!(!pricing_changes_between("gpt-5.6-terra", before, after));
+}

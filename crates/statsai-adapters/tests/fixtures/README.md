@@ -12,6 +12,11 @@ JSON shapes, and SQLite table layouts are retained.
 `opencode/sqlite-v1` is the supported aggregate-session shape; `sqlite-v2`
 uses the current local session/message/part/todo schemas with sanitized rows.
 
+`cursor/` is the exception: those CSVs are hand-authored rather than derived
+from a local store, because Cursor keeps no local usage trace. They reproduce
+the dashboard export's header, quoting, and enum values, and every value in
+them is invented — including the token counts, which elsewhere are real.
+
 Rerun from this directory:
 
 ```sh

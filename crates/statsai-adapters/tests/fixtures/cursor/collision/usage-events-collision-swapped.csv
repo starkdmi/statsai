@@ -1,0 +1,4 @@
+Date,Cloud Agent ID,Automation ID,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
+"2026-01-08T14:00:00.123Z","bc-fixture-0030","au-fixture-0002","Included","cursor-grok-4.6-medium","No","200","400","600","800","2000","Included"
+"2026-01-08T14:00:00.123Z","bc-fixture-0030","au-fixture-0002","Included","cursor-grok-4.6-medium","No","1000","2000","3000","4000","10000","Included"
+"2026-01-08T13:00:00.000Z","bc-fixture-0031","","Included","cursor-grok-4.6-high","No","100","200","300","400","1000","Included"

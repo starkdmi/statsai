@@ -13,6 +13,10 @@ pub struct ModelPricing {
 
 const CLAUDE_SONNET_5_STANDARD_PRICING_START: (i32, u32, u32) = (2026, 9, 1);
 const GPT_5_6_LUNA_TERRA_PRICE_CUT_START: (i32, u32, u32) = (2026, 7, 30);
+/// Promotional, announced to hold at least through 2026-11-21. When it lapses,
+/// add an end date here rather than reverting: usage priced under the promotion
+/// must keep its rate.
+const GPT_5_6_SOL_PROMO_START: (i32, u32, u32) = (2026, 8, 21);
 
 fn pricing(
     input_per_million: f64,
@@ -58,6 +62,13 @@ pub(crate) fn pricing_for_effective_speed(
         "claude-opus-4-6" | "claude-opus-4-7" => {
             pricing_with_cache_creation(30.0, 37.5, 3.0, 150.0)
         }
+        // Cursor's fast tier for Grok 4.6 is a flat 2x on input, cached input, and output.
+        "grok-4.6" => pricing(4.0, 1.0, 12.0),
+        // Grok 4.5 fast doubles input and cached input but triples output.
+        // Applied as multipliers against the standard rates above rather than as
+        // absolutes: xAI documents 4.5 cached input at $0.30/M, not 4.6's $0.50/M
+        // (https://docs.x.ai/developers/models/grok-4.5), so 2x lands at $0.60/M.
+        "grok-4.5" => pricing(4.0, 0.6, 18.0),
         _ => return (standard, false),
     };
     (fast, true)
@@ -99,6 +110,14 @@ fn gpt_5_6_luna_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
     }
 }
 
+fn gpt_5_6_sol_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
+    if date_tuple(usage_date) >= GPT_5_6_SOL_PROMO_START {
+        pricing_with_cache_creation(4.0, 5.0, 0.4, 20.0)
+    } else {
+        pricing_with_cache_creation(5.0, 6.25, 0.5, 30.0)
+    }
+}
+
 fn gpt_5_6_terra_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
     if date_tuple(usage_date) >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START {
         pricing_with_cache_creation(2.0, 2.5, 0.2, 12.0)
@@ -116,6 +135,8 @@ pub(crate) fn pricing_for_model_on(
         return pricing_for_model_on(mapped, usage_date);
     }
     match normalized.as_str() {
+        // Fable 5.1 matches Fable 5 except for cache reads, which dropped to $0.25/M.
+        "claude-fable-5-1" => Some(pricing_with_cache_creation(10.0, 12.5, 0.25, 50.0)),
         "claude-fable-5" | "claude-mythos-5" => {
             Some(pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0))
         }
@@ -138,8 +159,12 @@ pub(crate) fn pricing_for_model_on(
             Some(pricing_with_cache_creation(3.0, 3.75, 0.3, 15.0))
         }
         "claude-haiku-4-5" => Some(pricing_with_cache_creation(1.0, 1.25, 0.1, 5.0)),
+        // The default rate, covering the 272k context window Codex runs by
+        // default. A larger prompt reprices the whole request at 20/25/2/75,
+        // applied by `pricing_multipliers` where a record is one known request.
+        "gpt-6-astra" => Some(pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0)),
         // GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount.
-        "gpt-5.6-sol" => Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 30.0)),
+        "gpt-5.6-sol" => Some(gpt_5_6_sol_pricing(usage_date)),
         "gpt-5.6-terra" => Some(gpt_5_6_terra_pricing(usage_date)),
         "gpt-5.6-luna" => Some(gpt_5_6_luna_pricing(usage_date)),
         "gpt-5.5" => Some(pricing(5.0, 0.5, 30.0)),
@@ -198,6 +223,7 @@ pub fn pricing_changes_between(
         "gpt-5.6-luna" | "gpt-5.6-terra" | "codex-auto-review" => {
             start < GPT_5_6_LUNA_TERRA_PRICE_CUT_START && end >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START
         }
+        "gpt-5.6-sol" => start < GPT_5_6_SOL_PROMO_START && end >= GPT_5_6_SOL_PROMO_START,
         _ => false,
     }
 }
@@ -206,10 +232,15 @@ pub(crate) fn priced_model_name(
     model: &ModelInfo,
     usage_date: chrono::NaiveDate,
 ) -> Option<String> {
+    // The observed name comes first because `normalized_name` only caches a
+    // derivation of it. That cache is written once at scan time and goes stale
+    // whenever the normalizer learns a name it used to fold into a coarser one,
+    // and a stale cache that still resolves to a priced model would otherwise
+    // shadow the correct match forever.
     let candidates = [
-        model.normalized_name.as_deref(),
         model.name.as_deref(),
         model.provider_model_id.as_deref(),
+        model.normalized_name.as_deref(),
     ];
 
     for candidate in candidates.into_iter().flatten() {

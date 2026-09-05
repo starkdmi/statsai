@@ -157,7 +157,7 @@ fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (i128, i128) {
         .saturating_add(usage.cache_read_tokens.unwrap_or(0));
     let is_openai_long_context_model = matches!(
         model_name,
-        "gpt-5.4" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+        "gpt-5.4" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-astra"
     );
     let is_xai_long_context_model = matches!(
         model_name,

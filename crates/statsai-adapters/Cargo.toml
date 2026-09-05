@@ -19,6 +19,7 @@ statsai-pricing.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true
+csv.workspace = true
 rusqlite.workspace = true
 regex.workspace = true
 serde.workspace = true

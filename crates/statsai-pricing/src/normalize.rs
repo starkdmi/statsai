@@ -1,4 +1,38 @@
+use statsai_core::ModelInfo;
+
+/// Maps Cursor's reversed `claude-<version>-<family>` names onto catalog names.
+///
+/// Cursor writes `claude-4.5-sonnet` where every other surface writes
+/// `claude-sonnet-4-5`, so the substring table below never matches it.
+fn normalize_reversed_claude_model_name(lower: &str) -> Option<&'static str> {
+    let rest = lower.strip_prefix("claude-")?;
+    let (version, family) = rest.split_once('-')?;
+    let family = family.split('-').next()?;
+    Some(match (family, version) {
+        ("opus", "5") => "claude-opus-5",
+        ("opus", "4.8") => "claude-opus-4-8",
+        ("opus", "4.7") => "claude-opus-4-7",
+        ("opus", "4.6") => "claude-opus-4-6",
+        ("opus", "4.5") => "claude-opus-4-5",
+        ("opus", "4.1") => "claude-opus-4-1",
+        ("opus", "4") => "claude-opus-4",
+        ("sonnet", "5") => "claude-sonnet-5",
+        ("sonnet", "4.6") => "claude-sonnet-4-6",
+        ("sonnet", "4.5") => "claude-sonnet-4-5",
+        ("sonnet", "4") => "claude-sonnet-4",
+        ("sonnet", "3.7") => "claude-sonnet-3-7",
+        ("sonnet", "3.5") => "claude-sonnet-3-5",
+        ("haiku", "4.5") => "claude-haiku-4-5",
+        ("haiku", "3.5") => "claude-haiku-3-5",
+        _ => return None,
+    })
+}
+
 fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
+    // Must precede the `claude-fable-5` test, which would otherwise swallow every 5.1 name.
+    if lower.contains("claude-fable-5-1") || lower.contains("claude-fable-5.1") {
+        return Some("claude-fable-5-1");
+    }
     if lower.contains("claude-fable-5") {
         return Some("claude-fable-5");
     }
@@ -49,6 +83,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     }
     if lower.contains("claude-haiku-3-5") || lower.contains("claude-haiku-3.5") {
         return Some("claude-haiku-3-5");
+    }
+    if lower.contains("gpt-6-astra") {
+        return Some("gpt-6-astra");
     }
     if lower.contains("gpt-5.6-sol") {
         return Some("gpt-5.6-sol");
@@ -134,6 +171,43 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     None
 }
 
+/// Recomputes a model's `normalized_name` from its observed name.
+///
+/// `normalized_name` is a cache of a derivation, written once when an event is
+/// scanned. It goes stale whenever the normalizer learns a name it previously
+/// folded into a coarser one - `claude-fable-5-1-thinking-max` resolved to
+/// `claude-fable-5` before Fable 5.1 had its own entry - which then misprices
+/// and misgroups every already-stored event. Refresh it when repricing.
+///
+/// Returns the model unchanged when it carries no observed name to derive from.
+#[must_use]
+pub fn model_with_refreshed_normalization(model: &ModelInfo) -> ModelInfo {
+    let Some(observed) = model.name.as_deref().or(model.provider_model_id.as_deref()) else {
+        return model.clone();
+    };
+    ModelInfo {
+        normalized_name: Some(normalize_qualified_model_name(observed)),
+        ..model.clone()
+    }
+}
+
+/// Normalizes a possibly provider-qualified label such as `google/gemini-3.1-pro`.
+///
+/// The provider segment is dropped unconditionally, including for models with
+/// no catalog price. Gating this on pricing would make the same model normalize
+/// two different ways depending on whether it happened to be priced, splitting
+/// its history into separate groups the moment either side changed.
+///
+/// This is the definition adapters use when they first record a model, so that
+/// refreshing a stored `normalized_name` cannot drift from a fresh scan.
+#[must_use]
+pub fn normalize_qualified_model_name(label: &str) -> String {
+    label.rsplit_once('/').map_or_else(
+        || normalize_model_name(label),
+        |(_, model)| normalize_model_name(model),
+    )
+}
+
 #[must_use]
 pub fn normalize_model_name(name: &str) -> String {
     let name = name.trim();
@@ -145,6 +219,7 @@ pub fn normalize_model_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
 
     match lower.as_str() {
+        "claude-fable-5-1" | "claude-fable-5.1" => "claude-fable-5-1".to_string(),
         "claude-fable-5" => "claude-fable-5".to_string(),
         "claude-mythos-5" => "claude-mythos-5".to_string(),
         "claude-opus-5" | "claude-opus-5-thinking" => "claude-opus-5".to_string(),
@@ -182,6 +257,7 @@ pub fn normalize_model_name(name: &str) -> String {
         "codex-auto-review" => "codex-auto-review".to_string(),
         "gpt-5.4" => "gpt-5.4".to_string(),
         "gpt-5.4-mini" => "gpt-5.4-mini".to_string(),
+        "gpt-6-astra" | "gpt-6-astra-codex" => "gpt-6-astra".to_string(),
         "gpt-5.6-sol" => "gpt-5.6-sol".to_string(),
         "gpt-5.6-terra" => "gpt-5.6-terra".to_string(),
         "gpt-5.6-luna" => "gpt-5.6-luna".to_string(),
@@ -198,6 +274,7 @@ pub fn normalize_model_name(name: &str) -> String {
         "grok-4.20-0309-reasoning" => "grok-4.20-0309-reasoning".to_string(),
         "grok-4.20-0309-non-reasoning" => "grok-4.20-0309-non-reasoning".to_string(),
         _ => normalize_proxy_wrapped_model_name(&lower)
+            .or_else(|| normalize_reversed_claude_model_name(&lower))
             .map(ToString::to_string)
             .unwrap_or_else(|| name.to_ascii_lowercase()),
     }

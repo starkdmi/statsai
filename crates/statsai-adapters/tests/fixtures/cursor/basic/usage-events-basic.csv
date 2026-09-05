@@ -1,0 +1,7 @@
+Date,Cloud Agent ID,Automation ID,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
+"2026-01-05T10:30:00.000Z","bc-fixture-0001","","Included","cursor-grok-4.6-high-fast","No","1000","2000","3000","4000","10000","Included"
+"2026-01-05T10:20:00.000Z","bc-fixture-0001","","Included","cursor-grok-4.6-high","No","1000","2000","3000","4000","10000","Included"
+"2026-01-05T09:15:00.000Z","bc-fixture-0002","au-fixture-0001","Included","grok-bot-automation","No","500","1500","2500","3500","8000","Included"
+"2026-01-04T18:45:00.000Z","","","Included","claude-4.5-sonnet","No","100","200","300","400","1000","Included"
+"2026-01-04T17:05:00.000Z","","","Included","claude-fable-5-1-thinking-max","Yes","0","1000","9000","500","10500","Included"
+"2026-01-04T08:00:00.000Z","","","Included","gemini-3.1-pro","No","0","600","0","400","1000","Free"
