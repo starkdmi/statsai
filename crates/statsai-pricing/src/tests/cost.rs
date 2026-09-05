@@ -225,6 +225,273 @@ fn historical_claude_fast_mode_uses_the_six_times_opus_rate() {
 }
 
 #[test]
+fn cursor_grok_fast_mode_doubles_every_rate() {
+    let standard_model = statsai_core::ModelInfo {
+        name: Some("cursor-grok-4.6-high".to_string()),
+        normalized_name: Some("grok-4.6".to_string()),
+        provider_model_id: Some("cursor-grok-4.6-high".to_string()),
+        speed: Some("standard".to_string()),
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+    let fast_model = statsai_core::ModelInfo {
+        name: Some("cursor-grok-4.6-high-fast".to_string()),
+        provider_model_id: Some("cursor-grok-4.6-high-fast".to_string()),
+        speed: Some("fast".to_string()),
+        ..standard_model.clone()
+    };
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+
+    let standard = estimate_cost("cursor", Some(&standard_model), &usage);
+    let fast = estimate_cost("cursor", Some(&fast_model), &usage);
+
+    // 2.00 input + 2.00 cache write + 0.50 cache read + 6.00 output.
+    assert_eq!(
+        standard.estimated_api_equivalent_micro_usd,
+        Some(10_500_000)
+    );
+    assert_eq!(fast.estimated_api_equivalent_micro_usd, Some(21_000_000));
+    assert_eq!(
+        fast.pricing_source.as_deref(),
+        Some("xai_api_pricing:grok-4.6:fast")
+    );
+}
+
+#[test]
+fn cursor_grok_4_5_fast_doubles_input_and_triples_output() {
+    let standard_model = statsai_core::ModelInfo {
+        name: Some("cursor-grok-4.5-high".to_string()),
+        normalized_name: Some("grok-4.5".to_string()),
+        provider_model_id: Some("cursor-grok-4.5-high".to_string()),
+        speed: Some("standard".to_string()),
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+    let fast_model = statsai_core::ModelInfo {
+        name: Some("cursor-grok-4.5-high-fast".to_string()),
+        provider_model_id: Some("cursor-grok-4.5-high-fast".to_string()),
+        speed: Some("fast".to_string()),
+        ..standard_model.clone()
+    };
+    let usage = |input, cached, output| UsageCounts {
+        input_tokens: Some(input),
+        cache_read_tokens: Some(cached),
+        output_tokens: Some(output),
+        ..UsageCounts::default()
+    };
+
+    // Each category is priced on its own so the differing multipliers show.
+    let input_only = usage(1_000_000, 0, 0);
+    let cached_only = usage(0, 1_000_000, 0);
+    let output_only = usage(0, 0, 1_000_000);
+    let rate = |model, usage: &UsageCounts| {
+        estimate_cost("cursor", Some(model), usage)
+            .estimated_api_equivalent_micro_usd
+            .expect("cost")
+    };
+
+    assert_eq!(rate(&standard_model, &input_only), 2_000_000);
+    assert_eq!(rate(&fast_model, &input_only), 4_000_000);
+    // xAI documents 4.5 cached input at $0.30/M, so 2x is $0.60/M, not $1.00/M.
+    assert_eq!(rate(&standard_model, &cached_only), 300_000);
+    assert_eq!(rate(&fast_model, &cached_only), 600_000);
+    assert_eq!(rate(&standard_model, &output_only), 6_000_000);
+    assert_eq!(rate(&fast_model, &output_only), 18_000_000);
+}
+
+#[test]
+fn gpt_5_6_sol_uses_the_promotional_rate_from_its_start_date() {
+    let model = statsai_core::ModelInfo {
+        name: Some("gpt-5.6-sol".to_string()),
+        normalized_name: Some("gpt-5.6-sol".to_string()),
+        provider_model_id: Some("gpt-5.6-sol".to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let on = |timestamp: &str| {
+        let date = chrono::DateTime::parse_from_rfc3339(timestamp)
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        estimate_cost_at("codex", Some(&model), &usage, &date)
+            .estimated_api_equivalent_micro_usd
+            .expect("cost")
+    };
+
+    // 5.00 + 6.25 + 0.50 + 30.00 before the cut.
+    assert_eq!(on("2026-08-20T23:59:59Z"), 41_750_000);
+    // 4.00 + 5.00 + 0.40 + 20.00 from 2026-08-21.
+    assert_eq!(on("2026-08-21T00:00:00Z"), 29_400_000);
+    assert_eq!(on("2026-09-05T12:00:00Z"), 29_400_000);
+}
+
+#[test]
+fn fable_5_1_prices_cache_reads_below_fable_5() {
+    let usage = UsageCounts {
+        cache_read_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let model = |name: &str| statsai_core::ModelInfo {
+        name: Some(name.to_string()),
+        normalized_name: Some(normalize_model_name(name)),
+        provider_model_id: Some(name.to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+
+    let fable_5 = estimate_cost("cursor", Some(&model("claude-fable-5")), &usage);
+    let fable_5_1 = estimate_cost("cursor", Some(&model("claude-fable-5-1")), &usage);
+    let cursor_variant = estimate_cost(
+        "cursor",
+        Some(&model("claude-fable-5-1-thinking-max")),
+        &usage,
+    );
+
+    assert_eq!(fable_5.estimated_api_equivalent_micro_usd, Some(1_000_000));
+    assert_eq!(fable_5_1.estimated_api_equivalent_micro_usd, Some(250_000));
+    assert_eq!(
+        cursor_variant.estimated_api_equivalent_micro_usd,
+        Some(250_000)
+    );
+}
+
+#[test]
+fn estimates_cost_for_gpt_6_astra() {
+    let model = statsai_core::ModelInfo {
+        name: Some("gpt-6-astra".to_string()),
+        normalized_name: Some("gpt-6-astra".to_string()),
+        provider_model_id: Some("gpt-6-astra".to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+
+    let cost = estimate_cost("codex", Some(&model), &usage);
+
+    // 10.00 input + 1.00 cached input + 50.00 output.
+    assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(61_000_000));
+}
+
+#[test]
+fn gpt_6_astra_reprices_a_whole_request_above_the_context_threshold() {
+    let model = statsai_core::ModelInfo {
+        name: Some("gpt-6-astra".to_string()),
+        normalized_name: Some("gpt-6-astra".to_string()),
+        provider_model_id: Some("gpt-6-astra".to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+    // Prompt tokens are input + cache write + cache read.
+    let usage = |input| UsageCounts {
+        input_tokens: Some(input),
+        cache_creation_tokens: Some(50_000),
+        cache_read_tokens: Some(50_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+
+    // 200k prompt, default rate: 1.00 + 0.625 + 0.05 + 50.00.
+    let standard = estimate_cost("codex", Some(&model), &usage(100_000));
+    assert_eq!(
+        standard.estimated_api_equivalent_micro_usd,
+        Some(51_675_000)
+    );
+
+    // 400k prompt reprices every token: 6.00 + 1.25 + 0.10 + 75.00.
+    let long_context = estimate_cost("codex", Some(&model), &usage(300_000));
+    assert_eq!(
+        long_context.estimated_api_equivalent_micro_usd,
+        Some(82_350_000)
+    );
+
+    // A Cursor row is a session meter, not one request, so its prompt size is
+    // unknowable and it stays at the default rate: 3.00 + 0.625 + 0.05 + 50.00.
+    let meter = UsageCounts {
+        requests: None,
+        ..usage(300_000)
+    };
+    assert_eq!(
+        estimate_cost("cursor", Some(&model), &meter).estimated_api_equivalent_micro_usd,
+        Some(53_675_000)
+    );
+}
+
+#[test]
+fn cursor_reversed_claude_name_prices_like_the_canonical_name() {
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let model = statsai_core::ModelInfo {
+        name: Some("claude-4.5-sonnet".to_string()),
+        normalized_name: Some(normalize_model_name("claude-4.5-sonnet")),
+        provider_model_id: Some("claude-4.5-sonnet".to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+
+    let cost = estimate_cost("cursor", Some(&model), &usage);
+
+    // 3.00 input + 15.00 output.
+    assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(18_000_000));
+}
+
+#[test]
+fn cursor_internal_bot_models_stay_unpriced() {
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        total_tokens: Some(2_000_000),
+        ..UsageCounts::default()
+    };
+    for name in [
+        "grok-bot-automation",
+        "grok-bot-default",
+        "github_bugbot",
+        "auto",
+    ] {
+        let model = statsai_core::ModelInfo {
+            name: Some(name.to_string()),
+            normalized_name: Some(normalize_model_name(name)),
+            provider_model_id: Some(name.to_string()),
+            speed: None,
+            reasoning_level: None,
+            reasoning_level_raw: None,
+        };
+
+        let cost = estimate_cost("cursor", Some(&model), &usage);
+
+        assert_eq!(cost.estimated_api_equivalent_usd, None, "{name}");
+        assert_eq!(cost.estimated_api_equivalent_micro_usd, None, "{name}");
+        assert_eq!(cost.pricing_source.as_deref(), Some("unknown"), "{name}");
+    }
+}
+
+#[test]
 fn estimates_cost_for_legacy_claude_opus_4() {
     let model = statsai_core::ModelInfo {
         name: Some("claude-opus-4".to_string()),
@@ -1067,5 +1334,31 @@ fn grok_4_6_mixed_requests_sum_short_and_long_context_costs() {
     assert_ne!(
         combined.micro_usd(),
         aggregate.estimated_api_equivalent_micro_usd
+    );
+}
+
+#[test]
+fn a_stale_cached_normalization_does_not_shadow_the_observed_name() {
+    // Stored before Fable 5.1 existed in the catalog, so the cached
+    // normalization points at Fable 5 and its $1.00/M cache-read rate.
+    let stale = statsai_core::ModelInfo {
+        name: Some("claude-fable-5-1-thinking-max".to_string()),
+        normalized_name: Some("claude-fable-5".to_string()),
+        provider_model_id: Some("claude-fable-5-1-thinking-max".to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+    let usage = UsageCounts {
+        cache_read_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+
+    let cost = estimate_cost("cursor", Some(&stale), &usage);
+
+    assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(250_000));
+    assert_eq!(
+        cost.pricing_source.as_deref(),
+        Some("cursor_api_pricing:claude-fable-5-1")
     );
 }

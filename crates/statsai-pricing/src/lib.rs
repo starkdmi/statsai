@@ -14,18 +14,23 @@
 /// Increment this constant on every semantic pricing-rule change so persisted
 /// stores can reprice automatically. The descriptive catalog string is not an
 /// ordering key.
-pub const PRICING_RULESET_VERSION: u64 = 1;
+pub const PRICING_RULESET_VERSION: u64 = 2;
 
 /// Descriptive identifier for the compiled price list. Not an ordering key.
-pub const PRICING_CATALOG_VERSION: &str = "official:2026-08-19";
+pub const PRICING_CATALOG_VERSION: &str = "official:2026-09-05";
 
 mod catalog;
 mod cost;
 mod normalize;
 
 pub use catalog::{pricing_changes_between, pricing_for_model, ModelPricing};
-pub use cost::{estimate_cost, estimate_cost_at, overlay_estimated_cost, unknown_cost};
-pub use normalize::normalize_model_name;
+pub use cost::{
+    estimate_cost, estimate_cost_at, estimate_priced_from_source_records, overlay_estimated_cost,
+    unknown_cost,
+};
+pub use normalize::{
+    model_with_refreshed_normalization, normalize_model_name, normalize_qualified_model_name,
+};
 
 #[cfg(test)]
 mod tests;

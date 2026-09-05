@@ -36,6 +36,7 @@ mod archive;
 mod cache;
 mod claude;
 mod codex;
+mod cursor;
 mod event;
 mod grok;
 mod json;
@@ -85,6 +86,13 @@ pub(crate) use grok::grok_sessions_root;
 pub use grok::GrokBuildAdapter;
 pub(crate) use opencode::opencode_message_usage_counts;
 pub use opencode::OpenCodeAdapter;
+
+// Cursor arrives by explicit CSV import, so it is exported as parse functions
+// rather than as a discoverable adapter.
+pub use cursor::{
+    cursor_csv_paths, cursor_import_source, parse_cursor_usage_csv, unpriced_model_tokens,
+    CursorImportReport, CURSOR_PROVIDER,
+};
 
 pub const CLAUDE_CODE_PROVIDER: &str = "claude_code";
 pub const CODEX_PROVIDER: &str = "codex";

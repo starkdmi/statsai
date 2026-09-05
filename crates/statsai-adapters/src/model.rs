@@ -1,7 +1,7 @@
 use crate::value_as_u64;
 use serde_json::Value;
 use statsai_core::{ModelInfo, ReasoningLevel};
-use statsai_pricing::normalize_model_name;
+use statsai_pricing::{normalize_model_name, normalize_qualified_model_name};
 
 pub(crate) fn model_from_nested_value(value: &Value, fallback: Option<&str>) -> Option<ModelInfo> {
     let model = [
@@ -166,13 +166,6 @@ pub(crate) fn opencode_model_info(value: &str) -> Option<ModelInfo> {
     ))
 }
 
-pub(crate) fn normalize_provider_qualified_model_name(label: &str) -> String {
-    label
-        .rsplit_once('/')
-        .map(|(_, model)| normalize_model_name(model))
-        .unwrap_or_else(|| normalize_model_name(label))
-}
-
 pub(crate) fn opencode_model_info_from_value(value: &Value) -> Option<ModelInfo> {
     let label = opencode_model_label_from_value(value)?;
     let reasoning = opencode_reasoning_state_from_value(value);
@@ -182,7 +175,7 @@ pub(crate) fn opencode_model_info_from_value(value: &Value) -> Option<ModelInfo>
 pub(crate) fn opencode_named_model_info(label: &str, reasoning: &ModelReasoningState) -> ModelInfo {
     ModelInfo {
         name: Some(label.to_string()),
-        normalized_name: Some(normalize_provider_qualified_model_name(label)),
+        normalized_name: Some(normalize_qualified_model_name(label)),
         provider_model_id: Some(label.to_string()),
         speed: None,
         reasoning_level: reasoning.level,

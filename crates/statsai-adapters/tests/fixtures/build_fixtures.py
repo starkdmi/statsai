@@ -736,6 +736,88 @@ def build_grok(root: Path, output: Path, sanitizer: Sanitizer, sources: set[Path
     return {"basic": counts}
 
 
+CURSOR_CSV_HEADER = (
+    "Date,Cloud Agent ID,Automation ID,Kind,Model,Max Mode,"
+    "Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,"
+    "Output Tokens,Total Tokens,Cost"
+)
+
+# Cursor keeps no local usage trace, so these are authored rather than derived:
+# every value is invented, including the token counts. They reproduce the
+# dashboard export's header, quoting, and enum vocabulary.
+CURSOR_FIXTURES: dict[str, str] = {
+    "cursor/basic/usage-events-basic.csv": CURSOR_CSV_HEADER + """
+"2026-01-05T10:30:00.000Z","bc-fixture-0001","","Included","cursor-grok-4.6-high-fast","No","1000","2000","3000","4000","10000","Included"
+"2026-01-05T10:20:00.000Z","bc-fixture-0001","","Included","cursor-grok-4.6-high","No","1000","2000","3000","4000","10000","Included"
+"2026-01-05T09:15:00.000Z","bc-fixture-0002","au-fixture-0001","Included","grok-bot-automation","No","500","1500","2500","3500","8000","Included"
+"2026-01-04T18:45:00.000Z","","","Included","claude-4.5-sonnet","No","100","200","300","400","1000","Included"
+"2026-01-04T17:05:00.000Z","","","Included","claude-fable-5-1-thinking-max","Yes","0","1000","9000","500","10500","Included"
+"2026-01-04T08:00:00.000Z","","","Included","gemini-3.1-pro","No","0","600","0","400","1000","Free"
+""",
+    # Usage-based rows past the monthly quota carry a real charge. No export
+    # available today contains one, so the case exists only here.
+    "cursor/usage-based/usage-events-charged.csv": CURSOR_CSV_HEADER + """
+"2026-01-06T12:00:00.000Z","bc-fixture-0010","","Usage-based","cursor-grok-4.6-high","No","1000","2000","3000","4000","10000","$0.1234"
+"2026-01-06T11:30:00.000Z","","","Usage-based","claude-4.5-sonnet","No","100","200","300","400","1000","2.50"
+"2026-01-06T11:00:00.000Z","","","Included","cursor-grok-4.6-medium","No","100","200","300","400","1000","Included"
+"2026-01-06T10:30:00.000Z","","","Free","cursor-grok-4.6-low","No","100","200","300","400","1000","Free"
+"2026-01-06T10:00:00.000Z","","","Trial","cursor-grok-4.5-high","No","100","200","300","400","1000","Promotional"
+""",
+    # Two exports of overlapping ranges: the grok row grew between them, and
+    # the later export adds a row the earlier one predates.
+    "cursor/snapshots/export-early.csv": CURSOR_CSV_HEADER + """
+"2026-01-07T09:00:00.000Z","bc-fixture-0020","","Included","cursor-grok-4.6-high","No","1000","2000","3000","4000","10000","Included"
+"2026-01-06T20:00:00.000Z","bc-fixture-0021","","Included","composer-2.5-fast","No","500","500","1000","1000","3000","Included"
+""",
+    "cursor/snapshots/export-late.csv": CURSOR_CSV_HEADER + """
+"2026-01-07T11:00:00.000Z","bc-fixture-0022","","Included","cursor-grok-4.6-medium","No","100","200","300","400","1000","Included"
+"2026-01-07T09:00:00.000Z","bc-fixture-0020","","Included","cursor-grok-4.6-high","No","4000","8000","12000","16000","40000","Included"
+"2026-01-06T20:00:00.000Z","bc-fixture-0021","","Included","composer-2.5-fast","No","500","500","1000","1000","3000","Included"
+""",
+    # Two rows sharing every immutable field, differing only in tokens, in both
+    # orders: Cursor does not keep such a pair in a stable order across exports.
+    "cursor/collision/usage-events-collision.csv": CURSOR_CSV_HEADER + """
+"2026-01-08T14:00:00.123Z","bc-fixture-0030","au-fixture-0002","Included","cursor-grok-4.6-medium","No","1000","2000","3000","4000","10000","Included"
+"2026-01-08T14:00:00.123Z","bc-fixture-0030","au-fixture-0002","Included","cursor-grok-4.6-medium","No","200","400","600","800","2000","Included"
+"2026-01-08T13:00:00.000Z","bc-fixture-0031","","Included","cursor-grok-4.6-high","No","100","200","300","400","1000","Included"
+""",
+    "cursor/collision/usage-events-collision-swapped.csv": CURSOR_CSV_HEADER + """
+"2026-01-08T14:00:00.123Z","bc-fixture-0030","au-fixture-0002","Included","cursor-grok-4.6-medium","No","200","400","600","800","2000","Included"
+"2026-01-08T14:00:00.123Z","bc-fixture-0030","au-fixture-0002","Included","cursor-grok-4.6-medium","No","1000","2000","3000","4000","10000","Included"
+"2026-01-08T13:00:00.000Z","bc-fixture-0031","","Included","cursor-grok-4.6-high","No","100","200","300","400","1000","Included"
+""",
+    # Blank numeric cells occur in real exports; the rest is deliberate.
+    "cursor/malformed/usage-events-malformed.csv": CURSOR_CSV_HEADER + ",Experimental Column" + """
+"2026-01-09T10:00:00.000Z","bc-fixture-0040","","Included","cursor-grok-4.6-high","No","1000","2000","3000","4000","10000","Included","future"
+"2026-01-09T09:00:00.000Z","","","Included","cursor-grok-4.6-medium","No","","","","","","Included","future"
+"not-a-date","","","Included","cursor-grok-4.6-low","No","100","200","300","400","1000","Included","future"
+"2026-01-09T08:00:00.000Z","","","Included","","No","100","200","300","400","1000","Included","future"
+"2026-01-09T07:00:00.000Z","bc-fixture-0041","","Included","composer-2.5-fast","No","100","200","300","400","1000","Included","future"
+""",
+    "cursor/malformed/usage-events-legacy-header.csv": """Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
+"2026-01-09T12:00:00.000Z","Included","cursor-grok-4.5-high","No","1000","2000","3000","4000","10000","Included"
+"2026-01-09T11:00:00.000Z","Included","composer-2.5-fast","No","100","200","300","400","1000","Included"
+""",
+    "cursor/malformed/usage-events-no-date.csv": """Cloud Agent ID,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
+"bc-fixture-0050","Included","cursor-grok-4.6-high","No","1000","2000","3000","4000","10000","Included"
+""",
+}
+
+
+def build_cursor(output: Path) -> dict[str, Any]:
+    """Writes the authored Cursor CSV fixtures.
+
+    Unlike every other provider here there is nothing to read: Cursor's local
+    cache holds no usage detail, so these files are literals rather than
+    sanitized copies, and take no source root.
+    """
+    for relative, text in CURSOR_FIXTURES.items():
+        path = output / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text.lstrip("\n"), encoding="utf-8", newline="\n")
+    return {"files": len(CURSOR_FIXTURES), "derived_from_local_store": False}
+
+
 def fixture_files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file())
 
@@ -834,6 +916,11 @@ JSON shapes, and SQLite table layouts are retained.
 `opencode/sqlite-v1` is the supported aggregate-session shape; `sqlite-v2`
 uses the current local session/message/part/todo schemas with sanitized rows.
 
+`cursor/` is the exception: those CSVs are hand-authored rather than derived
+from a local store, because Cursor keeps no local usage trace. They reproduce
+the dashboard export's header, quoting, and enum values, and every value in
+them is invented — including the token counts, which elsewhere are real.
+
 Rerun from this directory:
 
 ```sh
@@ -869,6 +956,7 @@ def main() -> int:
             "codex": build_codex(args.codex_root.resolve(), staging, sanitizer, sources),
             "opencode": build_opencode(args.opencode_root.resolve(), staging, sanitizer, sources),
             "grok": build_grok(args.grok_root.resolve(), staging, sanitizer, sources),
+            "cursor": build_cursor(staging),
         }
         snapshot = readonly_snapshot(sources)
         forbidden = {HOME.name, str(HOME), *sanitizer.forbidden_tokens}

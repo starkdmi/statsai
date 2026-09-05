@@ -199,6 +199,38 @@ pub(crate) enum ImportSubcommand {
         #[arg(long, help = "Show per-file import details")]
         verbose: bool,
     },
+    #[command(
+        about = "Import Cursor dashboard usage-event CSV exports",
+        long_about = "Import usage-event CSV files exported from the Cursor dashboard
+(https://cursor.com/dashboard/usage).
+
+Export the widest range the dashboard offers rather than a single day.
+Cursor anchors each row to the moment a session first used a model, so a
+narrow window omits sessions that started earlier and were still running.
+
+Re-importing overlapping exports is safe in any order: a row's token counts
+only ever grow, and the larger snapshot wins.
+
+Costs are API-equivalent estimates rather than charges, except on
+usage-based rows where Cursor reports a real amount. Cursor-internal models
+(grok-bot-*, github_bugbot, auto) have no published price, so their tokens
+are counted with no cost attached.
+
+Usage is attributed to the day a session started, which is not directly
+comparable to the per-request daily figures from other providers."
+    )]
+    Cursor {
+        #[arg(
+            long,
+            required = true,
+            help = "Path to an exported CSV, or a directory of them (repeatable)"
+        )]
+        path: Vec<PathBuf>,
+        #[arg(long, help = "Preview without persisting")]
+        dry_run: bool,
+        #[arg(long, help = "Show per-file import details")]
+        verbose: bool,
+    },
 }
 
 #[derive(Debug, Args)]

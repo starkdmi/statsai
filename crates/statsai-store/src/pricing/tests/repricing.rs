@@ -794,3 +794,204 @@ fn read_only_applied_version_probe_does_not_open_or_reprice() {
         Some(7)
     );
 }
+
+#[test]
+fn a_store_left_on_an_older_ruleset_repairs_stale_and_missing_catalog_costs() {
+    let (store, source) = store_with_source("/tmp/pricing-ruleset-bump");
+    // Sol's promotional rate started 2026-08-21; usage after it was stored under
+    // the pre-promotion rates.
+    let sol_at = parse_utc("2026-08-22T12:00:00Z");
+    let sol = test_event(
+        &source,
+        sol_at,
+        "sol-after-promo",
+        "gpt-5.6-sol",
+        million_token_usage(),
+        CostInfo {
+            estimated_api_equivalent_usd: Some(4_175),
+            estimated_api_equivalent_micro_usd: Some(41_750_000),
+            pricing_source: Some("codex_api_pricing:gpt-5.6-sol".to_string()),
+            pricing_version: Some("official:2026-08-19".to_string()),
+            confidence: Confidence::Medium,
+            ..missing_cost()
+        },
+    );
+    // Astra had no catalog entry at all, so its cost was recorded as unknown.
+    let astra_at = parse_utc("2026-09-01T12:00:00Z");
+    let astra = test_event(
+        &source,
+        astra_at,
+        "astra-unpriced",
+        "gpt-6-astra",
+        million_token_usage(),
+        missing_cost(),
+    );
+    store.insert_event(&sol).expect("insert sol");
+    store.insert_event(&astra).expect("insert astra");
+    store
+        .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "1")
+        .expect("mark ruleset 1");
+
+    let report = store.ensure_current_pricing().expect("reprice");
+
+    assert!(!report.already_current);
+    assert_eq!(report.changed_events, 2);
+    // 4.00 input + 5.00 cache write + 0.40 cached + 20.00 output.
+    assert_eq!(
+        stored_event(&store, &sol.event_id.0)
+            .cost
+            .estimated_api_equivalent_micro_usd,
+        Some(29_400_000)
+    );
+    // 10.00 + 12.50 + 1.00 + 50.00.
+    assert_eq!(
+        stored_event(&store, &astra.event_id.0)
+            .cost
+            .estimated_api_equivalent_micro_usd,
+        Some(73_500_000)
+    );
+    assert_eq!(
+        store.applied_pricing_ruleset_version().expect("applied"),
+        Some(PRICING_RULESET_VERSION)
+    );
+}
+
+#[test]
+fn a_stored_event_with_a_stale_normalized_name_is_renormalized_and_repriced() {
+    let (store, source) = store_with_source("/tmp/pricing-stale-normalization");
+    let started_at = parse_utc("2026-09-01T12:00:00Z");
+    let mut event = test_event(
+        &source,
+        started_at,
+        "stale-fable",
+        "claude-fable-5-1-thinking-max",
+        UsageCounts {
+            cache_read_tokens: Some(1_000_000),
+            total_tokens: Some(1_000_000),
+            ..UsageCounts::default()
+        },
+        missing_cost(),
+    );
+    // Written when the normalizer still folded every 5.1 name into Fable 5.
+    event.model = Some(ModelInfo {
+        normalized_name: Some("claude-fable-5".to_string()),
+        ..event.model.clone().expect("model")
+    });
+    store.insert_event(&event).expect("insert");
+    store
+        .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "1")
+        .expect("mark ruleset 1");
+
+    store.ensure_current_pricing().expect("reprice");
+
+    let stored = stored_event(&store, &event.event_id.0);
+    let model = stored.model.expect("model");
+    assert_eq!(model.normalized_name.as_deref(), Some("claude-fable-5-1"));
+    assert_eq!(model.name.as_deref(), Some("claude-fable-5-1-thinking-max"));
+    // Fable 5.1 reads cache at $0.25/M, not Fable 5's $1.00/M.
+    assert_eq!(
+        stored.cost.estimated_api_equivalent_micro_usd,
+        Some(250_000)
+    );
+}
+
+/// A cost an adapter derived by summing per-request samples, which prices each
+/// request against its own context-size tier. Only the session total is stored,
+/// and its request count is not 1, so the generic estimator cannot reproduce it.
+fn source_derived_cost() -> CostInfo {
+    CostInfo {
+        estimated_api_equivalent_usd: Some(3_242),
+        estimated_api_equivalent_micro_usd: Some(32_426_240),
+        pricing_source: Some("xai_api_pricing:grok-4.6:unified_log_inference_usage".to_string()),
+        pricing_version: Some("official:2026-08-19".to_string()),
+        confidence: Confidence::Medium,
+        ..missing_cost()
+    }
+}
+
+#[test]
+fn repricing_keeps_a_summary_an_adapter_priced_from_source_records() {
+    let (store, source) = store_with_source("/tmp/pricing-source-derived-summary");
+    let start = parse_utc("2026-09-01T00:00:00Z");
+    let end = parse_utc("2026-09-01T23:59:59Z");
+    let mut summary = test_summary(&source, "grok-4.6", start, end, source_derived_cost());
+    summary.provider = "grok_build".to_string();
+    // A whole session's worth of requests, so the per-request context tiers the
+    // adapter applied are not recoverable from this aggregate.
+    summary.usage.requests = Some(37);
+    store.upsert_summary(&summary).expect("insert");
+    store
+        .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "1")
+        .expect("mark ruleset 1");
+
+    store.ensure_current_pricing().expect("reprice");
+
+    let stored = &store.summaries().expect("summaries")[0];
+    assert_eq!(stored.cost, source_derived_cost());
+}
+
+#[test]
+fn repricing_still_updates_a_summary_the_generic_estimator_owns() {
+    let (store, source) = store_with_source("/tmp/pricing-generic-summary");
+    let start = parse_utc("2026-09-01T00:00:00Z");
+    let end = parse_utc("2026-09-01T23:59:59Z");
+    // Same shape, but priced by the generic estimator, so it is safe to redo.
+    let generic = CostInfo {
+        pricing_source: Some("codex_api_pricing:gpt-5.6-sol".to_string()),
+        ..source_derived_cost()
+    };
+    let summary = test_summary(&source, "gpt-5.6-sol", start, end, generic.clone());
+    store.upsert_summary(&summary).expect("insert");
+    store
+        .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "1")
+        .expect("mark ruleset 1");
+
+    store.ensure_current_pricing().expect("reprice");
+
+    let stored = &store.summaries().expect("summaries")[0];
+    assert_ne!(stored.cost, generic);
+    assert_eq!(
+        stored.cost.pricing_version.as_deref(),
+        Some(PRICING_CATALOG_VERSION)
+    );
+}
+
+#[test]
+fn a_fast_mode_qualifier_is_not_mistaken_for_source_derived_pricing() {
+    let (store, source) = store_with_source("/tmp/pricing-fast-summary");
+    let start = parse_utc("2026-09-01T00:00:00Z");
+    let end = parse_utc("2026-09-01T23:59:59Z");
+    // `:fast` is written by the generic estimator itself, so it must not be
+    // read as an adapter fingerprint and freeze the estimate.
+    let fast = CostInfo {
+        pricing_source: Some("claude_code_api_pricing:claude-opus-5:fast".to_string()),
+        ..source_derived_cost()
+    };
+    let mut summary = test_summary(&source, "claude-opus-5", start, end, fast.clone());
+    summary.model = Some(ModelInfo {
+        speed: Some("fast".to_string()),
+        ..test_model("claude-opus-5")
+    });
+    store.upsert_summary(&summary).expect("insert");
+    store
+        .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "1")
+        .expect("mark ruleset 1");
+
+    store.ensure_current_pricing().expect("reprice");
+
+    let stored = &store.summaries().expect("summaries")[0];
+    assert_ne!(
+        stored.cost.estimated_api_equivalent_micro_usd,
+        fast.estimated_api_equivalent_micro_usd
+    );
+    // Recomputed, and still charged at the fast-mode rate.
+    assert!(
+        stored
+            .cost
+            .pricing_source
+            .as_deref()
+            .is_some_and(|source| source.ends_with(":claude-opus-5:fast")),
+        "unexpected pricing source: {:?}",
+        stored.cost.pricing_source
+    );
+}

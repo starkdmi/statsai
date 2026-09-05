@@ -1,9 +1,9 @@
 {
   "files": [
     {
-      "bytes": 763,
+      "bytes": 1070,
       "path": "README.md",
-      "sha256": "3f135b24139fed111d3058a3dfc9a946ed70fa74905baf45cfaa343f582ee6b7"
+      "sha256": "d26bf0b88616aa76c761b8c72f865141b2ab136ec99b922982be4512dea9d04b"
     },
     {
       "bytes": 8855,
@@ -64,6 +64,51 @@
       "bytes": 2505,
       "path": "codex/reasoning/sessions/2026/08/17/rollout-fixture-reasoning.jsonl",
       "sha256": "bb86399f4fbaeb92c45c6b6833a81e65afc3702bad4591dc71f5481b2667ebe1"
+    },
+    {
+      "bytes": 899,
+      "path": "cursor/basic/usage-events-basic.csv",
+      "sha256": "813f91fe4d82994be77b5f61f7c23596672dd9e0f610291951d50530de518626"
+    },
+    {
+      "bytes": 570,
+      "path": "cursor/collision/usage-events-collision-swapped.csv",
+      "sha256": "78589c5edc22c5966e1dbbba0a010ebbbd8b2ebff13eb894d12c686eafd3a2b9"
+    },
+    {
+      "bytes": 570,
+      "path": "cursor/collision/usage-events-collision.csv",
+      "sha256": "248959d903b8ffad55493c539c884868e65b2b48717db081f850dc9b352576c7"
+    },
+    {
+      "bytes": 333,
+      "path": "cursor/malformed/usage-events-legacy-header.csv",
+      "sha256": "a6ce6f38dc4438c86a0a0b5605a64f89c8f3c7df51a2bfe24f76c4b5df7874e1"
+    },
+    {
+      "bytes": 762,
+      "path": "cursor/malformed/usage-events-malformed.csv",
+      "sha256": "bea5107bd6714f7a2fd285f01ffa4fe3de0eaf0b1ce9de4bba14bd33091dfbc6"
+    },
+    {
+      "bytes": 229,
+      "path": "cursor/malformed/usage-events-no-date.csv",
+      "sha256": "967431b9789f09581be506a82041af27ea6e485d07bdc58f2f239b5525f845d6"
+    },
+    {
+      "bytes": 406,
+      "path": "cursor/snapshots/export-early.csv",
+      "sha256": "290d6ae2a72c054df6bc624218072dabd1044e734731e710c3698a1ec10eecdd"
+    },
+    {
+      "bytes": 539,
+      "path": "cursor/snapshots/export-late.csv",
+      "sha256": "f1b36085042c6cd642542cc224e65550888c5bce6cf0cdd7bb2c4af0f8ab73cd"
+    },
+    {
+      "bytes": 725,
+      "path": "cursor/usage-based/usage-events-charged.csv",
+      "sha256": "dd2b231300c1620b584d6cd868e61c28c58c3cca4c0a2a1da8967cb1978e4041"
     },
     {
       "bytes": 10632,
@@ -131,6 +176,10 @@
       "compaction": 43,
       "malformed": 10,
       "reasoning": 10
+    },
+    "cursor": {
+      "derived_from_local_store": false,
+      "files": 9
     },
     "grok": {
       "basic": {

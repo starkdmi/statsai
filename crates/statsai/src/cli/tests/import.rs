@@ -605,3 +605,245 @@ fn import_overlays_estimated_cost_when_store_ruleset_is_already_current() {
         expected_usd
     );
 }
+
+use super::super::import::dedupe_cursor_snapshots;
+use statsai_adapters::parse_cursor_usage_csv;
+
+fn cursor_fixture(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../statsai-adapters/tests/fixtures/cursor")
+        .join(relative)
+}
+
+fn import_cursor(store: &Store, relative: &str) {
+    import_cursor_usage_events(&[cursor_fixture(relative)], store, "device", false, false)
+        .expect("import cursor csv");
+}
+
+fn stored_totals(store: &Store) -> (usize, u64) {
+    let events = store.events().expect("events");
+    let total = events
+        .iter()
+        .map(|event| event.usage.computed_total())
+        .sum();
+    (events.len(), total)
+}
+
+#[test]
+fn cursor_import_order_does_not_change_the_result() {
+    let forwards = Store::in_memory().expect("store");
+    import_cursor(&forwards, "snapshots/export-early.csv");
+    import_cursor(&forwards, "snapshots/export-late.csv");
+
+    let backwards = Store::in_memory().expect("store");
+    import_cursor(&backwards, "snapshots/export-late.csv");
+    import_cursor(&backwards, "snapshots/export-early.csv");
+
+    assert_eq!(stored_totals(&forwards), stored_totals(&backwards));
+    // 40000 (grown) + 3000 (unchanged) + 1000 (new in the later export).
+    assert_eq!(stored_totals(&forwards), (3, 44_000));
+}
+
+#[test]
+fn cursor_import_keeps_the_larger_snapshot_of_a_growing_row() {
+    let store = Store::in_memory().expect("store");
+    import_cursor(&store, "snapshots/export-late.csv");
+    let after_late = stored_totals(&store);
+
+    import_cursor(&store, "snapshots/export-early.csv");
+
+    assert_eq!(stored_totals(&store), after_late);
+}
+
+#[test]
+fn cursor_import_is_idempotent() {
+    let store = Store::in_memory().expect("store");
+    import_cursor(&store, "basic/usage-events-basic.csv");
+    let first = stored_totals(&store);
+
+    import_cursor(&store, "basic/usage-events-basic.csv");
+
+    assert_eq!(stored_totals(&store), first);
+    assert_eq!(first.0, 6);
+}
+
+#[test]
+fn cursor_import_preserves_a_reported_charge_through_the_store() {
+    let store = Store::in_memory().expect("store");
+    import_cursor(&store, "usage-based/usage-events-charged.csv");
+    store.ensure_current_pricing().expect("refresh pricing");
+
+    let charged: Vec<_> = store
+        .events()
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.cost.provider_reported_micro_usd.is_some())
+        .collect();
+
+    assert_eq!(charged.len(), 2);
+    let mut amounts: Vec<i64> = charged
+        .iter()
+        .filter_map(|event| event.cost.provider_reported_micro_usd)
+        .collect();
+    amounts.sort_unstable();
+    assert_eq!(amounts, vec![123_400, 2_500_000]);
+    assert!(charged
+        .iter()
+        .all(|event| event.cost.pricing_source.as_deref() == Some("cursor.usage_event.cost")));
+}
+
+#[test]
+fn cursor_import_dry_run_writes_nothing() {
+    let store = Store::in_memory().expect("store");
+
+    import_cursor_usage_events(
+        &[cursor_fixture("basic/usage-events-basic.csv")],
+        &store,
+        "device",
+        true,
+        true,
+    )
+    .expect("dry run");
+
+    assert_eq!(stored_totals(&store), (0, 0));
+    assert!(store.list_sources().expect("sources").is_empty());
+}
+
+#[test]
+fn cursor_import_accepts_a_directory_of_exports() {
+    let store = Store::in_memory().expect("store");
+
+    import_cursor_usage_events(
+        &[cursor_fixture("snapshots")],
+        &store,
+        "device",
+        false,
+        false,
+    )
+    .expect("directory import");
+
+    // Both exports in the directory land in one pass, and the overlapping row
+    // resolves to the larger snapshot rather than being counted twice.
+    assert_eq!(stored_totals(&store), (3, 44_000));
+}
+
+#[test]
+fn cursor_import_registers_one_manual_source() {
+    let store = Store::in_memory().expect("store");
+    import_cursor(&store, "snapshots/export-early.csv");
+    import_cursor(&store, "snapshots/export-late.csv");
+
+    let sources = store.list_sources().expect("sources");
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].provider, "cursor");
+    assert_eq!(sources[0].source_kind, SourceKind::Manual);
+    // Nothing on disk backs this source, so verification must stay off.
+    assert_eq!(
+        sources[0].verification_mode,
+        statsai_core::SourceVerificationMode::Disabled
+    );
+}
+
+#[test]
+fn cursor_import_totals_match_what_the_store_keeps_across_overlapping_exports() {
+    let store = Store::in_memory().expect("store");
+
+    // The two snapshots overlap: the grok row appears in both, grown in the
+    // later one. Totals must reflect the winner, not the sum of both copies.
+    import_cursor_usage_events(
+        &[cursor_fixture("snapshots")],
+        &store,
+        "device",
+        false,
+        false,
+    )
+    .expect("directory import");
+
+    assert_eq!(stored_totals(&store), (3, 44_000));
+}
+
+#[test]
+fn cursor_snapshot_dedupe_reports_the_totals_the_store_will_keep() {
+    let options = ScanOptions {
+        device_id: "device".to_string(),
+        collect_tasks: false,
+        selected_cache_keys: None,
+    };
+    let mut parsed = Vec::new();
+    for name in ["snapshots/export-early.csv", "snapshots/export-late.csv"] {
+        parsed.extend(
+            parse_cursor_usage_csv(&cursor_fixture(name), &options)
+                .expect("parse")
+                .events,
+        );
+    }
+    // Summing the exports would report 5 events and 57,000 tokens.
+    assert_eq!(parsed.len(), 5);
+    assert_eq!(
+        parsed
+            .iter()
+            .map(|event| event.usage.computed_total())
+            .sum::<u64>(),
+        57_000
+    );
+
+    let deduped = dedupe_cursor_snapshots(parsed);
+
+    let store = Store::in_memory().expect("store");
+    import_cursor(&store, "snapshots/export-early.csv");
+    import_cursor(&store, "snapshots/export-late.csv");
+    assert_eq!(
+        (
+            deduped.len(),
+            deduped
+                .iter()
+                .map(|event| event.usage.computed_total())
+                .sum::<u64>()
+        ),
+        stored_totals(&store)
+    );
+    assert_eq!(stored_totals(&store), (3, 44_000));
+}
+
+#[test]
+fn cursor_reimport_preserves_a_connected_account() {
+    let store = Store::in_memory().expect("store");
+    import_cursor(&store, "basic/usage-events-basic.csv");
+
+    // Connect the source the way `statsai source connect` would, covering the
+    // whole fixture range.
+    let source = statsai_adapters::cursor_import_source();
+    let account_id = statsai_core::ProviderAccountId("cursor-account".to_string());
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .single()
+        .expect("started_at");
+    store
+        .upsert_source_account_assignment(&test_assignment(
+            &source,
+            &account_id,
+            started_at,
+            None,
+            started_at,
+        ))
+        .expect("assignment");
+    super::super::source::reattribute_source_records(&store, &source.source_id)
+        .expect("reattribute");
+    let linked = |store: &Store| {
+        store
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.provider_account_id.as_ref() == Some(&account_id))
+            .count()
+    };
+    assert_eq!(linked(&store), 6);
+
+    // Re-importing the same export must not strip the attribution.
+    import_cursor(&store, "basic/usage-events-basic.csv");
+    assert_eq!(linked(&store), 6);
+
+    // A later export covering new activity picks up the connection too.
+    import_cursor(&store, "snapshots/export-late.csv");
+    assert_eq!(linked(&store), 9);
+}

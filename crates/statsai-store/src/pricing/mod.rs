@@ -6,8 +6,9 @@ use rusqlite::params;
 use serde::de::DeserializeOwned;
 use statsai_core::{CostAccumulator, CostInfo, ModelInfo, UsageEvent, UsageSummary};
 use statsai_pricing::{
-    estimate_cost_at, overlay_estimated_cost, pricing_changes_between, unknown_cost,
-    PRICING_CATALOG_VERSION, PRICING_RULESET_VERSION,
+    estimate_cost_at, estimate_priced_from_source_records, model_with_refreshed_normalization,
+    overlay_estimated_cost, pricing_changes_between, unknown_cost, PRICING_CATALOG_VERSION,
+    PRICING_RULESET_VERSION,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -417,17 +418,23 @@ fn estimated_cost_for_loaded_events(
 }
 
 fn reprice_event(event: &UsageEvent) -> Option<UsageEvent> {
+    // The stored `normalized_name` caches a derivation of the observed name, so
+    // a ruleset that teaches the normalizer a new model leaves it stale. It
+    // feeds grouping as well as pricing, so refresh it here rather than only
+    // working around it at lookup time.
+    let model = event.model.as_ref().map(model_with_refreshed_normalization);
     let estimated = estimate_cost_at(
         &event.provider,
-        event.model.as_ref(),
+        model.as_ref(),
         &event.usage,
         &event.session.started_at,
     );
     let cost = overlay_estimated_cost(&event.cost, estimated);
-    if cost == event.cost {
+    if cost == event.cost && model == event.model {
         return None;
     }
     let mut updated = event.clone();
+    updated.model = model;
     updated.cost = cost;
     Some(updated)
 }
@@ -494,6 +501,13 @@ fn estimated_summary_cost(
     pricing_at: chrono::DateTime<chrono::Utc>,
     existing: &CostInfo,
 ) -> CostInfo {
+    // An adapter that priced from per-request records beat what this aggregate
+    // can express, so recomputing here would replace a better number with a
+    // worse one. Left untouched, including its catalog version: the estimate
+    // really was produced under that catalog, and a rescan is what refreshes it.
+    if estimate_priced_from_source_records(existing) {
+        return existing.clone();
+    }
     let estimated = if summary_crosses_pricing_boundary(model, period_start, period_end) {
         unknown_cost()
     } else {

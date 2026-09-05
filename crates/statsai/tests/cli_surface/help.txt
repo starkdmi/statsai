@@ -494,6 +494,7 @@ Usage: statsai import [OPTIONS] <COMMAND>
 
 Commands:
   summary  Import a reported usage summary JSON file
+  cursor   Import Cursor dashboard usage-event CSV exports
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -513,6 +514,45 @@ Options:
       --dry-run                Preview without persisting
       --verbose                Show per-file import details
   -h, --help                   Print help
+===== statsai import cursor --help =====
+Import usage-event CSV files exported from the Cursor dashboard
+(https://cursor.com/dashboard/usage).
+
+Export the widest range the dashboard offers rather than a single day.
+Cursor anchors each row to the moment a session first used a model, so a
+narrow window omits sessions that started earlier and were still running.
+
+Re-importing overlapping exports is safe in any order: a row's token counts
+only ever grow, and the larger snapshot wins.
+
+Costs are API-equivalent estimates rather than charges, except on
+usage-based rows where Cursor reports a real amount. Cursor-internal models
+(grok-bot-*, github_bugbot, auto) have no published price, so their tokens
+are counted with no cost attached.
+
+Usage is attributed to the day a session started, which is not directly
+comparable to the per-request daily figures from other providers.
+
+Usage: statsai import cursor [OPTIONS] --path <PATH>
+
+Options:
+      --path <PATH>
+          Path to an exported CSV, or a directory of them (repeatable)
+
+      --store <STORE>
+          Path to SQLite store
+
+      --device-id <DEVICE_ID>
+          Device identifier for multi-device sync
+
+      --dry-run
+          Preview without persisting
+
+      --verbose
+          Show per-file import details
+
+  -h, --help
+          Print help (see a summary with '-h')
 ===== statsai export --help =====
 Export stored events as JSON
 

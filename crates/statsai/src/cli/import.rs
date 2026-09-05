@@ -1,20 +1,25 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use statsai_adapters::{
+    cursor_csv_paths, cursor_import_source, parse_cursor_usage_csv, unpriced_model_tokens,
+    ScanOptions,
+};
 use statsai_core::{
     hash_text, normalize_email, normalize_provider_user_id, source_account_assignment_id,
     source_id as statsai_source_id, SourceAccountAssignment, SourceId, SourceKind, SourceLocation,
-    UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    UsageEvent, UsageSummary, UsageTotals, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
 };
 use statsai_sdk::{
     build_reported_usage_summary, ReportedUsageSummaryInput, ReportedUsageSummaryRecord,
     REPORTED_USAGE_IMPORT_ADAPTER_ID,
 };
 use statsai_store::{apply_current_estimated_pricing, Store};
-use std::collections::BTreeSet;
+use std::collections::{btree_map, BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::args::{ImportCommand, ImportSubcommand};
 use super::format::{abbreviate_home, format_cost, format_u64};
+use super::source::apply_source_account_resolution;
 
 pub(crate) fn import(command: ImportCommand, store: &Store, device_id: &str) -> Result<()> {
     match command.command {
@@ -41,7 +46,147 @@ pub(crate) fn import(command: ImportCommand, store: &Store, device_id: &str) -> 
                 replace,
             )?;
         }
+        ImportSubcommand::Cursor {
+            path,
+            dry_run,
+            verbose,
+        } => import_cursor_usage_events(&path, store, device_id, dry_run, verbose)?,
     }
+    Ok(())
+}
+
+/// Collapses repeated snapshots of one event down to the one the store keeps.
+///
+/// A Cursor row accumulates over a session, so overlapping exports carry the
+/// same event at different sizes. The largest wins, matching what the store
+/// does on insert, so reported totals equal what is actually persisted.
+pub(crate) fn dedupe_cursor_snapshots(events: Vec<UsageEvent>) -> Vec<UsageEvent> {
+    let mut winners: BTreeMap<String, UsageEvent> = BTreeMap::new();
+    for event in events {
+        match winners.entry(event.event_id.0.clone()) {
+            btree_map::Entry::Occupied(mut slot) => {
+                if event.usage.computed_total() > slot.get().usage.computed_total() {
+                    slot.insert(event);
+                }
+            }
+            btree_map::Entry::Vacant(slot) => {
+                slot.insert(event);
+            }
+        }
+    }
+    winners.into_values().collect()
+}
+
+/// Imports Cursor dashboard CSV exports.
+///
+/// Every export writes to one stable manual source, and event identity omits
+/// token counts, so re-importing an overlapping range is idempotent and order
+/// does not matter: a session's row grows over time, and the store keeps the
+/// larger snapshot. See `statsai_adapters::parse_cursor_usage_csv`.
+pub(crate) fn import_cursor_usage_events(
+    paths: &[PathBuf],
+    store: &Store,
+    device_id: &str,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<()> {
+    let options = ScanOptions {
+        device_id: device_id.to_string(),
+        collect_tasks: false,
+        selected_cache_keys: None,
+    };
+
+    let mut files = Vec::new();
+    for path in paths {
+        files.extend(cursor_csv_paths(path)?);
+    }
+    files.sort();
+    files.dedup();
+
+    let mut reports = Vec::with_capacity(files.len());
+    for file in &files {
+        reports.push(parse_cursor_usage_csv(file, &options)?);
+    }
+
+    let mut events = Vec::new();
+    let mut skipped = 0u64;
+    for report in &reports {
+        if verbose || dry_run {
+            println!(
+                "cursor export path={} rows={} events={} skipped={} warnings={}",
+                abbreviate_home(report.path.to_string_lossy().as_ref()),
+                format_u64(report.rows_read),
+                format_u64(report.events.len() as u64),
+                format_u64(report.rows_skipped),
+                format_u64(report.warnings.len() as u64)
+            );
+            for warning in &report.warnings {
+                println!("  warning: {warning}");
+            }
+        }
+        skipped += report.rows_skipped;
+        events.extend(report.events.iter().cloned());
+    }
+
+    // Totals are computed after collapsing snapshots, not per file: overlapping
+    // exports repeat a session's row, and reporting the sum would double-count
+    // every repeat against what the store actually keeps.
+    let mut events = dedupe_cursor_snapshots(events);
+    let mut total_usage = UsageTotals::default();
+    for event in &events {
+        total_usage.add_event(event);
+    }
+    let unpriced = unpriced_model_tokens(&events);
+
+    let unpriced_tokens: u64 = unpriced.values().copied().sum();
+    if (verbose || dry_run) && !unpriced.is_empty() {
+        println!("models without catalog pricing (tokens counted, cost omitted):");
+        for (model, tokens) in unpriced.iter().collect::<Vec<_>>().iter().rev() {
+            println!("  {model} tokens={}", format_u64(**tokens));
+        }
+    }
+
+    if dry_run {
+        println!(
+            "import preview: files={} events={} skipped_rows={} input={} cache_create={} cache_read={} output={} total={} unpriced_tokens={} cost={} written=0",
+            format_u64(files.len() as u64),
+            format_u64(events.len() as u64),
+            format_u64(skipped),
+            format_u64(total_usage.input_tokens),
+            format_u64(total_usage.cache_creation_tokens),
+            format_u64(total_usage.cached_input_tokens),
+            format_u64(total_usage.output_tokens),
+            format_u64(total_usage.total_tokens),
+            format_u64(unpriced_tokens),
+            format_cost(total_usage.estimated_cost_usd)
+        );
+        return Ok(());
+    }
+
+    let source = cursor_import_source();
+    store.upsert_source(&source)?;
+    // Cursor's export carries no account identity, so attribution comes from
+    // whatever the user connected this source to. Resolving it before insert
+    // keeps a re-import from unlinking events that were already attributed.
+    apply_source_account_resolution(store, &source, &mut events, &mut [])?;
+    let inserted = store.insert_events(&events)?;
+    // Anything not inserted matched an existing event and refreshed it in place.
+    let updated = (events.len() as u64).saturating_sub(inserted);
+    println!(
+        "import complete: files={} events={} inserted={} updated={} skipped_rows={} input={} cache_create={} cache_read={} output={} total={} unpriced_tokens={} cost={}",
+        format_u64(files.len() as u64),
+        format_u64(events.len() as u64),
+        format_u64(inserted),
+        format_u64(updated),
+        format_u64(skipped),
+        format_u64(total_usage.input_tokens),
+        format_u64(total_usage.cache_creation_tokens),
+        format_u64(total_usage.cached_input_tokens),
+        format_u64(total_usage.output_tokens),
+        format_u64(total_usage.total_tokens),
+        format_u64(unpriced_tokens),
+        format_cost(total_usage.estimated_cost_usd)
+    );
     Ok(())
 }
 
