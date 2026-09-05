@@ -184,6 +184,25 @@ fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (i128, i128) {
     }
 }
 
+/// Whether an estimate was priced from source records the store does not keep.
+///
+/// [`estimate_cost_at`] writes `{vendor}_api_pricing:{model}`, plus `:fast` for
+/// fast-mode rates. An adapter that prices from richer evidence appends its own
+/// qualifier - Grok Build sums per-request samples from the unified log, so each
+/// one is billed with its own context-size tier. A summary keeps only the
+/// session total, whose `requests` count is not 1, so recomputing it from that
+/// aggregate silently drops every tier decision and lands under the true cost.
+///
+/// Repricing therefore leaves these estimates alone. They are refreshed by a
+/// rescan, which re-reads the records they were derived from.
+#[must_use]
+pub fn estimate_priced_from_source_records(cost: &CostInfo) -> bool {
+    cost.pricing_source
+        .as_deref()
+        .and_then(|source| source.splitn(3, ':').nth(2))
+        .is_some_and(|qualifier| qualifier != "fast")
+}
+
 #[must_use]
 pub fn unknown_cost() -> CostInfo {
     CostInfo {

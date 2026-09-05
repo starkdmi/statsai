@@ -24,7 +24,10 @@ mod cost;
 mod normalize;
 
 pub use catalog::{pricing_changes_between, pricing_for_model, ModelPricing};
-pub use cost::{estimate_cost, estimate_cost_at, overlay_estimated_cost, unknown_cost};
+pub use cost::{
+    estimate_cost, estimate_cost_at, estimate_priced_from_source_records, overlay_estimated_cost,
+    unknown_cost,
+};
 pub use normalize::{
     model_with_refreshed_normalization, normalize_model_name, normalize_qualified_model_name,
 };
