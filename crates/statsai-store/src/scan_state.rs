@@ -245,7 +245,7 @@ impl Store {
         replacement: ScanFileReplacement<'_>,
     ) -> Result<ScanFileReplacementResult> {
         self.with_immediate_transaction(|| {
-            self.delete_events_for_source_file_hashes(
+            let deleted_events = self.delete_events_for_source_file_hashes(
                 replacement.source_id,
                 replacement.reconciled_file_hashes,
             )?;
@@ -255,6 +255,11 @@ impl Store {
             )?;
             let inserted_events = self.insert_events(replacement.events)?;
             let written_summaries = self.upsert_summaries(replacement.summaries)?;
+            // A quota observation can point at an event this just deleted, and the
+            // daemon -- the only caller -- never touches quota rows itself, so nothing
+            // else repairs the link. Run after the insert: a record that survives the
+            // rescan keeps its id, and the check treats it as still present.
+            self.clear_quota_usage_links_for_events(&deleted_events.deleted_event_ids)?;
             self.record_scan_file_entries(replacement.source_id, replacement.pending_entries)?;
             self.upgrade_scan_file_entries(
                 replacement.source_id,
