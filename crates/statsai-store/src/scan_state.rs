@@ -245,7 +245,7 @@ impl Store {
         replacement: ScanFileReplacement<'_>,
     ) -> Result<ScanFileReplacementResult> {
         self.with_immediate_transaction(|| {
-            self.delete_events_for_source_file_hashes(
+            let deleted_events = self.delete_events_for_source_file_hashes(
                 replacement.source_id,
                 replacement.reconciled_file_hashes,
             )?;
@@ -255,6 +255,11 @@ impl Store {
             )?;
             let inserted_events = self.insert_events(replacement.events)?;
             let written_summaries = self.upsert_summaries(replacement.summaries)?;
+            // A quota observation can point at an event this just deleted, and the
+            // daemon -- the only caller -- never touches quota rows itself, so nothing
+            // else repairs the link. Run after the insert: a record that survives the
+            // rescan keeps its id, and the check treats it as still present.
+            self.clear_quota_usage_links_for_events(&deleted_events.deleted_event_ids)?;
             self.record_scan_file_entries(replacement.source_id, replacement.pending_entries)?;
             self.upgrade_scan_file_entries(
                 replacement.source_id,
@@ -268,31 +273,52 @@ impl Store {
         })
     }
 
+    /// Whether any of this source's records predates file-hash provenance.
+    ///
+    /// Asked once per source on the incremental scan path, and only the first matching
+    /// row matters, so it is `EXISTS` rather than a count: counting walked every event
+    /// the source had and decoded each payload to return zero, which on a source with a
+    /// year of history measured most of a second.
+    ///
+    /// The events side spells its predicate from `EVENT_SOURCE_FILE_HASH_SQL`, the same
+    /// expression `usage_events_source_file_idx` is built on, so the lookup can be
+    /// answered from that index instead of from the payloads.
+    ///
+    /// `json_valid` guards both, because bare `json_extract` raises on a payload that is
+    /// not JSON and would fail the whole scan for the source over one unreadable row. A
+    /// payload that cannot be parsed has no readable file hash either, so it falls to
+    /// NULL and counts as missing -- the conservative answer, which asks for the fuller
+    /// reconcile rather than quietly skipping the row.
     pub fn source_records_missing_scan_file_hashes(&self, source_id: &SourceId) -> Result<bool> {
-        let event_missing: i64 = self.conn.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM usage_events
-            WHERE source_id = ?1
-              AND COALESCE(json_extract(payload, '$.parse_evidence.source_file_path_hash'), '') = ''
-            "#,
-            params![&source_id.0],
-            |row| row.get(0),
-        )?;
-        if event_missing > 0 {
+        let event_sql = format!(
+            "SELECT EXISTS(
+               SELECT 1 FROM usage_events
+               WHERE source_id = ?1 AND COALESCE({EVENT_SOURCE_FILE_HASH_SQL}, '') = ''
+             )"
+        );
+        let event_missing: bool =
+            self.conn
+                .query_row(&event_sql, params![&source_id.0], |row| row.get(0))?;
+        if event_missing {
             return Ok(true);
         }
 
-        let summary_missing: i64 = self.conn.query_row(
+        // `usage_summaries` carries the same `parse_evidence` shape but has no index on
+        // it, and holds orders of magnitude fewer rows, so this one reads the payloads.
+        let summary_missing: bool = self.conn.query_row(
             r#"
-            SELECT COUNT(*)
-            FROM usage_summaries
-            WHERE source_id = ?1
-              AND COALESCE(json_extract(payload, '$.parse_evidence.source_file_path_hash'), '') = ''
+            SELECT EXISTS(
+              SELECT 1 FROM usage_summaries
+              WHERE source_id = ?1
+                AND COALESCE(
+                      CASE WHEN json_valid(payload)
+                        THEN json_extract(payload, '$.parse_evidence.source_file_path_hash')
+                      END, '') = ''
+            )
             "#,
             params![&source_id.0],
             |row| row.get(0),
         )?;
-        Ok(summary_missing > 0)
+        Ok(summary_missing)
     }
 }

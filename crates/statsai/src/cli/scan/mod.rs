@@ -70,6 +70,11 @@ pub(crate) fn scan_with_adapters(
     let mut preview_rebuild_duration_ms = 0u64;
     let mut delete_duration_ms = 0u64;
     let mut insert_events_duration_ms = 0u64;
+    let mut account_evidence_duration_ms = 0u64;
+    let mut candidate_scan_duration_ms = 0u64;
+    let mut legacy_check_duration_ms = 0u64;
+    let mut account_resolution_duration_ms = 0u64;
+    let mut cache_write_duration_ms = 0u64;
     let mut quota_reconcile_duration_ms = 0u64;
     let mut plan_rebuild_duration_ms = 0u64;
     let mut orphan_links_duration_ms = 0u64;
@@ -91,6 +96,7 @@ pub(crate) fn scan_with_adapters(
             let account_evidence_enabled =
                 matches!(verification_mode, SourceVerificationMode::Auto);
             let mut account_evidence = AccountEvidenceScan::default();
+            let account_evidence_started_at = Instant::now();
             if account_evidence_enabled {
                 let account_evidence_checkpoints =
                     store.account_evidence_checkpoints(&source.source_id)?;
@@ -113,10 +119,13 @@ pub(crate) fn scan_with_adapters(
                     &mut account_evidence,
                 );
             }
+            account_evidence_duration_ms +=
+                account_evidence_started_at.elapsed().as_millis() as u64;
             let account_evidence_count = account_evidence.identity_observations.len()
                 + account_evidence.plan_observations.len()
                 + account_evidence.conversation_bindings.len();
             let account_evidence_checkpoint_count = account_evidence.checkpoints.len();
+            let candidate_scan_started_at = Instant::now();
             let cache_candidates = adapter.scan_candidates(&source)?;
             let compatible_scan_signatures =
                 scan_candidate_compatible_signatures(&cache_candidates);
@@ -138,11 +147,17 @@ pub(crate) fn scan_with_adapters(
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let scan_all_current_files = !file_cache_entries.is_empty()
                 && pending_file_entries.len() == file_cache_entries.len();
+            // The bucket ends here: everything above discovers files and compares them
+            // against the cache, while the legacy-provenance check below is a database
+            // read. Timing them together attributed the query's cost to the filesystem.
+            candidate_scan_duration_ms += candidate_scan_started_at.elapsed().as_millis() as u64;
+            let legacy_reconcile_started_at = Instant::now();
             let needs_legacy_full_reconcile = !command.replace
                 && !command.no_cache
                 && touched_files
                 && !scan_all_current_files
                 && store.source_records_missing_scan_file_hashes(&source.source_id)?;
+            legacy_check_duration_ms += legacy_reconcile_started_at.elapsed().as_millis() as u64;
             let replace_source_records = should_replace_source_records_for_scan(
                 command.replace,
                 command.no_cache,
@@ -311,6 +326,7 @@ pub(crate) fn scan_with_adapters(
                 continue;
             }
             let source_rebuild_report = store.apply_scan_update(|store| {
+                let account_resolution_started_at = Instant::now();
                 reconcile_verified_source_state(
                     store,
                     &mut source,
@@ -344,6 +360,8 @@ pub(crate) fn scan_with_adapters(
                     store
                         .apply_conversation_account_bindings(&source.source_id, &mut scan.events)?;
                 }
+                account_resolution_duration_ms +=
+                    account_resolution_started_at.elapsed().as_millis() as u64;
                 let mut affected_project_buckets = if command.include_tasks {
                     scan.task_spans
                         .iter()
@@ -485,6 +503,7 @@ pub(crate) fn scan_with_adapters(
                     rebuild_project_buckets.extend(affected_project_buckets);
                 }
 
+                let cache_write_started_at = Instant::now();
                 let cache_entries_to_record = if replace_source_records || command.no_cache {
                     &file_cache_entries
                 } else {
@@ -502,6 +521,7 @@ pub(crate) fn scan_with_adapters(
                 if account_evidence_enabled {
                     store.upsert_account_evidence_checkpoints(&account_evidence.checkpoints)?;
                 }
+                cache_write_duration_ms += cache_write_started_at.elapsed().as_millis() as u64;
 
                 if command.include_tasks
                     && !rebuild_project_buckets.is_empty()
@@ -613,8 +633,12 @@ pub(crate) fn scan_with_adapters(
         }
         if command.verbose {
             println!(
-                "timings_ms: adapter_scan={} delete={} insert_events={} quota_reconcile={} plan_rebuild={} orphan_links={} upsert_summaries={} upsert_task_spans={} rebuild_work_items={} rebuild_delete={} rebuild_span_load={} rebuild_verifications={} rebuild_grouping={} rebuild_title_selection={} rebuild_insert={} total_wall={}",
+                "timings_ms: account_evidence={} candidate_scan={} legacy_check={} adapter_scan={} account_resolution={} delete={} insert_events={} quota_reconcile={} plan_rebuild={} orphan_links={} upsert_summaries={} upsert_task_spans={} cache_write={} rebuild_work_items={} rebuild_delete={} rebuild_span_load={} rebuild_verifications={} rebuild_grouping={} rebuild_title_selection={} rebuild_insert={} total_wall={}",
+                format_u64(account_evidence_duration_ms),
+                format_u64(candidate_scan_duration_ms),
+                format_u64(legacy_check_duration_ms),
                 format_u64(adapter_scan_duration_ms),
+                format_u64(account_resolution_duration_ms),
                 format_u64(delete_duration_ms),
                 format_u64(insert_events_duration_ms),
                 format_u64(quota_reconcile_duration_ms),
@@ -622,6 +646,7 @@ pub(crate) fn scan_with_adapters(
                 format_u64(orphan_links_duration_ms),
                 format_u64(upsert_summaries_duration_ms),
                 format_u64(upsert_task_spans_duration_ms),
+                format_u64(cache_write_duration_ms),
                 format_u64(rebuild_work_items_duration_ms),
                 format_u64(rebuild_work_item_report.timings.delete_ms),
                 format_u64(rebuild_work_item_report.timings.span_load_ms),

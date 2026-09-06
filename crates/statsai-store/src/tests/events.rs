@@ -412,3 +412,74 @@ fn events_in_period_without_since_includes_pre_unix_history() {
         .expect("epoch floor");
     assert!(epoch_floor.is_empty());
 }
+
+#[test]
+fn source_emptiness_is_answered_without_loading_the_source() {
+    // `delete_orphaned_legacy_reported_sources` only ever wanted a boolean, and
+    // asking it by loading the source meant deserializing every event and summary
+    // it holds. The answer has to stay identical to what the full load reported,
+    // including that it is scoped to one source.
+    let store = Store::in_memory().expect("store");
+    let empty = statsai_core::SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-empty"),
+        LocationOrigin::Configured,
+    );
+    let populated = statsai_core::SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-populated"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&empty).expect("empty source");
+    store.upsert_source(&populated).expect("populated source");
+
+    assert!(!store
+        .source_has_events(&empty.source_id)
+        .expect("empty before"));
+    assert!(!store
+        .source_has_events(&populated.source_id)
+        .expect("populated before"));
+
+    store
+        .insert_event(&test_store_event(&populated, Utc::now(), "only-record"))
+        .expect("insert");
+
+    assert!(
+        store
+            .source_has_events(&populated.source_id)
+            .expect("populated after"),
+        "the source holding the event reports it"
+    );
+    assert!(
+        !store
+            .source_has_events(&empty.source_id)
+            .expect("empty after"),
+        "and the other source is unaffected"
+    );
+
+    // Agrees with what the full load would have said, which is what it replaced.
+    for source in [&empty, &populated] {
+        assert_eq!(
+            store
+                .source_has_events(&source.source_id)
+                .expect("existence"),
+            !store
+                .events_for_source(&source.source_id)
+                .expect("load")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .source_has_summaries(&source.source_id)
+                .expect("existence"),
+            !store
+                .summaries_for_source(&source.source_id)
+                .expect("load")
+                .is_empty()
+        );
+    }
+}
