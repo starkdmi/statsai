@@ -28,9 +28,9 @@ pub(crate) use rollups::{
     SyncRollupBucketKey,
 };
 pub(crate) use sql::{
-    begin_immediate_transaction_with_retry, commit_transaction, restrict_dir_permissions,
-    restrict_file_permissions, rollback, safe_u64_to_i64, sqlite_in_clause_placeholders,
-    sqlite_string_params, sync_state_from_row,
+    begin_immediate_transaction_with_retry, commit_transaction, parse_rfc3339_for_row,
+    restrict_dir_permissions, restrict_file_permissions, rollback, safe_u64_to_i64,
+    sqlite_in_clause_placeholders, sqlite_string_params, sync_state_from_row,
 };
 pub use verified::{
     apply_source_account_resolution, apply_verified_source_state,
@@ -117,6 +117,26 @@ const SQLITE_BUSY_RETRY_DELAY: Duration = if cfg!(test) {
     Duration::from_millis(250)
 };
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 3;
+
+/// SQL for the event payload fields the scan filters on, guarded against bad JSON.
+///
+/// These are indexed expressions, and SQLite only uses an expression index when the
+/// query repeats the expression verbatim -- so index and query both spell it from
+/// these constants rather than from two copies that can drift apart.
+///
+/// The `json_valid` guard is what makes them total. `json_extract` raises on a payload
+/// that is not JSON, and once that expression is indexed the error surfaces while
+/// *writing* the row: a single unreadable payload would stop inserts into
+/// `usage_events` altogether, which is precisely the failure the repricing and quota
+/// paths take care to survive. `CASE` short-circuits, so a bad payload simply indexes
+/// as NULL and stays invisible to these filters instead of taking the table down.
+pub(crate) const EVENT_SOURCE_FILE_HASH_SQL: &str = "CASE WHEN json_valid(payload) \
+     THEN json_extract(payload, '$.parse_evidence.source_file_path_hash') END";
+pub(crate) const EVENT_CONVERSATION_HASH_SQL: &str = "CASE WHEN json_valid(payload) \
+     THEN json_extract(payload, '$.session.local_session_id_hash') END";
+/// The one field plan evidence needs out of a quota observation payload.
+pub(crate) const QUOTA_PLAN_TYPE_SQL: &str = "CASE WHEN json_valid(payload) \
+     THEN json_extract(payload, '$.status.plan_type') END";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsagePeriodStats {
@@ -236,6 +256,17 @@ pub struct EventInsertBatchResult {
     pub canonical_event_ids: HashMap<EventId, EventId>,
 }
 
+/// What an event deletion removed, so callers can repair what pointed at it.
+///
+/// Quota observations carry a `usage_event_id`, and deleting the event leaves that
+/// link dangling. Naming the deleted ids lets the repair touch exactly those rows
+/// instead of sweeping the whole observation table looking for orphans.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EventDeletionImpact {
+    pub deleted: u64,
+    pub deleted_event_ids: Vec<EventId>,
+}
+
 pub struct ScanFileReplacement<'a> {
     pub source_id: &'a SourceId,
     pub reconciled_file_hashes: &'a [String],
@@ -322,9 +353,16 @@ impl Store {
     /// The page cache is raised because these archives are far larger than the
     /// 2MB default, which turns index maintenance into a stream of single-page
     /// reads.
+    ///
+    /// `mmap_size` covers what the cache cannot. A store with a year of history runs
+    /// to several gigabytes, so the reads that miss the cache are the ones that hurt,
+    /// and serving those from a mapping spares them a `pread` apiece. A gigabyte is
+    /// deliberately short of the whole file: it comfortably spans the tables scanning
+    /// touches without mapping the archive content that only full-text search reads.
     fn configure_connection(&self) -> Result<()> {
         self.conn.execute_batch(
             "PRAGMA cache_size = -65536;
+             PRAGMA mmap_size = 1073741824;
              PRAGMA temp_store = MEMORY;
              CREATE TEMP TABLE IF NOT EXISTS incoming_records (
                source_record_id TEXT,

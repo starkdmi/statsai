@@ -12,7 +12,7 @@ use statsai_core::{
     QUOTA_WEEKLY_WINDOW_MINUTES, QUOTA_WINDOW_SCHEMA_VERSION,
     QUOTA_WINDOW_SYNC_PROJECTION_SCHEMA_VERSION,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 mod cycles;
 mod observations;
@@ -89,6 +89,12 @@ pub struct QuotaDiscardCounts {
 }
 
 impl Store {
+    /// Clears every quota link whose event no longer exists, anywhere in the store.
+    ///
+    /// This walks the whole observation table, which is the right shape for retiring a
+    /// source outright but far too much for an incremental scan: the scan knows which
+    /// events it just deleted, so it uses
+    /// [`Store::clear_quota_usage_links_for_events`] instead.
     pub fn clear_orphaned_quota_usage_links(&self) -> Result<u64> {
         Ok(self.conn.execute(
             r#"
@@ -108,6 +114,41 @@ impl Store {
             "#,
             [],
         )? as u64)
+    }
+
+    /// Clears the quota links that pointed at `event_ids`.
+    ///
+    /// The `NOT EXISTS` guard survives from the full sweep on purpose: an event id can
+    /// be deleted and re-inserted within one scan -- a changed file is retired and
+    /// rescanned, and identical records keep their id -- and the link is still good in
+    /// that case. Checking rather than assuming means the caller may pass every id it
+    /// deleted without first working out which ones came back.
+    pub fn clear_quota_usage_links_for_events(&self, event_ids: &[EventId]) -> Result<u64> {
+        if event_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut statement = self.conn.prepare(
+            r#"
+            UPDATE quota_observations
+            SET usage_event_id = NULL,
+                usage_link_kind = 'none',
+                payload = json_set(
+                  payload,
+                  '$.usage_event_id', NULL,
+                  '$.usage_link_kind', 'none'
+                )
+            WHERE usage_event_id = ?1
+              AND NOT EXISTS (
+                SELECT 1 FROM usage_events e
+                WHERE e.event_id = ?1
+              )
+            "#,
+        )?;
+        let mut cleared = 0u64;
+        for event_id in event_ids {
+            cleared = cleared.saturating_add(statement.execute([&event_id.0])? as u64);
+        }
+        Ok(cleared)
     }
 }
 
