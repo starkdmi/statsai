@@ -140,6 +140,11 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
             verification_dependencies,
         );
         for mut source in sources {
+            // Same reuse the CLI scan takes: the auth-override, dependency-path and
+            // settings-modified probes below each derive this source's project paths,
+            // and doing that reads the project history. Dropped per source so a
+            // long-running daemon sees projects added between passes.
+            let _project_paths = statsai_adapters::ClaudeProjectPathMemo::begin();
             let verification_mode = source.verification_mode.clone();
             let account_evidence_enabled =
                 matches!(verification_mode, SourceVerificationMode::Auto);

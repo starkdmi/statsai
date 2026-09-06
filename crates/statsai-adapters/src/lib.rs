@@ -76,7 +76,7 @@ pub(crate) use sqlite::{
 };
 
 pub(crate) use claude::claude_usage_counts_from_value;
-pub use claude::ClaudeCodeAdapter;
+pub use claude::{ClaudeCodeAdapter, ClaudeProjectPathMemo};
 pub use codex::CodexAdapter;
 pub(crate) use codex::{
     codex_project_context_from_value, codex_quota_observation, codex_usage_counts_from_value,

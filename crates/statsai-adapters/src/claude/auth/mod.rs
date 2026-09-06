@@ -21,6 +21,7 @@ mod projects;
 
 pub(crate) use overrides::*;
 pub(crate) use plans::*;
+pub use projects::ClaudeProjectPathMemo;
 pub(crate) use projects::*;
 
 pub(crate) const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[

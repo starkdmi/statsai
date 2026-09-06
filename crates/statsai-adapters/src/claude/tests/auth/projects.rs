@@ -537,3 +537,127 @@ fn claude_session_state_stub_without_a_resolvable_sibling_blocks_attribution() {
         }
     );
 }
+
+#[test]
+fn project_path_memo_serves_repeat_reads_and_expires_with_its_scope() {
+    // Three probes derive the same source's project paths per scan, and deriving
+    // them reads the project history. The memo has to answer the repeats without
+    // touching the filesystem, and has to stop answering once the scope ends, so a
+    // project added between daemon passes is still seen.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("claude-config");
+    let projects_root = root.join("projects");
+    let project_store = projects_root.join("workspace");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&project_store).expect("project store");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(
+        project_store.join("sessions-index.json"),
+        serde_json::json!({ "originalPath": workspace.to_string_lossy() }).to_string(),
+    )
+    .expect("sessions index");
+
+    let first = claude_project_paths_from_session_indexes(&projects_root).expect("first read");
+    assert_eq!(first, vec![workspace.clone()]);
+
+    {
+        let _memo = ClaudeProjectPathMemo::begin();
+        let memoized = claude_project_paths_from_session_indexes(&projects_root);
+        assert_eq!(memoized.as_deref(), Some(first.as_slice()));
+
+        // Removing the index would change the answer, so a fresh read cannot
+        // return the old one -- only a memo that never looked can.
+        std::fs::remove_file(project_store.join("sessions-index.json")).expect("remove index");
+        assert_eq!(
+            claude_project_paths_from_session_indexes(&projects_root).as_deref(),
+            Some(first.as_slice()),
+            "a held memo answers without re-reading the filesystem"
+        );
+    }
+
+    // Scope gone: the same call now reports what is actually on disk. The store has
+    // no index and no transcripts left, so it contributes no project path.
+    assert_eq!(
+        claude_project_paths_from_session_indexes(&projects_root),
+        Some(Vec::new()),
+        "the memo does not outlive its scope"
+    );
+}
+
+#[test]
+fn nested_project_path_memo_scopes_do_not_retire_the_outer_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects_root = dir.path().join("claude-config").join("projects");
+    std::fs::create_dir_all(&projects_root).expect("projects root");
+
+    let outer = ClaudeProjectPathMemo::begin();
+    assert_eq!(
+        claude_project_paths_from_session_indexes(&projects_root),
+        Some(Vec::new())
+    );
+    {
+        let _inner = ClaudeProjectPathMemo::begin();
+        assert_eq!(
+            claude_project_paths_from_session_indexes(&projects_root),
+            Some(Vec::new())
+        );
+    }
+    // The inner scope ending must restore the outer memo, not clear caching entirely.
+    let project_store = projects_root.join("workspace");
+    std::fs::create_dir_all(&project_store).expect("project store");
+    std::fs::write(
+        project_store.join("sessions-index.json"),
+        serde_json::json!({ "originalPath": dir.path().join("workspace").to_string_lossy() })
+            .to_string(),
+    )
+    .expect("sessions index");
+    assert_eq!(
+        claude_project_paths_from_session_indexes(&projects_root),
+        Some(Vec::new()),
+        "the outer memo still answers after the inner scope ended"
+    );
+    drop(outer);
+    assert_eq!(
+        claude_project_paths_from_session_indexes(&projects_root).map(|paths| paths.len()),
+        Some(1),
+        "and the filesystem is read again once every scope is gone"
+    );
+}
+
+#[test]
+fn project_path_memo_does_not_remember_a_read_it_could_not_complete() {
+    // `None` means the directory could not be read conclusively, and the probes
+    // fail closed on it -- they suppress automatic attribution rather than assume a
+    // source is clear. Remembering it would let one unreadable moment settle the
+    // question for every probe left in the pass.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects_root = dir.path().join("projects");
+    // A file where a directory belongs: `read_dir` fails with something other than
+    // NotFound, which is what the derivation reports as inconclusive.
+    std::fs::write(&projects_root, "not a directory").expect("blocking file");
+
+    let _memo = ClaudeProjectPathMemo::begin();
+    assert_eq!(
+        claude_project_paths_from_session_indexes(&projects_root),
+        None,
+        "an unreadable projects root is inconclusive"
+    );
+
+    // Same scope, readable now. A memo that had remembered the failure would still
+    // be answering None.
+    std::fs::remove_file(&projects_root).expect("remove blocking file");
+    let project_store = projects_root.join("workspace");
+    std::fs::create_dir_all(&project_store).expect("project store");
+    std::fs::write(
+        project_store.join("sessions-index.json"),
+        serde_json::json!({ "originalPath": dir.path().join("workspace").to_string_lossy() })
+            .to_string(),
+    )
+    .expect("sessions index");
+
+    assert_eq!(
+        claude_project_paths_from_session_indexes(&projects_root).map(|paths| paths.len()),
+        Some(1),
+        "the next probe reads for itself rather than inheriting the failure"
+    );
+}
