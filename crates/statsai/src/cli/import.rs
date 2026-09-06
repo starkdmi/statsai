@@ -408,9 +408,7 @@ pub(crate) fn delete_orphaned_legacy_reported_sources(
         if !is_reported_usage_source(&source) {
             continue;
         }
-        if !store.events_for_source(&source_id)?.is_empty()
-            || !store.summaries_for_source(&source_id)?.is_empty()
-        {
+        if store.source_has_events(&source_id)? || store.source_has_summaries(&source_id)? {
             continue;
         }
         if store.delete_source(&source_id)? {

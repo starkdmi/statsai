@@ -480,6 +480,19 @@ impl Store {
         Ok(events)
     }
 
+    /// Whether this source has any event at all.
+    ///
+    /// Answering this by loading the source's events meant deserializing every one of
+    /// them to look at `is_empty()`, which on an established source is tens of megabytes
+    /// of JSON to decide a boolean. `usage_events_source_idx` settles it from an index.
+    pub fn source_has_events(&self, source_id: &SourceId) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM usage_events WHERE source_id = ?1)",
+            params![&source_id.0],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Returns this source's events belonging to any of `conversation_id_hashes`.
     ///
     /// `usage_events_source_conversation_idx` indexes the same expression, so this

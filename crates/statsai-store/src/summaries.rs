@@ -96,6 +96,18 @@ impl Store {
         Ok(summaries)
     }
 
+    /// Whether this source has any summary at all.
+    ///
+    /// The counterpart to [`Store::source_has_events`], for the same reason: the callers
+    /// that ask this only ever wanted a boolean.
+    pub fn source_has_summaries(&self, source_id: &SourceId) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM usage_summaries WHERE source_id = ?1)",
+            params![&source_id.0],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn rewrite_summaries(&self, summaries: &[UsageSummary]) -> Result<u64> {
         if summaries.is_empty() {
             return Ok(0);
