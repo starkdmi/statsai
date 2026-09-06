@@ -1,6 +1,69 @@
 use super::*;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Active only while a [`ClaudeProjectPathMemo`] is held on this thread.
+    static PROJECT_PATHS: RefCell<Option<HashMap<PathBuf, Option<Vec<PathBuf>>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Reuses derived project paths for as long as it is held.
+///
+/// Deriving them is the single most expensive thing a Claude scan does. Every project
+/// store without a `sessions-index.json` falls back to opening each of its transcripts
+/// and reading the head of the file, so the cost follows the size of the history rather
+/// than anything that changed -- and three separate entry points ask for the same answer
+/// about the same directory during one pass over a source: the auth-override probe, the
+/// dependency-path list, and the settings-modified probe. Measured on a real history it
+/// was roughly 110ms, three times per source, on a scan of well under a second.
+///
+/// Scoping is explicit rather than global because the answer does go stale: a project
+/// added while a daemon is running has to be seen by the next pass. A caller holds this
+/// for one pass and drops it, and anything that does not hold one reads the filesystem
+/// exactly as before, so caching is never inherited by accident.
+///
+/// Nesting is safe: the guard restores whatever it replaced, so an inner scope cannot
+/// retire an outer one's entries early.
+#[must_use = "the memo is only active while the guard is held"]
+pub struct ClaudeProjectPathMemo {
+    previous: Option<HashMap<PathBuf, Option<Vec<PathBuf>>>>,
+}
+
+impl ClaudeProjectPathMemo {
+    pub fn begin() -> Self {
+        let previous = PROJECT_PATHS.with(|memo| memo.borrow_mut().replace(HashMap::new()));
+        Self { previous }
+    }
+}
+
+impl Drop for ClaudeProjectPathMemo {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        PROJECT_PATHS.with(|memo| *memo.borrow_mut() = previous);
+    }
+}
 
 pub(crate) fn claude_project_paths_from_session_indexes(
+    projects_root: &Path,
+) -> Option<Vec<PathBuf>> {
+    let memoized = PROJECT_PATHS.with(|memo| {
+        memo.borrow()
+            .as_ref()
+            .and_then(|paths| paths.get(projects_root).cloned())
+    });
+    if let Some(paths) = memoized {
+        return paths;
+    }
+    let derived = claude_project_paths_from_session_indexes_uncached(projects_root);
+    PROJECT_PATHS.with(|memo| {
+        if let Some(paths) = memo.borrow_mut().as_mut() {
+            paths.insert(projects_root.to_path_buf(), derived.clone());
+        }
+    });
+    derived
+}
+
+fn claude_project_paths_from_session_indexes_uncached(
     projects_root: &Path,
 ) -> Option<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(projects_root) {

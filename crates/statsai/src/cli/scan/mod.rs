@@ -89,6 +89,11 @@ pub(crate) fn scan_with_adapters(
         let sources = scan_sources_for_adapter(adapter.as_ref(), &configured_sources);
 
         for mut source in sources {
+            // Three separate adapter probes below ask the Claude adapter for the same
+            // source's project paths, and deriving them reads the project history.
+            // Held for one source and dropped, so the next source -- and the next scan
+            // -- sees the filesystem as it is then.
+            let _project_paths = statsai_adapters::ClaudeProjectPathMemo::begin();
             if source.path_label.is_none() {
                 source.path_label = path_label_from_hashless_source(&source);
             }

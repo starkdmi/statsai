@@ -2,6 +2,7 @@ mod auth;
 mod parse;
 mod tasks;
 
+pub use auth::ClaudeProjectPathMemo;
 pub(crate) use auth::*;
 pub(crate) use parse::*;
 pub(crate) use tasks::*;
