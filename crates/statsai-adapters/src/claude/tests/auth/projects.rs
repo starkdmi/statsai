@@ -623,3 +623,41 @@ fn nested_project_path_memo_scopes_do_not_retire_the_outer_one() {
         "and the filesystem is read again once every scope is gone"
     );
 }
+
+#[test]
+fn project_path_memo_does_not_remember_a_read_it_could_not_complete() {
+    // `None` means the directory could not be read conclusively, and the probes
+    // fail closed on it -- they suppress automatic attribution rather than assume a
+    // source is clear. Remembering it would let one unreadable moment settle the
+    // question for every probe left in the pass.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects_root = dir.path().join("projects");
+    // A file where a directory belongs: `read_dir` fails with something other than
+    // NotFound, which is what the derivation reports as inconclusive.
+    std::fs::write(&projects_root, "not a directory").expect("blocking file");
+
+    let _memo = ClaudeProjectPathMemo::begin();
+    assert_eq!(
+        claude_project_paths_from_session_indexes(&projects_root),
+        None,
+        "an unreadable projects root is inconclusive"
+    );
+
+    // Same scope, readable now. A memo that had remembered the failure would still
+    // be answering None.
+    std::fs::remove_file(&projects_root).expect("remove blocking file");
+    let project_store = projects_root.join("workspace");
+    std::fs::create_dir_all(&project_store).expect("project store");
+    std::fs::write(
+        project_store.join("sessions-index.json"),
+        serde_json::json!({ "originalPath": dir.path().join("workspace").to_string_lossy() })
+            .to_string(),
+    )
+    .expect("sessions index");
+
+    assert_eq!(
+        claude_project_paths_from_session_indexes(&projects_root).map(|paths| paths.len()),
+        Some(1),
+        "the next probe reads for itself rather than inheriting the failure"
+    );
+}

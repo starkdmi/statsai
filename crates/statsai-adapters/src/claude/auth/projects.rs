@@ -3,7 +3,7 @@ use std::cell::RefCell;
 
 thread_local! {
     /// Active only while a [`ClaudeProjectPathMemo`] is held on this thread.
-    static PROJECT_PATHS: RefCell<Option<HashMap<PathBuf, Option<Vec<PathBuf>>>>> =
+    static PROJECT_PATHS: RefCell<Option<HashMap<PathBuf, Vec<PathBuf>>>> =
         const { RefCell::new(None) };
 }
 
@@ -22,11 +22,17 @@ thread_local! {
 /// for one pass and drops it, and anything that does not hold one reads the filesystem
 /// exactly as before, so caching is never inherited by accident.
 ///
+/// Only a derivation that succeeded is reused. A `None` means the directory could not be
+/// read conclusively, and the probes fail closed on it -- they suppress automatic
+/// attribution rather than assume a source is clear. Remembering that answer would let
+/// one unreadable moment settle the question for the rest of the pass, so a failure is
+/// returned and forgotten, and the next probe reads for itself.
+///
 /// Nesting is safe: the guard restores whatever it replaced, so an inner scope cannot
 /// retire an outer one's entries early.
 #[must_use = "the memo is only active while the guard is held"]
 pub struct ClaudeProjectPathMemo {
-    previous: Option<HashMap<PathBuf, Option<Vec<PathBuf>>>>,
+    previous: Option<HashMap<PathBuf, Vec<PathBuf>>>,
 }
 
 impl ClaudeProjectPathMemo {
@@ -52,15 +58,16 @@ pub(crate) fn claude_project_paths_from_session_indexes(
             .and_then(|paths| paths.get(projects_root).cloned())
     });
     if let Some(paths) = memoized {
-        return paths;
+        return Some(paths);
     }
-    let derived = claude_project_paths_from_session_indexes_uncached(projects_root);
+    // `?` rather than caching the outcome: a failed read is deliberately not remembered.
+    let derived = claude_project_paths_from_session_indexes_uncached(projects_root)?;
     PROJECT_PATHS.with(|memo| {
         if let Some(paths) = memo.borrow_mut().as_mut() {
             paths.insert(projects_root.to_path_buf(), derived.clone());
         }
     });
-    derived
+    Some(derived)
 }
 
 fn claude_project_paths_from_session_indexes_uncached(
