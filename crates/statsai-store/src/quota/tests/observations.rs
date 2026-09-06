@@ -763,3 +763,319 @@ fn quota_attribution_uses_exact_interval_boundary_and_reattributes_history() {
         .iter()
         .all(|record| record.observation.provider_account_id == Some(account_id.clone())));
 }
+
+#[test]
+fn scoped_link_clearing_matches_the_full_orphan_sweep() {
+    // An incremental scan clears links only for the events it just deleted,
+    // rather than walking every observation in the store. The two must agree:
+    // a link whose event is gone is cleared, a link whose event survives is
+    // left alone, and an id that was deleted and re-inserted within the same
+    // scan still counts as surviving.
+    let store = Store::in_memory().expect("store");
+    let observed_at = DateTime::from_timestamp(1_787_000_000, 0).expect("time");
+    let (source_id, account_id) = assigned_source(&store, observed_at);
+
+    let deleted_event = sample_usage_event(
+        &source_id,
+        &account_id,
+        observed_at,
+        "record-deleted",
+        10,
+        0,
+        5,
+        0,
+        1_000,
+    );
+    let kept_event = sample_usage_event(
+        &source_id,
+        &account_id,
+        observed_at,
+        "record-kept",
+        10,
+        0,
+        5,
+        0,
+        1_000,
+    );
+    store.insert_event(&deleted_event).expect("insert deleted");
+    store.insert_event(&kept_event).expect("insert kept");
+
+    let mut linked_to_deleted = sample_record(
+        source_id.clone(),
+        "observation-orphaned",
+        "semantic-orphaned",
+        observed_at,
+        1_787_500_000,
+        "primary",
+        10_080,
+        20.0,
+    );
+    linked_to_deleted.observation.usage_event_id = Some(deleted_event.event_id.clone());
+    linked_to_deleted.observation.usage_link_kind = QuotaUsageLinkKind::RecordEvent;
+    let mut linked_to_kept = sample_record(
+        source_id.clone(),
+        "observation-live",
+        "semantic-live",
+        observed_at,
+        1_787_500_000,
+        "primary",
+        10_080,
+        20.0,
+    );
+    linked_to_kept.observation.usage_event_id = Some(kept_event.event_id.clone());
+    linked_to_kept.observation.usage_link_kind = QuotaUsageLinkKind::RecordEvent;
+    store
+        .upsert_quota_observations(&[linked_to_deleted, linked_to_kept])
+        .expect("linked observations");
+
+    store
+        .conn
+        .execute(
+            "DELETE FROM usage_events WHERE event_id = ?1",
+            [&deleted_event.event_id.0],
+        )
+        .expect("delete event");
+
+    // Both ids are offered, exactly as the scan offers everything it deleted.
+    let cleared = store
+        .clear_quota_usage_links_for_events(&[
+            deleted_event.event_id.clone(),
+            kept_event.event_id.clone(),
+        ])
+        .expect("clear scoped links");
+    assert_eq!(cleared, 1, "only the observation whose event is gone");
+
+    let links = store
+        .quota_observations(&QuotaQuery::default(), false)
+        .expect("observations")
+        .into_iter()
+        .map(|record| {
+            (
+                record.observation.observation_id,
+                record.observation.usage_event_id,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        links,
+        vec![
+            (
+                "observation-live".to_string(),
+                Some(kept_event.event_id.clone())
+            ),
+            ("observation-orphaned".to_string(), None),
+        ]
+    );
+
+    // The full sweep now has nothing left to find, which is what says the
+    // scoped pass did the same job.
+    assert_eq!(
+        store
+            .clear_orphaned_quota_usage_links()
+            .expect("full sweep"),
+        0
+    );
+}
+
+#[test]
+fn scoped_payload_gc_drops_orphans_and_keeps_shared_payloads() {
+    // Payloads are shared: identical rate-limit responses collapse onto one
+    // row. Deleting a file's observations may therefore orphan a payload or
+    // may leave it referenced by an observation from another file, and the
+    // scoped collector has to tell those apart the way the full sweep did.
+    let store = Store::in_memory().expect("store");
+    let observed_at = DateTime::from_timestamp(1_787_000_000, 0).expect("time");
+    let source_id = SourceId("source-payload-gc".to_string());
+
+    let mut sole_holder = sample_record(
+        source_id.clone(),
+        "observation-sole",
+        "semantic-sole",
+        observed_at,
+        1_787_500_000,
+        "primary",
+        10_080,
+        20.0,
+    );
+    sole_holder.raw_rate_limits = json!({"primary": {"used_percent": 99.0}});
+    sole_holder.observation.payload_hash =
+        hash_text(&serde_json::to_string(&sole_holder.raw_rate_limits).expect("payload"));
+
+    // Same payload, two different files: one deletion must not retire it.
+    let shared_a = sample_record(
+        source_id.clone(),
+        "observation-shared-a",
+        "semantic-shared-a",
+        observed_at,
+        1_787_500_000,
+        "primary",
+        10_080,
+        20.0,
+    );
+    let mut shared_b = shared_a.clone();
+    shared_b.observation.observation_id = "observation-shared-b".to_string();
+    shared_b.observation.semantic_fingerprint = "semantic-shared-b".to_string();
+    shared_b.observation.source_file_path_hash = "file-observation-shared-b".to_string();
+    shared_b.windows[0].observation_id = shared_b.observation.observation_id.clone();
+    shared_b.windows[0].window_observation_id = "window-observation-shared-b".to_string();
+    assert_eq!(
+        shared_a.observation.payload_hash,
+        shared_b.observation.payload_hash
+    );
+
+    store
+        .upsert_quota_observations(&[sole_holder.clone(), shared_a.clone(), shared_b])
+        .expect("observations");
+    assert_eq!(payload_count(&store), 2);
+
+    // Retiring the file behind `shared_a` leaves `shared_b` holding the payload.
+    store
+        .delete_quota_observations_for_source_file_hashes(
+            &source_id,
+            &["file-observation-shared-a".to_string()],
+        )
+        .expect("delete shared file");
+    assert_eq!(payload_count(&store), 2, "still referenced by shared-b");
+
+    // Retiring the only holder does orphan its payload.
+    store
+        .delete_quota_observations_for_source_file_hashes(
+            &source_id,
+            &["file-observation-sole".to_string()],
+        )
+        .expect("delete sole file");
+    assert_eq!(payload_count(&store), 1);
+
+    // And the full sweep agrees there is nothing left to collect.
+    store
+        .delete_unreferenced_quota_payloads()
+        .expect("full sweep");
+    assert_eq!(payload_count(&store), 1);
+}
+
+fn payload_count(store: &Store) -> u64 {
+    store
+        .conn
+        .query_row("SELECT COUNT(*) FROM quota_payloads", [], |row| {
+            row.get::<_, u64>(0)
+        })
+        .expect("payload count")
+}
+
+#[test]
+fn correcting_a_record_in_place_retires_the_payload_it_abandoned() {
+    // An observation is identified by its file and line, not by its contents, so a
+    // corrected file rewrites the same `observation_id` with a different
+    // `payload_hash`. The row is retained rather than deleted, and the payload it
+    // used to point at is left with no referent -- the scoped collector has to
+    // notice that, the way the full sweep it replaced did.
+    let store = Store::in_memory().expect("store");
+    let observed_at = DateTime::from_timestamp(1_787_000_000, 0).expect("time");
+    let source_id = SourceId("source-corrected".to_string());
+
+    let original = sample_record(
+        source_id.clone(),
+        "observation-corrected",
+        "semantic-original",
+        observed_at,
+        1_787_500_000,
+        "primary",
+        10_080,
+        20.0,
+    );
+    let file_hashes = vec![original.observation.source_file_path_hash.clone()];
+    store
+        .replace_quota_observations_for_source_files(
+            &source_id,
+            &file_hashes,
+            std::slice::from_ref(&original),
+        )
+        .expect("seed");
+    assert_eq!(payload_count(&store), 1);
+    let original_payload_hash = original.observation.payload_hash.clone();
+
+    // The same file and line, re-read with different rate limits: same id, new payload.
+    let mut corrected = original.clone();
+    corrected.raw_rate_limits = json!({"primary": {"used_percent": 91.0}});
+    corrected.observation.payload_hash =
+        hash_text(&serde_json::to_string(&corrected.raw_rate_limits).expect("payload"));
+    corrected.observation.semantic_fingerprint = "semantic-corrected".to_string();
+    assert_eq!(
+        corrected.observation.observation_id, original.observation.observation_id,
+        "the correction must land on the same observation"
+    );
+    assert_ne!(corrected.observation.payload_hash, original_payload_hash);
+
+    store
+        .replace_quota_observations_for_source_files(
+            &source_id,
+            &file_hashes,
+            std::slice::from_ref(&corrected),
+        )
+        .expect("re-scan corrected file");
+
+    assert_eq!(
+        payload_count(&store),
+        1,
+        "the abandoned payload must not outlive the observation that referenced it"
+    );
+    let remaining: String = store
+        .conn
+        .query_row("SELECT payload_hash FROM quota_payloads", [], |row| {
+            row.get(0)
+        })
+        .expect("remaining payload");
+    assert_eq!(remaining, corrected.observation.payload_hash);
+}
+
+#[test]
+fn conversation_scoped_event_load_survives_more_hashes_than_sqlite_takes_parameters() {
+    // One bound parameter per conversation: an unchunked `IN` list trips SQLite's
+    // variable limit and fails the enclosing scan outright.
+    let store = Store::in_memory().expect("store");
+    let observed_at = DateTime::from_timestamp(1_787_000_000, 0).expect("time");
+    let (source_id, account_id) = assigned_source(&store, observed_at);
+
+    // Two real events, at known times, so ordering across chunks is checked too.
+    let later = sample_usage_event(
+        &source_id,
+        &account_id,
+        observed_at + Duration::hours(1),
+        "record-later",
+        10,
+        0,
+        5,
+        0,
+        1_000,
+    );
+    let earlier = sample_usage_event(
+        &source_id,
+        &account_id,
+        observed_at,
+        "record-earlier",
+        10,
+        0,
+        5,
+        0,
+        1_000,
+    );
+    store.insert_event(&later).expect("insert later");
+    store.insert_event(&earlier).expect("insert earlier");
+
+    // `sample_usage_event` hashes the conversation to the record id.
+    let mut hashes = vec!["record-later".to_string()];
+    hashes.extend((0..40_000).map(|index| format!("absent-conversation-{index}")));
+    hashes.push("record-earlier".to_string());
+
+    let events = store
+        .events_for_source_conversations(&source_id, &hashes)
+        .expect("load bound conversations");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["record-earlier", "record-later"],
+        "both events found, in started_at order across chunk boundaries"
+    );
+}

@@ -1,5 +1,46 @@
 use super::*;
+use crate::{parse_rfc3339_for_row, QUOTA_PLAN_TYPE_SQL};
 use std::cmp::Reverse;
+
+/// What deciding a plan run needs from a quota observation, and nothing else.
+///
+/// Deriving plan evidence used to load whole `QuotaObservationRecordV1`s: the observation
+/// payload, the joined raw rate-limit payload, and every window row, all deserialized. On a
+/// source with 86k observations that is well over a hundred megabytes of JSON parsed to
+/// produce a couple dozen plan rows.
+///
+/// These five fields are what the collapse actually reads, and they are exactly the columns
+/// `quota_observations_plan_evidence_idx` carries, so the rebuild answers from an index
+/// without touching the table at all.
+#[derive(Debug, Clone)]
+pub(crate) struct QuotaPlanRunCandidate {
+    observation_id: String,
+    source_id: SourceId,
+    provider_account_id: Option<ProviderAccountId>,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    raw_plan_name: Option<String>,
+}
+
+/// The provenance fields only a surviving run's closing observation contributes.
+///
+/// Runs collapse thousands of candidates into a couple dozen, so these are resolved after
+/// the collapse rather than carried through it -- a few primary-key lookups instead of a
+/// column on every row.
+#[derive(Debug, Clone)]
+pub(crate) struct QuotaPlanRunEndpoint {
+    provider: String,
+    source_file_path_hash: String,
+    semantic_fingerprint: String,
+}
+
+/// One collapsed run of consecutive observations naming the same plan.
+#[derive(Debug, Clone)]
+struct QuotaPlanRun {
+    candidate_index: usize,
+    provider_account_id: ProviderAccountId,
+    raw_plan_name: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
 
 impl Store {
     /// Convert an attributed quota status into plan evidence. A plan label by itself never
@@ -16,21 +57,52 @@ impl Store {
         &self,
         records: &[QuotaObservationRecordV1],
     ) -> Result<u64> {
-        struct PlanRun<'a> {
-            quota: &'a statsai_core::QuotaObservationV1,
-            provider_account_id: ProviderAccountId,
-            raw_plan_name: &'a str,
-            started_at: chrono::DateTime<chrono::Utc>,
-        }
+        let candidates = records
+            .iter()
+            .map(|record| {
+                let quota = &record.observation;
+                QuotaPlanRunCandidate {
+                    observation_id: quota.observation_id.clone(),
+                    source_id: quota.source_id.clone(),
+                    provider_account_id: quota.provider_account_id.clone(),
+                    observed_at: quota.observed_at,
+                    raw_plan_name: quota.status.plan_type.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let runs = self.collapse_quota_plan_runs(&candidates)?;
+        // The caller already holds the whole record, so no lookup is needed here.
+        let endpoints = runs
+            .iter()
+            .map(|run| {
+                let quota = &records[run.candidate_index].observation;
+                QuotaPlanRunEndpoint {
+                    provider: quota.provider.clone(),
+                    source_file_path_hash: quota.source_file_path_hash.clone(),
+                    semantic_fingerprint: quota.semantic_fingerprint.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.upsert_account_plan_observations(&quota_plan_observations_from_runs(
+            &candidates,
+            &runs,
+            &endpoints,
+        ))
+    }
 
+    /// Collapses consecutive same-plan candidates into one run apiece.
+    ///
+    /// Returns the index of the candidate that closes each run, so the caller can supply
+    /// that observation's provenance however it is cheapest to obtain.
+    fn collapse_quota_plan_runs(
+        &self,
+        candidates: &[QuotaPlanRunCandidate],
+    ) -> Result<Vec<QuotaPlanRun>> {
         let mut assignments_by_source = HashMap::new();
-        let mut attributed: Vec<(ProviderAccountId, &str, &statsai_core::QuotaObservationV1)> =
-            Vec::new();
-        for record in records {
-            let quota = &record.observation;
+        let mut attributed: Vec<(ProviderAccountId, &str, usize)> = Vec::new();
+        for (index, quota) in candidates.iter().enumerate() {
             let Some(raw_plan_name) = quota
-                .status
-                .plan_type
+                .raw_plan_name
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -54,83 +126,44 @@ impl Store {
             let Some(provider_account_id) = provider_account_id else {
                 continue;
             };
-            attributed.push((provider_account_id, raw_plan_name, quota));
+            attributed.push((provider_account_id, raw_plan_name, index));
         }
         // Records reach here in scan order, which is not observation order once a
         // rotated file or a re-import interleaves them. A run is only meaningful
         // along the timeline, so sort before collapsing.
         attributed.sort_by(|left, right| {
-            left.2
+            let left_quota = &candidates[left.2];
+            let right_quota = &candidates[right.2];
+            left_quota
                 .source_id
                 .0
-                .cmp(&right.2.source_id.0)
-                .then_with(|| left.2.observed_at.cmp(&right.2.observed_at))
-                .then_with(|| left.2.observation_id.cmp(&right.2.observation_id))
+                .cmp(&right_quota.source_id.0)
+                .then_with(|| left_quota.observed_at.cmp(&right_quota.observed_at))
+                .then_with(|| left_quota.observation_id.cmp(&right_quota.observation_id))
         });
 
-        let mut runs: Vec<PlanRun<'_>> = Vec::new();
-        for (provider_account_id, raw_plan_name, quota) in attributed {
+        let mut runs: Vec<QuotaPlanRun> = Vec::new();
+        for (provider_account_id, raw_plan_name, index) in attributed {
+            let quota = &candidates[index];
             let continues_run = runs.last().is_some_and(|run| {
-                run.quota.source_id == quota.source_id
+                candidates[run.candidate_index].source_id == quota.source_id
                     && run.provider_account_id == provider_account_id
                     && run.raw_plan_name.eq_ignore_ascii_case(raw_plan_name)
             });
             if continues_run {
                 let run = runs.last_mut().expect("checked above");
-                run.quota = quota;
-                run.raw_plan_name = raw_plan_name;
+                run.candidate_index = index;
+                run.raw_plan_name = raw_plan_name.to_string();
                 continue;
             }
-            runs.push(PlanRun {
-                quota,
+            runs.push(QuotaPlanRun {
+                candidate_index: index,
                 provider_account_id,
-                raw_plan_name,
+                raw_plan_name: raw_plan_name.to_string(),
                 started_at: quota.observed_at,
             });
         }
-
-        let observations = runs
-            .into_iter()
-            .map(|run| {
-                let quota = run.quota;
-                AccountPlanObservationV1 {
-                    schema_version: ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
-                    // Identified by where the run began, so extending it does not
-                    // mint a new row and retire the old one on every scan.
-                    observation_id: account_plan_observation_id(
-                        &quota.source_id,
-                        Some(&run.provider_account_id),
-                        run.raw_plan_name,
-                        &normalize_plan_name(run.raw_plan_name),
-                        run.started_at,
-                        AccountEvidenceKind::QuotaStatus,
-                    ),
-                    provider: quota.provider.clone(),
-                    source_id: quota.source_id.clone(),
-                    provider_account_id: Some(run.provider_account_id),
-                    raw_plan_name: run.raw_plan_name.to_string(),
-                    plan_name: normalize_plan_name(run.raw_plan_name),
-                    observed_at: quota.observed_at,
-                    // No period: the provider reported a plan while serving a
-                    // request, it did not declare a billing window. It did
-                    // report it *as of that moment*, though, which is what
-                    // `is_current_snapshot` means -- and it is fresher than
-                    // `auth.json`, which can sit on disk unchanged for weeks.
-                    // Leaving this false meant an account whose logs say "plus"
-                    // every day still read as `last_detected` as soon as its
-                    // last declared provider period ran out.
-                    active_from: None,
-                    active_until: None,
-                    is_current_snapshot: true,
-                    evidence_kind: AccountEvidenceKind::QuotaStatus,
-                    confidence: Confidence::High,
-                    parser_version: "quota-plan-evidence.v1".to_string(),
-                    artifact_path_hash: quota.source_file_path_hash.clone(),
-                    record_fingerprint: quota.semantic_fingerprint.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-        self.upsert_account_plan_observations(&observations)
+        Ok(runs)
     }
 
     /// Rebuilds every plan observation derived from quota status for one source.
@@ -138,6 +171,13 @@ impl Store {
     /// Quota rows are mutable scan projections, while the general plan ledger is append-only.
     /// Removing the old derived subset before recreating it prevents corrected files or changed
     /// account attribution from leaving stale plan/account claims behind.
+    ///
+    /// This runs once per changed source on every scan, and a source can hold six figures of
+    /// observations, so the candidate read is served entirely from
+    /// `quota_observations_plan_evidence_idx` -- no table rows, no join to `quota_payloads`, no
+    /// window rows, no `serde`. Only the couple dozen observations that survive the collapse
+    /// are then looked up in full. Unordered on purpose: the collapse sorts along the timeline
+    /// itself, because scan order is not observation order once a rotated file lands.
     pub fn rebuild_quota_plan_observations_for_source(&self, source_id: &SourceId) -> Result<u64> {
         self.with_immediate_transaction(|| {
             self.conn.execute(
@@ -147,8 +187,55 @@ impl Store {
                     serde_json::to_string(&AccountEvidenceKind::QuotaStatus)?
                 ],
             )?;
-            let records = self.quota_observations_for_source(source_id)?;
-            self.upsert_quota_plan_observations(&records)
+            let sql = format!(
+                "SELECT observation_id, source_id, provider_account_id, observed_at,
+                        {QUOTA_PLAN_TYPE_SQL}
+                 FROM quota_observations
+                 WHERE source_id = ?1"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let candidates = statement
+                .query_map([&source_id.0], |row| {
+                    Ok(QuotaPlanRunCandidate {
+                        observation_id: row.get(0)?,
+                        source_id: SourceId(row.get(1)?),
+                        provider_account_id: row
+                            .get::<_, Option<String>>(2)?
+                            .map(ProviderAccountId),
+                        observed_at: parse_rfc3339_for_row(&row.get::<_, String>(3)?, 3)?,
+                        // `plan_type` is a JSON string, so a non-text value here is a
+                        // malformed payload rather than a plan; treated as absent.
+                        raw_plan_name: row.get::<_, Option<String>>(4).unwrap_or(None),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+
+            let runs = self.collapse_quota_plan_runs(&candidates)?;
+            let mut endpoints = Vec::with_capacity(runs.len());
+            let mut statement = self.conn.prepare(
+                "SELECT provider, source_file_path_hash, semantic_fingerprint
+                 FROM quota_observations WHERE observation_id = ?1",
+            )?;
+            for run in &runs {
+                endpoints.push(statement.query_row(
+                    [&candidates[run.candidate_index].observation_id],
+                    |row| {
+                        Ok(QuotaPlanRunEndpoint {
+                            provider: row.get(0)?,
+                            source_file_path_hash: row.get(1)?,
+                            semantic_fingerprint: row.get(2)?,
+                        })
+                    },
+                )?);
+            }
+            drop(statement);
+
+            self.upsert_account_plan_observations(&quota_plan_observations_from_runs(
+                &candidates,
+                &runs,
+                &endpoints,
+            ))
         })
     }
 
@@ -460,20 +547,24 @@ impl Store {
     }
 
     pub fn reattribute_conversation_bound_events(&self, source_id: &SourceId) -> Result<u64> {
-        // Nothing to reattribute without bindings, and this is the common case:
-        // every scan of every Auto-verified source reached here. Checking first
-        // avoids loading and deserializing the source's events for no reason.
-        if self
-            .conversation_account_bindings(Some(source_id))?
-            .is_empty()
-        {
+        let bindings = self.conversation_account_bindings(Some(source_id))?;
+        // `apply_conversation_account_bindings` can only change an event whose
+        // conversation one of these bindings names, and it ignores turn-scoped
+        // bindings, so this is the exact set of conversations worth loading. It is
+        // usually a few dozen against tens of thousands of events: loading the whole
+        // source meant parsing sixty megabytes of payload to touch none of it.
+        let conversation_id_hashes = bindings
+            .iter()
+            .filter(|binding| binding.turn_id_hash.is_none())
+            .map(|binding| binding.conversation_id_hash.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if conversation_id_hashes.is_empty() {
             return Ok(0);
         }
-        // `events()` reads every row in `usage_events` and deserializes each
-        // payload before this filter sees it. On a store with hundreds of
-        // thousands of events that is the whole table parsed to keep one
-        // source's share; `events_for_source` pushes the same filter into SQL.
-        let mut events = self.events_for_source(source_id)?;
+        let mut events =
+            self.events_for_source_conversations(source_id, &conversation_id_hashes)?;
         let previous_accounts = events
             .iter()
             .map(|event| event.provider_account_id.clone())
@@ -694,4 +785,56 @@ fn plan_projection_precedence(
         Reverse(projection.plan_name.as_str()),
         Reverse(projection.raw_plan_name.as_str()),
     )
+}
+
+/// Turns collapsed runs into the ledger rows they claim.
+///
+/// `runs` and `endpoints` are parallel: each endpoint describes the observation that
+/// closes the run at the same index.
+fn quota_plan_observations_from_runs(
+    candidates: &[QuotaPlanRunCandidate],
+    runs: &[QuotaPlanRun],
+    endpoints: &[QuotaPlanRunEndpoint],
+) -> Vec<AccountPlanObservationV1> {
+    runs.iter()
+        .zip(endpoints)
+        .map(|(run, endpoint)| {
+            let quota = &candidates[run.candidate_index];
+            AccountPlanObservationV1 {
+                schema_version: ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+                // Identified by where the run began, so extending it does not
+                // mint a new row and retire the old one on every scan.
+                observation_id: account_plan_observation_id(
+                    &quota.source_id,
+                    Some(&run.provider_account_id),
+                    &run.raw_plan_name,
+                    &normalize_plan_name(&run.raw_plan_name),
+                    run.started_at,
+                    AccountEvidenceKind::QuotaStatus,
+                ),
+                provider: endpoint.provider.clone(),
+                source_id: quota.source_id.clone(),
+                provider_account_id: Some(run.provider_account_id.clone()),
+                raw_plan_name: run.raw_plan_name.clone(),
+                plan_name: normalize_plan_name(&run.raw_plan_name),
+                observed_at: quota.observed_at,
+                // No period: the provider reported a plan while serving a
+                // request, it did not declare a billing window. It did
+                // report it *as of that moment*, though, which is what
+                // `is_current_snapshot` means -- and it is fresher than
+                // `auth.json`, which can sit on disk unchanged for weeks.
+                // Leaving this false meant an account whose logs say "plus"
+                // every day still read as `last_detected` as soon as its
+                // last declared provider period ran out.
+                active_from: None,
+                active_until: None,
+                is_current_snapshot: true,
+                evidence_kind: AccountEvidenceKind::QuotaStatus,
+                confidence: Confidence::High,
+                parser_version: "quota-plan-evidence.v1".to_string(),
+                artifact_path_hash: endpoint.source_file_path_hash.clone(),
+                record_fingerprint: endpoint.semantic_fingerprint.clone(),
+            }
+        })
+        .collect()
 }

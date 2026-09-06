@@ -480,6 +480,48 @@ impl Store {
         Ok(events)
     }
 
+    /// Returns this source's events belonging to any of `conversation_id_hashes`.
+    ///
+    /// `usage_events_source_conversation_idx` indexes the same expression, so this
+    /// reads an index range per conversation instead of the whole table.
+    pub fn events_for_source_conversations(
+        &self,
+        source_id: &SourceId,
+        conversation_id_hashes: &[String],
+    ) -> Result<Vec<UsageEvent>> {
+        if conversation_id_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One parameter per conversation, plus the source, so an unbounded list would
+        // eventually trip SQLite's variable limit and fail the whole scan. Chunked to
+        // match every other `IN` lookup in the store.
+        const CHUNK_SIZE: usize = 300;
+        let mut events = Vec::new();
+        for chunk in conversation_id_hashes.chunks(CHUNK_SIZE) {
+            let sql = format!(
+                "SELECT payload FROM usage_events
+                 WHERE source_id = ?1 AND {EVENT_CONVERSATION_HASH_SQL} IN ({})",
+                sqlite_in_clause_placeholders(chunk.len())
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut bindings: Vec<&dyn rusqlite::types::ToSql> = vec![&source_id.0];
+            bindings.extend(sqlite_string_params(chunk));
+            let rows = stmt.query_map(bindings.as_slice(), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                events.push(serde_json::from_str::<UsageEvent>(&row?)?);
+            }
+        }
+        // Ordering is applied here rather than per chunk, so the result is in one order
+        // however the hashes were split.
+        events.sort_by(|left, right| {
+            left.session
+                .started_at
+                .cmp(&right.session.started_at)
+                .then_with(|| left.event_id.0.cmp(&right.event_id.0))
+        });
+        Ok(events)
+    }
+
     pub fn events_after(&self, cursor: Option<(&DateTime<Utc>, &str)>) -> Result<Vec<UsageEvent>> {
         let sql = if cursor.is_some() {
             r#"
@@ -524,17 +566,33 @@ impl Store {
         })
     }
 
-    pub fn delete_events_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
+    pub fn delete_events_for_sources(
+        &self,
+        source_ids: &[SourceId],
+    ) -> Result<EventDeletionImpact> {
         self.with_immediate_transaction(|| {
-            let mut deleted = 0u64;
+            let mut impact = EventDeletionImpact::default();
             for source_id in source_ids {
-                deleted += self.conn.execute(
+                // `usage_events_source_idx` covers this, so naming the ids costs an
+                // index range read rather than a pass over the payloads.
+                let mut statement = self
+                    .conn
+                    .prepare("SELECT event_id FROM usage_events WHERE source_id = ?1")?;
+                let rows = statement.query_map(params![&source_id.0], |row| {
+                    row.get::<_, String>(0).map(EventId)
+                })?;
+                for row in rows {
+                    impact.deleted_event_ids.push(row?);
+                }
+                drop(statement);
+
+                impact.deleted += self.conn.execute(
                     "DELETE FROM usage_events WHERE source_id = ?1",
                     params![&source_id.0],
                 )? as u64;
             }
             self.delete_sync_rollups_for_sources_in_tx(source_ids)?;
-            Ok(deleted)
+            Ok(impact)
         })
     }
 
@@ -542,26 +600,29 @@ impl Store {
         &self,
         source_id: &SourceId,
         file_hashes: &[String],
-    ) -> Result<u64> {
+    ) -> Result<EventDeletionImpact> {
         if file_hashes.is_empty() {
-            return Ok(0);
+            return Ok(EventDeletionImpact::default());
         }
 
         self.with_immediate_transaction(|| {
-            let mut deleted = 0u64;
+            let mut impact = EventDeletionImpact::default();
             let mut dirty_keys = BTreeSet::new();
 
+            // Both statements filter on the expression `usage_events_source_file_idx`
+            // indexes, so they read an index range rather than the whole table.
+            let select_sql = format!(
+                "SELECT payload FROM usage_events
+                 WHERE source_id = ?1 AND {EVENT_SOURCE_FILE_HASH_SQL} = ?2"
+            );
+            let delete_sql = format!(
+                "DELETE FROM usage_events
+                 WHERE source_id = ?1 AND {EVENT_SOURCE_FILE_HASH_SQL} = ?2"
+            );
             for file_hash in file_hashes {
                 let payloads: Vec<String>;
                 {
-                    let mut stmt = self.conn.prepare(
-                        r#"
-                        SELECT payload
-                        FROM usage_events
-                        WHERE source_id = ?1
-                          AND json_extract(payload, '$.parse_evidence.source_file_path_hash') = ?2
-                        "#,
-                    )?;
+                    let mut stmt = self.conn.prepare(&select_sql)?;
                     let rows =
                         stmt.query_map(params![&source_id.0, file_hash], |row| row.get(0))?;
                     payloads = rows.collect::<Result<Vec<_>, _>>()?;
@@ -570,20 +631,17 @@ impl Store {
                 for payload in payloads {
                     let event: UsageEvent = serde_json::from_str(&payload)?;
                     dirty_keys.insert(sync_rollup_bucket_key(&event));
+                    impact.deleted_event_ids.push(event.event_id);
                 }
 
-                deleted += self.conn.execute(
-                    r#"
-                    DELETE FROM usage_events
-                    WHERE source_id = ?1
-                      AND json_extract(payload, '$.parse_evidence.source_file_path_hash') = ?2
-                    "#,
-                    params![&source_id.0, file_hash],
-                )? as u64;
+                impact.deleted += self
+                    .conn
+                    .execute(&delete_sql, params![&source_id.0, file_hash])?
+                    as u64;
             }
 
             self.refresh_sync_rollups_for_keys(&dirty_keys)?;
-            Ok(deleted)
+            Ok(impact)
         })
     }
 

@@ -68,7 +68,9 @@ pub(crate) fn source(command: SourceCommand, store: &Store, device_id: &str) -> 
                 .source(&source_id)?
                 .with_context(|| format!("unknown source {}", source_id.0))?;
             let deleted_events = if delete_data {
-                store.delete_events_for_sources(std::slice::from_ref(&source_id))?
+                store
+                    .delete_events_for_sources(std::slice::from_ref(&source_id))?
+                    .deleted
             } else {
                 0
             };

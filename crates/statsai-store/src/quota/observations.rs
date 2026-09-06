@@ -1,6 +1,19 @@
 use super::*;
 
 impl Store {
+    /// Writes observations without collecting payloads, which callers must arrange for.
+    ///
+    /// An observation is keyed by its file and line rather than its contents, so upserting
+    /// a corrected record swaps its `payload_hash` and can leave the payload it used to
+    /// point at with no referent. Nothing here notices that. Every current caller reaches
+    /// this having already deleted the observations it is about to write --
+    /// `delete_quota_observations_for_sources` or
+    /// `delete_quota_observations_for_source_file_hashes`, both of which collect what they
+    /// orphan -- so the upsert only ever inserts, and there is no stale hash to abandon.
+    ///
+    /// A caller that upserts over rows it did not first delete needs
+    /// [`Store::replace_quota_observations_for_source_files`] instead, which reconciles and
+    /// collects in one step.
     pub fn upsert_quota_observations(&self, records: &[QuotaObservationRecordV1]) -> Result<u64> {
         self.with_immediate_transaction(|| self.upsert_quota_observations_inner(records))
     }
@@ -200,19 +213,27 @@ impl Store {
             .map(|record| record.observation.observation_id.as_str())
             .collect::<HashSet<_>>();
 
+        let mut orphaned_payload_hashes = BTreeSet::new();
         for source_file_path_hash in source_file_path_hashes {
             let mut statement = self.conn.prepare(
-                "SELECT observation_id FROM quota_observations
+                "SELECT observation_id, payload_hash FROM quota_observations
                  WHERE source_id = ?1 AND source_file_path_hash = ?2",
             )?;
-            let stored_observation_ids = statement
+            let stored_observations = statement
                 .query_map(params![&source_id.0, source_file_path_hash], |row| {
-                    row.get::<_, String>(0)
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
 
-            for observation_id in stored_observation_ids {
+            for (observation_id, payload_hash) in stored_observations {
+                // Every stored hash is a candidate, retained rows included. An
+                // observation is identified by its file and line, not by its contents,
+                // so a corrected file keeps the same `observation_id` while the upsert
+                // swaps its `payload_hash` -- and the payload it pointed at before can
+                // be left with no referent at all. The check after the upsert is what
+                // decides; this only has to avoid overlooking one.
+                orphaned_payload_hashes.insert(payload_hash);
                 if retained_observation_ids.contains(observation_id.as_str()) {
                     continue;
                 }
@@ -228,7 +249,9 @@ impl Store {
         }
 
         let written = self.upsert_quota_observations_inner(records)?;
-        self.delete_unreferenced_quota_payloads()?;
+        // After the upsert, so a payload the incoming records reuse is seen as still
+        // referenced rather than deleted and immediately rewritten.
+        self.delete_unreferenced_quota_payloads_for_hashes(&orphaned_payload_hashes)?;
         Ok(written)
     }
 
@@ -377,7 +400,20 @@ impl Store {
     ) -> Result<u64> {
         self.with_immediate_transaction(|| {
             let mut deleted = 0u64;
+            let mut orphaned_payload_hashes = BTreeSet::new();
             for file_hash in file_hashes {
+                let mut statement = self.conn.prepare(
+                    "SELECT payload_hash FROM quota_observations
+                     WHERE source_id = ?1 AND source_file_path_hash = ?2",
+                )?;
+                let rows = statement.query_map(params![&source_id.0, file_hash], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                for row in rows {
+                    orphaned_payload_hashes.insert(row?);
+                }
+                drop(statement);
+
                 self.conn.execute(
                     "DELETE FROM quota_window_observations WHERE observation_id IN (SELECT observation_id FROM quota_observations WHERE source_id = ?1 AND source_file_path_hash = ?2)",
                     params![&source_id.0, file_hash],
@@ -387,7 +423,7 @@ impl Store {
                     params![&source_id.0, file_hash],
                 )? as u64);
             }
-            self.delete_unreferenced_quota_payloads()?;
+            self.delete_unreferenced_quota_payloads_for_hashes(&orphaned_payload_hashes)?;
             Ok(deleted)
         })
     }
@@ -412,24 +448,29 @@ impl Store {
                 .map(String::as_str)
                 .collect::<HashSet<_>>();
             let mut statement = self.conn.prepare(
-                "SELECT observation_id, source_file_path_hash FROM quota_observations
+                "SELECT observation_id, source_file_path_hash, payload_hash FROM quota_observations
                  WHERE source_id = ?1",
             )?;
             let orphaned = statement
                 .query_map([&source_id.0], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
-                .filter(|(_, file_hash)| !retained.contains(file_hash.as_str()))
-                .map(|(observation_id, _)| observation_id)
+                .filter(|(_, file_hash, _)| !retained.contains(file_hash.as_str()))
+                .map(|(observation_id, _, payload_hash)| (observation_id, payload_hash))
                 .collect::<Vec<_>>();
             drop(statement);
             if orphaned.is_empty() {
                 return Ok(0);
             }
             let mut deleted = 0u64;
-            for observation_id in orphaned {
+            let mut orphaned_payload_hashes = BTreeSet::new();
+            for (observation_id, payload_hash) in orphaned {
                 self.conn.execute(
                     "DELETE FROM quota_window_observations WHERE observation_id = ?1",
                     [&observation_id],
@@ -438,17 +479,49 @@ impl Store {
                     "DELETE FROM quota_observations WHERE observation_id = ?1",
                     [&observation_id],
                 )? as u64);
+                orphaned_payload_hashes.insert(payload_hash);
             }
-            self.delete_unreferenced_quota_payloads()?;
+            self.delete_unreferenced_quota_payloads_for_hashes(&orphaned_payload_hashes)?;
             Ok(deleted)
         })
     }
 
+    /// Drops every payload no observation references, anywhere in the store.
+    ///
+    /// This reads `quota_payloads` in full and probes `quota_observations` for each
+    /// row, which is proportional to the archive rather than to what was just deleted.
+    /// Paths that know which payloads they orphaned should use
+    /// [`Store::delete_unreferenced_quota_payloads_for_hashes`].
     pub(crate) fn delete_unreferenced_quota_payloads(&self) -> Result<()> {
         self.conn.execute(
             "DELETE FROM quota_payloads WHERE payload_hash NOT IN (SELECT payload_hash FROM quota_observations)",
             [],
         )?;
+        Ok(())
+    }
+
+    /// Drops the payloads among `payload_hashes` that nothing references any more.
+    ///
+    /// Payloads are shared: identical rate-limit responses collapse onto one row, so a
+    /// deleted observation only orphans its payload when it was the last holder. The
+    /// `NOT EXISTS` probe rides `quota_observations_payload_hash_idx` as a covering
+    /// index, making this proportional to the deletion instead of the table.
+    pub(crate) fn delete_unreferenced_quota_payloads_for_hashes(
+        &self,
+        payload_hashes: &BTreeSet<String>,
+    ) -> Result<()> {
+        if payload_hashes.is_empty() {
+            return Ok(());
+        }
+        let mut statement = self.conn.prepare(
+            "DELETE FROM quota_payloads WHERE payload_hash = ?1
+             AND NOT EXISTS (
+               SELECT 1 FROM quota_observations o WHERE o.payload_hash = quota_payloads.payload_hash
+             )",
+        )?;
+        for payload_hash in payload_hashes {
+            statement.execute([payload_hash])?;
+        }
         Ok(())
     }
 

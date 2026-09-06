@@ -70,6 +70,9 @@ pub(crate) fn scan_with_adapters(
     let mut preview_rebuild_duration_ms = 0u64;
     let mut delete_duration_ms = 0u64;
     let mut insert_events_duration_ms = 0u64;
+    let mut quota_reconcile_duration_ms = 0u64;
+    let mut plan_rebuild_duration_ms = 0u64;
+    let mut orphan_links_duration_ms = 0u64;
     let mut upsert_summaries_duration_ms = 0u64;
     let mut upsert_task_spans_duration_ms = 0u64;
     let mut rebuild_work_items_duration_ms = 0u64;
@@ -350,10 +353,13 @@ pub(crate) fn scan_with_adapters(
                     BTreeSet::new()
                 };
                 let mut deleted_task_spans = Vec::new();
+                let mut deleted_event_ids = Vec::new();
                 if replace_source_records {
                     let delete_started_at = Instant::now();
-                    removed_event_count +=
+                    let deleted_events =
                         store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
+                    removed_event_count += deleted_events.deleted;
+                    deleted_event_ids.extend(deleted_events.deleted_event_ids);
                     removed_summary_count += store
                         .delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
                     if replace_all_source_quota_records {
@@ -377,10 +383,12 @@ pub(crate) fn scan_with_adapters(
                         &pending_file_entries,
                         &removed_file_entries,
                     );
-                    removed_event_count += store.delete_events_for_source_file_hashes(
+                    let deleted_events = store.delete_events_for_source_file_hashes(
                         &source.source_id,
                         &reconciled_file_hashes,
                     )?;
+                    removed_event_count += deleted_events.deleted;
+                    deleted_event_ids.extend(deleted_events.deleted_event_ids);
                     removed_summary_count += store.delete_summaries_for_source_file_hashes(
                         &source.source_id,
                         &reconciled_file_hashes,
@@ -409,6 +417,7 @@ pub(crate) fn scan_with_adapters(
                     &mut scan.quota_observations,
                     &insert_result.canonical_event_ids,
                 );
+                let quota_reconcile_started_at = Instant::now();
                 if replace_source_records && !replace_all_source_quota_records {
                     let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
                         &file_cache_entries,
@@ -430,8 +439,19 @@ pub(crate) fn scan_with_adapters(
                 } else {
                     store.upsert_quota_observations(&scan.quota_observations)?;
                 }
+                quota_reconcile_duration_ms +=
+                    quota_reconcile_started_at.elapsed().as_millis() as u64;
+
+                let plan_rebuild_started_at = Instant::now();
                 store.rebuild_quota_plan_observations_for_source(&source.source_id)?;
-                store.clear_orphaned_quota_usage_links()?;
+                plan_rebuild_duration_ms += plan_rebuild_started_at.elapsed().as_millis() as u64;
+
+                // Only the events this scan deleted can have orphaned a quota link, so
+                // the repair is scoped to them rather than sweeping every observation
+                // in the store looking for a dangling id.
+                let orphan_links_started_at = Instant::now();
+                store.clear_quota_usage_links_for_events(&deleted_event_ids)?;
+                orphan_links_duration_ms += orphan_links_started_at.elapsed().as_millis() as u64;
                 if command.include_tasks {
                     rewrite_task_span_linked_event_ids(
                         &mut scan.task_spans,
@@ -593,10 +613,13 @@ pub(crate) fn scan_with_adapters(
         }
         if command.verbose {
             println!(
-                "timings_ms: adapter_scan={} delete={} insert_events={} upsert_summaries={} upsert_task_spans={} rebuild_work_items={} rebuild_delete={} rebuild_span_load={} rebuild_verifications={} rebuild_grouping={} rebuild_title_selection={} rebuild_insert={} total_wall={}",
+                "timings_ms: adapter_scan={} delete={} insert_events={} quota_reconcile={} plan_rebuild={} orphan_links={} upsert_summaries={} upsert_task_spans={} rebuild_work_items={} rebuild_delete={} rebuild_span_load={} rebuild_verifications={} rebuild_grouping={} rebuild_title_selection={} rebuild_insert={} total_wall={}",
                 format_u64(adapter_scan_duration_ms),
                 format_u64(delete_duration_ms),
                 format_u64(insert_events_duration_ms),
+                format_u64(quota_reconcile_duration_ms),
+                format_u64(plan_rebuild_duration_ms),
+                format_u64(orphan_links_duration_ms),
                 format_u64(upsert_summaries_duration_ms),
                 format_u64(upsert_task_spans_duration_ms),
                 format_u64(rebuild_work_items_duration_ms),

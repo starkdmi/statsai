@@ -8,7 +8,7 @@ mod v2;
 pub(crate) use v1::*;
 pub(crate) use v2::*;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 23;
+pub const CURRENT_SCHEMA_VERSION: i64 = 24;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -148,6 +148,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         21 => apply_migration_021(conn),
         22 => apply_migration_022(conn),
         23 => apply_migration_023(conn),
+        24 => apply_migration_024(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -285,6 +286,7 @@ pub fn schema_version(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{EVENT_CONVERSATION_HASH_SQL, EVENT_SOURCE_FILE_HASH_SQL, QUOTA_PLAN_TYPE_SQL};
     use rusqlite::Connection;
 
     #[test]
@@ -325,6 +327,100 @@ mod tests {
             &conn,
             "quota_window_observations_observation_idx"
         ));
+        for index in [
+            "usage_events_source_file_idx",
+            "usage_events_source_conversation_idx",
+            "usage_events_source_idx",
+            "quota_observations_payload_hash_idx",
+            "quota_observations_usage_event_idx",
+            "quota_observations_plan_evidence_idx",
+        ] {
+            assert!(index_exists(&conn, index), "missing index {index}");
+        }
+    }
+
+    /// The scan filters are only fast while SQLite can match them to the indexes
+    /// migration 024 creates, and an expression index is matched by the text of the
+    /// expression. Reformatting a query -- or the index -- silently drops it back to a
+    /// full table scan, which is exactly the regression these indexes exist to fix, so
+    /// the plans are asserted rather than assumed.
+    #[test]
+    fn scan_hot_paths_use_indexes_rather_than_table_scans() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        migrate(&conn).expect("migrate fresh database");
+
+        for (label, sql) in [
+            (
+                "delete events for a source file",
+                format!(
+                    "SELECT payload FROM usage_events
+                     WHERE source_id = ?1 AND {EVENT_SOURCE_FILE_HASH_SQL} = ?2"
+                ),
+            ),
+            (
+                "load a source's bound conversations",
+                format!(
+                    "SELECT payload FROM usage_events
+                     WHERE source_id = ?1 AND {EVENT_CONVERSATION_HASH_SQL} IN (?2)
+                     ORDER BY started_at, event_id"
+                ),
+            ),
+            (
+                "look up a run endpoint's provenance",
+                "SELECT provider, source_file_path_hash, semantic_fingerprint
+                 FROM quota_observations WHERE observation_id = ?1"
+                    .to_string(),
+            ),
+            (
+                "clear one event's quota links",
+                "SELECT observation_id FROM quota_observations WHERE usage_event_id = ?1"
+                    .to_string(),
+            ),
+            (
+                "collect a payload's remaining references",
+                "SELECT 1 FROM quota_observations o WHERE o.payload_hash = ?1".to_string(),
+            ),
+        ] {
+            let plan = query_plan(&conn, &sql);
+            assert!(
+                !plan.contains("SCAN"),
+                "{label} falls back to a table scan: {plan}"
+            );
+        }
+
+        // The plan rebuild reads every observation a changed source holds, so it has to
+        // ride its own index. Asserted by name rather than by `COVERING`: whether SQLite
+        // reports the expression index as covering varies by version, and the read is
+        // fast either way as long as it is this index that serves it.
+        let plan_evidence = query_plan(
+            &conn,
+            &format!(
+                "SELECT observation_id, source_id, provider_account_id, observed_at,
+                        {QUOTA_PLAN_TYPE_SQL}
+                 FROM quota_observations WHERE source_id = ?1"
+            ),
+        );
+        assert!(
+            plan_evidence.contains("quota_observations_plan_evidence_idx"),
+            "plan evidence read does not use its index: {plan_evidence}"
+        );
+    }
+
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut statement = conn.prepare(&explain).expect("prepare explain");
+        // Planning does not read the bound values, only their count.
+        let bindings = (0..statement.parameter_count())
+            .map(|_| rusqlite::types::Null)
+            .collect::<Vec<_>>();
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(bindings), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("run explain")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("read explain rows");
+        rows.join(" | ")
     }
 
     #[test]
@@ -337,20 +433,20 @@ mod tests {
               applied_at TEXT NOT NULL
             );
             INSERT INTO schema_migrations (version, applied_at)
-            VALUES (24, '2026-08-23T00:00:00Z');
+            VALUES (25, '2026-08-23T00:00:00Z');
             "#,
         )
         .expect("create future schema marker");
 
-        let error = migrate(&conn).expect_err("schema 24 must be rejected by schema 23 binary");
+        let error = migrate(&conn).expect_err("schema 25 must be rejected by schema 24 binary");
 
         assert_eq!(
             error.to_string(),
-            "database schema version 24 is newer than this StatsAI binary supports (23); upgrade StatsAI or use a compatible database"
+            "database schema version 25 is newer than this StatsAI binary supports (24); upgrade StatsAI or use a compatible database"
         );
         assert_eq!(
             current_schema_version(&conn).expect("read unchanged version"),
-            24
+            25
         );
     }
 

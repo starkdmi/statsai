@@ -1,4 +1,5 @@
 use super::*;
+use crate::{EVENT_CONVERSATION_HASH_SQL, EVENT_SOURCE_FILE_HASH_SQL, QUOTA_PLAN_TYPE_SQL};
 use rusqlite::params;
 use statsai_core::{account_plan_observation_id, AccountPlanObservationV1};
 
@@ -433,5 +434,43 @@ pub(crate) fn apply_migration_023(conn: &Connection) -> Result<()> {
             ],
         )?;
     }
+    Ok(())
+}
+
+/// Indexes the lookups an incremental scan makes once per changed source.
+///
+/// Each of these filters existed before this migration and each one fell back to a
+/// full table scan, so a scan that touched one file still read `usage_events` and
+/// `quota_observations` end to end -- hundreds of megabytes apiece on a store with a
+/// year of history. The cost grew with the archive rather than with the change, which
+/// is the opposite of what an incremental scan promises.
+///
+/// Two of these index an expression rather than a column, because the file hash and
+/// the conversation hash live inside the event payload. The expression text comes from
+/// the same constants the queries use, since SQLite only matches an expression index
+/// when the query spells the expression exactly the same way.
+pub(crate) fn apply_migration_024(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        r#"
+        CREATE INDEX IF NOT EXISTS usage_events_source_file_idx
+          ON usage_events (source_id, {EVENT_SOURCE_FILE_HASH_SQL});
+        CREATE INDEX IF NOT EXISTS usage_events_source_conversation_idx
+          ON usage_events (source_id, {EVENT_CONVERSATION_HASH_SQL});
+        CREATE INDEX IF NOT EXISTS usage_events_source_idx
+          ON usage_events (source_id, started_at, event_id);
+        CREATE INDEX IF NOT EXISTS quota_observations_payload_hash_idx
+          ON quota_observations (payload_hash);
+        -- Wide enough to answer the plan-evidence read outright. The alternative is
+        -- reading a source's observation rows to reach one field inside each payload,
+        -- which is hundreds of megabytes on a source with a year of history.
+        CREATE INDEX IF NOT EXISTS quota_observations_plan_evidence_idx
+          ON quota_observations (source_id, observed_at, observation_id,
+                                 provider_account_id, {QUOTA_PLAN_TYPE_SQL});
+        -- Partial, because a link that is already NULL is never the orphan being
+        -- cleared, and the store is overwhelmingly linked rows.
+        CREATE INDEX IF NOT EXISTS quota_observations_usage_event_idx
+          ON quota_observations (usage_event_id) WHERE usage_event_id IS NOT NULL;
+        "#,
+    ))?;
     Ok(())
 }
