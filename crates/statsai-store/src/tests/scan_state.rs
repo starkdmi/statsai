@@ -357,3 +357,56 @@ fn scan_file_replacement_clears_links_to_events_it_retired() {
         "and the full sweep has nothing left to find"
     );
 }
+
+#[test]
+fn legacy_provenance_check_survives_a_payload_it_cannot_read() {
+    // The check runs on the ordinary incremental scan path, so raising on one
+    // unreadable payload would fail the whole scan for that source. A payload that
+    // cannot be parsed has no readable file hash either, so it has to read as
+    // missing -- the answer that asks for the fuller reconcile.
+    let store = Store::in_memory().expect("store");
+    let source = statsai_core::SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-legacy-provenance"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let now = Utc::now();
+
+    // One well-formed record that does carry provenance.
+    let mut hashed = test_store_event(&source, now, "hashed-record");
+    hashed.parse_evidence = Some(statsai_core::ParseEvidence {
+        event_key_version: "v1".to_string(),
+        source_file_path_hash: Some(hash_text("/tmp/codex-legacy-provenance/a.jsonl")),
+        source_line_number: Some(1),
+        source_record_id: Some("hashed-record".to_string()),
+        model_inferred: false,
+        timestamp_inferred: false,
+        account_identity_source: IdentitySource::Unresolved,
+    });
+    store.insert_event(&hashed).expect("hashed event");
+    assert!(
+        !store
+            .source_records_missing_scan_file_hashes(&source.source_id)
+            .expect("all records carry provenance"),
+        "a source whose records all carry a file hash is not missing any"
+    );
+
+    // The kind of row the repricing and quota paths deliberately survive.
+    store
+        .conn
+        .execute(
+            "UPDATE usage_events SET payload = 'not json at all' WHERE event_id = ?1",
+            [&hashed.event_id.0],
+        )
+        .expect("corrupt the payload");
+
+    assert!(
+        store
+            .source_records_missing_scan_file_hashes(&source.source_id)
+            .expect("an unreadable payload must not fail the check"),
+        "a payload that cannot be read counts as missing provenance"
+    );
+}
