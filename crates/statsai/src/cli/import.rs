@@ -94,6 +94,8 @@ pub(crate) fn import_cursor_usage_events(
         device_id: device_id.to_string(),
         collect_tasks: false,
         selected_cache_keys: None,
+        activity_scan_cursor: None,
+        activity_full_reconcile: false,
     };
 
     let mut files = Vec::new();

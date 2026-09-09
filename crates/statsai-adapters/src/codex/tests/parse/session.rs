@@ -58,7 +58,10 @@ fn codex_line_filter_skips_non_message_response_items() {
     let user_message = r#"{"timestamp":"2026-06-03T09:36:25.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#;
 
     assert_eq!(codex_line_kind(reasoning), CodexLineKind::Irrelevant);
-    assert_eq!(codex_line_kind(function_call), CodexLineKind::Irrelevant);
+    assert_eq!(
+        codex_line_kind(function_call),
+        CodexLineKind::ResponseItemToolCall
+    );
     assert_eq!(
         codex_line_kind(user_message),
         CodexLineKind::ResponseItemMessage

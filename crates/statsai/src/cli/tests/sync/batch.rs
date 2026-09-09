@@ -1506,6 +1506,8 @@ fn sync_batch_serialization_excludes_local_task_entities() {
         subscriptions: Vec::new(),
         account_plan_observations: Vec::new(),
         account_evidence_summaries: Vec::new(),
+        activity_rollups: Vec::new(),
+        activity_coverage: Vec::new(),
         events: Vec::new(),
         summaries: Vec::new(),
         task_buckets: Vec::new(),
@@ -1609,6 +1611,7 @@ fn build_sync_batch_respects_project_and_task_opt_ins() {
         .set_sync_preferences(SyncPreferences {
             include_projects: true,
             include_tasks: false,
+            include_activity: false,
         })
         .expect("persist sync preferences");
     let (persisted_batch, persisted_mode) =
@@ -1699,6 +1702,7 @@ fn code_change_metric_project_ids_follow_sync_project_preferences() {
         .set_sync_preferences(SyncPreferences {
             include_projects: true,
             include_tasks: false,
+            include_activity: false,
         })
         .expect("persist project opt-in");
     let exclude_command = SyncCommand {
@@ -1860,7 +1864,7 @@ fn quota_contributions_reach_the_batch_and_its_authoritative_ids() {
 
     assert_eq!(
         batch.schema_version,
-        statsai_core::SYNC_BATCH_V5_SCHEMA_VERSION
+        statsai_core::SYNC_BATCH_V6_SCHEMA_VERSION
     );
     assert_eq!(batch.quota_cycle_contributions.len(), 1);
     // The uploaded contribution carries no provider status at all, so the
@@ -2036,4 +2040,91 @@ fn sync_rollup_stats_summaries_roll_up_events_by_day_and_account() {
     assert!(summaries
         .iter()
         .all(|summary| summary.metadata.summary_format == "daily_rollup.v1"));
+}
+
+#[test]
+fn activity_sync_payload_omits_paths_commands_and_invocation_ids() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/.codex"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let invocation_id =
+        statsai_core::activity_invocation_id(&["codex", "thread_fixture_001", "item_fixture_001"]);
+    let invocation = statsai_core::ActivityInvocationV1 {
+        schema_version: statsai_core::ACTIVITY_INVOCATION_SCHEMA_VERSION.to_string(),
+        invocation_id: invocation_id.clone(),
+        provider: "codex".to_string(),
+        source_id: source.source_id.clone(),
+        provider_account_id: None,
+        source_file_path_hash: "hash".to_string(),
+        observed_at: Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 1)
+            .single()
+            .expect("ts"),
+        kind: statsai_core::ActivityKind::Tool,
+        display_name: "exec".to_string(),
+        family: statsai_core::ActivityFamily::Shell,
+        mcp_server: None,
+        mcp_tool: None,
+        plugin: None,
+        skill_catalog: None,
+        outcome: statsai_core::ActivityOutcome::Succeeded,
+        duration_ms: Some(420),
+        duration_kind: Some(statsai_core::ActivityDurationKind::Reported),
+        evidence: "codex-native-items".to_string(),
+        parser_revision: statsai_core::ACTIVITY_PARSER_REVISION.to_string(),
+    };
+    store
+        .persist_activity_scan(
+            "device",
+            &source.source_id,
+            &[invocation],
+            &[],
+            &["hash".to_string()],
+            statsai_store::ActivityPersistMode::ReplaceFiles,
+            None,
+        )
+        .expect("persist activity");
+
+    let include_command = SyncCommand {
+        include_activity: true,
+        ..test_sync_command("file")
+    };
+    let include_target = sync_target(&include_command).expect("target");
+    let (include_batch, _) =
+        build_sync_batch(&include_command, &store, "device", &include_target).expect("batch");
+    assert!(!include_batch.activity_rollups.is_empty());
+    let payload = serde_json::to_string(&include_batch).expect("serialize");
+    for forbidden in [
+        invocation_id.as_str(),
+        "thread_fixture_001",
+        "item_fixture_001",
+        "/tmp/.codex",
+        "/fixture/project",
+        "cat SKILL.md",
+        "bash",
+        "\\u0000",
+        "entity_key",
+    ] {
+        assert!(
+            !payload.contains(forbidden),
+            "v6 activity payload leaked {forbidden}: {payload}"
+        );
+    }
+    assert!(payload.contains("\"display_name\":\"exec\""));
+
+    let exclude_command = test_sync_command("file");
+    let exclude_target = sync_target(&exclude_command).expect("target");
+    let (exclude_batch, _) =
+        build_sync_batch(&exclude_command, &store, "device", &exclude_target).expect("excluded");
+    assert!(exclude_batch.activity_rollups.is_empty());
+    assert!(exclude_batch.activity_coverage.is_empty());
+    let excluded = serde_json::to_value(&exclude_batch).expect("serialize excluded");
+    assert!(excluded.get("activity_rollups").is_none());
+    assert!(excluded.get("activity_coverage").is_none());
 }

@@ -71,4 +71,16 @@ pub(crate) struct SyncCommand {
         help = "Disable hosted task sync for this device and future syncs"
     )]
     pub(crate) exclude_tasks: bool,
+    #[arg(
+        long,
+        conflicts_with = "exclude_activity",
+        help = "Enable hosted agent activity sync for this device and future syncs"
+    )]
+    pub(crate) include_activity: bool,
+    #[arg(
+        long,
+        conflicts_with = "include_activity",
+        help = "Disable hosted agent activity sync and prune names on the next successful HTTP sync"
+    )]
+    pub(crate) exclude_activity: bool,
 }

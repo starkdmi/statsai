@@ -1,0 +1,8 @@
+{
+  // fixture MCP catalog
+  "mcp": {
+    "example_server": {
+      "type": "local"
+    }
+  }
+}

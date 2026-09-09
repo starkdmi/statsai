@@ -10,15 +10,16 @@ use anyhow::{Context, Result};
 use statsai_adapters::{
     adapter_for_provider, default_adapters, retain_accounts_referenced_by_account_evidence,
     AccountEvidenceScan, ProviderAdapter, ScanCandidateFile, ScanDiagnostics, ScanOptions,
-    VerifiedSourceObservation,
+    VerifiedSourceObservation, OPENCODE_PROVIDER,
 };
 use statsai_core::{
     hash_text, EventId, QuotaObservationRecordV1, SourceId, SourceKind, SourceLocation,
     SourceVerificationMode, TaskSpan, TaskVerification, UsageEvent, UsageTotals,
+    ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
     derive_task_work_items, reconcile_verified_source_state, verified_source_observation_hash,
-    ScanFileStateEntry, Store, TaskRebuildReport,
+    ActivityPersistMode, ActivityScanCursor, ScanFileStateEntry, Store, TaskRebuildReport,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
@@ -54,6 +55,7 @@ pub(crate) fn scan_with_adapters(
     let mut summary_count = 0u64;
     let mut task_span_count = 0u64;
     let mut quota_observation_count = 0u64;
+    let mut activity_invocation_count = 0u64;
     let mut inserted_count = 0u64;
     let mut summary_written_count = 0u64;
     let mut task_span_written_count = 0u64;
@@ -76,6 +78,8 @@ pub(crate) fn scan_with_adapters(
     let mut account_resolution_duration_ms = 0u64;
     let mut cache_write_duration_ms = 0u64;
     let mut quota_reconcile_duration_ms = 0u64;
+    let mut activity_extract_duration_ms = 0u64;
+    let mut activity_write_duration_ms = 0u64;
     let mut plan_rebuild_duration_ms = 0u64;
     let mut orphan_links_duration_ms = 0u64;
     let mut upsert_summaries_duration_ms = 0u64;
@@ -179,6 +183,16 @@ pub(crate) fn scan_with_adapters(
             } else {
                 !pending_file_entries.is_empty()
             };
+            let stored_activity_cursor = store.activity_scan_cursor(&source.source_id)?;
+            let activity_full_reconcile = if adapter.provider() == OPENCODE_PROVIDER {
+                command.replace
+                    || command.no_cache
+                    || stored_activity_cursor
+                        .as_ref()
+                        .is_none_or(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION)
+            } else {
+                command.replace || command.no_cache
+            };
             let options = ScanOptions {
                 device_id: device_id.to_string(),
                 collect_tasks: command.include_tasks,
@@ -191,6 +205,14 @@ pub(crate) fn scan_with_adapters(
                             .map(|entry| entry.cache_key.clone())
                             .collect()
                     }),
+                activity_scan_cursor: if activity_full_reconcile {
+                    None
+                } else {
+                    stored_activity_cursor
+                        .as_ref()
+                        .map(|cursor| cursor.last_time_updated)
+                },
+                activity_full_reconcile,
             };
             let probed_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
@@ -259,12 +281,14 @@ pub(crate) fn scan_with_adapters(
             let source_summary_count = scan.summaries.len() as u64;
             let source_task_span_count = scan.task_spans.len() as u64;
             let source_quota_observation_count = scan.quota_observations.len() as u64;
+            let source_activity_count = scan.activity_invocations.len() as u64;
             let has_scan_activity = touched_files
                 || (has_cache_entry_upgrades && !command.preview)
                 || source_event_count > 0
                 || source_summary_count > 0
                 || source_task_span_count > 0
                 || source_quota_observation_count > 0
+                || source_activity_count > 0
                 || scan.diagnostics.files_scanned > 0
                 || scan.diagnostics.files_skipped_unchanged > 0
                 || log_rows > 0
@@ -277,6 +301,7 @@ pub(crate) fn scan_with_adapters(
                 && source_summary_count == 0
                 && source_task_span_count == 0
                 && source_quota_observation_count == 0
+                && source_activity_count == 0
                 && !touched_files
                 && !has_cache_entry_upgrades
                 && account_evidence_count == 0
@@ -293,6 +318,8 @@ pub(crate) fn scan_with_adapters(
             summary_count += source_summary_count;
             task_span_count += source_task_span_count;
             quota_observation_count += source_quota_observation_count;
+            activity_invocation_count += source_activity_count;
+            activity_extract_duration_ms += scan.diagnostics.activity_extract_ms;
             total_usage.add_totals(&source_usage);
             total_summary_usage.add_totals(&source_summary_usage);
             add_diagnostics(&mut total_diagnostics, &scan.diagnostics);
@@ -324,6 +351,7 @@ pub(crate) fn scan_with_adapters(
                     summaries: source_summary_count,
                     task_spans: source_task_span_count,
                     quota_observations: source_quota_observation_count,
+                    activity_invocations: source_activity_count,
                     summary_usage: &source_summary_usage,
                     diagnostics: &scan.diagnostics,
                     verbose: command.verbose || command.explain,
@@ -465,6 +493,42 @@ pub(crate) fn scan_with_adapters(
                 quota_reconcile_duration_ms +=
                     quota_reconcile_started_at.elapsed().as_millis() as u64;
 
+                let activity_write_started_at = Instant::now();
+                let activity_mode = ActivityPersistMode::for_scan(
+                    adapter.provider(),
+                    replace_source_records || activity_full_reconcile,
+                );
+                let reconciled_activity_hashes =
+                    if matches!(activity_mode, ActivityPersistMode::ReplaceFiles) {
+                        scan_file_hashes_for_reconciliation(
+                            if replace_source_records {
+                                &file_cache_entries
+                            } else {
+                                &pending_file_entries
+                            },
+                            &removed_file_entries,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                let activity_cursor =
+                    scan.activity_scan_cursor
+                        .map(|last_time_updated| ActivityScanCursor {
+                            last_time_updated,
+                            parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
+                        });
+                store.persist_activity_scan(
+                    device_id,
+                    &source.source_id,
+                    &scan.activity_invocations,
+                    &scan.activity_coverage,
+                    &reconciled_activity_hashes,
+                    activity_mode,
+                    activity_cursor,
+                )?;
+                activity_write_duration_ms +=
+                    activity_write_started_at.elapsed().as_millis() as u64;
+
                 let plan_rebuild_started_at = Instant::now();
                 store.rebuild_quota_plan_observations_for_source(&source.source_id)?;
                 plan_rebuild_duration_ms += plan_rebuild_started_at.elapsed().as_millis() as u64;
@@ -553,11 +617,12 @@ pub(crate) fn scan_with_adapters(
     if command.preview {
         if command.verbose {
             println!(
-                "preview total: sources={} usage_events={} summaries={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={} written=0",
+                "preview total: sources={} usage_events={} summaries={} quota_observations={} activity={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={} written=0",
                 format_u64(total_sources),
                 format_u64(event_count),
                 format_u64(summary_count),
                 format_u64(quota_observation_count),
+                format_u64(activity_invocation_count),
                 format_u64(total_usage.input_tokens),
                 format_u64(total_usage.cache_creation_tokens),
                 format_u64(total_usage.cached_input_tokens),
@@ -574,19 +639,21 @@ pub(crate) fn scan_with_adapters(
                 format_u64(preview_work_item_rebuild_count)
             );
             println!(
-                "timings_ms: adapter_scan={} preview_rebuild={} total_wall={}",
+                "timings_ms: adapter_scan={} activity_extract={} preview_rebuild={} total_wall={}",
                 format_u64(adapter_scan_duration_ms),
+                format_u64(activity_extract_duration_ms),
                 format_u64(preview_rebuild_duration_ms),
                 format_u64(scan_started_at.elapsed().as_millis() as u64)
             );
             print_scan_diagnostics_total(&total_diagnostics);
         } else {
             println!(
-                "preview total: sources={} usage_events={} summaries={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} written=0",
+                "preview total: sources={} usage_events={} summaries={} quota_observations={} activity={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} written=0",
                 format_u64(total_sources),
                 format_u64(event_count),
                 format_u64(summary_count),
                 format_u64(quota_observation_count),
+                format_u64(activity_invocation_count),
                 format_u64(total_usage.input_tokens),
                 format_u64(total_usage.cache_creation_tokens),
                 format_u64(total_usage.cached_input_tokens),
@@ -604,7 +671,7 @@ pub(crate) fn scan_with_adapters(
         }
     } else {
         println!(
-            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} task_spans={} task_spans_written={} quota_observations={} work_items_rebuilt={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={}",
+            "scan complete: sources={} usage_events={} inserted={} summaries={} summaries_written={} task_spans={} task_spans_written={} quota_observations={} activity={} work_items_rebuilt={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} log_rows={}",
             format_u64(total_sources),
             format_u64(event_count),
             format_u64(inserted_count),
@@ -613,6 +680,7 @@ pub(crate) fn scan_with_adapters(
             format_u64(task_span_count),
             format_u64(task_span_written_count),
             format_u64(quota_observation_count),
+            format_u64(activity_invocation_count),
             format_u64(rebuilt_work_item_count),
             format_u64(total_usage.input_tokens),
             format_u64(total_usage.cache_creation_tokens),
@@ -638,11 +706,13 @@ pub(crate) fn scan_with_adapters(
         }
         if command.verbose {
             println!(
-                "timings_ms: account_evidence={} candidate_scan={} legacy_check={} adapter_scan={} account_resolution={} delete={} insert_events={} quota_reconcile={} plan_rebuild={} orphan_links={} upsert_summaries={} upsert_task_spans={} cache_write={} rebuild_work_items={} rebuild_delete={} rebuild_span_load={} rebuild_verifications={} rebuild_grouping={} rebuild_title_selection={} rebuild_insert={} total_wall={}",
+                "timings_ms: account_evidence={} candidate_scan={} legacy_check={} adapter_scan={} activity_extract={} activity_write={} account_resolution={} delete={} insert_events={} quota_reconcile={} plan_rebuild={} orphan_links={} upsert_summaries={} upsert_task_spans={} cache_write={} rebuild_work_items={} rebuild_delete={} rebuild_span_load={} rebuild_verifications={} rebuild_grouping={} rebuild_title_selection={} rebuild_insert={} total_wall={}",
                 format_u64(account_evidence_duration_ms),
                 format_u64(candidate_scan_duration_ms),
                 format_u64(legacy_check_duration_ms),
                 format_u64(adapter_scan_duration_ms),
+                format_u64(activity_extract_duration_ms),
+                format_u64(activity_write_duration_ms),
                 format_u64(account_resolution_duration_ms),
                 format_u64(delete_duration_ms),
                 format_u64(insert_events_duration_ms),

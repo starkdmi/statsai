@@ -150,6 +150,7 @@ pub(crate) struct ScanPreviewLine<'a> {
     pub(crate) summaries: u64,
     pub(crate) task_spans: u64,
     pub(crate) quota_observations: u64,
+    pub(crate) activity_invocations: u64,
     pub(crate) summary_usage: &'a UsageTotals,
     pub(crate) diagnostics: &'a ScanDiagnostics,
     pub(crate) verbose: bool,
@@ -158,13 +159,14 @@ pub(crate) struct ScanPreviewLine<'a> {
 pub(crate) fn print_scan_preview_line(line: ScanPreviewLine<'_>) {
     if line.verbose {
         println!(
-            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
+            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} activity={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
             line.source.provider,
             preview_path_label(line.source),
             line.usage_events,
             line.summaries,
             line.task_spans,
             line.quota_observations,
+            line.activity_invocations,
             format_u64(line.usage.input_tokens),
             format_u64(line.usage.cache_creation_tokens),
             format_u64(line.usage.cached_input_tokens),
@@ -187,13 +189,14 @@ pub(crate) fn print_scan_preview_line(line: ScanPreviewLine<'_>) {
         );
     } else {
         println!(
-            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={}",
+            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} activity={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={}",
             line.source.provider,
             preview_path_label(line.source),
             line.usage_events,
             line.summaries,
             line.task_spans,
             line.quota_observations,
+            line.activity_invocations,
             format_u64(line.usage.input_tokens),
             format_u64(line.usage.cache_creation_tokens),
             format_u64(line.usage.cached_input_tokens),
@@ -217,6 +220,10 @@ pub(crate) fn add_diagnostics(target: &mut ScanDiagnostics, source: &ScanDiagnos
     target.invalid_rows += source.invalid_rows;
     target.timestamp_fallbacks += source.timestamp_fallbacks;
     target.model_fallbacks += source.model_fallbacks;
+    target.activity_rows += source.activity_rows;
+    target.activity_unknown_names += source.activity_unknown_names;
+    target.activity_part_rows += source.activity_part_rows;
+    target.activity_extract_ms += source.activity_extract_ms;
 }
 
 pub(crate) fn print_scan_diagnostics_total(diagnostics: &ScanDiagnostics) {

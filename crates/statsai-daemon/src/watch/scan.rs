@@ -4,17 +4,17 @@ use chrono::{DateTime, Utc};
 use statsai_adapters::{
     default_adapters, remap_account_evidence_account_ids,
     retain_accounts_referenced_by_account_evidence, AccountEvidenceScan, ProviderAdapter,
-    ScanCandidateFile, ScanOptions, VerifiedSourceObservation,
+    ScanCandidateFile, ScanOptions, VerifiedSourceObservation, OPENCODE_PROVIDER,
 };
 use statsai_core::{
     hash_text, provider_account_id_from_identity, timestamp_in_period, IdentitySource,
     ProviderAccountId, SourceAccountAssignment, SourceLocation, SourceVerificationMode, UsageEvent,
-    UsageSummary,
+    UsageSummary, ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
     find_existing_provider_account, reconcile_verified_source_state, upsert_provider_account,
-    verified_source_observation_hash, ScanFileReplacement, ScanFileStateEntry, Store,
-    UpsertProviderAccountInput,
+    verified_source_observation_hash, ActivityPersistMode, ActivityScanCursor, ScanFileReplacement,
+    ScanFileStateEntry, Store, UpsertProviderAccountInput,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -300,6 +300,24 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
             {
                 continue;
             }
+            let stored_activity_cursor = match scan_store.activity_scan_cursor(&source.source_id) {
+                Ok(cursor) => cursor,
+                Err(e) => {
+                    eprintln!(
+                        "daemon: activity cursor lookup failed for {}: {e}",
+                        source.path_label.as_deref().unwrap_or("unknown")
+                    );
+                    failed = true;
+                    continue;
+                }
+            };
+            let activity_full_reconcile = if source.provider == OPENCODE_PROVIDER {
+                stored_activity_cursor
+                    .as_ref()
+                    .is_none_or(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION)
+            } else {
+                false
+            };
             let options = ScanOptions {
                 device_id: device_id.to_string(),
                 collect_tasks: false,
@@ -309,6 +327,12 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                         .map(|entry| entry.cache_key.clone())
                         .collect::<HashSet<_>>(),
                 ),
+                activity_scan_cursor: if activity_full_reconcile {
+                    None
+                } else {
+                    stored_activity_cursor.map(|cursor| cursor.last_time_updated)
+                },
+                activity_full_reconcile,
             };
             let scan_result = if rescan_file_entries.is_empty() {
                 Ok(statsai_adapters::AdapterScan::default())
@@ -433,6 +457,19 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                     reconciled_file_hashes: &reconciled_file_hashes,
                                     events: &scan.events,
                                     summaries: &scan.summaries,
+                                    activity_invocations: &scan.activity_invocations,
+                                    activity_coverage: &scan.activity_coverage,
+                                    activity_persist_mode: ActivityPersistMode::for_scan(
+                                        &source.provider,
+                                        activity_full_reconcile,
+                                    ),
+                                    activity_scan_cursor: scan.activity_scan_cursor.map(
+                                        |last_time_updated| ActivityScanCursor {
+                                            last_time_updated,
+                                            parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
+                                        },
+                                    ),
+                                    device_id,
                                     pending_entries: &pending_file_entries,
                                     compatible_entries_to_upgrade: &compatible_entries_to_upgrade,
                                     removed_cache_keys: &removed_cache_keys,

@@ -253,6 +253,30 @@ pub(crate) fn build_sync_batch_with_identity_key(
         .iter()
         .map(|contribution| contribution.contribution_id.clone())
         .collect::<Vec<_>>();
+    let all_activity_rollups = if sync_preferences.include_activity {
+        store.all_activity_rollups()?
+    } else {
+        Vec::new()
+    };
+    let all_activity_coverage = if sync_preferences.include_activity {
+        store.all_activity_coverage()?
+    } else {
+        Vec::new()
+    };
+    let activity_rollups = if !sync_preferences.include_activity {
+        Vec::new()
+    } else if payload_mode == SyncPayloadMode::Rollups && !(command.full || state.is_none()) {
+        store.dirty_activity_rollups()?
+    } else {
+        all_activity_rollups.clone()
+    };
+    let activity_coverage = if !sync_preferences.include_activity {
+        Vec::new()
+    } else if payload_mode == SyncPayloadMode::Rollups && !(command.full || state.is_none()) {
+        store.dirty_activity_coverage()?
+    } else {
+        all_activity_coverage.clone()
+    };
 
     if payload_mode == SyncPayloadMode::Rollups {
         let label = rollup_mode_label(command);
@@ -295,6 +319,14 @@ pub(crate) fn build_sync_batch_with_identity_key(
             quota_cycle_contribution_ids: all_quota_cycle_contribution_ids,
             account_plan_observation_ids: snapshot_account_plan_observation_ids,
             account_evidence_summary_ids: snapshot_account_evidence_summary_ids,
+            activity_rollup_ids: all_activity_rollups
+                .iter()
+                .map(|rollup| rollup.rollup_id.clone())
+                .collect(),
+            activity_coverage_ids: all_activity_coverage
+                .iter()
+                .map(|coverage| coverage.coverage_id.clone())
+                .collect(),
         };
         let failed_without_resume = state.as_ref().is_some_and(|state| {
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()
@@ -369,6 +401,8 @@ pub(crate) fn build_sync_batch_with_identity_key(
             task_verifications,
             code_change_metrics,
             quota_cycle_contributions,
+            activity_rollups,
+            activity_coverage,
             authoritative_snapshot,
             created_at,
         },
@@ -418,6 +452,20 @@ pub(crate) fn record_rollup_sync_chunk_success(
         target,
         &batch.account_evidence_summaries,
     )?;
+    store.mark_activity_rollups_synced(
+        &batch
+            .activity_rollups
+            .iter()
+            .map(|rollup| rollup.rollup_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    store.mark_activity_coverage_synced(
+        &batch
+            .activity_coverage
+            .iter()
+            .map(|coverage| coverage.coverage_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
 }
@@ -461,6 +509,20 @@ pub(crate) fn record_sync_batch_success(
             .code_change_metrics
             .iter()
             .map(|metric| metric.metric_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    store.mark_activity_rollups_synced(
+        &batch
+            .activity_rollups
+            .iter()
+            .map(|rollup| rollup.rollup_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    store.mark_activity_coverage_synced(
+        &batch
+            .activity_coverage
+            .iter()
+            .map(|coverage| coverage.coverage_id.clone())
             .collect::<Vec<_>>(),
     )?;
     snapshot::invalidate_dashboard_cache();

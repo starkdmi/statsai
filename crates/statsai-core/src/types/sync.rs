@@ -1,9 +1,10 @@
 use crate::{
     project_contains_file_paths, project_has_stable_identity, AccountEvidenceSummaryV1,
-    AccountPlanProjectionV1, CodeChangeMetric, ProjectInfo, ProviderAccount, ProviderAccountId,
-    QuotaCycleContributionV1, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
-    SourceLocation, Subscription, SubscriptionId, SummaryId, TaskSpan, TaskVerification,
-    TaskVerificationId, UsageEvent, UsageSummary, WorkItem, WorkItemMember,
+    AccountPlanProjectionV1, ActivityCoverageV1, ActivityRollupV1, CodeChangeMetric, ProjectInfo,
+    ProviderAccount, ProviderAccountId, QuotaCycleContributionV1, SourceAccountAssignment,
+    SourceAccountAssignmentId, SourceId, SourceLocation, Subscription, SubscriptionId, SummaryId,
+    TaskSpan, TaskVerification, TaskVerificationId, UsageEvent, UsageSummary, WorkItem,
+    WorkItemMember,
 };
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -47,6 +48,14 @@ pub struct SyncBatch {
     /// evidenced. Individual observations never leave the device through this type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_evidence_summaries: Vec<AccountEvidenceSummaryV1>,
+    /// Daily tool/MCP/skill rollups. Names leave the device only when
+    /// `include_activity` is on. Invocation IDs, paths, arguments, and outputs
+    /// are deliberately absent from this type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity_rollups: Vec<ActivityRollupV1>,
+    /// Per-source coverage for activity kinds, including zero-call days.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity_coverage: Vec<ActivityCoverageV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoritative_snapshot: Option<SyncAuthoritativeSnapshot>,
     pub created_at: DateTime<Utc>,
@@ -75,6 +84,10 @@ pub struct SyncAuthoritativeSnapshot {
     pub account_plan_observation_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_evidence_summary_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity_rollup_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity_coverage_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -128,6 +141,10 @@ pub struct SyncEntityCounts {
     pub account_plan_observations: u64,
     #[serde(default, skip_serializing_if = "sync_count_is_zero")]
     pub account_evidence_summaries: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub activity_rollups: u64,
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub activity_coverage: u64,
 }
 
 fn sync_count_is_zero(value: &u64) -> bool {

@@ -2,6 +2,7 @@
 
 mod account_plan;
 mod accounts;
+mod activity;
 mod archive;
 mod code_changes;
 mod dedupe;
@@ -53,22 +54,27 @@ use statsai_core::{
     project_has_stable_identity, provider_account_id, provider_account_id_from_identity,
     sanitize_code_change_metric_for_sync, sanitize_summary_for_sync, semantic_event_fingerprint,
     source_account_assignment_id, subscription_id, summary_id, timestamp_in_period,
-    AccountEvidenceSummaryV1, AccountPlanProjectionV1, BillingPeriod, CodeChangeMetric, Confidence,
-    CostAccumulator, CostInfo, DailyRollup, EventId, EventSource, IdentitySource, LatencySource,
-    MetricStats, ModelInfo, PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId,
-    SemanticFingerprintInput, SourceAccountAssignment, SourceAccountAssignmentId, SourceId,
-    SourceKind, SourceLocation, SourceVerificationMode, Subscription, SubscriptionId,
-    SubscriptionStatus, SummaryId, SummaryMetadata, SummaryMetricTotals, SummaryMetrics,
-    SummaryModelMetrics, SummaryModelUsage, SyncAuthoritativeSnapshot, SyncBatch,
-    TaskVerificationCursor, TaskVerificationId, UsageCounts, UsageEvent, UsageSummary,
-    VerifiedSourceObservation, VerifiedSourceState, VerifiedSubscriptionState,
-    PROVIDER_ACCOUNT_SCHEMA_VERSION, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
-    SUBSCRIPTION_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+    AccountEvidenceSummaryV1, AccountPlanProjectionV1, ActivityCoverageV1, ActivityInvocationV1,
+    BillingPeriod, CodeChangeMetric, Confidence, CostAccumulator, CostInfo, DailyRollup, EventId,
+    EventSource, IdentitySource, LatencySource, MetricStats, ModelInfo, PrivacyInfo, PrivacyMode,
+    ProviderAccount, ProviderAccountId, SemanticFingerprintInput, SourceAccountAssignment,
+    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
+    Subscription, SubscriptionId, SubscriptionStatus, SummaryId, SummaryMetadata,
+    SummaryMetricTotals, SummaryMetrics, SummaryModelMetrics, SummaryModelUsage,
+    SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, TaskVerificationId, UsageCounts,
+    UsageEvent, UsageSummary, VerifiedSourceObservation, VerifiedSourceState,
+    VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION,
+    USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 pub use account_plan::AccountEvidenceReferenceCounts;
+pub use activity::{
+    ActivityPersistMode, ActivityPersistResult, ActivityScanCursor, ActivityStatus,
+    ActivityStatusRow,
+};
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use pricing::{
     apply_current_estimated_pricing, RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY,
@@ -105,6 +111,7 @@ pub use tasks::{
 const SYNC_ROLLUP_SUMMARY_VERSION: &str = "13";
 const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
 const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
+const SYNC_INCLUDE_ACTIVITY_METADATA_KEY: &str = "sync.include_activity";
 const LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY: &str = "migration.legacy_codex_plan_evidence.v1";
 const SQLITE_BUSY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(50)
@@ -179,6 +186,7 @@ pub struct PendingSyncSummaryCounts {
 pub struct SyncPreferences {
     pub include_projects: bool,
     pub include_tasks: bool,
+    pub include_activity: bool,
 }
 
 impl SyncPreferences {
@@ -189,6 +197,7 @@ impl SyncPreferences {
         Self {
             include_projects,
             include_tasks,
+            include_activity: self.include_activity,
         }
     }
 }
@@ -272,6 +281,11 @@ pub struct ScanFileReplacement<'a> {
     pub reconciled_file_hashes: &'a [String],
     pub events: &'a [UsageEvent],
     pub summaries: &'a [UsageSummary],
+    pub activity_invocations: &'a [ActivityInvocationV1],
+    pub activity_coverage: &'a [ActivityCoverageV1],
+    pub activity_persist_mode: ActivityPersistMode,
+    pub activity_scan_cursor: Option<ActivityScanCursor>,
+    pub device_id: &'a str,
     pub pending_entries: &'a [ScanFileStateEntry],
     pub compatible_entries_to_upgrade: &'a [ScanFileStateEntry],
     pub removed_cache_keys: &'a [String],
@@ -281,6 +295,7 @@ pub struct ScanFileReplacement<'a> {
 pub struct ScanFileReplacementResult {
     pub inserted_events: u64,
     pub written_summaries: u64,
+    pub written_activity_invocations: u64,
 }
 
 /// Counts produced while atomically applying an incoming sync batch.

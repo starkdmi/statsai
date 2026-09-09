@@ -347,6 +347,7 @@ pub(crate) fn reattribute_source_records(store: &Store, source_id: &SourceId) ->
     store.rewrite_events(&changed_events)?;
     store.rewrite_summaries(&changed_summaries)?;
     store.reattribute_quota_observations(source_id)?;
+    store.reattribute_activity_invocations(source_id)?;
     store.rebuild_quota_plan_observations_for_source(source_id)?;
     Ok(())
 }

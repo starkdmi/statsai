@@ -14,6 +14,7 @@ Commands:
   task          Review and rebuild local work items
   conversation  Collect and explore durable local conversation archives
   quota         Inspect reconstructed provider quota history
+  activity      Inspect observed tool, MCP, and skill activity
   privacy       Build and inspect the local privacy-filtered dataset
   sync          Export a sync batch to a sink
   schema        Print JSON schemas for backend-facing contracts
@@ -907,6 +908,31 @@ Options:
       --device-id <DEVICE_ID>  Device identifier for multi-device sync
       --format <FORMAT>        [possible values: csv, json, jsonl]
   -h, --help                   Print help
+===== statsai activity --help =====
+Inspect observed tool, MCP, and skill activity
+
+Usage: statsai activity [OPTIONS] <COMMAND>
+
+Commands:
+  status  Show observed tool, MCP, and skill activity
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai activity status --help =====
+Show observed tool, MCP, and skill activity
+
+Usage: statsai activity status [OPTIONS]
+
+Options:
+      --provider <PROVIDER>    Provider filter
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --kind <KIND>            Kind filter [possible values: tool, mcp, skill]
+      --json                   Output as JSON
+  -h, --help                   Print help
 ===== statsai privacy --help =====
 Build and inspect the local privacy-filtered dataset
 
@@ -1013,6 +1039,8 @@ Options:
       --exclude-projects         Disable project metadata sync for this device and future syncs
       --include-tasks            Enable hosted task sync for this device and future syncs (implies --include-projects)
       --exclude-tasks            Disable hosted task sync for this device and future syncs
+      --include-activity         Enable hosted agent activity sync for this device and future syncs
+      --exclude-activity         Disable hosted agent activity sync and prune names on the next successful HTTP sync
   -h, --help                     Print help
 ===== statsai schema --help =====
 Print JSON schemas for backend-facing contracts
@@ -1020,7 +1048,7 @@ Print JSON schemas for backend-facing contracts
 Usage: statsai schema [OPTIONS] <COMMAND>
 
 Commands:
-  sync-batch               Print the sync_batch.v4 JSON Schema
+  sync-batch               Print the sync_batch.v6 JSON Schema
   quota-window-projection  Print the quota_window_sync_projection.v1 JSON Schema
   help                     Print this message or the help of the given subcommand(s)
 
@@ -1029,7 +1057,7 @@ Options:
       --device-id <DEVICE_ID>  Device identifier for multi-device sync
   -h, --help                   Print help
 ===== statsai schema sync-batch --help =====
-Print the sync_batch.v4 JSON Schema
+Print the sync_batch.v6 JSON Schema
 
 Usage: statsai schema sync-batch [OPTIONS]
 

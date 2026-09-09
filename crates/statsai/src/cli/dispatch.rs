@@ -34,6 +34,7 @@ pub(crate) fn run() -> Result<()> {
                 Command::Task(command) => task(command, &store),
                 Command::Conversation(command) => conversation(command, &store, &device_id),
                 Command::Quota(command) => quota(command, &store, &device_id),
+                Command::Activity(command) => activity(command, &store),
                 Command::Privacy(command) => {
                     statsai::privacy_cli::run(command, &store, &store_path)
                 }

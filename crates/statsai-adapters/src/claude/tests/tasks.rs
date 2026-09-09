@@ -49,6 +49,8 @@ fn claude_partial_jsonl_scan_only_emits_selected_task_spans() {
             device_id: "device".to_string(),
             collect_tasks: true,
             selected_cache_keys: Some(selected),
+            activity_scan_cursor: None,
+            activity_full_reconcile: false,
         },
     )
     .expect("scan");
@@ -120,6 +122,8 @@ fn claude_partial_stats_cache_scan_does_not_emit_unscanned_task_spans() {
             device_id: "device".to_string(),
             collect_tasks: true,
             selected_cache_keys: Some(selected),
+            activity_scan_cursor: None,
+            activity_full_reconcile: false,
         },
     )
     .expect("scan");

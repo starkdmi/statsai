@@ -41,6 +41,7 @@ pub(crate) fn parse_codex_file(
     let mut project_cache = ProjectContextCache::new();
     let mut line_bytes = Vec::new();
     let mut index = 0usize;
+    let mut activity = crate::activity::CodexActivityExtractor::default();
 
     loop {
         let line_status =
@@ -64,6 +65,27 @@ pub(crate) fn parse_codex_file(
         }
         ctx.scan.diagnostics.raw_rows += 1;
         let line_kind = codex_line_kind(line);
+        if line_kind == CodexLineKind::EventItemCompleted {
+            let activity_started_at = std::time::Instant::now();
+            activity.observe_native_line(ctx.source, path, line, index, fallback_timestamp);
+            ctx.scan.diagnostics.activity_extract_ms +=
+                activity_started_at.elapsed().as_millis() as u64;
+            continue;
+        }
+        if line_kind == CodexLineKind::ResponseItemToolCall {
+            let activity_started_at = std::time::Instant::now();
+            activity.observe_legacy_line(
+                ctx.source,
+                path,
+                line,
+                &session_raw,
+                index,
+                fallback_timestamp,
+            );
+            ctx.scan.diagnostics.activity_extract_ms +=
+                activity_started_at.elapsed().as_millis() as u64;
+            continue;
+        }
         if line_kind == CodexLineKind::Irrelevant && !is_codex_quota_line_structurally(line) {
             continue;
         }
@@ -883,6 +905,15 @@ pub(crate) fn parse_codex_file(
         );
         push_deduped(ctx.scan, ctx.seen, event, DuplicateSelection::KeepFirst);
     }
+
+    let activity_started_at = std::time::Instant::now();
+    activity.finish(
+        ctx.scan,
+        &ctx.options.device_id,
+        ctx.source,
+        fallback_timestamp,
+    );
+    ctx.scan.diagnostics.activity_extract_ms += activity_started_at.elapsed().as_millis() as u64;
 
     Ok(())
 }

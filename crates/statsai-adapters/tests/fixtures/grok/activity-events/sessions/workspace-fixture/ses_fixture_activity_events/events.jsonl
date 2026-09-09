@@ -1,0 +1,6 @@
+{"type":"phase_changed","ts":"2026-01-01T00:00:01.000Z","phase":"phase_fixture_001"}
+{"type":"tool_started","ts":"2026-01-01T00:00:01.000Z","tool_name":"read_file"}
+{"type":"tool_completed","ts":"2026-01-01T00:00:01.009Z","tool_name":"read_file","tool_call_id":"tc_fixture_001","duration_ms":9,"outcome":"success"}
+{"type":"tool_completed","ts":"2026-01-01T00:00:02.000Z","tool_name":"run_terminal_command","tool_call_id":"tc_fixture_002","duration_ms":40,"outcome":"error"}
+{"type":"permission_resolved","ts":"2026-01-01T00:00:01.000Z","tool_name":"run_terminal_command","decision":"allow","wait_ms":0}
+{not-json

@@ -283,3 +283,212 @@ fn preview_task_rebuild_counts_shared_bucket_rebuilds_per_source_step() {
     assert_eq!(rebuilt_a + rebuilt_b, 2);
     assert_eq!(store.work_items().expect("work items").len(), 1);
 }
+
+fn test_activity_invocation(
+    source: &SourceLocation,
+    file_path: &str,
+) -> statsai_core::ActivityInvocationV1 {
+    statsai_core::ActivityInvocationV1 {
+        schema_version: statsai_core::ACTIVITY_INVOCATION_SCHEMA_VERSION.to_string(),
+        invocation_id: "inv-preview".to_string(),
+        provider: "codex".to_string(),
+        source_id: source.source_id.clone(),
+        provider_account_id: None,
+        source_file_path_hash: hash_text(file_path),
+        observed_at: Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 1)
+            .single()
+            .expect("ts"),
+        kind: statsai_core::ActivityKind::Tool,
+        display_name: "exec".to_string(),
+        family: statsai_core::ActivityFamily::Shell,
+        mcp_server: None,
+        mcp_tool: None,
+        plugin: None,
+        skill_catalog: None,
+        outcome: statsai_core::ActivityOutcome::Succeeded,
+        duration_ms: Some(12),
+        duration_kind: Some(statsai_core::ActivityDurationKind::Reported),
+        evidence: "codex-native-items".to_string(),
+        parser_revision: statsai_core::ACTIVITY_PARSER_REVISION.to_string(),
+    }
+}
+
+#[test]
+fn scan_preview_does_not_persist_activity() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-activity-preview"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let file_path = "/tmp/codex-activity-preview/session.jsonl";
+    let adapter = TestAdapter {
+        provider: "codex",
+        discovered: vec![source.clone()],
+        candidates: vec![test_scan_candidate(file_path, "sig-activity-preview")],
+        scan_result: statsai_adapters::AdapterScan {
+            activity_invocations: vec![test_activity_invocation(&source, file_path)],
+            ..statsai_adapters::AdapterScan::default()
+        },
+        probe_result: None,
+        scan_calls: None,
+    };
+
+    scan_with_adapters(
+        ScanCommand {
+            provider: None,
+            include_tasks: false,
+            preview: true,
+            no_cache: false,
+            replace: false,
+            verbose: false,
+            explain: false,
+        },
+        &store,
+        "device-test",
+        vec![Box::new(adapter)],
+    )
+    .expect("preview scan");
+
+    assert_eq!(store.activity_invocation_count().expect("count"), 0);
+    assert!(store.all_activity_rollups().expect("rollups").is_empty());
+}
+
+#[test]
+fn scan_persists_activity_invocations() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-activity-persist"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let file_path = "/tmp/codex-activity-persist/session.jsonl";
+    let adapter = TestAdapter {
+        provider: "codex",
+        discovered: vec![source.clone()],
+        candidates: vec![test_scan_candidate(file_path, "sig-activity-persist")],
+        scan_result: statsai_adapters::AdapterScan {
+            activity_invocations: vec![test_activity_invocation(&source, file_path)],
+            ..statsai_adapters::AdapterScan::default()
+        },
+        probe_result: None,
+        scan_calls: None,
+    };
+
+    scan_with_adapters(
+        ScanCommand {
+            provider: None,
+            include_tasks: false,
+            preview: false,
+            no_cache: false,
+            replace: false,
+            verbose: false,
+            explain: false,
+        },
+        &store,
+        "device-test",
+        vec![Box::new(adapter)],
+    )
+    .expect("persist scan");
+
+    assert_eq!(store.activity_invocation_count().expect("count"), 1);
+    let rollups = store.all_activity_rollups().expect("rollups");
+    assert_eq!(rollups.len(), 1);
+    assert_eq!(rollups[0].display_name, "exec");
+    assert_eq!(rollups[0].calls, 1);
+}
+
+#[test]
+fn incremental_scan_preserves_activity_from_cached_files() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-activity-incremental"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let file_a = "/tmp/codex-activity-incremental/a.jsonl";
+    let file_b = "/tmp/codex-activity-incremental/b.jsonl";
+    let mut invocation_a = test_activity_invocation(&source, file_a);
+    invocation_a.invocation_id = "inv-a".to_string();
+    let mut invocation_b = test_activity_invocation(&source, file_b);
+    invocation_b.invocation_id = "inv-b".to_string();
+    invocation_b.observed_at = Utc
+        .with_ymd_and_hms(2026, 1, 2, 0, 0, 1)
+        .single()
+        .expect("ts");
+
+    scan_with_adapters(
+        ScanCommand {
+            provider: None,
+            include_tasks: false,
+            preview: false,
+            no_cache: false,
+            replace: false,
+            verbose: false,
+            explain: false,
+        },
+        &store,
+        "device-test",
+        vec![Box::new(TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![
+                test_scan_candidate(file_a, "sig-a"),
+                test_scan_candidate(file_b, "sig-b"),
+            ],
+            scan_result: statsai_adapters::AdapterScan {
+                activity_invocations: vec![invocation_a.clone(), invocation_b.clone()],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        })],
+    )
+    .expect("first scan");
+    assert_eq!(store.activity_invocation_count().expect("count"), 2);
+
+    scan_with_adapters(
+        ScanCommand {
+            provider: None,
+            include_tasks: false,
+            preview: false,
+            no_cache: false,
+            replace: false,
+            verbose: false,
+            explain: false,
+        },
+        &store,
+        "device-test",
+        vec![Box::new(TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![
+                test_scan_candidate(file_a, "sig-a"),
+                test_scan_candidate(file_b, "sig-b-changed"),
+            ],
+            scan_result: statsai_adapters::AdapterScan {
+                activity_invocations: vec![invocation_a, invocation_b],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        })],
+    )
+    .expect("incremental scan");
+
+    assert_eq!(
+        store.activity_invocation_count().expect("count"),
+        2,
+        "activity from the cache-skipped file must survive an incremental scan"
+    );
+}

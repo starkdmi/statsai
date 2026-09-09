@@ -474,3 +474,77 @@ pub(crate) fn apply_migration_024(conn: &Connection) -> Result<()> {
     ))?;
     Ok(())
 }
+
+pub(crate) fn apply_migration_025(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS activity_invocations (
+          invocation_id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          provider_account_id TEXT,
+          source_file_path_hash TEXT NOT NULL,
+          observed_at TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          display_name TEXT NOT NULL,
+          family TEXT NOT NULL,
+          mcp_server TEXT,
+          mcp_tool TEXT,
+          plugin TEXT,
+          skill_catalog TEXT,
+          outcome TEXT NOT NULL,
+          duration_ms INTEGER,
+          duration_kind TEXT,
+          evidence TEXT NOT NULL,
+          parser_revision TEXT NOT NULL,
+          payload TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS activity_invocations_source_file_idx
+          ON activity_invocations (source_id, source_file_path_hash);
+        CREATE INDEX IF NOT EXISTS activity_invocations_account_idx
+          ON activity_invocations (provider_account_id, observed_at);
+        CREATE INDEX IF NOT EXISTS activity_invocations_observed_idx
+          ON activity_invocations (observed_at, kind);
+
+        CREATE TABLE IF NOT EXISTS activity_rollups (
+          rollup_id TEXT PRIMARY KEY,
+          device_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          provider_account_id TEXT,
+          day TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          entity_key TEXT NOT NULL,
+          dirty INTEGER NOT NULL DEFAULT 1,
+          payload_hash TEXT NOT NULL,
+          payload TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS activity_rollups_dirty_idx
+          ON activity_rollups (dirty);
+        CREATE INDEX IF NOT EXISTS activity_rollups_day_kind_idx
+          ON activity_rollups (day, kind);
+
+        CREATE TABLE IF NOT EXISTS activity_coverage (
+          coverage_id TEXT PRIMARY KEY,
+          device_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          day TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          dirty INTEGER NOT NULL DEFAULT 1,
+          payload TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS activity_coverage_source_day_idx
+          ON activity_coverage (source_id, day, kind);
+        CREATE INDEX IF NOT EXISTS activity_coverage_dirty_idx
+          ON activity_coverage (dirty);
+
+        CREATE TABLE IF NOT EXISTS activity_scan_cursors (
+          source_id TEXT PRIMARY KEY,
+          last_time_updated INTEGER NOT NULL,
+          parser_revision TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}

@@ -725,6 +725,8 @@ fn claude_scan_respects_selected_cache_keys() {
             device_id: "device".to_string(),
             collect_tasks: true,
             selected_cache_keys: Some(selected),
+            activity_scan_cursor: None,
+            activity_full_reconcile: false,
         },
     )
     .expect("scan");

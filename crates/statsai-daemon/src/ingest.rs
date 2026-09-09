@@ -2,8 +2,9 @@ use anyhow::{bail, Result};
 use statsai_core::{
     SyncAck, SyncBatch, SyncEntityCounts, SyncRejectedRecord, SYNC_ACK_V1_SCHEMA_VERSION,
     SYNC_ACK_V2_SCHEMA_VERSION, SYNC_ACK_V3_SCHEMA_VERSION, SYNC_ACK_V4_SCHEMA_VERSION,
-    SYNC_ACK_V5_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION,
-    SYNC_BATCH_V3_SCHEMA_VERSION, SYNC_BATCH_V4_SCHEMA_VERSION, SYNC_BATCH_V5_SCHEMA_VERSION,
+    SYNC_ACK_V5_SCHEMA_VERSION, SYNC_ACK_V6_SCHEMA_VERSION, SYNC_BATCH_V1_SCHEMA_VERSION,
+    SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION, SYNC_BATCH_V4_SCHEMA_VERSION,
+    SYNC_BATCH_V5_SCHEMA_VERSION, SYNC_BATCH_V6_SCHEMA_VERSION,
 };
 use statsai_store::Store;
 
@@ -20,6 +21,7 @@ fn sync_ack_schema_version(batch_schema_version: &str) -> Result<&'static str> {
         SYNC_BATCH_V3_SCHEMA_VERSION => Ok(SYNC_ACK_V3_SCHEMA_VERSION),
         SYNC_BATCH_V4_SCHEMA_VERSION => Ok(SYNC_ACK_V4_SCHEMA_VERSION),
         SYNC_BATCH_V5_SCHEMA_VERSION => Ok(SYNC_ACK_V5_SCHEMA_VERSION),
+        SYNC_BATCH_V6_SCHEMA_VERSION => Ok(SYNC_ACK_V6_SCHEMA_VERSION),
         other => bail!("unsupported sync batch schema {other}"),
     }
 }
@@ -30,28 +32,38 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
         && batch.schema_version != SYNC_BATCH_V3_SCHEMA_VERSION
         && batch.schema_version != SYNC_BATCH_V4_SCHEMA_VERSION
         && batch.schema_version != SYNC_BATCH_V5_SCHEMA_VERSION
+        && batch.schema_version != SYNC_BATCH_V6_SCHEMA_VERSION
     {
         bail!("unsupported sync batch schema {}", batch.schema_version);
     }
     if !matches!(
         batch.schema_version.as_str(),
-        SYNC_BATCH_V3_SCHEMA_VERSION | SYNC_BATCH_V4_SCHEMA_VERSION | SYNC_BATCH_V5_SCHEMA_VERSION
+        SYNC_BATCH_V3_SCHEMA_VERSION
+            | SYNC_BATCH_V4_SCHEMA_VERSION
+            | SYNC_BATCH_V5_SCHEMA_VERSION
+            | SYNC_BATCH_V6_SCHEMA_VERSION
     ) && !batch.code_change_metrics.is_empty()
     {
         bail!("code-change metrics require sync_batch.v3");
     }
     if !matches!(
         batch.schema_version.as_str(),
-        SYNC_BATCH_V4_SCHEMA_VERSION | SYNC_BATCH_V5_SCHEMA_VERSION
+        SYNC_BATCH_V4_SCHEMA_VERSION | SYNC_BATCH_V5_SCHEMA_VERSION | SYNC_BATCH_V6_SCHEMA_VERSION
     ) && !batch.quota_cycle_contributions.is_empty()
     {
         bail!("quota cycle contributions require sync_batch.v4");
     }
     if batch.schema_version != SYNC_BATCH_V5_SCHEMA_VERSION
+        && batch.schema_version != SYNC_BATCH_V6_SCHEMA_VERSION
         && (!batch.account_plan_observations.is_empty()
             || !batch.account_evidence_summaries.is_empty())
     {
         bail!("account-plan evidence requires sync_batch.v5");
+    }
+    if batch.schema_version != SYNC_BATCH_V6_SCHEMA_VERSION
+        && (!batch.activity_rollups.is_empty() || !batch.activity_coverage.is_empty())
+    {
+        bail!("activity collections require sync_batch.v6");
     }
     if batch
         .code_change_metrics
@@ -76,6 +88,9 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     if !batch.account_plan_observations.is_empty() || !batch.account_evidence_summaries.is_empty() {
         bail!("account-plan evidence is not supported by the loopback daemon");
     }
+    if !batch.activity_rollups.is_empty() || !batch.activity_coverage.is_empty() {
+        bail!("activity collections are not supported by the loopback daemon");
+    }
 
     let result = store.ingest_sync_batch(batch)?;
 
@@ -95,6 +110,8 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             quota_cycle_contributions: batch.quota_cycle_contributions.len() as u64,
             account_plan_observations: batch.account_plan_observations.len() as u64,
             account_evidence_summaries: batch.account_evidence_summaries.len() as u64,
+            activity_rollups: 0,
+            activity_coverage: 0,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -110,6 +127,8 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             quota_cycle_contributions: 0,
             account_plan_observations: 0,
             account_evidence_summaries: 0,
+            activity_rollups: 0,
+            activity_coverage: 0,
         },
         rejected: Vec::<SyncRejectedRecord>::new(),
     })

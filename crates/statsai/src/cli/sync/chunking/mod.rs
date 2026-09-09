@@ -20,6 +20,8 @@ const HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH: usize = 1_000;
 
 const HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH: usize = 100;
 
+pub(crate) const HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH: usize = 500;
+
 pub(crate) const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 
 const HTTP_ROLLUP_D1_QUERY_CHUNK_SIZE: usize = 90;
@@ -77,6 +79,8 @@ fn split_authoritative_snapshot(
         summary_ids: Vec::new(),
         code_change_metric_ids: Vec::new(),
         quota_cycle_contribution_ids: Vec::new(),
+        activity_rollup_ids: Vec::new(),
+        activity_coverage_ids: Vec::new(),
     };
     let mut parts = Vec::new();
     let mut current = empty_part();
@@ -113,6 +117,8 @@ fn split_authoritative_snapshot(
         snapshot.quota_cycle_contribution_ids,
         quota_cycle_contribution_ids
     );
+    append_ids!(snapshot.activity_rollup_ids, activity_rollup_ids);
+    append_ids!(snapshot.activity_coverage_ids, activity_coverage_ids);
     if authoritative_snapshot_id_count(&current) > 0 || parts.is_empty() {
         parts.push(current);
     }
@@ -134,6 +140,8 @@ fn authoritative_snapshot_id_count(snapshot: &SyncAuthoritativeSnapshot) -> usiz
         + snapshot.summary_ids.len()
         + snapshot.code_change_metric_ids.len()
         + snapshot.quota_cycle_contribution_ids.len()
+        + snapshot.activity_rollup_ids.len()
+        + snapshot.activity_coverage_ids.len()
 }
 
 pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<SyncBatch> {
@@ -147,11 +155,15 @@ pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch)
     let has_rollup_payload = metadata_count > 0
         || !batch.summaries.is_empty()
         || !batch.code_change_metrics.is_empty()
-        || !batch.quota_cycle_contributions.is_empty();
+        || !batch.quota_cycle_contributions.is_empty()
+        || !batch.activity_rollups.is_empty()
+        || !batch.activity_coverage.is_empty();
     if !has_task_payload
         && batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
         && batch.code_change_metrics.len() <= HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH
         && batch.quota_cycle_contributions.len() <= HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH
+        && batch.activity_rollups.len() <= HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH
+        && batch.activity_coverage.len() <= HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH
         && metadata_count <= HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH
     {
         return fit_http_rollup_batches_to_d1_budget(vec![batch.clone()]);
@@ -173,11 +185,20 @@ pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch)
         .quota_cycle_contributions
         .len()
         .div_ceil(HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH);
+    let activity_chunks = batch
+        .activity_rollups
+        .len()
+        .div_ceil(HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH)
+        + batch
+            .activity_coverage
+            .len()
+            .div_ceil(HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH);
     let mut chunks = Vec::with_capacity(
         total_chunks
             + metadata_chunks
             + code_change_chunks
             + quota_cycle_chunks
+            + activity_chunks
             + task_chunks.len(),
     );
 
@@ -193,6 +214,10 @@ pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch)
     chunks.extend(split_http_quota_cycle_contribution_chunks(
         batch,
         HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH,
+    ));
+    chunks.extend(split_http_activity_chunks(
+        batch,
+        HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH,
     ));
     chunks.extend(split_http_rollup_summary_chunks(
         batch,
@@ -217,6 +242,8 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
     chunk.task_verifications.clear();
     chunk.code_change_metrics.clear();
     chunk.quota_cycle_contributions.clear();
+    chunk.activity_rollups.clear();
+    chunk.activity_coverage.clear();
     chunk.authoritative_snapshot = None;
     chunk
 }

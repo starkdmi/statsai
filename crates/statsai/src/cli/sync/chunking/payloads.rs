@@ -1,6 +1,36 @@
 use super::*;
 
 pub(crate) fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<SyncBatch> {
+    if (!batch.activity_rollups.is_empty() || !batch.activity_coverage.is_empty())
+        && has_non_activity_payload(batch)
+    {
+        let mut without_activity = batch.clone();
+        without_activity.activity_rollups.clear();
+        without_activity.activity_coverage.clear();
+        let mut chunks = split_http_activity_chunks(
+            batch,
+            batch
+                .activity_rollups
+                .len()
+                .max(batch.activity_coverage.len())
+                .max(1),
+        );
+        chunks.extend(split_http_rollup_sync_batch_after_budget_error(
+            &without_activity,
+        ));
+        return chunks;
+    }
+    if batch.activity_rollups.len() > 1 || batch.activity_coverage.len() > 1 {
+        return split_http_activity_chunks(
+            batch,
+            batch
+                .activity_rollups
+                .len()
+                .max(batch.activity_coverage.len())
+                .div_ceil(2)
+                .max(1),
+        );
+    }
     if !batch.quota_cycle_contributions.is_empty() && has_non_quota_cycle_payload(batch) {
         let mut without_quota = batch.clone();
         without_quota.quota_cycle_contributions.clear();
@@ -111,6 +141,8 @@ pub(crate) fn has_non_code_change_payload(batch: &SyncBatch) -> bool {
         || !batch.task_buckets.is_empty()
         || !batch.task_verifications.is_empty()
         || !batch.quota_cycle_contributions.is_empty()
+        || !batch.activity_rollups.is_empty()
+        || !batch.activity_coverage.is_empty()
 }
 
 pub(crate) fn has_non_quota_cycle_payload(batch: &SyncBatch) -> bool {
@@ -120,6 +152,18 @@ pub(crate) fn has_non_quota_cycle_payload(batch: &SyncBatch) -> bool {
         || !batch.task_buckets.is_empty()
         || !batch.task_verifications.is_empty()
         || !batch.code_change_metrics.is_empty()
+        || !batch.activity_rollups.is_empty()
+        || !batch.activity_coverage.is_empty()
+}
+
+pub(crate) fn has_non_activity_payload(batch: &SyncBatch) -> bool {
+    http_rollup_metadata_count(batch) > 0
+        || !batch.events.is_empty()
+        || !batch.summaries.is_empty()
+        || !batch.task_buckets.is_empty()
+        || !batch.task_verifications.is_empty()
+        || !batch.code_change_metrics.is_empty()
+        || !batch.quota_cycle_contributions.is_empty()
 }
 
 /// Records the backend writes one statement per row for.
@@ -204,6 +248,32 @@ pub(crate) fn split_http_quota_cycle_contribution_chunks(
             chunk
         })
         .collect()
+}
+
+pub(crate) fn split_http_activity_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec<SyncBatch> {
+    let chunk_size = chunk_size.max(1);
+    let mut chunks = Vec::new();
+    chunks.extend(
+        batch
+            .activity_rollups
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(index, rollups)| {
+                let mut chunk =
+                    empty_http_rollup_chunk(batch, &format!("activity_rollups_{}", index + 1));
+                chunk.activity_rollups = rollups.to_vec();
+                chunk
+            }),
+    );
+    chunks.extend(batch.activity_coverage.chunks(chunk_size).enumerate().map(
+        |(index, coverage)| {
+            let mut chunk =
+                empty_http_rollup_chunk(batch, &format!("activity_coverage_{}", index + 1));
+            chunk.activity_coverage = coverage.to_vec();
+            chunk
+        },
+    ));
+    chunks
 }
 
 pub(crate) fn split_http_rollup_metadata_chunks(
@@ -340,6 +410,8 @@ pub(crate) fn split_http_rollup_summary_chunks(
             chunk.task_verifications.clear();
             chunk.code_change_metrics.clear();
             chunk.quota_cycle_contributions.clear();
+            chunk.activity_rollups.clear();
+            chunk.activity_coverage.clear();
             chunk.authoritative_snapshot = None;
             chunk
         })

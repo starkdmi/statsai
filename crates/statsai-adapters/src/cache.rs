@@ -8,17 +8,17 @@ use std::time::UNIX_EPOCH;
 pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever provider parsing semantics change,
 // so historical sessions get rescanned for runtime, pricing, and project context updates.
-// session-identity.v28: usage events adopt the session_meta id (the telemetry
-// `conversation.id`) as their session identity; cached files must reparse or
-// conversation-to-account bindings can never reach previously scanned events.
-pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "session-identity.v28";
+// activity-invocations.v29: extract tool/MCP/skill invocations from native
+// item_completed events and legacy response items; cached files must reparse
+// so historical sessions receive activity rows.
+pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v29";
 // streaming-usage-snapshot.v24: repeated Claude records for one provider request
 // keep the final cumulative usage snapshot instead of the first partial one, so
 // unchanged historical JSONL files must be reparsed to correct undercounted
 // output tokens and estimated cost.
-pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "streaming-usage-snapshot.v24";
-pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v15";
-pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "task-spans.v20";
+pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v25";
+pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v16";
+pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v21";
 
 pub(crate) fn scan_candidate(
     path: PathBuf,

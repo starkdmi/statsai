@@ -1,0 +1,4 @@
+{"type":"assistant","tool_calls":[{"id":"tc_fixture_001","name":"read_file","arguments":"{}"}]}
+{"type":"tool_result","tool_call_id":"tc_fixture_001","content":"..."}
+{"type":"backend_tool_call","id":"tc_fixture_backend","name":"backend_tool_call"}
+{not-json

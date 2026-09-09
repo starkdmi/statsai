@@ -35,13 +35,15 @@ pub const SYNC_BATCH_V2_SCHEMA_VERSION: &str = "sync_batch.v2";
 pub const SYNC_BATCH_V3_SCHEMA_VERSION: &str = "sync_batch.v3";
 pub const SYNC_BATCH_V4_SCHEMA_VERSION: &str = "sync_batch.v4";
 pub const SYNC_BATCH_V5_SCHEMA_VERSION: &str = "sync_batch.v5";
+pub const SYNC_BATCH_V6_SCHEMA_VERSION: &str = "sync_batch.v6";
 pub const SYNC_ACK_V1_SCHEMA_VERSION: &str = "sync_ack.v1";
 pub const SYNC_ACK_V2_SCHEMA_VERSION: &str = "sync_ack.v2";
 pub const SYNC_ACK_V3_SCHEMA_VERSION: &str = "sync_ack.v3";
 pub const SYNC_ACK_V4_SCHEMA_VERSION: &str = "sync_ack.v4";
 pub const SYNC_ACK_V5_SCHEMA_VERSION: &str = "sync_ack.v5";
-pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V5_SCHEMA_VERSION;
-pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V5_SCHEMA_VERSION;
+pub const SYNC_ACK_V6_SCHEMA_VERSION: &str = "sync_ack.v6";
+pub const SYNC_BATCH_SCHEMA_VERSION: &str = SYNC_BATCH_V6_SCHEMA_VERSION;
+pub const SYNC_ACK_SCHEMA_VERSION: &str = SYNC_ACK_V6_SCHEMA_VERSION;
 
 #[cfg(test)]
 mod tests;

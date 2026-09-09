@@ -44,6 +44,12 @@ pub(crate) fn effective_sync_preferences(
     if command.exclude_tasks {
         preferences.include_tasks = false;
     }
+    if command.include_activity {
+        preferences.include_activity = true;
+    }
+    if command.exclude_activity {
+        preferences.include_activity = false;
+    }
 
     Ok(preferences.normalized())
 }
@@ -57,7 +63,7 @@ fn apply_sync_preference_overrides(
     if preferences != original {
         store.set_sync_preferences(preferences)?;
         eprintln!(
-            "sync preferences updated: projects={} tasks={}",
+            "sync preferences updated: projects={} tasks={} activity={}",
             if preferences.include_projects {
                 "enabled"
             } else {
@@ -67,13 +73,31 @@ fn apply_sync_preference_overrides(
                 "enabled"
             } else {
                 "disabled"
+            },
+            if preferences.include_activity {
+                "enabled"
+            } else {
+                "disabled"
             }
         );
         if (!original.include_projects && preferences.include_projects)
             || (!original.include_tasks && preferences.include_tasks)
+            || (!original.include_activity && preferences.include_activity)
         {
             eprintln!(
                 "sync preferences changed privacy/backfill scope; the next sync may resend historical summaries to update the hosted mirror"
+            );
+        }
+        if !original.include_activity && preferences.include_activity {
+            store.mark_all_activity_rollups_dirty()?;
+            store.mark_all_activity_coverage_dirty()?;
+            eprintln!(
+                "activity sync enabled: all local activity rollups marked dirty for backfill"
+            );
+        }
+        if original.include_activity && !preferences.include_activity {
+            eprintln!(
+                "activity sync disabled: the next successful HTTP sync sends an empty activity snapshot so hosted names are pruned"
             );
         }
     }
@@ -413,13 +437,18 @@ fn maybe_disable_http_hosted_task_sync_payload(
 fn sync_status(store: &Store, device_id: &str) -> Result<()> {
     let sync_preferences = store.sync_preferences()?;
     println!(
-        "preferences projects={} tasks={}",
+        "preferences projects={} tasks={} activity={}",
         if sync_preferences.include_projects {
             "enabled"
         } else {
             "disabled"
         },
         if sync_preferences.include_tasks {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if sync_preferences.include_activity {
             "enabled"
         } else {
             "disabled"
@@ -868,6 +897,8 @@ mod tests {
             exclude_projects: false,
             include_tasks: false,
             exclude_tasks: false,
+            include_activity: false,
+            exclude_activity: false,
         }
     }
 

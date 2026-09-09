@@ -14,6 +14,7 @@ pub(super) use statsai_core::{
     WORK_ITEM_SCHEMA_VERSION,
 };
 
+pub(super) use std::collections::HashSet;
 pub(super) use std::path::Path;
 
 pub(super) use std::sync::{Arc, Mutex};
@@ -65,13 +66,23 @@ impl ProviderAdapter for TestAdapter {
     fn scan(
         &self,
         _source: &SourceLocation,
-        _options: &ScanOptions,
+        options: &ScanOptions,
     ) -> Result<statsai_adapters::AdapterScan> {
         if let Some(scan_calls) = &self.scan_calls {
             let mut calls = scan_calls.lock().expect("scan call mutex");
             *calls += 1;
         }
-        Ok(self.scan_result.clone())
+        let mut result = self.scan_result.clone();
+        if let Some(keys) = &options.selected_cache_keys {
+            let hashes = keys
+                .iter()
+                .map(|key| hash_text(key))
+                .collect::<HashSet<_>>();
+            result
+                .activity_invocations
+                .retain(|invocation| hashes.contains(&invocation.source_file_path_hash));
+        }
+        Ok(result)
     }
 }
 
@@ -93,6 +104,8 @@ pub(super) fn test_sync_command(sink: &str) -> SyncCommand {
         exclude_projects: false,
         include_tasks: false,
         exclude_tasks: false,
+        include_activity: false,
+        exclude_activity: false,
     }
 }
 

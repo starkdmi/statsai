@@ -260,6 +260,15 @@ impl Store {
             // else repairs the link. Run after the insert: a record that survives the
             // rescan keeps its id, and the check treats it as still present.
             self.clear_quota_usage_links_for_events(&deleted_events.deleted_event_ids)?;
+            let activity = self.persist_activity_scan_inner(
+                replacement.device_id,
+                replacement.source_id,
+                replacement.activity_invocations,
+                replacement.activity_coverage,
+                replacement.reconciled_file_hashes,
+                replacement.activity_persist_mode,
+                replacement.activity_scan_cursor.clone(),
+            )?;
             self.record_scan_file_entries(replacement.source_id, replacement.pending_entries)?;
             self.upgrade_scan_file_entries(
                 replacement.source_id,
@@ -269,6 +278,7 @@ impl Store {
             Ok(ScanFileReplacementResult {
                 inserted_events,
                 written_summaries,
+                written_activity_invocations: activity.written_invocations,
             })
         })
     }

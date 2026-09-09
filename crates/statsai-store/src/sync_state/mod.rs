@@ -623,6 +623,34 @@ impl Store {
                 &batch.account_evidence_summaries,
                 |summary| summary.summary_id.as_str(),
             )?;
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "activity_rollup",
+                &batch.activity_rollups,
+                |rollup| rollup.rollup_id.as_str(),
+            )?;
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "activity_coverage",
+                &batch.activity_coverage,
+                |coverage| coverage.coverage_id.as_str(),
+            )?;
+            self.mark_activity_rollups_synced_in_transaction(
+                &batch
+                    .activity_rollups
+                    .iter()
+                    .map(|rollup| rollup.rollup_id.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            self.mark_activity_coverage_synced_in_transaction(
+                &batch
+                    .activity_coverage
+                    .iter()
+                    .map(|coverage| coverage.coverage_id.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             self.record_task_bucket_snapshots_synced_in_transaction(
                 sink,
                 target,

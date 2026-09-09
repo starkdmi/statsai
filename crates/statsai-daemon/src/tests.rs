@@ -7,8 +7,8 @@ use statsai_core::{
     TaskVerificationId, UsageCounts, WorkItem, WorkItemId, WorkItemMember,
     CODE_CHANGE_METRIC_SCHEMA_VERSION, SYNC_ACK_V1_SCHEMA_VERSION, SYNC_ACK_V4_SCHEMA_VERSION,
     SYNC_BATCH_V1_SCHEMA_VERSION, SYNC_BATCH_V2_SCHEMA_VERSION, SYNC_BATCH_V3_SCHEMA_VERSION,
-    SYNC_BATCH_V4_SCHEMA_VERSION, SYNC_BATCH_V5_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION,
-    TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
+    SYNC_BATCH_V4_SCHEMA_VERSION, SYNC_BATCH_V5_SCHEMA_VERSION, SYNC_BATCH_V6_SCHEMA_VERSION,
+    TASK_SPAN_SCHEMA_VERSION, TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
 };
 
 fn empty_batch() -> SyncBatch {
@@ -22,6 +22,8 @@ fn empty_batch() -> SyncBatch {
         subscriptions: Vec::new(),
         account_plan_observations: Vec::new(),
         account_evidence_summaries: Vec::new(),
+        activity_rollups: Vec::new(),
+        activity_coverage: Vec::new(),
         events: Vec::new(),
         summaries: Vec::new(),
         task_buckets: Vec::new(),
@@ -283,6 +285,48 @@ fn ingest_v4_batch_refuses_quota_cycle_contributions_it_cannot_store() {
     assert!(error
         .to_string()
         .contains("quota cycle contributions are not supported"));
+}
+
+#[test]
+fn ingest_v6_batch_refuses_activity_collections_it_cannot_store() {
+    let store = Store::in_memory().expect("store");
+    let mut batch = empty_batch();
+    batch.schema_version = SYNC_BATCH_V6_SCHEMA_VERSION.to_string();
+    let now = Utc::now();
+    batch.activity_rollups.push(statsai_core::ActivityRollupV1 {
+        schema_version: statsai_core::ACTIVITY_ROLLUP_SCHEMA_VERSION.to_string(),
+        rollup_id: "activity-rollup-loopback".to_string(),
+        device_id: batch.device_id.clone(),
+        source_id: statsai_core::SourceId("source".to_string()),
+        provider: "codex".to_string(),
+        provider_account_id: None,
+        day: "2026-01-01".to_string(),
+        kind: statsai_core::ActivityKind::Tool,
+        entity_key: "exec".to_string(),
+        display_name: "exec".to_string(),
+        family: statsai_core::ActivityFamily::Shell,
+        mcp_server: None,
+        mcp_tool: None,
+        plugin: None,
+        skill_catalog: None,
+        calls: 1,
+        succeeded: 1,
+        failed: 0,
+        unknown: 0,
+        duration_samples: 1,
+        duration_sum_ms: 10,
+        duration_max_ms: Some(10),
+        duration_buckets: [1, 0, 0, 0, 0, 0, 0, 0],
+        duration_kind: Some(statsai_core::ActivityDurationKind::Reported),
+        first_seen: now,
+        last_seen: now,
+        evidence: "codex-native-items".to_string(),
+    });
+
+    let error = ingest_sync_batch(&store, &batch).expect_err("unsupported activity");
+    assert!(error
+        .to_string()
+        .contains("activity collections are not supported"));
 }
 
 #[test]
