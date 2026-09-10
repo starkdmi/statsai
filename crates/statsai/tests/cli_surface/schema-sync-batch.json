@@ -381,7 +381,6 @@
         "day",
         "device_id",
         "display_name",
-        "duration_buckets",
         "duration_samples",
         "duration_sum_ms",
         "entity_key",
@@ -412,16 +411,6 @@
         },
         "display_name": {
           "type": "string"
-        },
-        "duration_buckets": {
-          "type": "array",
-          "items": {
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0.0
-          },
-          "maxItems": 8,
-          "minItems": 8
         },
         "duration_kind": {
           "anyOf": [

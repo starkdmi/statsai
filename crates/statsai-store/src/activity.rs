@@ -3,10 +3,10 @@
 use super::*;
 use rusqlite::{params, OptionalExtension};
 use statsai_core::{
-    activity_account_key, activity_day_key, activity_duration_bucket_index, activity_entity_key,
-    activity_rollup_id, hash_text, sanitize_activity_invocation, ActivityCoverageV1,
-    ActivityFamily, ActivityInvocationV1, ActivityKind, ActivityOutcome, ActivityRollupV1,
-    ProviderAccountId, ACTIVITY_DURATION_BUCKET_COUNT, ACTIVITY_ROLLUP_SCHEMA_VERSION,
+    activity_account_key, activity_day_key, activity_entity_key, activity_rollup_id, hash_text,
+    sanitize_activity_invocation, ActivityCoverageV1, ActivityFamily, ActivityInvocationV1,
+    ActivityKind, ActivityOutcome, ActivityRollupV1, ProviderAccountId,
+    ACTIVITY_ROLLUP_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -993,7 +993,6 @@ fn build_activity_rollup(
     let mut duration_samples = 0u64;
     let mut duration_sum_ms = 0u64;
     let mut duration_max_ms: Option<u64> = None;
-    let mut duration_buckets = [0u64; ACTIVITY_DURATION_BUCKET_COUNT];
     let mut duration_kind = None;
     let mut mixed_duration_kind = false;
     let mut first_seen = first.observed_at;
@@ -1018,7 +1017,6 @@ fn build_activity_rollup(
                 Some(max) => max.max(duration_ms),
                 None => duration_ms,
             });
-            duration_buckets[activity_duration_bucket_index(duration_ms)] += 1;
             match (duration_kind, invocation.duration_kind) {
                 (None, Some(kind)) if !mixed_duration_kind => duration_kind = Some(kind),
                 (Some(existing), Some(kind)) if existing != kind => {
@@ -1066,7 +1064,6 @@ fn build_activity_rollup(
         duration_samples,
         duration_sum_ms,
         duration_max_ms,
-        duration_buckets,
         duration_kind,
         first_seen,
         last_seen,
@@ -1231,10 +1228,7 @@ mod tests {
         assert_eq!(rollups[0].calls, 2);
         assert_eq!(rollups[0].succeeded, 1);
         assert_eq!(rollups[0].failed, 1);
-        assert_eq!(
-            rollups[0].duration_buckets.iter().sum::<u64>(),
-            rollups[0].duration_samples
-        );
+        assert_eq!(rollups[0].duration_samples, 2);
         store
             .persist_activity_scan(
                 "device",

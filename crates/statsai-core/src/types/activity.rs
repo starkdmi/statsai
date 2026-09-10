@@ -30,17 +30,13 @@ use serde::{Deserialize, Serialize};
 pub const ACTIVITY_INVOCATION_SCHEMA_VERSION: &str = "activity_invocation.v1";
 pub const ACTIVITY_ROLLUP_SCHEMA_VERSION: &str = "activity_rollup.v1";
 pub const ACTIVITY_COVERAGE_SCHEMA_VERSION: &str = "activity_coverage.v1";
-pub const ACTIVITY_PARSER_REVISION: &str = "activity.v4";
+pub const ACTIVITY_PARSER_REVISION: &str = "activity.v5";
 /// Identity table for provider-native tool names. Bump when a rename or
 /// cross-provider alias is added; do not treat this as a parser revision of its own.
 pub const ACTIVITY_OP_ALIAS_REVISION: &str = "activity-ops.v2";
 /// Timestamps at or before Unix epoch, and any day before this instant, are
 /// treated as absent so a zero `completed_at_ms` cannot key 1970-01-01.
 pub const ACTIVITY_EARLIEST_PLAUSIBLE_MS: i64 = 1_704_067_200_000; // 2024-01-01T00:00:00Z
-
-pub const ACTIVITY_DURATION_BUCKET_COUNT: usize = 8;
-pub const ACTIVITY_DURATION_HISTOGRAM_EDGES_MS: [u64; 7] =
-    [10, 100, 1_000, 10_000, 60_000, 600_000, 3_600_000];
 
 pub const ACTIVITY_FAMILY_V1: [&str; 12] = [
     "file-read",
@@ -330,7 +326,6 @@ pub struct ActivityRollupV1 {
     pub duration_samples: u64,
     pub duration_sum_ms: u64,
     pub duration_max_ms: Option<u64>,
-    pub duration_buckets: [u64; ACTIVITY_DURATION_BUCKET_COUNT],
     pub duration_kind: Option<ActivityDurationKind>,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
@@ -531,52 +526,6 @@ pub fn canonical_activity_display_name(provider: &str, native_name: &str) -> Str
 }
 
 #[must_use]
-pub fn activity_duration_bucket_index(duration_ms: u64) -> usize {
-    ACTIVITY_DURATION_HISTOGRAM_EDGES_MS
-        .iter()
-        .position(|&edge| duration_ms < edge)
-        .unwrap_or(ACTIVITY_DURATION_BUCKET_COUNT - 1)
-}
-
-/// Upper edge of a histogram bucket, used as the p50/p90 estimate.
-///
-/// The last bucket is unbounded (`≥1h`); its reported edge is the 1h threshold.
-#[must_use]
-pub fn activity_duration_bucket_upper_edge_ms(index: usize) -> Option<u64> {
-    if index >= ACTIVITY_DURATION_BUCKET_COUNT {
-        return None;
-    }
-    Some(
-        ACTIVITY_DURATION_HISTOGRAM_EDGES_MS
-            .get(index)
-            .copied()
-            .unwrap_or(*ACTIVITY_DURATION_HISTOGRAM_EDGES_MS.last().expect("edges")),
-    )
-}
-
-/// Bucket-estimate percentile: the upper edge of the first bucket whose
-/// cumulative count reaches `percentile * samples`.
-#[must_use]
-pub fn activity_duration_percentile_ms(
-    buckets: &[u64; ACTIVITY_DURATION_BUCKET_COUNT],
-    samples: u64,
-    percentile: f64,
-) -> Option<u64> {
-    if samples == 0 || !(0.0..=1.0).contains(&percentile) {
-        return None;
-    }
-    let target = ((percentile * samples as f64).ceil() as u64).max(1);
-    let mut cumulative = 0u64;
-    for (index, count) in buckets.iter().enumerate() {
-        cumulative = cumulative.saturating_add(*count);
-        if cumulative >= target {
-            return activity_duration_bucket_upper_edge_ms(index);
-        }
-    }
-    activity_duration_bucket_upper_edge_ms(ACTIVITY_DURATION_BUCKET_COUNT - 1)
-}
-
-#[must_use]
 pub fn activity_rollup_id(
     device_id: &str,
     source_id: &str,
@@ -686,43 +635,6 @@ mod tests {
             let json = serde_json::to_string(&family).unwrap();
             assert_eq!(json, format!("\"{name}\""));
         }
-    }
-
-    #[test]
-    fn duration_buckets_split_on_documented_edges() {
-        assert_eq!(activity_duration_bucket_index(0), 0);
-        assert_eq!(activity_duration_bucket_index(9), 0);
-        assert_eq!(activity_duration_bucket_index(10), 1);
-        assert_eq!(activity_duration_bucket_index(99), 1);
-        assert_eq!(activity_duration_bucket_index(100), 2);
-        assert_eq!(activity_duration_bucket_index(999), 2);
-        assert_eq!(activity_duration_bucket_index(1_000), 3);
-        assert_eq!(activity_duration_bucket_index(9_999), 3);
-        assert_eq!(activity_duration_bucket_index(10_000), 4);
-        assert_eq!(activity_duration_bucket_index(59_999), 4);
-        assert_eq!(activity_duration_bucket_index(60_000), 5);
-        assert_eq!(activity_duration_bucket_index(599_999), 5);
-        assert_eq!(activity_duration_bucket_index(600_000), 6);
-        assert_eq!(activity_duration_bucket_index(3_599_999), 6);
-        assert_eq!(activity_duration_bucket_index(3_600_000), 7);
-        assert_eq!(activity_duration_bucket_index(u64::MAX), 7);
-    }
-
-    #[test]
-    fn percentile_reports_bucket_upper_edge() {
-        let mut buckets = [0u64; 8];
-        buckets[0] = 1;
-        buckets[2] = 1;
-        buckets[4] = 1;
-        assert_eq!(
-            activity_duration_percentile_ms(&buckets, 3, 0.5),
-            Some(1_000)
-        );
-        assert_eq!(
-            activity_duration_percentile_ms(&buckets, 3, 0.9),
-            Some(60_000)
-        );
-        assert_eq!(activity_duration_percentile_ms(&buckets, 0, 0.5), None);
     }
 
     #[test]

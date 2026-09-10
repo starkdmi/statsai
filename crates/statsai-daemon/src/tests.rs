@@ -317,7 +317,6 @@ fn ingest_v6_batch_refuses_activity_collections_it_cannot_store() {
         duration_samples: 1,
         duration_sum_ms: 10,
         duration_max_ms: Some(10),
-        duration_buckets: [1, 0, 0, 0, 0, 0, 0, 0],
         duration_kind: Some(statsai_core::ActivityDurationKind::Reported),
         first_seen: now,
         last_seen: now,
