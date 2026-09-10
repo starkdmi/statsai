@@ -1,17 +1,18 @@
 use super::families::{family_for_name, CLAUDE_FAMILY_ALIASES};
 use super::mcp::split_mcp_double_underscore;
+use super::shell_cmd::{classify_shell_command, shell_command_is_write};
 use super::skills::classify_claude_skill_input;
 use super::{
-    build_invocation, emit_kind_coverage, hashed_invocation_id, parse_rfc3339_utc, push_invocation,
-    signed_duration_ms, source_file_hash,
+    build_invocation, emit_kind_coverage, hashed_invocation_id, parse_rfc3339_utc,
+    push_command_for_tool, push_invocation, signed_duration_ms, source_file_hash,
 };
 use crate::AdapterScan;
 use crate::CLAUDE_CODE_PROVIDER;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use statsai_core::{
-    activity_day_key, ActivityCoverageLevel, ActivityDurationKind, ActivityFamily, ActivityKind,
-    ActivityOutcome, SourceLocation,
+    activity_day_key, canonical_activity_display_name, ActivityCoverageLevel, ActivityDurationKind,
+    ActivityFamily, ActivityKind, ActivityOutcome, SourceLocation,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -22,6 +23,7 @@ pub(crate) const CLAUDE_EVIDENCE: &str = "claude-tool-blocks";
 pub(crate) struct ClaudeActivityExtractor {
     pending: HashMap<String, PendingTool>,
     completed: Vec<statsai_core::ActivityInvocationV1>,
+    command_names: HashMap<String, (String, bool)>,
 }
 
 #[derive(Debug)]
@@ -94,6 +96,18 @@ impl ClaudeActivityExtractor {
                 continue;
             }
             let family = family_for_name(CLAUDE_FAMILY_ALIASES, name);
+            let display_name = canonical_activity_display_name(CLAUDE_CODE_PROVIDER, name);
+            if family == ActivityFamily::Shell {
+                if let Some(command) = block.pointer("/input/command").and_then(Value::as_str) {
+                    self.command_names.insert(
+                        invocation_id.clone(),
+                        (
+                            classify_shell_command(command),
+                            shell_command_is_write(command),
+                        ),
+                    );
+                }
+            }
             let invocation = build_invocation(
                 invocation_id.clone(),
                 CLAUDE_CODE_PROVIDER,
@@ -101,7 +115,7 @@ impl ClaudeActivityExtractor {
                 file_hash.clone(),
                 timestamp,
                 ActivityKind::Tool,
-                name.to_string(),
+                display_name,
                 family,
                 None,
                 None,
@@ -194,6 +208,11 @@ impl ClaudeActivityExtractor {
         let mut days = BTreeSet::new();
         for invocation in self.completed {
             days.insert(activity_day_key(invocation.observed_at));
+            if let Some((command_name, is_write)) =
+                self.command_names.get(&invocation.invocation_id)
+            {
+                push_command_for_tool(scan, &invocation, command_name, *is_write);
+            }
             push_invocation(scan, invocation);
         }
         let fallback_day = activity_day_key(fallback_timestamp);

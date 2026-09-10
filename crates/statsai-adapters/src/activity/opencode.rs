@@ -1,8 +1,9 @@
 use super::families::{family_for_name, OPENCODE_FAMILY_ALIASES};
 use super::mcp::split_opencode_mcp_name;
+use super::shell_cmd::{classify_shell_command, shell_command_is_write};
 use super::{
-    build_invocation, emit_kind_coverage, hashed_invocation_id, push_invocation, source_file_hash,
-    timestamp_from_millis,
+    build_invocation, emit_kind_coverage, hashed_invocation_id, push_command_for_tool,
+    push_invocation, source_file_hash, timestamp_from_millis,
 };
 use crate::AdapterScan;
 use crate::OPENCODE_PROVIDER;
@@ -10,8 +11,8 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::Deserialize;
 use statsai_core::{
-    activity_day_key, ActivityCoverageLevel, ActivityDurationKind, ActivityFamily, ActivityKind,
-    ActivityOutcome, SkillCatalog, SourceLocation,
+    activity_day_key, canonical_activity_display_name, ActivityCoverageLevel, ActivityDurationKind,
+    ActivityFamily, ActivityKind, ActivityOutcome, SkillCatalog, SourceLocation,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -42,6 +43,7 @@ struct OpenCodeToolState {
 #[derive(Deserialize)]
 struct OpenCodeToolInput {
     name: Option<String>,
+    command: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -207,27 +209,39 @@ pub(crate) fn extract_opencode_activity(
         }
 
         let family = family_for_name(OPENCODE_FAMILY_ALIASES, tool_name);
-        push_invocation(
-            scan,
-            build_invocation(
-                invocation_id,
-                OPENCODE_PROVIDER,
-                source.source_id.clone(),
-                file_hash.clone(),
-                observed_at,
-                ActivityKind::Tool,
-                tool_name.to_string(),
-                family,
-                None,
-                None,
-                None,
-                None,
-                outcome,
-                duration_ms,
-                duration_ms.map(|_| ActivityDurationKind::Reported),
-                OPENCODE_EVIDENCE,
-            ),
+        let tool = build_invocation(
+            invocation_id,
+            OPENCODE_PROVIDER,
+            source.source_id.clone(),
+            file_hash.clone(),
+            observed_at,
+            ActivityKind::Tool,
+            canonical_activity_display_name(OPENCODE_PROVIDER, tool_name),
+            family,
+            None,
+            None,
+            None,
+            None,
+            outcome,
+            duration_ms,
+            duration_ms.map(|_| ActivityDurationKind::Reported),
+            OPENCODE_EVIDENCE,
         );
+        if family == ActivityFamily::Shell {
+            if let Some(command) = parsed
+                .state
+                .as_ref()
+                .and_then(|state| state.input.as_ref()?.command.as_deref())
+            {
+                push_command_for_tool(
+                    scan,
+                    &tool,
+                    &classify_shell_command(command),
+                    shell_command_is_write(command),
+                );
+            }
+        }
+        push_invocation(scan, tool);
     }
 
     let fallback_day = activity_day_key(fallback_timestamp);

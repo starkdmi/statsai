@@ -86,6 +86,34 @@ fn push_invocation_counts_unknown_tool_names() {
     assert_eq!(scan.diagnostics.activity_unknown_names, 1);
 }
 
+#[test]
+fn command_invocation_marks_write_intent_as_file_write_family() {
+    let tool = build_invocation(
+        "id".to_string(),
+        "claude_code",
+        SourceId("src".to_string()),
+        "hash".to_string(),
+        Utc::now(),
+        ActivityKind::Tool,
+        "shell".to_string(),
+        ActivityFamily::Shell,
+        None,
+        None,
+        None,
+        None,
+        ActivityOutcome::Succeeded,
+        Some(12),
+        None,
+        "test",
+    );
+    let write = command_invocation_for_tool(&tool, "tee", true);
+    assert_eq!(write.kind, ActivityKind::Command);
+    assert_eq!(write.family, ActivityFamily::FileWrite);
+    assert_eq!(write.display_name, "tee");
+    let read = command_invocation_for_tool(&tool, "git", false);
+    assert_eq!(read.family, ActivityFamily::Shell);
+}
+
 fn fixture_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
@@ -137,7 +165,7 @@ fn extracts_codex_native_activity_fixture() {
     assert!(scan
         .activity_invocations
         .iter()
-        .any(|row| row.display_name == "exec" && row.kind == ActivityKind::Tool));
+        .any(|row| row.kind == ActivityKind::Command && row.display_name == "cat"));
     let example_skills: Vec<_> = scan
         .activity_invocations
         .iter()
@@ -193,7 +221,7 @@ fn extracts_codex_legacy_activity_without_mixing_native() {
     assert!(scan
         .activity_invocations
         .iter()
-        .any(|row| row.display_name == "exec"));
+        .any(|row| row.display_name == "shell"));
     let apply_patch = scan
         .activity_invocations
         .iter()
@@ -203,8 +231,8 @@ fn extracts_codex_legacy_activity_without_mixing_native() {
     let exec = scan
         .activity_invocations
         .iter()
-        .find(|row| row.display_name == "exec")
-        .expect("exec");
+        .find(|row| row.display_name == "shell")
+        .expect("shell");
     assert_eq!(exec.outcome, ActivityOutcome::Unknown);
     assert!(scan.activity_coverage.iter().any(|row| {
         row.level == statsai_core::ActivityCoverageLevel::Partial
@@ -233,7 +261,7 @@ fn extracts_codex_class_b_legacy_calls_when_item_completed_is_prose_only() {
     assert!(
         scan.activity_invocations
             .iter()
-            .any(|row| row.display_name == "exec" && row.kind == ActivityKind::Tool),
+            .any(|row| row.display_name == "shell" && row.kind == ActivityKind::Tool),
         "class-B files must count legacy tool calls"
     );
     assert!(scan.activity_invocations.iter().any(|row| {
@@ -277,7 +305,7 @@ fn extracts_claude_tool_blocks_including_fork_and_subagent() {
     assert!(scan
         .activity_invocations
         .iter()
-        .any(|row| row.display_name == "Bash"));
+        .any(|row| row.display_name == "shell"));
     assert!(scan
         .activity_invocations
         .iter()
@@ -291,11 +319,15 @@ fn extracts_claude_tool_blocks_including_fork_and_subagent() {
     assert!(scan
         .activity_invocations
         .iter()
-        .any(|row| row.display_name == "Glob"));
+        .any(|row| row.display_name == "glob"));
+    assert!(scan
+        .activity_invocations
+        .iter()
+        .any(|row| row.kind == ActivityKind::Command && row.display_name == "ls"));
     let bash_ids = scan
         .activity_invocations
         .iter()
-        .filter(|row| row.display_name == "Bash")
+        .filter(|row| row.display_name == "shell" && row.kind == ActivityKind::Tool)
         .map(|row| row.invocation_id.clone())
         .collect::<BTreeSet<_>>();
     assert_eq!(
@@ -306,14 +338,14 @@ fn extracts_claude_tool_blocks_including_fork_and_subagent() {
     assert_eq!(
         scan.activity_invocations
             .iter()
-            .find(|row| row.display_name == "Bash")
+            .find(|row| row.display_name == "shell" && row.kind == ActivityKind::Tool)
             .map(|row| row.outcome),
         Some(ActivityOutcome::Succeeded)
     );
     assert_eq!(
         scan.activity_invocations
             .iter()
-            .find(|row| row.display_name == "Read")
+            .find(|row| row.display_name == "read")
             .map(|row| row.outcome),
         Some(ActivityOutcome::Failed)
     );
@@ -328,7 +360,7 @@ fn extracts_claude_tool_blocks_including_fork_and_subagent() {
     assert_eq!(
         scan.activity_invocations
             .iter()
-            .find(|row| row.display_name == "Grep")
+            .find(|row| row.display_name == "grep")
             .map(|row| row.outcome),
         Some(ActivityOutcome::Unknown)
     );
@@ -354,7 +386,7 @@ fn extracts_grok_events_and_chat_fallback() {
     assert!(events_scan
         .activity_invocations
         .iter()
-        .any(|row| row.display_name == "read_file" && row.outcome == ActivityOutcome::Succeeded));
+        .any(|row| row.display_name == "read" && row.outcome == ActivityOutcome::Succeeded));
     assert!(events_scan.activity_coverage.iter().any(|row| {
         row.evidence == "grok-events" && row.level == statsai_core::ActivityCoverageLevel::Complete
     }));
@@ -376,7 +408,7 @@ fn extracts_grok_events_and_chat_fallback() {
     assert!(chat_scan
         .activity_invocations
         .iter()
-        .any(|row| row.display_name == "read_file"));
+        .any(|row| row.display_name == "read"));
     assert!(chat_scan
         .activity_invocations
         .iter()

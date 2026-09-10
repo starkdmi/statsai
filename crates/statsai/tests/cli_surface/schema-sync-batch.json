@@ -369,7 +369,8 @@
       "enum": [
         "tool",
         "mcp",
-        "skill"
+        "skill",
+        "command"
       ]
     },
     "ActivityRollupV1": {

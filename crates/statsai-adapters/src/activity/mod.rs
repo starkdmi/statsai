@@ -8,6 +8,7 @@ mod families;
 mod grok;
 mod mcp;
 mod opencode;
+mod shell_cmd;
 mod skills;
 
 pub(crate) use claude::*;
@@ -113,6 +114,50 @@ pub(crate) fn push_invocation(scan: &mut AdapterScan, invocation: ActivityInvoca
     }
     scan.diagnostics.activity_rows += 1;
     scan.activity_invocations.push(invocation);
+}
+
+pub(crate) fn command_invocation_for_tool(
+    tool: &ActivityInvocationV1,
+    classified: &str,
+    is_write: bool,
+) -> ActivityInvocationV1 {
+    build_invocation(
+        hashed_invocation_id(&[&tool.invocation_id, "command"]),
+        &tool.provider,
+        tool.source_id.clone(),
+        tool.source_file_path_hash.clone(),
+        tool.observed_at,
+        ActivityKind::Command,
+        classified.to_string(),
+        if is_write {
+            ActivityFamily::FileWrite
+        } else {
+            ActivityFamily::Shell
+        },
+        None,
+        None,
+        None,
+        None,
+        tool.outcome,
+        tool.duration_ms,
+        tool.duration_kind,
+        &tool.evidence,
+    )
+}
+
+pub(crate) fn push_command_for_tool(
+    scan: &mut AdapterScan,
+    tool: &ActivityInvocationV1,
+    classified: &str,
+    is_write: bool,
+) {
+    if classified.is_empty() {
+        return;
+    }
+    push_invocation(
+        scan,
+        command_invocation_for_tool(tool, classified, is_write),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -30,10 +30,10 @@ use serde::{Deserialize, Serialize};
 pub const ACTIVITY_INVOCATION_SCHEMA_VERSION: &str = "activity_invocation.v1";
 pub const ACTIVITY_ROLLUP_SCHEMA_VERSION: &str = "activity_rollup.v1";
 pub const ACTIVITY_COVERAGE_SCHEMA_VERSION: &str = "activity_coverage.v1";
-pub const ACTIVITY_PARSER_REVISION: &str = "activity.v2";
-/// Identity table for provider-native tool renames. Bump when a future
-/// rename is added; do not treat this as a parser revision of its own.
-pub const ACTIVITY_OP_ALIAS_REVISION: &str = "activity-ops.v1";
+pub const ACTIVITY_PARSER_REVISION: &str = "activity.v3";
+/// Identity table for provider-native tool names. Bump when a rename or
+/// cross-provider alias is added; do not treat this as a parser revision of its own.
+pub const ACTIVITY_OP_ALIAS_REVISION: &str = "activity-ops.v2";
 /// Timestamps at or before Unix epoch, and any day before this instant, are
 /// treated as absent so a zero `completed_at_ms` cannot key 1970-01-01.
 pub const ACTIVITY_EARLIEST_PLAUSIBLE_MS: i64 = 1_704_067_200_000; // 2024-01-01T00:00:00Z
@@ -68,6 +68,7 @@ pub enum ActivityKind {
     Tool,
     Mcp,
     Skill,
+    Command,
 }
 
 impl ActivityKind {
@@ -77,6 +78,7 @@ impl ActivityKind {
             Self::Tool => "tool",
             Self::Mcp => "mcp",
             Self::Skill => "skill",
+            Self::Command => "command",
         }
     }
 
@@ -86,6 +88,7 @@ impl ActivityKind {
             "tool" => Some(Self::Tool),
             "mcp" => Some(Self::Mcp),
             "skill" => Some(Self::Skill),
+            "command" => Some(Self::Command),
             _ => None,
         }
     }
@@ -472,7 +475,7 @@ pub fn activity_entity_key(
             }
             _ => display_name.to_string(),
         },
-        ActivityKind::Tool => display_name.to_string(),
+        ActivityKind::Tool | ActivityKind::Command => display_name.to_string(),
     }
 }
 
@@ -483,19 +486,38 @@ pub fn activity_day_key(observed_at: DateTime<Utc>) -> String {
 
 /// Map a provider-native tool name onto a stable identity.
 ///
-/// `activity-ops.v1` (2026-09):
-/// - Codex shell: `shell` (2025-09–10) → `shell_command` (2025-11–2026-01)
-///   → `exec_command` (2026-02–07) → `exec` (2026-06+); `run` (2026-07, brief)
-///   all map to `exec`. `write_stdin` is the unified_exec stdin companion, not
-///   a rename, and is left alone.
-/// - Codex file-write: native `FileChange` is already stored as `apply_patch`,
-///   matching the legacy name.
+/// `activity-ops.v2` (2026-09):
+/// - Shell: Codex `shell` → `shell_command` → `exec_command` → `exec`/`run`,
+///   Claude `Bash`, OpenCode `bash`, Grok `run_terminal_command` all map to
+///   `shell`. `write_stdin` is the unified_exec stdin companion, not a rename.
+/// - Read/edit/write/grep/glob/web names collapse across Claude, OpenCode, and
+///   Grok. Codex `apply_patch` stays distinct from `edit`/`write`.
 #[must_use]
 pub fn canonical_activity_display_name(provider: &str, native_name: &str) -> String {
     match (provider, native_name) {
         ("codex", "shell" | "shell_command" | "exec_command" | "exec" | "run") => {
-            "exec".to_string()
+            "shell".to_string()
         }
+        ("claude_code", "Bash") | ("opencode", "bash") | ("grok_build", "run_terminal_command") => {
+            "shell".to_string()
+        }
+        ("claude_code", "Read" | "NotebookRead")
+        | ("opencode", "read")
+        | ("grok_build", "read_file") => "read".to_string(),
+        ("claude_code", "Edit" | "MultiEdit" | "NotebookEdit")
+        | ("opencode", "edit" | "multiedit")
+        | ("grok_build", "search_replace") => "edit".to_string(),
+        ("claude_code", "Write") | ("opencode", "write") | ("grok_build", "write") => {
+            "write".to_string()
+        }
+        ("claude_code", "Grep") | ("opencode", "grep") | ("grok_build", "grep") => {
+            "grep".to_string()
+        }
+        ("claude_code", "Glob") | ("opencode", "glob") => "glob".to_string(),
+        ("claude_code", "WebFetch") | ("opencode", "webfetch") => "web_fetch".to_string(),
+        ("claude_code", "WebSearch")
+        | ("opencode", "websearch" | "google_search")
+        | ("codex", "web_search_call") => "web_search".to_string(),
         _ => native_name.to_string(),
     }
 }
@@ -585,9 +607,9 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
-    fn canonical_codex_shell_aliases_collapse_to_exec() {
+    fn canonical_ops_collapse_shell_read_and_write_aliases() {
         for native in ["shell", "shell_command", "exec_command", "exec", "run"] {
-            assert_eq!(canonical_activity_display_name("codex", native), "exec");
+            assert_eq!(canonical_activity_display_name("codex", native), "shell");
         }
         assert_eq!(
             canonical_activity_display_name("codex", "write_stdin"),
@@ -599,9 +621,18 @@ mod tests {
         );
         assert_eq!(
             canonical_activity_display_name("claude_code", "Bash"),
-            "Bash"
+            "shell"
         );
-        assert_eq!(canonical_activity_display_name("opencode", "bash"), "bash");
+        assert_eq!(canonical_activity_display_name("opencode", "bash"), "shell");
+        assert_eq!(
+            canonical_activity_display_name("claude_code", "Read"),
+            "read"
+        );
+        assert_eq!(canonical_activity_display_name("opencode", "read"), "read");
+        assert_eq!(
+            canonical_activity_display_name("grok_build", "run_terminal_command"),
+            "shell"
+        );
     }
 
     #[test]

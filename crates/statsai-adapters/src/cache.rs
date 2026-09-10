@@ -8,13 +8,11 @@ use std::time::UNIX_EPOCH;
 pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever provider parsing semantics change,
 // so historical sessions get rescanned for runtime, pricing, and project context updates.
-// activity-invocations.v30: Claude absent is_error is success; Codex class-B
-// stream switch, shell aliases, FileChange unknown, legacy exit_code, skill
-// path segments, and non-positive completed_at_ms rejected.
-pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v30";
-pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v26";
-pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v16";
-pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v21";
+// activity-invocations.v31: canonical operation names and POSIX command heads.
+pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v31";
+pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v27";
+pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v17";
+pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v22";
 
 pub(crate) fn scan_candidate(
     path: PathBuf,

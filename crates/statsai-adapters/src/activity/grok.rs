@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use statsai_core::{
-    activity_day_key, ActivityCoverageLevel, ActivityDurationKind, ActivityFamily, ActivityKind,
-    ActivityOutcome, SourceLocation,
+    activity_day_key, canonical_activity_display_name, ActivityCoverageLevel, ActivityDurationKind,
+    ActivityFamily, ActivityKind, ActivityOutcome, SourceLocation,
 };
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -132,7 +132,7 @@ fn extract_grok_events(
                 file_hash.clone(),
                 observed_at,
                 ActivityKind::Tool,
-                name.to_string(),
+                canonical_activity_display_name(GROK_BUILD_PROVIDER, name),
                 family,
                 None,
                 None,
@@ -254,7 +254,7 @@ fn extract_grok_chat_history(
                         file_hash.clone(),
                         observed_at,
                         ActivityKind::Tool,
-                        name,
+                        canonical_activity_display_name(GROK_BUILD_PROVIDER, &name),
                         family,
                         None,
                         None,
@@ -319,7 +319,7 @@ fn extract_grok_chat_history(
                 file_hash.clone(),
                 observed_at,
                 ActivityKind::Tool,
-                name,
+                canonical_activity_display_name(GROK_BUILD_PROVIDER, &name),
                 family,
                 None,
                 None,

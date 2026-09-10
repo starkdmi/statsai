@@ -773,6 +773,7 @@ impl Store {
                 ActivityKind::Tool => status.tool_calls += 1,
                 ActivityKind::Mcp => status.mcp_calls += 1,
                 ActivityKind::Skill => status.skill_loads += 1,
+                ActivityKind::Command => {}
             }
             match outcome_raw.as_str() {
                 "succeeded" => status.succeeded += 1,
@@ -820,6 +821,7 @@ impl Store {
                 ActivityKind::Tool => tools.push(row),
                 ActivityKind::Mcp => mcp.push(row),
                 ActivityKind::Skill => skills.push(row),
+                ActivityKind::Command => {}
             }
         }
         for list in [&mut tools, &mut mcp, &mut skills] {

@@ -1,10 +1,13 @@
 use super::families::{family_for_name, CODEX_LEGACY_FAMILY_ALIASES};
 use super::mcp::split_mcp_double_underscore;
+use super::shell_cmd::{
+    classify_shell_argv, classify_shell_command, shell_argv_is_write, shell_command_is_write,
+};
 use super::skills::classify_skill_path;
 use super::{
-    build_invocation, duration_from_secs_nanos, emit_kind_coverage, hashed_invocation_id,
-    hashed_invocation_id_or_ordinal, parse_rfc3339_utc, push_invocation, source_file_hash,
-    timestamp_from_millis,
+    build_invocation, command_invocation_for_tool, duration_from_secs_nanos, emit_kind_coverage,
+    hashed_invocation_id, hashed_invocation_id_or_ordinal, parse_rfc3339_utc, push_invocation,
+    source_file_hash, timestamp_from_millis,
 };
 use crate::AdapterScan;
 use crate::CODEX_PROVIDER;
@@ -209,6 +212,7 @@ struct NativeItem {
     id: Option<String>,
     status: Option<String>,
     parsed_cmd: Option<Vec<ParsedCmd>>,
+    command: Option<CommandSpec>,
     duration: Option<NativeDuration>,
     server: Option<String>,
     tool: Option<String>,
@@ -220,6 +224,13 @@ struct ParsedCmd {
     #[serde(rename = "type")]
     cmd_type: Option<String>,
     path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CommandSpec {
+    Argv(Vec<String>),
+    Line(String),
 }
 
 #[derive(Deserialize)]
@@ -308,14 +319,14 @@ fn parse_native_line(
     match parsed.payload.item.item_type.as_str() {
         "CommandExecution" => {
             let family = command_family(parsed.payload.item.parsed_cmd.as_deref().unwrap_or(&[]));
-            invocations.push(build_invocation(
+            let tool = build_invocation(
                 invocation_id.clone(),
                 CODEX_PROVIDER,
                 source.source_id.clone(),
                 file_hash.clone(),
                 observed_at,
                 ActivityKind::Tool,
-                "exec".to_string(),
+                canonical_activity_display_name(CODEX_PROVIDER, "exec"),
                 family,
                 None,
                 None,
@@ -325,7 +336,13 @@ fn parse_native_line(
                 duration_ms,
                 duration_kind,
                 CODEX_NATIVE_EVIDENCE,
-            ));
+            );
+            if let Some((classified, is_write)) =
+                classify_codex_command(parsed.payload.item.command.as_ref())
+            {
+                invocations.push(command_invocation_for_tool(&tool, &classified, is_write));
+            }
+            invocations.push(tool);
             if let Some(cmds) = parsed.payload.item.parsed_cmd.as_ref() {
                 for cmd in cmds {
                     if cmd.cmd_type.as_deref() != Some("read") {
@@ -539,6 +556,18 @@ fn parse_native_line(
     (!invocations.is_empty()).then_some(invocations)
 }
 
+fn classify_codex_command(command: Option<&CommandSpec>) -> Option<(String, bool)> {
+    match command? {
+        CommandSpec::Argv(argv) if !argv.is_empty() => {
+            Some((classify_shell_argv(argv), shell_argv_is_write(argv)))
+        }
+        CommandSpec::Line(line) if !line.is_empty() => {
+            Some((classify_shell_command(line), shell_command_is_write(line)))
+        }
+        _ => None,
+    }
+}
+
 fn command_family(cmds: &[ParsedCmd]) -> ActivityFamily {
     if cmds.is_empty() {
         return ActivityFamily::Shell;
@@ -608,7 +637,7 @@ fn parse_legacy_line(
                 file_hash,
                 observed_at,
                 ActivityKind::Tool,
-                "web_search_call".to_string(),
+                "web_search".to_string(),
                 ActivityFamily::Web,
                 None,
                 None,
@@ -657,7 +686,10 @@ fn parse_legacy_line(
             )),
         });
     }
-    let family = family_for_name(CODEX_LEGACY_FAMILY_ALIASES, &name);
+    let family = family_for_name(
+        CODEX_LEGACY_FAMILY_ALIASES,
+        parsed.payload.name.as_deref().unwrap_or(payload_type),
+    );
     Some(LegacyObserve::Start {
         call_id: call_id_owned,
         invocation: Box::new(build_invocation(
