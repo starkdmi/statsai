@@ -12,6 +12,81 @@ mod payloads;
 pub(crate) use budget::*;
 pub(crate) use payloads::*;
 
+/// Indexed `_{kind}_{n}` suffixes the rollup splitter can emit.
+///
+/// The sync cursor stripper iterates this same list. A handwritten copy in
+/// the HTTP client drifted three times (quota, account plans, activity) and
+/// forced `--full` whenever the remote last-batch id used an unrecognized kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpRollupIndexedChunkKind {
+    Sources,
+    Accounts,
+    Assignments,
+    Subscriptions,
+    AccountPlans,
+    AccountEvidence,
+    TaskBuckets,
+    TaskVerifications,
+    CodeChanges,
+    QuotaCycles,
+    ActivityRollups,
+    ActivityCoverage,
+    Snapshot,
+}
+
+impl HttpRollupIndexedChunkKind {
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Sources,
+        Self::Accounts,
+        Self::Assignments,
+        Self::Subscriptions,
+        Self::AccountPlans,
+        Self::AccountEvidence,
+        Self::TaskBuckets,
+        Self::TaskVerifications,
+        Self::CodeChanges,
+        Self::QuotaCycles,
+        Self::ActivityRollups,
+        Self::ActivityCoverage,
+        Self::Snapshot,
+    ];
+
+    pub(crate) const METADATA: &'static [Self] = &[
+        Self::Sources,
+        Self::Accounts,
+        Self::Assignments,
+        Self::Subscriptions,
+        Self::AccountPlans,
+        Self::AccountEvidence,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sources => "sources",
+            Self::Accounts => "accounts",
+            Self::Assignments => "assignments",
+            Self::Subscriptions => "subscriptions",
+            Self::AccountPlans => "account_plans",
+            Self::AccountEvidence => "account_evidence",
+            Self::TaskBuckets => "task_buckets",
+            Self::TaskVerifications => "task_verifications",
+            Self::CodeChanges => "code_changes",
+            Self::QuotaCycles => "quota_cycles",
+            Self::ActivityRollups => "activity_rollups",
+            Self::ActivityCoverage => "activity_coverage",
+            Self::Snapshot => "snapshot",
+        }
+    }
+
+    pub(crate) fn suffix(self, one_based_index: usize) -> String {
+        format!("{}_{}", self.as_str(), one_based_index)
+    }
+}
+
+pub(crate) fn http_rollup_part_chunk_suffix(part: usize, total: usize) -> String {
+    format!("part_{part}_of_{total}")
+}
+
 pub(crate) const HTTP_ROLLUP_SUMMARIES_PER_BATCH: usize = 25;
 
 pub(crate) const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
@@ -46,7 +121,7 @@ pub(crate) fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch
         ) {
             let mut snapshot_chunk = empty_http_rollup_chunk(
                 &data_batch,
-                &format!("snapshot_{}", snapshot.part_index + 1),
+                &HttpRollupIndexedChunkKind::Snapshot.suffix(snapshot.part_index as usize + 1),
             );
             snapshot_chunk.authoritative_snapshot = Some(snapshot);
             chunks.push(snapshot_chunk);

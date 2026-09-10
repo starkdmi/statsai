@@ -613,37 +613,41 @@ fn optional_task_verification_feed_statuses_do_not_fail_sync() {
 }
 
 #[test]
-fn logical_http_rollup_batch_id_strips_known_chunk_suffixes() {
+fn logical_http_rollup_batch_id_strips_every_indexed_chunk_kind() {
+    let base = "batch_1";
+    for kind in HttpRollupIndexedChunkKind::ALL {
+        let emitted = format!("{base}_{}", kind.suffix(3));
+        assert_eq!(
+            logical_http_rollup_batch_id(&emitted),
+            base,
+            "stripper must recognise {}",
+            kind.as_str()
+        );
+        let stacked = format!(
+            "{base}_{}_{}",
+            http_rollup_part_chunk_suffix(3, 9),
+            kind.suffix(4)
+        );
+        assert_eq!(
+            logical_http_rollup_batch_id(&stacked),
+            base,
+            "stacked part+{} must strip to the logical id",
+            kind.as_str()
+        );
+    }
     assert_eq!(
-        logical_http_rollup_batch_id("batch_1_part_11_of_11"),
-        "batch_1"
+        logical_http_rollup_batch_id(&format!("{base}_{}", http_rollup_part_chunk_suffix(11, 11))),
+        base
     );
     assert_eq!(
-        logical_http_rollup_batch_id("batch_1_part_11_of_11_part_1_of_2"),
-        "batch_1"
+        logical_http_rollup_batch_id(&format!(
+            "{base}_{}_{}",
+            http_rollup_part_chunk_suffix(11, 11),
+            http_rollup_part_chunk_suffix(1, 2)
+        )),
+        base
     );
-    assert_eq!(logical_http_rollup_batch_id("batch_1_sources_1"), "batch_1");
-    assert_eq!(
-        logical_http_rollup_batch_id("batch_1_part_3_of_9_sources_1"),
-        "batch_1"
-    );
-    assert_eq!(
-        logical_http_rollup_batch_id("batch_1_subscriptions_2"),
-        "batch_1"
-    );
-    assert_eq!(
-        logical_http_rollup_batch_id("batch_1_task_buckets_2"),
-        "batch_1"
-    );
-    assert_eq!(
-        logical_http_rollup_batch_id("batch_1_part_3_of_9_task_verifications_4"),
-        "batch_1"
-    );
-    assert_eq!(
-        logical_http_rollup_batch_id("batch_1_code_changes_3"),
-        "batch_1"
-    );
-    assert_eq!(logical_http_rollup_batch_id("batch_1"), "batch_1");
+    assert_eq!(logical_http_rollup_batch_id(base), base);
     assert_eq!(
         logical_http_rollup_batch_id("batch_1_part_final"),
         "batch_1_part_final"

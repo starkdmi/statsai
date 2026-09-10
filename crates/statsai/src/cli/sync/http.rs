@@ -14,7 +14,7 @@ use super::batch::{record_rollup_sync_chunk_success, record_sync_batch_success};
 use super::chunking::{
     has_non_code_change_payload, has_non_quota_cycle_payload, http_rollup_metadata_count,
     split_http_rollup_sync_batch_after_budget_error, split_http_rollup_sync_batches,
-    HTTP_ROLLUP_SUMMARIES_PER_BATCH,
+    HttpRollupIndexedChunkKind, HTTP_ROLLUP_SUMMARIES_PER_BATCH,
 };
 use super::SyncPayloadMode;
 
@@ -667,17 +667,9 @@ fn strip_one_http_rollup_batch_suffix(batch_id: &str) -> String {
         }
     }
 
-    for marker in [
-        "_sources_",
-        "_accounts_",
-        "_assignments_",
-        "_subscriptions_",
-        "_task_buckets_",
-        "_task_verifications_",
-        "_code_changes_",
-        "_snapshot_",
-    ] {
-        if let Some(index) = batch_id.rfind(marker) {
+    for kind in HttpRollupIndexedChunkKind::ALL {
+        let marker = format!("_{}_", kind.as_str());
+        if let Some(index) = batch_id.rfind(&marker) {
             let suffix = &batch_id[(index + marker.len())..];
             if suffix.parse::<usize>().is_ok() {
                 return batch_id[..index].to_string();
