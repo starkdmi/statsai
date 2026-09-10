@@ -289,7 +289,7 @@
       ]
     },
     "ActivityCoverageV1": {
-      "description": "Per-source, per-day, per-kind coverage, including zero-call days.",
+      "description": "Per-source coverage for a contiguous run of days at one level.\n\nConsecutive days that share `(source, kind, level, evidence)` collapse to one row so a 256-day legacy stream is not 256 D1 writes. `day` is the inclusive start; `day_end` is the inclusive end (`day` when the run is a single day, or empty on payloads written before ranges existed).",
       "type": "object",
       "required": [
         "coverage_id",
@@ -308,6 +308,10 @@
           "type": "string"
         },
         "day": {
+          "type": "string"
+        },
+        "day_end": {
+          "default": "",
           "type": "string"
         },
         "device_id": {

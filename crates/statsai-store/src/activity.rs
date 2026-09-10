@@ -581,13 +581,21 @@ impl Store {
             if keep.contains(coverage_id.as_str()) {
                 continue;
             }
+            let parsed_kind = ActivityKind::parse(&kind);
+            let superseded = parsed_kind.is_some_and(|kind| {
+                incoming.iter().any(|row| {
+                    row.kind == kind
+                        && row.day.as_str() <= day.as_str()
+                        && row.effective_day_end() >= day.as_str()
+                })
+            });
             let remaining: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM activity_invocations
                  WHERE source_id = ?1 AND substr(observed_at, 1, 10) = ?2 AND kind = ?3",
                 params![&source_id.0, &day, &kind],
                 |row| row.get(0),
             )?;
-            if remaining == 0 {
+            if remaining == 0 || superseded {
                 self.conn.execute(
                     "DELETE FROM activity_coverage WHERE coverage_id = ?1",
                     params![coverage_id],
@@ -1148,6 +1156,7 @@ mod tests {
             source_id: source.source_id.clone(),
             provider: "codex".to_string(),
             day: day.to_string(),
+            day_end: day.to_string(),
             kind,
             level: ActivityCoverageLevel::Complete,
             evidence: "codex-native-items".to_string(),
@@ -1598,6 +1607,63 @@ mod tests {
             store.all_activity_rollups().expect("rollups")[0].display_name,
             "read"
         );
+    }
+
+    #[test]
+    fn replace_source_drops_per_day_coverage_inside_a_coalesced_range() {
+        let store = Store::in_memory().expect("store");
+        let source = test_source();
+        store.upsert_source(&source).expect("source");
+        let day1 = invocation(
+            "a",
+            &source,
+            1,
+            ActivityKind::Tool,
+            "exec",
+            ActivityFamily::Shell,
+            ActivityOutcome::Succeeded,
+            Some(1),
+            "file-a",
+        );
+        let mut day2 = day1.clone();
+        day2.invocation_id = "b".to_string();
+        day2.observed_at = Utc
+            .with_ymd_and_hms(2026, 1, 2, 1, 0, 0)
+            .single()
+            .expect("ts");
+        store
+            .persist_activity_scan(
+                "device",
+                &source.source_id,
+                &[day1.clone(), day2.clone()],
+                &[
+                    coverage(&source, ActivityKind::Tool, "2026-01-01"),
+                    coverage(&source, ActivityKind::Tool, "2026-01-02"),
+                ],
+                &["file-a".to_string()],
+                ActivityPersistMode::ReplaceSource,
+                None,
+            )
+            .expect("per-day");
+        assert_eq!(store.all_activity_coverage().expect("before").len(), 2);
+
+        let mut range = coverage(&source, ActivityKind::Tool, "2026-01-01");
+        range.day_end = "2026-01-02".to_string();
+        store
+            .persist_activity_scan(
+                "device",
+                &source.source_id,
+                &[day1, day2],
+                &[range],
+                &["file-a".to_string()],
+                ActivityPersistMode::ReplaceSource,
+                None,
+            )
+            .expect("range");
+        let rows = store.all_activity_coverage().expect("after");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].day, "2026-01-01");
+        assert_eq!(rows[0].day_end, "2026-01-02");
     }
 
     #[test]

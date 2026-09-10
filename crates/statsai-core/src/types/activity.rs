@@ -330,7 +330,12 @@ pub struct ActivityRollupV1 {
     pub evidence: String,
 }
 
-/// Per-source, per-day, per-kind coverage, including zero-call days.
+/// Per-source coverage for a contiguous run of days at one level.
+///
+/// Consecutive days that share `(source, kind, level, evidence)` collapse to
+/// one row so a 256-day legacy stream is not 256 D1 writes. `day` is the
+/// inclusive start; `day_end` is the inclusive end (`day` when the run is a
+/// single day, or empty on payloads written before ranges existed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ActivityCoverageV1 {
     pub schema_version: String,
@@ -339,10 +344,61 @@ pub struct ActivityCoverageV1 {
     pub source_id: SourceId,
     pub provider: String,
     pub day: String,
+    #[serde(default)]
+    pub day_end: String,
     pub kind: ActivityKind,
     pub level: ActivityCoverageLevel,
     pub evidence: String,
     pub parser_revision: String,
+}
+
+impl ActivityCoverageV1 {
+    #[must_use]
+    pub fn effective_day_end(&self) -> &str {
+        if self.day_end.is_empty() {
+            &self.day
+        } else {
+            &self.day_end
+        }
+    }
+}
+
+/// Collapse a set of ISO days into inclusive `[start, end]` runs.
+#[must_use]
+pub fn coalesce_iso_day_ranges<'a, I>(days: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut parsed = days
+        .into_iter()
+        .filter_map(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok())
+        .collect::<Vec<_>>();
+    parsed.sort_unstable();
+    parsed.dedup();
+    let mut ranges = Vec::new();
+    let mut start = None;
+    let mut end = None;
+    for day in parsed {
+        match (start, end) {
+            (None, _) => {
+                start = Some(day);
+                end = Some(day);
+            }
+            (Some(_), Some(prev)) if prev.succ_opt() == Some(day) => {
+                end = Some(day);
+            }
+            (Some(range_start), Some(range_end)) => {
+                ranges.push((range_start.to_string(), range_end.to_string()));
+                start = Some(day);
+                end = Some(day);
+            }
+            _ => {}
+        }
+    }
+    if let (Some(range_start), Some(range_end)) = (start, end) {
+        ranges.push((range_start.to_string(), range_end.to_string()));
+    }
+    ranges
 }
 
 #[must_use]
@@ -717,5 +773,39 @@ mod tests {
             ActivityCoverageLevel::Unavailable.honesty_rank()
                 > ActivityCoverageLevel::Partial.honesty_rank()
         );
+    }
+
+    #[test]
+    fn coalesce_iso_day_ranges_merges_contiguous_days_and_keeps_gaps() {
+        assert_eq!(
+            coalesce_iso_day_ranges(["2026-01-01", "2026-01-02", "2026-01-03"]),
+            vec![("2026-01-01".to_string(), "2026-01-03".to_string())]
+        );
+        assert_eq!(
+            coalesce_iso_day_ranges(["2026-01-01", "2026-01-03", "2026-01-02", "2026-01-10"]),
+            vec![
+                ("2026-01-01".to_string(), "2026-01-03".to_string()),
+                ("2026-01-10".to_string(), "2026-01-10".to_string()),
+            ]
+        );
+        assert!(coalesce_iso_day_ranges(Vec::<&str>::new()).is_empty());
+    }
+
+    #[test]
+    fn coverage_payloads_without_day_end_treat_the_start_as_the_end() {
+        let row = ActivityCoverageV1 {
+            schema_version: ACTIVITY_COVERAGE_SCHEMA_VERSION.to_string(),
+            coverage_id: "id".to_string(),
+            device_id: "device".to_string(),
+            source_id: crate::SourceId("src".to_string()),
+            provider: "codex".to_string(),
+            day: "2026-01-01".to_string(),
+            day_end: String::new(),
+            kind: ActivityKind::Tool,
+            level: ActivityCoverageLevel::Partial,
+            evidence: "legacy".to_string(),
+            parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
+        };
+        assert_eq!(row.effective_day_end(), "2026-01-01");
     }
 }

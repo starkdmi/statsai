@@ -18,10 +18,10 @@ pub(crate) use opencode::*;
 use crate::AdapterScan;
 use chrono::{DateTime, TimeZone, Utc};
 use statsai_core::{
-    activity_coverage_id, activity_invocation_id, canonical_display, hash_text,
-    sanitize_activity_invocation, ActivityCoverageLevel, ActivityCoverageV1, ActivityDurationKind,
-    ActivityFamily, ActivityInvocationV1, ActivityKind, ActivityOutcome, SourceId, SourceLocation,
-    ACTIVITY_COVERAGE_SCHEMA_VERSION, ACTIVITY_EARLIEST_PLAUSIBLE_MS,
+    activity_coverage_id, activity_invocation_id, canonical_display, coalesce_iso_day_ranges,
+    hash_text, sanitize_activity_invocation, ActivityCoverageLevel, ActivityCoverageV1,
+    ActivityDurationKind, ActivityFamily, ActivityInvocationV1, ActivityKind, ActivityOutcome,
+    SourceId, SourceLocation, ACTIVITY_COVERAGE_SCHEMA_VERSION, ACTIVITY_EARLIEST_PLAUSIBLE_MS,
     ACTIVITY_INVOCATION_SCHEMA_VERSION, ACTIVITY_PARSER_REVISION,
 };
 use std::collections::BTreeSet;
@@ -122,6 +122,7 @@ pub(crate) fn push_coverage(
     source: &SourceLocation,
     provider: &str,
     day: &str,
+    day_end: &str,
     kind: ActivityKind,
     level: ActivityCoverageLevel,
     evidence: &str,
@@ -136,6 +137,9 @@ pub(crate) fn push_coverage(
             existing.level = level;
             existing.evidence = evidence.to_string();
         }
+        if day_end > existing.effective_day_end() {
+            existing.day_end = day_end.to_string();
+        }
         return;
     }
     scan.activity_coverage.push(ActivityCoverageV1 {
@@ -145,6 +149,7 @@ pub(crate) fn push_coverage(
         source_id: source.source_id.clone(),
         provider: provider.to_string(),
         day: day.to_string(),
+        day_end: day_end.to_string(),
         kind,
         level,
         evidence: evidence.to_string(),
@@ -164,22 +169,14 @@ pub(crate) fn emit_kind_coverage(
     level: ActivityCoverageLevel,
     evidence: &str,
 ) {
-    if days.is_empty() {
+    let ranges = if days.is_empty() {
+        vec![(fallback_day.to_string(), fallback_day.to_string())]
+    } else {
+        coalesce_iso_day_ranges(days.iter().map(String::as_str))
+    };
+    for (day, day_end) in ranges {
         push_coverage(
-            scan,
-            device_id,
-            source,
-            provider,
-            fallback_day,
-            kind,
-            level,
-            evidence,
-        );
-        return;
-    }
-    for day in days {
-        push_coverage(
-            scan, device_id, source, provider, day, kind, level, evidence,
+            scan, device_id, source, provider, &day, &day_end, kind, level, evidence,
         );
     }
 }
