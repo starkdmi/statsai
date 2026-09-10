@@ -74,13 +74,17 @@ impl CodexActivityExtractor {
                 invocation,
             }) => {
                 if let Some(call_id) = call_id {
-                    let mut pending = PendingLegacy { invocation };
+                    let mut pending = PendingLegacy {
+                        invocation: *invocation,
+                    };
                     if let Some(outcome) = self.pending_legacy_outcomes.remove(&call_id) {
                         pending.invocation.outcome = outcome;
                     }
                     self.legacy_by_call.insert(call_id, pending);
                 } else {
-                    self.legacy_unkeyed.push(PendingLegacy { invocation });
+                    self.legacy_unkeyed.push(PendingLegacy {
+                        invocation: *invocation,
+                    });
                 }
             }
             Some(LegacyObserve::Output { call_id, outcome }) => {
@@ -242,7 +246,7 @@ struct LegacyPayload {
 enum LegacyObserve {
     Start {
         call_id: Option<String>,
-        invocation: statsai_core::ActivityInvocationV1,
+        invocation: Box<statsai_core::ActivityInvocationV1>,
     },
     Output {
         call_id: String,
@@ -597,7 +601,7 @@ fn parse_legacy_line(
     if payload_type == "web_search_call" {
         return Some(LegacyObserve::Start {
             call_id: None,
-            invocation: build_invocation(
+            invocation: Box::new(build_invocation(
                 hashed_invocation_id(&["codex", session_id, &ordinal.to_string()]),
                 CODEX_PROVIDER,
                 source.source_id.clone(),
@@ -614,7 +618,7 @@ fn parse_legacy_line(
                 None,
                 None,
                 CODEX_LEGACY_EVIDENCE,
-            ),
+            )),
         });
     }
     let native_name = parsed.payload.name.as_deref().unwrap_or(payload_type);
@@ -633,7 +637,7 @@ fn parse_legacy_line(
     if let Some((server, tool)) = split_mcp_double_underscore(&name) {
         return Some(LegacyObserve::Start {
             call_id: call_id_owned,
-            invocation: build_invocation(
+            invocation: Box::new(build_invocation(
                 invocation_id,
                 CODEX_PROVIDER,
                 source.source_id.clone(),
@@ -650,13 +654,13 @@ fn parse_legacy_line(
                 None,
                 None,
                 CODEX_LEGACY_EVIDENCE,
-            ),
+            )),
         });
     }
     let family = family_for_name(CODEX_LEGACY_FAMILY_ALIASES, &name);
     Some(LegacyObserve::Start {
         call_id: call_id_owned,
-        invocation: build_invocation(
+        invocation: Box::new(build_invocation(
             invocation_id,
             CODEX_PROVIDER,
             source.source_id.clone(),
@@ -673,7 +677,7 @@ fn parse_legacy_line(
             None,
             None,
             CODEX_LEGACY_EVIDENCE,
-        ),
+        )),
     })
 }
 
