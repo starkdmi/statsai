@@ -69,7 +69,10 @@ impl CodexActivityExtractor {
         fallback_timestamp: DateTime<Utc>,
     ) {
         match parse_legacy_line(source, path, line, session_id, ordinal, fallback_timestamp) {
-            Some(LegacyObserve::Start { call_id, invocation }) => {
+            Some(LegacyObserve::Start {
+                call_id,
+                invocation,
+            }) => {
                 if let Some(call_id) = call_id {
                     let mut pending = PendingLegacy { invocation };
                     if let Some(outcome) = self.pending_legacy_outcomes.remove(&call_id) {
@@ -140,11 +143,7 @@ impl CodexActivityExtractor {
             );
         } else {
             let mut days = BTreeSet::new();
-            for pending in self
-                .legacy_by_call
-                .into_values()
-                .chain(self.legacy_unkeyed)
-            {
+            for pending in self.legacy_by_call.into_values().chain(self.legacy_unkeyed) {
                 days.insert(activity_day_key(pending.invocation.observed_at));
                 push_invocation(scan, pending.invocation);
             }
@@ -289,7 +288,10 @@ fn parse_native_line(
             .and_then(|duration| duration_from_secs_nanos(duration.secs, duration.nanos)),
     };
     let duration_kind = duration_ms.map(|_| ActivityDurationKind::Reported);
-    let outcome = native_item_outcome(&parsed.payload.item.item_type, parsed.payload.item.status.as_deref());
+    let outcome = native_item_outcome(
+        &parsed.payload.item.item_type,
+        parsed.payload.item.status.as_deref(),
+    );
     let item_id = parsed.payload.item.id.as_deref().unwrap_or("");
     let thread_id = parsed.payload.thread_id.as_deref().unwrap_or("");
     let ordinal_key = ordinal.to_string();
@@ -572,7 +574,10 @@ fn parse_legacy_line(
 ) -> Option<LegacyObserve> {
     let parsed: LegacyLine = serde_json::from_str(line).ok()?;
     let payload_type = parsed.payload.payload_type.as_deref()?;
-    if matches!(payload_type, "function_call_output" | "custom_tool_call_output") {
+    if matches!(
+        payload_type,
+        "function_call_output" | "custom_tool_call_output"
+    ) {
         let call_id = parsed.payload.call_id.filter(|value| !value.is_empty())?;
         let outcome = legacy_outcome_from_output(parsed.payload.output.as_ref());
         return Some(LegacyObserve::Output { call_id, outcome });
@@ -618,10 +623,7 @@ fn parse_legacy_line(
     } else {
         canonical_activity_display_name(CODEX_PROVIDER, native_name)
     };
-    let call_id_owned = parsed
-        .payload
-        .call_id
-        .filter(|value| !value.is_empty());
+    let call_id_owned = parsed.payload.call_id.filter(|value| !value.is_empty());
     let call_id_ref = call_id_owned.as_deref().unwrap_or("");
     let ordinal_key = ordinal.to_string();
     let invocation_id = hashed_invocation_id_or_ordinal(
@@ -740,10 +742,7 @@ mod tests {
             parsed.payload.payload_type.as_deref(),
             Some("function_call_output")
         );
-        assert_eq!(
-            parsed.payload.call_id.as_deref(),
-            Some("call_fixture_003")
-        );
+        assert_eq!(parsed.payload.call_id.as_deref(), Some("call_fixture_003"));
         assert_eq!(
             legacy_outcome_from_output(parsed.payload.output.as_ref()),
             ActivityOutcome::Failed

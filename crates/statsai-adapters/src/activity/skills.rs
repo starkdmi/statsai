@@ -23,7 +23,10 @@ pub fn classify_skill_path(path: &str) -> Option<ClassifiedSkill> {
     let without_file = normalized
         .strip_suffix("/SKILL.md")
         .or_else(|| normalized.strip_suffix("/skill.md"))?;
-    let segments: Vec<&str> = without_file.split('/').filter(|part| !part.is_empty()).collect();
+    let segments: Vec<&str> = without_file
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     if segments.len() < 2 {
         return None;
     }
@@ -77,7 +80,9 @@ fn contains_segment_seq(segments: &[&str], needle: &[&str]) -> bool {
     if needle.is_empty() || segments.len() < needle.len() {
         return false;
     }
-    segments.windows(needle.len()).any(|window| window == needle)
+    segments
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// `/<plugin>/<version>/skills/<name>` immediately before the skill name.
@@ -154,7 +159,10 @@ mod tests {
         )
         .expect("cached plugin skill");
         assert_eq!(cached_plugin.catalog, SkillCatalog::Plugin);
-        assert_eq!(cached_plugin.plugin.as_deref(), Some("control-in-app-browser"));
+        assert_eq!(
+            cached_plugin.plugin.as_deref(),
+            Some("control-in-app-browser")
+        );
 
         let system = classify_skill_path("/opt/codex/skills/.system/example-skill/SKILL.md")
             .expect("system skill");

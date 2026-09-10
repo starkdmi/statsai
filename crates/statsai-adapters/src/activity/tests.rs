@@ -159,9 +159,10 @@ fn extracts_codex_native_activity_fixture() {
         .activity_invocations
         .iter()
         .any(|row| row.kind == ActivityKind::Tool && row.display_name == "update_plan"));
-    assert!(scan.activity_invocations.iter().all(|row| {
-        !row.observed_at.to_rfc3339().starts_with("1970-01-01")
-    }));
+    assert!(scan
+        .activity_invocations
+        .iter()
+        .all(|row| { !row.observed_at.to_rfc3339().starts_with("1970-01-01") }));
     assert!(scan
         .activity_invocations
         .iter()

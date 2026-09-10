@@ -537,8 +537,14 @@ mod tests {
             canonical_activity_display_name("codex", "write_stdin"),
             "write_stdin"
         );
-        assert_eq!(canonical_activity_display_name("codex", "apply_patch"), "apply_patch");
-        assert_eq!(canonical_activity_display_name("claude_code", "Bash"), "Bash");
+        assert_eq!(
+            canonical_activity_display_name("codex", "apply_patch"),
+            "apply_patch"
+        );
+        assert_eq!(
+            canonical_activity_display_name("claude_code", "Bash"),
+            "Bash"
+        );
         assert_eq!(canonical_activity_display_name("opencode", "bash"), "bash");
     }
 

@@ -934,7 +934,10 @@ fn pick_rollup_representative<'a>(rows: &[&'a ActivityInvocationV1]) -> &'a Acti
             mcp_server: row.mcp_server.as_deref().unwrap_or(""),
             mcp_tool: row.mcp_tool.as_deref().unwrap_or(""),
             plugin: row.plugin.as_deref().unwrap_or(""),
-            skill_catalog: row.skill_catalog.map(|catalog| catalog.as_str()).unwrap_or(""),
+            skill_catalog: row
+                .skill_catalog
+                .map(|catalog| catalog.as_str())
+                .unwrap_or(""),
             evidence: row.evidence.as_str(),
         };
         *counts.entry(key).or_insert(0) += 1;
@@ -951,7 +954,10 @@ fn pick_rollup_representative<'a>(rows: &[&'a ActivityInvocationV1]) -> &'a Acti
                 && row.mcp_server.as_deref().unwrap_or("") == best.mcp_server
                 && row.mcp_tool.as_deref().unwrap_or("") == best.mcp_tool
                 && row.plugin.as_deref().unwrap_or("") == best.plugin
-                && row.skill_catalog.map(|catalog| catalog.as_str()).unwrap_or("")
+                && row
+                    .skill_catalog
+                    .map(|catalog| catalog.as_str())
+                    .unwrap_or("")
                     == best.skill_catalog
                 && row.evidence == best.evidence
         })
