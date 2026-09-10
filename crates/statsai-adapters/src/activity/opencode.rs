@@ -5,6 +5,7 @@ use super::{
     build_invocation, emit_kind_coverage, hashed_invocation_id, push_command_for_tool,
     push_invocation, source_file_hash, timestamp_from_millis,
 };
+use crate::sqlite_column_exists;
 use crate::sqlite_table_exists;
 use crate::AdapterScan;
 use crate::OPENCODE_PROVIDER;
@@ -86,8 +87,12 @@ pub(crate) fn extract_opencode_activity(
 
     let last_time_updated = cursor.unwrap_or(0);
     let message_models = load_opencode_message_models(connection)?;
-    let mut statement = connection
-        .prepare("SELECT id, time_created, time_updated, data FROM part WHERE time_updated > ?1")?;
+    let part_sql = if sqlite_column_exists(connection, "part", "message_id")? {
+        "SELECT id, time_created, time_updated, data, message_id FROM part WHERE time_updated > ?1"
+    } else {
+        "SELECT id, time_created, time_updated, data, NULL FROM part WHERE time_updated > ?1"
+    };
+    let mut statement = connection.prepare(part_sql)?;
     let mut rows = statement.query([last_time_updated])?;
     let file_hash = source_file_hash(db_path);
     let mcp_classified = !mcp_servers.is_empty();
@@ -102,6 +107,7 @@ pub(crate) fn extract_opencode_activity(
         let time_updated: i64 = row.get(2)?;
         max_updated = max_updated.max(time_updated);
         let data_text: String = row.get(3)?;
+        let part_message_id: Option<String> = row.get(4)?;
         let parsed: OpenCodeToolPart = match serde_json::from_str(&data_text) {
             Ok(value) => value,
             Err(_) => continue,
@@ -135,10 +141,12 @@ pub(crate) fn extract_opencode_activity(
             .unwrap_or(fallback_timestamp);
         days.insert(activity_day_key(observed_at));
         let invocation_id = hashed_invocation_id(&["opencode", &part_id]);
-        let model = parsed
-            .message_id
+        let model_key = part_message_id
             .as_deref()
-            .and_then(|id| message_models.get(id).cloned());
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .or(parsed.message_id.as_deref());
+        let model = model_key.and_then(|id| message_models.get(id).cloned());
 
         if tool_name == "skill" {
             let skill_name = parsed
@@ -329,7 +337,7 @@ fn load_opencode_message_models(
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
-        if let Some(model) = crate::model::opencode_model_id_from_value(&value) {
+        if let Some(model) = crate::model::opencode_message_model_id(&value) {
             let model = model.trim();
             if !model.is_empty() {
                 map.insert(id, model.to_string());

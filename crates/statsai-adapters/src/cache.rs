@@ -11,7 +11,7 @@ pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // activity-invocations.v32: model attribution on activity invocations.
 pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v32";
 pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v28";
-pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v18";
+pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v19";
 pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v22";
 
 pub(crate) fn scan_candidate(

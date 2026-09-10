@@ -649,6 +649,10 @@ def opencode() -> None:
           tokens_cache_write INTEGER NOT NULL DEFAULT 0, time_created INTEGER NOT NULL,
           time_updated INTEGER NOT NULL, directory TEXT NOT NULL
         );
+        CREATE TABLE message (
+          id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+          time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
         CREATE TABLE part (
           id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
           time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
@@ -670,6 +674,23 @@ def opencode() -> None:
             MS,
             MS + 3000,
             "/fixture/project",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO message VALUES (?,?,?,?,?)",
+        (
+            "msg_fixture_001",
+            "ses_fixture_activity",
+            MS,
+            MS + 3000,
+            json.dumps(
+                {
+                    "id": "msg_fixture_001",
+                    "providerID": "opencode",
+                    "modelID": "gpt-5.2-codex",
+                },
+                separators=(",", ":"),
+            ),
         ),
     )
     parts = [

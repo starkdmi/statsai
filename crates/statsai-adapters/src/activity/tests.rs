@@ -466,6 +466,12 @@ fn extracts_opencode_tool_parts_and_skips_noop_cursor() {
     assert!(scan.activity_invocations.iter().any(|row| {
         row.kind == ActivityKind::Mcp && row.mcp_server.as_deref() == Some("example_server")
     }));
+    assert!(
+        scan.activity_invocations
+            .iter()
+            .all(|row| row.model.as_deref() == Some("gpt-5.2-codex")),
+        "OpenCode joins model via part.message_id"
+    );
     serialized_invocations_omit_secrets(&scan);
 
     let mut noop = AdapterScan::default();
@@ -482,4 +488,99 @@ fn extracts_opencode_tool_parts_and_skips_noop_cursor() {
     .expect("cursor extract");
     assert_eq!(second.rows_returned, 0);
     assert!(noop.activity_invocations.is_empty());
+}
+
+#[test]
+fn opencode_joins_model_from_part_message_id_not_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("opencode.db");
+    let connection = rusqlite::Connection::open(&db_path).expect("db");
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE message (
+              id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              time_created INTEGER NOT NULL,
+              time_updated INTEGER NOT NULL,
+              data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+              id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+              time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+            );
+            "#,
+        )
+        .expect("schema");
+    connection
+        .execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "msg_fixture_001",
+                "ses_fixture",
+                1_767_225_600_000i64,
+                1_767_225_600_010i64,
+                r#"{"id":"msg_fixture_001","providerID":"opencode","modelID":"antigravity-claude-opus-4-5-thinking"}"#,
+            ],
+        )
+        .expect("message");
+    connection
+        .execute(
+            "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "part_fixture_001",
+                "msg_fixture_001",
+                "ses_fixture",
+                1_767_225_600_000i64,
+                1_767_225_600_010i64,
+                r#"{"type":"tool","callID":"call_fixture_001","tool":"bash","state":{"status":"completed","input":{"command":"cat > /tmp/out.txt"},"time":{"start":1767225600000,"end":1767225600010}}}"#,
+            ],
+        )
+        .expect("part");
+    drop(connection);
+
+    let source = SourceLocation::local_adapter(
+        crate::OPENCODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        statsai_core::LocationOrigin::Configured,
+    );
+    let connection = crate::open_sqlite_readonly(&db_path).expect("readonly");
+    let mut scan = AdapterScan::default();
+    extract_opencode_activity(
+        &mut scan,
+        &connection,
+        &source,
+        &db_path,
+        "device",
+        None,
+        &[],
+        Utc::now(),
+    )
+    .expect("extract");
+
+    let shell = scan
+        .activity_invocations
+        .iter()
+        .find(|row| row.kind == ActivityKind::Tool && row.display_name == "shell")
+        .expect("shell tool");
+    assert_eq!(
+        shell.model.as_deref(),
+        Some("antigravity-claude-opus-4-5-thinking")
+    );
+    let command = scan
+        .activity_invocations
+        .iter()
+        .find(|row| row.kind == ActivityKind::Command)
+        .expect("command");
+    assert_eq!(
+        command.model.as_deref(),
+        Some("antigravity-claude-opus-4-5-thinking")
+    );
+    assert_ne!(
+        shell.model.as_deref(),
+        Some("msg_fixture_001"),
+        "message UUID must not become the model"
+    );
 }
