@@ -21,7 +21,8 @@ use statsai_core::{
     activity_coverage_id, activity_invocation_id, canonical_display, hash_text,
     sanitize_activity_invocation, ActivityCoverageLevel, ActivityCoverageV1, ActivityDurationKind,
     ActivityFamily, ActivityInvocationV1, ActivityKind, ActivityOutcome, SourceId, SourceLocation,
-    ACTIVITY_COVERAGE_SCHEMA_VERSION, ACTIVITY_INVOCATION_SCHEMA_VERSION, ACTIVITY_PARSER_REVISION,
+    ACTIVITY_COVERAGE_SCHEMA_VERSION, ACTIVITY_EARLIEST_PLAUSIBLE_MS,
+    ACTIVITY_INVOCATION_SCHEMA_VERSION, ACTIVITY_PARSER_REVISION,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -37,7 +38,12 @@ pub(crate) fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
 }
 
 pub(crate) fn timestamp_from_millis(value: i64) -> Option<DateTime<Utc>> {
-    Utc.timestamp_millis_opt(value).single()
+    if value <= 0 {
+        return None;
+    }
+    Utc.timestamp_millis_opt(value)
+        .single()
+        .filter(|ts| ts.timestamp_millis() >= ACTIVITY_EARLIEST_PLAUSIBLE_MS)
 }
 
 pub(crate) fn duration_from_secs_nanos(secs: Option<u64>, nanos: Option<u32>) -> Option<u64> {

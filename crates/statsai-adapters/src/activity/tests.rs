@@ -1,6 +1,6 @@
 use super::*;
 use chrono::Utc;
-use statsai_core::{ActivityFamily, ActivityKind, ActivityOutcome, SourceId};
+use statsai_core::{ActivityFamily, ActivityKind, ActivityOutcome, SkillCatalog, SourceId};
 use std::collections::BTreeSet;
 
 #[test]
@@ -36,8 +36,12 @@ fn family_aliases_cover_documented_names() {
         ActivityFamily::FileRead
     );
     assert_eq!(
-        super::families::family_for_name(super::families::CODEX_LEGACY_FAMILY_ALIASES, "mystery"),
-        ActivityFamily::Other
+        super::families::family_for_name(super::families::CODEX_LEGACY_FAMILY_ALIASES, "run"),
+        ActivityFamily::Shell
+    );
+    assert_eq!(
+        super::families::family_for_name(super::families::CODEX_LEGACY_FAMILY_ALIASES, "exec"),
+        ActivityFamily::Shell
     );
 }
 
@@ -134,17 +138,30 @@ fn extracts_codex_native_activity_fixture() {
         .activity_invocations
         .iter()
         .any(|row| row.display_name == "exec" && row.kind == ActivityKind::Tool));
-    assert!(scan
+    let example_skills: Vec<_> = scan
         .activity_invocations
         .iter()
-        .any(|row| { row.kind == ActivityKind::Skill && row.display_name == "example-skill" }));
+        .filter(|row| row.kind == ActivityKind::Skill && row.display_name == "example-skill")
+        .collect();
+    assert!(!example_skills.is_empty());
+    assert!(example_skills
+        .iter()
+        .all(|row| row.skill_catalog == Some(SkillCatalog::Project)));
     assert!(scan.activity_invocations.iter().any(|row| {
         row.kind == ActivityKind::Mcp && row.mcp_server.as_deref() == Some("example_server")
     }));
     assert!(scan
         .activity_invocations
         .iter()
-        .any(|row| row.display_name == "apply_patch"));
+        .any(|row| row.display_name == "apply_patch"
+            && row.outcome == statsai_core::ActivityOutcome::Unknown));
+    assert!(scan
+        .activity_invocations
+        .iter()
+        .any(|row| row.kind == ActivityKind::Tool && row.display_name == "update_plan"));
+    assert!(scan.activity_invocations.iter().all(|row| {
+        !row.observed_at.to_rfc3339().starts_with("1970-01-01")
+    }));
     assert!(scan
         .activity_invocations
         .iter()
@@ -176,6 +193,18 @@ fn extracts_codex_legacy_activity_without_mixing_native() {
         .activity_invocations
         .iter()
         .any(|row| row.display_name == "exec"));
+    let apply_patch = scan
+        .activity_invocations
+        .iter()
+        .find(|row| row.display_name == "apply_patch")
+        .expect("apply_patch");
+    assert_eq!(apply_patch.outcome, ActivityOutcome::Failed);
+    let exec = scan
+        .activity_invocations
+        .iter()
+        .find(|row| row.display_name == "exec")
+        .expect("exec");
+    assert_eq!(exec.outcome, ActivityOutcome::Unknown);
     assert!(scan.activity_coverage.iter().any(|row| {
         row.level == statsai_core::ActivityCoverageLevel::Partial
             && row.evidence == "codex-legacy-response-items"
@@ -185,6 +214,47 @@ fn extracts_codex_legacy_activity_without_mixing_native() {
         .iter()
         .all(|row| row.duration_ms.is_none()));
     serialized_invocations_omit_secrets(&scan);
+}
+
+#[test]
+fn extracts_codex_class_b_legacy_calls_when_item_completed_is_prose_only() {
+    let root = fixture_root().join("codex/activity-class-b");
+    let source = SourceLocation::local_adapter(
+        crate::CODEX_PROVIDER,
+        "test",
+        "0",
+        &root,
+        statsai_core::LocationOrigin::Configured,
+    );
+    let scan =
+        crate::codex::scan_codex_source(&crate::CodexAdapter, &source, &crate::tests::options())
+            .expect("scan");
+    assert!(
+        scan.activity_invocations
+            .iter()
+            .any(|row| row.display_name == "exec" && row.kind == ActivityKind::Tool),
+        "class-B files must count legacy tool calls"
+    );
+    assert!(scan.activity_invocations.iter().any(|row| {
+        row.display_name == "apply_patch" && row.outcome == ActivityOutcome::Succeeded
+    }));
+    assert!(scan.activity_coverage.iter().any(|row| {
+        row.level == statsai_core::ActivityCoverageLevel::Partial
+            && row.evidence == "codex-legacy-response-items"
+    }));
+    assert!(scan
+        .activity_invocations
+        .iter()
+        .all(|row| row.evidence == "codex-legacy-response-items"));
+    serialized_invocations_omit_secrets(&scan);
+}
+
+#[test]
+fn timestamp_from_millis_rejects_non_positive_and_pre_2024() {
+    assert!(super::timestamp_from_millis(0).is_none());
+    assert!(super::timestamp_from_millis(-1).is_none());
+    assert!(super::timestamp_from_millis(1).is_none());
+    assert!(super::timestamp_from_millis(1_767_225_600_000).is_some());
 }
 
 #[test]
@@ -231,6 +301,35 @@ fn extracts_claude_tool_blocks_including_fork_and_subagent() {
         bash_ids.len(),
         1,
         "forked duplicate tool_use.id shares one invocation id"
+    );
+    assert_eq!(
+        scan.activity_invocations
+            .iter()
+            .find(|row| row.display_name == "Bash")
+            .map(|row| row.outcome),
+        Some(ActivityOutcome::Succeeded)
+    );
+    assert_eq!(
+        scan.activity_invocations
+            .iter()
+            .find(|row| row.display_name == "Read")
+            .map(|row| row.outcome),
+        Some(ActivityOutcome::Failed)
+    );
+    assert!(
+        scan.activity_invocations.iter().any(|row| {
+            row.kind == ActivityKind::Tool
+                && row.display_name == "Skill"
+                && row.outcome == ActivityOutcome::Succeeded
+        }),
+        "paired Skill tool_result without is_error is succeeded"
+    );
+    assert_eq!(
+        scan.activity_invocations
+            .iter()
+            .find(|row| row.display_name == "Grep")
+            .map(|row| row.outcome),
+        Some(ActivityOutcome::Unknown)
     );
     serialized_invocations_omit_secrets(&scan);
 }

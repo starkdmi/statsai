@@ -55,11 +55,16 @@ fn codex_extracts_cwd_and_git_metadata_from_session_meta() {
 fn codex_line_filter_skips_non_message_response_items() {
     let reasoning = r#"{"timestamp":"2026-06-03T09:36:21.793Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"abc"}}"#;
     let function_call = r#"{"timestamp":"2026-06-03T09:36:24.895Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}"}}"#;
+    let function_call_output = r#"{"timestamp":"2026-06-03T09:36:24.900Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"{}"}}"#;
     let user_message = r#"{"timestamp":"2026-06-03T09:36:25.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#;
 
     assert_eq!(codex_line_kind(reasoning), CodexLineKind::Irrelevant);
     assert_eq!(
         codex_line_kind(function_call),
+        CodexLineKind::ResponseItemToolCall
+    );
+    assert_eq!(
+        codex_line_kind(function_call_output),
         CodexLineKind::ResponseItemToolCall
     );
     assert_eq!(

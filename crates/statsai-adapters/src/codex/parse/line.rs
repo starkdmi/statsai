@@ -97,7 +97,9 @@ pub(crate) fn codex_line_kind(line: &str) -> CodexLineKind {
         return if header.contains("\"payload\":{\"type\":\"message\"") {
             CodexLineKind::ResponseItemMessage
         } else if header.contains("\"payload\":{\"type\":\"function_call\"")
+            || header.contains("\"payload\":{\"type\":\"function_call_output\"")
             || header.contains("\"payload\":{\"type\":\"custom_tool_call\"")
+            || header.contains("\"payload\":{\"type\":\"custom_tool_call_output\"")
             || header.contains("\"payload\":{\"type\":\"web_search_call\"")
             || header.contains("\"payload\":{\"type\":\"tool_search_call\"")
         {

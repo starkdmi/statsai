@@ -2,6 +2,24 @@
 //!
 //! Invocation records stay on the device. Rollups and coverage rows are the only
 //! activity shapes that may leave it, and only when `include_activity` is on.
+//!
+//! ## §3.1 Codex streams
+//!
+//! Per file, switch to the native `item_completed` stream only when a
+//! **tool-bearing** item is present (`CommandExecution`, `FileChange`,
+//! `McpToolCall`, and the other extracted item types). Prose-only
+//! `item_completed` items (`Reasoning`, `AgentMessage`, `UserMessage`,
+//! `ContextCompaction`) do not flip the switch. Files that emit those prose
+//! items alongside legacy `function_call` records (class B) keep the legacy
+//! stream; treating “any `item_completed` line” as native-only would drop
+//! those calls.
+//!
+//! ## §3.2 Claude `is_error`
+//!
+//! `is_error` is an optional Anthropic tool-result field that defaults to
+//! false. A paired `tool_result` with `is_error == true` is failed; a paired
+//! result with `is_error == false` **or the field absent** is succeeded.
+//! Reserve `unknown` for unpaired `tool_use` blocks.
 
 use crate::ids::{ProviderAccountId, SourceId};
 use crate::paths::hash_text;
@@ -12,7 +30,13 @@ use serde::{Deserialize, Serialize};
 pub const ACTIVITY_INVOCATION_SCHEMA_VERSION: &str = "activity_invocation.v1";
 pub const ACTIVITY_ROLLUP_SCHEMA_VERSION: &str = "activity_rollup.v1";
 pub const ACTIVITY_COVERAGE_SCHEMA_VERSION: &str = "activity_coverage.v1";
-pub const ACTIVITY_PARSER_REVISION: &str = "activity.v1";
+pub const ACTIVITY_PARSER_REVISION: &str = "activity.v2";
+/// Identity table for provider-native tool renames. Bump when a future
+/// rename is added; do not treat this as a parser revision of its own.
+pub const ACTIVITY_OP_ALIAS_REVISION: &str = "activity-ops.v1";
+/// Timestamps at or before Unix epoch, and any day before this instant, are
+/// treated as absent so a zero `completed_at_ms` cannot key 1970-01-01.
+pub const ACTIVITY_EARLIEST_PLAUSIBLE_MS: i64 = 1_704_067_200_000; // 2024-01-01T00:00:00Z
 
 pub const ACTIVITY_DURATION_BUCKET_COUNT: usize = 8;
 pub const ACTIVITY_DURATION_HISTOGRAM_EDGES_MS: [u64; 7] =
@@ -175,6 +199,7 @@ pub enum SkillCatalog {
     Project,
     Plugin,
     System,
+    Unknown,
 }
 
 impl SkillCatalog {
@@ -185,6 +210,7 @@ impl SkillCatalog {
             Self::Project => "project",
             Self::Plugin => "plugin",
             Self::System => "system",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -195,6 +221,7 @@ impl SkillCatalog {
             "project" => Some(Self::Project),
             "plugin" => Some(Self::Plugin),
             "system" => Some(Self::System),
+            "unknown" => Some(Self::Unknown),
             _ => None,
         }
     }
@@ -398,6 +425,25 @@ pub fn activity_day_key(observed_at: DateTime<Utc>) -> String {
     observed_at.date_naive().to_string()
 }
 
+/// Map a provider-native tool name onto a stable identity.
+///
+/// `activity-ops.v1` (2026-09):
+/// - Codex shell: `shell` (2025-09–10) → `shell_command` (2025-11–2026-01)
+///   → `exec_command` (2026-02–07) → `exec` (2026-06+); `run` (2026-07, brief)
+///   all map to `exec`. `write_stdin` is the unified_exec stdin companion, not
+///   a rename, and is left alone.
+/// - Codex file-write: native `FileChange` is already stored as `apply_patch`,
+///   matching the legacy name.
+#[must_use]
+pub fn canonical_activity_display_name(provider: &str, native_name: &str) -> String {
+    match (provider, native_name) {
+        ("codex", "shell" | "shell_command" | "exec_command" | "exec" | "run") => {
+            "exec".to_string()
+        }
+        _ => native_name.to_string(),
+    }
+}
+
 #[must_use]
 pub fn activity_duration_bucket_index(duration_ms: u64) -> usize {
     ACTIVITY_DURATION_HISTOGRAM_EDGES_MS
@@ -481,6 +527,30 @@ pub fn activity_account_key(account_id: Option<&ProviderAccountId>) -> &str {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn canonical_codex_shell_aliases_collapse_to_exec() {
+        for native in ["shell", "shell_command", "exec_command", "exec", "run"] {
+            assert_eq!(canonical_activity_display_name("codex", native), "exec");
+        }
+        assert_eq!(
+            canonical_activity_display_name("codex", "write_stdin"),
+            "write_stdin"
+        );
+        assert_eq!(canonical_activity_display_name("codex", "apply_patch"), "apply_patch");
+        assert_eq!(canonical_activity_display_name("claude_code", "Bash"), "Bash");
+        assert_eq!(canonical_activity_display_name("opencode", "bash"), "bash");
+    }
+
+    #[test]
+    fn skill_catalog_unknown_round_trips() {
+        assert_eq!(SkillCatalog::Unknown.as_str(), "unknown");
+        assert_eq!(SkillCatalog::parse("unknown"), Some(SkillCatalog::Unknown));
+        assert_eq!(
+            serde_json::to_string(&SkillCatalog::Unknown).unwrap(),
+            "\"unknown\""
+        );
+    }
 
     #[test]
     fn family_round_trips_kebab_case() {

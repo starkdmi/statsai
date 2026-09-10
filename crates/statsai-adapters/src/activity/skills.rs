@@ -11,8 +11,9 @@ pub struct ClassifiedSkill {
 
 /// Codex structured `read` of `.../skills/<name>/SKILL.md`.
 ///
-/// Counts only when the path ends with `/SKILL.md` and the grandparent directory
-/// is named `skills`, or the path contains `/.agents/skills/`.
+/// Counts only when the path ends with `/SKILL.md` and a parent directory is
+/// named `skills`, or the path contains `.agents/skills` or `skills/.system`
+/// as path segments. Relative and absolute forms classify identically.
 #[must_use]
 pub fn classify_skill_path(path: &str) -> Option<ClassifiedSkill> {
     let normalized = path.replace('\\', "/");
@@ -22,41 +23,43 @@ pub fn classify_skill_path(path: &str) -> Option<ClassifiedSkill> {
     let without_file = normalized
         .strip_suffix("/SKILL.md")
         .or_else(|| normalized.strip_suffix("/skill.md"))?;
-    let (parent, name) = without_file.rsplit_once('/')?;
+    let segments: Vec<&str> = without_file.split('/').filter(|part| !part.is_empty()).collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let name = *segments.last()?;
     if name.is_empty() {
         return None;
     }
-    let grandparent = parent.rsplit_once('/').map(|(rest, _)| rest);
-    let grandparent_is_skills = parent.ends_with("/skills") || parent.ends_with("/skills/");
-    let agents_skills = normalized.contains("/.agents/skills/");
-    let system_skills = normalized.contains("/skills/.system/");
-    if !grandparent_is_skills && !agents_skills && !system_skills {
+    let parent_is_skills = segments.get(segments.len().saturating_sub(2)) == Some(&"skills");
+    let agents_skills = contains_segment_seq(&segments, &[".agents", "skills"]);
+    let system_skills = contains_segment_seq(&segments, &["skills", ".system"]);
+    if !parent_is_skills && !agents_skills && !system_skills {
         return None;
     }
-    let _ = grandparent;
 
-    if normalized.contains("/skills/.system/") {
+    if system_skills {
         return Some(ClassifiedSkill {
             name: name.to_string(),
             catalog: SkillCatalog::System,
             plugin: None,
         });
     }
-    if normalized.contains("/.agents/skills/") {
+    if agents_skills {
         return Some(ClassifiedSkill {
             name: name.to_string(),
             catalog: SkillCatalog::Project,
             plugin: None,
         });
     }
-    if normalized.contains("/.codex/skills/") {
+    if contains_segment_seq(&segments, &[".codex", "skills"]) {
         return Some(ClassifiedSkill {
             name: name.to_string(),
             catalog: SkillCatalog::User,
             plugin: None,
         });
     }
-    if let Some(plugin) = plugin_from_skill_path(without_file, name) {
+    if let Some(plugin) = plugin_from_skill_segments(&segments, name) {
         return Some(ClassifiedSkill {
             name: name.to_string(),
             catalog: SkillCatalog::Plugin,
@@ -65,20 +68,32 @@ pub fn classify_skill_path(path: &str) -> Option<ClassifiedSkill> {
     }
     Some(ClassifiedSkill {
         name: name.to_string(),
-        catalog: SkillCatalog::User,
+        catalog: SkillCatalog::Unknown,
         plugin: None,
     })
 }
 
+fn contains_segment_seq(segments: &[&str], needle: &[&str]) -> bool {
+    if needle.is_empty() || segments.len() < needle.len() {
+        return false;
+    }
+    segments.windows(needle.len()).any(|window| window == needle)
+}
+
 /// `/<plugin>/<version>/skills/<name>` immediately before the skill name.
-fn plugin_from_skill_path(without_file: &str, skill_name: &str) -> Option<String> {
-    let suffix = format!("/skills/{skill_name}");
-    let prefix = without_file.strip_suffix(&suffix)?;
-    let (plugin_root, version) = prefix.rsplit_once('/')?;
+fn plugin_from_skill_segments(segments: &[&str], skill_name: &str) -> Option<String> {
+    let len = segments.len();
+    if len < 4 {
+        return None;
+    }
+    if segments[len - 1] != skill_name || segments[len - 2] != "skills" {
+        return None;
+    }
+    let version = segments[len - 3];
+    let plugin = segments[len - 4];
     if version.is_empty() || version.starts_with('.') {
         return None;
     }
-    let plugin = plugin_root.rsplit_once('/')?.1;
     if plugin.is_empty() || plugin.starts_with('.') || plugin == "skills" {
         return None;
     }
@@ -121,6 +136,11 @@ mod tests {
         assert_eq!(project.name, "example-skill");
         assert_eq!(project.catalog, SkillCatalog::Project);
 
+        let relative_project = classify_skill_path(".agents/skills/rust-skills/SKILL.md")
+            .expect("relative project skill");
+        assert_eq!(relative_project.name, "rust-skills");
+        assert_eq!(relative_project.catalog, SkillCatalog::Project);
+
         let plugin = classify_skill_path(
             "/home/fixture/.codex/plugins/acme-plugin/1.0.0/skills/example-skill/SKILL.md",
         )
@@ -129,9 +149,23 @@ mod tests {
         assert_eq!(plugin.catalog, SkillCatalog::Plugin);
         assert_eq!(plugin.plugin.as_deref(), Some("acme-plugin"));
 
+        let cached_plugin = classify_skill_path(
+            "/home/fixture/.codex/plugins/cache/control-in-app-browser/0.1.0/skills/visualize/SKILL.md",
+        )
+        .expect("cached plugin skill");
+        assert_eq!(cached_plugin.catalog, SkillCatalog::Plugin);
+        assert_eq!(cached_plugin.plugin.as_deref(), Some("control-in-app-browser"));
+
         let system = classify_skill_path("/opt/codex/skills/.system/example-skill/SKILL.md")
             .expect("system skill");
         assert_eq!(system.catalog, SkillCatalog::System);
+    }
+
+    #[test]
+    fn unclassifiable_skills_paths_are_unknown_not_user() {
+        let classified = classify_skill_path("/tmp/skills/mystery/SKILL.md").expect("unknown");
+        assert_eq!(classified.catalog, SkillCatalog::Unknown);
+        assert_eq!(classified.name, "mystery");
     }
 
     #[test]

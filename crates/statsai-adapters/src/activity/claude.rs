@@ -165,9 +165,8 @@ impl ClaudeActivityExtractor {
                 continue;
             };
             pending.invocation.outcome = match block.get("is_error").and_then(Value::as_bool) {
-                Some(false) => ActivityOutcome::Succeeded,
                 Some(true) => ActivityOutcome::Failed,
-                None => ActivityOutcome::Unknown,
+                Some(false) | None => ActivityOutcome::Succeeded,
             };
             pending.invocation.duration_ms =
                 signed_duration_ms(pending.invocation.observed_at, timestamp);

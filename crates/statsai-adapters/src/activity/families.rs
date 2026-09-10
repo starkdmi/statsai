@@ -14,6 +14,10 @@ pub(crate) const CODEX_LEGACY_FAMILY_ALIASES: &[FamilyAlias] = &[
         family: ActivityFamily::Shell,
     },
     FamilyAlias {
+        name: "run",
+        family: ActivityFamily::Shell,
+    },
+    FamilyAlias {
         name: "exec_command",
         family: ActivityFamily::Shell,
     },

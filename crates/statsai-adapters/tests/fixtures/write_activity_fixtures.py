@@ -154,6 +154,45 @@ def codex_native() -> None:
                     },
                 },
             },
+            {
+                "timestamp": "2026-01-01T00:00:07.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "thread_fixture_001",
+                    "started_at_ms": None,
+                    "completed_at_ms": 0,
+                    "item": {
+                        "type": "Plan",
+                        "id": "item_fixture_plan",
+                        "status": "completed",
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:08.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "thread_fixture_001",
+                    "started_at_ms": MS + 7000,
+                    "completed_at_ms": MS + 7420,
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "item_fixture_relative_skill",
+                        "status": "completed",
+                        "command": ["bash", "-lc", "cat SKILL.md"],
+                        "parsed_cmd": [
+                            {
+                                "type": "read",
+                                "cmd": "cat SKILL.md",
+                                "name": "SKILL.md",
+                                "path": ".agents/skills/example-skill/SKILL.md",
+                            }
+                        ],
+                    },
+                },
+            },
         ],
     )
 
@@ -220,6 +259,81 @@ def codex_legacy() -> None:
                     "arguments": "{}",
                     "call_id": "call_fixture_003",
                     "id": "fc_fixture_003",
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:06.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_fixture_003",
+                    "output": json.dumps({"output": "...", "metadata": {"exit_code": 1}}),
+                },
+            },
+        ],
+    )
+
+
+def codex_class_b() -> None:
+    jsonl(
+        ROOT / "codex/activity-class-b/sessions/2026/01/01/rollout-fixture-activity-class-b.jsonl",
+        [
+            {
+                "timestamp": TS,
+                "type": "session_meta",
+                "payload": {
+                    "id": "id_fixture_activity_class_b",
+                    "timestamp": TS,
+                    "cwd": "/fixture/project",
+                },
+            },
+            {
+                "timestamp": TS,
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "thread_fixture_class_b",
+                    "item": {"type": "Reasoning", "id": "item_fixture_reasoning"},
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "thread_fixture_class_b",
+                    "item": {"type": "AgentMessage", "id": "item_fixture_agent"},
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:03.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{}",
+                    "call_id": "call_fixture_class_b_exec",
+                    "id": "fc_fixture_class_b_exec",
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:04.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "arguments": "{}",
+                    "call_id": "call_fixture_class_b_patch",
+                    "id": "fc_fixture_class_b_patch",
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:05.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_fixture_class_b_patch",
+                    "output": json.dumps({"output": "...", "metadata": {"exit_code": 0}}),
                 },
             },
         ],
@@ -711,6 +825,7 @@ def update_manifest() -> None:
 def main() -> None:
     codex_native()
     codex_legacy()
+    codex_class_b()
     codex_malformed()
     claude()
     grok()

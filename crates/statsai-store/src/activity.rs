@@ -915,6 +915,49 @@ fn rollup_bucket_key(invocation: &ActivityInvocationV1) -> ActivityRollupBucketK
     }
 }
 
+fn pick_rollup_representative<'a>(rows: &[&'a ActivityInvocationV1]) -> &'a ActivityInvocationV1 {
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Key<'a> {
+        family: &'a str,
+        display_name: &'a str,
+        mcp_server: &'a str,
+        mcp_tool: &'a str,
+        plugin: &'a str,
+        skill_catalog: &'a str,
+        evidence: &'a str,
+    }
+    let mut counts: BTreeMap<Key<'_>, u64> = BTreeMap::new();
+    for row in rows {
+        let key = Key {
+            family: row.family.as_str(),
+            display_name: row.display_name.as_str(),
+            mcp_server: row.mcp_server.as_deref().unwrap_or(""),
+            mcp_tool: row.mcp_tool.as_deref().unwrap_or(""),
+            plugin: row.plugin.as_deref().unwrap_or(""),
+            skill_catalog: row.skill_catalog.map(|catalog| catalog.as_str()).unwrap_or(""),
+            evidence: row.evidence.as_str(),
+        };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    let (best, _) = counts
+        .into_iter()
+        .max_by_key(|(key, count)| (*count, std::cmp::Reverse(key.clone())))
+        .expect("rollup group is non-empty");
+    rows.iter()
+        .copied()
+        .find(|row| {
+            row.family.as_str() == best.family
+                && row.display_name == best.display_name
+                && row.mcp_server.as_deref().unwrap_or("") == best.mcp_server
+                && row.mcp_tool.as_deref().unwrap_or("") == best.mcp_tool
+                && row.plugin.as_deref().unwrap_or("") == best.plugin
+                && row.skill_catalog.map(|catalog| catalog.as_str()).unwrap_or("")
+                    == best.skill_catalog
+                && row.evidence == best.evidence
+        })
+        .unwrap_or(rows[0])
+}
+
 fn build_activity_rollup(
     device_id: &str,
     key: &ActivityRollupBucketKey,
@@ -922,7 +965,7 @@ fn build_activity_rollup(
     entity_key: &str,
     rows: &[&ActivityInvocationV1],
 ) -> ActivityRollupV1 {
-    let first = rows[0];
+    let first = pick_rollup_representative(rows);
     let mut calls = 0u64;
     let mut succeeded = 0u64;
     let mut failed = 0u64;
@@ -1168,6 +1211,66 @@ mod tests {
             rollups[0].duration_buckets.iter().sum::<u64>(),
             rollups[0].duration_samples
         );
+        store
+            .persist_activity_scan(
+                "device",
+                &source.source_id,
+                &rows,
+                &cover,
+                &["file-a".to_string()],
+                ActivityPersistMode::ReplaceFiles,
+                None,
+            )
+            .expect("third");
+        assert_eq!(store.activity_invocation_count().expect("count"), 2);
+        let rollups = store.all_activity_rollups().expect("rollups");
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].calls, 2);
+        assert_eq!(
+            rollups.iter().map(|row| row.calls).sum::<u64>(),
+            store.activity_invocation_count().expect("count")
+        );
+    }
+
+    #[test]
+    fn rollup_picks_majority_family_when_one_entity_disagrees() {
+        let store = Store::in_memory().expect("store");
+        let source = test_source();
+        store.upsert_source(&source).expect("source");
+        let mut rows = Vec::new();
+        for (id, family) in [
+            ("a", ActivityFamily::Shell),
+            ("b", ActivityFamily::Shell),
+            ("c", ActivityFamily::Shell),
+            ("d", ActivityFamily::FileRead),
+        ] {
+            rows.push(invocation(
+                id,
+                &source,
+                1,
+                ActivityKind::Tool,
+                "exec",
+                family,
+                ActivityOutcome::Succeeded,
+                None,
+                "file-a",
+            ));
+        }
+        store
+            .persist_activity_scan(
+                "device",
+                &source.source_id,
+                &rows,
+                &[],
+                &["file-a".to_string()],
+                ActivityPersistMode::ReplaceFiles,
+                None,
+            )
+            .expect("persist");
+        let rollups = store.all_activity_rollups().expect("rollups");
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].family, ActivityFamily::Shell);
+        assert_eq!(rollups[0].calls, 4);
     }
 
     #[test]

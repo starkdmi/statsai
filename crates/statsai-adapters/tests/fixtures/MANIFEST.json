@@ -1,9 +1,9 @@
 {
   "files": [
     {
-      "bytes": 1070,
+      "bytes": 1291,
       "path": "README.md",
-      "sha256": "d26bf0b88616aa76c761b8c72f865141b2ab136ec99b922982be4512dea9d04b"
+      "sha256": "5ff24bbc9310bd128cd3f8419aaac646449dbd8c9ca9c1f02d4f2dd1eec13cc4"
     },
     {
       "bytes": 685,
@@ -61,9 +61,14 @@
       "sha256": "45090702eaae5f1b70a22ce238e3d6357bf861a801a81f446ef6c7f88fdaf6b6"
     },
     {
-      "bytes": 1066,
+      "bytes": 1182,
+      "path": "codex/activity-class-b/sessions/2026/01/01/rollout-fixture-activity-class-b.jsonl",
+      "sha256": "c6f2f4c019763b82df1d235b03f58b549d22ccc1b4ed4b9e5edb0fab9f79c4a6"
+    },
+    {
+      "bytes": 1268,
       "path": "codex/activity-legacy/sessions/2026/01/01/rollout-fixture-activity-legacy.jsonl",
-      "sha256": "963852edae495fb60da306403e79897034248e11cc500fb28f1190ab87de7e90"
+      "sha256": "5201a9121d97d248ef11154d7c472a6dd2e01da6537640e98b8fa6cf90eee64f"
     },
     {
       "bytes": 429,
@@ -71,9 +76,9 @@
       "sha256": "2129bdf4ea370cb350d08becb8a279eb3c7d8aa7359392abda6dd55a2ee1fc43"
     },
     {
-      "bytes": 2236,
+      "bytes": 2914,
       "path": "codex/activity-native/sessions/2026/01/01/rollout-fixture-activity-native.jsonl",
-      "sha256": "c0a19036a424b4415b96f9cce1853f7634ded36ba42d3d52fe10a1049ea5e9d9"
+      "sha256": "6bded7de13c17fd076190582715f6387d2d174c626df01a0cfca6d34b27879be"
     },
     {
       "bytes": 2505,
