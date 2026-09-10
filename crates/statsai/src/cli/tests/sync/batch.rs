@@ -2073,6 +2073,7 @@ fn activity_sync_payload_omits_paths_commands_and_invocation_ids() {
         mcp_tool: None,
         plugin: None,
         skill_catalog: None,
+        model: None,
         outcome: statsai_core::ActivityOutcome::Succeeded,
         duration_ms: Some(420),
         duration_kind: Some(statsai_core::ActivityDurationKind::Reported),

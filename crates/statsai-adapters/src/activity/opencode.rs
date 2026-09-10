@@ -5,16 +5,19 @@ use super::{
     build_invocation, emit_kind_coverage, hashed_invocation_id, push_command_for_tool,
     push_invocation, source_file_hash, timestamp_from_millis,
 };
+use crate::sqlite_table_exists;
 use crate::AdapterScan;
 use crate::OPENCODE_PROVIDER;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::Deserialize;
+use serde_json::Value;
 use statsai_core::{
     activity_day_key, canonical_activity_display_name, ActivityCoverageLevel, ActivityDurationKind,
-    ActivityFamily, ActivityKind, ActivityOutcome, SkillCatalog, SourceLocation,
+    ActivityFamily, ActivityInvocationV1, ActivityKind, ActivityOutcome, SkillCatalog,
+    SourceLocation,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 pub(crate) const OPENCODE_EVIDENCE: &str = "opencode-tool-parts";
@@ -30,6 +33,8 @@ struct OpenCodeToolPart {
     #[serde(rename = "type")]
     part_type: Option<String>,
     tool: Option<String>,
+    #[serde(rename = "messageID", alias = "message_id")]
+    message_id: Option<String>,
     state: Option<OpenCodeToolState>,
 }
 
@@ -80,6 +85,7 @@ pub(crate) fn extract_opencode_activity(
     }
 
     let last_time_updated = cursor.unwrap_or(0);
+    let message_models = load_opencode_message_models(connection)?;
     let mut statement = connection
         .prepare("SELECT id, time_created, time_updated, data FROM part WHERE time_updated > ?1")?;
     let mut rows = statement.query([last_time_updated])?;
@@ -129,6 +135,10 @@ pub(crate) fn extract_opencode_activity(
             .unwrap_or(fallback_timestamp);
         days.insert(activity_day_key(observed_at));
         let invocation_id = hashed_invocation_id(&["opencode", &part_id]);
+        let model = parsed
+            .message_id
+            .as_deref()
+            .and_then(|id| message_models.get(id).cloned());
 
         if tool_name == "skill" {
             let skill_name = parsed
@@ -138,44 +148,50 @@ pub(crate) fn extract_opencode_activity(
                 .unwrap_or_else(|| "skill".to_string());
             push_invocation(
                 scan,
-                build_invocation(
-                    hashed_invocation_id(&["opencode", &part_id, "skill"]),
-                    OPENCODE_PROVIDER,
-                    source.source_id.clone(),
-                    file_hash.clone(),
-                    observed_at,
-                    ActivityKind::Skill,
-                    skill_name,
-                    ActivityFamily::Other,
-                    None,
-                    None,
-                    None,
-                    Some(SkillCatalog::User),
-                    outcome,
-                    duration_ms,
-                    duration_ms.map(|_| ActivityDurationKind::Reported),
-                    OPENCODE_EVIDENCE,
+                with_model(
+                    build_invocation(
+                        hashed_invocation_id(&["opencode", &part_id, "skill"]),
+                        OPENCODE_PROVIDER,
+                        source.source_id.clone(),
+                        file_hash.clone(),
+                        observed_at,
+                        ActivityKind::Skill,
+                        skill_name,
+                        ActivityFamily::Other,
+                        None,
+                        None,
+                        None,
+                        Some(SkillCatalog::User),
+                        outcome,
+                        duration_ms,
+                        duration_ms.map(|_| ActivityDurationKind::Reported),
+                        OPENCODE_EVIDENCE,
+                    ),
+                    model.clone(),
                 ),
             );
             push_invocation(
                 scan,
-                build_invocation(
-                    invocation_id,
-                    OPENCODE_PROVIDER,
-                    source.source_id.clone(),
-                    file_hash.clone(),
-                    observed_at,
-                    ActivityKind::Tool,
-                    "skill".to_string(),
-                    ActivityFamily::Other,
-                    None,
-                    None,
-                    None,
-                    None,
-                    outcome,
-                    duration_ms,
-                    duration_ms.map(|_| ActivityDurationKind::Reported),
-                    OPENCODE_EVIDENCE,
+                with_model(
+                    build_invocation(
+                        invocation_id,
+                        OPENCODE_PROVIDER,
+                        source.source_id.clone(),
+                        file_hash.clone(),
+                        observed_at,
+                        ActivityKind::Tool,
+                        "skill".to_string(),
+                        ActivityFamily::Other,
+                        None,
+                        None,
+                        None,
+                        None,
+                        outcome,
+                        duration_ms,
+                        duration_ms.map(|_| ActivityDurationKind::Reported),
+                        OPENCODE_EVIDENCE,
+                    ),
+                    model.clone(),
                 ),
             );
             continue;
@@ -185,23 +201,26 @@ pub(crate) fn extract_opencode_activity(
             if let Some((server, tool)) = split_opencode_mcp_name(tool_name, mcp_servers) {
                 push_invocation(
                     scan,
-                    build_invocation(
-                        invocation_id,
-                        OPENCODE_PROVIDER,
-                        source.source_id.clone(),
-                        file_hash.clone(),
-                        observed_at,
-                        ActivityKind::Mcp,
-                        tool.to_string(),
-                        ActivityFamily::Mcp,
-                        Some(server),
-                        Some(tool.to_string()),
-                        None,
-                        None,
-                        outcome,
-                        duration_ms,
-                        duration_ms.map(|_| ActivityDurationKind::Reported),
-                        OPENCODE_EVIDENCE,
+                    with_model(
+                        build_invocation(
+                            invocation_id,
+                            OPENCODE_PROVIDER,
+                            source.source_id.clone(),
+                            file_hash.clone(),
+                            observed_at,
+                            ActivityKind::Mcp,
+                            tool.to_string(),
+                            ActivityFamily::Mcp,
+                            Some(server),
+                            Some(tool.to_string()),
+                            None,
+                            None,
+                            outcome,
+                            duration_ms,
+                            duration_ms.map(|_| ActivityDurationKind::Reported),
+                            OPENCODE_EVIDENCE,
+                        ),
+                        model.clone(),
                     ),
                 );
                 continue;
@@ -209,7 +228,7 @@ pub(crate) fn extract_opencode_activity(
         }
 
         let family = family_for_name(OPENCODE_FAMILY_ALIASES, tool_name);
-        let tool = build_invocation(
+        let mut tool = build_invocation(
             invocation_id,
             OPENCODE_PROVIDER,
             source.source_id.clone(),
@@ -227,6 +246,7 @@ pub(crate) fn extract_opencode_activity(
             duration_ms.map(|_| ActivityDurationKind::Reported),
             OPENCODE_EVIDENCE,
         );
+        tool.model = model.clone();
         if family == ActivityFamily::Shell {
             if let Some(command) = parsed
                 .state
@@ -287,6 +307,36 @@ pub(crate) fn extract_opencode_activity(
         last_time_updated: max_updated,
         rows_returned,
     })
+}
+
+fn with_model(mut invocation: ActivityInvocationV1, model: Option<String>) -> ActivityInvocationV1 {
+    invocation.model = model;
+    invocation
+}
+
+fn load_opencode_message_models(
+    connection: &Connection,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    if !sqlite_table_exists(connection, "message")? {
+        return Ok(map);
+    }
+    let mut statement = connection.prepare("SELECT id, data FROM message")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let data: String = row.get(1)?;
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        if let Some(model) = crate::model::opencode_model_id_from_value(&value) {
+            let model = model.trim();
+            if !model.is_empty() {
+                map.insert(id, model.to_string());
+            }
+        }
+    }
+    Ok(map)
 }
 
 pub(crate) fn load_opencode_mcp_servers(config_path: &Path) -> Vec<String> {

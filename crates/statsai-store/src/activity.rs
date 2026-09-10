@@ -411,7 +411,7 @@ impl Store {
         let invocations = self.activity_invocations_for_bucket(key)?;
         let previous_ids = self.activity_rollup_ids_for_bucket(key)?;
         let mut next_ids = BTreeSet::new();
-        let mut grouped: BTreeMap<(ActivityKind, String), Vec<&ActivityInvocationV1>> =
+        let mut grouped: BTreeMap<(ActivityKind, String, String), Vec<&ActivityInvocationV1>> =
             BTreeMap::new();
         for invocation in &invocations {
             let entity_key = activity_entity_key(
@@ -422,11 +422,15 @@ impl Store {
                 invocation.plugin.as_deref(),
             );
             grouped
-                .entry((invocation.kind, entity_key))
+                .entry((
+                    invocation.kind,
+                    entity_key,
+                    invocation.model.clone().unwrap_or_default(),
+                ))
                 .or_default()
                 .push(invocation);
         }
-        for ((kind, entity_key), rows) in grouped {
+        for ((kind, entity_key, _), rows) in grouped {
             let rollup = build_activity_rollup(device_id, key, kind, &entity_key, &rows);
             next_ids.insert(rollup.rollup_id.clone());
             self.upsert_activity_rollup(&rollup)?;
@@ -1039,6 +1043,7 @@ fn build_activity_rollup(
             &key.day,
             kind,
             entity_key,
+            first.model.as_deref(),
         ),
         device_id: device_id.to_string(),
         source_id: SourceId(key.source_id.clone()),
@@ -1053,6 +1058,7 @@ fn build_activity_rollup(
         mcp_tool: first.mcp_tool.clone(),
         plugin: first.plugin.clone(),
         skill_catalog: first.skill_catalog,
+        model: first.model.clone(),
         calls,
         succeeded,
         failed,
@@ -1138,6 +1144,7 @@ mod tests {
             mcp_tool: None,
             plugin: None,
             skill_catalog: None,
+            model: None,
             outcome,
             duration_ms,
             duration_kind: duration_ms.map(|_| ActivityDurationKind::Reported),

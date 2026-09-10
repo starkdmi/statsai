@@ -490,6 +490,12 @@
             "null"
           ]
         },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "plugin": {
           "type": [
             "string",

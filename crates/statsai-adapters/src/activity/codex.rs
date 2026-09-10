@@ -31,6 +31,7 @@ pub(crate) struct CodexActivityExtractor {
     legacy_unkeyed: Vec<PendingLegacy>,
     pending_legacy_outcomes: HashMap<String, ActivityOutcome>,
     saw_native: bool,
+    current_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -44,6 +45,23 @@ struct PendingLegacy {
 }
 
 impl CodexActivityExtractor {
+    pub(crate) fn observe_turn_context(&mut self, line: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("turn_context") {
+            return;
+        }
+        if let Some(model) = value
+            .pointer("/payload/model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            self.current_model = Some(model.to_string());
+        }
+    }
+
     pub(crate) fn observe_native_line(
         &mut self,
         source: &SourceLocation,
@@ -57,7 +75,8 @@ impl CodexActivityExtractor {
             return;
         };
         self.saw_native = true;
-        for invocation in parsed {
+        for mut invocation in parsed {
+            invocation.model = self.current_model.clone();
             self.native.push(PendingNative { invocation });
         }
     }
@@ -76,18 +95,16 @@ impl CodexActivityExtractor {
                 call_id,
                 invocation,
             }) => {
+                let mut invocation = *invocation;
+                invocation.model = self.current_model.clone();
                 if let Some(call_id) = call_id {
-                    let mut pending = PendingLegacy {
-                        invocation: *invocation,
-                    };
+                    let mut pending = PendingLegacy { invocation };
                     if let Some(outcome) = self.pending_legacy_outcomes.remove(&call_id) {
                         pending.invocation.outcome = outcome;
                     }
                     self.legacy_by_call.insert(call_id, pending);
                 } else {
-                    self.legacy_unkeyed.push(PendingLegacy {
-                        invocation: *invocation,
-                    });
+                    self.legacy_unkeyed.push(PendingLegacy { invocation });
                 }
             }
             Some(LegacyObserve::Output { call_id, outcome }) => {
@@ -783,5 +800,18 @@ mod tests {
             legacy_outcome_from_output(parsed.payload.output.as_ref()),
             ActivityOutcome::Failed
         );
+    }
+
+    #[test]
+    fn turn_context_model_uses_top_level_type_not_payload_type() {
+        let mut extractor = CodexActivityExtractor::default();
+        extractor.observe_turn_context(
+            r#"{"type":"event_msg","payload":{"type":"turn_context","model":"gpt-incorrect"}}"#,
+        );
+        assert_eq!(extractor.current_model, None);
+        extractor.observe_turn_context(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+        );
+        assert_eq!(extractor.current_model.as_deref(), Some("gpt-5.4"));
     }
 }

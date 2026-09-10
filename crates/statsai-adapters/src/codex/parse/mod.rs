@@ -65,6 +65,9 @@ pub(crate) fn parse_codex_file(
         }
         ctx.scan.diagnostics.raw_rows += 1;
         let line_kind = codex_line_kind(line);
+        if line_kind == CodexLineKind::TurnContext {
+            activity.observe_turn_context(line);
+        }
         if line_kind == CodexLineKind::EventItemCompleted {
             let activity_started_at = std::time::Instant::now();
             activity.observe_native_line(ctx.source, path, line, index, fallback_timestamp);

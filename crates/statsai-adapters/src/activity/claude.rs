@@ -59,6 +59,12 @@ impl ClaudeActivityExtractor {
             .and_then(Value::as_str)
             .and_then(parse_rfc3339_utc)
             .unwrap_or(fallback_timestamp);
+        let model = value
+            .pointer("/message/model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
         let Some(content) = value.pointer("/message/content").and_then(Value::as_array) else {
             return;
         };
@@ -73,7 +79,7 @@ impl ClaudeActivityExtractor {
             let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
             let invocation_id = hashed_invocation_id(&["claude-code", id]);
             if let Some((server, tool)) = split_mcp_double_underscore(name) {
-                let invocation = build_invocation(
+                let mut invocation = build_invocation(
                     invocation_id,
                     CLAUDE_CODE_PROVIDER,
                     source.source_id.clone(),
@@ -91,6 +97,7 @@ impl ClaudeActivityExtractor {
                     None,
                     CLAUDE_EVIDENCE,
                 );
+                invocation.model = model.clone();
                 self.pending
                     .insert(id.to_string(), PendingTool { invocation });
                 continue;
@@ -108,7 +115,7 @@ impl ClaudeActivityExtractor {
                     );
                 }
             }
-            let invocation = build_invocation(
+            let mut invocation = build_invocation(
                 invocation_id.clone(),
                 CLAUDE_CODE_PROVIDER,
                 source.source_id.clone(),
@@ -126,6 +133,7 @@ impl ClaudeActivityExtractor {
                 None,
                 CLAUDE_EVIDENCE,
             );
+            invocation.model = model.clone();
             self.pending
                 .insert(id.to_string(), PendingTool { invocation });
             if name == "Skill" {
@@ -135,7 +143,7 @@ impl ClaudeActivityExtractor {
                     .filter(|value| !value.is_empty())
                 {
                     let classified = classify_claude_skill_input(skill_name);
-                    self.completed.push(build_invocation(
+                    let mut skill = build_invocation(
                         hashed_invocation_id(&["claude-code", id, "skill"]),
                         CLAUDE_CODE_PROVIDER,
                         source.source_id.clone(),
@@ -152,7 +160,9 @@ impl ClaudeActivityExtractor {
                         None,
                         None,
                         CLAUDE_EVIDENCE,
-                    ));
+                    );
+                    skill.model = model.clone();
+                    self.completed.push(skill);
                 }
             }
         }

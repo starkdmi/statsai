@@ -166,6 +166,10 @@ fn extracts_codex_native_activity_fixture() {
         .activity_invocations
         .iter()
         .any(|row| row.kind == ActivityKind::Command && row.display_name == "cat"));
+    assert!(scan
+        .activity_invocations
+        .iter()
+        .any(|row| { row.kind == ActivityKind::Tool && row.model.as_deref() == Some("gpt-5.4") }));
     let example_skills: Vec<_> = scan
         .activity_invocations
         .iter()
@@ -324,6 +328,10 @@ fn extracts_claude_tool_blocks_including_fork_and_subagent() {
         .activity_invocations
         .iter()
         .any(|row| row.kind == ActivityKind::Command && row.display_name == "ls"));
+    assert!(scan
+        .activity_invocations
+        .iter()
+        .any(|row| row.model.as_deref() == Some("claude-fixture")));
     let bash_ids = scan
         .activity_invocations
         .iter()

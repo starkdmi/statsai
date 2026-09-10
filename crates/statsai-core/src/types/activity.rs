@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 pub const ACTIVITY_INVOCATION_SCHEMA_VERSION: &str = "activity_invocation.v1";
 pub const ACTIVITY_ROLLUP_SCHEMA_VERSION: &str = "activity_rollup.v1";
 pub const ACTIVITY_COVERAGE_SCHEMA_VERSION: &str = "activity_coverage.v1";
-pub const ACTIVITY_PARSER_REVISION: &str = "activity.v3";
+pub const ACTIVITY_PARSER_REVISION: &str = "activity.v4";
 /// Identity table for provider-native tool names. Bump when a rename or
 /// cross-provider alias is added; do not treat this as a parser revision of its own.
 pub const ACTIVITY_OP_ALIAS_REVISION: &str = "activity-ops.v2";
@@ -291,6 +291,8 @@ pub struct ActivityInvocationV1 {
     pub mcp_tool: Option<String>,
     pub plugin: Option<String>,
     pub skill_catalog: Option<SkillCatalog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub outcome: ActivityOutcome,
     pub duration_ms: Option<u64>,
     pub duration_kind: Option<ActivityDurationKind>,
@@ -319,6 +321,8 @@ pub struct ActivityRollupV1 {
     pub mcp_tool: Option<String>,
     pub plugin: Option<String>,
     pub skill_catalog: Option<SkillCatalog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub calls: u64,
     pub succeeded: u64,
     pub failed: u64,
@@ -440,6 +444,10 @@ pub fn sanitize_activity_invocation(
         (!value.is_empty()).then_some(value)
     });
     invocation.plugin = invocation.plugin.and_then(|value| {
+        let value = sanitize_activity_identifier(&value);
+        (!value.is_empty()).then_some(value)
+    });
+    invocation.model = invocation.model.and_then(|value| {
         let value = sanitize_activity_identifier(&value);
         (!value.is_empty()).then_some(value)
     });
@@ -576,10 +584,12 @@ pub fn activity_rollup_id(
     day: &str,
     kind: ActivityKind,
     entity_key: &str,
+    model: Option<&str>,
 ) -> String {
     hash_text(&format!(
-        "activity_rollup.v1\0{device_id}\0{source_id}\0{account_key}\0{day}\0{}\0{entity_key}",
-        kind.as_str()
+        "activity_rollup.v1\0{device_id}\0{source_id}\0{account_key}\0{day}\0{}\0{entity_key}\0{}",
+        kind.as_str(),
+        model.unwrap_or("")
     ))
 }
 
@@ -633,6 +643,29 @@ mod tests {
             canonical_activity_display_name("grok_build", "run_terminal_command"),
             "shell"
         );
+    }
+
+    #[test]
+    fn activity_rollup_id_includes_model() {
+        let without = activity_rollup_id(
+            "d",
+            "src",
+            "unlinked",
+            "2026-01-01",
+            ActivityKind::Tool,
+            "shell",
+            None,
+        );
+        let with = activity_rollup_id(
+            "d",
+            "src",
+            "unlinked",
+            "2026-01-01",
+            ActivityKind::Tool,
+            "shell",
+            Some("gpt-5.4"),
+        );
+        assert_ne!(without, with);
     }
 
     #[test]
@@ -762,6 +795,7 @@ mod tests {
             mcp_tool: None,
             plugin: None,
             skill_catalog: None,
+            model: None,
             outcome: ActivityOutcome::Unknown,
             duration_ms: None,
             duration_kind: None,
@@ -784,6 +818,7 @@ mod tests {
             mcp_tool: None,
             plugin: None,
             skill_catalog: None,
+            model: None,
             outcome: ActivityOutcome::Unknown,
             duration_ms: None,
             duration_kind: None,

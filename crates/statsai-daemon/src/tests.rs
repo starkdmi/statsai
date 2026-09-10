@@ -309,6 +309,7 @@ fn ingest_v6_batch_refuses_activity_collections_it_cannot_store() {
         mcp_tool: None,
         plugin: None,
         skill_catalog: None,
+        model: None,
         calls: 1,
         succeeded: 1,
         failed: 0,

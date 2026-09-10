@@ -306,6 +306,7 @@ fn test_activity_invocation(
         mcp_tool: None,
         plugin: None,
         skill_catalog: None,
+        model: None,
         outcome: statsai_core::ActivityOutcome::Succeeded,
         duration_ms: Some(12),
         duration_kind: Some(statsai_core::ActivityDurationKind::Reported),

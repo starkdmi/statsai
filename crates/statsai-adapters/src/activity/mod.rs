@@ -97,6 +97,7 @@ pub(crate) fn build_invocation(
         mcp_tool,
         plugin,
         skill_catalog,
+        model: None,
         outcome,
         duration_ms,
         duration_kind,
@@ -121,7 +122,7 @@ pub(crate) fn command_invocation_for_tool(
     classified: &str,
     is_write: bool,
 ) -> ActivityInvocationV1 {
-    build_invocation(
+    let mut invocation = build_invocation(
         hashed_invocation_id(&[&tool.invocation_id, "command"]),
         &tool.provider,
         tool.source_id.clone(),
@@ -142,7 +143,9 @@ pub(crate) fn command_invocation_for_tool(
         tool.duration_ms,
         tool.duration_kind,
         &tool.evidence,
-    )
+    );
+    invocation.model = tool.model.clone();
+    invocation
 }
 
 pub(crate) fn push_command_for_tool(
