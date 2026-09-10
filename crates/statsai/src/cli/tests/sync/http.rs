@@ -248,7 +248,7 @@ fn http_rollup_sync_restarts_full_snapshot_after_snapshot_failure() {
             ));
             if chunk.authoritative_snapshot.is_some() {
                 return Err(anyhow::Error::msg(
-                    r#"sync endpoint returned HTTP 429: {"error":"rate_limited","retryAfterSeconds":60}"#,
+                    r#"sync endpoint returned HTTP 409: {"error":"batch_id_payload_conflict"}"#,
                 ));
             }
             record_rollup_sync_chunk_success(&store, "http", &target, &logical_batch_id, chunk)
@@ -258,8 +258,8 @@ fn http_rollup_sync_restarts_full_snapshot_after_snapshot_failure() {
             break;
         }
     }
-    let error = observed_error.expect("rate limit should stop the snapshot request");
-    assert!(error.to_string().contains("HTTP 429"));
+    let error = observed_error.expect("snapshot conflict should stop the snapshot request");
+    assert!(error.to_string().contains("HTTP 409"));
     store
         .record_sync_failure("http", &target)
         .expect("record sync failure");
@@ -424,12 +424,155 @@ fn http_rollup_chunk_does_not_resend_a_decided_rejection() {
 }
 
 #[test]
-fn http_rollup_rate_limit_is_left_to_the_endpoints_own_retry_after() {
-    // 429 carries a `Retry-After` this backoff cannot read, so resending on
-    // our own schedule would ignore the delay the endpoint asked for.
+fn http_rollup_chunk_waits_retry_after_then_resends_a_rate_limited_chunk() {
+    let now = Utc
+        .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+        .single()
+        .expect("date");
+    let batch = test_task_only_sync_batch(now, 1, 1);
+    let attempts = std::cell::Cell::new(0_usize);
+    let send = |_: &SyncBatch| -> Result<()> {
+        attempts.set(attempts.get() + 1);
+        if attempts.get() == 1 {
+            Err(anyhow::anyhow!(
+                r#"sync endpoint returned HTTP 429: {{"error":"rate_limited","retryAfterSeconds":60}}"#
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
+    let delays = std::cell::RefCell::new(Vec::new());
+    send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|delay| {
+        delays.borrow_mut().push(delay)
+    })
+    .expect("rate-limited chunk is resent after Retry-After rather than aborting");
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(delays.into_inner(), vec![StdDuration::from_secs(60)]);
+}
+
+#[test]
+fn http_rollup_chunk_reads_retry_after_from_a_plain_429_message() {
+    let now = Utc
+        .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+        .single()
+        .expect("date");
+    let batch = test_task_only_sync_batch(now, 1, 1);
+    let attempts = std::cell::Cell::new(0_usize);
+    let send = |_: &SyncBatch| -> Result<()> {
+        attempts.set(attempts.get() + 1);
+        if attempts.get() == 1 {
+            Err(anyhow::anyhow!(
+                "sync endpoint returned HTTP 429: Too Many Requests (Retry-After: 45)"
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
+    let delays = std::cell::RefCell::new(Vec::new());
+    send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|delay| {
+        delays.borrow_mut().push(delay)
+    })
+    .expect("plain-text 429 with Retry-After is resent after the advertised wait");
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(delays.into_inner(), vec![StdDuration::from_secs(45)]);
+}
+
+#[test]
+fn http_rollup_chunk_does_not_guess_a_delay_for_a_429_without_retry_after() {
+    let now = Utc
+        .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+        .single()
+        .expect("date");
+    let batch = test_task_only_sync_batch(now, 1, 1);
+    let attempts = std::cell::Cell::new(0_usize);
+    let send = |_: &SyncBatch| -> Result<()> {
+        attempts.set(attempts.get() + 1);
+        Err(anyhow::anyhow!(
+            r#"sync endpoint returned HTTP 429: {{"error":"sync_write_user"}}"#
+        ))
+    };
+
+    let error = send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|_| {
+        panic!("a 429 without Retry-After must not invent a wait")
+    })
+    .expect_err("429 without Retry-After is reported immediately");
+
+    assert!(error.to_string().contains("HTTP 429"));
+    assert_eq!(attempts.get(), 1);
+}
+
+#[test]
+fn http_rollup_chunk_stops_honouring_retry_after_that_never_clears() {
+    let now = Utc
+        .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+        .single()
+        .expect("date");
+    let batch = test_task_only_sync_batch(now, 1, 1);
+    let attempts = std::cell::Cell::new(0_usize);
+    let send = |_: &SyncBatch| -> Result<()> {
+        attempts.set(attempts.get() + 1);
+        Err(anyhow::anyhow!(
+            r#"sync endpoint returned HTTP 429: {{"error":"rate_limited","retryAfterSeconds":60}}"#
+        ))
+    };
+
+    let delays = std::cell::RefCell::new(Vec::new());
+    let error = send_http_rollup_chunk_with_retry_using_sleep(&batch, &send, &|delay| {
+        delays.borrow_mut().push(delay)
+    })
+    .expect_err("a window that never empties still fails the run");
+
+    assert!(error.to_string().contains("429"));
+    assert_eq!(attempts.get(), 4);
+    assert_eq!(
+        delays.into_inner(),
+        vec![
+            StdDuration::from_secs(60),
+            StdDuration::from_secs(60),
+            StdDuration::from_secs(60),
+        ]
+    );
+}
+
+#[test]
+fn http_rollup_rate_limit_is_not_on_the_transient_backoff_schedule() {
+    // 429 is not a lost answer: it is the endpoint asking for a specific wait.
+    // Honouring that delay is a separate path from the 500 doubling backoff.
     assert!(!is_transient_http_sync_error(&anyhow::anyhow!(
-        r#"sync endpoint returned HTTP 429: {{"error":"sync_write_user"}}"#
+        r#"sync endpoint returned HTTP 429: {{"error":"rate_limited","retryAfterSeconds":60}}"#
     )));
+    assert_eq!(
+        http_sync_retry_after(&anyhow::anyhow!(
+            r#"sync endpoint returned HTTP 429: {{"error":"rate_limited","retryAfterSeconds":60}}"#
+        )),
+        Some(StdDuration::from_secs(60))
+    );
+    assert_eq!(
+        http_sync_retry_after(&anyhow::anyhow!(
+            "sync endpoint returned HTTP 429: Too Many Requests (Retry-After: 45)"
+        )),
+        Some(StdDuration::from_secs(45))
+    );
+    assert_eq!(
+        http_sync_retry_after(&anyhow::anyhow!(
+            r#"sync endpoint returned HTTP 429: {{"error":"sync_write_user"}}"#
+        )),
+        None
+    );
+    assert_eq!(
+        http_sync_retry_after(&anyhow::anyhow!(
+            r#"sync endpoint returned HTTP 429: {{"error":"rate_limited","retryAfterSeconds":0}}"#
+        )),
+        Some(StdDuration::from_secs(1))
+    );
+    assert_eq!(
+        http_sync_retry_after(&anyhow::anyhow!(
+            r#"sync endpoint returned HTTP 429: {{"error":"rate_limited","retryAfterSeconds":999}}"#
+        )),
+        Some(StdDuration::from_secs(120))
+    );
     assert!(is_transient_http_sync_error(&anyhow::anyhow!(
         "sync endpoint returned HTTP 503: Your worker restarted mid-request."
     )));

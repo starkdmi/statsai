@@ -312,9 +312,16 @@ or is acknowledged as a duplicate. Statuses are read without requiring a JSON
 body, since these failures come from the infrastructure in front of the worker
 and answer in plain text.
 
-HTTP 429 is deliberately not resent on that schedule: it carries the endpoint's
+HTTP 429 is not resent on that doubling schedule: it carries the endpoint's
 own `Retry-After`, and retrying sooner would work against the limit it asked
-for. Any other 4xx is a decision that repeating cannot change, so it fails the
+for. The sender reads `retryAfterSeconds` from the JSON body, or a
+`Retry-After: <seconds>` token echoed from the header on a non-JSON body,
+sleeps for that delay (clamped to 1–120 seconds), and resends the identical
+chunk, three times before the run gives up. A 429 with no delay advertised
+still fails the run immediately. Batch *count* does not trip this limit;
+throughput does. Small, fast batches on a new device are more likely to fill
+a 30-request rolling minute than a large device whose payloads pace themselves.
+Any other 4xx is a decision that repeating cannot change, so it fails the
 run immediately.
 
 ## Response Shapes

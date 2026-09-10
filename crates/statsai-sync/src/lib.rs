@@ -92,14 +92,19 @@ impl HttpSink {
         let response = match response {
             Ok(response) => response,
             Err(ureq::Error::Status(code, response)) => {
+                let retry_after = response
+                    .header("retry-after")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
                 let body = response.into_string().unwrap_or_default();
                 if let Some(detail) = unrecognized_field_detail(&body) {
                     bail!("sync endpoint returned HTTP {code}: {detail}");
                 }
+                let truncated = body.trim().chars().take(200).collect::<String>();
                 bail!(
-                    "sync endpoint returned HTTP {}: {}",
-                    code,
-                    body.trim().chars().take(200).collect::<String>()
+                    "sync endpoint returned HTTP {code}: {}",
+                    http_sync_error_detail(&truncated, retry_after.as_deref())
                 );
             }
             Err(error) => bail!("sync endpoint request failed: {}", error),
@@ -150,6 +155,29 @@ impl SyncSink for HttpSink {
     fn send(&self, batch: &SyncBatch) -> Result<()> {
         self.send_with_ack(batch)?;
         Ok(())
+    }
+}
+
+/// Surfaces `Retry-After` on non-JSON 429s without rewriting a JSON body.
+///
+/// JSON rate-limit replies already carry `retryAfterSeconds`, and appending
+/// after that body would break `parse_http_sync_error`. A plain-text 429 from
+/// the infrastructure in front of the worker has no such field, so the header
+/// is echoed where the retry reader can find it.
+fn http_sync_error_detail(body: &str, retry_after: Option<&str>) -> String {
+    if serde_json::from_str::<serde_json::Value>(body).is_ok() {
+        return body.to_string();
+    }
+    let Some(retry_after) = retry_after else {
+        return body.to_string();
+    };
+    if body.to_ascii_lowercase().contains("retry-after:") {
+        return body.to_string();
+    }
+    if body.is_empty() {
+        format!("(Retry-After: {retry_after})")
+    } else {
+        format!("{body} (Retry-After: {retry_after})")
     }
 }
 
@@ -550,6 +578,67 @@ mod tests {
         let error = sink.send(&empty_batch()).expect_err("500 should fail");
         handle.join().expect("server thread");
         assert!(error.to_string().contains("HTTP 500"));
+    }
+
+    #[test]
+    fn http_sink_preserves_json_rate_limit_body() {
+        let server = Server::http("127.0.0.1:0").expect("server");
+        let endpoint = format!("http://{}/v1/sync/batches", server.server_addr());
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().expect("request");
+            let response =
+                Response::from_string(r#"{"error":"rate_limited","retryAfterSeconds":60}"#)
+                    .with_status_code(429)
+                    .with_header(Header::from_bytes("retry-after", "60").unwrap());
+            request.respond(response).expect("respond");
+        });
+
+        let sink = HttpSink::new(endpoint, None).expect("sink");
+        let error = sink.send(&empty_batch()).expect_err("429 should fail");
+        handle.join().expect("server thread");
+        let message = error.to_string();
+        assert!(message.contains("HTTP 429"));
+        assert!(message.contains(r#""retryAfterSeconds":60"#));
+        assert!(
+            !message.to_ascii_lowercase().contains("retry-after:"),
+            "JSON bodies must stay parseable: {message}"
+        );
+    }
+
+    #[test]
+    fn http_sink_echoes_retry_after_on_plain_429() {
+        let server = Server::http("127.0.0.1:0").expect("server");
+        let endpoint = format!("http://{}/v1/sync/batches", server.server_addr());
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().expect("request");
+            let response = Response::from_string("Too Many Requests")
+                .with_status_code(429)
+                .with_header(Header::from_bytes("retry-after", "45").unwrap());
+            request.respond(response).expect("respond");
+        });
+
+        let sink = HttpSink::new(endpoint, None).expect("sink");
+        let error = sink.send(&empty_batch()).expect_err("429 should fail");
+        handle.join().expect("server thread");
+        let message = error.to_string();
+        assert!(message.contains("HTTP 429"));
+        assert!(message.contains("Retry-After: 45"));
+    }
+
+    #[test]
+    fn http_sync_error_detail_leaves_json_alone() {
+        assert_eq!(
+            http_sync_error_detail(
+                r#"{"error":"rate_limited","retryAfterSeconds":60}"#,
+                Some("60")
+            ),
+            r#"{"error":"rate_limited","retryAfterSeconds":60}"#
+        );
+        assert_eq!(
+            http_sync_error_detail("Too Many Requests", Some("45")),
+            "Too Many Requests (Retry-After: 45)"
+        );
+        assert_eq!(http_sync_error_detail("", Some("30")), "(Retry-After: 30)");
     }
 
     #[test]
