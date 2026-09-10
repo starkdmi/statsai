@@ -45,6 +45,11 @@ def codex_native() -> None:
             },
             {
                 "timestamp": TS,
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.4"},
+            },
+            {
+                "timestamp": TS,
                 "type": "event_msg",
                 "ordinal": 12,
                 "payload": {
@@ -311,7 +316,7 @@ def codex_class_b() -> None:
                 "payload": {
                     "type": "function_call",
                     "name": "exec_command",
-                    "arguments": "{}",
+                    "arguments": json.dumps({"command": ["bash", "-lc", "cargo test"]}),
                     "call_id": "call_fixture_class_b_exec",
                     "id": "fc_fixture_class_b_exec",
                 },
@@ -340,6 +345,60 @@ def codex_class_b() -> None:
     )
 
 
+def codex_command_shapes() -> None:
+    jsonl(
+        ROOT / "codex/activity-commands/sessions/2026/01/01/rollout-fixture-activity-commands.jsonl",
+        [
+            {
+                "timestamp": TS,
+                "type": "session_meta",
+                "payload": {"id": "id_fixture_activity_commands", "timestamp": TS},
+            },
+            {
+                "timestamp": TS,
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_started",
+                    "thread_id": "thread_fixture_commands",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "item_fixture_started_only",
+                        "status": "in_progress",
+                        "command": "bash -lc 'npm test'",
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "thread_fixture_commands",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "item_fixture_started_only",
+                        "status": "completed",
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-01-01T00:00:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "thread_fixture_commands",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "item_fixture_string_command",
+                        "status": "completed",
+                        "command": "git status",
+                    },
+                },
+            },
+        ],
+    )
+
+
 def codex_malformed() -> None:
     jsonl(
         ROOT / "codex/activity-malformed/sessions/2026/01/01/rollout-fixture-activity-malformed.jsonl",
@@ -360,7 +419,7 @@ def codex_malformed() -> None:
                         "type": "CommandExecution",
                         "id": "item_fixture_malformed",
                         "status": "completed",
-                        "parsed_cmd": [{"type": "unknown", "cmd": "echo"}],
+                        "parsed_cmd": [{"type": "unknown", "cmd": "rg"}],
                     },
                 },
             },
@@ -847,6 +906,7 @@ def main() -> None:
     codex_native()
     codex_legacy()
     codex_class_b()
+    codex_command_shapes()
     codex_malformed()
     claude()
     grok()

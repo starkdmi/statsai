@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 pub const ACTIVITY_INVOCATION_SCHEMA_VERSION: &str = "activity_invocation.v1";
 pub const ACTIVITY_ROLLUP_SCHEMA_VERSION: &str = "activity_rollup.v1";
 pub const ACTIVITY_COVERAGE_SCHEMA_VERSION: &str = "activity_coverage.v1";
-pub const ACTIVITY_PARSER_REVISION: &str = "activity.v5";
+pub const ACTIVITY_PARSER_REVISION: &str = "activity.v6";
 /// Identity table for provider-native tool names. Bump when a rename or
 /// cross-provider alias is added; do not treat this as a parser revision of its own.
 pub const ACTIVITY_OP_ALIAS_REVISION: &str = "activity-ops.v2";

@@ -46,6 +46,7 @@ pub(crate) enum CodexLineKind {
     TaskComplete,
     HeadlessUsage,
     ResponseItemToolCall,
+    EventItemStarted,
     EventItemCompleted,
 }
 
@@ -120,6 +121,9 @@ pub(crate) fn codex_line_kind(line: &str) -> CodexLineKind {
         }
         if header.contains("\"payload\":{\"type\":\"task_complete\"") {
             return CodexLineKind::TaskComplete;
+        }
+        if header.contains("\"payload\":{\"type\":\"item_started\"") {
+            return CodexLineKind::EventItemStarted;
         }
         if header.contains("\"payload\":{\"type\":\"item_completed\"") {
             return CodexLineKind::EventItemCompleted;

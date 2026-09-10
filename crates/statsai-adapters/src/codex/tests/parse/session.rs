@@ -74,6 +74,11 @@ fn codex_line_filter_skips_non_message_response_items() {
 
     let unrelated_event = r#"{"timestamp":"2026-06-03T09:36:26.000Z","type":"event_msg","payload":{"type":"agent_message","model":"gpt-incorrect"}}"#;
     assert_eq!(codex_line_kind(unrelated_event), CodexLineKind::Irrelevant);
+    let item_started = r#"{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"item_started","item":{"type":"CommandExecution"}}}"#;
+    assert_eq!(
+        codex_line_kind(item_started),
+        CodexLineKind::EventItemStarted
+    );
     assert!(!is_codex_quota_line_structurally(reasoning));
 
     let reordered_quota = r#"{"payload": {"rate_limits": {"primary": {"used_percent": 1, "window_minutes": 300, "resets_at": 1787832000}}, "type": "token_count"}, "type": "event_msg"}"#;

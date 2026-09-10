@@ -68,6 +68,13 @@ pub(crate) fn parse_codex_file(
         if line_kind == CodexLineKind::TurnContext {
             activity.observe_turn_context(line);
         }
+        if line_kind == CodexLineKind::EventItemStarted {
+            let activity_started_at = std::time::Instant::now();
+            activity.observe_native_started(line);
+            ctx.scan.diagnostics.activity_extract_ms +=
+                activity_started_at.elapsed().as_millis() as u64;
+            continue;
+        }
         if line_kind == CodexLineKind::EventItemCompleted {
             let activity_started_at = std::time::Instant::now();
             activity.observe_native_line(ctx.source, path, line, index, fallback_timestamp);

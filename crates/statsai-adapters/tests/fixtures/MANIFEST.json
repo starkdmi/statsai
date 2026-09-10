@@ -61,9 +61,14 @@
       "sha256": "45090702eaae5f1b70a22ce238e3d6357bf861a801a81f446ef6c7f88fdaf6b6"
     },
     {
-      "bytes": 1182,
+      "bytes": 1230,
       "path": "codex/activity-class-b/sessions/2026/01/01/rollout-fixture-activity-class-b.jsonl",
-      "sha256": "c6f2f4c019763b82df1d235b03f58b549d22ccc1b4ed4b9e5edb0fab9f79c4a6"
+      "sha256": "673b94394cd771fd19c65e8e096514c06d5e99f520c5b7485eb3edf5a58ea938"
+    },
+    {
+      "bytes": 876,
+      "path": "codex/activity-commands/sessions/2026/01/01/rollout-fixture-activity-commands.jsonl",
+      "sha256": "75d56d5df4e25798e9d1d90d54159a8e7fbb189dfee6b028c93908220da73439"
     },
     {
       "bytes": 1268,
@@ -71,14 +76,14 @@
       "sha256": "5201a9121d97d248ef11154d7c472a6dd2e01da6537640e98b8fa6cf90eee64f"
     },
     {
-      "bytes": 429,
+      "bytes": 427,
       "path": "codex/activity-malformed/sessions/2026/01/01/rollout-fixture-activity-malformed.jsonl",
-      "sha256": "2129bdf4ea370cb350d08becb8a279eb3c7d8aa7359392abda6dd55a2ee1fc43"
+      "sha256": "056505596e1179ba2214743a0e2aa275b4041448499c4cb969be1dc3e2c53917"
     },
     {
-      "bytes": 2914,
+      "bytes": 3007,
       "path": "codex/activity-native/sessions/2026/01/01/rollout-fixture-activity-native.jsonl",
-      "sha256": "6bded7de13c17fd076190582715f6387d2d174c626df01a0cfca6d34b27879be"
+      "sha256": "d935fccd166f2394db0ca7836a9c1aa5880a20a1deb2cb70687eacb42321b9ba"
     },
     {
       "bytes": 2505,
@@ -201,9 +206,9 @@
       "sha256": "8007a86ce6c9a55cc3882a69e88f4a164d27cc6e945a0abb923242f38a39c7e6"
     },
     {
-      "bytes": 20480,
+      "bytes": 28672,
       "path": "opencode/activity/opencode.db",
-      "sha256": "f9da0d7047a4da7ceab661764bd885335e125edd3855e67eeea66f93157bec56"
+      "sha256": "aa2daebacb4df630fb0fd7e728ce2d30184f611789df161ddee8a34df369949a"
     },
     {
       "bytes": 96,

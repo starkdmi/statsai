@@ -226,6 +226,10 @@ fn extracts_codex_legacy_activity_without_mixing_native() {
         .activity_invocations
         .iter()
         .any(|row| row.display_name == "shell"));
+    assert!(scan
+        .activity_invocations
+        .iter()
+        .any(|row| row.kind == ActivityKind::Command && row.display_name == "ls"));
     let apply_patch = scan
         .activity_invocations
         .iter()
@@ -268,6 +272,10 @@ fn extracts_codex_class_b_legacy_calls_when_item_completed_is_prose_only() {
             .any(|row| row.display_name == "shell" && row.kind == ActivityKind::Tool),
         "class-B files must count legacy tool calls"
     );
+    assert!(scan
+        .activity_invocations
+        .iter()
+        .any(|row| { row.kind == ActivityKind::Command && row.display_name == "cargo" }));
     assert!(scan.activity_invocations.iter().any(|row| {
         row.display_name == "apply_patch" && row.outcome == ActivityOutcome::Succeeded
     }));
@@ -280,6 +288,71 @@ fn extracts_codex_class_b_legacy_calls_when_item_completed_is_prose_only() {
         .iter()
         .all(|row| row.evidence == "codex-legacy-response-items"));
     serialized_invocations_omit_secrets(&scan);
+}
+
+#[test]
+fn extracts_codex_commands_from_parsed_cmd_legacy_arguments_and_item_started() {
+    let malformed_root = fixture_root().join("codex/activity-malformed");
+    let malformed_source = SourceLocation::local_adapter(
+        crate::CODEX_PROVIDER,
+        "test",
+        "0",
+        &malformed_root,
+        statsai_core::LocationOrigin::Configured,
+    );
+    let malformed = crate::codex::scan_codex_source(
+        &crate::CodexAdapter,
+        &malformed_source,
+        &crate::tests::options(),
+    )
+    .expect("malformed scan");
+    assert!(malformed
+        .activity_invocations
+        .iter()
+        .any(|row| { row.kind == ActivityKind::Command && row.display_name == "rg" }));
+    assert_eq!(
+        malformed
+            .activity_invocations
+            .iter()
+            .filter(|row| row.kind == ActivityKind::Tool && row.display_name == "shell")
+            .count(),
+        malformed
+            .activity_invocations
+            .iter()
+            .filter(|row| row.kind == ActivityKind::Command)
+            .count()
+    );
+
+    let shapes_root = fixture_root().join("codex/activity-commands");
+    let shapes_source = SourceLocation::local_adapter(
+        crate::CODEX_PROVIDER,
+        "test",
+        "0",
+        &shapes_root,
+        statsai_core::LocationOrigin::Configured,
+    );
+    let shapes = crate::codex::scan_codex_source(
+        &crate::CodexAdapter,
+        &shapes_source,
+        &crate::tests::options(),
+    )
+    .expect("command shapes scan");
+    let command_names = names(&shapes, ActivityKind::Command);
+    assert!(command_names.contains(&"npm".to_string()));
+    assert!(command_names.contains(&"git".to_string()));
+    let shell_tools = shapes
+        .activity_invocations
+        .iter()
+        .filter(|row| row.kind == ActivityKind::Tool && row.display_name == "shell")
+        .count();
+    let commands = shapes
+        .activity_invocations
+        .iter()
+        .filter(|row| row.kind == ActivityKind::Command)
+        .count();
+    assert_eq!(shell_tools, commands);
+    serialized_invocations_omit_secrets(&malformed);
+    serialized_invocations_omit_secrets(&shapes);
 }
 
 #[test]

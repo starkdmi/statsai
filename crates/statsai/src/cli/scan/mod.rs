@@ -178,12 +178,10 @@ pub(crate) fn scan_with_adapters(
                 command.replace,
                 needs_legacy_full_reconcile,
             );
-            let should_run_adapter_scan = if replace_source_records {
-                !file_cache_entries.is_empty()
-            } else {
-                !pending_file_entries.is_empty()
-            };
             let stored_activity_cursor = store.activity_scan_cursor(&source.source_id)?;
+            let parser_revision_mismatch = stored_activity_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION);
             let activity_full_reconcile = if adapter.provider() == OPENCODE_PROVIDER {
                 command.replace
                     || command.no_cache
@@ -191,14 +189,20 @@ pub(crate) fn scan_with_adapters(
                         .as_ref()
                         .is_none_or(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION)
             } else {
-                command.replace || command.no_cache
+                command.replace || command.no_cache || parser_revision_mismatch
+            };
+            let should_run_adapter_scan = if replace_source_records || activity_full_reconcile {
+                !file_cache_entries.is_empty()
+            } else {
+                !pending_file_entries.is_empty()
             };
             let options = ScanOptions {
                 device_id: device_id.to_string(),
                 collect_tasks: command.include_tasks,
                 selected_cache_keys: (should_run_adapter_scan
                     && !replace_source_records
-                    && !command.no_cache)
+                    && !command.no_cache
+                    && !activity_full_reconcile)
                     .then(|| {
                         pending_file_entries
                             .iter()
@@ -511,12 +515,15 @@ pub(crate) fn scan_with_adapters(
                     } else {
                         Vec::new()
                     };
-                let activity_cursor =
-                    scan.activity_scan_cursor
-                        .map(|last_time_updated| ActivityScanCursor {
-                            last_time_updated,
-                            parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
-                        });
+                let activity_cursor = Some(ActivityScanCursor {
+                    last_time_updated: scan.activity_scan_cursor.unwrap_or_else(|| {
+                        stored_activity_cursor
+                            .as_ref()
+                            .map(|cursor| cursor.last_time_updated)
+                            .unwrap_or(0)
+                    }),
+                    parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
+                });
                 store.persist_activity_scan(
                     device_id,
                     &source.source_id,

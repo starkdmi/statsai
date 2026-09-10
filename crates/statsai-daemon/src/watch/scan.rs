@@ -287,19 +287,6 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                 };
             let verified_state_changed = matches!(verification_mode, SourceVerificationMode::Auto)
                 && source.verified_state_hash != next_verified_state_hash;
-            let rescan_file_entries = if removed_file_entries.is_empty() {
-                &pending_file_entries
-            } else {
-                &file_cache_entries
-            };
-            if pending_file_entries.is_empty()
-                && removed_file_entries.is_empty()
-                && !has_cache_entry_upgrades
-                && !verified_state_changed
-                && !has_account_evidence
-            {
-                continue;
-            }
             let stored_activity_cursor = match scan_store.activity_scan_cursor(&source.source_id) {
                 Ok(cursor) => cursor,
                 Err(e) => {
@@ -316,21 +303,44 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                     .as_ref()
                     .is_none_or(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION)
             } else {
-                false
+                stored_activity_cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION)
+            };
+            if pending_file_entries.is_empty()
+                && removed_file_entries.is_empty()
+                && !has_cache_entry_upgrades
+                && !verified_state_changed
+                && !has_account_evidence
+                && !activity_full_reconcile
+            {
+                continue;
+            }
+            let rescan_file_entries = if activity_full_reconcile || !removed_file_entries.is_empty()
+            {
+                &file_cache_entries
+            } else {
+                &pending_file_entries
             };
             let options = ScanOptions {
                 device_id: device_id.to_string(),
                 collect_tasks: false,
-                selected_cache_keys: Some(
-                    rescan_file_entries
-                        .iter()
-                        .map(|entry| entry.cache_key.clone())
-                        .collect::<HashSet<_>>(),
-                ),
+                selected_cache_keys: if activity_full_reconcile {
+                    None
+                } else {
+                    Some(
+                        rescan_file_entries
+                            .iter()
+                            .map(|entry| entry.cache_key.clone())
+                            .collect::<HashSet<_>>(),
+                    )
+                },
                 activity_scan_cursor: if activity_full_reconcile {
                     None
                 } else {
-                    stored_activity_cursor.map(|cursor| cursor.last_time_updated)
+                    stored_activity_cursor
+                        .as_ref()
+                        .map(|cursor| cursor.last_time_updated)
                 },
                 activity_full_reconcile,
             };
@@ -463,12 +473,17 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                         &source.provider,
                                         activity_full_reconcile,
                                     ),
-                                    activity_scan_cursor: scan.activity_scan_cursor.map(
-                                        |last_time_updated| ActivityScanCursor {
-                                            last_time_updated,
-                                            parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
-                                        },
-                                    ),
+                                    activity_scan_cursor: Some(ActivityScanCursor {
+                                        last_time_updated: scan
+                                            .activity_scan_cursor
+                                            .unwrap_or_else(|| {
+                                                stored_activity_cursor
+                                                    .as_ref()
+                                                    .map(|cursor| cursor.last_time_updated)
+                                                    .unwrap_or(0)
+                                            }),
+                                        parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
+                                    }),
                                     device_id,
                                     pending_entries: &pending_file_entries,
                                     compatible_entries_to_upgrade: &compatible_entries_to_upgrade,

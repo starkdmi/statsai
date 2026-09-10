@@ -3,6 +3,8 @@
 //! The raw command string is never stored. Only a vocabulary basename or
 //! `other` is returned. Path-qualified invocations collapse to `other`.
 
+use serde_json::Value;
+
 /// Vocabulary revision for the public-registry binary head list.
 #[allow(dead_code)]
 pub const ACTIVITY_SHELL_BIN_REVISION: &str = "activity-shell-bins.v1";
@@ -325,6 +327,57 @@ pub fn classify_shell_argv(argv: &[String]) -> String {
     classify_head(words[0])
 }
 
+/// Flatten Codex/Claude/OpenCode shell argument payloads into a classified head.
+///
+/// Accepts a script string, an argv array, a JSON string of either, or an
+/// object with `command`/`cmd`/`script`/`shell_command`/`input`.
+pub fn classify_command_payload(value: &Value) -> Option<(String, bool)> {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                if !parsed.is_string() {
+                    if let Some(classified) = classify_command_payload(&parsed) {
+                        return Some(classified);
+                    }
+                }
+            }
+            Some((
+                classify_shell_command(trimmed),
+                shell_command_is_write(trimmed),
+            ))
+        }
+        Value::Array(items) => {
+            let argv = items
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?;
+            if argv.is_empty() {
+                return None;
+            }
+            let argv = argv.into_iter().map(str::to_string).collect::<Vec<_>>();
+            Some((classify_shell_argv(&argv), shell_argv_is_write(&argv)))
+        }
+        Value::Object(object) => [
+            "command",
+            "cmd",
+            "script",
+            "shell_command",
+            "input",
+            "Argv",
+            "argv",
+            "Line",
+            "line",
+        ]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(classify_command_payload)),
+        _ => None,
+    }
+}
+
 pub fn shell_command_is_write(command: &str) -> bool {
     let tokens = posix_tokens(command);
     if tokens
@@ -355,6 +408,18 @@ fn classify_tokens(tokens: &[Token]) -> String {
     for simple in simple_commands(tokens) {
         let mut words = simple;
         skip_assignments(&mut words);
+        let Some(head) = words.first().copied() else {
+            continue;
+        };
+        if SHELLS.binary_search(&basename(head)).is_ok() {
+            let argv = words
+                .iter()
+                .map(|word| (*word).to_string())
+                .collect::<Vec<_>>();
+            if let Some(script) = wrapper_script(&argv) {
+                return classify_shell_command(script);
+            }
+        }
         skip_wrappers(&mut words);
         let Some(head) = words.first().copied() else {
             continue;
@@ -619,6 +684,9 @@ mod tests {
             "python"
         );
         assert_eq!(classify_shell_command("git log | head -n 20"), "git");
+        assert_eq!(classify_shell_command("bash -lc 'npm test'"), "npm");
+        assert_eq!(classify_shell_command("bash -lc git status"), "git");
+        assert_eq!(classify_shell_command("/bin/bash -lc 'npm test'"), "npm");
         assert_eq!(classify_shell_command("cd crates && cargo test"), "cargo");
         assert_eq!(classify_shell_command("./hack.sh && cargo test"), "other");
         assert_eq!(classify_shell_command("~/bin/foo"), "other");
@@ -635,5 +703,41 @@ mod tests {
         ));
         assert!(shell_command_is_write("tee README.md"));
         assert!(!shell_command_is_write("cargo test"));
+    }
+
+    #[test]
+    fn command_payload_accepts_argv_script_object_and_json_string() {
+        use serde_json::json;
+        assert_eq!(
+            classify_command_payload(&json!(["bash", "-lc", "git status"])).map(|(name, _)| name),
+            Some("git".to_string())
+        );
+        assert_eq!(
+            classify_command_payload(&json!("bash -lc 'npm test'")).map(|(name, _)| name),
+            Some("npm".to_string())
+        );
+        assert_eq!(
+            classify_command_payload(&json!({"command": ["tee", "README.md"]})),
+            Some(("tee".to_string(), true))
+        );
+        assert_eq!(
+            classify_command_payload(&json!({"command": ["sed", "-n", "1p", "file"]})),
+            Some(("sed".to_string(), false))
+        );
+        assert_eq!(
+            classify_command_payload(&json!("{\"cmd\":\"ls -la\"}")).map(|(name, _)| name),
+            Some("ls".to_string())
+        );
+        assert_eq!(
+            classify_command_payload(&json!({"Argv": ["python3", "-c", "print(1)"]}))
+                .map(|(name, _)| name),
+            Some("python3".to_string())
+        );
+        assert_eq!(
+            classify_command_payload(&json!({"Line": "git status"})).map(|(name, _)| name),
+            Some("git".to_string())
+        );
+        assert_eq!(classify_command_payload(&json!({})), None);
+        assert_eq!(classify_command_payload(&json!([])), None);
     }
 }

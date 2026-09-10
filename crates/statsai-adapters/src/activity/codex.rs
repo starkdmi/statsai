@@ -1,8 +1,6 @@
 use super::families::{family_for_name, CODEX_LEGACY_FAMILY_ALIASES};
 use super::mcp::split_mcp_double_underscore;
-use super::shell_cmd::{
-    classify_shell_argv, classify_shell_command, shell_argv_is_write, shell_command_is_write,
-};
+use super::shell_cmd::{classify_command_payload, classify_shell_command, shell_command_is_write};
 use super::skills::classify_skill_path;
 use super::{
     build_invocation, command_invocation_for_tool, duration_from_secs_nanos, emit_kind_coverage,
@@ -30,6 +28,7 @@ pub(crate) struct CodexActivityExtractor {
     legacy_by_call: HashMap<String, PendingLegacy>,
     legacy_unkeyed: Vec<PendingLegacy>,
     pending_legacy_outcomes: HashMap<String, ActivityOutcome>,
+    pending_native_commands: HashMap<String, (String, bool)>,
     saw_native: bool,
     current_model: Option<String>,
 }
@@ -42,6 +41,7 @@ struct PendingNative {
 #[derive(Debug)]
 struct PendingLegacy {
     invocation: statsai_core::ActivityInvocationV1,
+    command: Option<(String, bool)>,
 }
 
 impl CodexActivityExtractor {
@@ -62,6 +62,21 @@ impl CodexActivityExtractor {
         }
     }
 
+    pub(crate) fn observe_native_started(&mut self, line: &str) {
+        let Ok(parsed) = serde_json::from_str::<NativeLine>(line) else {
+            return;
+        };
+        if parsed.payload.item.item_type != "CommandExecution" {
+            return;
+        }
+        let Some(id) = parsed.payload.item.id.clone() else {
+            return;
+        };
+        if let Some(classified) = classify_native_item_command(&parsed.payload.item) {
+            self.pending_native_commands.insert(id, classified);
+        }
+    }
+
     pub(crate) fn observe_native_line(
         &mut self,
         source: &SourceLocation,
@@ -70,8 +85,14 @@ impl CodexActivityExtractor {
         ordinal: usize,
         fallback_timestamp: DateTime<Utc>,
     ) {
-        let Some(parsed) = parse_native_line(source, path, line, ordinal, fallback_timestamp)
-        else {
+        let Some(parsed) = parse_native_line(
+            source,
+            path,
+            line,
+            ordinal,
+            fallback_timestamp,
+            &mut self.pending_native_commands,
+        ) else {
             return;
         };
         self.saw_native = true;
@@ -94,17 +115,24 @@ impl CodexActivityExtractor {
             Some(LegacyObserve::Start {
                 call_id,
                 invocation,
+                command,
             }) => {
                 let mut invocation = *invocation;
                 invocation.model = self.current_model.clone();
                 if let Some(call_id) = call_id {
-                    let mut pending = PendingLegacy { invocation };
+                    let mut pending = PendingLegacy {
+                        invocation,
+                        command,
+                    };
                     if let Some(outcome) = self.pending_legacy_outcomes.remove(&call_id) {
                         pending.invocation.outcome = outcome;
                     }
                     self.legacy_by_call.insert(call_id, pending);
                 } else {
-                    self.legacy_unkeyed.push(PendingLegacy { invocation });
+                    self.legacy_unkeyed.push(PendingLegacy {
+                        invocation,
+                        command,
+                    });
                 }
             }
             Some(LegacyObserve::Output { call_id, outcome }) => {
@@ -169,6 +197,12 @@ impl CodexActivityExtractor {
             let mut days = BTreeSet::new();
             for pending in self.legacy_by_call.into_values().chain(self.legacy_unkeyed) {
                 days.insert(activity_day_key(pending.invocation.observed_at));
+                if let Some((classified, is_write)) = pending.command.as_ref() {
+                    push_invocation(
+                        scan,
+                        command_invocation_for_tool(&pending.invocation, classified, *is_write),
+                    );
+                }
                 push_invocation(scan, pending.invocation);
             }
             emit_kind_coverage(
@@ -229,7 +263,8 @@ struct NativeItem {
     id: Option<String>,
     status: Option<String>,
     parsed_cmd: Option<Vec<ParsedCmd>>,
-    command: Option<CommandSpec>,
+    #[serde(default)]
+    command: Option<Value>,
     duration: Option<NativeDuration>,
     server: Option<String>,
     tool: Option<String>,
@@ -241,13 +276,7 @@ struct ParsedCmd {
     #[serde(rename = "type")]
     cmd_type: Option<String>,
     path: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum CommandSpec {
-    Argv(Vec<String>),
-    Line(String),
+    cmd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +297,8 @@ struct LegacyPayload {
     payload_type: Option<String>,
     name: Option<String>,
     call_id: Option<String>,
+    arguments: Option<Value>,
+    input: Option<Value>,
     output: Option<Value>,
 }
 
@@ -275,6 +306,7 @@ enum LegacyObserve {
     Start {
         call_id: Option<String>,
         invocation: Box<statsai_core::ActivityInvocationV1>,
+        command: Option<(String, bool)>,
     },
     Output {
         call_id: String,
@@ -298,6 +330,7 @@ fn parse_native_line(
     line: &str,
     ordinal: usize,
     fallback_timestamp: DateTime<Utc>,
+    pending_commands: &mut HashMap<String, (String, bool)>,
 ) -> Option<Vec<statsai_core::ActivityInvocationV1>> {
     let parsed: NativeLine = serde_json::from_str(line).ok()?;
     if IGNORED_NATIVE_TYPES.contains(&parsed.payload.item.item_type.as_str()) {
@@ -354,8 +387,15 @@ fn parse_native_line(
                 duration_kind,
                 CODEX_NATIVE_EVIDENCE,
             );
-            if let Some((classified, is_write)) =
-                classify_codex_command(parsed.payload.item.command.as_ref())
+            if let Some((classified, is_write)) = classify_native_item_command(&parsed.payload.item)
+                .or_else(|| {
+                    parsed
+                        .payload
+                        .item
+                        .id
+                        .as_ref()
+                        .and_then(|id| pending_commands.remove(id))
+                })
             {
                 invocations.push(command_invocation_for_tool(&tool, &classified, is_write));
             }
@@ -573,16 +613,36 @@ fn parse_native_line(
     (!invocations.is_empty()).then_some(invocations)
 }
 
-fn classify_codex_command(command: Option<&CommandSpec>) -> Option<(String, bool)> {
-    match command? {
-        CommandSpec::Argv(argv) if !argv.is_empty() => {
-            Some((classify_shell_argv(argv), shell_argv_is_write(argv)))
+fn classify_native_item_command(item: &NativeItem) -> Option<(String, bool)> {
+    if let Some(command) = item.command.as_ref() {
+        if let Some(classified) = classify_command_payload(command) {
+            return Some(classified);
         }
-        CommandSpec::Line(line) if !line.is_empty() => {
-            Some((classify_shell_command(line), shell_command_is_write(line)))
-        }
-        _ => None,
     }
+    let cmds = item.parsed_cmd.as_deref()?;
+    let script = cmds.iter().find_map(|cmd| {
+        cmd.cmd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })?;
+    Some((
+        classify_shell_command(script),
+        shell_command_is_write(script),
+    ))
+}
+
+fn classify_legacy_shell_command(
+    native_name: &str,
+    arguments: Option<&Value>,
+    input: Option<&Value>,
+) -> Option<(String, bool)> {
+    if canonical_activity_display_name(CODEX_PROVIDER, native_name) != "shell" {
+        return None;
+    }
+    arguments
+        .and_then(classify_command_payload)
+        .or_else(|| input.and_then(classify_command_payload))
 }
 
 fn command_family(cmds: &[ParsedCmd]) -> ActivityFamily {
@@ -665,6 +725,7 @@ fn parse_legacy_line(
                 None,
                 CODEX_LEGACY_EVIDENCE,
             )),
+            command: None,
         });
     }
     let native_name = parsed.payload.name.as_deref().unwrap_or(payload_type);
@@ -701,11 +762,17 @@ fn parse_legacy_line(
                 None,
                 CODEX_LEGACY_EVIDENCE,
             )),
+            command: None,
         });
     }
     let family = family_for_name(
         CODEX_LEGACY_FAMILY_ALIASES,
         parsed.payload.name.as_deref().unwrap_or(payload_type),
+    );
+    let command = classify_legacy_shell_command(
+        native_name,
+        parsed.payload.arguments.as_ref(),
+        parsed.payload.input.as_ref(),
     );
     Some(LegacyObserve::Start {
         call_id: call_id_owned,
@@ -727,6 +794,7 @@ fn parse_legacy_line(
             None,
             CODEX_LEGACY_EVIDENCE,
         )),
+        command,
     })
 }
 

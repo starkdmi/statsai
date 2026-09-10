@@ -8,8 +8,9 @@ use std::time::UNIX_EPOCH;
 pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // Invalidate unchanged-file scan cache entries whenever provider parsing semantics change,
 // so historical sessions get rescanned for runtime, pricing, and project context updates.
-// activity-invocations.v32: model attribution on activity invocations.
-pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v32";
+// activity-invocations.v33: Codex command extraction from parsed_cmd, legacy
+// function_call arguments/input, and item_started CommandExecution.
+pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v33";
 pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v28";
 pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v19";
 pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v22";
