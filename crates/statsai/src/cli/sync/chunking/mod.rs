@@ -12,6 +12,81 @@ mod payloads;
 pub(crate) use budget::*;
 pub(crate) use payloads::*;
 
+/// Indexed `_{kind}_{n}` suffixes the rollup splitter can emit.
+///
+/// The sync cursor stripper iterates this same list. A handwritten copy in
+/// the HTTP client drifted three times (quota, account plans, activity) and
+/// forced `--full` whenever the remote last-batch id used an unrecognized kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpRollupIndexedChunkKind {
+    Sources,
+    Accounts,
+    Assignments,
+    Subscriptions,
+    AccountPlans,
+    AccountEvidence,
+    TaskBuckets,
+    TaskVerifications,
+    CodeChanges,
+    QuotaCycles,
+    ActivityRollups,
+    ActivityCoverage,
+    Snapshot,
+}
+
+impl HttpRollupIndexedChunkKind {
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Sources,
+        Self::Accounts,
+        Self::Assignments,
+        Self::Subscriptions,
+        Self::AccountPlans,
+        Self::AccountEvidence,
+        Self::TaskBuckets,
+        Self::TaskVerifications,
+        Self::CodeChanges,
+        Self::QuotaCycles,
+        Self::ActivityRollups,
+        Self::ActivityCoverage,
+        Self::Snapshot,
+    ];
+
+    pub(crate) const METADATA: &'static [Self] = &[
+        Self::Sources,
+        Self::Accounts,
+        Self::Assignments,
+        Self::Subscriptions,
+        Self::AccountPlans,
+        Self::AccountEvidence,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sources => "sources",
+            Self::Accounts => "accounts",
+            Self::Assignments => "assignments",
+            Self::Subscriptions => "subscriptions",
+            Self::AccountPlans => "account_plans",
+            Self::AccountEvidence => "account_evidence",
+            Self::TaskBuckets => "task_buckets",
+            Self::TaskVerifications => "task_verifications",
+            Self::CodeChanges => "code_changes",
+            Self::QuotaCycles => "quota_cycles",
+            Self::ActivityRollups => "activity_rollups",
+            Self::ActivityCoverage => "activity_coverage",
+            Self::Snapshot => "snapshot",
+        }
+    }
+
+    pub(crate) fn suffix(self, one_based_index: usize) -> String {
+        format!("{}_{}", self.as_str(), one_based_index)
+    }
+}
+
+pub(crate) fn http_rollup_part_chunk_suffix(part: usize, total: usize) -> String {
+    format!("part_{part}_of_{total}")
+}
+
 pub(crate) const HTTP_ROLLUP_SUMMARIES_PER_BATCH: usize = 25;
 
 pub(crate) const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
@@ -19,6 +94,8 @@ pub(crate) const HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH: usize = 20;
 const HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH: usize = 1_000;
 
 const HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH: usize = 100;
+
+pub(crate) const HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH: usize = 500;
 
 pub(crate) const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 
@@ -44,7 +121,7 @@ pub(crate) fn split_http_rollup_sync_batches(batch: &SyncBatch) -> Vec<SyncBatch
         ) {
             let mut snapshot_chunk = empty_http_rollup_chunk(
                 &data_batch,
-                &format!("snapshot_{}", snapshot.part_index + 1),
+                &HttpRollupIndexedChunkKind::Snapshot.suffix(snapshot.part_index as usize + 1),
             );
             snapshot_chunk.authoritative_snapshot = Some(snapshot);
             chunks.push(snapshot_chunk);
@@ -77,6 +154,8 @@ fn split_authoritative_snapshot(
         summary_ids: Vec::new(),
         code_change_metric_ids: Vec::new(),
         quota_cycle_contribution_ids: Vec::new(),
+        activity_rollup_ids: Vec::new(),
+        activity_coverage_ids: Vec::new(),
     };
     let mut parts = Vec::new();
     let mut current = empty_part();
@@ -113,6 +192,8 @@ fn split_authoritative_snapshot(
         snapshot.quota_cycle_contribution_ids,
         quota_cycle_contribution_ids
     );
+    append_ids!(snapshot.activity_rollup_ids, activity_rollup_ids);
+    append_ids!(snapshot.activity_coverage_ids, activity_coverage_ids);
     if authoritative_snapshot_id_count(&current) > 0 || parts.is_empty() {
         parts.push(current);
     }
@@ -134,6 +215,8 @@ fn authoritative_snapshot_id_count(snapshot: &SyncAuthoritativeSnapshot) -> usiz
         + snapshot.summary_ids.len()
         + snapshot.code_change_metric_ids.len()
         + snapshot.quota_cycle_contribution_ids.len()
+        + snapshot.activity_rollup_ids.len()
+        + snapshot.activity_coverage_ids.len()
 }
 
 pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<SyncBatch> {
@@ -147,11 +230,15 @@ pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch)
     let has_rollup_payload = metadata_count > 0
         || !batch.summaries.is_empty()
         || !batch.code_change_metrics.is_empty()
-        || !batch.quota_cycle_contributions.is_empty();
+        || !batch.quota_cycle_contributions.is_empty()
+        || !batch.activity_rollups.is_empty()
+        || !batch.activity_coverage.is_empty();
     if !has_task_payload
         && batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
         && batch.code_change_metrics.len() <= HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH
         && batch.quota_cycle_contributions.len() <= HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH
+        && batch.activity_rollups.len() <= HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH
+        && batch.activity_coverage.len() <= HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH
         && metadata_count <= HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH
     {
         return fit_http_rollup_batches_to_d1_budget(vec![batch.clone()]);
@@ -173,11 +260,20 @@ pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch)
         .quota_cycle_contributions
         .len()
         .div_ceil(HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH);
+    let activity_chunks = batch
+        .activity_rollups
+        .len()
+        .div_ceil(HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH)
+        + batch
+            .activity_coverage
+            .len()
+            .div_ceil(HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH);
     let mut chunks = Vec::with_capacity(
         total_chunks
             + metadata_chunks
             + code_change_chunks
             + quota_cycle_chunks
+            + activity_chunks
             + task_chunks.len(),
     );
 
@@ -193,6 +289,10 @@ pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch)
     chunks.extend(split_http_quota_cycle_contribution_chunks(
         batch,
         HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH,
+    ));
+    chunks.extend(split_http_activity_chunks(
+        batch,
+        HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH,
     ));
     chunks.extend(split_http_rollup_summary_chunks(
         batch,
@@ -217,6 +317,8 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
     chunk.task_verifications.clear();
     chunk.code_change_metrics.clear();
     chunk.quota_cycle_contributions.clear();
+    chunk.activity_rollups.clear();
+    chunk.activity_coverage.clear();
     chunk.authoritative_snapshot = None;
     chunk
 }

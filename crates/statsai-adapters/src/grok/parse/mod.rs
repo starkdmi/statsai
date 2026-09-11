@@ -89,6 +89,17 @@ pub(crate) fn parse_grok_summary(
         .map(|path| grok_session_stats(path, &mut scan.diagnostics.invalid_rows))
         .transpose()?
         .unwrap_or_default();
+    if let Some(session_dir) = session_dir {
+        let activity_started_at = std::time::Instant::now();
+        crate::activity::extract_grok_session_activity(
+            scan,
+            source,
+            session_dir,
+            &options.device_id,
+            observed_at,
+        )?;
+        scan.diagnostics.activity_extract_ms += activity_started_at.elapsed().as_millis() as u64;
+    }
     let inference_stats = unified_session_stats
         .get(session_id.as_str())
         .cloned()

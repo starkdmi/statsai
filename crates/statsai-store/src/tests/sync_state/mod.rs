@@ -144,6 +144,8 @@ fn record_rollup_chunk_sync_success_retries_busy_database() {
         subscriptions: Vec::new(),
         account_plan_observations: Vec::new(),
         account_evidence_summaries: Vec::new(),
+        activity_rollups: Vec::new(),
+        activity_coverage: Vec::new(),
         events: Vec::new(),
         summaries: summaries.clone(),
         task_buckets: Vec::new(),
@@ -397,6 +399,7 @@ fn sync_preferences_round_trip_and_normalize_tasks() {
         .set_sync_preferences(SyncPreferences {
             include_projects: false,
             include_tasks: true,
+            include_activity: false,
         })
         .expect("save sync preferences");
 
@@ -405,6 +408,7 @@ fn sync_preferences_round_trip_and_normalize_tasks() {
         SyncPreferences {
             include_projects: true,
             include_tasks: true,
+            include_activity: false,
         }
     );
 }

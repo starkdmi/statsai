@@ -93,6 +93,8 @@ fn sync_ack_v1_omits_zero_task_counters() {
             quota_cycle_contributions: 0,
             account_plan_observations: 0,
             account_evidence_summaries: 0,
+            activity_rollups: 0,
+            activity_coverage: 0,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -107,6 +109,8 @@ fn sync_ack_v1_omits_zero_task_counters() {
             quota_cycle_contributions: 0,
             account_plan_observations: 0,
             account_evidence_summaries: 0,
+            activity_rollups: 0,
+            activity_coverage: 0,
         },
         rejected: Vec::new(),
     };
@@ -139,6 +143,8 @@ fn sync_ack_v3_keeps_nonzero_task_and_code_change_counters() {
             quota_cycle_contributions: 0,
             account_plan_observations: 0,
             account_evidence_summaries: 0,
+            activity_rollups: 0,
+            activity_coverage: 0,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -153,6 +159,8 @@ fn sync_ack_v3_keeps_nonzero_task_and_code_change_counters() {
             quota_cycle_contributions: 0,
             account_plan_observations: 0,
             account_evidence_summaries: 0,
+            activity_rollups: 0,
+            activity_coverage: 0,
         },
         rejected: Vec::new(),
     };
@@ -185,6 +193,8 @@ fn sync_ack_v4_keeps_nonzero_quota_cycle_counters() {
             quota_cycle_contributions: 4,
             account_plan_observations: 0,
             account_evidence_summaries: 0,
+            activity_rollups: 0,
+            activity_coverage: 0,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -199,6 +209,8 @@ fn sync_ack_v4_keeps_nonzero_quota_cycle_counters() {
             quota_cycle_contributions: 0,
             account_plan_observations: 0,
             account_evidence_summaries: 0,
+            activity_rollups: 0,
+            activity_coverage: 0,
         },
         rejected: Vec::new(),
     };

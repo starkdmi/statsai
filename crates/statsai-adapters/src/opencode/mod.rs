@@ -1,5 +1,6 @@
 use crate::*;
 use anyhow::Result;
+use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -434,6 +435,35 @@ pub(crate) fn scan_opencode_source(
     }
     scan.diagnostics.files_scanned = 1;
     scan.diagnostics.accepted_events = scan.events.len() as u64;
+    let mcp_config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(statsai_core::home_dir)
+        .map(|root| {
+            if std::env::var_os("XDG_CONFIG_HOME").is_some() {
+                root.join("opencode").join("opencode.json")
+            } else {
+                root.join(".config").join("opencode").join("opencode.json")
+            }
+        });
+    let mcp_servers = mcp_config
+        .as_ref()
+        .map(|path| crate::activity::load_opencode_mcp_servers(path))
+        .unwrap_or_default();
+    let fallback_timestamp = file_modified_timestamp(&db_path).unwrap_or_else(Utc::now);
+    let activity_started_at = std::time::Instant::now();
+    let cursor = crate::activity::extract_opencode_activity(
+        &mut scan,
+        &connection,
+        source,
+        &db_path,
+        &options.device_id,
+        options.activity_scan_cursor,
+        &mcp_servers,
+        fallback_timestamp,
+    )?;
+    scan.diagnostics.activity_extract_ms += activity_started_at.elapsed().as_millis() as u64;
+    scan.activity_scan_cursor = Some(cursor.last_time_updated);
+    scan.diagnostics.activity_part_rows = cursor.rows_returned;
     Ok(scan)
 }
 

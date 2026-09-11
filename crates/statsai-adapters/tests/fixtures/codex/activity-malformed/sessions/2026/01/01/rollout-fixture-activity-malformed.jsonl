@@ -1,0 +1,3 @@
+{"timestamp":"2026-01-01T00:00:01.000Z","type":"session_meta","payload":{"id":"id_fixture_activity_malformed","timestamp":"2026-01-01T00:00:01.000Z"}}
+{not-json
+{"timestamp":"2026-01-01T00:00:02.000Z","type":"event_msg","payload":{"type":"item_completed","thread_id":"thread_fixture_malformed","item":{"type":"CommandExecution","id":"item_fixture_malformed","status":"completed","parsed_cmd":[{"type":"unknown","cmd":"rg"}]}}}

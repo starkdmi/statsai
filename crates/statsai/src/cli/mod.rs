@@ -1,4 +1,5 @@
 pub(super) mod account;
+pub(super) mod activity;
 pub(super) mod args;
 pub(super) mod auth;
 pub(super) mod conversation;
@@ -19,6 +20,7 @@ pub(super) mod sync;
 pub(super) mod task;
 
 pub(crate) use account::*;
+pub(crate) use activity::*;
 pub(crate) use args::*;
 pub(crate) use auth::*;
 pub(crate) use conversation::*;

@@ -16,6 +16,13 @@ authoritative snapshot IDs part of the versioned contract. Versions 1–4 never
 treat those collections or their snapshot IDs as authoritative. Because a v4
 acknowledgement carries no counter for them, a collector must not place them in
 a v4 batch even though a v4 backend would ignore the unknown keys.
+`sync_batch.v6` adds daily tool/MCP/skill activity rollups and per-source
+coverage rows, plus their acknowledgement counts and authoritative snapshot
+IDs. Versions 1–5 never treat absent activity fields as authoritative. Activity
+names leave the device only when the collector preference `include_activity` is
+on; turning it off sends an authoritative empty activity ID set so the backend
+prunes hosted names. Invocation IDs, arguments, outputs, commands, prompts, and
+file paths never appear in a v6 payload.
 The collector owns local scanning, normalization, idempotent local storage, and
 privacy scrubbing. The backend owns authentication, validation, deduplication,
 rollups, and user-facing queries. The production path sends sanitized batches to
@@ -264,11 +271,14 @@ device ownership or reconcile deletions. It rejects batches carrying
 `quota_cycle_contributions` for the same reason: a local store keeps quota
 observations and derives its own cycles from them, so acknowledging another
 device's cycles would tell the sender they had been stored when they had not.
+It likewise rejects `activity_rollups` and `activity_coverage`: hosted activity
+is a Cloudflare-only collection, and the loopback daemon has nowhere to store
+another device's names.
 `/api/sync/batches` is the production contract. A compatible backend should:
 
 - require an authenticated device access token
 - accept `Authorization: Bearer <device_access_token>` from stored auth, `--auth-token`, or `STATSAI_SYNC_TOKEN`
-- validate the request body against `sync_batch.v1` through `sync_batch.v5`
+- validate the request body against `sync_batch.v1` through `sync_batch.v6`
 - reject unsupported `schema_version` values
 - deduplicate sources, accounts, source-account assignments, subscriptions, summaries, and equivalent account-plan evidence when server-side deduplication is needed
 - treat collector IDs as stable client-provided IDs, not database primary keys exposed to users
@@ -278,9 +288,9 @@ device's cycles would tell the sender they had been stored when they had not.
   as the complete set of metadata and summary IDs owned by the authenticated
   device; v3 fragments also carry code-change metric IDs; v4 fragments also
   carry quota-cycle contribution IDs; v5 fragments also carry account-plan
-  observation and evidence-summary IDs; each fragment carries
-  zero-based `part_index` and a common
-  `part_count`, with at most 200 IDs across its ID arrays
+  observation and evidence-summary IDs; v6 fragments also carry activity
+  rollup and coverage IDs; each fragment carries zero-based `part_index` and a
+  common `part_count`, with at most 200 IDs across its ID arrays
 - stage snapshot ownership without pruning until the final in-order fragment;
   then apply ownership and deletion reconciliation atomically, pruning a hosted
   entity only when no device still owns its canonical row
@@ -302,9 +312,16 @@ or is acknowledged as a duplicate. Statuses are read without requiring a JSON
 body, since these failures come from the infrastructure in front of the worker
 and answer in plain text.
 
-HTTP 429 is deliberately not resent on that schedule: it carries the endpoint's
+HTTP 429 is not resent on that doubling schedule: it carries the endpoint's
 own `Retry-After`, and retrying sooner would work against the limit it asked
-for. Any other 4xx is a decision that repeating cannot change, so it fails the
+for. The sender reads `retryAfterSeconds` from the JSON body, or a
+`Retry-After: <seconds>` token echoed from the header on a non-JSON body,
+sleeps for that delay (clamped to 1–120 seconds), and resends the identical
+chunk, three times before the run gives up. A 429 with no delay advertised
+still fails the run immediately. Batch *count* does not trip this limit;
+throughput does. Small, fast batches on a new device are more likely to fill
+a 30-request rolling minute than a large device whose payloads pace themselves.
+Any other 4xx is a decision that repeating cannot change, so it fails the
 run immediately.
 
 ## Response Shapes
@@ -341,11 +358,14 @@ run immediately.
 `quota_cycle_contributions` counter.
 `sync_batch.v5` returns `sync_ack.v5`, which additionally adds the
 `account_plan_observations` and `account_evidence_summaries` counters.
+`sync_batch.v6` returns `sync_ack.v6`, which additionally adds the
+`activity_rollups` and `activity_coverage` counters.
 Collectors require the acknowledgement version to match the submitted batch
 version exactly; a v1 acknowledgement cannot successfully acknowledge a v2
 batch, a v2 acknowledgement cannot acknowledge a v3 batch, a v3
-acknowledgement cannot acknowledge a v4 batch, and a v4 acknowledgement cannot
-acknowledge a v5 batch.
+acknowledgement cannot acknowledge a v4 batch, a v4 acknowledgement cannot
+acknowledge a v5 batch, and a v5 acknowledgement cannot acknowledge a v6
+batch.
 
 The current loopback daemon returns this shape and reports duplicate events
 when the existing store already has the semantic event. Source, account,
@@ -430,7 +450,7 @@ snapshot are retained through their active ownership mapping; omitted unowned
 rows are pruned. Legacy rows from other devices, and canonical rows still owned
 by any device, are preserved.
 
-The HTTP sink parses `sync_ack.v1` through `sync_ack.v5` before
+The HTTP sink parses `sync_ack.v1` through `sync_ack.v6` before
 updating local state. File and stdout sinks update state after their local write
 succeeds.
 
@@ -468,7 +488,8 @@ summary rollups plus metadata, along with hosted task snapshots and hosted task
 verification actions for `sync_batch.v2` and later, plus code-change
 metrics for `sync_batch.v3` and later, plus quota-cycle contributions for
 `sync_batch.v4` and later, plus privacy-safe account-plan evidence for
-`sync_batch.v5`. The collector now prepares those
+`sync_batch.v5`, plus opt-in activity rollups and coverage for
+`sync_batch.v6`. The collector now prepares those
 daily rollups before HTTP sync, so a normal Cloudflare sync can populate the
 dashboard without shipping raw events. Repeated batches are idempotent by
 stable IDs.

@@ -39,6 +39,7 @@ pub(crate) fn parse_claude_file(
     let fallback_project = claude_project_context_for_file(session_projects, projects, path);
     let mut project_cache = ProjectContextCache::new();
     let mut current_reasoning = ModelReasoningState::default();
+    let mut activity = crate::activity::ClaudeActivityExtractor::default();
 
     let mut line_bytes = Vec::new();
     let mut index = 0usize;
@@ -67,6 +68,10 @@ pub(crate) fn parse_claude_file(
             ctx.scan.diagnostics.invalid_rows += 1;
             continue;
         };
+        let activity_started_at = std::time::Instant::now();
+        activity.observe_value(ctx.source, path, &value, fallback_timestamp);
+        ctx.scan.diagnostics.activity_extract_ms +=
+            activity_started_at.elapsed().as_millis() as u64;
         let reasoning = claude_reasoning_state_from_value(&value);
         if reasoning.raw.is_some() {
             current_reasoning = reasoning;
@@ -149,6 +154,15 @@ pub(crate) fn parse_claude_file(
         );
         push_deduped(ctx.scan, ctx.seen, event, duplicate_selection);
     }
+
+    let activity_started_at = std::time::Instant::now();
+    activity.finish(
+        ctx.scan,
+        &ctx.options.device_id,
+        ctx.source,
+        fallback_timestamp,
+    );
+    ctx.scan.diagnostics.activity_extract_ms += activity_started_at.elapsed().as_millis() as u64;
 
     Ok(())
 }

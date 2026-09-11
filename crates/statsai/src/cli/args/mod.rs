@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 mod account;
+mod activity;
 mod quota;
 mod report;
 mod scan;
@@ -13,6 +14,7 @@ mod sync;
 mod task;
 
 pub(crate) use account::*;
+pub(crate) use activity::*;
 pub(crate) use quota::*;
 pub(crate) use report::*;
 pub(crate) use scan::*;
@@ -60,6 +62,8 @@ pub(crate) enum Command {
     Conversation(ConversationCommand),
     #[command(about = "Inspect reconstructed provider quota history")]
     Quota(QuotaCommand),
+    #[command(about = "Inspect observed tool, MCP, and skill activity")]
+    Activity(ActivityCommand),
     #[command(about = "Build and inspect the local privacy-filtered dataset")]
     Privacy(statsai::privacy_cli::PrivacyCommand),
     #[command(about = "Export a sync batch to a sink")]
@@ -268,7 +272,7 @@ pub(crate) enum StoreAdminSubcommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SchemaSubcommand {
-    #[command(about = "Print the sync_batch.v4 JSON Schema")]
+    #[command(about = "Print the sync_batch.v6 JSON Schema")]
     SyncBatch,
     #[command(about = "Print the quota_window_sync_projection.v1 JSON Schema")]
     QuotaWindowProjection,

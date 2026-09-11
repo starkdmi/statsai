@@ -98,6 +98,10 @@ pub(crate) fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     let code_change_metric_queries = usize::from(!batch.code_change_metrics.is_empty()) * 2;
     let quota_cycle_contribution_queries =
         usize::from(!batch.quota_cycle_contributions.is_empty()) * 2;
+    // Activity collections upsert via one json_each statement plus one
+    // ownership write, matching quota-cycle batching.
+    let activity_queries = usize::from(!batch.activity_rollups.is_empty()) * 2
+        + usize::from(!batch.activity_coverage.is_empty()) * 2;
     let code_change_owner_metadata_refresh_queries = usize::from(
         batch.schema_version == SYNC_BATCH_SCHEMA_VERSION
             && batch
@@ -122,6 +126,7 @@ pub(crate) fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
         + dashboard_snapshot_queries
         + code_change_metric_queries
         + quota_cycle_contribution_queries
+        + activity_queries
         + code_change_owner_metadata_refresh_queries
         + estimate_http_rollup_task_queries(batch)
         + final_sync_bookkeeping_queries

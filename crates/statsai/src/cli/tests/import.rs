@@ -768,6 +768,8 @@ fn cursor_snapshot_dedupe_reports_the_totals_the_store_will_keep() {
         device_id: "device".to_string(),
         collect_tasks: false,
         selected_cache_keys: None,
+        activity_scan_cursor: None,
+        activity_full_reconcile: false,
     };
     let mut parsed = Vec::new();
     for name in ["snapshots/export-early.csv", "snapshots/export-late.csv"] {

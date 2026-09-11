@@ -1,6 +1,36 @@
 use super::*;
 
 pub(crate) fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<SyncBatch> {
+    if (!batch.activity_rollups.is_empty() || !batch.activity_coverage.is_empty())
+        && has_non_activity_payload(batch)
+    {
+        let mut without_activity = batch.clone();
+        without_activity.activity_rollups.clear();
+        without_activity.activity_coverage.clear();
+        let mut chunks = split_http_activity_chunks(
+            batch,
+            batch
+                .activity_rollups
+                .len()
+                .max(batch.activity_coverage.len())
+                .max(1),
+        );
+        chunks.extend(split_http_rollup_sync_batch_after_budget_error(
+            &without_activity,
+        ));
+        return chunks;
+    }
+    if batch.activity_rollups.len() > 1 || batch.activity_coverage.len() > 1 {
+        return split_http_activity_chunks(
+            batch,
+            batch
+                .activity_rollups
+                .len()
+                .max(batch.activity_coverage.len())
+                .div_ceil(2)
+                .max(1),
+        );
+    }
     if !batch.quota_cycle_contributions.is_empty() && has_non_quota_cycle_payload(batch) {
         let mut without_quota = batch.clone();
         without_quota.quota_cycle_contributions.clear();
@@ -111,6 +141,8 @@ pub(crate) fn has_non_code_change_payload(batch: &SyncBatch) -> bool {
         || !batch.task_buckets.is_empty()
         || !batch.task_verifications.is_empty()
         || !batch.quota_cycle_contributions.is_empty()
+        || !batch.activity_rollups.is_empty()
+        || !batch.activity_coverage.is_empty()
 }
 
 pub(crate) fn has_non_quota_cycle_payload(batch: &SyncBatch) -> bool {
@@ -120,6 +152,18 @@ pub(crate) fn has_non_quota_cycle_payload(batch: &SyncBatch) -> bool {
         || !batch.task_buckets.is_empty()
         || !batch.task_verifications.is_empty()
         || !batch.code_change_metrics.is_empty()
+        || !batch.activity_rollups.is_empty()
+        || !batch.activity_coverage.is_empty()
+}
+
+pub(crate) fn has_non_activity_payload(batch: &SyncBatch) -> bool {
+    http_rollup_metadata_count(batch) > 0
+        || !batch.events.is_empty()
+        || !batch.summaries.is_empty()
+        || !batch.task_buckets.is_empty()
+        || !batch.task_verifications.is_empty()
+        || !batch.code_change_metrics.is_empty()
+        || !batch.quota_cycle_contributions.is_empty()
 }
 
 /// Records the backend writes one statement per row for.
@@ -153,8 +197,10 @@ pub(crate) fn split_http_rollup_task_chunks(
             .chunks(task_bucket_chunk_size)
             .enumerate()
             .map(|(index, buckets)| {
-                let mut chunk =
-                    empty_http_rollup_chunk(batch, &format!("task_buckets_{}", index + 1));
+                let mut chunk = empty_http_rollup_chunk(
+                    batch,
+                    &HttpRollupIndexedChunkKind::TaskBuckets.suffix(index + 1),
+                );
                 chunk.task_buckets = buckets.to_vec();
                 chunk
             }),
@@ -165,8 +211,10 @@ pub(crate) fn split_http_rollup_task_chunks(
             .chunks(task_verification_chunk_size)
             .enumerate()
             .map(|(index, verifications)| {
-                let mut chunk =
-                    empty_http_rollup_chunk(batch, &format!("task_verifications_{}", index + 1));
+                let mut chunk = empty_http_rollup_chunk(
+                    batch,
+                    &HttpRollupIndexedChunkKind::TaskVerifications.suffix(index + 1),
+                );
                 chunk.task_verifications = verifications.to_vec();
                 chunk
             }),
@@ -183,7 +231,10 @@ pub(crate) fn split_http_code_change_metric_chunks(
         .chunks(chunk_size.max(1))
         .enumerate()
         .map(|(index, metrics)| {
-            let mut chunk = empty_http_rollup_chunk(batch, &format!("code_changes_{}", index + 1));
+            let mut chunk = empty_http_rollup_chunk(
+                batch,
+                &HttpRollupIndexedChunkKind::CodeChanges.suffix(index + 1),
+            );
             chunk.code_change_metrics = metrics.to_vec();
             chunk
         })
@@ -199,11 +250,44 @@ pub(crate) fn split_http_quota_cycle_contribution_chunks(
         .chunks(chunk_size.max(1))
         .enumerate()
         .map(|(index, contributions)| {
-            let mut chunk = empty_http_rollup_chunk(batch, &format!("quota_cycles_{}", index + 1));
+            let mut chunk = empty_http_rollup_chunk(
+                batch,
+                &HttpRollupIndexedChunkKind::QuotaCycles.suffix(index + 1),
+            );
             chunk.quota_cycle_contributions = contributions.to_vec();
             chunk
         })
         .collect()
+}
+
+pub(crate) fn split_http_activity_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec<SyncBatch> {
+    let chunk_size = chunk_size.max(1);
+    let mut chunks = Vec::new();
+    chunks.extend(
+        batch
+            .activity_rollups
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(index, rollups)| {
+                let mut chunk = empty_http_rollup_chunk(
+                    batch,
+                    &HttpRollupIndexedChunkKind::ActivityRollups.suffix(index + 1),
+                );
+                chunk.activity_rollups = rollups.to_vec();
+                chunk
+            }),
+    );
+    chunks.extend(batch.activity_coverage.chunks(chunk_size).enumerate().map(
+        |(index, coverage)| {
+            let mut chunk = empty_http_rollup_chunk(
+                batch,
+                &HttpRollupIndexedChunkKind::ActivityCoverage.suffix(index + 1),
+            );
+            chunk.activity_coverage = coverage.to_vec();
+            chunk
+        },
+    ));
+    chunks
 }
 
 pub(crate) fn split_http_rollup_metadata_chunks(
@@ -211,107 +295,88 @@ pub(crate) fn split_http_rollup_metadata_chunks(
     chunk_size: usize,
 ) -> Vec<SyncBatch> {
     let mut chunks = Vec::new();
-    chunks.extend(split_http_rollup_single_metadata_kind(
-        batch, "sources", chunk_size,
-    ));
-    chunks.extend(split_http_rollup_single_metadata_kind(
-        batch, "accounts", chunk_size,
-    ));
-    chunks.extend(split_http_rollup_single_metadata_kind(
-        batch,
-        "assignments",
-        chunk_size,
-    ));
-    chunks.extend(split_http_rollup_single_metadata_kind(
-        batch,
-        "subscriptions",
-        chunk_size,
-    ));
-    chunks.extend(split_http_rollup_single_metadata_kind(
-        batch,
-        "account_plans",
-        chunk_size,
-    ));
-    chunks.extend(split_http_rollup_single_metadata_kind(
-        batch,
-        "account_evidence",
-        chunk_size,
-    ));
+    for kind in HttpRollupIndexedChunkKind::METADATA {
+        chunks.extend(split_http_rollup_single_metadata_kind(
+            batch, *kind, chunk_size,
+        ));
+    }
     chunks
 }
 
 pub(crate) fn split_http_rollup_single_metadata_kind(
     batch: &SyncBatch,
-    kind: &str,
+    kind: HttpRollupIndexedChunkKind,
     chunk_size: usize,
 ) -> Vec<SyncBatch> {
     let chunk_size = chunk_size.max(1);
     match kind {
-        "sources" => batch
+        HttpRollupIndexedChunkKind::Sources => batch
             .sources
             .chunks(chunk_size)
             .enumerate()
             .map(|(index, records)| {
-                let mut chunk = empty_http_rollup_chunk(batch, &format!("sources_{}", index + 1));
+                let mut chunk = empty_http_rollup_chunk(batch, &kind.suffix(index + 1));
                 chunk.sources = records.to_vec();
                 chunk
             })
             .collect(),
-        "accounts" => batch
+        HttpRollupIndexedChunkKind::Accounts => batch
             .accounts
             .chunks(chunk_size)
             .enumerate()
             .map(|(index, records)| {
-                let mut chunk = empty_http_rollup_chunk(batch, &format!("accounts_{}", index + 1));
+                let mut chunk = empty_http_rollup_chunk(batch, &kind.suffix(index + 1));
                 chunk.accounts = records.to_vec();
                 chunk
             })
             .collect(),
-        "assignments" => batch
+        HttpRollupIndexedChunkKind::Assignments => batch
             .source_account_assignments
             .chunks(chunk_size)
             .enumerate()
             .map(|(index, records)| {
-                let mut chunk =
-                    empty_http_rollup_chunk(batch, &format!("assignments_{}", index + 1));
+                let mut chunk = empty_http_rollup_chunk(batch, &kind.suffix(index + 1));
                 chunk.source_account_assignments = records.to_vec();
                 chunk
             })
             .collect(),
-        "subscriptions" => batch
+        HttpRollupIndexedChunkKind::Subscriptions => batch
             .subscriptions
             .chunks(chunk_size)
             .enumerate()
             .map(|(index, records)| {
-                let mut chunk =
-                    empty_http_rollup_chunk(batch, &format!("subscriptions_{}", index + 1));
+                let mut chunk = empty_http_rollup_chunk(batch, &kind.suffix(index + 1));
                 chunk.subscriptions = records.to_vec();
                 chunk
             })
             .collect(),
-        "account_plans" => batch
+        HttpRollupIndexedChunkKind::AccountPlans => batch
             .account_plan_observations
             .chunks(chunk_size)
             .enumerate()
             .map(|(index, records)| {
-                let mut chunk =
-                    empty_http_rollup_chunk(batch, &format!("account_plans_{}", index + 1));
+                let mut chunk = empty_http_rollup_chunk(batch, &kind.suffix(index + 1));
                 chunk.account_plan_observations = records.to_vec();
                 chunk
             })
             .collect(),
-        "account_evidence" => batch
+        HttpRollupIndexedChunkKind::AccountEvidence => batch
             .account_evidence_summaries
             .chunks(chunk_size)
             .enumerate()
             .map(|(index, records)| {
-                let mut chunk =
-                    empty_http_rollup_chunk(batch, &format!("account_evidence_{}", index + 1));
+                let mut chunk = empty_http_rollup_chunk(batch, &kind.suffix(index + 1));
                 chunk.account_evidence_summaries = records.to_vec();
                 chunk
             })
             .collect(),
-        _ => Vec::new(),
+        HttpRollupIndexedChunkKind::TaskBuckets
+        | HttpRollupIndexedChunkKind::TaskVerifications
+        | HttpRollupIndexedChunkKind::CodeChanges
+        | HttpRollupIndexedChunkKind::QuotaCycles
+        | HttpRollupIndexedChunkKind::ActivityRollups
+        | HttpRollupIndexedChunkKind::ActivityCoverage
+        | HttpRollupIndexedChunkKind::Snapshot => Vec::new(),
     }
 }
 
@@ -327,7 +392,11 @@ pub(crate) fn split_http_rollup_summary_chunks(
         .enumerate()
         .map(|(index, summaries)| {
             let mut chunk = batch.clone();
-            chunk.batch_id = format!("{}_part_{}_of_{}", batch.batch_id, index + 1, total_chunks);
+            chunk.batch_id = format!(
+                "{}_{}",
+                batch.batch_id,
+                http_rollup_part_chunk_suffix(index + 1, total_chunks)
+            );
             chunk.sources.clear();
             chunk.accounts.clear();
             chunk.source_account_assignments.clear();
@@ -340,6 +409,8 @@ pub(crate) fn split_http_rollup_summary_chunks(
             chunk.task_verifications.clear();
             chunk.code_change_metrics.clear();
             chunk.quota_cycle_contributions.clear();
+            chunk.activity_rollups.clear();
+            chunk.activity_coverage.clear();
             chunk.authoritative_snapshot = None;
             chunk
         })

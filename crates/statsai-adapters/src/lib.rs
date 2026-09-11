@@ -13,15 +13,16 @@ use statsai_core::{
     provider_account_id_from_identity, summarize_task_text, task_preview_from_prompt, task_span_id,
     task_title_from_prompt, task_title_is_generic, task_title_is_weak_signal,
     task_title_signal_score, title_topic_tokens, AccountEvidenceCheckpointV1, AccountEvidenceKind,
-    AccountIdentityObservationV1, AccountPlanObservationV1, Confidence,
-    ConversationAccountBindingV1, CostAccumulator, CostInfo, EventId, LatencySource,
-    LocationOrigin, ModelInfo, ProjectInfo, ProviderAccountId, QuotaCreditsV1,
-    QuotaObservationRecordV1, QuotaObservationV1, QuotaStatusV1, QuotaUsageLinkKind,
-    QuotaWindowObservationV1, RuntimeInfo, SourceLocation, SummaryMetadata, SummaryMetrics,
-    TaskSpan, UsageCounts, UsageEvent, UsageSummary, ACCOUNT_EVIDENCE_CHECKPOINT_SCHEMA_VERSION,
-    ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION, ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION,
-    CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION, QUOTA_OBSERVATION_SCHEMA_VERSION,
-    QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION,
+    AccountIdentityObservationV1, AccountPlanObservationV1, ActivityCoverageV1,
+    ActivityInvocationV1, Confidence, ConversationAccountBindingV1, CostAccumulator, CostInfo,
+    EventId, LatencySource, LocationOrigin, ModelInfo, ProjectInfo, ProviderAccountId,
+    QuotaCreditsV1, QuotaObservationRecordV1, QuotaObservationV1, QuotaStatusV1,
+    QuotaUsageLinkKind, QuotaWindowObservationV1, RuntimeInfo, SourceLocation, SummaryMetadata,
+    SummaryMetrics, TaskSpan, UsageCounts, UsageEvent, UsageSummary,
+    ACCOUNT_EVIDENCE_CHECKPOINT_SCHEMA_VERSION, ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION,
+    ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION, CONVERSATION_ACCOUNT_BINDING_SCHEMA_VERSION,
+    QUOTA_OBSERVATION_SCHEMA_VERSION, QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION,
+    TASK_SPAN_SCHEMA_VERSION,
 };
 use statsai_pricing::{estimate_cost_at, normalize_model_name, unknown_cost};
 use std::borrow::Cow;
@@ -32,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
+mod activity;
 mod archive;
 mod cache;
 mod claude;
@@ -110,6 +112,8 @@ pub struct ScanOptions {
     pub device_id: String,
     pub collect_tasks: bool,
     pub selected_cache_keys: Option<HashSet<String>>,
+    pub activity_scan_cursor: Option<i64>,
+    pub activity_full_reconcile: bool,
 }
 
 impl ScanOptions {
@@ -144,6 +148,10 @@ pub struct ScanDiagnostics {
     pub invalid_rows: u64,
     pub timestamp_fallbacks: u64,
     pub model_fallbacks: u64,
+    pub activity_rows: u64,
+    pub activity_unknown_names: u64,
+    pub activity_part_rows: u64,
+    pub activity_extract_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -152,6 +160,9 @@ pub struct AdapterScan {
     pub summaries: Vec<UsageSummary>,
     pub task_spans: Vec<TaskSpan>,
     pub quota_observations: Vec<QuotaObservationRecordV1>,
+    pub activity_invocations: Vec<ActivityInvocationV1>,
+    pub activity_coverage: Vec<ActivityCoverageV1>,
+    pub activity_scan_cursor: Option<i64>,
     pub diagnostics: ScanDiagnostics,
     pub verified_source_state: Option<VerifiedSourceState>,
 }
@@ -538,6 +549,8 @@ pub(crate) mod tests {
             device_id: "device".to_string(),
             collect_tasks: true,
             selected_cache_keys: None,
+            activity_scan_cursor: None,
+            activity_full_reconcile: false,
         }
     }
 
@@ -546,6 +559,8 @@ pub(crate) mod tests {
             device_id: "device".to_string(),
             collect_tasks: false,
             selected_cache_keys: None,
+            activity_scan_cursor: None,
+            activity_full_reconcile: false,
         }
     }
 

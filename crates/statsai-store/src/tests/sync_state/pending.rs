@@ -499,3 +499,250 @@ fn the_strongest_evidence_wins_a_projection_collision() {
         "the stronger evidence must survive the collision"
     );
 }
+
+fn activity_test_source() -> statsai_core::SourceLocation {
+    statsai_core::SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-activity-pending"),
+        LocationOrigin::Configured,
+    )
+}
+
+fn activity_rollup(
+    source: &statsai_core::SourceLocation,
+    rollup_id: &str,
+    calls: u64,
+) -> statsai_core::ActivityRollupV1 {
+    let seen = Utc
+        .with_ymd_and_hms(2026, 1, 1, 9, 0, 0)
+        .single()
+        .expect("timestamp");
+    statsai_core::ActivityRollupV1 {
+        schema_version: statsai_core::ACTIVITY_ROLLUP_SCHEMA_VERSION.to_string(),
+        rollup_id: rollup_id.to_string(),
+        device_id: "device".to_string(),
+        source_id: source.source_id.clone(),
+        provider: "codex".to_string(),
+        provider_account_id: None,
+        day: "2026-01-01".to_string(),
+        kind: statsai_core::ActivityKind::Tool,
+        entity_key: "shell".to_string(),
+        display_name: "shell".to_string(),
+        family: statsai_core::ActivityFamily::Shell,
+        mcp_server: None,
+        mcp_tool: None,
+        plugin: None,
+        skill_catalog: None,
+        model: Some("gpt-5.4".to_string()),
+        calls,
+        succeeded: calls,
+        failed: 0,
+        unknown: 0,
+        duration_samples: calls,
+        duration_sum_ms: calls * 10,
+        duration_max_ms: Some(10),
+        duration_kind: Some(statsai_core::ActivityDurationKind::Reported),
+        first_seen: seen,
+        last_seen: seen,
+        evidence: "codex-native-items".to_string(),
+    }
+}
+
+fn activity_coverage_row(
+    source: &statsai_core::SourceLocation,
+    coverage_id: &str,
+    level: statsai_core::ActivityCoverageLevel,
+) -> statsai_core::ActivityCoverageV1 {
+    statsai_core::ActivityCoverageV1 {
+        schema_version: statsai_core::ACTIVITY_COVERAGE_SCHEMA_VERSION.to_string(),
+        coverage_id: coverage_id.to_string(),
+        device_id: "device".to_string(),
+        source_id: source.source_id.clone(),
+        provider: "codex".to_string(),
+        day: "2026-01-01".to_string(),
+        day_end: "2026-01-01".to_string(),
+        kind: statsai_core::ActivityKind::Tool,
+        level,
+        evidence: "codex-native-items".to_string(),
+        parser_revision: statsai_core::ACTIVITY_PARSER_REVISION.to_string(),
+    }
+}
+
+/// The bug this replaced: `dirty` is one global flag, so acknowledging a rollup
+/// at the first target hid it from every other target permanently.
+#[test]
+fn activity_rollups_stay_pending_for_targets_that_never_acknowledged_them() {
+    let store = Store::in_memory().expect("store");
+    let source = activity_test_source();
+    let first = "http://127.0.0.1:8787/api/sync/batches";
+    let second = "https://dev-api.example.com/api/sync/batches";
+    let rollups = vec![activity_rollup(&source, "rollup-a", 3)];
+
+    assert_eq!(
+        store
+            .pending_activity_rollups_for_sync("http", first, &rollups)
+            .expect("pending first")
+            .len(),
+        1
+    );
+
+    store
+        .record_activity_rollups_synced("http", first, &rollups)
+        .expect("record first");
+
+    assert!(store
+        .pending_activity_rollups_for_sync("http", first, &rollups)
+        .expect("pending first after")
+        .is_empty());
+    assert_eq!(
+        store
+            .pending_activity_rollups_for_sync("http", second, &rollups)
+            .expect("pending second")
+            .len(),
+        1,
+        "a second target must still receive rollups it never acknowledged"
+    );
+}
+
+#[test]
+fn activity_coverage_stays_pending_for_targets_that_never_acknowledged_it() {
+    let store = Store::in_memory().expect("store");
+    let source = activity_test_source();
+    let first = "http://127.0.0.1:8787/api/sync/batches";
+    let second = "https://dev-api.example.com/api/sync/batches";
+    let coverage = vec![activity_coverage_row(
+        &source,
+        "coverage-a",
+        statsai_core::ActivityCoverageLevel::Complete,
+    )];
+
+    store
+        .record_activity_coverage_synced("http", first, &coverage)
+        .expect("record first");
+
+    assert!(store
+        .pending_activity_coverage_for_sync("http", first, &coverage)
+        .expect("pending first after")
+        .is_empty());
+    assert_eq!(
+        store
+            .pending_activity_coverage_for_sync("http", second, &coverage)
+            .expect("pending second")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn activity_rollups_resend_when_the_payload_changed_since_acknowledgement() {
+    let store = Store::in_memory().expect("store");
+    let source = activity_test_source();
+    let target = "https://dev-api.example.com/api/sync/batches";
+    let acknowledged = vec![activity_rollup(&source, "rollup-a", 3)];
+
+    store
+        .record_activity_rollups_synced("http", target, &acknowledged)
+        .expect("record");
+
+    let rescanned = vec![activity_rollup(&source, "rollup-a", 9)];
+    let pending = store
+        .pending_activity_rollups_for_sync("http", target, &rescanned)
+        .expect("pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].calls, 9);
+}
+
+/// An upload that never lands must not consume the row. Acknowledgement is
+/// written only on batch success, so an interrupted send leaves it pending, and
+/// a rescan during the interrupted send is still picked up afterwards.
+#[test]
+fn interrupted_activity_upload_leaves_rollups_pending() {
+    let store = Store::in_memory().expect("store");
+    let source = activity_test_source();
+    let target = "https://dev-api.example.com/api/sync/batches";
+    let in_flight = vec![activity_rollup(&source, "rollup-a", 3)];
+
+    let pending = store
+        .pending_activity_rollups_for_sync("http", target, &in_flight)
+        .expect("pending");
+    assert_eq!(pending.len(), 1, "nothing acknowledged yet");
+
+    // The send fails: no acknowledgement is recorded.
+    let retried = store
+        .pending_activity_rollups_for_sync("http", target, &in_flight)
+        .expect("pending after failure");
+    assert_eq!(retried.len(), 1, "a failed upload must not consume the row");
+
+    // A rescan changes the payload while the older one was in flight; the late
+    // acknowledgement for the older payload must not mask the newer one.
+    store
+        .record_activity_rollups_synced("http", target, &in_flight)
+        .expect("late ack");
+    let rescanned = vec![activity_rollup(&source, "rollup-a", 4)];
+    assert_eq!(
+        store
+            .pending_activity_rollups_for_sync("http", target, &rescanned)
+            .expect("pending after rescan")
+            .len(),
+        1
+    );
+}
+
+/// Disabling activity sends an empty authoritative snapshot, which retires the
+/// target's activity acknowledgements. Re-enabling must therefore backfill
+/// without any local flag being flipped.
+#[test]
+fn disabling_activity_retires_acknowledgements_so_re_enabling_backfills() {
+    let store = Store::in_memory().expect("store");
+    let source = activity_test_source();
+    let target = "https://dev-api.example.com/api/sync/batches";
+    let rollups = vec![activity_rollup(&source, "rollup-a", 3)];
+    let coverage = vec![activity_coverage_row(
+        &source,
+        "coverage-a",
+        statsai_core::ActivityCoverageLevel::Complete,
+    )];
+
+    store
+        .record_activity_rollups_synced("http", target, &rollups)
+        .expect("record rollups");
+    store
+        .record_activity_coverage_synced("http", target, &coverage)
+        .expect("record coverage");
+    assert!(store
+        .pending_activity_rollups_for_sync("http", target, &rollups)
+        .expect("pending")
+        .is_empty());
+
+    // Activity disabled: the snapshot carries no activity ids.
+    let disabled_snapshot = statsai_core::SyncAuthoritativeSnapshot {
+        snapshot_id: "batch-disabled_authoritative".to_string(),
+        part_index: 0,
+        part_count: 1,
+        ..Default::default()
+    };
+    assert!(store
+        .sync_target_has_retired_entities("http", target, &disabled_snapshot)
+        .expect("has retired"));
+    store
+        .reconcile_sync_tracking_to_authoritative_snapshot("http", target, &disabled_snapshot)
+        .expect("reconcile");
+
+    assert_eq!(
+        store
+            .pending_activity_rollups_for_sync("http", target, &rollups)
+            .expect("pending after re-enable")
+            .len(),
+        1,
+        "re-enabling activity must resend rows the remote pruned"
+    );
+    assert_eq!(
+        store
+            .pending_activity_coverage_for_sync("http", target, &coverage)
+            .expect("coverage after re-enable")
+            .len(),
+        1
+    );
+}

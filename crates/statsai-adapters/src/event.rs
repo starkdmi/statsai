@@ -138,6 +138,15 @@ pub(crate) fn merge_adapter_scan(
     target
         .quota_observations
         .append(&mut source.quota_observations);
+    target
+        .activity_invocations
+        .append(&mut source.activity_invocations);
+    target
+        .activity_coverage
+        .append(&mut source.activity_coverage);
+    if source.activity_scan_cursor.is_some() {
+        target.activity_scan_cursor = source.activity_scan_cursor;
+    }
     target.diagnostics.files_scanned = target
         .diagnostics
         .files_scanned
@@ -174,6 +183,22 @@ pub(crate) fn merge_adapter_scan(
         .diagnostics
         .model_fallbacks
         .saturating_add(source.diagnostics.model_fallbacks);
+    target.diagnostics.activity_rows = target
+        .diagnostics
+        .activity_rows
+        .saturating_add(source.diagnostics.activity_rows);
+    target.diagnostics.activity_unknown_names = target
+        .diagnostics
+        .activity_unknown_names
+        .saturating_add(source.diagnostics.activity_unknown_names);
+    target.diagnostics.activity_part_rows = target
+        .diagnostics
+        .activity_part_rows
+        .saturating_add(source.diagnostics.activity_part_rows);
+    target.diagnostics.activity_extract_ms = target
+        .diagnostics
+        .activity_extract_ms
+        .saturating_add(source.diagnostics.activity_extract_ms);
 }
 
 pub(crate) struct ProviderEventParts<'a> {

@@ -14,7 +14,7 @@ use super::batch::{record_rollup_sync_chunk_success, record_sync_batch_success};
 use super::chunking::{
     has_non_code_change_payload, has_non_quota_cycle_payload, http_rollup_metadata_count,
     split_http_rollup_sync_batch_after_budget_error, split_http_rollup_sync_batches,
-    HTTP_ROLLUP_SUMMARIES_PER_BATCH,
+    HttpRollupIndexedChunkKind, HTTP_ROLLUP_SUMMARIES_PER_BATCH,
 };
 use super::SyncPayloadMode;
 
@@ -25,6 +25,14 @@ const HTTP_ROLLUP_TRANSIENT_RESEND_ATTEMPTS: u32 = 3;
 
 /// Delay before the first resend. Each further attempt doubles it.
 const HTTP_ROLLUP_TRANSIENT_RESEND_DELAY: StdDuration = StdDuration::from_secs(1);
+
+/// Times a chunk is resent after HTTP 429 before the run gives up. The
+/// endpoint's `Retry-After` is expected to clear a rolling window in one
+/// wait; a handful of honoured delays covers a window that has not yet emptied.
+const HTTP_ROLLUP_RATE_LIMIT_RESEND_ATTEMPTS: u32 = 3;
+
+const HTTP_ROLLUP_RATE_LIMIT_RETRY_AFTER_MIN_SECS: u64 = 1;
+const HTTP_ROLLUP_RATE_LIMIT_RETRY_AFTER_MAX_SECS: u64 = 120;
 
 const HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
@@ -220,6 +228,7 @@ where
     S: Fn(StdDuration),
 {
     let mut resends = 0_u32;
+    let mut rate_limit_resends = 0_u32;
     loop {
         match send_chunk(chunk) {
             Ok(()) => return Ok(()),
@@ -239,6 +248,23 @@ where
                 resends += 1;
                 eprintln!(
                     "http rollup mode: {} did not complete ({error}); resending in {}s ({resends}/{HTTP_ROLLUP_TRANSIENT_RESEND_ATTEMPTS})",
+                    chunk.batch_id,
+                    delay.as_secs(),
+                );
+                sleep(delay);
+            }
+            // 429 is a decision about *when*, not about the batch. Honour the
+            // delay the endpoint advertised rather than inventing one, then
+            // send the identical chunk. Guessing a shorter wait would refill
+            // the window that just rejected us; devices with small, fast
+            // batches are the ones that hit this.
+            Err(error)
+                if rate_limit_resends < HTTP_ROLLUP_RATE_LIMIT_RESEND_ATTEMPTS
+                    && let Some(delay) = http_sync_retry_after(&error) =>
+            {
+                rate_limit_resends += 1;
+                eprintln!(
+                    "http rollup mode: {} rate-limited ({error}); retrying in {}s after Retry-After ({rate_limit_resends}/{HTTP_ROLLUP_RATE_LIMIT_RESEND_ATTEMPTS})",
                     chunk.batch_id,
                     delay.as_secs(),
                 );
@@ -271,13 +297,62 @@ where
 
 /// Failures that leave a batch's fate unknown rather than deciding it.
 ///
-/// Only server-side infrastructure statuses qualify. 429 is deliberately
-/// excluded: the endpoint advertises its own `Retry-After`, which this backoff
-/// cannot see, so resending on our own schedule would work against the limit it
-/// asked for. 501 is excluded because "not implemented" is a decision that
-/// repeating cannot change.
+/// Only server-side infrastructure statuses qualify. 429 is excluded from
+/// this doubling backoff: it carries the endpoint's own `Retry-After`, and
+/// resending on our schedule would work against the limit it asked for. That
+/// delay is honoured separately by `http_sync_retry_after`. 501 is excluded
+/// because "not implemented" is a decision that repeating cannot change.
 pub(crate) fn is_transient_http_sync_error(error: &anyhow::Error) -> bool {
     http_sync_error_status(error).is_some_and(|status| matches!(status, 500 | 502 | 503 | 504))
+}
+
+/// Delay the endpoint asked for on HTTP 429.
+///
+/// Prefers `retryAfterSeconds` in the JSON body, then a `Retry-After: <seconds>`
+/// token in the message (the header echoed after a non-JSON body). A 429 with
+/// neither is still fatal: inventing a wait would refill the window.
+pub(crate) fn http_sync_retry_after(error: &anyhow::Error) -> Option<StdDuration> {
+    if http_sync_error_status(error) != Some(429) {
+        return None;
+    }
+    let seconds = retry_after_seconds_from_json(error)
+        .or_else(|| retry_after_seconds_from_message(&error.to_string()))?;
+    Some(clamp_retry_after(seconds))
+}
+
+fn retry_after_seconds_from_json(error: &anyhow::Error) -> Option<u64> {
+    let parsed = parse_http_sync_error(error)?;
+    json_non_negative_seconds(parsed.body.get("retryAfterSeconds")?)
+}
+
+fn json_non_negative_seconds(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        .or_else(|| {
+            value
+                .as_f64()
+                .and_then(|n| (n.is_finite() && n >= 0.0).then_some(n as u64))
+        })
+}
+
+fn retry_after_seconds_from_message(message: &str) -> Option<u64> {
+    let lower = message.to_ascii_lowercase();
+    let marker = "retry-after:";
+    let start = lower.find(marker)?;
+    let rest = message.get(start + marker.len()..)?.trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn clamp_retry_after(seconds: u64) -> StdDuration {
+    StdDuration::from_secs(seconds.clamp(
+        HTTP_ROLLUP_RATE_LIMIT_RETRY_AFTER_MIN_SECS,
+        HTTP_ROLLUP_RATE_LIMIT_RETRY_AFTER_MAX_SECS,
+    ))
 }
 
 /// Reads the status of a sync endpoint failure whatever its body looks like.
@@ -592,17 +667,9 @@ fn strip_one_http_rollup_batch_suffix(batch_id: &str) -> String {
         }
     }
 
-    for marker in [
-        "_sources_",
-        "_accounts_",
-        "_assignments_",
-        "_subscriptions_",
-        "_task_buckets_",
-        "_task_verifications_",
-        "_code_changes_",
-        "_snapshot_",
-    ] {
-        if let Some(index) = batch_id.rfind(marker) {
+    for kind in HttpRollupIndexedChunkKind::ALL {
+        let marker = format!("_{}_", kind.as_str());
+        if let Some(index) = batch_id.rfind(&marker) {
             let suffix = &batch_id[(index + marker.len())..];
             if suffix.parse::<usize>().is_ok() {
                 return batch_id[..index].to_string();

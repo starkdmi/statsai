@@ -9,6 +9,9 @@ Timestamps, numeric usage/cost/latency fields, public model names, enum values,
 JSON shapes, and SQLite table layouts are retained.
 
 `malformed-record` and `malformed` each add one intentionally invalid JSONL row.
+Hand-authored `activity-*` fixtures cover tool/MCP/skill extraction for Codex,
+Claude Code, OpenCode, and Grok Build. They are synthetic; regenerate them with
+`write_activity_fixtures.py` rather than `build_fixtures.py`.
 `opencode/sqlite-v1` is the supported aggregate-session shape; `sqlite-v2`
 uses the current local session/message/part/todo schemas with sanitized rows.
 

@@ -306,6 +306,8 @@ pub(crate) fn test_task_only_sync_batch(
         subscriptions: Vec::new(),
         account_plan_observations: Vec::new(),
         account_evidence_summaries: Vec::new(),
+        activity_rollups: Vec::new(),
+        activity_coverage: Vec::new(),
         events: Vec::new(),
         summaries: Vec::new(),
         task_buckets,

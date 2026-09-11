@@ -29,6 +29,20 @@
         "$ref": "#/definitions/ProviderAccount"
       }
     },
+    "activity_coverage": {
+      "description": "Per-source coverage for activity kinds, including zero-call days.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ActivityCoverageV1"
+      }
+    },
+    "activity_rollups": {
+      "description": "Daily tool/MCP/skill rollups. Names leave the device only when `include_activity` is on. Invocation IDs, paths, arguments, and outputs are deliberately absent from this type.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ActivityRollupV1"
+      }
+    },
     "authoritative_snapshot": {
       "anyOf": [
         {
@@ -262,6 +276,258 @@
         },
         "semantic_fingerprint": {
           "type": "string"
+        }
+      }
+    },
+    "ActivityCoverageLevel": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "sample-based",
+        "unavailable"
+      ]
+    },
+    "ActivityCoverageV1": {
+      "description": "Per-source coverage for a contiguous run of days at one level.\n\nConsecutive days that share `(source, kind, level, evidence)` collapse to one row so a 256-day legacy stream is not 256 D1 writes. `day` is the inclusive start; `day_end` is the inclusive end (`day` when the run is a single day, or empty on payloads written before ranges existed).",
+      "type": "object",
+      "required": [
+        "coverage_id",
+        "day",
+        "device_id",
+        "evidence",
+        "kind",
+        "level",
+        "parser_revision",
+        "provider",
+        "schema_version",
+        "source_id"
+      ],
+      "properties": {
+        "coverage_id": {
+          "type": "string"
+        },
+        "day": {
+          "type": "string"
+        },
+        "day_end": {
+          "default": "",
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/ActivityKind"
+        },
+        "level": {
+          "$ref": "#/definitions/ActivityCoverageLevel"
+        },
+        "parser_revision": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        }
+      }
+    },
+    "ActivityDurationKind": {
+      "type": "string",
+      "enum": [
+        "reported",
+        "wall-clock"
+      ]
+    },
+    "ActivityFamily": {
+      "type": "string",
+      "enum": [
+        "file-read",
+        "file-write",
+        "code-search",
+        "shell",
+        "web",
+        "browser",
+        "computer",
+        "agent",
+        "planning",
+        "media",
+        "mcp",
+        "other"
+      ]
+    },
+    "ActivityKind": {
+      "type": "string",
+      "enum": [
+        "tool",
+        "mcp",
+        "skill",
+        "command"
+      ]
+    },
+    "ActivityRollupV1": {
+      "description": "Device-local / synced daily rollup. No invocation IDs.",
+      "type": "object",
+      "required": [
+        "calls",
+        "day",
+        "device_id",
+        "display_name",
+        "duration_samples",
+        "duration_sum_ms",
+        "entity_key",
+        "evidence",
+        "failed",
+        "family",
+        "first_seen",
+        "kind",
+        "last_seen",
+        "provider",
+        "rollup_id",
+        "schema_version",
+        "source_id",
+        "succeeded",
+        "unknown"
+      ],
+      "properties": {
+        "calls": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "day": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "duration_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ActivityDurationKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "duration_max_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "duration_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "duration_sum_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "entity_key": {
+          "description": "Local rollup identity. Contains a NUL separator for MCP and plugin skills; omitted on the wire because the backend reconstructs it.",
+          "writeOnly": true,
+          "type": "string"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "failed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "family": {
+          "$ref": "#/definitions/ActivityFamily"
+        },
+        "first_seen": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "kind": {
+          "$ref": "#/definitions/ActivityKind"
+        },
+        "last_seen": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "mcp_server": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mcp_tool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plugin": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rollup_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "skill_catalog": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SkillCatalog"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "succeeded": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unknown": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
         }
       }
     },
@@ -1198,6 +1464,16 @@
         }
       }
     },
+    "SkillCatalog": {
+      "type": "string",
+      "enum": [
+        "user",
+        "project",
+        "plugin",
+        "system",
+        "unknown"
+      ]
+    },
     "SourceAccountAssignment": {
       "type": "object",
       "required": [
@@ -1734,6 +2010,18 @@
           }
         },
         "account_plan_observation_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "activity_coverage_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "activity_rollup_ids": {
           "type": "array",
           "items": {
             "type": "string"

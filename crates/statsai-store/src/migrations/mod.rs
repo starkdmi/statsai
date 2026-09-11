@@ -8,7 +8,7 @@ mod v2;
 pub(crate) use v1::*;
 pub(crate) use v2::*;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 24;
+pub const CURRENT_SCHEMA_VERSION: i64 = 25;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -149,6 +149,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         22 => apply_migration_022(conn),
         23 => apply_migration_023(conn),
         24 => apply_migration_024(conn),
+        25 => apply_migration_025(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -334,9 +335,18 @@ mod tests {
             "quota_observations_payload_hash_idx",
             "quota_observations_usage_event_idx",
             "quota_observations_plan_evidence_idx",
+            "activity_invocations_source_file_idx",
+            "activity_invocations_account_idx",
+            "activity_invocations_observed_idx",
+            "activity_rollups_dirty_idx",
+            "activity_rollups_day_kind_idx",
         ] {
             assert!(index_exists(&conn, index), "missing index {index}");
         }
+        assert!(table_exists(&conn, "activity_invocations"));
+        assert!(table_exists(&conn, "activity_rollups"));
+        assert!(table_exists(&conn, "activity_coverage"));
+        assert!(table_exists(&conn, "activity_scan_cursors"));
     }
 
     /// The scan filters are only fast while SQLite can match them to the indexes
@@ -433,20 +443,20 @@ mod tests {
               applied_at TEXT NOT NULL
             );
             INSERT INTO schema_migrations (version, applied_at)
-            VALUES (25, '2026-08-23T00:00:00Z');
+            VALUES (26, '2026-08-23T00:00:00Z');
             "#,
         )
         .expect("create future schema marker");
 
-        let error = migrate(&conn).expect_err("schema 25 must be rejected by schema 24 binary");
+        let error = migrate(&conn).expect_err("schema 26 must be rejected by schema 25 binary");
 
         assert_eq!(
             error.to_string(),
-            "database schema version 25 is newer than this StatsAI binary supports (24); upgrade StatsAI or use a compatible database"
+            "database schema version 26 is newer than this StatsAI binary supports (25); upgrade StatsAI or use a compatible database"
         );
         assert_eq!(
             current_schema_version(&conn).expect("read unchanged version"),
-            25
+            26
         );
     }
 

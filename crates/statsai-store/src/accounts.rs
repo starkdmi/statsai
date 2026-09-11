@@ -354,9 +354,16 @@ impl Store {
             .map(|value| parse_bool_metadata_value(SYNC_INCLUDE_TASKS_METADATA_KEY, value))
             .transpose()?
             .unwrap_or(false);
+        let include_activity = self
+            .metadata_value(SYNC_INCLUDE_ACTIVITY_METADATA_KEY)?
+            .as_deref()
+            .map(|value| parse_bool_metadata_value(SYNC_INCLUDE_ACTIVITY_METADATA_KEY, value))
+            .transpose()?
+            .unwrap_or(false);
         Ok(SyncPreferences {
             include_projects,
             include_tasks,
+            include_activity,
         }
         .normalized())
     }
@@ -374,6 +381,14 @@ impl Store {
         self.set_metadata_value(
             SYNC_INCLUDE_TASKS_METADATA_KEY,
             if preferences.include_tasks { "1" } else { "0" },
+        )?;
+        self.set_metadata_value(
+            SYNC_INCLUDE_ACTIVITY_METADATA_KEY,
+            if preferences.include_activity {
+                "1"
+            } else {
+                "0"
+            },
         )?;
         Ok(())
     }

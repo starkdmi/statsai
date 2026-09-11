@@ -45,6 +45,9 @@ pub(crate) enum CodexLineKind {
     TaskStarted,
     TaskComplete,
     HeadlessUsage,
+    ResponseItemToolCall,
+    EventItemStarted,
+    EventItemCompleted,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +97,14 @@ pub(crate) fn codex_line_kind(line: &str) -> CodexLineKind {
     if header.contains("\"type\":\"response_item\"") {
         return if header.contains("\"payload\":{\"type\":\"message\"") {
             CodexLineKind::ResponseItemMessage
+        } else if header.contains("\"payload\":{\"type\":\"function_call\"")
+            || header.contains("\"payload\":{\"type\":\"function_call_output\"")
+            || header.contains("\"payload\":{\"type\":\"custom_tool_call\"")
+            || header.contains("\"payload\":{\"type\":\"custom_tool_call_output\"")
+            || header.contains("\"payload\":{\"type\":\"web_search_call\"")
+            || header.contains("\"payload\":{\"type\":\"tool_search_call\"")
+        {
+            CodexLineKind::ResponseItemToolCall
         } else {
             CodexLineKind::Irrelevant
         };
@@ -110,6 +121,12 @@ pub(crate) fn codex_line_kind(line: &str) -> CodexLineKind {
         }
         if header.contains("\"payload\":{\"type\":\"task_complete\"") {
             return CodexLineKind::TaskComplete;
+        }
+        if header.contains("\"payload\":{\"type\":\"item_started\"") {
+            return CodexLineKind::EventItemStarted;
+        }
+        if header.contains("\"payload\":{\"type\":\"item_completed\"") {
+            return CodexLineKind::EventItemCompleted;
         }
         return CodexLineKind::Irrelevant;
     }

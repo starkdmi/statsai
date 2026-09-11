@@ -4,17 +4,17 @@ use chrono::{DateTime, Utc};
 use statsai_adapters::{
     default_adapters, remap_account_evidence_account_ids,
     retain_accounts_referenced_by_account_evidence, AccountEvidenceScan, ProviderAdapter,
-    ScanCandidateFile, ScanOptions, VerifiedSourceObservation,
+    ScanCandidateFile, ScanOptions, VerifiedSourceObservation, OPENCODE_PROVIDER,
 };
 use statsai_core::{
     hash_text, provider_account_id_from_identity, timestamp_in_period, IdentitySource,
     ProviderAccountId, SourceAccountAssignment, SourceLocation, SourceVerificationMode, UsageEvent,
-    UsageSummary,
+    UsageSummary, ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
     find_existing_provider_account, reconcile_verified_source_state, upsert_provider_account,
-    verified_source_observation_hash, ScanFileReplacement, ScanFileStateEntry, Store,
-    UpsertProviderAccountInput,
+    verified_source_observation_hash, ActivityPersistMode, ActivityScanCursor, ScanFileReplacement,
+    ScanFileStateEntry, Store, UpsertProviderAccountInput,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -287,28 +287,62 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                 };
             let verified_state_changed = matches!(verification_mode, SourceVerificationMode::Auto)
                 && source.verified_state_hash != next_verified_state_hash;
-            let rescan_file_entries = if removed_file_entries.is_empty() {
-                &pending_file_entries
+            let stored_activity_cursor = match scan_store.activity_scan_cursor(&source.source_id) {
+                Ok(cursor) => cursor,
+                Err(e) => {
+                    eprintln!(
+                        "daemon: activity cursor lookup failed for {}: {e}",
+                        source.path_label.as_deref().unwrap_or("unknown")
+                    );
+                    failed = true;
+                    continue;
+                }
+            };
+            let activity_full_reconcile = if source.provider == OPENCODE_PROVIDER {
+                stored_activity_cursor
+                    .as_ref()
+                    .is_none_or(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION)
             } else {
-                &file_cache_entries
+                stored_activity_cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION)
             };
             if pending_file_entries.is_empty()
                 && removed_file_entries.is_empty()
                 && !has_cache_entry_upgrades
                 && !verified_state_changed
                 && !has_account_evidence
+                && !activity_full_reconcile
             {
                 continue;
             }
+            let rescan_file_entries = if activity_full_reconcile || !removed_file_entries.is_empty()
+            {
+                &file_cache_entries
+            } else {
+                &pending_file_entries
+            };
             let options = ScanOptions {
                 device_id: device_id.to_string(),
                 collect_tasks: false,
-                selected_cache_keys: Some(
-                    rescan_file_entries
-                        .iter()
-                        .map(|entry| entry.cache_key.clone())
-                        .collect::<HashSet<_>>(),
-                ),
+                selected_cache_keys: if activity_full_reconcile {
+                    None
+                } else {
+                    Some(
+                        rescan_file_entries
+                            .iter()
+                            .map(|entry| entry.cache_key.clone())
+                            .collect::<HashSet<_>>(),
+                    )
+                },
+                activity_scan_cursor: if activity_full_reconcile {
+                    None
+                } else {
+                    stored_activity_cursor
+                        .as_ref()
+                        .map(|cursor| cursor.last_time_updated)
+                },
+                activity_full_reconcile,
             };
             let scan_result = if rescan_file_entries.is_empty() {
                 Ok(statsai_adapters::AdapterScan::default())
@@ -433,6 +467,24 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                     reconciled_file_hashes: &reconciled_file_hashes,
                                     events: &scan.events,
                                     summaries: &scan.summaries,
+                                    activity_invocations: &scan.activity_invocations,
+                                    activity_coverage: &scan.activity_coverage,
+                                    activity_persist_mode: ActivityPersistMode::for_scan(
+                                        &source.provider,
+                                        activity_full_reconcile,
+                                    ),
+                                    activity_scan_cursor: Some(ActivityScanCursor {
+                                        last_time_updated: scan
+                                            .activity_scan_cursor
+                                            .unwrap_or_else(|| {
+                                                stored_activity_cursor
+                                                    .as_ref()
+                                                    .map(|cursor| cursor.last_time_updated)
+                                                    .unwrap_or(0)
+                                            }),
+                                        parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
+                                    }),
+                                    device_id,
                                     pending_entries: &pending_file_entries,
                                     compatible_entries_to_upgrade: &compatible_entries_to_upgrade,
                                     removed_cache_keys: &removed_cache_keys,

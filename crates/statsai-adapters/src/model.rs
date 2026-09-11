@@ -231,6 +231,31 @@ pub(crate) fn opencode_model_id_from_value(value: &Value) -> Option<String> {
         })
 }
 
+/// Model id on an OpenCode `message` row. Top-level `id` is the message UUID.
+pub(crate) fn opencode_message_model_id(value: &Value) -> Option<String> {
+    value
+        .get("modelID")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            value
+                .get("model")
+                .and_then(opencode_model_id_from_model_value)
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+        })
+        .or_else(|| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
 pub(crate) fn opencode_model_id_from_model_value(value: &Value) -> Option<String> {
     value
         .get("modelID")
