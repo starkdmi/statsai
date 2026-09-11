@@ -89,10 +89,11 @@ fn apply_sync_preference_overrides(
             );
         }
         if !original.include_activity && preferences.include_activity {
-            store.mark_all_activity_rollups_dirty()?;
-            store.mark_all_activity_coverage_dirty()?;
+            // No local flag to flip: each target resends whatever it has not
+            // acknowledged. Disabling sent an empty activity snapshot, which
+            // retired that target's acknowledgements, so the backfill follows.
             eprintln!(
-                "activity sync enabled: all local activity rollups marked dirty for backfill"
+                "activity sync enabled: the next sync backfills whatever the target has not acknowledged"
             );
         }
         if original.include_activity && !preferences.include_activity {
@@ -173,17 +174,20 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
 
         if command.dry_run {
             eprintln!(
-            "dry run: sink={} mode={} include_projects={} include_tasks={} sources={} events={} summaries={} task_buckets={} task_verifications={}",
+            "dry run: sink={} mode={} include_projects={} include_tasks={} include_activity={} sources={} events={} summaries={} task_buckets={} task_verifications={} activity_rollups={} activity_coverage={}",
             command.sink,
             sync_payload_mode_name(payload_mode),
             sync_preferences.include_projects,
             sync_preferences.include_tasks,
+            sync_preferences.include_activity,
             batch.sources.len(),
             batch.events.len(),
             batch.summaries.len()
             ,
             batch.task_buckets.len(),
             batch.task_verifications.len(),
+            batch.activity_rollups.len(),
+            batch.activity_coverage.len(),
         );
             return Ok(());
         }
@@ -1106,6 +1110,106 @@ mod tests {
                 .expect("read cursor")
                 .is_none(),
             "--full is the caller asking for the full re-upload"
+        );
+    }
+
+    fn activity_source() -> statsai_core::SourceLocation {
+        statsai_core::SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            std::path::Path::new("/tmp/codex-two-target-sync"),
+            statsai_core::LocationOrigin::Configured,
+        )
+    }
+
+    fn seed_activity_rollup(store: &Store, source: &statsai_core::SourceLocation) {
+        store.upsert_source(source).expect("source");
+        let invocation = statsai_core::ActivityInvocationV1 {
+            schema_version: statsai_core::ACTIVITY_INVOCATION_SCHEMA_VERSION.to_string(),
+            invocation_id: "invocation-a".to_string(),
+            provider: "codex".to_string(),
+            source_id: source.source_id.clone(),
+            provider_account_id: None,
+            source_file_path_hash: "file".to_string(),
+            observed_at: Utc::now(),
+            kind: statsai_core::ActivityKind::Tool,
+            display_name: "shell".to_string(),
+            family: statsai_core::ActivityFamily::Shell,
+            mcp_server: None,
+            mcp_tool: None,
+            plugin: None,
+            skill_catalog: None,
+            model: Some("gpt-5.4".to_string()),
+            outcome: statsai_core::ActivityOutcome::Succeeded,
+            duration_ms: Some(3),
+            duration_kind: Some(statsai_core::ActivityDurationKind::Reported),
+            evidence: "codex-native-items".to_string(),
+            parser_revision: statsai_core::ACTIVITY_PARSER_REVISION.to_string(),
+        };
+        store
+            .persist_activity_scan(
+                "device",
+                &source.source_id,
+                &[invocation],
+                &[],
+                &["file".to_string()],
+                statsai_store::ActivityPersistMode::ReplaceFiles,
+                None,
+            )
+            .expect("persist activity");
+    }
+
+    /// Regression: activity selection used the global `dirty` column, so the
+    /// first target to sync cleared it and every other target silently never
+    /// received those rollups.
+    #[test]
+    fn syncing_activity_to_one_target_does_not_hide_it_from_another() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let local = "http://127.0.0.1:8787/api/sync/batches";
+        let dev = "https://dev-api.example.test/api/sync/batches";
+        let store = store_with_cursor(&directory.path().join("store.sqlite"), local);
+        store
+            .restore_sync_states(&[SyncState {
+                sink: "http".to_string(),
+                target: dev.to_string(),
+                last_success_at: Utc::now(),
+                last_batch_id: "batch-dev".to_string(),
+                last_event_started_at: None,
+                last_event_id: None,
+                last_summary_observed_at: None,
+                last_summary_id: None,
+                last_task_verification_updated_at: None,
+                last_task_verification_id: None,
+                failure_count: 0,
+                pending_resume_batch_id: None,
+            }])
+            .expect("seed dev cursor");
+        let source = activity_source();
+        seed_activity_rollup(&store, &source);
+
+        let mut command = sync_command(false);
+        command.include_activity = true;
+
+        let (local_batch, _) =
+            build_sync_batch(&command, &store, "device", local).expect("local batch");
+        assert_eq!(local_batch.activity_rollups.len(), 1);
+
+        // The local target acknowledges the upload.
+        record_sync_batch_success(&store, "http", local, &local_batch).expect("record local");
+
+        let (local_again, _) =
+            build_sync_batch(&command, &store, "device", local).expect("local batch again");
+        assert!(
+            local_again.activity_rollups.is_empty(),
+            "an acknowledged rollup must not be resent to the same target"
+        );
+
+        let (dev_batch, _) = build_sync_batch(&command, &store, "device", dev).expect("dev batch");
+        assert_eq!(
+            dev_batch.activity_rollups.len(),
+            1,
+            "dev never acknowledged this rollup, so it must still be sent"
         );
     }
 }

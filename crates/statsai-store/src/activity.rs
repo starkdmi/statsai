@@ -669,12 +669,18 @@ impl Store {
         self.activity_rollups_by_sql("SELECT payload FROM activity_rollups ORDER BY day, rollup_id")
     }
 
+    /// Rows changed since the last sync to *some* target. Not a sync selector:
+    /// `dirty` is one global flag, so the first target to sync clears it for
+    /// every other one and the rest silently never receive those rows. Sync
+    /// selection goes through `pending_activity_rollups_for_sync`, which reads
+    /// the per-target `entity_sync_state` ledger.
     pub fn dirty_activity_rollups(&self) -> Result<Vec<ActivityRollupV1>> {
         self.activity_rollups_by_sql(
             "SELECT payload FROM activity_rollups WHERE dirty = 1 ORDER BY day, rollup_id",
         )
     }
 
+    /// See [`Store::dirty_activity_rollups`]: not a sync selector.
     pub fn dirty_activity_coverage(&self) -> Result<Vec<ActivityCoverageV1>> {
         self.activity_coverage_by_sql(
             "SELECT payload FROM activity_coverage WHERE dirty = 1 ORDER BY day, coverage_id",

@@ -266,14 +266,14 @@ pub(crate) fn build_sync_batch_with_identity_key(
     let activity_rollups = if !sync_preferences.include_activity {
         Vec::new()
     } else if payload_mode == SyncPayloadMode::Rollups && !(command.full || state.is_none()) {
-        store.dirty_activity_rollups()?
+        store.pending_activity_rollups_for_sync(&command.sink, target, &all_activity_rollups)?
     } else {
         all_activity_rollups.clone()
     };
     let activity_coverage = if !sync_preferences.include_activity {
         Vec::new()
     } else if payload_mode == SyncPayloadMode::Rollups && !(command.full || state.is_none()) {
-        store.dirty_activity_coverage()?
+        store.pending_activity_coverage_for_sync(&command.sink, target, &all_activity_coverage)?
     } else {
         all_activity_coverage.clone()
     };
@@ -511,6 +511,11 @@ pub(crate) fn record_sync_batch_success(
             .map(|metric| metric.metric_id.clone())
             .collect::<Vec<_>>(),
     )?;
+    // Per-target acknowledgement is what selection reads. Only the chunked
+    // rollup path recorded it, so a batch sent whole left the ledger empty and
+    // the next sync to that target resent every rollup.
+    store.record_activity_rollups_synced(sink, target, &batch.activity_rollups)?;
+    store.record_activity_coverage_synced(sink, target, &batch.activity_coverage)?;
     store.mark_activity_rollups_synced(
         &batch
             .activity_rollups

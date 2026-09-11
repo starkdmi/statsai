@@ -1,4 +1,5 @@
 use super::*;
+use statsai_core::{ActivityCoverageV1, ActivityRollupV1};
 
 impl Store {
     pub fn pending_sources_for_sync(
@@ -140,6 +141,39 @@ impl Store {
             "account_evidence_summary",
             summaries,
             |summary| summary.summary_id.as_str(),
+        )
+    }
+
+    /// Activity rows this target has not acknowledged, or acknowledged at an
+    /// older payload. The local `dirty` column cannot answer this: it is one
+    /// global flag, so the first target to sync clears it for every other one.
+    pub fn pending_activity_rollups_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        rollups: &[ActivityRollupV1],
+    ) -> Result<Vec<ActivityRollupV1>> {
+        self.pending_serialized_entities_for_sync(
+            sink,
+            target,
+            "activity_rollup",
+            rollups,
+            |rollup| rollup.rollup_id.as_str(),
+        )
+    }
+
+    pub fn pending_activity_coverage_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        coverage: &[ActivityCoverageV1],
+    ) -> Result<Vec<ActivityCoverageV1>> {
+        self.pending_serialized_entities_for_sync(
+            sink,
+            target,
+            "activity_coverage",
+            coverage,
+            |coverage| coverage.coverage_id.as_str(),
         )
     }
 

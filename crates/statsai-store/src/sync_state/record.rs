@@ -1,4 +1,5 @@
 use super::*;
+use statsai_core::{ActivityCoverageV1, ActivityRollupV1};
 
 impl Store {
     pub fn record_sources_synced(
@@ -289,6 +290,46 @@ impl Store {
                 "account_evidence_summary",
                 summaries,
                 |summary| summary.summary_id.as_str(),
+            )
+        })
+    }
+
+    pub fn record_activity_rollups_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        rollups: &[ActivityRollupV1],
+    ) -> Result<()> {
+        if rollups.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "activity_rollup",
+                rollups,
+                |rollup| rollup.rollup_id.as_str(),
+            )
+        })
+    }
+
+    pub fn record_activity_coverage_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        coverage: &[ActivityCoverageV1],
+    ) -> Result<()> {
+        if coverage.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "activity_coverage",
+                coverage,
+                |coverage| coverage.coverage_id.as_str(),
             )
         })
     }
