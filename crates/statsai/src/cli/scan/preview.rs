@@ -159,7 +159,7 @@ pub(crate) struct ScanPreviewLine<'a> {
 pub(crate) fn print_scan_preview_line(line: ScanPreviewLine<'_>) {
     if line.verbose {
         println!(
-            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} activity={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
+            "{} path={} usage_events={} summaries={} task_spans={} quota_observations={} activity={} input={} cache_create={} cache_read={} output={} total={} est_cost={} summary_total={} summary_est_cost={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} oversized={} files={} cached={} timestamp_fallbacks={} model_fallbacks={} origin={} source={}",
             line.source.provider,
             preview_path_label(line.source),
             line.usage_events,
@@ -180,6 +180,7 @@ pub(crate) fn print_scan_preview_line(line: ScanPreviewLine<'_>) {
             format_u64(line.diagnostics.duplicate_events),
             format_u64(line.diagnostics.skipped_zero_events),
             format_u64(line.diagnostics.invalid_rows),
+            format_u64(line.diagnostics.oversized_rows),
             format_u64(line.diagnostics.files_scanned),
             format_u64(line.diagnostics.files_skipped_unchanged),
             format_u64(line.diagnostics.timestamp_fallbacks),
@@ -218,6 +219,7 @@ pub(crate) fn add_diagnostics(target: &mut ScanDiagnostics, source: &ScanDiagnos
     target.duplicate_events += source.duplicate_events;
     target.skipped_zero_events += source.skipped_zero_events;
     target.invalid_rows += source.invalid_rows;
+    target.oversized_rows += source.oversized_rows;
     target.timestamp_fallbacks += source.timestamp_fallbacks;
     target.model_fallbacks += source.model_fallbacks;
     target.activity_rows += source.activity_rows;
@@ -228,7 +230,7 @@ pub(crate) fn add_diagnostics(target: &mut ScanDiagnostics, source: &ScanDiagnos
 
 pub(crate) fn print_scan_diagnostics_total(diagnostics: &ScanDiagnostics) {
     println!(
-        "diagnostics: files={} cached={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} timestamp_fallbacks={} model_fallbacks={}",
+        "diagnostics: files={} cached={} raw_rows={} candidates={} duplicates={} skipped_zero={} invalid={} oversized={} timestamp_fallbacks={} model_fallbacks={}",
         format_u64(diagnostics.files_scanned),
         format_u64(diagnostics.files_skipped_unchanged),
         format_u64(diagnostics.raw_rows),
@@ -236,6 +238,7 @@ pub(crate) fn print_scan_diagnostics_total(diagnostics: &ScanDiagnostics) {
         format_u64(diagnostics.duplicate_events),
         format_u64(diagnostics.skipped_zero_events),
         format_u64(diagnostics.invalid_rows),
+        format_u64(diagnostics.oversized_rows),
         format_u64(diagnostics.timestamp_fallbacks),
         format_u64(diagnostics.model_fallbacks)
     );

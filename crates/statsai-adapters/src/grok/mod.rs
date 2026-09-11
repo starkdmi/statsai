@@ -66,9 +66,9 @@ pub(crate) fn scan_grok_build_source(
         return Ok(scan);
     }
 
-    let (unified_log_index, invalid_unified_rows) =
-        parse_grok_unified_log_with_invalid_rows(&root)?;
-    scan.diagnostics.invalid_rows += invalid_unified_rows;
+    let (unified_log_index, unified_log_rows) = parse_grok_unified_log_with_row_counts(&root)?;
+    scan.diagnostics.invalid_rows += unified_log_rows.invalid;
+    scan.diagnostics.oversized_rows += unified_log_rows.oversized;
     for candidate in
         grok_build_scan_candidates_with_unified_log(source, adapter.version(), &unified_log_index)?
     {

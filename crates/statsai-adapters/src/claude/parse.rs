@@ -52,7 +52,7 @@ pub(crate) fn parse_claude_file(
         index = index.saturating_add(1);
         if line_status == BoundedLineRead::Oversized {
             ctx.scan.diagnostics.raw_rows += 1;
-            ctx.scan.diagnostics.invalid_rows += 1;
+            ctx.scan.diagnostics.oversized_rows += 1;
             continue;
         }
         let Ok(line) = std::str::from_utf8(&line_bytes) else {

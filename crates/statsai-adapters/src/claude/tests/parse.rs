@@ -1062,3 +1062,59 @@ fn claude_carries_max_thinking_tokens_forward_as_raw_reasoning_metadata() {
     assert_eq!(model.reasoning_level, None);
     assert_eq!(model.reasoning_level_raw.as_deref(), Some("31999"));
 }
+
+#[test]
+fn claude_scan_separates_oversized_rows_from_malformed_ones() {
+    // The Codex fixture cannot cover this half: Codex classifies a line by its
+    // header before parsing, so a truncated row is skipped as an unrecognised
+    // kind. Claude parses every line, so both counters can be observed at once.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let project_store = root.join("projects").join("example-workspace");
+    std::fs::create_dir_all(&project_store).expect("project store");
+
+    let mut file =
+        std::fs::File::create(project_store.join("session.jsonl")).expect("transcript fixture");
+    writeln!(
+        file,
+        "{{\"timestamp\":\"2026-05-01T00:00:00Z\",\"sessionId\":\"session-a\",\"message\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":2}}}}}}"
+    )
+    .expect("write usage row");
+    writeln!(
+        file,
+        "{{\"timestamp\":\"2026-05-01T00:00:01Z\",\"payload\":\"{}\"}}",
+        "x".repeat(crate::json::MAX_JSONL_RECORD_BYTES + 1)
+    )
+    .expect("write oversized row");
+    writeln!(file, "{{\"timestamp\":\"2026-05-01T00:00:02Z\",").expect("write malformed row");
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        root,
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(
+        &ClaudeCodeAdapter,
+        &source,
+        &ScanOptions {
+            device_id: "device".to_string(),
+            collect_tasks: false,
+            selected_cache_keys: None,
+            activity_scan_cursor: None,
+            activity_full_reconcile: false,
+        },
+    )
+    .expect("scan");
+
+    assert_eq!(
+        scan.diagnostics.oversized_rows, 1,
+        "a row over the reader's cap is too large, not broken"
+    );
+    assert_eq!(
+        scan.diagnostics.invalid_rows, 1,
+        "a truncated row is still malformed"
+    );
+    assert_eq!(scan.events.len(), 1, "the usable row is still collected");
+}

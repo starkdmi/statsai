@@ -21,7 +21,7 @@ pub(crate) fn for_grok_jsonl_record(
         }
         index = index.saturating_add(1);
         if line_status == BoundedLineRead::Oversized {
-            parse_stats.invalid_rows += 1;
+            parse_stats.oversized_rows += 1;
             continue;
         }
         let Ok(line) = std::str::from_utf8(&line_bytes) else {

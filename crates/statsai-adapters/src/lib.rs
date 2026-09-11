@@ -147,7 +147,14 @@ pub struct ScanDiagnostics {
     pub accepted_events: u64,
     pub duplicate_events: u64,
     pub skipped_zero_events: u64,
+    /// Rows the reader could not parse: malformed JSON, or bytes that are not
+    /// UTF-8. Something is wrong with the record.
     pub invalid_rows: u64,
+    /// Rows skipped for exceeding `MAX_JSONL_RECORD_BYTES`. Nothing is wrong
+    /// with them; they are simply too large to hold in memory. Counted apart
+    /// from `invalid_rows` because the two call for different responses, and a
+    /// single number cannot say which one a scan hit.
+    pub oversized_rows: u64,
     pub timestamp_fallbacks: u64,
     pub model_fallbacks: u64,
     pub activity_rows: u64,
