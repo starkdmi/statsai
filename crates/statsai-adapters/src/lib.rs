@@ -24,7 +24,9 @@ use statsai_core::{
     QUOTA_OBSERVATION_SCHEMA_VERSION, QUOTA_WINDOW_OBSERVATION_SCHEMA_VERSION,
     TASK_SPAN_SCHEMA_VERSION,
 };
-use statsai_pricing::{estimate_cost_at, normalize_model_name, unknown_cost};
+use statsai_pricing::{
+    estimate_cost_at, normalize_model_name, unknown_cost, MESSAGE_USAGE_PRICING_SUFFIX,
+};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;

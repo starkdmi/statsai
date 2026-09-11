@@ -98,7 +98,7 @@ pub(crate) fn scan_opencode_source(
             cache_creation_5m_tokens: None,
             cache_creation_1h_tokens: None,
             total_tokens: None,
-            requests: Some(1),
+            requests: opencode_session_requests(recovered_session_models.get(&session_id)),
             local_prompt_eval_tokens: None,
             local_eval_tokens: None,
         };
@@ -205,6 +205,19 @@ pub(crate) fn scan_opencode_source(
         if model_inferred {
             scan.diagnostics.model_fallbacks += 1;
         }
+        let message_cost = recovered_session_models
+            .get(&session_id)
+            .and_then(|summary| {
+                opencode_session_cost_from_messages(
+                    adapter.provider(),
+                    model.as_ref(),
+                    &summary.usage_samples,
+                    &usage,
+                    &ended_at,
+                )
+            })
+            .filter(|cost| cost.estimated_micro_usd().is_some());
+        let priced_from_messages = message_cost.is_some();
         let mut event = usage_event(
             adapter,
             source,
@@ -230,13 +243,22 @@ pub(crate) fn scan_opencode_source(
             },
         );
         event.session.title = title.filter(|title| !title.trim().is_empty());
+        if let Some(message_cost) = message_cost {
+            event.cost = message_cost;
+        }
         if provider_cost > 0.0 {
             if let Some(provider_cost_micro_usd) = usd_to_micro_usd(provider_cost) {
                 event
                     .cost
                     .set_provider_reported_micro_usd(provider_cost_micro_usd);
             }
-            event.cost.pricing_source = Some("opencode.session.cost".to_string());
+            // The suffix survives here so repricing keeps its hands off an estimate
+            // it cannot reproduce from the aggregate this event stores.
+            event.cost.pricing_source = Some(if priced_from_messages {
+                format!("opencode.session.cost{MESSAGE_USAGE_PRICING_SUFFIX}")
+            } else {
+                "opencode.session.cost".to_string()
+            });
             event.cost.confidence = Confidence::High;
         }
         push_deduped(&mut scan, &mut seen, event, DuplicateSelection::KeepFirst);
@@ -262,8 +284,18 @@ pub(crate) fn scan_opencode_source(
             ) {
                 continue;
             }
-            let residual_usage =
+            let mut residual_usage =
                 subtract_usage_counts(&aggregate.usage, reconstructed.map(|value| &value.usage));
+            // `subtract_usage_counts` labels a delta as one request, which is true for
+            // the per-turn deltas it was written for but not for what is left of a
+            // session row after its recovered messages are removed.
+            residual_usage.requests = aggregate.usage.requests.and_then(|total| {
+                let emitted = reconstructed
+                    .and_then(|value| value.usage.requests)
+                    .unwrap_or(0);
+                let residual = total.saturating_sub(emitted);
+                (residual > 0).then_some(residual)
+            });
             if residual_usage.computed_total() == 0 {
                 continue;
             }
@@ -522,6 +554,12 @@ pub(crate) fn load_opencode_session_models(
         let model = opencode_message_model_info(&value);
         let entry = models.entry(session_id).or_default();
         entry.has_variant |= opencode_message_has_variant(&value);
+        if usage.computed_total() > 0 {
+            entry.usage_samples.push(UsageCounts {
+                requests: Some(1),
+                ..usage.clone()
+            });
+        }
         if usage.computed_total() > 0 && model.is_none() {
             entry.ambiguous = true;
             continue;
@@ -563,6 +601,57 @@ pub(crate) fn load_opencode_session_models(
     Ok(models)
 }
 
+/// Requests a session row stands for, counted from its usage-bearing messages.
+///
+/// A `session` row totals every request in the session, so it must not claim to be
+/// a single request: long-context tiers are priced per request, and a tier decision
+/// made against a whole session's tokens bills short requests at the long-context
+/// rate. `None` when the messages are gone and the true count is unknowable.
+fn opencode_session_requests(summary: Option<&OpenCodeSessionModelSummary>) -> Option<u64> {
+    summary
+        .map(|summary| summary.usage_samples.len() as u64)
+        .filter(|messages| *messages > 0)
+}
+
+/// Prices a session row from the individual messages it totals.
+///
+/// The session row alone cannot be priced correctly: every long-context tier is a
+/// per-request decision, so one verdict for a whole session either bills short
+/// requests at the long rate or long requests at the short rate. The message rows
+/// carry each request's own tokens, so each is priced on its own and the results
+/// are summed. Usage the messages do not account for - compaction, pruned rows -
+/// is priced as the request-less aggregate it is, which leaves it untiered.
+///
+/// `None` when no message covers the row, leaving the aggregate estimate in place.
+fn opencode_session_cost_from_messages(
+    provider: &str,
+    model: Option<&ModelInfo>,
+    samples: &[UsageCounts],
+    session_usage: &UsageCounts,
+    occurred_at: &DateTime<Utc>,
+) -> Option<CostInfo> {
+    let (first, rest) = samples.split_first()?;
+    let mut cost = estimate_cost_at(provider, model, first, occurred_at);
+    let mut total = CostAccumulator::default();
+    total.add_estimated(&cost);
+    let mut accounted = first.clone();
+    for sample in rest {
+        total.add_estimated(&estimate_cost_at(provider, model, sample, occurred_at));
+        accounted = sum_usage_counts(&accounted, sample);
+    }
+    let mut residual = subtract_usage_counts(session_usage, Some(&accounted));
+    residual.requests = None;
+    if residual.computed_total() > 0 {
+        total.add_estimated(&estimate_cost_at(provider, model, &residual, occurred_at));
+    }
+    let micro_usd = total.micro_usd()?;
+    cost.set_estimated_micro_usd(micro_usd);
+    cost.pricing_source = cost
+        .pricing_source
+        .map(|source| format!("{source}{MESSAGE_USAGE_PRICING_SUFFIX}"));
+    Some(cost)
+}
+
 pub(crate) fn load_opencode_todos(connection: &Connection) -> Result<HashMap<String, Vec<String>>> {
     let mut statement = match connection
         .prepare("SELECT session_id, content FROM todo ORDER BY session_id, position")
@@ -595,6 +684,8 @@ pub(crate) struct OpenCodeSessionModelSummary {
     pub(crate) ambiguous: bool,
     pub(crate) has_variant: bool,
     pub(crate) model_conflict: bool,
+    /// Per-request usage behind the session row, one entry per usage-bearing message.
+    pub(crate) usage_samples: Vec<UsageCounts>,
 }
 
 #[derive(Debug, Clone)]
