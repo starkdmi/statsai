@@ -184,23 +184,35 @@ fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (i128, i128) {
     }
 }
 
+/// Marks an estimate summed from the per-request rows behind an aggregate.
+///
+/// Appended to whatever pricing source the event already carries, including an
+/// adapter-owned one such as `opencode.session.cost`, which has no model segment
+/// for the positional check below to find.
+pub const MESSAGE_USAGE_PRICING_SUFFIX: &str = ":message_usage";
+
 /// Whether an estimate was priced from source records the store does not keep.
 ///
 /// [`estimate_cost_at`] writes `{vendor}_api_pricing:{model}`, plus `:fast` for
 /// fast-mode rates. An adapter that prices from richer evidence appends its own
-/// qualifier - Grok Build sums per-request samples from the unified log, so each
-/// one is billed with its own context-size tier. A summary keeps only the
-/// session total, whose `requests` count is not 1, so recomputing it from that
-/// aggregate silently drops every tier decision and lands under the true cost.
+/// qualifier - Grok Build sums per-request samples from the unified log, and
+/// OpenCode sums the messages behind a session row, so each request is billed
+/// with its own context-size tier. The stored event keeps only the aggregate,
+/// whose `requests` count is not 1, so recomputing it from that aggregate
+/// silently drops every tier decision and lands under the true cost.
 ///
 /// Repricing therefore leaves these estimates alone. They are refreshed by a
 /// rescan, which re-reads the records they were derived from.
 #[must_use]
 pub fn estimate_priced_from_source_records(cost: &CostInfo) -> bool {
-    cost.pricing_source
-        .as_deref()
-        .and_then(|source| source.splitn(3, ':').nth(2))
-        .is_some_and(|qualifier| qualifier != "fast")
+    let Some(source) = cost.pricing_source.as_deref() else {
+        return false;
+    };
+    source.ends_with(MESSAGE_USAGE_PRICING_SUFFIX)
+        || source
+            .splitn(3, ':')
+            .nth(2)
+            .is_some_and(|qualifier| qualifier != "fast")
 }
 
 #[must_use]

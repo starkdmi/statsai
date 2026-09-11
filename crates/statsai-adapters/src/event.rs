@@ -175,6 +175,10 @@ pub(crate) fn merge_adapter_scan(
         .diagnostics
         .invalid_rows
         .saturating_add(source.diagnostics.invalid_rows);
+    target.diagnostics.oversized_rows = target
+        .diagnostics
+        .oversized_rows
+        .saturating_add(source.diagnostics.oversized_rows);
     target.diagnostics.timestamp_fallbacks = target
         .diagnostics
         .timestamp_fallbacks

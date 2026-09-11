@@ -51,6 +51,49 @@ fn codex_source_scans_sessions_and_archived_sessions() {
 }
 
 #[test]
+fn codex_scan_counts_oversized_rows_apart_from_malformed_ones() {
+    // Codex writes a `compacted` checkpoint carrying the whole conversation it
+    // replaced, which routinely exceeds the reader's per-line cap. Nothing is
+    // wrong with those rows, so counting them as invalid made a healthy scan
+    // look like it had hit corruption.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+
+    let mut file = File::create(sessions.join("session.jsonl")).expect("fixture");
+    writeln!(
+        file,
+        "{{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":2}}}}"
+    )
+    .expect("write usage row");
+    writeln!(
+        file,
+        "{{\"timestamp\":\"2026-05-01T00:00:01Z\",\"type\":\"compacted\",\"payload\":\"{}\"}}",
+        "x".repeat(MAX_JSONL_RECORD_BYTES + 1)
+    )
+    .expect("write oversized row");
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+
+    let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(
+        scan.diagnostics.oversized_rows, 1,
+        "the compacted row is too large, not broken"
+    );
+    assert_eq!(
+        scan.diagnostics.invalid_rows, 0,
+        "a row the reader declined to hold is not a malformed one"
+    );
+    assert_eq!(scan.events.len(), 1, "the usable row is still collected");
+}
+
+#[test]
 fn codex_scan_respects_selected_cache_keys() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sessions = dir.path().join("sessions");

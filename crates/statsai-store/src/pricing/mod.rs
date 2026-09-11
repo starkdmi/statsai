@@ -423,13 +423,20 @@ fn reprice_event(event: &UsageEvent) -> Option<UsageEvent> {
     // feeds grouping as well as pricing, so refresh it here rather than only
     // working around it at lookup time.
     let model = event.model.as_ref().map(model_with_refreshed_normalization);
-    let estimated = estimate_cost_at(
-        &event.provider,
-        model.as_ref(),
-        &event.usage,
-        &event.session.started_at,
-    );
-    let cost = overlay_estimated_cost(&event.cost, estimated);
+    // An adapter that priced from per-request rows beat what this event's
+    // aggregate can express, so only the model normalization is refreshed here.
+    // A rescan, which re-reads those rows, is what refreshes the estimate.
+    let cost = if estimate_priced_from_source_records(&event.cost) {
+        event.cost.clone()
+    } else {
+        let estimated = estimate_cost_at(
+            &event.provider,
+            model.as_ref(),
+            &event.usage,
+            &event.session.started_at,
+        );
+        overlay_estimated_cost(&event.cost, estimated)
+    };
     if cost == event.cost && model == event.model {
         return None;
     }

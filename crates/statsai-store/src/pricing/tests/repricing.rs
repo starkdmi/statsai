@@ -995,3 +995,37 @@ fn a_fast_mode_qualifier_is_not_mistaken_for_source_derived_pricing() {
         stored.cost.pricing_source
     );
 }
+
+#[test]
+fn per_request_priced_events_keep_their_estimate_through_repricing() {
+    let (store, source) = store_with_source("/tmp/opencode-message-priced");
+    let started_at = parse_utc("2026-07-29T12:00:00Z");
+    let mut cost = missing_cost();
+    // Summed from the messages behind a session row, so it is above what this
+    // event's own aggregate would produce.
+    cost.estimated_api_equivalent_usd = Some(136);
+    cost.estimated_api_equivalent_micro_usd = Some(1_360_000);
+    cost.pricing_source = Some("xai_api_pricing:grok-4.6:message_usage".to_string());
+    cost.confidence = Confidence::Medium;
+    let usage = UsageCounts {
+        input_tokens: Some(240_000),
+        cache_read_tokens: Some(160_000),
+        output_tokens: Some(20_000),
+        requests: Some(2),
+        ..UsageCounts::default()
+    };
+    let event = test_event(&source, started_at, "messages", "grok-4.6", usage, cost);
+    store.insert_event(&event).expect("insert");
+
+    store.ensure_current_pricing().expect("reprice");
+
+    let stored = stored_event(&store, &event.event_id.0);
+    assert_eq!(
+        stored.cost.estimated_api_equivalent_micro_usd,
+        Some(1_360_000)
+    );
+    assert_eq!(
+        stored.cost.pricing_source.as_deref(),
+        Some("xai_api_pricing:grok-4.6:message_usage")
+    );
+}

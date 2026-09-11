@@ -2,26 +2,22 @@ use super::*;
 
 pub(crate) fn grok_session_stats(
     session_dir: &Path,
-    invalid_rows: &mut u64,
+    counts: &mut GrokRowCounts,
 ) -> Result<GrokSessionStats> {
     let mut stats = GrokSessionStats::default();
-    parse_grok_chat_history(
-        &session_dir.join("chat_history.jsonl"),
-        &mut stats,
-        invalid_rows,
-    )?;
-    parse_grok_updates(&session_dir.join("updates.jsonl"), &mut stats, invalid_rows)?;
-    parse_grok_events(&session_dir.join("events.jsonl"), &mut stats, invalid_rows)?;
+    parse_grok_chat_history(&session_dir.join("chat_history.jsonl"), &mut stats, counts)?;
+    parse_grok_updates(&session_dir.join("updates.jsonl"), &mut stats, counts)?;
+    parse_grok_events(&session_dir.join("events.jsonl"), &mut stats, counts)?;
     Ok(stats)
 }
 
 pub(crate) fn parse_grok_unified_log(root: &Path) -> Result<GrokUnifiedLogIndex> {
-    Ok(parse_grok_unified_log_with_invalid_rows(root)?.0)
+    Ok(parse_grok_unified_log_with_row_counts(root)?.0)
 }
 
-pub(crate) fn parse_grok_unified_log_with_invalid_rows(
+pub(crate) fn parse_grok_unified_log_with_row_counts(
     root: &Path,
-) -> Result<(GrokUnifiedLogIndex, u64)> {
+) -> Result<(GrokUnifiedLogIndex, GrokRowCounts)> {
     let mut index = GrokUnifiedLogIndex::default();
     let parse_stats = for_grok_jsonl_record(&grok_unified_log_path(root), |line, value| {
         if value.get("msg").and_then(Value::as_str) != Some("shell.turn.inference_done") {
@@ -83,15 +79,17 @@ pub(crate) fn parse_grok_unified_log_with_invalid_rows(
             .or_insert(row_signature);
         Ok(())
     })?;
-    Ok((index, parse_stats.invalid_rows))
+    let mut counts = GrokRowCounts::default();
+    counts.add(&parse_stats);
+    Ok((index, counts))
 }
 
 pub(crate) fn parse_grok_chat_history(
     path: &Path,
     stats: &mut GrokSessionStats,
-    invalid_rows: &mut u64,
+    counts: &mut GrokRowCounts,
 ) -> Result<()> {
-    *invalid_rows += for_grok_jsonl_value(path, |value| {
+    counts.add(&for_grok_jsonl_value(path, |value| {
         stats.chat_rows += 1;
         match value.get("type").and_then(Value::as_str) {
             Some("user") => stats.user_messages += 1,
@@ -102,18 +100,17 @@ pub(crate) fn parse_grok_chat_history(
             _ => {}
         }
         Ok(())
-    })?
-    .invalid_rows;
+    })?);
     Ok(())
 }
 
 pub(crate) fn parse_grok_updates(
     path: &Path,
     stats: &mut GrokSessionStats,
-    invalid_rows: &mut u64,
+    counts: &mut GrokRowCounts,
 ) -> Result<()> {
     let mut prompt_context_tokens = HashMap::<String, u64>::new();
-    *invalid_rows += for_grok_jsonl_value(path, |value| {
+    counts.add(&for_grok_jsonl_value(path, |value| {
         stats.update_rows += 1;
         update_max(
             &mut stats.max_total_tokens,
@@ -144,8 +141,7 @@ pub(crate) fn parse_grok_updates(
             value.pointer("/params/update/tokens_after"),
         );
         Ok(())
-    })?
-    .invalid_rows;
+    })?);
     stats.prompt_count = prompt_context_tokens.len() as u64;
     stats.prompt_context_tokens = prompt_context_tokens
         .values()
@@ -157,9 +153,9 @@ pub(crate) fn parse_grok_updates(
 pub(crate) fn parse_grok_events(
     path: &Path,
     stats: &mut GrokSessionStats,
-    invalid_rows: &mut u64,
+    counts: &mut GrokRowCounts,
 ) -> Result<()> {
-    *invalid_rows += for_grok_jsonl_value(path, |value| {
+    counts.add(&for_grok_jsonl_value(path, |value| {
         stats.events_rows += 1;
         if value.get("type").and_then(Value::as_str) == Some("turn_started") {
             if let Some(observation) = grok_turn_model_observation(value) {
@@ -167,7 +163,6 @@ pub(crate) fn parse_grok_events(
             }
         }
         Ok(())
-    })?
-    .invalid_rows;
+    })?);
     Ok(())
 }

@@ -12,7 +12,9 @@ pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // function_call arguments/input, and item_started CommandExecution.
 pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v33";
 pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v28";
-pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v19";
+// activity-invocations.v20: session rows report their message count as requests and
+// are priced per message, so long-context tiers stop being decided session-wide.
+pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v20";
 pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v22";
 
 pub(crate) fn scan_candidate(

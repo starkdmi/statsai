@@ -85,10 +85,13 @@ pub(crate) fn parse_grok_summary(
     let signals = session_dir
         .map(|parent| parent.join("signals.json"))
         .and_then(|path| read_json_file(&path).map(|value| (path, value)));
+    let mut session_rows = GrokRowCounts::default();
     let stats = session_dir
-        .map(|path| grok_session_stats(path, &mut scan.diagnostics.invalid_rows))
+        .map(|path| grok_session_stats(path, &mut session_rows))
         .transpose()?
         .unwrap_or_default();
+    scan.diagnostics.invalid_rows += session_rows.invalid;
+    scan.diagnostics.oversized_rows += session_rows.oversized;
     if let Some(session_dir) = session_dir {
         let activity_started_at = std::time::Instant::now();
         crate::activity::extract_grok_session_activity(

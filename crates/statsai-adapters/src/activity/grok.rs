@@ -88,7 +88,7 @@ fn extract_grok_events(
         }
         ordinal = ordinal.saturating_add(1);
         if status == BoundedLineRead::Oversized {
-            scan.diagnostics.invalid_rows += 1;
+            scan.diagnostics.oversized_rows += 1;
             continue;
         }
         let Ok(line) = std::str::from_utf8(&line_bytes) else {
@@ -194,7 +194,7 @@ fn extract_grok_chat_history(
             break;
         }
         if status == BoundedLineRead::Oversized {
-            scan.diagnostics.invalid_rows += 1;
+            scan.diagnostics.oversized_rows += 1;
             continue;
         }
         let Ok(line) = std::str::from_utf8(&line_bytes) else {

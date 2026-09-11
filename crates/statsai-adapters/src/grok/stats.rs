@@ -53,6 +53,22 @@ pub(crate) struct GrokUnifiedLogIndex {
 pub(crate) struct GrokJsonlParseStats {
     pub(crate) rows: u64,
     pub(crate) invalid_rows: u64,
+    pub(crate) oversized_rows: u64,
+}
+
+/// Rows a Grok pass could not turn into records, carried together so the two
+/// reasons stay distinguishable on the way up to `ScanDiagnostics`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GrokRowCounts {
+    pub(crate) invalid: u64,
+    pub(crate) oversized: u64,
+}
+
+impl GrokRowCounts {
+    pub(crate) fn add(&mut self, stats: &GrokJsonlParseStats) {
+        self.invalid = self.invalid.saturating_add(stats.invalid_rows);
+        self.oversized = self.oversized.saturating_add(stats.oversized_rows);
+    }
 }
 
 impl GrokInferenceStats {
