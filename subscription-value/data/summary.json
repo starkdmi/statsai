@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-09-12T22:44:00Z",
+  "n_observations": 800,
+  "by_provider": {
+    "anthropic": 360,
+    "openai": 202,
+    "cursor": 132,
+    "xai": 106
+  },
+  "n_high_confidence_ge_80": 308,
+  "analysis_kept": 491,
+  "viral_quartet_status": "exhausted_no_attributed_primary",
+  "collection_status": "discovery_frontiers_largely_exhausted",
+  "viberank": {
+    "n": 1116,
+    "p50": 1479,
+    "p90": 7685,
+    "mean": 3570
+  },
+  "tokenmaxxing_top100": {
+    "p50": 9689,
+    "p90": 37596
+  },
+  "semianalysis": {
+    "pro_20x_usd": 14000,
+    "claude_max_20x_usd": 8000
+  }
+}

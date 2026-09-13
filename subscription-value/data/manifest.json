@@ -1,0 +1,48 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_version": "statsai_subscription_value.observation.v1",
+  "generated_at": "2026-09-13T08:35:52Z",
+  "baseline_n": 800,
+  "total_observations": 800,
+  "unique_observation_ids": 800,
+  "shard_size_target": 200,
+  "shards": [
+    {
+      "file": "data/observations/observations-0001.jsonl",
+      "rows": 200,
+      "bytes": 411376,
+      "sha256": "b6e45899f0dd7152dabbb87fa267e0b0384328fb693a189f7df9aa41e1730c16",
+      "first_id": "claude-001",
+      "last_id": "claude-200"
+    },
+    {
+      "file": "data/observations/observations-0002.jsonl",
+      "rows": 200,
+      "bytes": 458624,
+      "sha256": "09d6b229601ef194c33812e0bfa453838557efc8f560b8159404021a8e56f538",
+      "first_id": "claude-201",
+      "last_id": "codex-040"
+    },
+    {
+      "file": "data/observations/observations-0003.jsonl",
+      "rows": 200,
+      "bytes": 457572,
+      "sha256": "d9be4be859181a9786acba2bbe0f4daf9c7ebb934f49fea5fff0c2c70be61c94",
+      "first_id": "codex-041",
+      "last_id": "cursor-038"
+    },
+    {
+      "file": "data/observations/observations-0004.jsonl",
+      "rows": 200,
+      "bytes": 499151,
+      "sha256": "87bc7198f2960c20ac25c7453ae2414a459f77270db97755526ebff71be9349e",
+      "first_id": "cursor-039",
+      "last_id": "grok-106"
+    }
+  ],
+  "files": {
+    "sources": "data/sources.jsonl",
+    "leads": "data/leads.jsonl",
+    "summary": "data/summary.json"
+  }
+}
