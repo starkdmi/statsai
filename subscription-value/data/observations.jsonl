@@ -1,0 +1,11 @@
+# POINTER ONLY — this file is not the observation corpus.
+# Do not invent, concatenate, or reconstruct rows here.
+#
+# Canonical 800 observations will be committed as checksummed shards:
+#   data/observations/observations-0001.jsonl  (claude-001 .. claude-200)
+#   data/observations/observations-0002.jsonl  (claude-201 .. codex-040)
+#   data/observations/observations-0003.jsonl  (codex-041 .. cursor-038)
+#   data/observations/observations-0004.jsonl  (cursor-039 .. grok-106)
+#
+# Verify each shard against data/manifest.json (rows, bytes, sha256, first_id, last_id).
+# See DATASET_README.md and HANDOFF.md.

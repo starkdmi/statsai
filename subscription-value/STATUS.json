@@ -1,0 +1,24 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_version": "statsai_subscription_value.observation.v1",
+  "phase": "layout_ready_awaiting_shards",
+  "layout_ready": true,
+  "docs_ready": true,
+  "manifest_ready": true,
+  "summary_ready": true,
+  "shards_committed": false,
+  "baseline_n": 800,
+  "committed_observations": 0,
+  "expected_shards": 4,
+  "verified_shards": 0,
+  "pending_shards": [
+    "data/observations/observations-0001.jsonl",
+    "data/observations/observations-0002.jsonl",
+    "data/observations/observations-0003.jsonl",
+    "data/observations/observations-0004.jsonl"
+  ],
+  "collection_status": "discovery_frontiers_largely_exhausted",
+  "viral_quartet_status": "exhausted_no_attributed_primary",
+  "handoff": "READY_FOR_SHARDS",
+  "updated_at": "2026-09-13T08:41:00Z"
+}

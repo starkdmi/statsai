@@ -1,0 +1,34 @@
+{
+  "collection_status": "discovery_frontiers_largely_exhausted",
+  "viral_quartet_status": "exhausted_no_attributed_primary",
+  "corpus_version": "1.0.0",
+  "schema_version": "statsai_subscription_value.observation.v1",
+  "baseline_n": 800,
+  "analysis_kept": 491,
+  "n_high_confidence_ge_80": 308,
+  "by_provider": {
+    "anthropic": 360,
+    "openai": 202,
+    "cursor": 132,
+    "xai": 106
+  },
+  "quality_audit": {
+    "n": 800,
+    "primary": 0.96,
+    "plan_known": 0.715,
+    "raw_tokens": 0.3275,
+    "conf_ge_70": 0.605,
+    "conf_ge_85": 0.2662
+  },
+  "shard_ingest": {
+    "expected": 4,
+    "received": 0,
+    "verified": 0,
+    "encoding": "gzip+base64",
+    "verify_against": "data/manifest.json"
+  },
+  "notes": [
+    "Observation rows are not invented in this layout commit.",
+    "Shards arrive in follow-up messages as gzip+base64 and must match data/manifest.json SHA-256, row counts, byte sizes, and first/last IDs."
+  ]
+}
