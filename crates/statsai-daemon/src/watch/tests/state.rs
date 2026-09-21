@@ -212,6 +212,7 @@ fn disabled_configured_source_suppresses_matching_discovered_watch_scan() {
         adapters[0].as_ref(),
         &[disabled],
         std::slice::from_ref(&root.path().to_path_buf()),
+        false,
         &watch_plan.verification_dependencies,
     );
 
@@ -263,6 +264,7 @@ fn watch_path_build_and_event_routing_probe_dependencies_once() {
         adapters[0].as_ref(),
         std::slice::from_ref(&source),
         std::slice::from_ref(&external_profile),
+        false,
         &refreshed_watch_plan.verification_dependencies,
     );
 
@@ -319,6 +321,7 @@ fn external_verification_dependency_is_watched_and_routes_to_its_source() {
         &adapter,
         std::slice::from_ref(&source),
         std::slice::from_ref(&external_profile),
+        false,
         &verification_dependencies,
     );
 

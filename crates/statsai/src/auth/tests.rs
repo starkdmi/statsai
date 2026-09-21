@@ -2,6 +2,7 @@ use super::logout::logout_backend;
 use super::session::{with_device_id_retry, DeviceSessionRequestError};
 use super::*;
 use std::cell::Cell;
+use std::io::Write;
 
 #[test]
 fn credential_transport_allows_https_and_explicit_loopback_http_only() {
@@ -706,4 +707,468 @@ fn with_device_id_retry_propagates_fatal_errors() {
     .expect_err("fatal error should propagate");
 
     assert!(error.to_string().contains("fatal problem"));
+}
+
+#[test]
+fn oauth_callback_keeps_state_checks_and_header_limits() {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let server = statsai_daemon::http::Server::http("127.0.0.1:0").expect("bind");
+    let address = server.server_addr().to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let code =
+            super::session::listen_for_callback(&server, "state-expected").expect("callback");
+        sender.send(code).expect("send code");
+    });
+
+    let mut oversized = TcpStream::connect(&address).expect("connect");
+    oversized
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    oversized
+        .write_all(b"GET /callback?code=early&state=state-expected HTTP/1.1\r\n")
+        .expect("write");
+    oversized
+        .write_all(&vec![b'h'; statsai_daemon::http::MAX_HEADER_LINE_BYTES + 8])
+        .expect("write");
+    oversized.write_all(b"\r\n\r\n").expect("write");
+    let rejected = read_socket(&mut oversized);
+    assert!(rejected.contains("431"), "{rejected}");
+
+    let mut invalid = TcpStream::connect(&address).expect("connect");
+    invalid
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    invalid
+        .write_all(b"GET /callback?code=nope&state=wrong HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write");
+    let rejected = read_socket(&mut invalid);
+    assert!(rejected.contains("400"), "{rejected}");
+    assert!(receiver.try_recv().is_err());
+
+    let mut valid = TcpStream::connect(&address).expect("connect");
+    valid
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    valid
+        .write_all(
+            b"GET /callback?code=abc%20123&state=state-expected HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .expect("write");
+    let accepted = read_socket(&mut valid);
+    assert!(accepted.contains("200"), "{accepted}");
+    assert!(accepted.contains("Device linked"), "{accepted}");
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(2)).expect("code"),
+        "abc 123"
+    );
+}
+
+fn read_socket(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => buffer.extend_from_slice(&chunk[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if !buffer.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+#[test]
+fn oversized_token_refresh_does_not_replace_credentials() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        read_http_headers(&mut stream);
+        let body = vec![b'x'; statsai_core::JSON_RESPONSE_LIMIT_AUTH + 1];
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).expect("header");
+        stream.write_all(&body).ok();
+    });
+    let api = format!("http://{address}");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("auth.json");
+    let mut credentials = AuthCredentials {
+        backend: Some("cloudflare".to_string()),
+        api_base_url: Some(api.clone()),
+        cloudflare_refresh_token: Some("refresh-old".to_string()),
+        cloudflare_refresh_expires_at_secs: 10,
+        cloudflare_access_token: Some("access-old".to_string()),
+        cloudflare_access_expires_at_secs: 10,
+        device_id: Some("device-old".to_string()),
+    };
+    write_credentials(&path, &credentials).expect("seed");
+    let before = std::fs::read(&path).expect("read seed");
+    let error = refresh_cloudflare_access_token(&path, &mut credentials, &api)
+        .expect_err("oversized refresh");
+    let message = format!("{error:#}");
+    assert!(message.contains("byte limit"), "{message}");
+    assert_eq!(std::fs::read(&path).expect("read after"), before);
+    assert_eq!(
+        credentials.cloudflare_refresh_token.as_deref(),
+        Some("refresh-old")
+    );
+    assert_eq!(
+        credentials.cloudflare_access_token.as_deref(),
+        Some("access-old")
+    );
+}
+
+#[test]
+fn malformed_token_refresh_does_not_replace_credentials() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        read_http_headers(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{")
+            .expect("write");
+    });
+    let api = format!("http://{address}");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("auth.json");
+    let mut credentials = AuthCredentials {
+        backend: Some("cloudflare".to_string()),
+        api_base_url: Some(api.clone()),
+        cloudflare_refresh_token: Some("refresh-old".to_string()),
+        cloudflare_refresh_expires_at_secs: 10,
+        cloudflare_access_token: Some("access-old".to_string()),
+        cloudflare_access_expires_at_secs: 10,
+        device_id: Some("device-old".to_string()),
+    };
+    write_credentials(&path, &credentials).expect("seed");
+    let before = std::fs::read(&path).expect("read seed");
+    let error = refresh_cloudflare_access_token(&path, &mut credentials, &api)
+        .expect_err("malformed refresh");
+    assert!(
+        format!("{error:#}").contains("parse JSON") || format!("{error:#}").contains("expected"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&path).expect("read after"), before);
+    assert_eq!(
+        credentials.cloudflare_access_token.as_deref(),
+        Some("access-old")
+    );
+}
+
+fn read_http_headers(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let mut seen = Vec::new();
+    let mut byte = [0_u8; 1];
+    while stream.read(&mut byte).unwrap_or(0) == 1 {
+        seen.push(byte[0]);
+        if seen.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&seen);
+    let mut length = 0_usize;
+    for line in text.lines() {
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut left = length;
+    let mut trash = [0_u8; 1024];
+    while left > 0 {
+        let chunk = left.min(trash.len());
+        let count = stream.read(&mut trash[..chunk]).unwrap_or(0);
+        if count == 0 {
+            break;
+        }
+        left -= count;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_secret_service_negotiates_an_encrypted_session() {
+    let _isolated = IsolatedSecretService::start();
+    let entry = session_entry("http://127.0.0.1:9").expect("session entry");
+    entry
+        .set_password("encrypted-session-secret")
+        .expect("store session");
+    assert_eq!(
+        entry.get_password().expect("read session"),
+        "encrypted-session-secret"
+    );
+    let log = _isolated.finish();
+    let algorithms = open_session_algorithms(&log);
+    assert!(
+        algorithms
+            .iter()
+            .any(|algorithm| algorithm == "dh-ietf1024-sha256-aes128-cbc-pkcs7"),
+        "{log}"
+    );
+    assert!(
+        algorithms.iter().all(|algorithm| algorithm != "plain"),
+        "{log}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+struct IsolatedSecretService {
+    dbus_pid: u32,
+    keyring_pid: u32,
+    monitor: std::process::Child,
+    log_path: std::path::PathBuf,
+    previous_env: [(&'static str, Option<String>); 3],
+    _directory: tempfile::TempDir,
+}
+
+#[cfg(target_os = "linux")]
+impl IsolatedSecretService {
+    fn start() -> Self {
+        let directory = tempfile::tempdir().expect("isolated dbus dir");
+        let runtime = directory.path().join("runtime");
+        let data = directory.path().join("data");
+        std::fs::create_dir_all(&runtime).expect("runtime");
+        std::fs::create_dir_all(&data).expect("data");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+                .expect("runtime permissions");
+        }
+        let socket = directory.path().join("bus");
+        let output = std::process::Command::new("dbus-daemon")
+            .args([
+                "--session",
+                "--fork",
+                "--nopidfile",
+                "--print-address=1",
+                "--print-pid=1",
+                &format!("--address=unix:path={}", socket.display()),
+            ])
+            .output()
+            .expect("start dbus-daemon");
+        assert!(
+            output.status.success(),
+            "dbus-daemon failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).expect("dbus output");
+        let mut lines = text.lines();
+        let address = lines.next().expect("dbus address").to_string();
+        let dbus_pid = lines
+            .next()
+            .and_then(|line| line.trim().parse().ok())
+            .expect("dbus pid");
+        let previous_env = [
+            set_isolated_env("DBUS_SESSION_BUS_ADDRESS", &address),
+            set_isolated_env("XDG_RUNTIME_DIR", &runtime.to_string_lossy()),
+            set_isolated_env("XDG_DATA_HOME", &data.to_string_lossy()),
+        ];
+        std::fs::create_dir_all(runtime.join("keyring")).expect("keyring control dir");
+        let started = std::process::Command::new("gnome-keyring-daemon")
+            .args(["--start", "--components=secrets", "--daemonize"])
+            .output()
+            .expect("start gnome-keyring");
+        assert!(
+            started.status.success(),
+            "gnome-keyring start failed: {}\n{}",
+            String::from_utf8_lossy(&started.stdout),
+            String::from_utf8_lossy(&started.stderr)
+        );
+
+        let keyring_pid = wait_for_secret_service_pid();
+        let mut unlock = std::process::Command::new("gnome-keyring-daemon")
+            .arg("--unlock")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn gnome-keyring unlock");
+        unlock
+            .stdin
+            .take()
+            .expect("unlock stdin")
+            .write_all(b"statsai-test")
+            .expect("password");
+        let unlock = unlock.wait_with_output().expect("unlock");
+        assert!(
+            unlock.status.success(),
+            "gnome-keyring unlock failed: {}",
+            String::from_utf8_lossy(&unlock.stderr)
+        );
+        alias_unlocked_collection_as_default();
+        let log_path = directory.path().join("monitor.log");
+        let log_file = std::fs::File::create(&log_path).expect("monitor log");
+        let monitor = std::process::Command::new("dbus-monitor")
+            .arg("--session")
+            .stdout(log_file)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("dbus-monitor");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        Self {
+            dbus_pid,
+            keyring_pid,
+            monitor,
+            log_path,
+            previous_env,
+            _directory: directory,
+        }
+    }
+
+    fn finish(mut self) -> String {
+        let _ = self.monitor.kill();
+        let _ = self.monitor.wait();
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for IsolatedSecretService {
+    fn drop(&mut self) {
+        let _ = self.monitor.kill();
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &self.keyring_pid.to_string()])
+            .status();
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &self.dbus_pid.to_string()])
+            .status();
+        for (key, previous) in &self.previous_env {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_isolated_env(key: &'static str, value: &str) -> (&'static str, Option<String>) {
+    let previous = std::env::var(key).ok();
+    std::env::set_var(key, value);
+    (key, previous)
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+fn alias_unlocked_collection_as_default() {
+    let listed = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.secrets",
+            "/org/freedesktop/secrets",
+            "org.freedesktop.DBus.Properties.Get",
+            "string:org.freedesktop.Secret.Service",
+            "string:Collections",
+        ])
+        .output()
+        .expect("list secret collections");
+    let text = String::from_utf8_lossy(&listed.stdout);
+    let mut paths = text
+        .lines()
+        .filter_map(|line| {
+            let start = line.find('"')?;
+            let rest = &line[start + 1..];
+            let end = rest.find('"')?;
+            let path = &rest[..end];
+            path.starts_with("/org/freedesktop/secrets/collection/")
+                .then(|| path.to_string())
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| !path.ends_with("/session"));
+    let Some(path) = paths.first() else {
+        panic!("secret service has no collection:\n{text}");
+    };
+    let aliased = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.secrets",
+            "/org/freedesktop/secrets",
+            "org.freedesktop.Secret.Service.SetAlias",
+            "string:default",
+            &format!("objpath:{path}"),
+        ])
+        .output()
+        .expect("alias default collection");
+    assert!(
+        aliased.status.success(),
+        "alias default collection failed: {}\n{}",
+        String::from_utf8_lossy(&aliased.stdout),
+        String::from_utf8_lossy(&aliased.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_secret_service_pid() -> u32 {
+    let started = std::time::Instant::now();
+    let mut last = String::new();
+    while started.elapsed() < std::time::Duration::from_secs(5) {
+        match secret_service_pid() {
+            Ok(pid) => return pid,
+            Err(error) => last = error,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("secret service did not register: {last}");
+}
+
+#[cfg(target_os = "linux")]
+fn secret_service_pid() -> Result<u32, String> {
+    let output = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--dest=org.freedesktop.DBus",
+            "--print-reply",
+            "--type=method_call",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.GetConnectionUnixProcessID",
+            "string:org.freedesktop.secrets",
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace()
+        .find_map(|token| token.parse::<u32>().ok())
+        .ok_or_else(|| format!("{}\n{}", text, String::from_utf8_lossy(&output.stderr)))
+}
+
+#[cfg(target_os = "linux")]
+fn open_session_algorithms(log: &str) -> Vec<String> {
+    let mut algorithms = Vec::new();
+    let mut lines = log.lines();
+    while let Some(line) = lines.next() {
+        if !line.contains("member=OpenSession") {
+            continue;
+        }
+        let Some(next) = lines.next() else {
+            break;
+        };
+        if let Some(start) = next.find('"') {
+            if let Some(end) = next[start + 1..].find('"') {
+                algorithms.push(next[start + 1..start + 1 + end].to_string());
+            }
+        }
+    }
+    algorithms
 }

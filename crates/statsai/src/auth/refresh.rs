@@ -76,7 +76,12 @@ pub(crate) fn refresh_cloudflare_access_token(
             }
         }
     };
-    let json: serde_json::Value = response.into_json()?;
+    let encoding = response.header("Content-Encoding").map(str::to_owned);
+    let json: serde_json::Value = statsai_core::read_encoded_json_limited(
+        response.into_reader(),
+        encoding.as_deref(),
+        statsai_core::JSON_RESPONSE_LIMIT_AUTH,
+    )?;
     let access_token = json["accessToken"]
         .as_str()
         .context("Missing accessToken from token refresh")?

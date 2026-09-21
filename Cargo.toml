@@ -45,7 +45,7 @@ clap = { version = "4", features = ["derive"] }
 csv = "1"
 hex = "0.4"
 libc = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
 schemars = { version = "0.8", features = ["chrono"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -54,7 +54,7 @@ tempfile = "3"
 thiserror = "1"
 tiny_http = "0.12"
 walkdir = "2"
-notify = "7"
+notify = "8.2.0"
 nix = { version = "0.30", features = ["fs", "poll"] }
 opf-mlx = "0.2.1"
 ureq = { version = "2.9", features = ["json"] }

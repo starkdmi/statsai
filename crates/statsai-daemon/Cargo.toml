@@ -7,16 +7,26 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 statsai-adapters.workspace = true
 statsai-core.workspace = true
 statsai-store.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+ascii = "1"
+chunked_transfer = "1"
+httpdate = "1"
+log = "0.4"
 notify = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-tiny_http.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fsevent-sys = "4.1"
+libc.workspace = true
 
 [features]
 watch = ["dep:notify"]

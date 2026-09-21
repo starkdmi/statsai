@@ -29,9 +29,9 @@ pub(crate) use rollups::{
     SyncRollupBucketKey,
 };
 pub(crate) use sql::{
-    begin_immediate_transaction_with_retry, commit_transaction, parse_rfc3339_for_row,
-    restrict_dir_permissions, restrict_file_permissions, rollback, safe_u64_to_i64,
-    sqlite_in_clause_placeholders, sqlite_string_params, sync_state_from_row,
+    begin_immediate_transaction_with_retry, commit_transaction, enable_sqlite_defensive,
+    parse_rfc3339_for_row, restrict_dir_permissions, restrict_file_permissions, rollback,
+    safe_u64_to_i64, sqlite_in_clause_placeholders, sqlite_string_params, sync_state_from_row,
 };
 pub use verified::{
     apply_source_account_resolution, apply_verified_source_state,
@@ -349,6 +349,7 @@ impl Store {
         }
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         restrict_file_permissions(path)?;
+        enable_sqlite_defensive(&conn)?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         let store = Self { conn };
         store.migrate()?;
@@ -428,9 +429,9 @@ impl Store {
     }
 
     pub fn in_memory() -> Result<Self> {
-        let store = Self {
-            conn: Connection::open_in_memory()?,
-        };
+        let conn = Connection::open_in_memory()?;
+        enable_sqlite_defensive(&conn)?;
+        let store = Self { conn };
         store.conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         store.migrate()?;
         store.configure_connection()?;
@@ -605,11 +606,18 @@ impl Store {
         migrations::schema_version(&self.conn)
     }
 
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn checkpoint_wal(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     }
 }
 
+#[cfg(test)]
+mod sqlite_security;
 #[cfg(test)]
 mod tests;

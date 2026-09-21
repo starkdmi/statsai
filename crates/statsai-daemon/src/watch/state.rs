@@ -69,6 +69,10 @@ impl VerificationDependencyCache {
         paths
     }
 
+    pub(super) fn invalidate_all(&mut self) {
+        self.entries.clear();
+    }
+
     pub(super) fn invalidate_changed(
         &mut self,
         adapters: &[Box<dyn ProviderAdapter>],

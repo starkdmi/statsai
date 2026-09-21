@@ -585,6 +585,100 @@ fn test_task_bucket_snapshot() -> TaskBucketSnapshot {
     }
 }
 
+#[test]
+fn daemon_run_serves_health_and_rejects_oversized_headers() {
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let address = listener.local_addr().expect("port");
+    drop(listener);
+    let store = Arc::new(Mutex::new(Store::in_memory().expect("store")));
+    thread::spawn(move || {
+        let _ = run(&address.to_string(), store, "daemon-token");
+    });
+
+    let health = wait_for_response(&address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(health.contains("200"), "{health}");
+    assert!(health.contains("\"status\": \"ok\""), "{health}");
+
+    let mut status = TcpStream::connect(address).expect("status");
+    status
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    status
+        .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write");
+    let denied = read_response(&mut status);
+    assert!(denied.contains("401"), "{denied}");
+
+    let mut oversized = TcpStream::connect(address).expect("oversized");
+    oversized
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    oversized
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("write");
+    oversized
+        .write_all(&vec![b'a'; http::MAX_HEADER_LINE_BYTES + 8])
+        .expect("write");
+    oversized.write_all(b"\r\n\r\n").expect("write");
+    let rejected = read_response(&mut oversized);
+    assert!(rejected.contains("431"), "{rejected}");
+}
+
+fn wait_for_response(address: &std::net::SocketAddr, request: &str) -> String {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        if let Ok(mut stream) = TcpStream::connect(address) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout");
+            if stream.write_all(request.as_bytes()).is_ok() {
+                let response = read_response(&mut stream);
+                if !response.is_empty() {
+                    return response;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("daemon did not respond on {address}");
+}
+
+fn read_response(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => buffer.extend_from_slice(&chunk[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if !buffer.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
 fn test_task_verification() -> TaskVerification {
     let created_at = Utc
         .with_ymd_and_hms(2026, 7, 5, 10, 6, 0)

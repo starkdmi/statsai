@@ -383,9 +383,14 @@ impl GitHubClient {
     }
 
     fn get_json<T: DeserializeOwned>(&self, request: ureq::Request, action: &str) -> Result<T> {
-        self.call(request, action)?
-            .into_json()
-            .with_context(|| format!("parse GitHub response while attempting to {action}"))
+        let response = self.call(request, action)?;
+        let encoding = response.header("Content-Encoding").map(str::to_owned);
+        statsai_core::read_encoded_json_limited(
+            response.into_reader(),
+            encoding.as_deref(),
+            statsai_core::JSON_RESPONSE_LIMIT_DEFAULT,
+        )
+        .with_context(|| format!("parse GitHub response while attempting to {action}"))
     }
 
     fn call(&self, request: ureq::Request, action: &str) -> Result<ureq::Response> {

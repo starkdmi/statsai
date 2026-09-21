@@ -1,12 +1,18 @@
+mod fsevent;
+mod pending;
 mod scan;
 mod state;
 
 pub(crate) use super::lock_store;
+#[cfg(test)]
+use pending::WatchNotice;
+use pending::{note_notify_event, PendingWatch};
 use scan::*;
 use state::*;
 
+use crate::http::Server;
 use anyhow::{Context, Result};
-use notify::{Event, EventKind};
+use notify::{Event, Watcher};
 use statsai_adapters::{default_adapters, ProviderAdapter};
 use statsai_store::Store;
 use std::collections::{HashMap, HashSet};
@@ -14,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
-use tiny_http::Server;
 
 const WATCH_SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const WATCH_SCAN_INITIAL_RETRY_DELAY: Duration = if cfg!(test) {
@@ -60,32 +65,95 @@ pub fn watch_and_serve(
     } = initial_plan;
     let verification_dependencies = Arc::new(RwLock::new(initial_verification_dependencies));
     let (watcher_signal_tx, watcher_signal_rx) = mpsc::sync_channel(1);
-    let pending_changed_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
+    let pending_changed_paths = Arc::new(Mutex::new(PendingWatch::default()));
     let callback_pending_paths = Arc::clone(&pending_changed_paths);
+    let callback_signal = watcher_signal_tx;
 
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        if let Ok(event) = res {
-            if matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-            ) {
-                callback_pending_paths
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .extend(event.paths);
-                let _ = watcher_signal_tx.try_send(());
-            }
-        }
-    })
-    .context("create file watcher")?;
+    #[cfg(target_os = "macos")]
+    {
+        let mut watcher = fsevent::FsEventWatcher::new(
+            move |event| note_signaled_event(&callback_pending_paths, &callback_signal, event),
+            notify::Config::default(),
+        )
+        .context("create FSEvents watcher")?;
+        run_watch_loop(
+            &mut watcher,
+            |watcher| watcher.poll_restart(),
+            addr,
+            store,
+            device_id,
+            auth_token,
+            watch_adapters,
+            verification_dependency_cache,
+            verification_dependencies,
+            initial_sources,
+            watcher_signal_rx,
+            pending_changed_paths,
+            startup_executable,
+            bind_addr,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut watcher = notify::recommended_watcher(move |event| {
+            note_signaled_event(&callback_pending_paths, &callback_signal, event);
+        })
+        .context("create file watcher")?;
+        run_watch_loop(
+            &mut watcher,
+            |_| Ok(()),
+            addr,
+            store,
+            device_id,
+            auth_token,
+            watch_adapters,
+            verification_dependency_cache,
+            verification_dependencies,
+            initial_sources,
+            watcher_signal_rx,
+            pending_changed_paths,
+            startup_executable,
+            bind_addr,
+        )
+    }
+}
 
+fn note_signaled_event(
+    pending: &Arc<Mutex<PendingWatch>>,
+    signal: &mpsc::SyncSender<()>,
+    event: Result<Event, notify::Error>,
+) {
+    note_notify_event(
+        &mut pending.lock().unwrap_or_else(|error| error.into_inner()),
+        event,
+    );
+    let _ = signal.try_send(());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_watch_loop<W: Watcher>(
+    watcher: &mut W,
+    mut poll_watcher: impl FnMut(&mut W) -> Result<()>,
+    _addr: &str,
+    store: Arc<Mutex<Store>>,
+    device_id: &str,
+    auth_token: &str,
+    watch_adapters: Vec<Box<dyn ProviderAdapter>>,
+    mut verification_dependency_cache: VerificationDependencyCache,
+    verification_dependencies: Arc<RwLock<VerificationDependencySnapshot>>,
+    initial_sources: HashMap<PathBuf, WatchScope>,
+    watcher_signal_rx: mpsc::Receiver<()>,
+    pending_changed_paths: Arc<Mutex<PendingWatch>>,
+    startup_executable: Option<ExecutableStamp>,
+    bind_addr: std::net::SocketAddr,
+) -> Result<()> {
     let background_store = {
         let store = super::lock_store(&store);
         store.reopen()
     };
     let (scan_signal_tx, scan_signal_rx) = mpsc::sync_channel(1);
     let worker_scan_signal_tx = scan_signal_tx.clone();
-    let pending_scan_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
+    let pending_scan_paths = Arc::new(Mutex::new(PendingWatch::default()));
     let worker_pending_scan_paths = Arc::clone(&pending_scan_paths);
     let worker_shared_store = Arc::clone(&store);
     let worker_verification_dependencies = Arc::clone(&verification_dependencies);
@@ -95,17 +163,11 @@ pub fn watch_and_serve(
         .spawn(move || {
             let mut retry_delay = WATCH_SCAN_INITIAL_RETRY_DELAY;
             while scan_signal_rx.recv().is_ok() {
-                let changed = worker_pending_scan_paths
+                let notice = worker_pending_scan_paths
                     .lock()
-                    .map(|mut paths| {
-                        std::mem::take(&mut *paths).into_iter().collect::<Vec<_>>()
-                    })
-                    .unwrap_or_else(|error| {
-                        std::mem::take(&mut *error.into_inner())
-                            .into_iter()
-                            .collect::<Vec<_>>()
-                    });
-                if changed.is_empty() {
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if notice.paths().is_empty() && !notice.rescan_all() {
                     continue;
                 }
                 let dependency_snapshot = worker_verification_dependencies
@@ -115,14 +177,15 @@ pub fn watch_and_serve(
                 let scan_succeeded = process_background_scan(
                     &worker_pending_scan_paths,
                     &worker_scan_signal_tx,
-                    changed,
+                    notice,
                     retry_delay,
-                    |changed| match background_store.as_ref() {
+                    |notice| match background_store.as_ref() {
                         Ok(store) => rescan_changed_sources(
                             store,
                             &worker_shared_store,
                             &worker_device_id,
-                            changed,
+                            notice.paths(),
+                            notice.rescan_all(),
                             &dependency_snapshot,
                         ),
                         Err(error) => {
@@ -134,7 +197,8 @@ pub fn watch_and_serve(
                             rescan_changed_sources_with_adapters_and_dependencies(
                                 &store,
                                 &worker_device_id,
-                                changed,
+                                notice.paths(),
+                                notice.rescan_all(),
                                 &adapters,
                                 &dependency_snapshot,
                             )
@@ -155,7 +219,7 @@ pub fn watch_and_serve(
     let mut watched_sources = HashMap::new();
     let mut uncertain_watch_sources = HashSet::new();
     let initially_watched = reconcile_watch_sources(
-        &mut watcher,
+        watcher,
         &mut watched_sources,
         &mut uncertain_watch_sources,
         initial_sources,
@@ -175,18 +239,20 @@ pub fn watch_and_serve(
             eprintln!("daemon: executable changed on disk; restarting");
             return Ok(());
         }
+        poll_watcher(watcher)?;
         match watcher_signal_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(()) => {
-                let changed = pending_changed_paths
+                let notice = pending_changed_paths
                     .lock()
-                    .map(|mut paths| std::mem::take(&mut *paths).into_iter().collect::<Vec<_>>())
-                    .unwrap_or_else(|error| {
-                        std::mem::take(&mut *error.into_inner())
-                            .into_iter()
-                            .collect::<Vec<_>>()
-                    });
-                verification_dependency_cache.invalidate_changed(&watch_adapters, &changed);
-                enqueue_background_scan(&pending_scan_paths, &scan_signal_tx, changed);
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if notice.rescan_all() {
+                    verification_dependency_cache.invalidate_all();
+                } else {
+                    verification_dependency_cache
+                        .invalidate_changed(&watch_adapters, notice.paths());
+                }
+                enqueue_watch_notice(&pending_scan_paths, &scan_signal_tx, notice);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -210,7 +276,7 @@ pub fn watch_and_serve(
                         .unwrap_or_else(|error| error.into_inner()) =
                         desired_plan.verification_dependencies;
                     let newly_watched = reconcile_watch_sources(
-                        &mut watcher,
+                        watcher,
                         &mut watched_sources,
                         &mut uncertain_watch_sources,
                         desired_plan.paths,

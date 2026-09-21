@@ -160,9 +160,13 @@ fn pull_remote_task_verifications(
         }
         Err(error) => return Err(http_request_error("pull task verifications", error)),
     };
-    let feed: TaskVerificationFeedResponse = response
-        .into_json()
-        .context("parse task verification feed")?;
+    let encoding = response.header("Content-Encoding").map(str::to_owned);
+    let feed: TaskVerificationFeedResponse = statsai_core::read_encoded_json_limited(
+        response.into_reader(),
+        encoding.as_deref(),
+        statsai_core::JSON_RESPONSE_LIMIT_DEFAULT,
+    )
+    .context("parse task verification feed")?;
     let mut affected_buckets = BTreeSet::new();
     for verification in &feed.verifications {
         if store.merge_task_verification(verification)? {
@@ -640,10 +644,13 @@ pub(crate) fn optional_http_sync_preflight_status(status: u16) -> bool {
 }
 
 fn http_response_json(response: ureq::Response, action: &str) -> Result<Value> {
-    let body = response
-        .into_string()
-        .with_context(|| format!("read HTTP {action} response body"))?;
-    serde_json::from_str(&body).with_context(|| format!("parse HTTP {action} response JSON"))
+    let encoding = response.header("Content-Encoding").map(str::to_owned);
+    statsai_core::read_encoded_json_limited(
+        response.into_reader(),
+        encoding.as_deref(),
+        statsai_core::JSON_RESPONSE_LIMIT_DEFAULT,
+    )
+    .with_context(|| format!("parse HTTP {action} response JSON"))
 }
 
 pub(crate) fn logical_http_rollup_batch_id(batch_id: &str) -> String {
@@ -686,4 +693,134 @@ pub(crate) fn remote_last_sync_batch_id(remote: &Value) -> Option<&str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod response_limit_tests {
+    use super::*;
+    use chrono::Utc;
+    use statsai_core::{TaskVerificationCursor, TaskVerificationId};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn an_oversized_task_feed_leaves_the_sync_cursor_unchanged() {
+        let store = Store::in_memory().expect("store");
+        let cursor = TaskVerificationCursor {
+            updated_at: Utc::now(),
+            verification_id: TaskVerificationId("kept-verification".to_string()),
+        };
+        store
+            .record_sync_success(
+                "http",
+                "http://cursor.test",
+                "batch-seed",
+                &[],
+                &[],
+                Some(&cursor),
+            )
+            .expect("seed cursor");
+        let before = store
+            .sync_task_verification_cursor("http", "http://cursor.test")
+            .expect("cursor");
+        assert!(before.is_some());
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_request(&mut stream);
+            let length = statsai_core::JSON_RESPONSE_LIMIT_DEFAULT + 1;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(header.as_bytes()).is_err() {
+                return;
+            }
+            let chunk = vec![b'y'; 64 * 1024];
+            let mut sent = 0_usize;
+            while sent < length {
+                let count = (length - sent).min(chunk.len());
+                if stream.write_all(&chunk[..count]).is_err() {
+                    return;
+                }
+                sent += count;
+            }
+        });
+        let endpoint = format!("http://{address}/api/sync/batches");
+        let error = pull_remote_task_verifications(
+            &store,
+            "http",
+            "http://cursor.test",
+            &endpoint,
+            Some("token"),
+        )
+        .expect_err("oversized feed");
+        assert!(format!("{error:#}").contains("byte limit"), "{error:#}");
+        let after = store
+            .sync_task_verification_cursor("http", "http://cursor.test")
+            .expect("cursor after");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_malformed_task_feed_leaves_the_sync_cursor_unchanged() {
+        let store = Store::in_memory().expect("store");
+        let cursor = TaskVerificationCursor {
+            updated_at: Utc::now(),
+            verification_id: TaskVerificationId("kept-verification".to_string()),
+        };
+        store
+            .record_sync_success(
+                "http",
+                "http://cursor.test",
+                "batch-seed",
+                &[],
+                &[],
+                Some(&cursor),
+            )
+            .expect("seed cursor");
+        let before = store
+            .sync_task_verification_cursor("http", "http://cursor.test")
+            .expect("cursor");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_request(&mut stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{",
+            );
+        });
+        let endpoint = format!("http://{address}/api/sync/batches");
+        let error = pull_remote_task_verifications(
+            &store,
+            "http",
+            "http://cursor.test",
+            &endpoint,
+            Some("token"),
+        )
+        .expect_err("malformed feed");
+        assert!(
+            format!("{error:#}").contains("parse task verification feed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store
+                .sync_task_verification_cursor("http", "http://cursor.test")
+                .expect("cursor after"),
+            before
+        );
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) {
+        let mut seen = Vec::new();
+        let mut byte = [0_u8; 1];
+        while stream.read(&mut byte).unwrap_or(0) == 1 {
+            seen.push(byte[0]);
+            if seen.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+    }
 }

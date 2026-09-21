@@ -1,5 +1,6 @@
 //! SQLite-consistent APFS cloning for development stores.
 
+use super::enable_sqlite_defensive;
 use anyhow::{bail, Context, Result};
 #[cfg(target_os = "macos")]
 use rusqlite::TransactionBehavior;
@@ -389,11 +390,13 @@ fn checkpoint_wal_while_writer_is_held(connection: &Connection, source: &Path) -
 }
 
 fn open_read_only(path: &Path) -> Result<Connection> {
-    Connection::open_with_flags(
+    let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| format!("open database read-only at {}", path.display()))
+    .with_context(|| format!("open database read-only at {}", path.display()))?;
+    enable_sqlite_defensive(&connection)?;
+    Ok(connection)
 }
 
 #[cfg(target_os = "macos")]
@@ -403,6 +406,7 @@ fn open_read_write(path: &Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("open database for snapshot at {}", path.display()))?;
+    enable_sqlite_defensive(&connection)?;
     connection
         .busy_timeout(SNAPSHOT_BUSY_TIMEOUT)
         .with_context(|| format!("configure snapshot timeout for {}", path.display()))?;

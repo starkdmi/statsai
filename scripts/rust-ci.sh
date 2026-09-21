@@ -56,6 +56,7 @@ run_fmt() {
 
 run_clippy() {
   "${cargo_command[@]}" clippy --workspace --all-targets -- -D warnings
+  "${cargo_command[@]}" clippy -p statsai-daemon --features watch --all-targets -- -D warnings
 }
 
 run_tests() {

@@ -10,7 +10,7 @@ use statsai_store::ScanFileStateEntry;
 use std::sync::{Arc, Mutex};
 #[test]
 fn background_scan_queue_coalesces_paths_without_dropping_them() {
-    let pending = Arc::new(Mutex::new(HashSet::new()));
+    let pending = Arc::new(Mutex::new(PendingWatch::default()));
     let (signal_tx, signal_rx) = mpsc::sync_channel(1);
     let first = PathBuf::from("/tmp/statsai-scan-first");
     let second = PathBuf::from("/tmp/statsai-scan-second");
@@ -21,21 +21,21 @@ fn background_scan_queue_coalesces_paths_without_dropping_them() {
     signal_rx.try_recv().expect("one coalesced wakeup");
     assert!(signal_rx.try_recv().is_err());
     assert_eq!(
-        *pending.lock().expect("pending scan paths"),
-        HashSet::from([first, second])
+        pending.lock().expect("pending scan paths").paths(),
+        &HashSet::from([first, second])
     );
 }
 
 #[test]
 fn failed_background_scan_is_requeued_for_retry() {
-    let pending = Arc::new(Mutex::new(HashSet::new()));
+    let pending = Arc::new(Mutex::new(PendingWatch::default()));
     let (signal_tx, signal_rx) = mpsc::sync_channel(1);
     let changed = PathBuf::from("/tmp/statsai-scan-retry");
 
     let scan_succeeded = process_background_scan(
         &pending,
         &signal_tx,
-        vec![changed.clone()],
+        WatchNotice::Paths(vec![changed.clone()]),
         Duration::ZERO,
         |_| anyhow::bail!("database is locked"),
     );
@@ -43,8 +43,8 @@ fn failed_background_scan_is_requeued_for_retry() {
     assert!(!scan_succeeded);
     signal_rx.try_recv().expect("retry wakeup");
     assert_eq!(
-        *pending.lock().expect("pending scan paths"),
-        HashSet::from([changed])
+        pending.lock().expect("pending scan paths").paths(),
+        &HashSet::from([changed])
     );
 }
 
