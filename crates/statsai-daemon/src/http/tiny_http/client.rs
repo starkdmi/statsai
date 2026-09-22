@@ -2,7 +2,7 @@ use ascii::AsciiString;
 
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
-use std::io::{BufReader, BufWriter, ErrorKind, Read};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -263,15 +263,18 @@ impl ClientConnection {
         let response = Response::from_string(body.unwrap_or_default()).with_status_code(status);
         match self.socket.try_clone() {
             Ok(socket) => {
-                let writer = DeadlineWrite {
+                let mut writer = DeadlineWrite {
                     inner: writer,
                     socket,
                     deadline: Instant::now() + self.limits.write_deadline,
                 };
-                response.raw_print(writer, version, &[], false, None).ok();
+                let _ = response.raw_print(&mut writer, version, &[], false, None);
+                let _ = writer.flush();
             }
             Err(_) => {
-                response.raw_print(writer, version, &[], false, None).ok();
+                let mut writer = writer;
+                let _ = response.raw_print(&mut writer, version, &[], false, None);
+                let _ = writer.flush();
             }
         }
     }

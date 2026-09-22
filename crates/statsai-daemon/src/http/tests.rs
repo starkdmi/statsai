@@ -18,10 +18,14 @@ fn spawn_echo(limits: HttpLimits) -> std::net::SocketAddr {
     let ListenAddr::IP(addr) = server.server_addr() else {
         panic!("expected a TCP listener");
     };
-    thread::spawn(move || {
-        while let Ok(Some(request)) = server.recv_timeout(Duration::from_secs(3)) {
-            let body = format!("{} {}", request.method(), request.url());
-            let _ = request.respond(Response::from_string(body));
+    thread::spawn(move || loop {
+        match server.recv_timeout(Duration::from_millis(250)) {
+            Ok(Some(request)) => {
+                let body = format!("{} {}", request.method(), request.url());
+                let _ = request.respond(Response::from_string(body));
+            }
+            Ok(None) => {}
+            Err(_) => break,
         }
     });
     addr
@@ -460,7 +464,13 @@ fn unsupported_http_version_releases_connection_slots() {
 }
 
 fn rss_bytes() -> Option<usize> {
-    let status = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages: usize = status.split_whitespace().next()?.parse().ok()?;
-    Some(pages.saturating_mul(4096))
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let Some(value) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        let kb: usize = value.split_whitespace().next()?.parse().ok()?;
+        return Some(kb.saturating_mul(1024));
+    }
+    None
 }
