@@ -696,10 +696,7 @@ fn grok_inference_model_resolution_distinguishes_grok_4_7_fast_by_timestamp() {
         standard_cost.estimated_api_equivalent_micro_usd,
         Some(200_000)
     );
-    assert_eq!(
-        fast_cost.estimated_api_equivalent_micro_usd,
-        Some(400_000)
-    );
+    assert_eq!(fast_cost.estimated_api_equivalent_micro_usd, Some(400_000));
 }
 
 #[test]
