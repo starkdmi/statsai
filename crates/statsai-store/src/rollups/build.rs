@@ -63,7 +63,7 @@ pub(crate) fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
     let mut total_cache_read = 0u64;
     let mut total_reasoning = 0u64;
     let mut total_tokens = 0u64;
-    let mut total_events = 0u64;
+    let mut total_requests = 0u64;
     let mut estimated_cost = CostAccumulator::default();
     let mut provider_reported_cost = CostAccumulator::default();
     let mut has_provider_reported_usd = false;
@@ -99,7 +99,8 @@ pub(crate) fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             total_cache_read.saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
         total_reasoning = total_reasoning.saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
         total_tokens = total_tokens.saturating_add(event.usage.computed_total());
-        total_events = total_events.saturating_add(1);
+        let requests = event.usage.requests.unwrap_or(1);
+        total_requests = total_requests.saturating_add(requests);
         estimated_cost.add_estimated(&event.cost);
         if event.cost.provider_reported_micro_usd.is_some()
             || event.cost.provider_reported_usd.is_some()
@@ -235,7 +236,7 @@ pub(crate) fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             .1
             .total_tokens
             .saturating_add(event.usage.computed_total());
-        entry.1.requests = entry.1.requests.saturating_add(1);
+        entry.1.requests = entry.1.requests.saturating_add(requests);
         entry.1.estimated_cost.add_estimated(&event.cost);
         if event.cost.provider_reported_micro_usd.is_some()
             || event.cost.provider_reported_usd.is_some()
@@ -345,7 +346,7 @@ pub(crate) fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
             cache_read_tokens: Some(total_cache_read),
             reasoning_tokens: Some(total_reasoning),
             total_tokens: Some(total_tokens),
-            requests: Some(total_events),
+            requests: Some(total_requests),
             local_prompt_eval_tokens: None,
             local_eval_tokens: None,
         },

@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn sync_rollup_counts_underlying_requests_in_codex_turn_events() {
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-multi-request-rollup"),
+        LocationOrigin::Configured,
+    );
+    let day = Utc
+        .with_ymd_and_hms(2026, 9, 22, 9, 0, 0)
+        .single()
+        .expect("day");
+    let mut first = test_store_event(&source, day, "turn-a");
+    first.model = Some(ModelInfo {
+        normalized_name: Some("gpt-6-sol".to_string()),
+        ..ModelInfo::default()
+    });
+    first.usage.requests = Some(3);
+
+    let mut second = test_store_event(&source, day + chrono::Duration::minutes(1), "turn-b");
+    second.model = first.model.clone();
+    second.usage.requests = Some(5);
+
+    let mut legacy = test_store_event(&source, day + chrono::Duration::minutes(2), "legacy");
+    legacy.model = Some(ModelInfo {
+        normalized_name: Some("gpt-5.4".to_string()),
+        ..ModelInfo::default()
+    });
+
+    let summary = build_sync_rollup_summary(&[first, second, legacy]);
+
+    assert_eq!(summary.usage.requests, Some(9));
+    assert_eq!(summary.models.len(), 2);
+    assert_eq!(summary.models[0].usage.requests, Some(1));
+    assert_eq!(summary.models[1].usage.requests, Some(8));
+}
+
+#[test]
 fn sync_rollups_export_path_only_project_metadata() {
     let store = Store::in_memory().expect("store");
     let source = SourceLocation::local_adapter(

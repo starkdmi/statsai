@@ -105,7 +105,7 @@ impl Store {
             r#"
             SELECT
               COALESCE(SUM(total_tokens), 0),
-              COUNT(*)
+              COALESCE(SUM(COALESCE(CAST(json_extract(payload, '$.usage.requests') AS INTEGER), 1)), 0)
             FROM usage_events
             WHERE started_at >= ?1
             "#,

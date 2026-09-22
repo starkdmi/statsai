@@ -106,9 +106,10 @@ pub use tasks::{
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
 };
 
-// 13: project identity dropped the git remote, so every bucket that carries a
-// path has to be rebuilt for a repository rename to stop splitting a day.
-const SYNC_ROLLUP_SUMMARY_VERSION: &str = "13";
+// 14: rollup request counts sum underlying requests inside each usage event.
+// Codex turn events may contain multiple API requests, so old rollups must be
+// rebuilt and synced again to make model and provider counts comparable.
+const SYNC_ROLLUP_SUMMARY_VERSION: &str = "14";
 const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
 const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
 const SYNC_INCLUDE_ACTIVITY_METADATA_KEY: &str = "sync.include_activity";

@@ -348,7 +348,7 @@ fn insert_events_batches_in_one_transaction() {
 }
 
 #[test]
-fn usage_event_period_stats_since_counts_recent_events() {
+fn usage_event_period_stats_since_counts_requests_inside_recent_events() {
     let store = Store::in_memory().expect("store");
     let source = statsai_core::SourceLocation::local_adapter(
         "codex",
@@ -359,15 +359,17 @@ fn usage_event_period_stats_since_counts_recent_events() {
     );
     store.upsert_source(&source).expect("source");
     let now = Utc::now();
-    let recent = test_store_event(&source, now - chrono::Duration::minutes(5), "recent");
-    let old = test_store_event(&source, now - chrono::Duration::days(2), "old");
+    let mut recent = test_store_event(&source, now - chrono::Duration::minutes(5), "recent");
+    recent.usage.requests = Some(5);
+    let mut old = test_store_event(&source, now - chrono::Duration::days(2), "old");
+    old.usage.requests = Some(2);
     store.insert_events(&[recent, old]).expect("insert events");
 
     let stats = store
         .usage_event_period_stats_since(now - chrono::Duration::hours(1))
         .expect("period stats");
 
-    assert_eq!(stats.requests, 1);
+    assert_eq!(stats.requests, 5);
     assert_eq!(stats.tokens, 15);
 }
 
