@@ -174,7 +174,7 @@ fn dirty_sync_rollups_rebuild_stale_summary_versions() {
         output_tokens: Some(12),
         reasoning_tokens: Some(3),
         total_tokens: Some(15),
-        requests: Some(1),
+        requests: Some(5),
         ..UsageCounts::default()
     };
     event.runtime = Some(statsai_core::RuntimeInfo {
@@ -203,7 +203,7 @@ fn dirty_sync_rollups_rebuild_stale_summary_versions() {
     store
             .conn
             .execute(
-                "UPDATE sync_rollups SET payload = json_set(payload, '$.metadata.summary_version', '3'), dirty = 0",
+                "UPDATE sync_rollups SET payload = json_set(payload, '$.metadata.summary_version', '13', '$.usage.requests', 1), dirty = 0",
                 [],
             )
             .expect("downgrade payload version");
@@ -216,6 +216,7 @@ fn dirty_sync_rollups_rebuild_stale_summary_versions() {
         rebuilt[0].metadata.summary_version.as_deref(),
         Some(SYNC_ROLLUP_SUMMARY_VERSION)
     );
+    assert_eq!(rebuilt[0].usage.requests, Some(5));
     let metrics = rebuilt[0].metrics.as_ref().expect("metrics");
     assert_eq!(metrics.tracked_requests, Some(1));
     assert_eq!(metrics.tracked_output_tokens, Some(12));
