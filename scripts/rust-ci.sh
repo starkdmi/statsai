@@ -57,6 +57,23 @@ run_fmt() {
 run_clippy() {
   "${cargo_command[@]}" clippy --workspace --all-targets -- -D warnings
   "${cargo_command[@]}" clippy -p statsai-daemon --features watch --all-targets -- -D warnings
+  run_macos_watch_arch_clippy
+}
+
+# Linux cannot typecheck the FSEvents backend. On macOS, clippy both
+# architectures so a host-only job cannot hide darwin.rs failures.
+run_macos_watch_arch_clippy() {
+  if [[ "$(uname -s)" != Darwin ]]; then
+    return 0
+  fi
+  local targets=(aarch64-apple-darwin x86_64-apple-darwin)
+  if command -v rustup >/dev/null 2>&1; then
+    rustup target add "${targets[@]}" --toolchain "$required_rust_version"
+  fi
+  local target
+  for target in "${targets[@]}"; do
+    "${cargo_command[@]}" clippy -p statsai-daemon --features watch --all-targets --target "$target" -- -D warnings
+  done
 }
 
 run_tests() {

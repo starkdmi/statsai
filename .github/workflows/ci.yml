@@ -22,6 +22,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/rust-ci.sh fmt
       - run: ./scripts/rust-ci.sh clippy
