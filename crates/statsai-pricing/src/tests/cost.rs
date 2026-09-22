@@ -909,6 +909,90 @@ fn test_model(name: &str) -> statsai_core::ModelInfo {
     }
 }
 
+#[test]
+fn opus_5_5_prices_both_cache_write_lifetimes_without_long_context_surcharge() {
+    let model = test_model("claude-opus-5.5");
+    let usage = UsageCounts {
+        input_tokens: Some(300_000),
+        cache_creation_tokens: Some(200_000),
+        cache_creation_5m_tokens: Some(100_000),
+        cache_creation_1h_tokens: Some(100_000),
+        cache_read_tokens: Some(400_000),
+        output_tokens: Some(10_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let at = parse_utc("2026-09-22T12:00:00Z");
+    let standard = estimate_cost_at("claude_code", Some(&model), &usage, &at);
+    let fast = estimate_cost_at(
+        "claude_code",
+        Some(&statsai_core::ModelInfo {
+            speed: Some("fast".to_string()),
+            ..model
+        }),
+        &usage,
+        &at,
+    );
+
+    assert_eq!(standard.estimated_api_equivalent_micro_usd, Some(2_780_000));
+    assert_eq!(fast.estimated_api_equivalent_micro_usd, Some(5_560_000));
+    assert_eq!(
+        fast.pricing_source.as_deref(),
+        Some("claude_code_api_pricing:claude-opus-5-5:fast")
+    );
+}
+
+#[test]
+fn gpt_6_sol_and_luna_reprice_entire_request_above_272k() {
+    let at = parse_utc("2026-09-22T12:00:00Z");
+    for (name, short_cost, long_cost, fast_long_cost) in [
+        ("gpt-6-sol", 564_400, 1_079_200, 2_158_400),
+        ("gpt-6-luna", 28_220, 53_960, 107_920),
+    ] {
+        let model = test_model(name);
+        let short_usage = UsageCounts {
+            input_tokens: Some(100_000),
+            cache_creation_tokens: Some(100_000),
+            cache_read_tokens: Some(72_000),
+            output_tokens: Some(10_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        };
+        let long_usage = UsageCounts {
+            cache_read_tokens: Some(73_000),
+            ..short_usage.clone()
+        };
+        let standard_short = estimate_cost_at("codex", Some(&model), &short_usage, &at);
+        let standard_long = estimate_cost_at("codex", Some(&model), &long_usage, &at);
+        let fast_long = estimate_cost_at(
+            "codex",
+            Some(&statsai_core::ModelInfo {
+                speed: Some("fast".to_string()),
+                ..model
+            }),
+            &long_usage,
+            &at,
+        );
+
+        assert_eq!(
+            standard_short.estimated_api_equivalent_micro_usd,
+            Some(short_cost)
+        );
+        assert_eq!(
+            standard_long.estimated_api_equivalent_micro_usd,
+            Some(long_cost)
+        );
+        assert_eq!(
+            fast_long.estimated_api_equivalent_micro_usd,
+            Some(fast_long_cost)
+        );
+        assert_eq!(
+            fast_long.pricing_source.as_deref(),
+            Some(format!("codex_api_pricing:{name}:fast").as_str())
+        );
+    }
+}
+
 fn parse_utc(value: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(value)
         .expect("valid timestamp")

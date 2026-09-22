@@ -55,6 +55,22 @@ fn normalizes_gpt_6_astra() {
 }
 
 #[test]
+fn normalizes_new_opus_and_gpt_6_models_without_collapsing_opus_5_5() {
+    assert_eq!(normalize_model_name("claude-opus-5-5"), "claude-opus-5-5");
+    assert_eq!(normalize_model_name("claude-opus-5.5"), "claude-opus-5-5");
+    assert_eq!(normalize_model_name("claude-5.5-opus"), "claude-opus-5-5");
+    assert_eq!(
+        normalize_model_name("openrouter/claude-opus-5-5-thinking"),
+        "claude-opus-5-5"
+    );
+    assert_eq!(normalize_model_name("openai/gpt-6-sol"), "gpt-6-sol");
+    assert_eq!(
+        normalize_model_name("relay/openai-gpt-6-luna"),
+        "gpt-6-luna"
+    );
+}
+
+#[test]
 fn normalizes_codex_aliases() {
     assert_eq!(normalize_model_name("gpt-5.1-codex"), "gpt-5-codex");
     assert_eq!(normalize_model_name("gpt-5.1-codex-mini"), "gpt-5-mini");
