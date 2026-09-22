@@ -150,10 +150,6 @@ impl RootMap {
         }
     }
 
-    pub(crate) fn refresh_targets(&mut self, canonicalize: impl Fn(&Path) -> Option<PathBuf>) {
-        let _ = self.refresh_changed_targets(canonicalize);
-    }
-
     /// Updates canonical targets that still exist. Deleted mappings keep the
     /// last known canonical path. Returns whether any stored target changed.
     pub(crate) fn refresh_changed_targets(
@@ -323,11 +319,11 @@ mod tests {
             PathBuf::from("/real/old"),
             true,
         );
-        roots.refresh_targets(|_| None);
+        assert!(!roots.refresh_changed_targets(|_| None));
         assert_eq!(roots.canonical_paths(), vec![PathBuf::from("/real/old")]);
-        roots.refresh_targets(|configured| {
+        assert!(roots.refresh_changed_targets(|configured| {
             (configured == Path::new("/configured/link")).then(|| PathBuf::from("/real/new"))
-        });
+        }));
         assert_eq!(roots.canonical_paths(), vec![PathBuf::from("/real/new")]);
     }
 
@@ -348,14 +344,14 @@ mod tests {
         assert!(translated.paths.contains(&link.join("child")));
         std::fs::remove_file(&link).expect("remove link");
         std::os::unix::fs::symlink(&new_target, &link).expect("retarget");
-        roots.refresh_targets(|configured| configured.canonicalize().ok());
+        assert!(roots.refresh_changed_targets(|configured| configured.canonicalize().ok()));
         assert_eq!(
             roots.canonical_paths(),
             vec![new_target.canonicalize().expect("new canonical")]
         );
         std::fs::remove_file(&link).expect("delete link");
         let stored = roots.canonical_paths();
-        roots.refresh_targets(|configured| configured.canonicalize().ok());
+        assert!(!roots.refresh_changed_targets(|configured| configured.canonicalize().ok()));
         assert_eq!(roots.canonical_paths(), stored);
         assert_eq!(roots.unwatch(&link), Some(Some(stored[0].clone())));
     }

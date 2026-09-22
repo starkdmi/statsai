@@ -147,19 +147,24 @@ private `recursive_mode.is_recursive()`, captured `stream.0` inside a
 **Fix.** Both items are `pub(in crate::watch)`. Recursion uses
 `matches!(recursive_mode, RecursiveMode::Recursive)`. The FSEvents
 thread consumes the wrapper through `into_inner()` after the move.
-`std::ptr` is gone.
+`std::ptr` and the unused `PathBuf` import are gone. `poll_restart`
+errors convert from `notify::Error` to `anyhow::Error`. The unused
+`refresh_targets` wrapper is gone; production and tests call
+`refresh_changed_targets`.
 
 **Evidence.** macOS `clippy` for `aarch64-apple-darwin` and
 `x86_64-apple-darwin` with `--features watch` (`scripts/rust-ci.sh` and
-the macOS CI job). Linux-only checks still cannot validate `darwin.rs`.
+the macOS CI job). Linux-only checks still cannot typecheck `darwin.rs`.
+The ARM64 development build compiles `statsai-daemon` on macOS and
+catches the same errors.
 
 ### F4–F7 follow-up P2 — Symlink retargeting
 
 **Issue.** Registrations use the canonical target. Replacing the
 configured symlink elsewhere need not emit `ROOT_CHANGED` on that
 target. Periodic reconciliation only compared configured paths, so an
-unchanged path did not re-register. The earlier test called
-`refresh_targets` directly.
+unchanged path did not re-register. An earlier test called
+`refresh_targets` directly; that wrapper is gone.
 
 **Fix.** `poll_restart` (the 250 ms watch-loop hook) compares canonical
 targets via `refresh_changed_targets`. A change rebuilds FSEvents
