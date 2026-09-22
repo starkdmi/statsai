@@ -78,6 +78,9 @@ pub fn estimate_cost_at(
 
     let mut pricing_source = match model_name.as_str() {
         "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{observed_name}"),
+        "grok-4.7" if provider.eq_ignore_ascii_case("cursor") => {
+            format!("cursor_model_pricing:{observed_name}")
+        }
         "grok-build-0.1"
         | "grok-4.3"
         | "grok-4.5"
