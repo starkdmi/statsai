@@ -142,6 +142,18 @@ where
         self.shutdown_unread();
         Err(IoError::new(ErrorKind::InvalidInput, DecoderError))
     }
+
+    fn read_chunk_payload(&mut self, buf: &mut [u8], remaining: usize) -> IoResult<usize> {
+        if buf.is_empty() {
+            self.remaining_chunks_size = Some(remaining);
+            return Ok(0);
+        }
+        let read = self.source.read(buf)?;
+        if read == 0 {
+            return self.fail_invalid();
+        }
+        Ok(read)
+    }
 }
 
 impl<R> Read for ChunkDecoder<R>
@@ -168,13 +180,13 @@ where
         };
 
         if buf.len() < remaining_chunks_size {
-            let read = self.source.read(buf)?;
+            let read = self.read_chunk_payload(buf, remaining_chunks_size)?;
             self.remaining_chunks_size = Some(remaining_chunks_size - read);
             return Ok(read);
         }
 
         let buf = &mut buf[..remaining_chunks_size];
-        let read = self.source.read(buf)?;
+        let read = self.read_chunk_payload(buf, remaining_chunks_size)?;
 
         self.remaining_chunks_size = if read == remaining_chunks_size {
             self.read_carriage_return()?;
@@ -385,5 +397,36 @@ mod test {
         let mut body = String::new();
         decoder.read_to_string(&mut body).unwrap();
         assert_eq!(body, "{}");
+    }
+
+    #[test]
+    fn premature_eof_after_partial_chunk_payload_is_rejected() {
+        let mut decoder = ChunkDecoder::new(b"3\r\n{}".as_slice());
+        let mut body = Vec::new();
+        assert_eq!(
+            decoder.read_to_end(&mut body).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn premature_eof_on_a_short_read_buffer_is_rejected() {
+        let mut decoder = ChunkDecoder::new(b"3\r\n{".as_slice());
+        let mut byte = [0_u8; 1];
+        assert_eq!(decoder.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte[0], b'{');
+        assert_eq!(
+            decoder.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn empty_read_buffer_does_not_finish_a_chunk() {
+        let mut decoder = ChunkDecoder::new(b"3\r\nhel\r\n0\r\n\r\n".as_slice());
+        assert_eq!(decoder.read(&mut []).unwrap(), 0);
+        let mut body = String::new();
+        decoder.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "hel");
     }
 }
