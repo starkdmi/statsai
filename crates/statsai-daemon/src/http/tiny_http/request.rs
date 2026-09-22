@@ -8,9 +8,8 @@ use std::str::FromStr;
 use std::sync::mpsc::Sender;
 
 use crate::http::tiny_http::connection::Connection;
-use crate::http::tiny_http::util::{EqualReader, FusedReader};
+use crate::http::tiny_http::util::{ChunkDecoder, EqualReader, FusedReader};
 use crate::http::tiny_http::{HTTPVersion, Header, Method, Response, StatusCode};
-use chunked_transfer::Decoder;
 
 /// Represents an HTTP request made by a client.
 ///
@@ -221,7 +220,10 @@ where
     } else if transfer_encoding.is_some() {
         // if a transfer-encoding was specified, then "chunked" is ALWAYS applied
         // over the message (RFC2616 #3.6)
-        Box::new(FusedReader::new(Decoder::new(source_data))) as Box<dyn Read + Send + 'static>
+        Box::new(FusedReader::new(ChunkDecoder::with_unread_close(
+            source_data,
+            unread_close,
+        ))) as Box<dyn Read + Send + 'static>
     } else {
         // if we have neither a Content-Length nor a Transfer-Encoding,
         // assuming that we have no data

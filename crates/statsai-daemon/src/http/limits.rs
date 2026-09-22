@@ -4,6 +4,8 @@ use std::time::Duration;
 
 /// Maximum bytes in one request-line or header line, excluding the CRLF.
 pub const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+/// Maximum bytes in one chunk-size line including extensions, excluding CRLF.
+pub const MAX_CHUNK_METADATA_BYTES: usize = MAX_HEADER_LINE_BYTES;
 /// Maximum bytes from the request line through the blank line, including CRLFs.
 pub const MAX_HEADER_BYTES: usize = 32 * 1024;
 /// Maximum number of header fields. The request line is not counted.

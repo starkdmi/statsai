@@ -2,7 +2,8 @@
 //!
 //! The implementation is tiny_http 0.12.0, patched in this crate so `cargo install`
 //! and packaged binaries enforce the same limits. Upstream licenses are
-//! `src/http/tiny_http/LICENSE-MIT` and `LICENSE-APACHE`.
+//! `src/http/tiny_http/LICENSE-MIT` and `LICENSE-APACHE` (tiny-http and the
+//! rust-chunked-transfer decoder this crate vendors a bounded copy of).
 //! Upstream: <https://github.com/tiny-http/tiny-http/tree/0.12.0>.
 
 mod limits;
@@ -13,7 +14,7 @@ mod tiny_http;
 mod tests;
 
 pub use limits::{
-    HttpLimits, BODY_DEADLINE, HEADER_DEADLINE, MAX_ACTIVE_CONNECTIONS, MAX_HEADERS,
-    MAX_HEADER_BYTES, MAX_HEADER_LINE_BYTES, MAX_QUEUED_REQUESTS, WRITE_DEADLINE,
+    HttpLimits, BODY_DEADLINE, HEADER_DEADLINE, MAX_ACTIVE_CONNECTIONS, MAX_CHUNK_METADATA_BYTES,
+    MAX_HEADERS, MAX_HEADER_BYTES, MAX_HEADER_LINE_BYTES, MAX_QUEUED_REQUESTS, WRITE_DEADLINE,
 };
 pub use tiny_http::{Header, ListenAddr, Method, Request, Response, Server, StatusCode};
