@@ -31,6 +31,29 @@ fn spawn_echo(limits: HttpLimits) -> std::net::SocketAddr {
     addr
 }
 
+fn spawn_body_echo(limits: HttpLimits) -> std::net::SocketAddr {
+    let server = Server::http_with_limits("127.0.0.1:0", limits).expect("bind");
+    let ListenAddr::IP(addr) = server.server_addr() else {
+        panic!("expected a TCP listener");
+    };
+    thread::spawn(move || loop {
+        match server.recv_timeout(Duration::from_millis(250)) {
+            Ok(Some(mut request)) => {
+                let mut body = Vec::new();
+                match request.as_reader().read_to_end(&mut body) {
+                    Ok(_) => {
+                        let _ = request.respond(Response::from_data(body));
+                    }
+                    Err(_) => drop(request),
+                }
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+    });
+    addr
+}
+
 fn connect(addr: std::net::SocketAddr) -> TcpStream {
     let stream = TcpStream::connect(addr).expect("connect");
     stream
@@ -74,6 +97,72 @@ fn read_available(stream: &mut TcpStream) -> Vec<u8> {
     buffer
 }
 
+fn write_or_closed(stream: &mut TcpStream, data: &[u8]) {
+    match stream.write_all(data) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::UnexpectedEof
+            ) => {}
+        Err(error) => panic!("write request: {error}"),
+    }
+}
+
+fn write_repeating_or_closed(stream: &mut TcpStream, byte: u8, count: usize) {
+    let block = [byte; 4096];
+    let mut remaining = count;
+    while remaining > 0 {
+        let n = remaining.min(block.len());
+        match stream.write_all(&block[..n]) {
+            Ok(()) => remaining -= n,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("write padding: {error}"),
+        }
+    }
+}
+
+fn recovered_body_echo(addr: std::net::SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        if let Ok(mut stream) = TcpStream::connect(addr) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            if stream
+                .write_all(
+                    b"POST /recovered HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nping",
+                )
+                .is_ok()
+            {
+                last = String::from_utf8_lossy(&read_available(&mut stream)).into_owned();
+                if last.contains("200") && last.contains("ping") {
+                    return;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("server did not recover after chunked framing rejection: {last}");
+}
+
 fn header_line(content_len: usize) -> Vec<u8> {
     let prefix = b"X-Pad: ";
     assert!(content_len >= prefix.len());
@@ -96,6 +185,7 @@ fn production_limits_match_the_security_bounds() {
     assert_eq!(limits.body_deadline, Duration::from_secs(30));
     assert_eq!(limits.write_deadline, Duration::from_secs(30));
     assert_eq!(MAX_HEADER_LINE_BYTES, limits.max_header_line_bytes);
+    assert_eq!(MAX_CHUNK_METADATA_BYTES, MAX_HEADER_LINE_BYTES);
     assert_eq!(MAX_HEADERS, limits.max_headers);
     assert_eq!(MAX_ACTIVE_CONNECTIONS, limits.max_active_connections);
     assert_eq!(MAX_QUEUED_REQUESTS, limits.max_queued_requests);
@@ -507,6 +597,121 @@ fn unsupported_http_version_releases_connection_slots() {
     assert!(
         last.contains("/after-version"),
         "slot recovered after HTTP/2.0 rejections and disconnects: {last}"
+    );
+}
+
+#[test]
+fn oversized_chunk_metadata_is_rejected_and_the_server_recovers() {
+    let addr = spawn_body_echo(limits_for_tests());
+    let before = rss_bytes();
+    let started = Instant::now();
+    let mut stream = connect(addr);
+    write_or_closed(
+        &mut stream,
+        b"POST /chunk HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2",
+    );
+    write_repeating_or_closed(&mut stream, b' ', MAX_CHUNK_METADATA_BYTES);
+    write_or_closed(&mut stream, b"\r\n{}\r\n0\r\n\r\n");
+    let response = String::from_utf8_lossy(&read_available(&mut stream)).into_owned();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?} {response}",
+        started.elapsed()
+    );
+    assert!(
+        !response.contains("{}"),
+        "decoded payload must not be accepted after oversized chunk metadata: {response}"
+    );
+    assert_eq!(stream.read(&mut [0; 8]).unwrap_or(1), 0);
+    if let (Some(before), Some(after)) = (before, rss_bytes()) {
+        assert!(
+            after.saturating_sub(before) < 64 * 1024 * 1024,
+            "chunk-size line must not size an allocation: before={before} after={after}"
+        );
+    }
+    recovered_body_echo(addr);
+}
+
+#[test]
+fn unfinished_chunk_metadata_hits_the_absolute_deadline() {
+    let server = Server::http_with_limits(
+        "127.0.0.1:0",
+        HttpLimits {
+            body_deadline: Duration::from_millis(200),
+            ..limits_for_tests()
+        },
+    )
+    .expect("bind");
+    let ListenAddr::IP(addr) = server.server_addr() else {
+        panic!("tcp");
+    };
+    let handle = thread::spawn(move || {
+        let mut request = server
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recv")
+            .expect("request");
+        let started = Instant::now();
+        let mut body = Vec::new();
+        let error = request
+            .as_reader()
+            .read_to_end(&mut body)
+            .expect_err("deadline");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(body.is_empty());
+    });
+    let mut stream = connect(addr);
+    stream
+        .write_all(
+            b"POST /chunk HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2",
+        )
+        .unwrap();
+    handle.join().expect("server thread");
+}
+
+#[test]
+fn overflowing_chunk_size_is_rejected_and_the_server_recovers() {
+    let addr = spawn_body_echo(limits_for_tests());
+    let mut stream = connect(addr);
+    write_or_closed(
+        &mut stream,
+        b"POST /chunk HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n{}\r\n0\r\n\r\n",
+    );
+    let response = String::from_utf8_lossy(&read_available(&mut stream)).into_owned();
+    assert!(
+        !response.contains("{}"),
+        "overflowing chunk size must not decode a body: {response}"
+    );
+    assert_eq!(stream.read(&mut [0; 8]).unwrap_or(1), 0);
+    recovered_body_echo(addr);
+}
+
+#[test]
+fn valid_chunked_requests_decode_the_payload() {
+    let addr = spawn_body_echo(limits_for_tests());
+    let mut stream = connect(addr);
+    stream
+        .write_all(
+            b"POST /chunk HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+        )
+        .unwrap();
+    let response = String::from_utf8_lossy(&read_available(&mut stream)).into_owned();
+    assert!(response.contains("200"), "{response}");
+    assert!(
+        response.contains("{}"),
+        "valid chunked body must be decoded: {response}"
+    );
+
+    let mut with_ext = connect(addr);
+    with_ext
+        .write_all(
+            b"POST /chunk HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2;ext=1\r\n{}\r\n0\r\n\r\n",
+        )
+        .unwrap();
+    let response = String::from_utf8_lossy(&read_available(&mut with_ext)).into_owned();
+    assert!(
+        response.contains("200") && response.contains("{}"),
+        "{response}"
     );
 }
 

@@ -658,6 +658,69 @@ fn daemon_run_serves_health_and_rejects_oversized_headers() {
     assert!(recovered.contains("200"), "{recovered}");
 }
 
+#[test]
+fn daemon_run_rejects_oversized_chunk_metadata_without_json_validation() {
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let address = listener.local_addr().expect("port");
+    drop(listener);
+    let store = Arc::new(Mutex::new(Store::in_memory().expect("store")));
+    thread::spawn(move || {
+        let _ = run(&address.to_string(), store, "daemon-token");
+    });
+
+    let health = wait_for_response(&address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(health.contains("200"), "{health}");
+
+    let mut valid = TcpStream::connect(address).expect("valid chunked");
+    valid
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    valid
+        .write_all(
+            b"POST /v1/sync/batches HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer daemon-token\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+        )
+        .expect("write valid chunked");
+    let decoded = read_response(&mut valid);
+    assert!(
+        decoded.contains("invalid batch"),
+        "valid chunked JSON must reach validation: {decoded}"
+    );
+
+    let mut oversized = TcpStream::connect(address).expect("oversized chunked");
+    oversized
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    oversized
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("write timeout");
+    let headers = b"POST /v1/sync/batches HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer daemon-token\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n2";
+    if oversized.write_all(headers).is_ok() {
+        let pad = [b' '; 4096];
+        let mut remaining = http::MAX_CHUNK_METADATA_BYTES;
+        while remaining > 0 {
+            let n = remaining.min(pad.len());
+            if oversized.write_all(&pad[..n]).is_err() {
+                break;
+            }
+            remaining -= n;
+        }
+        let _ = oversized.write_all(b"\r\n{}\r\n0\r\n\r\n");
+    }
+    let rejected = read_response(&mut oversized);
+    assert!(
+        !rejected.contains("invalid batch"),
+        "oversized chunk-size line must not reach JSON validation: {rejected}"
+    );
+
+    let recovered = wait_for_response(&address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(recovered.contains("200"), "{recovered}");
+}
+
 fn wait_for_response(address: &std::net::SocketAddr, request: &str) -> String {
     use std::io::Write;
     use std::net::TcpStream;
