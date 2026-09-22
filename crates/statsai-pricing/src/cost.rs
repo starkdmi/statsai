@@ -175,9 +175,7 @@ fn pricing_multipliers(
         .saturating_add(usage.cache_read_tokens.unwrap_or(0));
 
     if model_name == "grok-4.7" && provider.eq_ignore_ascii_case("cursor") {
-        if usage.requests == Some(1)
-            && prompt_tokens > CURSOR_GROK_4_7_LONG_CONTEXT_THRESHOLD
-        {
+        if usage.requests == Some(1) && prompt_tokens > CURSOR_GROK_4_7_LONG_CONTEXT_THRESHOLD {
             // Cursor publishes 2x standard rates above 256k, while Fast is 3x the
             // short-context standard rate. Fast base pricing is already 2x here,
             // so its long-context multiplier is 1.5x rather than 2x.
