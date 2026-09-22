@@ -264,6 +264,9 @@ Covered regressions include:
 
 - huge unread `Content-Length` on the daemon, echo server, and OAuth callback
 - HTTP/2.0 `505` slot release, including client disconnect then `/after-version`
+- oversized chunk-size lines and extensions (8 KiB cap), unfinished metadata
+  hitting the body deadline, numeric overflow, valid chunked `{}`, and daemon
+  recovery without `invalid batch`
 - canonical symlink retarget comparison (no live FSEvents backend here)
 - isolated Linux keyring child process with encrypted `OpenSession`
 
