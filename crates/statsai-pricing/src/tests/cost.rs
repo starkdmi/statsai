@@ -1338,6 +1338,118 @@ fn grok_4_6_mixed_requests_sum_short_and_long_context_costs() {
 }
 
 #[test]
+fn grok_4_7_build_uses_standard_and_fast_rates() {
+    let standard = test_model("grok-4.7");
+    let fast = test_model("grok-4.7-build-fast");
+    let usage = UsageCounts {
+        input_tokens: Some(100_000),
+        cache_read_tokens: Some(90_000),
+        output_tokens: Some(10_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+
+    let standard_cost = estimate_cost("grok_build", Some(&standard), &usage);
+    let fast_cost = estimate_cost("grok_build", Some(&fast), &usage);
+
+    assert_eq!(
+        standard_cost.estimated_api_equivalent_micro_usd,
+        Some(305_000)
+    );
+    assert_eq!(fast_cost.estimated_api_equivalent_micro_usd, Some(610_000));
+    assert_eq!(
+        standard_cost.pricing_source.as_deref(),
+        Some("xai_api_pricing:grok-4.7")
+    );
+    assert_eq!(
+        fast_cost.pricing_source.as_deref(),
+        Some("xai_api_pricing:grok-4.7:fast")
+    );
+}
+
+#[test]
+fn grok_4_7_build_long_context_starts_at_200k_prompt_tokens() {
+    let standard = test_model("grok-4.7");
+    let fast = test_model("grok-4.7-build-fast");
+    let usage = UsageCounts {
+        input_tokens: Some(120_000),
+        cache_read_tokens: Some(80_000),
+        output_tokens: Some(10_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+
+    let standard_cost = estimate_cost("grok_build", Some(&standard), &usage);
+    let fast_cost = estimate_cost("grok_build", Some(&fast), &usage);
+
+    assert_eq!(
+        standard_cost.estimated_api_equivalent_micro_usd,
+        Some(680_000)
+    );
+    assert_eq!(
+        fast_cost.estimated_api_equivalent_micro_usd,
+        Some(1_360_000)
+    );
+}
+
+#[test]
+fn cursor_grok_4_7_uses_256k_boundary_and_three_times_fast_long_context_rates() {
+    let standard = statsai_core::ModelInfo {
+        name: Some("cursor-grok-4.7-xhigh".to_string()),
+        normalized_name: Some("grok-4.7".to_string()),
+        provider_model_id: Some("cursor-grok-4.7-xhigh".to_string()),
+        speed: Some("standard".to_string()),
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+    let fast = statsai_core::ModelInfo {
+        name: Some("cursor-grok-4.7-xhigh-fast".to_string()),
+        provider_model_id: Some("cursor-grok-4.7-xhigh-fast".to_string()),
+        speed: Some("fast".to_string()),
+        ..standard.clone()
+    };
+    let at_threshold = UsageCounts {
+        input_tokens: Some(256_000),
+        output_tokens: Some(10_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let above_threshold = UsageCounts {
+        input_tokens: Some(256_001),
+        output_tokens: Some(10_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+
+    let standard_at = estimate_cost("cursor", Some(&standard), &at_threshold);
+    let standard_above = estimate_cost("cursor", Some(&standard), &above_threshold);
+    let fast_at = estimate_cost("cursor", Some(&fast), &at_threshold);
+    let fast_above = estimate_cost("cursor", Some(&fast), &above_threshold);
+
+    assert_eq!(
+        standard_at.estimated_api_equivalent_micro_usd,
+        Some(572_000)
+    );
+    assert_eq!(
+        standard_above.estimated_api_equivalent_micro_usd,
+        Some(1_144_004)
+    );
+    assert_eq!(fast_at.estimated_api_equivalent_micro_usd, Some(1_144_000));
+    assert_eq!(
+        fast_above.estimated_api_equivalent_micro_usd,
+        Some(1_716_006)
+    );
+    assert_eq!(
+        standard_above.pricing_source.as_deref(),
+        Some("cursor_model_pricing:grok-4.7")
+    );
+    assert_eq!(
+        fast_above.pricing_source.as_deref(),
+        Some("cursor_model_pricing:grok-4.7:fast")
+    );
+}
+
+#[test]
 fn a_stale_cached_normalization_does_not_shadow_the_observed_name() {
     // Stored before Fable 5.1 existed in the catalog, so the cached
     // normalization points at Fable 5 and its $1.00/M cache-read rate.

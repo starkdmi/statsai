@@ -52,17 +52,27 @@ pub(crate) fn grok_normalized_model_id(model_id: &str) -> String {
     normalize_model_name(model_id)
 }
 
-pub(crate) fn grok_models_equivalent(left: &str, right: &str) -> bool {
-    grok_normalized_model_id(left) == grok_normalized_model_id(right)
+fn grok_model_equivalence_key(model_id: &str) -> String {
+    let model_id = model_id.trim();
+    let normalized = grok_normalized_model_id(model_id);
+    if model_id.to_ascii_lowercase().ends_with("-fast") {
+        format!("{normalized}:fast")
+    } else {
+        normalized
+    }
 }
 
-pub(crate) fn unique_grok_normalized_models<'a>(
+pub(crate) fn grok_models_equivalent(left: &str, right: &str) -> bool {
+    grok_model_equivalence_key(left) == grok_model_equivalence_key(right)
+}
+
+pub(crate) fn unique_grok_model_keys<'a>(
     ids: impl IntoIterator<Item = &'a str>,
 ) -> HashSet<String> {
     ids.into_iter()
         .map(str::trim)
         .filter(|model_id| !model_id.is_empty())
-        .map(grok_normalized_model_id)
+        .map(grok_model_equivalence_key)
         .collect()
 }
 
@@ -95,6 +105,7 @@ pub(crate) fn last_grok_model_at_or_before(
 
 pub(crate) fn resolve_grok_inference_sample_model(
     sample: &GrokInferenceSample,
+    sample_count: usize,
     prompt_models: &[GrokModelObservation],
     turn_models: &[GrokModelObservation],
     session_models_used: &[String],
@@ -108,14 +119,26 @@ pub(crate) fn resolve_grok_inference_sample_model(
                 .iter()
                 .map(|observation| observation.model_id.as_str()),
         );
-    let assignable = unique_grok_normalized_models(assignable_ids);
+    let assignable = unique_grok_model_keys(assignable_ids);
     if assignable.len() == 1 {
-        let models_used =
-            unique_grok_normalized_models(session_models_used.iter().map(String::as_str));
-        // A lone prompt/turn observation cannot cover every inference when
-        // modelsUsed reports another model: request-level attribution is
-        // incomplete, so do not silently price the missing model as this one.
-        if !models_used.is_empty() && models_used != assignable {
+        let models_used = unique_grok_model_keys(session_models_used.iter().map(String::as_str));
+        // modelsUsed may include a selected model that made no request. When
+        // there is exactly one inference, matching prompt and turn observations
+        // before it identify its model despite that extra selection. With more
+        // inferences, one observed model cannot account for an unobserved one.
+        let confirmed_single_sample = sample_count == 1
+            && sample.observed_at.is_some_and(|at| {
+                prompt_models.iter().any(|observation| {
+                    observation
+                        .observed_at
+                        .is_some_and(|observed_at| observed_at <= at)
+                }) && turn_models.iter().any(|observation| {
+                    observation
+                        .observed_at
+                        .is_some_and(|observed_at| observed_at <= at)
+                })
+            });
+        if !models_used.is_empty() && models_used != assignable && !confirmed_single_sample {
             return None;
         }
         let model_id = prompt_models
@@ -148,7 +171,7 @@ pub(crate) fn resolve_grok_inference_sample_model(
         .iter()
         .map(String::as_str)
         .chain(grok_current_model_id(current_model));
-    if unique_grok_normalized_models(session_ids).len() == 1 {
+    if unique_grok_model_keys(session_ids).len() == 1 {
         return current_model.cloned().or_else(|| {
             session_models_used
                 .first()

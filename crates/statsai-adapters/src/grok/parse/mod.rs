@@ -27,6 +27,7 @@ pub(crate) fn estimate_grok_inference_sample_costs(
     for sample in samples {
         let Some(model) = resolve_grok_inference_sample_model(
             sample,
+            samples.len(),
             prompt_models,
             turn_models,
             session_models_used,
@@ -242,7 +243,7 @@ pub(crate) fn parse_grok_summary(
             &session_models_used,
             &summary.observed_at,
         )
-    } else if unique_grok_normalized_models(
+    } else if unique_grok_model_keys(
         session_models_used
             .iter()
             .map(String::as_str)

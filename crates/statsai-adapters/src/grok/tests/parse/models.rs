@@ -576,6 +576,7 @@ fn grok_inference_model_resolution_joins_prompt_model_id_by_timestamp() {
             usage: UsageCounts::default(),
             observed_at: Some(first),
         },
+        2,
         &prompt_models,
         &[],
         &["grok-4.5".to_string(), "grok-4.6".to_string()],
@@ -587,6 +588,7 @@ fn grok_inference_model_resolution_joins_prompt_model_id_by_timestamp() {
             usage: UsageCounts::default(),
             observed_at: Some(second),
         },
+        2,
         &prompt_models,
         &[],
         &["grok-4.5".to_string(), "grok-4.6".to_string()],
@@ -598,6 +600,7 @@ fn grok_inference_model_resolution_joins_prompt_model_id_by_timestamp() {
             usage: UsageCounts::default(),
             observed_at: Some(first),
         },
+        2,
         &[],
         &[],
         &["grok-4.5".to_string(), "grok-4.6".to_string()],
@@ -609,6 +612,187 @@ fn grok_inference_model_resolution_joins_prompt_model_id_by_timestamp() {
     assert_eq!(second_model.name.as_deref(), Some("grok-4.6"));
     assert_eq!(second_model.normalized_name.as_deref(), Some("grok-4.6"));
     assert_eq!(unresolved, None);
+}
+
+#[test]
+fn grok_inference_model_resolution_distinguishes_grok_4_7_fast_by_timestamp() {
+    let first = DateTime::parse_from_rfc3339("2026-09-22T10:00:10Z")
+        .expect("first")
+        .with_timezone(&Utc);
+    let second = DateTime::parse_from_rfc3339("2026-09-22T10:01:10Z")
+        .expect("second")
+        .with_timezone(&Utc);
+    let prompt_models = [
+        GrokModelObservation {
+            model_id: "grok-4.7".to_string(),
+            observed_at: Some(
+                DateTime::parse_from_rfc3339("2026-09-22T10:00:00Z")
+                    .expect("standard")
+                    .with_timezone(&Utc),
+            ),
+        },
+        GrokModelObservation {
+            model_id: "grok-4.7-build-fast".to_string(),
+            observed_at: Some(
+                DateTime::parse_from_rfc3339("2026-09-22T10:01:00Z")
+                    .expect("fast")
+                    .with_timezone(&Utc),
+            ),
+        },
+    ];
+    let current = model_info("grok-4.7-build-fast");
+
+    let standard = resolve_grok_inference_sample_model(
+        &GrokInferenceSample {
+            usage: UsageCounts {
+                input_tokens: Some(100_000),
+                requests: Some(1),
+                ..UsageCounts::default()
+            },
+            observed_at: Some(first),
+        },
+        2,
+        &prompt_models,
+        &[],
+        &["grok-4.7".to_string(), "grok-4.7-build-fast".to_string()],
+        Some(&current),
+    )
+    .expect("standard model");
+    let fast = resolve_grok_inference_sample_model(
+        &GrokInferenceSample {
+            usage: UsageCounts {
+                input_tokens: Some(100_000),
+                requests: Some(1),
+                ..UsageCounts::default()
+            },
+            observed_at: Some(second),
+        },
+        2,
+        &prompt_models,
+        &[],
+        &["grok-4.7".to_string(), "grok-4.7-build-fast".to_string()],
+        Some(&current),
+    )
+    .expect("fast model");
+
+    assert_eq!(standard.name.as_deref(), Some("grok-4.7"));
+    assert_eq!(fast.name.as_deref(), Some("grok-4.7-build-fast"));
+
+    let standard_cost = statsai_pricing::estimate_cost(
+        GROK_BUILD_PROVIDER,
+        Some(&standard),
+        &UsageCounts {
+            input_tokens: Some(100_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        },
+    );
+    let fast_cost = statsai_pricing::estimate_cost(
+        GROK_BUILD_PROVIDER,
+        Some(&fast),
+        &UsageCounts {
+            input_tokens: Some(100_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        },
+    );
+
+    assert_eq!(
+        standard_cost.estimated_api_equivalent_micro_usd,
+        Some(200_000)
+    );
+    assert_eq!(fast_cost.estimated_api_equivalent_micro_usd, Some(400_000));
+}
+
+#[test]
+fn grok_build_prices_single_fast_inference_when_signals_list_both_speeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = dir
+        .path()
+        .join("sessions")
+        .join("%2Fworkspace")
+        .join("session-fast-only");
+    std::fs::create_dir_all(&session).expect("session dir");
+    std::fs::create_dir_all(dir.path().join("logs")).expect("logs dir");
+    std::fs::write(
+        session.join("summary.json"),
+        serde_json::json!({
+            "info": {"id": "session-fast-only", "cwd": dir.path()},
+            "updated_at": "2026-09-22T20:32:05Z",
+            "current_model_id": "grok-4.7",
+            "chat_format_version": 1
+        })
+        .to_string(),
+    )
+    .expect("summary");
+    std::fs::write(
+        session.join("signals.json"),
+        serde_json::json!({
+            "modelsUsed": ["grok-4.7", "grok-4.7-build-fast"],
+            "primaryModelId": "grok-4.7",
+            "turnCount": 1
+        })
+        .to_string(),
+    )
+    .expect("signals");
+    std::fs::write(
+        session.join("updates.jsonl"),
+        serde_json::json!({
+            "timestamp": 1_790_109_116,
+            "params": {
+                "update": {"_meta": {"modelId": "grok-4.7-build-fast", "promptIndex": 0}},
+                "_meta": {"agentTimestampMs": 1_790_109_116_000i64}
+            }
+        })
+        .to_string(),
+    )
+    .expect("updates");
+    std::fs::write(
+        session.join("events.jsonl"),
+        serde_json::json!({
+            "ts": "2026-09-22T20:31:56Z",
+            "type": "turn_started",
+            "model_id": "grok-4.7-build-fast"
+        })
+        .to_string(),
+    )
+    .expect("events");
+    std::fs::write(
+        dir.path().join("logs/unified.jsonl"),
+        serde_json::json!({
+            "ts": "2026-09-22T20:31:58Z",
+            "sid": "session-fast-only",
+            "msg": "shell.turn.inference_done",
+            "ctx": {
+                "prompt_tokens": 19_323,
+                "cached_prompt_tokens": 1_152,
+                "completion_tokens": 39,
+                "reasoning_tokens": 29
+            }
+        })
+        .to_string(),
+    )
+    .expect("unified log");
+    let source = SourceLocation::local_adapter(
+        GROK_BUILD_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+
+    let scan = scan_grok_build_source(&GrokBuildAdapter, &source, &options()).expect("scan");
+    let summary = &scan.summaries[0];
+
+    assert_eq!(summary.usage.requests, Some(1));
+    assert_eq!(
+        summary.cost.estimated_api_equivalent_micro_usd,
+        Some(74_652)
+    );
+    assert_eq!(
+        summary.cost.pricing_source.as_deref(),
+        Some("xai_api_pricing:grok-4.7:fast:unified_log_inference_usage")
+    );
 }
 
 #[test]
@@ -632,6 +816,7 @@ fn grok_inference_model_resolution_rejects_partial_observation_when_models_used_
 
     let mixed = resolve_grok_inference_sample_model(
         &sample,
+        2,
         &prompt_models,
         &[],
         &["grok-4.5".to_string(), "grok-4.6".to_string()],
@@ -639,6 +824,7 @@ fn grok_inference_model_resolution_rejects_partial_observation_when_models_used_
     );
     let matching = resolve_grok_inference_sample_model(
         &sample,
+        2,
         &prompt_models,
         &[],
         &["grok-4.5".to_string()],
@@ -646,7 +832,7 @@ fn grok_inference_model_resolution_rejects_partial_observation_when_models_used_
     )
     .expect("matching modelsUsed");
     let empty_used =
-        resolve_grok_inference_sample_model(&sample, &prompt_models, &[], &[], Some(&current))
+        resolve_grok_inference_sample_model(&sample, 2, &prompt_models, &[], &[], Some(&current))
             .expect("empty modelsUsed");
 
     assert_eq!(mixed, None);

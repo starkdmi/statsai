@@ -142,6 +142,13 @@ fn normalizes_grok_build_aliases() {
         "grok-4.6"
     );
     assert_eq!(normalize_model_name("relay/xai-grok-4.6"), "grok-4.6");
+    assert_eq!(normalize_model_name("grok-4.7"), "grok-4.7");
+    assert_eq!(normalize_model_name("grok-4.7-build-fast"), "grok-4.7");
+    assert_eq!(normalize_model_name("cursor-grok-4.7-xhigh"), "grok-4.7");
+    assert_eq!(
+        normalize_model_name("cursor-grok-4.7-high-fast"),
+        "grok-4.7"
+    );
 }
 
 #[test]
