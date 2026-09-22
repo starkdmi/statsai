@@ -242,7 +242,7 @@ pub(crate) fn parse_grok_summary(
             &session_models_used,
             &summary.observed_at,
         )
-    } else if unique_grok_normalized_models(
+    } else if unique_grok_model_keys(
         session_models_used
             .iter()
             .map(String::as_str)
