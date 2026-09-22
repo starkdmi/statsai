@@ -52,17 +52,27 @@ pub(crate) fn grok_normalized_model_id(model_id: &str) -> String {
     normalize_model_name(model_id)
 }
 
-pub(crate) fn grok_models_equivalent(left: &str, right: &str) -> bool {
-    grok_normalized_model_id(left) == grok_normalized_model_id(right)
+fn grok_model_equivalence_key(model_id: &str) -> String {
+    let model_id = model_id.trim();
+    let normalized = grok_normalized_model_id(model_id);
+    if model_id.to_ascii_lowercase().ends_with("-fast") {
+        format!("{normalized}:fast")
+    } else {
+        normalized
+    }
 }
 
-pub(crate) fn unique_grok_normalized_models<'a>(
+pub(crate) fn grok_models_equivalent(left: &str, right: &str) -> bool {
+    grok_model_equivalence_key(left) == grok_model_equivalence_key(right)
+}
+
+pub(crate) fn unique_grok_model_keys<'a>(
     ids: impl IntoIterator<Item = &'a str>,
 ) -> HashSet<String> {
     ids.into_iter()
         .map(str::trim)
         .filter(|model_id| !model_id.is_empty())
-        .map(grok_normalized_model_id)
+        .map(grok_model_equivalence_key)
         .collect()
 }
 
@@ -108,10 +118,10 @@ pub(crate) fn resolve_grok_inference_sample_model(
                 .iter()
                 .map(|observation| observation.model_id.as_str()),
         );
-    let assignable = unique_grok_normalized_models(assignable_ids);
+    let assignable = unique_grok_model_keys(assignable_ids);
     if assignable.len() == 1 {
         let models_used =
-            unique_grok_normalized_models(session_models_used.iter().map(String::as_str));
+            unique_grok_model_keys(session_models_used.iter().map(String::as_str));
         // A lone prompt/turn observation cannot cover every inference when
         // modelsUsed reports another model: request-level attribution is
         // incomplete, so do not silently price the missing model as this one.
@@ -148,7 +158,7 @@ pub(crate) fn resolve_grok_inference_sample_model(
         .iter()
         .map(String::as_str)
         .chain(grok_current_model_id(current_model));
-    if unique_grok_normalized_models(session_ids).len() == 1 {
+    if unique_grok_model_keys(session_ids).len() == 1 {
         return current_model.cloned().or_else(|| {
             session_models_used
                 .first()
