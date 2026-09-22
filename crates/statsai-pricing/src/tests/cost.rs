@@ -1445,6 +1445,14 @@ fn cursor_grok_4_7_uses_256k_boundary_and_three_times_fast_long_context_rates() 
         fast_above.estimated_api_equivalent_micro_usd,
         Some(1_716_006)
     );
+    assert_eq!(
+        standard_above.pricing_source.as_deref(),
+        Some("cursor_model_pricing:grok-4.7")
+    );
+    assert_eq!(
+        fast_above.pricing_source.as_deref(),
+        Some("cursor_model_pricing:grok-4.7:fast")
+    );
 }
 
 #[test]
