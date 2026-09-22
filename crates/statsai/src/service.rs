@@ -303,12 +303,17 @@ struct DaemonHealth {
 
 #[cfg(target_os = "macos")]
 fn daemon_health(api: &str) -> Option<DaemonHealth> {
-    ureq::get(&format!("http://{api}/health"))
+    let response = ureq::get(&format!("http://{api}/health"))
         .timeout(std::time::Duration::from_millis(400))
         .call()
-        .ok()?
-        .into_json()
-        .ok()
+        .ok()?;
+    let encoding = response.header("Content-Encoding").map(str::to_owned);
+    statsai_core::read_encoded_json_limited(
+        response.into_reader(),
+        encoding.as_deref(),
+        statsai_core::JSON_RESPONSE_LIMIT_HEALTH,
+    )
+    .ok()
 }
 
 #[cfg(all(test, target_os = "macos"))]

@@ -109,7 +109,13 @@ impl HttpSink {
             }
             Err(error) => bail!("sync endpoint request failed: {}", error),
         };
-        let ack: SyncAck = response.into_json().context("parse sync ack")?;
+        let encoding = response.header("Content-Encoding").map(str::to_owned);
+        let ack: SyncAck = statsai_core::read_encoded_json_limited(
+            response.into_reader(),
+            encoding.as_deref(),
+            statsai_core::JSON_RESPONSE_LIMIT_DEFAULT,
+        )
+        .context("parse sync ack")?;
         validate_sync_ack(batch, &ack)?;
         Ok(ack)
     }
@@ -411,6 +417,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use statsai_core::{SyncBatch, SYNC_ACK_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION};
+    use std::io::Write;
     use std::sync::mpsc;
     use tiny_http::{Header, Method, Response, Server};
 
@@ -858,6 +865,85 @@ mod tests {
             duplicate_events,
             rejected,
         )
+    }
+
+    #[test]
+    fn http_sink_rejects_an_oversized_ack_before_it_can_be_applied() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_http_request(&mut stream);
+            let length = statsai_core::JSON_RESPONSE_LIMIT_DEFAULT + 1;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(header.as_bytes()).is_err() {
+                return;
+            }
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut sent = 0_usize;
+            while sent < length {
+                let count = (length - sent).min(chunk.len());
+                if stream.write_all(&chunk[..count]).is_err() {
+                    return;
+                }
+                sent += count;
+            }
+        });
+        let sink = HttpSink::new(format!("http://{address}/v1/sync/batches"), None).expect("sink");
+        let error = sink
+            .send_with_ack(&empty_batch())
+            .expect_err("oversized ack");
+        let message = format!("{error:#}");
+        assert!(message.contains("byte limit"), "{message}");
+    }
+
+    #[test]
+    fn http_sink_rejects_malformed_json_without_accepting_the_batch() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_http_request(&mut stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{",
+            );
+        });
+        let sink = HttpSink::new(format!("http://{address}/v1/sync/batches"), None).expect("sink");
+        let error = sink
+            .send_with_ack(&empty_batch())
+            .expect_err("malformed ack");
+        assert!(format!("{error:#}").contains("parse sync ack"), "{error:#}");
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut seen = Vec::new();
+        let mut byte = [0_u8; 1];
+        while stream.read(&mut byte).unwrap_or(0) == 1 {
+            seen.push(byte[0]);
+            if seen.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&seen);
+        let mut length = 0_usize;
+        for line in text.lines() {
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut left = length;
+        let mut trash = [0_u8; 1024];
+        while left > 0 {
+            let chunk = left.min(trash.len());
+            let count = stream.read(&mut trash[..chunk]).unwrap_or(0);
+            if count == 0 {
+                break;
+            }
+            left -= count;
+        }
     }
 
     fn test_ack_json_with_schema(

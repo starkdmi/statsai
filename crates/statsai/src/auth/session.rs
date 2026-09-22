@@ -34,10 +34,10 @@ pub fn login(no_open: bool, headless: bool, device_name: Option<String>) -> Resu
         return headless_login(&api_base_url, &remembered_device_id, &device_name);
     }
 
-    let server = tiny_http::Server::http("127.0.0.1:0")
+    let server = statsai_daemon::http::Server::http("127.0.0.1:0")
         .map_err(|error| anyhow::anyhow!("Failed to bind loopback server: {}", error))?;
     let port = match server.server_addr() {
-        tiny_http::ListenAddr::IP(addr) => addr.port(),
+        statsai_daemon::http::ListenAddr::IP(addr) => addr.port(),
         _ => bail!("Expected loopback IP address"),
     };
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
@@ -212,9 +212,7 @@ pub(crate) fn exchange_cloudflare_device_code(
     };
     parse_device_session_response(
         api_base_url,
-        response
-            .into_json()
-            .map_err(|error| DeviceSessionRequestError::Fatal(error.into()))?,
+        read_auth_json(response).map_err(DeviceSessionRequestError::Fatal)?,
     )
 }
 
@@ -251,8 +249,7 @@ pub(crate) fn start_headless_device_login(
             )));
         }
     };
-    response
-        .into_json()
+    read_auth_json(response)
         .context("parse headless login start response")
         .map_err(DeviceSessionRequestError::Fatal)
 }
@@ -322,9 +319,7 @@ pub(crate) fn poll_headless_device_login(
         };
         return parse_device_session_response(
             api_base_url,
-            response
-                .into_json()
-                .map_err(|error| DeviceSessionRequestError::Fatal(error.into()))?,
+            read_auth_json(response).map_err(DeviceSessionRequestError::Fatal)?,
         );
     }
 }
@@ -426,6 +421,16 @@ pub(crate) fn device_session_request_error(
     }
 }
 
+fn read_auth_json<T: serde::de::DeserializeOwned>(response: ureq::Response) -> Result<T> {
+    let encoding = response.header("Content-Encoding").map(str::to_owned);
+    statsai_core::read_encoded_json_limited(
+        response.into_reader(),
+        encoding.as_deref(),
+        statsai_core::JSON_RESPONSE_LIMIT_AUTH,
+    )
+    .map_err(Into::into)
+}
+
 pub(crate) fn response_error_code(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -445,7 +450,7 @@ pub(crate) fn generate_random_string(len: usize) -> Result<String> {
 }
 
 pub(crate) fn listen_for_callback(
-    server: &tiny_http::Server,
+    server: &statsai_daemon::http::Server,
     expected_state: &str,
 ) -> Result<String> {
     for request in server.incoming_requests() {
@@ -468,7 +473,7 @@ pub(crate) fn listen_for_callback(
 
         if let (Some(code), Some(state)) = (code, state) {
             if state == expected_state {
-                let response = tiny_http::Response::from_string(
+                let response = statsai_daemon::http::Response::from_string(
                     "<html>\
                      <head><style>body { font-family: sans-serif; text-align: center; padding-top: 50px; background-color: #f7f9fa; color: #1c1e21; }</style></head>\
                      <body>\
@@ -477,15 +482,18 @@ pub(crate) fn listen_for_callback(
                      </body>\
                      </html>",
                 )
-                .with_header(tiny_http::Header::from_bytes("content-type", "text/html").unwrap());
+                .with_header(
+                    statsai_daemon::http::Header::from_bytes("content-type", "text/html").unwrap(),
+                );
                 let _ = request.respond(response);
                 return Ok(code);
             }
         }
 
-        let response =
-            tiny_http::Response::from_string("Waiting for a valid device authorization...")
-                .with_status_code(tiny_http::StatusCode(400));
+        let response = statsai_daemon::http::Response::from_string(
+            "Waiting for a valid device authorization...",
+        )
+        .with_status_code(statsai_daemon::http::StatusCode(400));
         let _ = request.respond(response);
     }
     bail!("Server shut down without receiving device authorization code")

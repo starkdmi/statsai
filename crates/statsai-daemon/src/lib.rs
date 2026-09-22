@@ -1,7 +1,9 @@
 //! Loopback API + file-watching daemon for `statsai`.
 
+pub mod http;
 mod ingest;
 
+pub use http::{Header, HttpLimits, ListenAddr, Method, Request, Response, Server, StatusCode};
 pub use ingest::ingest_sync_batch;
 
 use anyhow::{bail, Context, Result};
@@ -11,7 +13,6 @@ use statsai_store::Store;
 use std::io::Read;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const MAX_SYNC_BATCH_BYTES: usize = 8 * 1024 * 1024;
 

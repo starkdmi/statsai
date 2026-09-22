@@ -22,6 +22,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/rust-ci.sh fmt
       - run: ./scripts/rust-ci.sh clippy
@@ -33,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config dbus gnome-keyring
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy

@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+flate2 = "1"
 base64.workspace = true
 chrono.workspace = true
 hex.workspace = true
@@ -20,3 +21,4 @@ unicode-normalization.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+ureq.workspace = true

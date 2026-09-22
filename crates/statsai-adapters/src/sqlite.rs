@@ -3,13 +3,17 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 pub(crate) fn open_sqlite_readonly(path: &Path) -> Result<Connection> {
-    Connection::open_with_flags(
+    let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| format!("open sqlite {}", path.display()))
+    .with_context(|| format!("open sqlite {}", path.display()))?;
+    let _previous = connection
+        .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .with_context(|| format!("enable SQLite defensive mode for {}", path.display()))?;
+    Ok(connection)
 }
 
 pub(crate) fn sqlite_table_exists(connection: &Connection, table: &str) -> Result<bool> {

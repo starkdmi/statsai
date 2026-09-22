@@ -4,6 +4,18 @@ mod placeholders;
 
 pub(crate) use placeholders::*;
 
+/// Enables SQLite defensive mode before migrations or queries run.
+///
+/// Defensive mode rejects `writable_schema` and other statements that can
+/// corrupt the database through SQL. Official FTS5 content writes and WAL
+/// pragmas stay available.
+pub(crate) fn enable_sqlite_defensive(conn: &Connection) -> Result<()> {
+    let _previous = conn
+        .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .context("enable SQLite defensive mode")?;
+    Ok(())
+}
+
 pub(crate) fn restrict_dir_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {

@@ -1,3 +1,4 @@
+use super::pending::{merge_notice, PendingWatch, WatchNotice};
 use super::state::{watch_sources_for_adapter, VerificationDependencySnapshot};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -23,28 +24,43 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub(super) fn enqueue_background_scan(
-    pending: &Arc<Mutex<HashSet<PathBuf>>>,
+    pending: &Arc<Mutex<PendingWatch>>,
     signal: &mpsc::SyncSender<()>,
     changed: Vec<PathBuf>,
 ) {
-    pending
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .extend(changed);
+    enqueue_watch_notice(pending, signal, WatchNotice::Paths(changed));
+}
+
+pub(super) fn enqueue_watch_notice(
+    pending: &Arc<Mutex<PendingWatch>>,
+    signal: &mpsc::SyncSender<()>,
+    notice: WatchNotice,
+) {
+    merge_notice(
+        &mut pending.lock().unwrap_or_else(|error| error.into_inner()),
+        notice,
+    );
     let _ = signal.try_send(());
 }
 
 pub(super) fn process_background_scan(
-    pending: &Arc<Mutex<HashSet<PathBuf>>>,
+    pending: &Arc<Mutex<PendingWatch>>,
     signal: &mpsc::SyncSender<()>,
-    changed: Vec<PathBuf>,
+    notice: WatchNotice,
     retry_delay: Duration,
-    scan: impl FnOnce(&[PathBuf]) -> Result<()>,
+    scan: impl FnOnce(&WatchNotice) -> Result<()>,
 ) -> bool {
-    if let Err(error) = scan(&changed) {
+    if notice.paths().is_empty() && !notice.rescan_all() {
+        return true;
+    }
+    if let Err(error) = scan(&notice) {
         eprintln!("daemon: background scan failed and will be retried: {error:#}");
         std::thread::sleep(retry_delay);
-        enqueue_background_scan(pending, signal, changed);
+        pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .restore_failed(notice);
+        let _ = signal.try_send(());
         return false;
     }
     true
@@ -55,6 +71,7 @@ pub(super) fn rescan_changed_sources(
     commit_store: &Arc<Mutex<Store>>,
     device_id: &str,
     changed: &[PathBuf],
+    rescan_all: bool,
     verification_dependencies: &VerificationDependencySnapshot,
 ) -> Result<()> {
     let adapters: Vec<Box<dyn ProviderAdapter>> = default_adapters();
@@ -63,6 +80,7 @@ pub(super) fn rescan_changed_sources(
         Some(commit_store),
         device_id,
         changed,
+        rescan_all,
         &adapters,
         verification_dependencies,
     )
@@ -79,6 +97,7 @@ pub(super) fn rescan_changed_sources_with_adapters(
         store,
         device_id,
         changed,
+        false,
         adapters,
         &VerificationDependencySnapshot::default(),
     )
@@ -88,6 +107,7 @@ pub(super) fn rescan_changed_sources_with_adapters_and_dependencies(
     store: &Store,
     device_id: &str,
     changed: &[PathBuf],
+    rescan_all: bool,
     adapters: &[Box<dyn ProviderAdapter>],
     verification_dependencies: &VerificationDependencySnapshot,
 ) -> Result<()> {
@@ -96,6 +116,7 @@ pub(super) fn rescan_changed_sources_with_adapters_and_dependencies(
         None,
         device_id,
         changed,
+        rescan_all,
         adapters,
         verification_dependencies,
     )
@@ -114,6 +135,7 @@ pub(super) fn rescan_changed_sources_with_adapters_and_commit_store(
         commit_store,
         device_id,
         changed,
+        false,
         adapters,
         &VerificationDependencySnapshot::default(),
     )
@@ -124,6 +146,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
     commit_store: Option<&Arc<Mutex<Store>>>,
     device_id: &str,
     changed: &[PathBuf],
+    rescan_all: bool,
     adapters: &[Box<dyn ProviderAdapter>],
     verification_dependencies: &VerificationDependencySnapshot,
 ) -> Result<()> {
@@ -137,6 +160,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
             adapter.as_ref(),
             &configured,
             changed,
+            rescan_all,
             verification_dependencies,
         );
         for mut source in sources {
@@ -586,11 +610,15 @@ pub(super) fn scan_sources_for_paths(
     adapter: &dyn ProviderAdapter,
     configured: &[SourceLocation],
     changed: &[PathBuf],
+    rescan_all: bool,
     verification_dependencies: &VerificationDependencySnapshot,
 ) -> Vec<SourceLocation> {
     watch_sources_for_adapter(adapter, configured)
         .into_iter()
         .filter(|source| {
+            if rescan_all {
+                return source.path_label.is_some();
+            }
             source_in_changed_paths(source, changed, verification_dependencies.paths_for(source))
         })
         .collect()
