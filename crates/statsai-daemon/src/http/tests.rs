@@ -715,6 +715,23 @@ fn valid_chunked_requests_decode_the_payload() {
     );
 }
 
+#[test]
+fn incomplete_chunk_payload_on_half_close_is_rejected() {
+    let addr = spawn_body_echo(limits_for_tests());
+    let mut stream = connect(addr);
+    write_or_closed(
+        &mut stream,
+        b"POST /chunk HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n{}",
+    );
+    stream.shutdown(Shutdown::Write).ok();
+    let response = String::from_utf8_lossy(&read_available(&mut stream)).into_owned();
+    assert!(
+        !response.contains("{}"),
+        "truncated chunk payload must not be treated as a complete body: {response}"
+    );
+    recovered_body_echo(addr);
+}
+
 fn rss_bytes() -> Option<usize> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {

@@ -721,6 +721,70 @@ fn daemon_run_rejects_oversized_chunk_metadata_without_json_validation() {
     assert!(recovered.contains("200"), "{recovered}");
 }
 
+#[test]
+fn truncated_chunked_sync_batch_does_not_mutate_the_store() {
+    use std::io::Write;
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let address = listener.local_addr().expect("port");
+    drop(listener);
+    let store = Arc::new(Mutex::new(Store::in_memory().expect("store")));
+    let inspect = Arc::clone(&store);
+    thread::spawn(move || {
+        let _ = run(&address.to_string(), store, "daemon-token");
+    });
+
+    let health = wait_for_response(&address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(health.contains("200"), "{health}");
+
+    let mut batch = empty_batch();
+    batch.batch_id = "batch_eof_test".to_string();
+    batch.task_buckets = vec![test_task_bucket_snapshot()];
+    batch.task_verifications = vec![test_task_verification()];
+    let payload = serde_json::to_vec(&batch).expect("valid batch json");
+    assert!(
+        serde_json::from_slice::<SyncBatch>(&payload).is_ok(),
+        "truncated framing must still carry a complete JSON object"
+    );
+
+    let mut stream = TcpStream::connect(address).expect("truncated chunked");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("write timeout");
+    let header = format!(
+        "POST /v1/sync/batches HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer daemon-token\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n",
+        payload.len() + 1
+    );
+    stream.write_all(header.as_bytes()).expect("write headers");
+    stream.write_all(&payload).expect("write batch json");
+    stream.shutdown(Shutdown::Write).expect("half-close");
+    let rejected = read_response(&mut stream);
+    assert!(
+        !rejected.contains("batch_eof_test"),
+        "incomplete chunk must not be ingested: {rejected}"
+    );
+
+    {
+        let store = lock_store(&inspect);
+        assert!(store
+            .task_verifications()
+            .expect("task verifications")
+            .is_empty());
+        assert!(store.work_items().expect("work items").is_empty());
+        assert!(store.task_spans().expect("task spans").is_empty());
+        assert_eq!(store.event_count().expect("events"), 0);
+    }
+
+    let recovered = wait_for_response(&address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(recovered.contains("200"), "{recovered}");
+}
+
 fn wait_for_response(address: &std::net::SocketAddr, request: &str) -> String {
     use std::io::Write;
     use std::net::TcpStream;

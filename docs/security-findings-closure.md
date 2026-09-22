@@ -124,9 +124,11 @@ The 30-second body deadline is not a memory bound.
 folded into a `u64` one byte at a time. Extensions are skipped with a
 counter. Metadata (size line plus extensions, excluding CRLF) is capped
 at 8 KiB, matching header lines. Overflowing sizes and malformed framing
-fail as `InvalidInput` and shut the connection down. Abandoned chunked
-bodies close on `Drop` unless the last-chunk trailer was consumed.
-Response encoding still uses the upstream `Encoder`.
+fail as `InvalidInput` and shut the connection down. A payload `read`
+that returns zero while chunk bytes remain is also `InvalidInput`; an
+empty caller buffer still returns `Ok(0)` without finishing the chunk.
+Abandoned chunked bodies close on `Drop` unless the last-chunk trailer
+was consumed. Response encoding still uses the upstream `Encoder`.
 
 **Evidence.**
 
@@ -142,6 +144,13 @@ Response encoding still uses the upstream `Encoder`.
 - `daemon_run_rejects_oversized_chunk_metadata_without_json_validation`
   (valid `{}` reaches `invalid batch`; a padded size line does not;
   then `/health`)
+- `premature_eof_after_partial_chunk_payload_is_rejected` /
+  `premature_eof_on_a_short_read_buffer_is_rejected` /
+  `empty_read_buffer_does_not_finish_a_chunk`
+- `incomplete_chunk_payload_on_half_close_is_rejected`
+- `truncated_chunked_sync_batch_does_not_mutate_the_store`
+  (valid batch JSON in an unfinished chunk; store stays empty; then
+  `/health`)
 
 ### F3 — Bounded JSON decoding
 
@@ -267,6 +276,8 @@ Covered regressions include:
 - oversized chunk-size lines and extensions (8 KiB cap), unfinished metadata
   hitting the body deadline, numeric overflow, valid chunked `{}`, and daemon
   recovery without `invalid batch`
+- premature EOF in a nonempty chunk payload (`3\r\n{}`), empty-buffer reads,
+  and a half-closed chunked sync that cannot mutate an isolated store
 - canonical symlink retarget comparison (no live FSEvents backend here)
 - isolated Linux keyring child process with encrypted `OpenSession`
 
