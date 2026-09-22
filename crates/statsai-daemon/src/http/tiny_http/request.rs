@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 use std::sync::mpsc::Sender;
 
+use crate::http::tiny_http::connection::Connection;
 use crate::http::tiny_http::util::{EqualReader, FusedReader};
 use crate::http::tiny_http::{HTTPVersion, Header, Method, Response, StatusCode};
 use chunked_transfer::Decoder;
@@ -135,6 +136,7 @@ pub fn new_request<R, W>(
     remote_addr: Option<SocketAddr>,
     mut source_data: R,
     writer: W,
+    unread_close: Option<Connection>,
 ) -> Result<Request, RequestCreationError>
 where
     R: Read + Send + 'static,
@@ -212,7 +214,8 @@ where
 
             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
         } else {
-            let (data_reader, _) = EqualReader::new(source_data, content_length); // TODO:
+            let (data_reader, _) =
+                EqualReader::with_unread_close(source_data, content_length, unread_close);
             Box::new(FusedReader::new(data_reader)) as Box<dyn Read + Send + 'static>
         }
     } else if transfer_encoding.is_some() {

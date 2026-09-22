@@ -711,7 +711,7 @@ fn with_device_id_retry_propagates_fatal_errors() {
 
 #[test]
 fn oauth_callback_keeps_state_checks_and_header_limits() {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
 
@@ -737,6 +737,23 @@ fn oauth_callback_keeps_state_checks_and_header_limits() {
     oversized.write_all(b"\r\n\r\n").expect("write");
     let rejected = read_socket(&mut oversized);
     assert!(rejected.contains("431"), "{rejected}");
+
+    let started = std::time::Instant::now();
+    let mut huge = TcpStream::connect(&address).expect("connect");
+    huge.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    huge.write_all(
+        b"GET /callback?code=early&state=wrong HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4000000000\r\n\r\n",
+    )
+    .expect("write");
+    let huge_response = read_socket(&mut huge);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{huge_response}"
+    );
+    assert!(huge_response.contains("400"), "{huge_response}");
+    assert_eq!(huge.read(&mut [0; 8]).unwrap_or(1), 0);
+    assert!(receiver.try_recv().is_err());
 
     let mut invalid = TcpStream::connect(&address).expect("connect");
     invalid
@@ -907,16 +924,31 @@ fn read_http_headers(stream: &mut std::net::TcpStream) {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_secret_service_negotiates_an_encrypted_session() {
-    let _isolated = IsolatedSecretService::start();
-    let entry = session_entry("http://127.0.0.1:9").expect("session entry");
-    entry
-        .set_password("encrypted-session-secret")
-        .expect("store session");
-    assert_eq!(
-        entry.get_password().expect("read session"),
-        "encrypted-session-secret"
+    if std::env::var_os("STATSAI_KEYRING_CHILD").is_some() {
+        run_encrypted_session_probe();
+        return;
+    }
+
+    let isolated = IsolatedSecretService::start();
+    isolated.assert_default_alias_survives_a_new_connection();
+    let child = isolated
+        .command(std::env::current_exe().expect("test binary"))
+        .env("STATSAI_KEYRING_CHILD", "1")
+        .args([
+            "--exact",
+            "auth::tests::linux_secret_service_negotiates_an_encrypted_session",
+            "--nocapture",
+        ])
+        .output()
+        .expect("spawn keyring child");
+    assert!(
+        child.status.success(),
+        "encrypted session child failed: {}\n{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr),
+        isolated.daemon_stderr()
     );
-    let log = _isolated.finish();
+    let log = isolated.finish();
     let algorithms = open_session_algorithms(&log);
     assert!(
         algorithms
@@ -931,29 +963,50 @@ fn linux_secret_service_negotiates_an_encrypted_session() {
 }
 
 #[cfg(target_os = "linux")]
+fn run_encrypted_session_probe() {
+    let entry = session_entry("http://127.0.0.1:9").expect("session entry");
+    entry
+        .set_password("encrypted-session-secret")
+        .expect("store session");
+    assert_eq!(
+        entry.get_password().expect("read session"),
+        "encrypted-session-secret"
+    );
+}
+
+#[cfg(target_os = "linux")]
 struct IsolatedSecretService {
     dbus_pid: u32,
     keyring_pid: u32,
     monitor: std::process::Child,
     log_path: std::path::PathBuf,
-    previous_env: [(&'static str, Option<String>); 3],
+    stderr_path: std::path::PathBuf,
+    address: String,
+    runtime: std::path::PathBuf,
+    data: std::path::PathBuf,
+    home: std::path::PathBuf,
     _directory: tempfile::TempDir,
 }
 
 #[cfg(target_os = "linux")]
 impl IsolatedSecretService {
     fn start() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
         let directory = tempfile::tempdir().expect("isolated dbus dir");
         let runtime = directory.path().join("runtime");
         let data = directory.path().join("data");
+        let home = directory.path().join("home");
+        let keyrings = data.join("keyrings");
         std::fs::create_dir_all(&runtime).expect("runtime");
-        std::fs::create_dir_all(&data).expect("data");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
-                .expect("runtime permissions");
-        }
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&keyrings).expect("keyrings");
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+            .expect("runtime permissions");
+        std::fs::set_permissions(&keyrings, std::fs::Permissions::from_mode(0o700))
+            .expect("keyrings permissions");
+        std::fs::write(keyrings.join("default"), "session\n").expect("persist default alias");
+
         let socket = directory.path().join("bus");
         let output = std::process::Command::new("dbus-daemon")
             .args([
@@ -978,31 +1031,41 @@ impl IsolatedSecretService {
             .next()
             .and_then(|line| line.trim().parse().ok())
             .expect("dbus pid");
-        let previous_env = [
-            set_isolated_env("DBUS_SESSION_BUS_ADDRESS", &address),
-            set_isolated_env("XDG_RUNTIME_DIR", &runtime.to_string_lossy()),
-            set_isolated_env("XDG_DATA_HOME", &data.to_string_lossy()),
-        ];
-        std::fs::create_dir_all(runtime.join("keyring")).expect("keyring control dir");
-        let started = std::process::Command::new("gnome-keyring-daemon")
-            .args(["--start", "--components=secrets", "--daemonize"])
-            .output()
-            .expect("start gnome-keyring");
+
+        let stderr_path = directory.path().join("gnome-keyring.err");
+        let stderr_file = std::fs::File::create(&stderr_path).expect("gnome-keyring stderr");
+        let started = IsolatedSecretService::command_with(
+            "gnome-keyring-daemon",
+            &address,
+            &runtime,
+            &data,
+            &home,
+        )
+        .args(["--start", "--components=secrets", "--daemonize"])
+        .stderr(std::process::Stdio::from(stderr_file))
+        .output()
+        .expect("start gnome-keyring");
         assert!(
             started.status.success(),
             "gnome-keyring start failed: {}\n{}",
             String::from_utf8_lossy(&started.stdout),
-            String::from_utf8_lossy(&started.stderr)
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
         );
 
-        let keyring_pid = wait_for_secret_service_pid();
-        let mut unlock = std::process::Command::new("gnome-keyring-daemon")
-            .arg("--unlock")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn gnome-keyring unlock");
+        let keyring_pid = wait_for_secret_service_pid(&address);
+        let mut unlock = IsolatedSecretService::command_with(
+            "gnome-keyring-daemon",
+            &address,
+            &runtime,
+            &data,
+            &home,
+        )
+        .arg("--unlock")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn gnome-keyring unlock");
         unlock
             .stdin
             .take()
@@ -1012,27 +1075,157 @@ impl IsolatedSecretService {
         let unlock = unlock.wait_with_output().expect("unlock");
         assert!(
             unlock.status.success(),
-            "gnome-keyring unlock failed: {}",
-            String::from_utf8_lossy(&unlock.stderr)
+            "gnome-keyring unlock failed: {}\n{}",
+            String::from_utf8_lossy(&unlock.stderr),
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
         );
-        alias_unlocked_collection_as_default();
-        let log_path = directory.path().join("monitor.log");
-        let log_file = std::fs::File::create(&log_path).expect("monitor log");
-        let monitor = std::process::Command::new("dbus-monitor")
-            .arg("--session")
-            .stdout(log_file)
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("dbus-monitor");
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        Self {
+
+        let isolated = Self {
             dbus_pid,
             keyring_pid,
-            monitor,
-            log_path,
-            previous_env,
+            monitor: IsolatedSecretService::command_with(
+                "dbus-monitor",
+                &address,
+                &runtime,
+                &data,
+                &home,
+            )
+            .arg("--session")
+            .stdout(
+                std::fs::File::create(directory.path().join("monitor.log")).expect("monitor log"),
+            )
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("dbus-monitor"),
+            log_path: directory.path().join("monitor.log"),
+            stderr_path,
+            address,
+            runtime,
+            data,
+            home,
             _directory: directory,
-        }
+        };
+        isolated.provision_unlocked_default_collection();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        isolated
+    }
+
+    fn command_with(
+        name: impl AsRef<std::ffi::OsStr>,
+        address: &str,
+        runtime: &std::path::Path,
+        data: &std::path::Path,
+        home: &std::path::Path,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new(name);
+        command
+            .env("DBUS_SESSION_BUS_ADDRESS", address)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("XDG_DATA_HOME", data)
+            .env("HOME", home)
+            .env_remove("GNOME_KEYRING_CONTROL")
+            .env_remove("GNOME_KEYRING_PID");
+        command
+    }
+
+    fn command(&self, name: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+        IsolatedSecretService::command_with(
+            name,
+            &self.address,
+            &self.runtime,
+            &self.data,
+            &self.home,
+        )
+    }
+
+    fn dbus_send(&self, args: &[&str]) -> std::process::Output {
+        self.command("dbus-send")
+            .args(args)
+            .output()
+            .expect("dbus-send")
+    }
+
+    fn provision_unlocked_default_collection(&self) {
+        let listed = self.dbus_send(&[
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.secrets",
+            "/org/freedesktop/secrets",
+            "org.freedesktop.DBus.Properties.Get",
+            "string:org.freedesktop.Secret.Service",
+            "string:Collections",
+        ]);
+        let text = String::from_utf8_lossy(&listed.stdout);
+        let mut paths = text
+            .lines()
+            .filter_map(|line| {
+                let start = line.find('"')?;
+                let rest = &line[start + 1..];
+                let end = rest.find('"')?;
+                let path = &rest[..end];
+                path.starts_with("/org/freedesktop/secrets/collection/")
+                    .then(|| path.to_string())
+            })
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|path| !path.ends_with("/session"));
+        let Some(path) = paths.first() else {
+            panic!(
+                "secret service has no collection:\n{text}\n{}",
+                self.daemon_stderr()
+            );
+        };
+        let aliased = self.dbus_send(&[
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.secrets",
+            "/org/freedesktop/secrets",
+            "org.freedesktop.Secret.Service.SetAlias",
+            "string:default",
+            &format!("objpath:{path}"),
+        ]);
+        assert!(
+            aliased.status.success(),
+            "alias default collection failed: {}\n{}\n{}",
+            String::from_utf8_lossy(&aliased.stdout),
+            String::from_utf8_lossy(&aliased.stderr),
+            self.daemon_stderr()
+        );
+        let collection = path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .expect("collection name");
+        std::fs::write(
+            self.data.join("keyrings").join("default"),
+            format!("{collection}\n"),
+        )
+        .expect("rewrite default alias file");
+        self.assert_default_alias_survives_a_new_connection();
+    }
+
+    fn assert_default_alias_survives_a_new_connection(&self) {
+        let output = self.dbus_send(&[
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.secrets",
+            "/org/freedesktop/secrets",
+            "org.freedesktop.Secret.Service.ReadAlias",
+            "string:default",
+        ]);
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && text.contains("/org/freedesktop/secrets/collection/")
+                && !text.contains("object path \"/\""),
+            "ReadAlias(default) must resolve from a fresh connection: {}\n{}\n{}",
+            text,
+            String::from_utf8_lossy(&output.stderr),
+            self.daemon_stderr()
+        );
+    }
+
+    fn daemon_stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }
 
     fn finish(mut self) -> String {
@@ -1052,79 +1245,15 @@ impl Drop for IsolatedSecretService {
         let _ = std::process::Command::new("kill")
             .args(["-TERM", &self.dbus_pid.to_string()])
             .status();
-        for (key, previous) in &self.previous_env {
-            match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn set_isolated_env(key: &'static str, value: &str) -> (&'static str, Option<String>) {
-    let previous = std::env::var(key).ok();
-    std::env::set_var(key, value);
-    (key, previous)
-}
-
-#[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
-fn alias_unlocked_collection_as_default() {
-    let listed = std::process::Command::new("dbus-send")
-        .args([
-            "--session",
-            "--print-reply",
-            "--dest=org.freedesktop.secrets",
-            "/org/freedesktop/secrets",
-            "org.freedesktop.DBus.Properties.Get",
-            "string:org.freedesktop.Secret.Service",
-            "string:Collections",
-        ])
-        .output()
-        .expect("list secret collections");
-    let text = String::from_utf8_lossy(&listed.stdout);
-    let mut paths = text
-        .lines()
-        .filter_map(|line| {
-            let start = line.find('"')?;
-            let rest = &line[start + 1..];
-            let end = rest.find('"')?;
-            let path = &rest[..end];
-            path.starts_with("/org/freedesktop/secrets/collection/")
-                .then(|| path.to_string())
-        })
-        .collect::<Vec<_>>();
-    paths.sort_by_key(|path| !path.ends_with("/session"));
-    let Some(path) = paths.first() else {
-        panic!("secret service has no collection:\n{text}");
-    };
-    let aliased = std::process::Command::new("dbus-send")
-        .args([
-            "--session",
-            "--print-reply",
-            "--dest=org.freedesktop.secrets",
-            "/org/freedesktop/secrets",
-            "org.freedesktop.Secret.Service.SetAlias",
-            "string:default",
-            &format!("objpath:{path}"),
-        ])
-        .output()
-        .expect("alias default collection");
-    assert!(
-        aliased.status.success(),
-        "alias default collection failed: {}\n{}",
-        String::from_utf8_lossy(&aliased.stdout),
-        String::from_utf8_lossy(&aliased.stderr)
-    );
-}
-
-#[cfg(target_os = "linux")]
-fn wait_for_secret_service_pid() -> u32 {
+fn wait_for_secret_service_pid(address: &str) -> u32 {
     let started = std::time::Instant::now();
     let mut last = String::new();
     while started.elapsed() < std::time::Duration::from_secs(5) {
-        match secret_service_pid() {
+        match secret_service_pid(address) {
             Ok(pid) => return pid,
             Err(error) => last = error,
         }
@@ -1134,8 +1263,9 @@ fn wait_for_secret_service_pid() -> u32 {
 }
 
 #[cfg(target_os = "linux")]
-fn secret_service_pid() -> Result<u32, String> {
+fn secret_service_pid(address: &str) -> Result<u32, String> {
     let output = std::process::Command::new("dbus-send")
+        .env("DBUS_SESSION_BUS_ADDRESS", address)
         .args([
             "--session",
             "--dest=org.freedesktop.DBus",

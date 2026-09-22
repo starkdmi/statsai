@@ -1,13 +1,19 @@
 use std::io::Read;
 use std::io::Result as IoResult;
+use std::net::Shutdown;
 use std::sync::mpsc::channel;
 use std::sync::mpsc::{Receiver, Sender};
+
+use crate::http::tiny_http::connection::Connection;
+
+const DISCARD_BUFFER_BYTES: usize = 8192;
 
 /// A `Reader` that reads exactly the number of bytes from a sub-reader.
 ///
 /// If the limit is reached, it returns EOF. If the limit is not reached
-/// when the destructor is called, the remaining bytes will be read and
-/// thrown away.
+/// when the destructor is called, remaining bytes are either discarded
+/// through a fixed-size buffer or the connection is shut down. The declared
+/// remainder is never used as an allocation size.
 pub struct EqualReader<R>
 where
     R: Read,
@@ -15,6 +21,7 @@ where
     reader: R,
     size: usize,
     last_read_signal: Sender<IoResult<()>>,
+    close_unread: Option<Connection>,
 }
 
 impl<R> EqualReader<R>
@@ -22,12 +29,21 @@ where
     R: Read,
 {
     pub fn new(reader: R, size: usize) -> (EqualReader<R>, Receiver<IoResult<()>>) {
+        Self::with_unread_close(reader, size, None)
+    }
+
+    pub fn with_unread_close(
+        reader: R,
+        size: usize,
+        close_unread: Option<Connection>,
+    ) -> (EqualReader<R>, Receiver<IoResult<()>>) {
         let (tx, rx) = channel();
 
         let r = EqualReader {
             reader,
             size,
             last_read_signal: tx,
+            close_unread,
         };
 
         (r, rx)
@@ -64,12 +80,25 @@ where
     R: Read,
 {
     fn drop(&mut self) {
+        if self.size == 0 {
+            return;
+        }
+
+        // Rejected and abandoned bodies close the connection instead of
+        // draining a client-declared remainder that can be gigabytes.
+        if let Some(socket) = self.close_unread.take() {
+            let _ = socket.shutdown(Shutdown::Both);
+            self.size = 0;
+            let _ = self.last_read_signal.send(Ok(()));
+            return;
+        }
+
         let mut remaining_to_read = self.size;
-
+        self.size = 0;
+        let mut buf = [0_u8; DISCARD_BUFFER_BYTES];
         while remaining_to_read > 0 {
-            let mut buf = vec![0; remaining_to_read];
-
-            match self.reader.read(&mut buf) {
+            let chunk = remaining_to_read.min(buf.len());
+            match self.reader.read(&mut buf[..chunk]) {
                 Err(e) => {
                     self.last_read_signal.send(Err(e)).ok();
                     break;
@@ -88,7 +117,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::EqualReader;
+    use super::{EqualReader, DISCARD_BUFFER_BYTES};
     use std::io::Read;
 
     #[test]
@@ -127,5 +156,23 @@ mod tests {
         let mut string = String::new();
         org_reader.read_to_string(&mut string).unwrap();
         assert_eq!(string, " world");
+    }
+
+    #[test]
+    fn drop_never_allocates_the_declared_remainder() {
+        struct BoundedRead;
+        impl Read for BoundedRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    buf.len() <= DISCARD_BUFFER_BYTES,
+                    "discard buffer grew to {}",
+                    buf.len()
+                );
+                Ok(0)
+            }
+        }
+
+        let (reader, _) = EqualReader::new(BoundedRead, usize::MAX / 2);
+        drop(reader);
     }
 }

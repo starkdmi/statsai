@@ -587,7 +587,7 @@ fn test_task_bucket_snapshot() -> TaskBucketSnapshot {
 
 #[test]
 fn daemon_run_serves_health_and_rejects_oversized_headers() {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
     use std::time::Duration;
@@ -627,6 +627,35 @@ fn daemon_run_serves_health_and_rejects_oversized_headers() {
     oversized.write_all(b"\r\n\r\n").expect("write");
     let rejected = read_response(&mut oversized);
     assert!(rejected.contains("431"), "{rejected}");
+
+    let started = std::time::Instant::now();
+    let mut huge = TcpStream::connect(address).expect("huge");
+    huge.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    huge.write_all(
+        b"GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4000000000\r\n\r\n",
+    )
+    .expect("write");
+    let huge_response = read_response(&mut huge);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{huge_response}"
+    );
+    assert!(huge_response.contains("200"), "{huge_response}");
+    assert_eq!(huge.read(&mut [0; 8]).unwrap_or(1), 0);
+
+    let mut unsupported = TcpStream::connect(address).expect("http2");
+    unsupported
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    unsupported
+        .write_all(b"GET /health HTTP/2.0\r\nHost: localhost\r\n\r\n")
+        .expect("write");
+    let version = read_response(&mut unsupported);
+    assert!(version.contains("505"), "{version}");
+
+    let recovered = wait_for_response(&address, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert!(recovered.contains("200"), "{recovered}");
 }
 
 fn wait_for_response(address: &std::net::SocketAddr, request: &str) -> String {

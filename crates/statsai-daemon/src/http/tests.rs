@@ -376,3 +376,91 @@ fn the_request_queue_rejects_work_beyond_its_cap() {
     assert!(queued_response.contains("queued"), "{queued_response}");
     handle.join().expect("server thread");
 }
+
+#[test]
+fn an_unread_enormous_body_closes_promptly_without_growing_the_discard_buffer() {
+    let addr = spawn_echo(limits_for_tests());
+    let before = rss_bytes();
+    let started = Instant::now();
+    let mut stream = connect(addr);
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4000000000\r\n\r\n")
+        .unwrap();
+    let response = String::from_utf8_lossy(&read_available(&mut stream)).into_owned();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(response.contains("200"), "{response}");
+    assert_eq!(stream.read(&mut [0; 8]).unwrap_or(1), 0);
+    if let (Some(before), Some(after)) = (before, rss_bytes()) {
+        assert!(
+            after.saturating_sub(before) < 64 * 1024 * 1024,
+            "declared Content-Length must not size an allocation: before={before} after={after}"
+        );
+    }
+
+    let mut recovered = connect(addr);
+    recovered
+        .write_all(b"GET /recovered HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let response = String::from_utf8_lossy(&read_available(&mut recovered)).into_owned();
+    assert!(response.contains("/recovered"), "{response}");
+}
+
+#[test]
+fn unsupported_http_version_releases_connection_slots() {
+    let limits = HttpLimits {
+        max_active_connections: 2,
+        max_queued_requests: 2,
+        ..limits_for_tests()
+    };
+    let addr = spawn_echo(limits);
+    let mut stuck = Vec::new();
+    for _ in 0..4 {
+        let mut stream = connect(addr);
+        stream
+            .write_all(b"GET / HTTP/2.0\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let response = String::from_utf8_lossy(&read_available(&mut stream)).into_owned();
+        assert!(response.contains("505"), "{response}");
+        stuck.push(stream);
+    }
+    drop(stuck);
+
+    for _ in 0..4 {
+        let mut stream = connect(addr);
+        stream
+            .write_all(b"GET / HTTP/2.0\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        drop(stream);
+    }
+
+    let mut recovered = None;
+    for _ in 0..20 {
+        if let Ok(stream) = TcpStream::connect(addr) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            recovered = Some(stream);
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let mut recovered = recovered.expect("slot recovered after HTTP/2.0 rejections");
+    recovered
+        .write_all(b"GET /after-version HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let response = String::from_utf8_lossy(&read_available(&mut recovered)).into_owned();
+    assert!(response.contains("/after-version"), "{response}");
+}
+
+fn rss_bytes() -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: usize = status.split_whitespace().next()?.parse().ok()?;
+    Some(pages.saturating_mul(4096))
+}

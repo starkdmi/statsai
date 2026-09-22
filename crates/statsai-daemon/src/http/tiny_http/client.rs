@@ -63,6 +63,8 @@ enum ReadError {
     ReadIoError(IoError),
     /// a header line, the header block, or the header count exceeded the limit
     LimitsExceeded,
+    /// the request used an HTTP version this server does not speak
+    UnsupportedVersion,
 }
 
 impl ClientConnection {
@@ -197,6 +199,10 @@ impl ClientConnection {
             (method, path, version, headers)
         };
 
+        if version > HTTPVersion(1, 1) {
+            return Err(ReadError::UnsupportedVersion);
+        }
+
         // building the writer for the request
         let writer = self.sink.next().unwrap();
 
@@ -206,6 +212,7 @@ impl ClientConnection {
 
         let body_socket = self.socket.try_clone().map_err(ReadError::ReadIoError)?;
         let write_socket = self.socket.try_clone().map_err(ReadError::ReadIoError)?;
+        let unread_close = self.socket.try_clone().map_err(ReadError::ReadIoError)?;
         let started = Instant::now();
         let data_source = DeadlineRead {
             inner: data_source,
@@ -228,6 +235,7 @@ impl ClientConnection {
             *self.remote_addr.as_ref().unwrap(),
             data_source,
             writer,
+            Some(unread_close),
         )
         .map_err(|e| {
             use crate::http::tiny_http::request;
@@ -242,6 +250,37 @@ impl ClientConnection {
         // return the request
         Ok(request)
     }
+
+    fn write_error_response(
+        &mut self,
+        status: crate::http::tiny_http::StatusCode,
+        version: HTTPVersion,
+        body: Option<String>,
+    ) {
+        use crate::http::tiny_http::Response;
+
+        let writer = self.sink.next().unwrap();
+        let writer = match self.socket.try_clone() {
+            Ok(socket) => DeadlineWrite {
+                inner: writer,
+                socket,
+                deadline: Instant::now() + self.limits.write_deadline,
+            },
+            Err(_) => {
+                let response = match body {
+                    Some(body) => Response::from_string(body).with_status_code(status),
+                    None => Response::new_empty(status),
+                };
+                response.raw_print(writer, version, &[], false, None).ok();
+                return;
+            }
+        };
+        let response = match body {
+            Some(body) => Response::from_string(body).with_status_code(status),
+            None => Response::new_empty(status),
+        };
+        response.raw_print(writer, version, &[], false, None).ok();
+    }
 }
 
 impl Iterator for ClientConnection {
@@ -250,7 +289,7 @@ impl Iterator for ClientConnection {
     /// Blocks until the next Request is available.
     /// Returns None when no new Requests will come from the client.
     fn next(&mut self) -> Option<Request> {
-        use crate::http::tiny_http::{Response, StatusCode};
+        use crate::http::tiny_http::StatusCode;
 
         // the client sent a "connection: close" header in this previous request
         //  or is using HTTP 1.0, meaning that no new request will come
@@ -261,69 +300,53 @@ impl Iterator for ClientConnection {
         loop {
             let rq = match self.read() {
                 Err(ReadError::WrongRequestLine) => {
-                    let writer = self.sink.next().unwrap();
-                    let response = Response::new_empty(StatusCode(400));
-                    response
-                        .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
-                        .ok();
-                    return None; // we don't know where the next request would start,
-                                 // se we have to close
+                    self.write_error_response(StatusCode(400), HTTPVersion(1, 1), None);
+                    let _ = self.socket.shutdown(std::net::Shutdown::Both);
+                    return None;
                 }
 
                 Err(ReadError::WrongHeader(ver)) => {
-                    let writer = self.sink.next().unwrap();
-                    let response = Response::new_empty(StatusCode(400));
-                    response.raw_print(writer, ver, &[], false, None).ok();
-                    return None; // we don't know where the next request would start,
-                                 // se we have to close
+                    self.write_error_response(StatusCode(400), ver, None);
+                    let _ = self.socket.shutdown(std::net::Shutdown::Both);
+                    return None;
                 }
 
                 Err(ReadError::LimitsExceeded) => {
-                    let writer = self.sink.next().unwrap();
-                    let response = crate::http::tiny_http::Response::from_string(
-                        "request headers are too large".to_owned(),
-                    )
-                    .with_status_code(crate::http::tiny_http::StatusCode(431));
-                    response
-                        .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
-                        .ok();
+                    self.write_error_response(
+                        StatusCode(431),
+                        HTTPVersion(1, 1),
+                        Some("request headers are too large".to_owned()),
+                    );
+                    let _ = self.socket.shutdown(std::net::Shutdown::Both);
+                    return None;
+                }
+
+                Err(ReadError::UnsupportedVersion) => {
+                    self.write_error_response(
+                        StatusCode(505),
+                        HTTPVersion(1, 1),
+                        Some("This server only supports HTTP versions 1.0 and 1.1".to_owned()),
+                    );
+                    let _ = self.socket.shutdown(std::net::Shutdown::Both);
                     return None;
                 }
 
                 Err(ReadError::ReadIoError(ref err)) if is_deadline_error(err) => {
-                    // request timeout
-                    let writer = self.sink.next().unwrap();
-                    let response = Response::new_empty(StatusCode(408));
-                    response
-                        .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
-                        .ok();
-                    return None; // closing the connection
+                    self.write_error_response(StatusCode(408), HTTPVersion(1, 1), None);
+                    let _ = self.socket.shutdown(std::net::Shutdown::Both);
+                    return None;
                 }
 
                 Err(ReadError::ExpectationFailed(ver)) => {
-                    let writer = self.sink.next().unwrap();
-                    let response = Response::new_empty(StatusCode(417));
-                    response.raw_print(writer, ver, &[], true, None).ok();
-                    return None; // TODO: should be recoverable, but needs handling in case of body
+                    self.write_error_response(StatusCode(417), ver, None);
+                    let _ = self.socket.shutdown(std::net::Shutdown::Both);
+                    return None;
                 }
 
                 Err(ReadError::ReadIoError(_)) => return None,
 
                 Ok(rq) => rq,
             };
-
-            // checking HTTP version
-            if *rq.http_version() > (1, 1) {
-                let writer = self.sink.next().unwrap();
-                let response = Response::from_string(
-                    "This server only supports HTTP versions 1.0 and 1.1".to_owned(),
-                )
-                .with_status_code(StatusCode(505));
-                response
-                    .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
-                    .ok();
-                continue;
-            }
 
             // updating the status of the connection
             let connection_header = rq
