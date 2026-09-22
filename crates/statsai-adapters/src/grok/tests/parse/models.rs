@@ -673,19 +673,33 @@ fn grok_inference_model_resolution_distinguishes_grok_4_7_fast_by_timestamp() {
     assert_eq!(standard.name.as_deref(), Some("grok-4.7"));
     assert_eq!(fast.name.as_deref(), Some("grok-4.7-build-fast"));
 
-    let standard_cost = estimate_cost(GROK_BUILD_PROVIDER, Some(&standard), &UsageCounts {
-        input_tokens: Some(100_000),
-        requests: Some(1),
-        ..UsageCounts::default()
-    });
-    let fast_cost = estimate_cost(GROK_BUILD_PROVIDER, Some(&fast), &UsageCounts {
-        input_tokens: Some(100_000),
-        requests: Some(1),
-        ..UsageCounts::default()
-    });
+    let standard_cost = statsai_pricing::estimate_cost(
+        GROK_BUILD_PROVIDER,
+        Some(&standard),
+        &UsageCounts {
+            input_tokens: Some(100_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        },
+    );
+    let fast_cost = statsai_pricing::estimate_cost(
+        GROK_BUILD_PROVIDER,
+        Some(&fast),
+        &UsageCounts {
+            input_tokens: Some(100_000),
+            requests: Some(1),
+            ..UsageCounts::default()
+        },
+    );
 
-    assert_eq!(standard_cost.estimated_api_equivalent_micro_usd, Some(200_000));
-    assert_eq!(fast_cost.estimated_api_equivalent_micro_usd, Some(400_000));
+    assert_eq!(
+        standard_cost.estimated_api_equivalent_micro_usd,
+        Some(200_000)
+    );
+    assert_eq!(
+        fast_cost.estimated_api_equivalent_micro_usd,
+        Some(400_000)
+    );
 }
 
 #[test]
