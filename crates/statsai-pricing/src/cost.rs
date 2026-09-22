@@ -37,10 +37,18 @@ pub fn estimate_cost_at(
     let Some(standard_pricing) = pricing_for_model_on(&model_name, usage_date) else {
         return unknown_cost();
     };
+    let effective_speed = model.speed.as_deref().or_else(|| {
+        [model.name.as_deref(), model.provider_model_id.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|name| name.trim().to_ascii_lowercase().ends_with("-fast"))
+            .then_some("fast")
+    });
     let (pricing, uses_fast_mode_pricing) =
-        pricing_for_effective_speed(&model_name, model.speed.as_deref(), standard_pricing);
+        pricing_for_effective_speed(&model_name, effective_speed, standard_pricing);
 
-    let (input_multiplier, output_multiplier) = pricing_multipliers(&model_name, usage);
+    let (input_multiplier, output_multiplier) =
+        pricing_multipliers(provider, &model_name, usage, uses_fast_mode_pricing);
     let mut numerator = component_cost_numerator(
         i128::from(usage.input_tokens.unwrap_or(0)),
         pricing.input_per_million,
@@ -74,6 +82,7 @@ pub fn estimate_cost_at(
         | "grok-4.3"
         | "grok-4.5"
         | "grok-4.6"
+        | "grok-4.7"
         | "grok-4.20-multi-agent-0309"
         | "grok-4.20-0309-reasoning"
         | "grok-4.20-0309-non-reasoning" => {
@@ -146,15 +155,37 @@ fn cache_creation_cost_numerator(
     ))
 }
 
-fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (i128, i128) {
+fn pricing_multipliers(
+    provider: &str,
+    model_name: &str,
+    usage: &UsageCounts,
+    uses_fast_mode_pricing: bool,
+) -> (i128, i128) {
     const OPENAI_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
     const XAI_LONG_CONTEXT_THRESHOLD: u64 = 200_000;
+    const CURSOR_GROK_4_7_LONG_CONTEXT_THRESHOLD: u64 = 256_000;
 
     let prompt_tokens = usage
         .input_tokens
         .unwrap_or(0)
         .saturating_add(usage.cache_creation_tokens.unwrap_or(0))
         .saturating_add(usage.cache_read_tokens.unwrap_or(0));
+
+    if model_name == "grok-4.7"
+        && provider.eq_ignore_ascii_case("cursor")
+        && usage.requests == Some(1)
+        && prompt_tokens > CURSOR_GROK_4_7_LONG_CONTEXT_THRESHOLD
+    {
+        // Cursor publishes 2x standard rates above 256k, while Fast is 3x the
+        // short-context standard rate. Fast base pricing is already 2x here,
+        // so its long-context multiplier is 1.5x rather than 2x.
+        return if uses_fast_mode_pricing {
+            (15_000, 15_000)
+        } else {
+            (20_000, 20_000)
+        };
+    }
+
     let is_openai_long_context_model = matches!(
         model_name,
         "gpt-5.4" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-astra"
@@ -165,6 +196,7 @@ fn pricing_multipliers(model_name: &str, usage: &UsageCounts) -> (i128, i128) {
             | "grok-4.3"
             | "grok-4.5"
             | "grok-4.6"
+            | "grok-4.7"
             | "grok-4.20-multi-agent-0309"
             | "grok-4.20-0309-reasoning"
             | "grok-4.20-0309-non-reasoning"
