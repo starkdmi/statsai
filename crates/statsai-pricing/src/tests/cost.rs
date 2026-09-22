@@ -1356,10 +1356,7 @@ fn grok_4_7_build_uses_standard_and_fast_rates() {
         standard_cost.estimated_api_equivalent_micro_usd,
         Some(310_000)
     );
-    assert_eq!(
-        fast_cost.estimated_api_equivalent_micro_usd,
-        Some(620_000)
-    );
+    assert_eq!(fast_cost.estimated_api_equivalent_micro_usd, Some(620_000));
     assert_eq!(
         standard_cost.pricing_source.as_deref(),
         Some("xai_api_pricing:grok-4.7")
@@ -1437,10 +1434,7 @@ fn cursor_grok_4_7_uses_256k_boundary_and_three_times_fast_long_context_rates() 
         standard_above.estimated_api_equivalent_micro_usd,
         Some(1_144_004)
     );
-    assert_eq!(
-        fast_at.estimated_api_equivalent_micro_usd,
-        Some(1_144_000)
-    );
+    assert_eq!(fast_at.estimated_api_equivalent_micro_usd, Some(1_144_000));
     assert_eq!(
         fast_above.estimated_api_equivalent_micro_usd,
         Some(1_716_006)
