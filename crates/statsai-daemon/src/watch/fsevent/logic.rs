@@ -151,11 +151,25 @@ impl RootMap {
     }
 
     pub(crate) fn refresh_targets(&mut self, canonicalize: impl Fn(&Path) -> Option<PathBuf>) {
+        let _ = self.refresh_changed_targets(canonicalize);
+    }
+
+    /// Updates canonical targets that still exist. Deleted mappings keep the
+    /// last known canonical path. Returns whether any stored target changed.
+    pub(crate) fn refresh_changed_targets(
+        &mut self,
+        canonicalize: impl Fn(&Path) -> Option<PathBuf>,
+    ) -> bool {
+        let mut changed = false;
         for root in self.by_configured.values_mut() {
             if let Some(canonical) = canonicalize(&root.configured) {
-                root.canonical = canonical;
+                if canonical != root.canonical {
+                    root.canonical = canonical;
+                    changed = true;
+                }
             }
         }
+        changed
     }
 
     pub(crate) fn canonical_paths(&self) -> Vec<PathBuf> {
@@ -344,6 +358,29 @@ mod tests {
         roots.refresh_targets(|configured| configured.canonicalize().ok());
         assert_eq!(roots.canonical_paths(), stored);
         assert_eq!(roots.unwatch(&link), Some(Some(stored[0].clone())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_retarget_is_detected_by_comparing_canonical_paths() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let old_target = directory.path().join("old");
+        let new_target = directory.path().join("new");
+        std::fs::create_dir(&old_target).expect("old target");
+        std::fs::create_dir(&new_target).expect("new target");
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&old_target, &link).expect("symlink");
+        let mut roots = RootMap::default();
+        roots.insert(link.clone(), link.canonicalize().expect("canonical"), true);
+        let replacement = directory.path().join("link.next");
+        std::os::unix::fs::symlink(&new_target, &replacement).expect("next link");
+        std::fs::rename(&replacement, &link).expect("atomic retarget");
+        assert!(roots.refresh_changed_targets(|configured| configured.canonicalize().ok()));
+        assert!(!roots.refresh_changed_targets(|configured| configured.canonicalize().ok()));
+        assert_eq!(
+            roots.canonical_paths(),
+            vec![new_target.canonicalize().expect("new canonical")]
+        );
     }
 
     #[test]

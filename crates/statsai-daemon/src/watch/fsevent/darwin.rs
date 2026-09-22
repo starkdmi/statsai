@@ -24,12 +24,11 @@ use std::ffi::CStr;
 use std::os::raw;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-pub(super) struct FsEventWatcher {
+pub(in crate::watch) struct FsEventWatcher {
     paths: cf::CFMutableArrayRef,
     since_when: fs::FSEventStreamEventId,
     latency: cf::CFTimeInterval,
@@ -67,6 +66,18 @@ extern "C" {
 struct CFSendWrapper(cf::CFRef);
 unsafe impl Send for CFSendWrapper {}
 
+impl CFSendWrapper {
+    /// Consumes the wrapper after it has been moved onto the destination thread.
+    ///
+    /// `CFRef` is not `Send`. Projecting `.0` inside a `move` closure captures the
+    /// raw pointer and drops the wrapper's `Send` impl. Call this method only after
+    /// the wrapper itself has been moved, so the FSEvents thread is the exclusive
+    /// owner of the run-loop pointer.
+    fn into_inner(self) -> cf::CFRef {
+        self.0
+    }
+}
+
 impl FsEventWatcher {
     fn from_event_handler(event_handler: Arc<Mutex<dyn EventHandler>>) -> Result<Self> {
         let paths = unsafe {
@@ -93,21 +104,23 @@ impl FsEventWatcher {
         })
     }
 
-    pub(super) fn poll_restart(&mut self) -> Result<()> {
-        if !self.shared.restart.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        self.shared
+    pub(in crate::watch) fn poll_restart(&mut self) -> Result<()> {
+        let restart_requested = self.shared.restart.swap(false, Ordering::AcqRel);
+        let retargeted = self
+            .shared
             .roots
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .refresh_targets(|configured| {
+            .refresh_changed_targets(|configured| {
                 if configured.exists() {
                     configured.canonicalize().ok()
                 } else {
                     None
                 }
             });
+        if !restart_requested && !retargeted {
+            return Ok(());
+        }
         self.restart_stream()
     }
 
@@ -150,7 +163,11 @@ impl FsEventWatcher {
             .roots
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(path.to_path_buf(), canonical, recursive_mode.is_recursive());
+            .insert(
+                path.to_path_buf(),
+                canonical,
+                matches!(recursive_mode, RecursiveMode::Recursive),
+            );
         Ok(())
     }
 
@@ -247,7 +264,7 @@ impl FsEventWatcher {
         let thread_handle = thread::Builder::new()
             .name("statsai-fsevents".to_string())
             .spawn(move || {
-                let stream = stream.0;
+                let stream = stream.into_inner();
                 unsafe {
                     let current = cf::CFRunLoopGetCurrent();
                     fs::FSEventStreamScheduleWithRunLoop(
@@ -269,7 +286,10 @@ impl FsEventWatcher {
                 }
             })?;
         self.runloop = Some((
-            rl_rx.recv().expect("receive FSEvents run loop").0,
+            rl_rx
+                .recv()
+                .expect("receive FSEvents run loop")
+                .into_inner(),
             thread_handle,
         ));
         Ok(())
@@ -407,5 +427,81 @@ impl Drop for FsEventWatcher {
                 cf::CFRelease(self.paths);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::RecursiveMode;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn live_watcher_detects_an_atomic_symlink_retarget_and_new_writes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let old_target = directory.path().join("old");
+        let new_target = directory.path().join("new");
+        std::fs::create_dir(&old_target).expect("old");
+        std::fs::create_dir(&new_target).expect("new");
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&old_target, &link).expect("symlink");
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = FsEventWatcher::new(
+            move |event| {
+                let _ = tx.send(event);
+            },
+            Config::default(),
+        )
+        .expect("watcher");
+        watcher
+            .watch(&link, RecursiveMode::Recursive)
+            .expect("watch symlink");
+
+        let replacement = directory.path().join("link.next");
+        std::os::unix::fs::symlink(&new_target, &replacement).expect("next link");
+        std::fs::rename(&replacement, &link).expect("atomic retarget");
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut saw_rescan = false;
+        while Instant::now() < deadline {
+            watcher.poll_restart().expect("poll retarget");
+            while let Ok(event) = rx.try_recv() {
+                if event.as_ref().ok().is_some_and(|event| event.need_rescan()) {
+                    saw_rescan = true;
+                }
+            }
+            if saw_rescan {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            saw_rescan,
+            "retargeted symlink must rebuild registrations without a manual refresh"
+        );
+
+        std::fs::write(new_target.join("observed.txt"), b"after retarget").expect("write");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut saw_write = false;
+        while Instant::now() < deadline {
+            watcher.poll_restart().expect("poll write");
+            while let Ok(event) = rx.try_recv() {
+                if let Ok(event) = event {
+                    saw_write |= event.paths.iter().any(|path| {
+                        path.ends_with("observed.txt") || path.ends_with("link/observed.txt")
+                    });
+                }
+            }
+            if saw_write {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            saw_write,
+            "writes under the new symlink target must reach the watcher"
+        );
     }
 }

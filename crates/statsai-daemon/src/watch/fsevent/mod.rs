@@ -10,4 +10,4 @@ mod logic;
 mod darwin;
 
 #[cfg(target_os = "macos")]
-pub(super) use darwin::FsEventWatcher;
+pub(in crate::watch) use darwin::FsEventWatcher;
