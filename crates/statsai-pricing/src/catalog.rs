@@ -56,7 +56,14 @@ pub(crate) fn pricing_for_effective_speed(
     }
 
     let fast = match model_name {
+        "claude-opus-5-5" => pricing_with_cache_creation(8.0, 10.0, 0.4, 40.0),
         "claude-opus-5" | "claude-opus-4-8" => pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0),
+        "gpt-6-sol" | "gpt-6-luna" => pricing_with_cache_creation(
+            standard.input_per_million * 2.0,
+            standard.cache_creation_per_million * 2.0,
+            standard.cached_input_per_million * 2.0,
+            standard.output_per_million * 2.0,
+        ),
         // Historical fast-mode rates. Effective `usage.speed` is authoritative:
         // unsupported requests either failed or reported `standard` after fallback.
         "claude-opus-4-6" | "claude-opus-4-7" => {
@@ -140,6 +147,7 @@ pub(crate) fn pricing_for_model_on(
         "claude-fable-5" | "claude-mythos-5" => {
             Some(pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0))
         }
+        "claude-opus-5-5" => Some(pricing_with_cache_creation(4.0, 5.0, 0.2, 20.0)),
         "claude-opus-5" => Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 25.0)),
         "claude-sonnet-5" => {
             let date = (usage_date.year(), usage_date.month(), usage_date.day());
@@ -163,6 +171,8 @@ pub(crate) fn pricing_for_model_on(
         // default. A larger prompt reprices the whole request at 20/25/2/75,
         // applied by `pricing_multipliers` where a record is one known request.
         "gpt-6-astra" => Some(pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0)),
+        "gpt-6-sol" => Some(pricing_with_cache_creation(2.0, 2.5, 0.2, 10.0)),
+        "gpt-6-luna" => Some(pricing_with_cache_creation(0.1, 0.125, 0.01, 0.5)),
         // GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount.
         "gpt-5.6-sol" => Some(gpt_5_6_sol_pricing(usage_date)),
         "gpt-5.6-terra" => Some(gpt_5_6_terra_pricing(usage_date)),

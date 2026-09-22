@@ -9,6 +9,7 @@ fn normalize_reversed_claude_model_name(lower: &str) -> Option<&'static str> {
     let (version, family) = rest.split_once('-')?;
     let family = family.split('-').next()?;
     Some(match (family, version) {
+        ("opus", "5.5") => "claude-opus-5-5",
         ("opus", "5") => "claude-opus-5",
         ("opus", "4.8") => "claude-opus-4-8",
         ("opus", "4.7") => "claude-opus-4-7",
@@ -38,6 +39,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     }
     if lower.contains("claude-mythos-5") {
         return Some("claude-mythos-5");
+    }
+    if lower.contains("claude-opus-5-5") || lower.contains("claude-opus-5.5") {
+        return Some("claude-opus-5-5");
     }
     if lower.contains("claude-opus-5") {
         return Some("claude-opus-5");
@@ -86,6 +90,12 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     }
     if lower.contains("gpt-6-astra") {
         return Some("gpt-6-astra");
+    }
+    if lower.contains("gpt-6-sol") {
+        return Some("gpt-6-sol");
+    }
+    if lower.contains("gpt-6-luna") {
+        return Some("gpt-6-luna");
     }
     if lower.contains("gpt-5.6-sol") {
         return Some("gpt-5.6-sol");
@@ -225,6 +235,9 @@ pub fn normalize_model_name(name: &str) -> String {
         "claude-fable-5-1" | "claude-fable-5.1" => "claude-fable-5-1".to_string(),
         "claude-fable-5" => "claude-fable-5".to_string(),
         "claude-mythos-5" => "claude-mythos-5".to_string(),
+        "claude-opus-5-5" | "claude-opus-5-5-thinking" | "claude-opus-5.5" => {
+            "claude-opus-5-5".to_string()
+        }
         "claude-opus-5" | "claude-opus-5-thinking" => "claude-opus-5".to_string(),
         "claude-sonnet-5" | "claude-sonnet-5-thinking" => "claude-sonnet-5".to_string(),
         "claude-3-5-sonnet-20241022" | "claude-sonnet-3-5" => "claude-sonnet-3-5".to_string(),
@@ -261,6 +274,8 @@ pub fn normalize_model_name(name: &str) -> String {
         "gpt-5.4" => "gpt-5.4".to_string(),
         "gpt-5.4-mini" => "gpt-5.4-mini".to_string(),
         "gpt-6-astra" | "gpt-6-astra-codex" => "gpt-6-astra".to_string(),
+        "gpt-6-sol" => "gpt-6-sol".to_string(),
+        "gpt-6-luna" => "gpt-6-luna".to_string(),
         "gpt-5.6-sol" => "gpt-5.6-sol".to_string(),
         "gpt-5.6-terra" => "gpt-5.6-terra".to_string(),
         "gpt-5.6-luna" => "gpt-5.6-luna".to_string(),

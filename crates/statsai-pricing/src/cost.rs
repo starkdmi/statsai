@@ -191,7 +191,13 @@ fn pricing_multipliers(
 
     let is_openai_long_context_model = matches!(
         model_name,
-        "gpt-5.4" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-astra"
+        "gpt-5.4"
+            | "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-5.6-luna"
+            | "gpt-6-astra"
+            | "gpt-6-sol"
+            | "gpt-6-luna"
     );
     let is_xai_long_context_model = matches!(
         model_name,
