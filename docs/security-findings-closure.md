@@ -213,3 +213,24 @@ verification extracts those crates outside the workspace and checks that
 the patched files and Cargo features are present, then builds the
 extracted `statsai-daemon` / `statsai-store` / `statsai` sources against
 the extracted path dependencies.
+
+## Linux verification (this environment)
+
+`scripts/rust-ci.sh full` passed on Linux x86_64 (fmt, clippy including
+`statsai-daemon --features watch`, workspace tests, and watch tests).
+Covered regressions include:
+
+- huge unread `Content-Length` on the daemon, echo server, and OAuth callback
+- HTTP/2.0 `505` slot release, including client disconnect then `/after-version`
+- canonical symlink retarget comparison (no live FSEvents backend here)
+- isolated Linux keyring child process with encrypted `OpenSession`
+
+Packaged `0.5.0` crates were extracted to a separate workspace, patched
+sources were grepped in the tarballs, and the same regressions were
+re-run against those extracted sources.
+
+This environment cannot typecheck `darwin.rs` or clippy
+`aarch64-apple-darwin` / `x86_64-apple-darwin`. macOS CI installs both
+targets and runs `scripts/rust-ci.sh clippy`, which clippy the watch
+backend for each architecture. The live `FsEventWatcher` retarget test
+is compiled only on macOS.
