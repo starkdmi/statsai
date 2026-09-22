@@ -144,6 +144,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("grok-composer-2.5") || lower.contains("composer-2.5") {
         return Some("composer-2.5");
     }
+    if lower.contains("grok-4.7") {
+        return Some("grok-4.7");
+    }
     if lower.contains("grok-4.6") {
         return Some("grok-4.6");
     }
@@ -267,6 +270,7 @@ pub fn normalize_model_name(name: &str) -> String {
         "composer-2.5" | "grok-composer-2.5" => "composer-2.5".to_string(),
         "composer-2.5-fast" | "grok-composer-2.5-fast" => "composer-2.5-fast".to_string(),
         "grok-build" | "grok-build-0.1" => "grok-build-0.1".to_string(),
+        "grok-4.7" | "grok-4.7-build-fast" => "grok-4.7".to_string(),
         "grok-4.6" | "grok-4.6-build" | "grok-4.6-latest" => "grok-4.6".to_string(),
         "grok-4.5" | "grok-4.5-latest" | "grok-build-latest" => "grok-4.5".to_string(),
         "grok-4.3" | "grok-4.3-latest" => "grok-4.3".to_string(),
