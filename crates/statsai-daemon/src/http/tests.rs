@@ -1,5 +1,5 @@
 use super::*;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -50,14 +50,23 @@ fn read_available(stream: &mut TcpStream) -> Vec<u8> {
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => buffer.extend_from_slice(&chunk[..count]),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut =>
-            {
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 if !buffer.is_empty() {
                     break;
                 }
                 thread::sleep(Duration::from_millis(20));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::UnexpectedEof
+                ) =>
+            {
+                // macOS can RST an unread excess connection instead of returning EOF.
+                break;
             }
             Err(error) => panic!("read response: {error}"),
         }
