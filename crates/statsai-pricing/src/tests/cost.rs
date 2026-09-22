@@ -1343,7 +1343,7 @@ fn grok_4_7_build_uses_standard_and_fast_rates() {
     let fast = test_model("grok-4.7-build-fast");
     let usage = UsageCounts {
         input_tokens: Some(100_000),
-        cache_read_tokens: Some(100_000),
+        cache_read_tokens: Some(90_000),
         output_tokens: Some(10_000),
         requests: Some(1),
         ..UsageCounts::default()
@@ -1354,9 +1354,9 @@ fn grok_4_7_build_uses_standard_and_fast_rates() {
 
     assert_eq!(
         standard_cost.estimated_api_equivalent_micro_usd,
-        Some(310_000)
+        Some(305_000)
     );
-    assert_eq!(fast_cost.estimated_api_equivalent_micro_usd, Some(620_000));
+    assert_eq!(fast_cost.estimated_api_equivalent_micro_usd, Some(610_000));
     assert_eq!(
         standard_cost.pricing_source.as_deref(),
         Some("xai_api_pricing:grok-4.7")
