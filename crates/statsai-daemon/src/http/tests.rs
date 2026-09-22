@@ -441,26 +441,32 @@ fn unsupported_http_version_releases_connection_slots() {
         drop(stream);
     }
 
-    let mut recovered = None;
-    for _ in 0..20 {
-        if let Ok(stream) = TcpStream::connect(addr) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        if let Ok(mut stream) = TcpStream::connect(addr) {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             stream
                 .set_write_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            recovered = Some(stream);
-            break;
+            if stream
+                .write_all(b"GET /after-version HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .is_ok()
+            {
+                last = String::from_utf8_lossy(&read_available(&mut stream)).into_owned();
+                if last.contains("/after-version") {
+                    break;
+                }
+            }
         }
         thread::sleep(Duration::from_millis(25));
     }
-    let mut recovered = recovered.expect("slot recovered after HTTP/2.0 rejections");
-    recovered
-        .write_all(b"GET /after-version HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .unwrap();
-    let response = String::from_utf8_lossy(&read_available(&mut recovered)).into_owned();
-    assert!(response.contains("/after-version"), "{response}");
+    assert!(
+        last.contains("/after-version"),
+        "slot recovered after HTTP/2.0 rejections and disconnects: {last}"
+    );
 }
 
 fn rss_bytes() -> Option<usize> {
