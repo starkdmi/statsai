@@ -612,6 +612,83 @@ fn grok_inference_model_resolution_joins_prompt_model_id_by_timestamp() {
 }
 
 #[test]
+fn grok_inference_model_resolution_distinguishes_grok_4_7_fast_by_timestamp() {
+    let first = DateTime::parse_from_rfc3339("2026-09-22T10:00:10Z")
+        .expect("first")
+        .with_timezone(&Utc);
+    let second = DateTime::parse_from_rfc3339("2026-09-22T10:01:10Z")
+        .expect("second")
+        .with_timezone(&Utc);
+    let prompt_models = [
+        GrokModelObservation {
+            model_id: "grok-4.7".to_string(),
+            observed_at: Some(
+                DateTime::parse_from_rfc3339("2026-09-22T10:00:00Z")
+                    .expect("standard")
+                    .with_timezone(&Utc),
+            ),
+        },
+        GrokModelObservation {
+            model_id: "grok-4.7-build-fast".to_string(),
+            observed_at: Some(
+                DateTime::parse_from_rfc3339("2026-09-22T10:01:00Z")
+                    .expect("fast")
+                    .with_timezone(&Utc),
+            ),
+        },
+    ];
+    let current = model_info("grok-4.7-build-fast");
+
+    let standard = resolve_grok_inference_sample_model(
+        &GrokInferenceSample {
+            usage: UsageCounts {
+                input_tokens: Some(100_000),
+                requests: Some(1),
+                ..UsageCounts::default()
+            },
+            observed_at: Some(first),
+        },
+        &prompt_models,
+        &[],
+        &["grok-4.7".to_string(), "grok-4.7-build-fast".to_string()],
+        Some(&current),
+    )
+    .expect("standard model");
+    let fast = resolve_grok_inference_sample_model(
+        &GrokInferenceSample {
+            usage: UsageCounts {
+                input_tokens: Some(100_000),
+                requests: Some(1),
+                ..UsageCounts::default()
+            },
+            observed_at: Some(second),
+        },
+        &prompt_models,
+        &[],
+        &["grok-4.7".to_string(), "grok-4.7-build-fast".to_string()],
+        Some(&current),
+    )
+    .expect("fast model");
+
+    assert_eq!(standard.name.as_deref(), Some("grok-4.7"));
+    assert_eq!(fast.name.as_deref(), Some("grok-4.7-build-fast"));
+
+    let standard_cost = estimate_cost(GROK_BUILD_PROVIDER, Some(&standard), &UsageCounts {
+        input_tokens: Some(100_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    });
+    let fast_cost = estimate_cost(GROK_BUILD_PROVIDER, Some(&fast), &UsageCounts {
+        input_tokens: Some(100_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    });
+
+    assert_eq!(standard_cost.estimated_api_equivalent_micro_usd, Some(200_000));
+    assert_eq!(fast_cost.estimated_api_equivalent_micro_usd, Some(400_000));
+}
+
+#[test]
 fn grok_inference_model_resolution_rejects_partial_observation_when_models_used_is_mixed() {
     let observed_at = DateTime::parse_from_rfc3339("2026-08-16T18:32:10Z")
         .expect("observed")
