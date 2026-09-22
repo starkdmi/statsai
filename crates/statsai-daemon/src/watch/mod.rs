@@ -78,7 +78,7 @@ pub fn watch_and_serve(
         .context("create FSEvents watcher")?;
         run_watch_loop(
             &mut watcher,
-            |watcher| watcher.poll_restart(),
+            |watcher| Ok(watcher.poll_restart()?),
             addr,
             store,
             device_id,

@@ -23,7 +23,7 @@ use notify::{Config, Event, EventHandler, EventKind, RecursiveMode, Result, Watc
 use std::ffi::CStr;
 use std::os::raw;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
