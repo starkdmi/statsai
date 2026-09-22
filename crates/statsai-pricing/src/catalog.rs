@@ -62,8 +62,8 @@ pub(crate) fn pricing_for_effective_speed(
         "claude-opus-4-6" | "claude-opus-4-7" => {
             pricing_with_cache_creation(30.0, 37.5, 3.0, 150.0)
         }
-        // Cursor's fast tier for Grok 4.6 is a flat 2x on input, cached input, and output.
-        "grok-4.6" => pricing(4.0, 1.0, 12.0),
+        // Grok 4.6/4.7 Fast is 2x the standard short-context token rates.
+        "grok-4.6" | "grok-4.7" => pricing(4.0, 1.0, 12.0),
         // Grok 4.5 fast doubles input and cached input but triples output.
         // Applied as multipliers against the standard rates above rather than as
         // absolutes: xAI documents 4.5 cached input at $0.30/M, not 4.6's $0.50/M
@@ -190,9 +190,9 @@ pub(crate) fn pricing_for_model_on(
         | "grok-4.20-0309-reasoning"
         | "grok-4.20-0309-non-reasoning" => Some(pricing(1.25, 0.2, 2.5)),
         "grok-4.5" => Some(pricing(2.0, 0.3, 6.0)),
-        // Official Grok 4.6 cached-input rate is $0.50/M below 200k prompt tokens
-        // ($1.00/M at or above 200k): https://docs.x.ai/developers/models/grok-4.6
-        "grok-4.6" => Some(pricing(2.0, 0.5, 6.0)),
+        // Official Grok 4.6/4.7 short-context rates are $2/M input,
+        // $0.50/M cached input, and $6/M output.
+        "grok-4.6" | "grok-4.7" => Some(pricing(2.0, 0.5, 6.0)),
         _ => None,
     }
 }
