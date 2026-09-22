@@ -260,26 +260,20 @@ impl ClientConnection {
         use crate::http::tiny_http::Response;
 
         let writer = self.sink.next().unwrap();
-        let writer = match self.socket.try_clone() {
-            Ok(socket) => DeadlineWrite {
-                inner: writer,
-                socket,
-                deadline: Instant::now() + self.limits.write_deadline,
-            },
-            Err(_) => {
-                let response = match body {
-                    Some(body) => Response::from_string(body).with_status_code(status),
-                    None => Response::new_empty(status),
+        let response = Response::from_string(body.unwrap_or_default()).with_status_code(status);
+        match self.socket.try_clone() {
+            Ok(socket) => {
+                let writer = DeadlineWrite {
+                    inner: writer,
+                    socket,
+                    deadline: Instant::now() + self.limits.write_deadline,
                 };
                 response.raw_print(writer, version, &[], false, None).ok();
-                return;
             }
-        };
-        let response = match body {
-            Some(body) => Response::from_string(body).with_status_code(status),
-            None => Response::new_empty(status),
-        };
-        response.raw_print(writer, version, &[], false, None).ok();
+            Err(_) => {
+                response.raw_print(writer, version, &[], false, None).ok();
+            }
+        }
     }
 }
 
