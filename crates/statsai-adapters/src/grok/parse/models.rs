@@ -120,8 +120,7 @@ pub(crate) fn resolve_grok_inference_sample_model(
         );
     let assignable = unique_grok_model_keys(assignable_ids);
     if assignable.len() == 1 {
-        let models_used =
-            unique_grok_model_keys(session_models_used.iter().map(String::as_str));
+        let models_used = unique_grok_model_keys(session_models_used.iter().map(String::as_str));
         // A lone prompt/turn observation cannot cover every inference when
         // modelsUsed reports another model: request-level attribution is
         // incomplete, so do not silently price the missing model as this one.
