@@ -219,11 +219,7 @@ impl ClientConnection {
             socket: body_socket,
             deadline: started + self.limits.body_deadline,
         };
-        let writer = DeadlineWrite {
-            inner: writer,
-            socket: write_socket,
-            deadline: started + self.limits.write_deadline,
-        };
+        let writer = DeadlineWrite::new(writer, write_socket, self.limits.write_deadline);
 
         // building the next reader
         let request = crate::http::tiny_http::request::new_request(
@@ -263,11 +259,7 @@ impl ClientConnection {
         let response = Response::from_string(body.unwrap_or_default()).with_status_code(status);
         match self.socket.try_clone() {
             Ok(socket) => {
-                let mut writer = DeadlineWrite {
-                    inner: writer,
-                    socket,
-                    deadline: Instant::now() + self.limits.write_deadline,
-                };
+                let mut writer = DeadlineWrite::new(writer, socket, self.limits.write_deadline);
                 let _ = response.raw_print(&mut writer, version, &[], false, None);
                 let _ = writer.flush();
             }

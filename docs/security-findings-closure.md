@@ -106,6 +106,11 @@ deadline, then the connection is shut down.
 - `daemon_run_serves_health_and_rejects_oversized_headers` `HTTP/2.0`
   `505` followed by a successful `/health`
 
+The response write window starts on the first write, not when headers
+are parsed, so a queued request can still reply after handler delay.
+`write_deadline_starts_when_the_response_is_written` sleeps past a
+150 ms limit before `respond` and still succeeds.
+
 ### F3 — Bounded JSON decoding
 
 **Issue.** `into_json()` could decompress or parse unbounded response
@@ -176,7 +181,7 @@ state are left in place. Missing paths keep the last canonical.
 - `a_symlink_retarget_is_detected_by_comparing_canonical_paths` (atomic
   rename, no `ROOT_CHANGED`)
 - `live_watcher_detects_an_atomic_symlink_retarget_and_new_writes`
-  (macOS-only; real `FsEventWatcher`, `poll_restart` only, then a write
+  (macOS CI: real `FsEventWatcher`, `poll_restart` only, then a write
   under the new target)
 
 ### F8 — Linux keyring encryption
@@ -235,7 +240,8 @@ sources were grepped in the tarballs, and the same regressions were
 re-run against those extracted sources.
 
 This environment cannot typecheck `darwin.rs` or clippy
-`aarch64-apple-darwin` / `x86_64-apple-darwin`. macOS CI installs both
-targets and runs `scripts/rust-ci.sh clippy`, which clippy the watch
-backend for each architecture. The live `FsEventWatcher` retarget test
-is compiled only on macOS.
+`aarch64-apple-darwin` / `x86_64-apple-darwin`. macOS CI clippy both
+Apple targets with `--features watch`, and
+`live_watcher_detects_an_atomic_symlink_retarget_and_new_writes` passed
+on `macos-latest`. The ARM64 development build compiles `statsai-daemon`
+on macOS.

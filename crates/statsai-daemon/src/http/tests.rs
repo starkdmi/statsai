@@ -382,6 +382,38 @@ fn the_request_queue_rejects_work_beyond_its_cap() {
 }
 
 #[test]
+fn write_deadline_starts_when_the_response_is_written() {
+    let server = Server::http_with_limits(
+        "127.0.0.1:0",
+        HttpLimits {
+            write_deadline: Duration::from_millis(150),
+            ..limits_for_tests()
+        },
+    )
+    .expect("bind");
+    let ListenAddr::IP(addr) = server.server_addr() else {
+        panic!("tcp");
+    };
+    let handle = thread::spawn(move || {
+        let request = server
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recv")
+            .expect("request");
+        thread::sleep(Duration::from_millis(250));
+        request
+            .respond(Response::from_string("late"))
+            .expect("queue wait must not consume the write deadline");
+    });
+    let mut stream = connect(addr);
+    stream
+        .write_all(b"GET /late HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let response = String::from_utf8_lossy(&read_available(&mut stream)).into_owned();
+    assert!(response.contains("late"), "{response}");
+    handle.join().expect("server thread");
+}
+
+#[test]
 fn an_unread_enormous_body_closes_promptly_without_growing_the_discard_buffer() {
     let addr = spawn_echo(limits_for_tests());
     let before = rss_bytes();

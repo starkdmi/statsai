@@ -48,12 +48,35 @@ impl<R: Read> Read for DeadlineRead<R> {
 pub(crate) struct DeadlineWrite<W> {
     pub(crate) inner: W,
     pub(crate) socket: Connection,
-    pub(crate) deadline: Instant,
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl<W> DeadlineWrite<W> {
+    pub(crate) fn new(inner: W, socket: Connection, timeout: Duration) -> Self {
+        Self {
+            inner,
+            socket,
+            timeout,
+            deadline: None,
+        }
+    }
+
+    /// Starts the write window on the first write or flush.
+    ///
+    /// Queue wait and handler time must not consume this budget; it bounds a
+    /// slow client reading the response, not a parked request.
+    fn deadline(&mut self) -> Instant {
+        *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + self.timeout)
+    }
 }
 
 impl<W: Write> Write for DeadlineWrite<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        arm_write(&self.socket, self.deadline, "write deadline exceeded")?;
+        let deadline = self.deadline();
+        arm_write(&self.socket, deadline, "write deadline exceeded")?;
         match self.inner.write(buf) {
             Err(error) if is_socket_deadline(&error) => Err(io::Error::new(
                 ErrorKind::TimedOut,
@@ -64,7 +87,8 @@ impl<W: Write> Write for DeadlineWrite<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        arm_write(&self.socket, self.deadline, "write deadline exceeded")?;
+        let deadline = self.deadline();
+        arm_write(&self.socket, deadline, "write deadline exceeded")?;
         match self.inner.flush() {
             Err(error) if is_socket_deadline(&error) => Err(io::Error::new(
                 ErrorKind::TimedOut,
