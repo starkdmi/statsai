@@ -111,6 +111,38 @@ are parsed, so a queued request can still reply after handler delay.
 `write_deadline_starts_when_the_response_is_written` sleeps past a
 150 ms limit before `respond` and still succeeds.
 
+### F2 follow-up P2 — Unbounded chunk-size lines
+
+**Issue.** Chunked request bodies used `chunked_transfer::Decoder`, which
+buffers the chunk-size line and extensions in an uncapped `Vec`. The 8
+MiB sync cap counts decoded payload only, so an authenticated
+`Transfer-Encoding: chunked` request can spend megabytes and seconds on
+framing (`2` plus padding, then `{}`) and still reach JSON validation.
+The 30-second body deadline is not a memory bound.
+
+**Fix.** The vendored server decodes chunks locally. Size digits are
+folded into a `u64` one byte at a time. Extensions are skipped with a
+counter. Metadata (size line plus extensions, excluding CRLF) is capped
+at 8 KiB, matching header lines. Overflowing sizes and malformed framing
+fail as `InvalidInput` and shut the connection down. Abandoned chunked
+bodies close on `Drop` unless the last-chunk trailer was consumed.
+Response encoding still uses the upstream `Encoder`.
+
+**Evidence.**
+
+- `chunk_size_at_the_metadata_cap_is_accepted` /
+  `oversized_chunk_size_line_is_rejected` /
+  `oversized_chunk_extension_is_rejected` /
+  `unfinished_chunk_size_line_is_rejected` /
+  `numeric_overflow_is_rejected`
+- `oversized_chunk_metadata_is_rejected_and_the_server_recovers`
+- `unfinished_chunk_metadata_hits_the_absolute_deadline`
+- `overflowing_chunk_size_is_rejected_and_the_server_recovers`
+- `valid_chunked_requests_decode_the_payload`
+- `daemon_run_rejects_oversized_chunk_metadata_without_json_validation`
+  (valid `{}` reaches `invalid batch`; a padded size line does not;
+  then `/health`)
+
 ### F3 — Bounded JSON decoding
 
 **Issue.** `into_json()` could decompress or parse unbounded response
