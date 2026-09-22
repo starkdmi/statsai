@@ -10,7 +10,7 @@ fn grok_request_level_pricing_upgrade_advances_parser_revision() {
         .and_then(|(_, value)| value.parse::<u32>().ok())
         .expect("Grok parser revision");
 
-    assert!(revision > 19);
+    assert!(revision > 22);
 }
 
 #[test]

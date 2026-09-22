@@ -105,6 +105,7 @@ pub(crate) fn last_grok_model_at_or_before(
 
 pub(crate) fn resolve_grok_inference_sample_model(
     sample: &GrokInferenceSample,
+    sample_count: usize,
     prompt_models: &[GrokModelObservation],
     turn_models: &[GrokModelObservation],
     session_models_used: &[String],
@@ -121,10 +122,23 @@ pub(crate) fn resolve_grok_inference_sample_model(
     let assignable = unique_grok_model_keys(assignable_ids);
     if assignable.len() == 1 {
         let models_used = unique_grok_model_keys(session_models_used.iter().map(String::as_str));
-        // A lone prompt/turn observation cannot cover every inference when
-        // modelsUsed reports another model: request-level attribution is
-        // incomplete, so do not silently price the missing model as this one.
-        if !models_used.is_empty() && models_used != assignable {
+        // modelsUsed may include a selected model that made no request. When
+        // there is exactly one inference, matching prompt and turn observations
+        // before it identify its model despite that extra selection. With more
+        // inferences, one observed model cannot account for an unobserved one.
+        let confirmed_single_sample = sample_count == 1
+            && sample.observed_at.is_some_and(|at| {
+                prompt_models.iter().any(|observation| {
+                    observation
+                        .observed_at
+                        .is_some_and(|observed_at| observed_at <= at)
+                }) && turn_models.iter().any(|observation| {
+                    observation
+                        .observed_at
+                        .is_some_and(|observed_at| observed_at <= at)
+                })
+            });
+        if !models_used.is_empty() && models_used != assignable && !confirmed_single_sample {
             return None;
         }
         let model_id = prompt_models

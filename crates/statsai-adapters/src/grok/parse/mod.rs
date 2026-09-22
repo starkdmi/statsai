@@ -27,6 +27,7 @@ pub(crate) fn estimate_grok_inference_sample_costs(
     for sample in samples {
         let Some(model) = resolve_grok_inference_sample_model(
             sample,
+            samples.len(),
             prompt_models,
             turn_models,
             session_models_used,

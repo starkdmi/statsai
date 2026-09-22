@@ -15,7 +15,9 @@ pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations
 // activity-invocations.v20: session rows report their message count as requests and
 // are priced per message, so long-context tiers stop being decided session-wide.
 pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v20";
-pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v22";
+// Revisit Grok sessions whose Fast request was left unpriced because modelsUsed
+// also retained a selected standard model that made no inference.
+pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "grok-fast-pricing.v23";
 
 pub(crate) fn scan_candidate(
     path: PathBuf,
