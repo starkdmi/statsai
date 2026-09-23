@@ -23,13 +23,14 @@ pub(crate) fn parse_codex_file(
     let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
     let file_fallback_project = project_context_from_path_fallback(root, path);
-    // Both are per session: one file can interleave several sessions, and each
-    // keeps its own cumulative total and its own usage source.
+    // Both are per session: one file can interleave several sessions.
     let mut previous_totals: HashMap<String, Option<CodexCumulativeTotal>> = HashMap::new();
-    // Once a session has a `token_usage_record`, its later `token_count` lines
-    // only carry quota and context. Records are the usage source from there on,
-    // which is also where compaction inference shows up.
-    let mut sessions_using_records: HashSet<String> = HashSet::new();
+    // A `token_usage_record` precedes the `token_count` for the same response
+    // and carries identical usage; compaction inference has a record and no
+    // token_count. The record is counted and remembered here until the next
+    // advancing token_count, which is dropped only when it repeats that usage.
+    // A response whose record is missing or malformed keeps its token_count.
+    let mut unpaired_record_usage: HashMap<String, UsageCounts> = HashMap::new();
     let mut current_model: Option<String> = None;
     let mut current_reasoning = ModelReasoningState::default();
     let mut current_model_is_fallback = false;
@@ -367,15 +368,13 @@ pub(crate) fn parse_codex_file(
             .map(ToOwned::to_owned)
             .or_else(|| session_raw_from_value(&value))
             .unwrap_or_else(|| session_raw.clone());
-        // Only a record that carries usage can take over from `token_count`. A
-        // malformed one must not silence the token_count lines that follow it.
         let record_usage = is_token_usage_record
             .then(|| codex_token_usage_record_from_value(&value))
             .flatten()
             .map(|record| record.usage)
             .filter(|usage| usage.total_tokens.is_some());
-        if record_usage.is_some() {
-            sessions_using_records.insert(event_session_raw.clone());
+        if let Some(usage) = &record_usage {
+            unpaired_record_usage.insert(event_session_raw.clone(), usage.clone());
         }
         let is_task_started = is_codex_task_started(&value);
         let is_task_complete = is_codex_task_complete(&value);
@@ -416,11 +415,10 @@ pub(crate) fn parse_codex_file(
         let usage = if is_token_usage_record {
             record_usage
         } else if is_token_count_event {
-            if sessions_using_records.contains(&event_session_raw) {
-                None
-            } else {
-                token_count_usage.clone()
-            }
+            token_count_usage.as_ref().and_then(|usage| {
+                let paired = unpaired_record_usage.remove(&event_session_raw);
+                (paired.as_ref() != Some(usage)).then(|| usage.clone())
+            })
         } else {
             codex_headless_usage_value(&value).map(codex_usage_counts_from_value)
         };

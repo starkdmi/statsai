@@ -41,7 +41,8 @@ pub(crate) fn collect_codex_quota_observations(
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
-    let mut previous_total = None;
+    // Keyed like the usage parser: a line's own session id, else the file's.
+    let mut previous_totals = HashMap::new();
     let mut observations = Vec::new();
     let mut line_bytes = Vec::new();
     let mut line_number = 0usize;
@@ -65,8 +66,12 @@ pub(crate) fn collect_codex_quota_observations(
         {
             continue;
         }
-        let usage_sample =
-            codex_token_count_usage(value.pointer("/payload/info"), &mut previous_total);
+        let usage_sample = codex_token_count_usage(
+            value.pointer("/payload/info"),
+            previous_totals
+                .entry(session_raw_from_value(&value).unwrap_or_default())
+                .or_default(),
+        );
         let observed_at = timestamp_from_nested_value(&value).unwrap_or(fallback_timestamp);
         if let Some(observation) =
             codex_quota_observation(source, path, line_number, observed_at, usage_sample, &value)

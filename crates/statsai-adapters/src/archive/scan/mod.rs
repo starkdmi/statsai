@@ -2,7 +2,7 @@ use super::super::{
     canonical_display, codex_project_context_from_value, codex_quota_observation,
     codex_token_count_usage, codex_usage_roots, collect_jsonl_files, expand_home_path,
     file_modified_timestamp, grok_sessions_root, model_from_nested_value, open_sqlite_readonly,
-    read_bounded_jsonl_line, resolve_project_context, source_root_path,
+    read_bounded_jsonl_line, resolve_project_context, session_raw_from_value, source_root_path,
     timestamp_from_nested_value, BoundedLineRead, ProjectContextCache, CLAUDE_CODE_PROVIDER,
     CODEX_PROVIDER, GROK_BUILD_PROVIDER, MAX_JSONL_RECORD_BYTES, OPENCODE_PROVIDER,
 };

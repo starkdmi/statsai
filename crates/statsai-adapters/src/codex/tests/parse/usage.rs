@@ -426,7 +426,7 @@ fn assert_interleaved_sessions_keep_their_own_usage(usage: &str, record: String)
     // cumulative total equals A's last one and is still a new response for B.
     let token_count = |timestamp: &str, session: &str| {
         format!(
-            r#"{{"timestamp":"{timestamp}","session_id":"{session}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{usage},"last_token_usage":{usage}}}}}}}"#
+            r#"{{"timestamp":"{timestamp}","session_id":"{session}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{usage},"last_token_usage":{usage}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":10,"window_minutes":300,"resets_at":1790000000}},"plan_type":"plus"}}}}}}"#
         )
     };
     let task = |timestamp: &str, session: &str, kind: &str, at: &str| {
@@ -464,8 +464,12 @@ fn assert_interleaved_sessions_keep_their_own_usage(usage: &str, record: String)
         ),
     ];
 
-    let (scan, _, _) = scan_session_lines(&lines);
+    let (scan, quota_len, positive_samples) = scan_session_lines(&lines);
 
+    // The archive quota scan keys cumulative totals the same way, so B's
+    // sample is not mistaken for a repeat of A's.
+    assert_eq!(quota_len, 2);
+    assert_eq!(positive_samples, 2);
     let mut totals = scan
         .events
         .iter()
@@ -508,6 +512,34 @@ fn codex_record_without_usage_keeps_token_count_as_the_usage_source() {
     assert_eq!(scan.events.len(), 1);
     assert_eq!(scan.events[0].usage.computed_total(), 120);
     assert_eq!(scan.events[0].usage.requests, Some(1));
+}
+
+#[test]
+fn codex_malformed_record_after_records_began_keeps_its_token_count() {
+    // The first response is recorded normally; the second response's record
+    // is malformed, so its token_count is the only evidence of it.
+    let first = serde_json::json!({"input_tokens": 90, "output_tokens": 10, "total_tokens": 100});
+    let first_total = first.clone();
+    let second = serde_json::json!({"input_tokens": 45, "output_tokens": 5, "total_tokens": 50});
+    let second_total =
+        serde_json::json!({"input_tokens": 135, "output_tokens": 15, "total_tokens": 150});
+    let (started, completed) = turn_bounds("2026-09-01T10:00:00Z", "2026-09-01T10:00:09Z");
+    let lines = vec![
+        started,
+        format!(
+            r#"{{"timestamp":"2026-09-01T10:00:01Z","type":"token_usage_record","payload":{{"usage":{first}}}}}"#
+        ),
+        token_count_line("2026-09-01T10:00:02Z", "codex", Some(first_total), first),
+        r#"{"timestamp":"2026-09-01T10:00:03Z","type":"token_usage_record","payload":{"usage":{}}}"#.to_string(),
+        token_count_line("2026-09-01T10:00:04Z", "codex", Some(second_total), second),
+        completed,
+    ];
+
+    let (scan, _, _) = scan_session_lines(&lines);
+
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.events[0].usage.computed_total(), 150);
+    assert_eq!(scan.events[0].usage.requests, Some(2));
 }
 
 #[test]

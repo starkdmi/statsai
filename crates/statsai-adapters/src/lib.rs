@@ -84,7 +84,7 @@ pub use claude::{ClaudeCodeAdapter, ClaudeProjectPathMemo};
 pub use codex::CodexAdapter;
 pub(crate) use codex::{
     codex_project_context_from_value, codex_quota_observation, codex_token_count_usage,
-    codex_usage_roots,
+    codex_usage_roots, session_raw_from_value,
 };
 pub(crate) use grok::grok_sessions_root;
 pub use grok::GrokBuildAdapter;
