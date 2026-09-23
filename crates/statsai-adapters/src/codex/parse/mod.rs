@@ -23,11 +23,13 @@ pub(crate) fn parse_codex_file(
     let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
     let file_fallback_project = project_context_from_path_fallback(root, path);
-    let mut previous_total: Option<CodexCumulativeTotal> = None;
-    // Once a file contains a `token_usage_record`, later `token_count` lines
+    // Both are per session: one file can interleave several sessions, and each
+    // keeps its own cumulative total and its own usage source.
+    let mut previous_totals: HashMap<String, Option<CodexCumulativeTotal>> = HashMap::new();
+    // Once a session has a `token_usage_record`, its later `token_count` lines
     // only carry quota and context. Records are the usage source from there on,
     // which is also where compaction inference shows up.
-    let mut usage_from_records = false;
+    let mut sessions_using_records: HashSet<String> = HashSet::new();
     let mut current_model: Option<String> = None;
     let mut current_reasoning = ModelReasoningState::default();
     let mut current_model_is_fallback = false;
@@ -356,6 +358,8 @@ pub(crate) fn parse_codex_file(
 
         let is_token_count_event = is_codex_token_count(&value);
         let is_token_usage_record = is_codex_token_usage_record(&value);
+        let event_session_raw =
+            session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
         // Only a record that carries usage can take over from `token_count`. A
         // malformed one must not silence the token_count lines that follow it.
         let record_usage = is_token_usage_record
@@ -364,7 +368,7 @@ pub(crate) fn parse_codex_file(
             .map(|record| record.usage)
             .filter(|usage| usage.total_tokens.is_some());
         if record_usage.is_some() {
-            usage_from_records = true;
+            sessions_using_records.insert(event_session_raw.clone());
         }
         let is_task_started = is_codex_task_started(&value);
         let is_task_complete = is_codex_task_complete(&value);
@@ -392,17 +396,20 @@ pub(crate) fn parse_codex_file(
         let user_message_preview = collect_tasks
             .then(|| codex_user_message_preview(&value))
             .flatten();
-        let event_session_raw =
-            session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
         let token_count_usage = if is_token_count_event {
-            codex_token_count_usage(value.pointer("/payload/info"), &mut previous_total)
+            codex_token_count_usage(
+                value.pointer("/payload/info"),
+                previous_totals
+                    .entry(event_session_raw.clone())
+                    .or_default(),
+            )
         } else {
             None
         };
         let usage = if is_token_usage_record {
             record_usage
         } else if is_token_count_event {
-            if usage_from_records {
+            if sessions_using_records.contains(&event_session_raw) {
                 None
             } else {
                 token_count_usage.clone()

@@ -405,6 +405,74 @@ fn codex_ignores_the_phantom_token_count_after_compaction() {
 }
 
 #[test]
+fn codex_interleaved_sessions_keep_their_own_usage_source_and_totals() {
+    // Session A switches to records; session B stays on token_count. B's first
+    // cumulative total equals A's last one and is still a new response for B.
+    let usage = r#"{"input_tokens":90,"output_tokens":10,"total_tokens":100}"#;
+    let token_count = |timestamp: &str, session: &str| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","session_id":"{session}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{usage},"last_token_usage":{usage}}}}}}}"#
+        )
+    };
+    let task = |timestamp: &str, session: &str, kind: &str, at: &str| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","session_id":"{session}","type":"event_msg","payload":{{"type":"{kind}","{at}":"{timestamp}"}}}}"#
+        )
+    };
+    let lines = vec![
+        task(
+            "2026-09-01T10:00:00Z",
+            "session-a",
+            "task_started",
+            "started_at",
+        ),
+        task(
+            "2026-09-01T10:00:01Z",
+            "session-b",
+            "task_started",
+            "started_at",
+        ),
+        format!(
+            r#"{{"timestamp":"2026-09-01T10:00:02Z","session_id":"session-a","type":"token_usage_record","payload":{{"usage":{usage}}}}}"#
+        ),
+        token_count("2026-09-01T10:00:03Z", "session-a"),
+        token_count("2026-09-01T10:00:04Z", "session-b"),
+        task(
+            "2026-09-01T10:00:05Z",
+            "session-a",
+            "task_complete",
+            "completed_at",
+        ),
+        task(
+            "2026-09-01T10:00:06Z",
+            "session-b",
+            "task_complete",
+            "completed_at",
+        ),
+    ];
+
+    let (scan, _, _) = scan_session_lines(&lines);
+
+    let mut totals = scan
+        .events
+        .iter()
+        .map(|event| {
+            (
+                event.session.local_session_id_hash.clone(),
+                event.usage.computed_total(),
+            )
+        })
+        .collect::<Vec<_>>();
+    totals.sort();
+    let mut expected = vec![
+        (Some(hash_text("session-a")), 100),
+        (Some(hash_text("session-b")), 100),
+    ];
+    expected.sort();
+    assert_eq!(totals, expected);
+}
+
+#[test]
 fn codex_record_without_usage_keeps_token_count_as_the_usage_source() {
     // A record that carries no usable usage cannot stand in for the
     // token_count lines after it, or those responses would vanish.
