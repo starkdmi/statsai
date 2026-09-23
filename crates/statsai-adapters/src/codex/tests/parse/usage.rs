@@ -405,6 +405,31 @@ fn codex_ignores_the_phantom_token_count_after_compaction() {
 }
 
 #[test]
+fn codex_record_without_usage_keeps_token_count_as_the_usage_source() {
+    // A record that carries no usable usage cannot stand in for the
+    // token_count lines after it, or those responses would vanish.
+    let total = serde_json::json!({
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "total_tokens": 120
+    });
+    let (started, completed) = turn_bounds("2026-09-01T10:00:00Z", "2026-09-01T10:00:05Z");
+    let lines = vec![
+        started,
+        r#"{"timestamp":"2026-09-01T10:00:01Z","type":"token_usage_record","payload":{"turn_id":"00000000-0000-7000-8000-0000000000a1"}}"#.to_string(),
+        r#"{"timestamp":"2026-09-01T10:00:02Z","type":"token_usage_record","payload":{"usage":{}}}"#.to_string(),
+        token_count_line("2026-09-01T10:00:03Z", "codex", Some(total.clone()), total),
+        completed,
+    ];
+
+    let (scan, _, _) = scan_session_lines(&lines);
+
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.events[0].usage.computed_total(), 120);
+    assert_eq!(scan.events[0].usage.requests, Some(1));
+}
+
+#[test]
 fn codex_counts_a_decreased_token_total_as_a_reset() {
     // A fork or resume can restart the cumulative total. That is new usage,
     // unlike an exact repeat of the previous total.

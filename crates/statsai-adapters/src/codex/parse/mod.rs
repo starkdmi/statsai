@@ -356,7 +356,14 @@ pub(crate) fn parse_codex_file(
 
         let is_token_count_event = is_codex_token_count(&value);
         let is_token_usage_record = is_codex_token_usage_record(&value);
-        if is_token_usage_record {
+        // Only a record that carries usage can take over from `token_count`. A
+        // malformed one must not silence the token_count lines that follow it.
+        let record_usage = is_token_usage_record
+            .then(|| codex_token_usage_record_from_value(&value))
+            .flatten()
+            .map(|record| record.usage)
+            .filter(|usage| usage.total_tokens.is_some());
+        if record_usage.is_some() {
             usage_from_records = true;
         }
         let is_task_started = is_codex_task_started(&value);
@@ -393,7 +400,7 @@ pub(crate) fn parse_codex_file(
             None
         };
         let usage = if is_token_usage_record {
-            codex_token_usage_record_from_value(&value).map(|record| record.usage)
+            record_usage
         } else if is_token_count_event {
             if usage_from_records {
                 None
