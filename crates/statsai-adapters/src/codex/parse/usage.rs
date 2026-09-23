@@ -52,12 +52,29 @@ pub(crate) struct CodexCumulativeTotal {
     counts: UsageCounts,
 }
 
+/// Whether a `token_count` repeats the response a `token_usage_record` already
+/// counted. Compares the normalized counts, so whether either side reported
+/// `total_tokens` explicitly does not matter.
+pub(crate) fn same_codex_response_usage(record: &UsageCounts, token_count: &UsageCounts) -> bool {
+    let key = |usage: &UsageCounts| {
+        (
+            usage.input_tokens.unwrap_or(0),
+            usage.output_tokens.unwrap_or(0),
+            usage.cache_creation_tokens.unwrap_or(0),
+            usage.cache_read_tokens.unwrap_or(0),
+            usage.reasoning_tokens.unwrap_or(0),
+        )
+    };
+    key(record) == key(token_count)
+}
+
 /// Usage to attribute for one `token_count` line.
 ///
-/// When `total_token_usage` repeats the previous cumulative total in this
-/// file, the line is a duplicate snapshot (or the post-compaction context
+/// When `total_token_usage` repeats the previous cumulative total for this
+/// session, the line is a duplicate snapshot (or the post-compaction context
 /// size) and contributes nothing. A smaller total is a fork or resume reset
-/// and still counts. Lines with no cumulative total keep `last_token_usage`.
+/// and still counts, from zero. Lines with no cumulative total keep
+/// `last_token_usage`.
 pub(crate) fn codex_token_count_usage(
     info: Option<&Value>,
     previous: &mut Option<CodexCumulativeTotal>,
@@ -76,14 +93,20 @@ pub(crate) fn codex_token_count_usage(
     let unchanged = previous
         .as_ref()
         .is_some_and(|previous| cumulative_total_unchanged(previous, total_value));
+    let reset = previous
+        .as_ref()
+        .is_some_and(|previous| cumulative_total_decreased(previous, total_value));
     let usage = if unchanged {
         None
     } else {
         last_usage.or_else(|| {
-            Some(crate::subtract_usage_counts(
-                &total_counts,
-                previous.as_ref().map(|previous| &previous.counts),
-            ))
+            // After a reset the counter restarted at zero, so the whole new
+            // total is usage; subtracting the larger old total would clamp
+            // every field to zero.
+            let baseline = (!reset)
+                .then(|| previous.as_ref().map(|previous| &previous.counts))
+                .flatten();
+            Some(crate::subtract_usage_counts(&total_counts, baseline))
         })
     };
     *previous = Some(CodexCumulativeTotal {
@@ -99,6 +122,16 @@ fn cumulative_total_unchanged(previous: &CodexCumulativeTotal, raw: &Value) -> b
         // An equal counter is a repeated snapshot. A smaller one is a reset.
         (Some(before), Some(after)) => before == after,
         _ => &previous.raw == raw,
+    }
+}
+
+fn cumulative_total_decreased(previous: &CodexCumulativeTotal, raw: &Value) -> bool {
+    match (
+        previous.raw.get("total_tokens").and_then(Value::as_u64),
+        raw.get("total_tokens").and_then(Value::as_u64),
+    ) {
+        (Some(before), Some(after)) => after < before,
+        _ => false,
     }
 }
 

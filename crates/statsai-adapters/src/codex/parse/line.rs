@@ -47,6 +47,7 @@ pub(crate) enum CodexLineKind {
     EventUserMessage,
     TokenCount,
     TokenUsageRecord,
+    Compacted,
     TaskStarted,
     TaskComplete,
     HeadlessUsage,
@@ -98,6 +99,9 @@ pub(crate) fn codex_line_kind(line: &str) -> CodexLineKind {
     }
     if header.contains("\"type\":\"turn_context\"") {
         return CodexLineKind::TurnContext;
+    }
+    if header.contains("\"type\":\"compacted\"") {
+        return CodexLineKind::Compacted;
     }
     if header.contains("\"type\":\"response_item\"") {
         return if header.contains("\"payload\":{\"type\":\"message\"") {

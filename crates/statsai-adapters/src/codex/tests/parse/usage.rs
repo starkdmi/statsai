@@ -407,18 +407,108 @@ fn codex_ignores_the_phantom_token_count_after_compaction() {
 #[test]
 fn codex_interleaved_sessions_keep_their_own_usage_source_and_totals() {
     let usage = r#"{"input_tokens":90,"output_tokens":10,"total_tokens":100}"#;
-    // Records may name their session at the top level or only by
-    // `payload.thread_id`; a sub-agent's `payload.session_id` is its parent.
-    for record in [
+    let record = format!(
+        r#"{{"timestamp":"2026-09-01T10:00:02Z","session_id":"session-a","type":"token_usage_record","payload":{{"thread_id":"session-a","usage":{usage}}}}}"#
+    );
+    assert_interleaved_sessions_keep_their_own_usage(usage, record);
+}
+
+#[test]
+fn codex_forked_history_pairs_records_named_for_the_parent_thread() {
+    // A fork copies its parent's history: the copied record names the parent
+    // thread, and the token_count after it carries no thread id at all. Both
+    // belong to the forked file's session and describe one response.
+    let usage = serde_json::json!({"input_tokens": 90, "output_tokens": 10, "total_tokens": 100});
+    let (started, completed) = turn_bounds("2026-09-01T10:00:00Z", "2026-09-01T10:00:05Z");
+    let lines = vec![
+        r#"{"timestamp":"2026-09-01T09:59:59Z","type":"session_meta","payload":{"id":"00000000-0000-7000-8000-00000000f0f0"}}"#.to_string(),
+        started,
         format!(
-            r#"{{"timestamp":"2026-09-01T10:00:02Z","session_id":"session-a","type":"token_usage_record","payload":{{"usage":{usage}}}}}"#
+            r#"{{"timestamp":"2026-09-01T10:00:01Z","type":"token_usage_record","payload":{{"thread_id":"00000000-0000-7000-8000-000000000001","session_id":"00000000-0000-7000-8000-000000000001","usage":{usage}}}}}"#
         ),
+        token_count_line("2026-09-01T10:00:02Z", "codex", Some(usage.clone()), usage),
+        completed,
+    ];
+
+    let (scan, _, _) = scan_session_lines(&lines);
+
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.events[0].usage.computed_total(), 100);
+    assert_eq!(scan.events[0].usage.requests, Some(1));
+}
+
+#[test]
+fn codex_compaction_record_does_not_suppress_a_later_response_in_the_turn() {
+    // Compaction inference has a record and no token_count. A later response
+    // in the same turn has no usable record, and its token_count happens to
+    // repeat the compaction usage.
+    let usage = serde_json::json!({"input_tokens": 90, "output_tokens": 10, "total_tokens": 100});
+    let total = serde_json::json!({"input_tokens": 180, "output_tokens": 20, "total_tokens": 200});
+    let (started, completed) = turn_bounds("2026-09-01T10:00:00Z", "2026-09-01T10:00:09Z");
+    let lines = vec![
+        started,
         format!(
-            r#"{{"timestamp":"2026-09-01T10:00:02Z","type":"token_usage_record","payload":{{"thread_id":"session-a","session_id":"session-parent","usage":{usage}}}}}"#
+            r#"{{"timestamp":"2026-09-01T10:00:01Z","type":"token_usage_record","payload":{{"usage":{usage}}}}}"#
         ),
-    ] {
-        assert_interleaved_sessions_keep_their_own_usage(usage, record);
-    }
+        r#"{"timestamp":"2026-09-01T10:00:02Z","type":"compacted","payload":{"message":"synthetic","window_number":1}}"#.to_string(),
+        token_count_line("2026-09-01T10:00:03Z", "codex", Some(total), usage),
+        completed,
+    ];
+
+    let (scan, _, _) = scan_session_lines(&lines);
+
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.events[0].usage.computed_total(), 200);
+    assert_eq!(scan.events[0].usage.requests, Some(2));
+}
+
+#[test]
+fn codex_record_outside_a_turn_links_its_paired_quota_sample() {
+    let usage = serde_json::json!({"input_tokens": 90, "output_tokens": 10, "total_tokens": 100});
+    let lines = vec![
+        format!(
+            r#"{{"timestamp":"2026-09-01T10:00:01Z","type":"token_usage_record","payload":{{"usage":{usage}}}}}"#
+        ),
+        token_count_line("2026-09-01T10:00:02Z", "codex", Some(usage.clone()), usage),
+    ];
+
+    let (scan, _, _) = scan_session_lines(&lines);
+
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.quota_observations.len(), 1);
+    assert_eq!(
+        scan.quota_observations[0]
+            .observation
+            .usage_event_id
+            .as_ref(),
+        Some(&scan.events[0].event_id)
+    );
+}
+
+#[test]
+fn codex_counter_reset_without_last_usage_counts_the_new_total() {
+    let earlier =
+        serde_json::json!({"input_tokens": 900, "output_tokens": 100, "total_tokens": 1000});
+    let restarted = serde_json::json!({"input_tokens": 45, "output_tokens": 5, "total_tokens": 50});
+    let token_count = |timestamp: &str, total: &serde_json::Value| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{total}}}}}}}"#
+        )
+    };
+    let lines = vec![
+        token_count("2026-09-01T10:00:01Z", &earlier),
+        token_count("2026-09-01T10:00:02Z", &restarted),
+    ];
+
+    let (scan, _, _) = scan_session_lines(&lines);
+
+    let mut totals = scan
+        .events
+        .iter()
+        .map(|event| event.usage.computed_total())
+        .collect::<Vec<_>>();
+    totals.sort_unstable();
+    assert_eq!(totals, vec![50, 1000]);
 }
 
 fn assert_interleaved_sessions_keep_their_own_usage(usage: &str, record: String) {

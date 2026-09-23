@@ -11,6 +11,7 @@ pub(crate) struct CodexLineRecord {
     pub(crate) model_explicit: bool,
     pub(crate) usage: Option<UsageCounts>,
     pub(crate) is_token_count_event: bool,
+    pub(crate) is_usage_record: bool,
     pub(crate) is_task_started: bool,
     pub(crate) is_task_complete: bool,
     pub(crate) message_role: Option<String>,
@@ -108,9 +109,9 @@ pub(crate) struct ActiveCodexTurn {
     pub(crate) prompt_previews: Vec<CodexPromptPreviewCandidate>,
     pub(crate) last_activity_at: DateTime<Utc>,
     pub(crate) usage_lines: Vec<usize>,
-    /// `token_count` lines inside the turn that carry no usage because the
-    /// file's records are the usage source. Their quota observations still
-    /// belong to this turn's event.
+    /// `token_count` lines inside the turn that carry no usage, because they
+    /// repeat a total or pair with a `token_usage_record`. Their quota
+    /// observations still belong to this turn's event.
     pub(crate) quota_lines: Vec<usize>,
     pub(crate) project: Option<ProjectInfo>,
 }

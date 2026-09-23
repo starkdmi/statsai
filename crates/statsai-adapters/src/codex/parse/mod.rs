@@ -30,7 +30,10 @@ pub(crate) fn parse_codex_file(
     // token_count. The record is counted and remembered here until the next
     // advancing token_count, which is dropped only when it repeats that usage.
     // A response whose record is missing or malformed keeps its token_count.
-    let mut unpaired_record_usage: HashMap<String, UsageCounts> = HashMap::new();
+    // `compacted` and turn boundaries end the pairing window. Keyed by record
+    // line so a paired token_count's quota sample can follow the record.
+    let mut unpaired_records: HashMap<String, (UsageCounts, usize)> = HashMap::new();
+    let mut paired_quota_lines: HashMap<usize, usize> = HashMap::new();
     let mut current_model: Option<String> = None;
     let mut current_reasoning = ModelReasoningState::default();
     let mut current_model_is_fallback = false;
@@ -103,6 +106,18 @@ pub(crate) fn parse_codex_file(
                 activity_started_at.elapsed().as_millis() as u64;
             continue;
         }
+        if line_kind == CodexLineKind::Compacted {
+            // The row carries the whole compacted conversation, so read the
+            // session from its header instead of parsing it.
+            let session = codex_json_string_prefix_after_marker(
+                codex_line_header(line),
+                "\"session_id\":\"",
+                256,
+            )
+            .unwrap_or_else(|| session_raw.clone());
+            unpaired_records.remove(&session);
+            continue;
+        }
         if line_kind == CodexLineKind::Irrelevant && !is_codex_quota_line_structurally(line) {
             continue;
         }
@@ -166,6 +181,7 @@ pub(crate) fn parse_codex_file(
                     model_explicit: false,
                     usage: None,
                     is_token_count_event: false,
+                    is_usage_record: false,
                     is_task_started: false,
                     is_task_complete: false,
                     message_role: role,
@@ -231,6 +247,7 @@ pub(crate) fn parse_codex_file(
                 model_explicit: false,
                 usage: None,
                 is_token_count_event: false,
+                is_usage_record: false,
                 is_task_started: false,
                 is_task_complete: false,
                 message_role,
@@ -293,6 +310,7 @@ pub(crate) fn parse_codex_file(
                 model_explicit: false,
                 usage: None,
                 is_token_count_event: false,
+                is_usage_record: false,
                 is_task_started: false,
                 is_task_complete: false,
                 message_role: None,
@@ -359,29 +377,25 @@ pub(crate) fn parse_codex_file(
 
         let is_token_count_event = is_codex_token_count(&value);
         let is_token_usage_record = is_codex_token_usage_record(&value);
-        // A record names the thread it belongs to in `payload.thread_id`, which
-        // is the session id turns are keyed by. Its `payload.session_id` is the
-        // parent session for a sub-agent, so it must not be used here.
-        let event_session_raw = is_token_usage_record
-            .then(|| value.pointer("/payload/thread_id").and_then(Value::as_str))
-            .flatten()
-            .map(ToOwned::to_owned)
-            .or_else(|| session_raw_from_value(&value))
-            .unwrap_or_else(|| session_raw.clone());
+        // Records are keyed exactly like the token_count lines they pair with.
+        // `payload.thread_id` is not used: a fork copies its parent's history,
+        // records and all, and token_count carries no thread id to match it.
+        let event_session_raw =
+            session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
         let record_usage = is_token_usage_record
             .then(|| codex_token_usage_record_from_value(&value))
             .flatten()
             .map(|record| record.usage)
             .filter(|usage| usage.total_tokens.is_some());
         if let Some(usage) = &record_usage {
-            unpaired_record_usage.insert(event_session_raw.clone(), usage.clone());
+            unpaired_records.insert(event_session_raw.clone(), (usage.clone(), index));
         }
         let is_task_started = is_codex_task_started(&value);
         let is_task_complete = is_codex_task_complete(&value);
         // A record and its token_count belong to one turn. An unpaired record
         // must not suppress a later turn's token_count that happens to match.
         if is_task_started || is_task_complete {
-            unpaired_record_usage.remove(&event_session_raw);
+            unpaired_records.remove(&event_session_raw);
         }
         let task_started_at = is_task_started
             .then(|| codex_task_timestamp(&value, &["/payload/started_at"]))
@@ -421,8 +435,15 @@ pub(crate) fn parse_codex_file(
             record_usage
         } else if is_token_count_event {
             token_count_usage.as_ref().and_then(|usage| {
-                let paired = unpaired_record_usage.remove(&event_session_raw);
-                (paired.as_ref() != Some(usage)).then(|| usage.clone())
+                match unpaired_records.remove(&event_session_raw) {
+                    Some((record_usage, record_line))
+                        if same_codex_response_usage(&record_usage, usage) =>
+                    {
+                        paired_quota_lines.insert(record_line, index);
+                        None
+                    }
+                    _ => Some(usage.clone()),
+                }
             })
         } else {
             codex_headless_usage_value(&value).map(codex_usage_counts_from_value)
@@ -505,7 +526,8 @@ pub(crate) fn parse_codex_file(
             model_inferred,
             model_explicit,
             usage,
-            is_token_count_event: is_token_count_event || is_token_usage_record,
+            is_token_count_event,
+            is_usage_record: is_token_usage_record,
             is_task_started,
             is_task_complete,
             message_role,
@@ -924,7 +946,9 @@ pub(crate) fn parse_codex_file(
                 project: record
                     .project
                     .or_else(|| project_context_from_path_fallback(root, path)),
-                event_kind: if record.is_token_count_event {
+                event_kind: if record.is_usage_record {
+                    "codex_usage_record"
+                } else if record.is_token_count_event {
                     "codex_token_count"
                 } else {
                     "codex_headless_usage"
@@ -934,7 +958,7 @@ pub(crate) fn parse_codex_file(
                 source_type: "jsonl",
                 model_inferred: record.model_inferred,
                 timestamp_inferred: record.timestamp_inferred,
-                deduplication: if record.is_token_count_event {
+                deduplication: if record.is_token_count_event || record.is_usage_record {
                     EventDeduplication::PathIndependent
                 } else {
                     EventDeduplication::SessionScoped
@@ -942,10 +966,13 @@ pub(crate) fn parse_codex_file(
                 dedupe_salt: None,
             },
         );
+        // A record's paired token_count carries the quota sample for it.
+        let mut linked_quota_lines = vec![record.line_number];
+        linked_quota_lines.extend(paired_quota_lines.get(&record.line_number));
         link_quota_observations(
             ctx.scan,
             &quota_observation_indices,
-            &[record.line_number],
+            &linked_quota_lines,
             &event.event_id,
             QuotaUsageLinkKind::RecordEvent,
         );
