@@ -515,6 +515,35 @@ fn codex_record_without_usage_keeps_token_count_as_the_usage_source() {
 }
 
 #[test]
+fn codex_unpaired_record_does_not_suppress_a_later_turn() {
+    // Turn one ends on a record with no token_count (compaction). Turn two
+    // has no usable record, and its token_count happens to repeat that usage.
+    let usage = serde_json::json!({"input_tokens": 90, "output_tokens": 10, "total_tokens": 100});
+    let (first_started, first_completed) =
+        turn_bounds("2026-09-01T10:00:00Z", "2026-09-01T10:00:02Z");
+    let (second_started, second_completed) =
+        turn_bounds("2026-09-01T10:01:00Z", "2026-09-01T10:01:02Z");
+    let lines = vec![
+        first_started,
+        format!(
+            r#"{{"timestamp":"2026-09-01T10:00:01Z","type":"token_usage_record","payload":{{"usage":{usage}}}}}"#
+        ),
+        first_completed,
+        second_started,
+        token_count_line("2026-09-01T10:01:01Z", "codex", Some(usage.clone()), usage),
+        second_completed,
+    ];
+
+    let (scan, _, _) = scan_session_lines(&lines);
+
+    assert_eq!(scan.events.len(), 2);
+    assert!(scan
+        .events
+        .iter()
+        .all(|event| event.usage.computed_total() == 100));
+}
+
+#[test]
 fn codex_malformed_record_after_records_began_keeps_its_token_count() {
     // The first response is recorded normally; the second response's record
     // is malformed, so its token_count is the only evidence of it.

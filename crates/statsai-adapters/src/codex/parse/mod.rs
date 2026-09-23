@@ -378,6 +378,11 @@ pub(crate) fn parse_codex_file(
         }
         let is_task_started = is_codex_task_started(&value);
         let is_task_complete = is_codex_task_complete(&value);
+        // A record and its token_count belong to one turn. An unpaired record
+        // must not suppress a later turn's token_count that happens to match.
+        if is_task_started || is_task_complete {
+            unpaired_record_usage.remove(&event_session_raw);
+        }
         let task_started_at = is_task_started
             .then(|| codex_task_timestamp(&value, &["/payload/started_at"]))
             .flatten();
