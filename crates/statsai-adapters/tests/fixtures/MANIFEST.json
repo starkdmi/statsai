@@ -106,6 +106,16 @@
       "sha256": "bb86399f4fbaeb92c45c6b6833a81e65afc3702bad4591dc71f5481b2667ebe1"
     },
     {
+      "bytes": 7067,
+      "path": "codex/usage-record/mixed/sessions/2026/09/01/rollout-fixture-usage-record.jsonl",
+      "sha256": "0475c7ff12c76c2bcb6ba47f7721792c83879f650974b83dbcbc5ad88a4ac52a"
+    },
+    {
+      "bytes": 3294,
+      "path": "codex/usage-record/subagent/sessions/2026/09/01/rollout-fixture-usage-record-subagent.jsonl",
+      "sha256": "35a9d4d0f9a9f8ec914ec960d58e5303c9d4fc4b61756cd50f473c434f0457f2"
+    },
+    {
       "bytes": 899,
       "path": "cursor/basic/usage-events-basic.csv",
       "sha256": "813f91fe4d82994be77b5f61f7c23596672dd9e0f610291951d50530de518626"
@@ -250,7 +260,11 @@
       "basic": 10,
       "compaction": 43,
       "malformed": 10,
-      "reasoning": 10
+      "reasoning": 10,
+      "usage-record": {
+        "mixed": 16,
+        "subagent": 7
+      }
     },
     "cursor": {
       "derived_from_local_store": false,

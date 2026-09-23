@@ -17,6 +17,10 @@ pub(crate) fn is_codex_token_count(value: &Value) -> bool {
         && value.pointer("/payload/type").and_then(Value::as_str) == Some("token_count")
 }
 
+pub(crate) fn is_codex_token_usage_record(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("token_usage_record")
+}
+
 pub(crate) fn is_codex_task_started(value: &Value) -> bool {
     value.get("type").and_then(Value::as_str) == Some("event_msg")
         && value.pointer("/payload/type").and_then(Value::as_str) == Some("task_started")
@@ -42,6 +46,7 @@ pub(crate) enum CodexLineKind {
     ResponseItemMessage,
     EventUserMessage,
     TokenCount,
+    TokenUsageRecord,
     TaskStarted,
     TaskComplete,
     HeadlessUsage,
@@ -129,6 +134,12 @@ pub(crate) fn codex_line_kind(line: &str) -> CodexLineKind {
             return CodexLineKind::EventItemCompleted;
         }
         return CodexLineKind::Irrelevant;
+    }
+    // Match this before the headless `"usage":` fallback. On current rollout
+    // lines the usage object sits past the 256-byte header, so without this
+    // check the row is dropped as irrelevant.
+    if header.contains("\"type\":\"token_usage_record\"") {
+        return CodexLineKind::TokenUsageRecord;
     }
     if header.contains("\"usage\":")
         || header.contains("\"token_count\":")

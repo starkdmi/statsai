@@ -23,7 +23,11 @@ pub(crate) fn parse_codex_file(
     let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
     let file_fallback_project = project_context_from_path_fallback(root, path);
-    let mut previous_totals: Option<UsageCounts> = None;
+    let mut previous_total: Option<CodexCumulativeTotal> = None;
+    // Once a file contains a `token_usage_record`, later `token_count` lines
+    // only carry quota and context. Records are the usage source from there on,
+    // which is also where compaction inference shows up.
+    let mut usage_from_records = false;
     let mut current_model: Option<String> = None;
     let mut current_reasoning = ModelReasoningState::default();
     let mut current_model_is_fallback = false;
@@ -351,6 +355,10 @@ pub(crate) fn parse_codex_file(
         }
 
         let is_token_count_event = is_codex_token_count(&value);
+        let is_token_usage_record = is_codex_token_usage_record(&value);
+        if is_token_usage_record {
+            usage_from_records = true;
+        }
         let is_task_started = is_codex_task_started(&value);
         let is_task_complete = is_codex_task_complete(&value);
         let task_started_at = is_task_started
@@ -379,27 +387,27 @@ pub(crate) fn parse_codex_file(
             .flatten();
         let event_session_raw =
             session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
-        let usage = if is_token_count_event {
-            let info = value.pointer("/payload/info");
-            let total_usage = info
-                .and_then(|info| info.get("total_token_usage"))
-                .map(codex_usage_counts_from_value);
-            let usage = info
-                .and_then(|info| info.get("last_token_usage"))
-                .map(codex_usage_counts_from_value)
-                .or_else(|| {
-                    total_usage
-                        .as_ref()
-                        .map(|total| subtract_usage_counts(total, previous_totals.as_ref()))
-                });
-            if let Some(total) = total_usage {
-                previous_totals = Some(total);
+        let token_count_usage = if is_token_count_event {
+            codex_token_count_usage(value.pointer("/payload/info"), &mut previous_total)
+        } else {
+            None
+        };
+        let usage = if is_token_usage_record {
+            codex_token_usage_record_from_value(&value).map(|record| record.usage)
+        } else if is_token_count_event {
+            if usage_from_records {
+                None
+            } else {
+                token_count_usage.clone()
             }
-            usage
         } else {
             codex_headless_usage_value(&value).map(codex_usage_counts_from_value)
         };
-        let quota_usage_sample = usage.clone();
+        let quota_usage_sample = if is_token_count_event {
+            token_count_usage
+        } else {
+            usage.clone()
+        };
 
         let (timestamp, timestamp_inferred) = timestamp_from_nested_value(&value)
             .map(|timestamp| (timestamp, false))
@@ -473,7 +481,7 @@ pub(crate) fn parse_codex_file(
             model_inferred,
             model_explicit,
             usage,
-            is_token_count_event,
+            is_token_count_event: is_token_count_event || is_token_usage_record,
             is_task_started,
             is_task_complete,
             message_role,

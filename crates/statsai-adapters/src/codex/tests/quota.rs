@@ -138,7 +138,7 @@ fn codex_quota_parser_requires_integer_reset_epochs_and_leniently_reads_balances
 }
 
 #[test]
-fn codex_quota_links_consumed_samples_to_turn_events_and_preserves_zero_samples() {
+fn codex_quota_links_consumed_samples_and_drops_usage_on_a_repeated_total() {
     let directory = tempfile::tempdir().expect("tempdir");
     let root = directory.path().join("codex");
     let sessions = root.join("sessions");
@@ -209,14 +209,12 @@ fn codex_quota_links_consumed_samples_to_turn_events_and_preserves_zero_samples(
         scan.quota_observations[0].observation.usage_event_id,
         Some(scan.events[0].event_id.clone())
     );
-    assert_eq!(
-        scan.quota_observations[1]
-            .observation
-            .usage_sample
-            .as_ref()
-            .map(UsageCounts::computed_total),
-        Some(0)
-    );
+    // The second token_count repeats total_token_usage, so it is not usage.
+    // The observation is still recorded and stays unlinked.
+    assert!(scan.quota_observations[1]
+        .observation
+        .usage_sample
+        .is_none());
     assert_eq!(
         scan.quota_observations[1].observation.usage_link_kind,
         QuotaUsageLinkKind::None

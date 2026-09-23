@@ -41,7 +41,7 @@ pub(crate) fn collect_codex_quota_observations(
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
-    let mut previous_totals: Option<UsageCounts> = None;
+    let mut previous_total = None;
     let mut observations = Vec::new();
     let mut line_bytes = Vec::new();
     let mut line_number = 0usize;
@@ -65,21 +65,8 @@ pub(crate) fn collect_codex_quota_observations(
         {
             continue;
         }
-        let info = value.pointer("/payload/info");
-        let total_usage = info
-            .and_then(|info| info.get("total_token_usage"))
-            .map(codex_usage_counts_from_value);
-        let usage_sample = info
-            .and_then(|info| info.get("last_token_usage"))
-            .map(codex_usage_counts_from_value)
-            .or_else(|| {
-                total_usage
-                    .as_ref()
-                    .map(|total| subtract_usage_counts(total, previous_totals.as_ref()))
-            });
-        if let Some(total_usage) = total_usage {
-            previous_totals = Some(total_usage);
-        }
+        let usage_sample =
+            codex_token_count_usage(value.pointer("/payload/info"), &mut previous_total);
         let observed_at = timestamp_from_nested_value(&value).unwrap_or(fallback_timestamp);
         if let Some(observation) =
             codex_quota_observation(source, path, line_number, observed_at, usage_sample, &value)
