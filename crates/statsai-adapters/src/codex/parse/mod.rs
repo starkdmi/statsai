@@ -23,7 +23,17 @@ pub(crate) fn parse_codex_file(
     let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
     let file_fallback_project = project_context_from_path_fallback(root, path);
-    let mut previous_totals: Option<UsageCounts> = None;
+    // Both are per session: one file can interleave several sessions.
+    let mut previous_totals: HashMap<String, Option<CodexCumulativeTotal>> = HashMap::new();
+    // A `token_usage_record` precedes the `token_count` for the same response
+    // and carries identical usage; compaction inference has a record and no
+    // token_count. The record is counted and remembered here until the next
+    // advancing token_count, which is dropped only when it repeats that usage.
+    // A response whose record is missing or malformed keeps its token_count.
+    // `compacted` and turn boundaries end the pairing window. Keyed by record
+    // line so a paired token_count's quota sample can follow the record.
+    let mut unpaired_records: HashMap<String, (UsageCounts, usize)> = HashMap::new();
+    let mut paired_quota_lines: HashMap<usize, usize> = HashMap::new();
     let mut current_model: Option<String> = None;
     let mut current_reasoning = ModelReasoningState::default();
     let mut current_model_is_fallback = false;
@@ -96,6 +106,18 @@ pub(crate) fn parse_codex_file(
                 activity_started_at.elapsed().as_millis() as u64;
             continue;
         }
+        if line_kind == CodexLineKind::Compacted {
+            // The row carries the whole compacted conversation, so read the
+            // session from its header instead of parsing it.
+            let session = codex_json_string_prefix_after_marker(
+                codex_line_header(line),
+                "\"session_id\":\"",
+                256,
+            )
+            .unwrap_or_else(|| session_raw.clone());
+            unpaired_records.remove(&session);
+            continue;
+        }
         if line_kind == CodexLineKind::Irrelevant && !is_codex_quota_line_structurally(line) {
             continue;
         }
@@ -159,6 +181,7 @@ pub(crate) fn parse_codex_file(
                     model_explicit: false,
                     usage: None,
                     is_token_count_event: false,
+                    is_usage_record: false,
                     is_task_started: false,
                     is_task_complete: false,
                     message_role: role,
@@ -224,6 +247,7 @@ pub(crate) fn parse_codex_file(
                 model_explicit: false,
                 usage: None,
                 is_token_count_event: false,
+                is_usage_record: false,
                 is_task_started: false,
                 is_task_complete: false,
                 message_role,
@@ -286,6 +310,7 @@ pub(crate) fn parse_codex_file(
                 model_explicit: false,
                 usage: None,
                 is_token_count_event: false,
+                is_usage_record: false,
                 is_task_started: false,
                 is_task_complete: false,
                 message_role: None,
@@ -351,8 +376,27 @@ pub(crate) fn parse_codex_file(
         }
 
         let is_token_count_event = is_codex_token_count(&value);
+        let is_token_usage_record = is_codex_token_usage_record(&value);
+        // Records are keyed exactly like the token_count lines they pair with.
+        // `payload.thread_id` is not used: a fork copies its parent's history,
+        // records and all, and token_count carries no thread id to match it.
+        let event_session_raw =
+            session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
+        let record_usage = is_token_usage_record
+            .then(|| codex_token_usage_record_from_value(&value))
+            .flatten()
+            .map(|record| record.usage)
+            .filter(|usage| usage.total_tokens.is_some());
+        if let Some(usage) = &record_usage {
+            unpaired_records.insert(event_session_raw.clone(), (usage.clone(), index));
+        }
         let is_task_started = is_codex_task_started(&value);
         let is_task_complete = is_codex_task_complete(&value);
+        // A record and its token_count belong to one turn. An unpaired record
+        // must not suppress a later turn's token_count that happens to match.
+        if is_task_started || is_task_complete {
+            unpaired_records.remove(&event_session_raw);
+        }
         let task_started_at = is_task_started
             .then(|| codex_task_timestamp(&value, &["/payload/started_at"]))
             .flatten();
@@ -377,29 +421,38 @@ pub(crate) fn parse_codex_file(
         let user_message_preview = collect_tasks
             .then(|| codex_user_message_preview(&value))
             .flatten();
-        let event_session_raw =
-            session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
-        let usage = if is_token_count_event {
-            let info = value.pointer("/payload/info");
-            let total_usage = info
-                .and_then(|info| info.get("total_token_usage"))
-                .map(codex_usage_counts_from_value);
-            let usage = info
-                .and_then(|info| info.get("last_token_usage"))
-                .map(codex_usage_counts_from_value)
-                .or_else(|| {
-                    total_usage
-                        .as_ref()
-                        .map(|total| subtract_usage_counts(total, previous_totals.as_ref()))
-                });
-            if let Some(total) = total_usage {
-                previous_totals = Some(total);
-            }
-            usage
+        let token_count_usage = if is_token_count_event {
+            codex_token_count_usage(
+                value.pointer("/payload/info"),
+                previous_totals
+                    .entry(event_session_raw.clone())
+                    .or_default(),
+            )
+        } else {
+            None
+        };
+        let usage = if is_token_usage_record {
+            record_usage
+        } else if is_token_count_event {
+            token_count_usage.as_ref().and_then(|usage| {
+                match unpaired_records.remove(&event_session_raw) {
+                    Some((record_usage, record_line))
+                        if same_codex_response_usage(&record_usage, usage) =>
+                    {
+                        paired_quota_lines.insert(record_line, index);
+                        None
+                    }
+                    _ => Some(usage.clone()),
+                }
+            })
         } else {
             codex_headless_usage_value(&value).map(codex_usage_counts_from_value)
         };
-        let quota_usage_sample = usage.clone();
+        let quota_usage_sample = if is_token_count_event {
+            token_count_usage
+        } else {
+            usage.clone()
+        };
 
         let (timestamp, timestamp_inferred) = timestamp_from_nested_value(&value)
             .map(|timestamp| (timestamp, false))
@@ -474,6 +527,7 @@ pub(crate) fn parse_codex_file(
             model_explicit,
             usage,
             is_token_count_event,
+            is_usage_record: is_token_usage_record,
             is_task_started,
             is_task_complete,
             message_role,
@@ -514,6 +568,7 @@ pub(crate) fn parse_codex_file(
                     .as_ref()
                     .map(|_| vec![record.line_number])
                     .unwrap_or_default(),
+                quota_lines: Vec::new(),
                 project: record.project.clone(),
             });
             if record.usage.is_some() {
@@ -604,6 +659,8 @@ pub(crate) fn parse_codex_file(
                     turn.last_usage = Some(usage);
                     turn.usage_lines.push(record.line_number);
                 }
+            } else if quota_observation_indices.contains_key(&record.line_number) {
+                turn.quota_lines.push(record.line_number);
             }
         }
 
@@ -678,6 +735,7 @@ pub(crate) fn parse_codex_file(
                 },
             );
             let mut linked_quota_lines = turn.usage_lines.clone();
+            linked_quota_lines.extend_from_slice(&turn.quota_lines);
             if record.usage.is_some() {
                 linked_quota_lines.push(record.line_number);
             }
@@ -888,7 +946,9 @@ pub(crate) fn parse_codex_file(
                 project: record
                     .project
                     .or_else(|| project_context_from_path_fallback(root, path)),
-                event_kind: if record.is_token_count_event {
+                event_kind: if record.is_usage_record {
+                    "codex_usage_record"
+                } else if record.is_token_count_event {
                     "codex_token_count"
                 } else {
                     "codex_headless_usage"
@@ -898,7 +958,7 @@ pub(crate) fn parse_codex_file(
                 source_type: "jsonl",
                 model_inferred: record.model_inferred,
                 timestamp_inferred: record.timestamp_inferred,
-                deduplication: if record.is_token_count_event {
+                deduplication: if record.is_token_count_event || record.is_usage_record {
                     EventDeduplication::PathIndependent
                 } else {
                     EventDeduplication::SessionScoped
@@ -906,10 +966,13 @@ pub(crate) fn parse_codex_file(
                 dedupe_salt: None,
             },
         );
+        // A record's paired token_count carries the quota sample for it.
+        let mut linked_quota_lines = vec![record.line_number];
+        linked_quota_lines.extend(paired_quota_lines.get(&record.line_number));
         link_quota_observations(
             ctx.scan,
             &quota_observation_indices,
-            &[record.line_number],
+            &linked_quota_lines,
             &event.event_id,
             QuotaUsageLinkKind::RecordEvent,
         );

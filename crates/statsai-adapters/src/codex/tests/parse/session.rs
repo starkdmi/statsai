@@ -106,6 +106,34 @@ fn codex_line_kind_uses_header_window_for_large_user_messages() {
 }
 
 #[test]
+fn codex_token_usage_record_is_never_classified_as_headless_usage() {
+    // `"usage":` on a real record sits past the 256-byte header, under payload.
+    // A compact line still carries that key inside the header. Neither shape
+    // may fall through to HeadlessUsage.
+    let compact = r#"{"timestamp":"2026-09-01T10:00:02.080Z","type":"token_usage_record","payload":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#;
+    assert!(compact.len() < 256);
+    assert!(compact.contains("\"usage\":"));
+    assert_eq!(codex_line_kind(compact), CodexLineKind::TokenUsageRecord);
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/codex/usage-record/mixed/sessions/2026/09/01/rollout-fixture-usage-record.jsonl",
+    );
+    let realistic = std::fs::read_to_string(fixture)
+        .expect("fixture")
+        .lines()
+        .find(|line| line.contains("\"token_usage_record\""))
+        .expect("record line")
+        .to_string();
+    let usage_at = realistic.find("\"usage\":").expect("usage field");
+    assert!(
+        usage_at > 256,
+        "the fixture must keep usage outside the header window, at {usage_at}"
+    );
+    assert!(!codex_line_header(&realistic).contains("\"usage\":"));
+    assert_eq!(codex_line_kind(&realistic), CodexLineKind::TokenUsageRecord);
+}
+
+#[test]
 fn codex_task_spans_prefer_real_user_message_over_wrapper_response_item() {
     let dir = tempfile::tempdir().expect("tempdir");
     let codex_root = dir.path().join("codex");

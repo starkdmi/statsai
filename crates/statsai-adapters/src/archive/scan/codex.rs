@@ -41,7 +41,10 @@ pub(crate) fn collect_codex_quota_observations(
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
-    let mut previous_totals: Option<UsageCounts> = None;
+    // Keyed like the usage parser: a line's own session id, else the file's
+    // latest `session_meta` id.
+    let mut previous_totals = HashMap::new();
+    let mut file_session = String::new();
     let mut observations = Vec::new();
     let mut line_bytes = Vec::new();
     let mut line_number = 0usize;
@@ -60,26 +63,23 @@ pub(crate) fn collect_codex_quota_observations(
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            if let Some(id) = value.pointer("/payload/id").and_then(Value::as_str) {
+                file_session = id.to_owned();
+            }
+            continue;
+        }
         if value.get("type").and_then(Value::as_str) != Some("event_msg")
             || value.pointer("/payload/type").and_then(Value::as_str) != Some("token_count")
         {
             continue;
         }
-        let info = value.pointer("/payload/info");
-        let total_usage = info
-            .and_then(|info| info.get("total_token_usage"))
-            .map(codex_usage_counts_from_value);
-        let usage_sample = info
-            .and_then(|info| info.get("last_token_usage"))
-            .map(codex_usage_counts_from_value)
-            .or_else(|| {
-                total_usage
-                    .as_ref()
-                    .map(|total| subtract_usage_counts(total, previous_totals.as_ref()))
-            });
-        if let Some(total_usage) = total_usage {
-            previous_totals = Some(total_usage);
-        }
+        let usage_sample = codex_token_count_usage(
+            value.pointer("/payload/info"),
+            previous_totals
+                .entry(session_raw_from_value(&value).unwrap_or_else(|| file_session.clone()))
+                .or_default(),
+        );
         let observed_at = timestamp_from_nested_value(&value).unwrap_or(fallback_timestamp);
         if let Some(observation) =
             codex_quota_observation(source, path, line_number, observed_at, usage_sample, &value)
