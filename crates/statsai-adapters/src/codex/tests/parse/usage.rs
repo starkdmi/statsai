@@ -604,6 +604,27 @@ fn codex_usage_record_fixture_counts_each_record_once_across_eras() {
         5,
         "token_count lines still supply quota after records begin"
     );
+    // A token_count carries no usage once records begin, but its quota
+    // observation still belongs to the turn that the records fed.
+    let linked_to = |event_index: usize| {
+        scan.quota_observations
+            .iter()
+            .filter(|record| {
+                record.observation.usage_event_id.as_ref()
+                    == Some(&scan.events[event_index].event_id)
+            })
+            .count()
+    };
+    assert_eq!(linked_to(0), 1, "legacy advancing token_count");
+    assert_eq!(linked_to(1), 1, "record-era paired token_count");
+    assert!(scan.quota_observations.iter().all(|record| {
+        let positive = record
+            .observation
+            .usage_sample
+            .as_ref()
+            .is_some_and(|usage| usage.computed_total() > 0);
+        positive == record.observation.usage_event_id.is_some()
+    }));
 }
 
 #[test]

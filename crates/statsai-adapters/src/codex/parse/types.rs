@@ -108,5 +108,9 @@ pub(crate) struct ActiveCodexTurn {
     pub(crate) prompt_previews: Vec<CodexPromptPreviewCandidate>,
     pub(crate) last_activity_at: DateTime<Utc>,
     pub(crate) usage_lines: Vec<usize>,
+    /// `token_count` lines inside the turn that carry no usage because the
+    /// file's records are the usage source. Their quota observations still
+    /// belong to this turn's event.
+    pub(crate) quota_lines: Vec<usize>,
     pub(crate) project: Option<ProjectInfo>,
 }

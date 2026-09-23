@@ -522,6 +522,7 @@ pub(crate) fn parse_codex_file(
                     .as_ref()
                     .map(|_| vec![record.line_number])
                     .unwrap_or_default(),
+                quota_lines: Vec::new(),
                 project: record.project.clone(),
             });
             if record.usage.is_some() {
@@ -612,6 +613,8 @@ pub(crate) fn parse_codex_file(
                     turn.last_usage = Some(usage);
                     turn.usage_lines.push(record.line_number);
                 }
+            } else if quota_observation_indices.contains_key(&record.line_number) {
+                turn.quota_lines.push(record.line_number);
             }
         }
 
@@ -686,6 +689,7 @@ pub(crate) fn parse_codex_file(
                 },
             );
             let mut linked_quota_lines = turn.usage_lines.clone();
+            linked_quota_lines.extend_from_slice(&turn.quota_lines);
             if record.usage.is_some() {
                 linked_quota_lines.push(record.line_number);
             }
