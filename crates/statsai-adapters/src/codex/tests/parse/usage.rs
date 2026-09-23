@@ -406,9 +406,24 @@ fn codex_ignores_the_phantom_token_count_after_compaction() {
 
 #[test]
 fn codex_interleaved_sessions_keep_their_own_usage_source_and_totals() {
+    let usage = r#"{"input_tokens":90,"output_tokens":10,"total_tokens":100}"#;
+    // Records may name their session at the top level or only by
+    // `payload.thread_id`; a sub-agent's `payload.session_id` is its parent.
+    for record in [
+        format!(
+            r#"{{"timestamp":"2026-09-01T10:00:02Z","session_id":"session-a","type":"token_usage_record","payload":{{"usage":{usage}}}}}"#
+        ),
+        format!(
+            r#"{{"timestamp":"2026-09-01T10:00:02Z","type":"token_usage_record","payload":{{"thread_id":"session-a","session_id":"session-parent","usage":{usage}}}}}"#
+        ),
+    ] {
+        assert_interleaved_sessions_keep_their_own_usage(usage, record);
+    }
+}
+
+fn assert_interleaved_sessions_keep_their_own_usage(usage: &str, record: String) {
     // Session A switches to records; session B stays on token_count. B's first
     // cumulative total equals A's last one and is still a new response for B.
-    let usage = r#"{"input_tokens":90,"output_tokens":10,"total_tokens":100}"#;
     let token_count = |timestamp: &str, session: &str| {
         format!(
             r#"{{"timestamp":"{timestamp}","session_id":"{session}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{usage},"last_token_usage":{usage}}}}}}}"#
@@ -432,9 +447,7 @@ fn codex_interleaved_sessions_keep_their_own_usage_source_and_totals() {
             "task_started",
             "started_at",
         ),
-        format!(
-            r#"{{"timestamp":"2026-09-01T10:00:02Z","session_id":"session-a","type":"token_usage_record","payload":{{"usage":{usage}}}}}"#
-        ),
+        record,
         token_count("2026-09-01T10:00:03Z", "session-a"),
         token_count("2026-09-01T10:00:04Z", "session-b"),
         task(

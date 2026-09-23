@@ -358,8 +358,15 @@ pub(crate) fn parse_codex_file(
 
         let is_token_count_event = is_codex_token_count(&value);
         let is_token_usage_record = is_codex_token_usage_record(&value);
-        let event_session_raw =
-            session_raw_from_value(&value).unwrap_or_else(|| session_raw.clone());
+        // A record names the thread it belongs to in `payload.thread_id`, which
+        // is the session id turns are keyed by. Its `payload.session_id` is the
+        // parent session for a sub-agent, so it must not be used here.
+        let event_session_raw = is_token_usage_record
+            .then(|| value.pointer("/payload/thread_id").and_then(Value::as_str))
+            .flatten()
+            .map(ToOwned::to_owned)
+            .or_else(|| session_raw_from_value(&value))
+            .unwrap_or_else(|| session_raw.clone());
         // Only a record that carries usage can take over from `token_count`. A
         // malformed one must not silence the token_count lines that follow it.
         let record_usage = is_token_usage_record
