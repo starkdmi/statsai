@@ -1,7 +1,10 @@
 use super::*;
 
 mod build;
+mod sessions;
 mod summaries;
+
+pub use sessions::{SessionFilter, SessionSort, SessionStats};
 
 pub(crate) use build::*;
 pub(crate) use summaries::*;

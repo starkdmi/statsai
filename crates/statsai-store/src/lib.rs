@@ -80,6 +80,7 @@ pub use pricing::{
     apply_current_estimated_pricing, RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY,
     APPLIED_PRICING_RULESET_VERSION_KEY,
 };
+pub use rollups::{SessionFilter, SessionSort, SessionStats};
 pub use snapshot::{
     clone_database_to, database_applied_pricing_ruleset_version, database_schema_version,
     DatabaseClone,
@@ -142,6 +143,10 @@ pub(crate) const EVENT_SOURCE_FILE_HASH_SQL: &str = "CASE WHEN json_valid(payloa
      THEN json_extract(payload, '$.parse_evidence.source_file_path_hash') END";
 pub(crate) const EVENT_CONVERSATION_HASH_SQL: &str = "CASE WHEN json_valid(payload) \
      THEN json_extract(payload, '$.session.local_session_id_hash') END";
+/// Hashed `session_…` id. Indexed so a session refresh reads one conversation
+/// instead of scanning every usage payload.
+pub(crate) const EVENT_SESSION_ID_SQL: &str = "CASE WHEN json_valid(payload) \
+     THEN json_extract(payload, '$.session.session_id') END";
 /// The one field plan evidence needs out of a quota observation payload.
 pub(crate) const QUOTA_PLAN_TYPE_SQL: &str = "CASE WHEN json_valid(payload) \
      THEN json_extract(payload, '$.status.plan_type') END";
@@ -355,6 +360,7 @@ impl Store {
         let store = Self { conn };
         store.migrate()?;
         store.configure_connection()?;
+        store.backfill_session_rollups_if_needed()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
     }
@@ -436,6 +442,7 @@ impl Store {
         store.conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         store.migrate()?;
         store.configure_connection()?;
+        store.backfill_session_rollups_if_needed()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
     }

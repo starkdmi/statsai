@@ -201,6 +201,11 @@ impl Store {
                 ],
             )?;
         }
+        let raw_session_ids = conversations
+            .iter()
+            .map(|conversation| conversation.native_conversation_id.clone())
+            .collect::<Vec<_>>();
+        self.refresh_session_rollups_for_raw_ids(&raw_session_ids)?;
         Ok(result)
     }
 

@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use statsai::snapshot;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -8,6 +8,7 @@ mod activity;
 mod quota;
 mod report;
 mod scan;
+mod sessions;
 mod source;
 mod subscription;
 mod sync;
@@ -18,6 +19,7 @@ pub(crate) use activity::*;
 pub(crate) use quota::*;
 pub(crate) use report::*;
 pub(crate) use scan::*;
+pub(crate) use sessions::*;
 pub(crate) use source::*;
 pub(crate) use subscription::*;
 pub(crate) use sync::*;
@@ -46,6 +48,8 @@ pub(crate) enum Command {
     Scan(ScanCommand),
     #[command(about = "Show usage reports (weekly, monthly, all-time, or a date range)")]
     Report(ReportCommand),
+    #[command(about = "List local session rollups")]
+    Sessions(SessionsCommand),
     #[command(about = "Manage configured source paths")]
     Source(SourceCommand),
     #[command(about = "List canonical provider accounts")]

@@ -225,6 +225,32 @@ pub(crate) struct ProviderEventParts<'a> {
     pub(crate) dedupe_salt: Option<String>,
 }
 
+pub(crate) fn message_count_runtime(
+    user_messages: u64,
+    assistant_messages: u64,
+    developer_messages: u64,
+) -> Option<RuntimeInfo> {
+    let total = user_messages
+        .saturating_add(assistant_messages)
+        .saturating_add(developer_messages);
+    if total == 0 {
+        return None;
+    }
+    Some(RuntimeInfo {
+        runtime_name: None,
+        host_id: None,
+        latency_ms: None,
+        latency_source: None,
+        time_to_first_token_ms: None,
+        prompt_eval_duration_ms: None,
+        eval_duration_ms: None,
+        total_messages: Some(total),
+        user_messages: (user_messages > 0).then_some(user_messages),
+        assistant_messages: (assistant_messages > 0).then_some(assistant_messages),
+        developer_messages: (developer_messages > 0).then_some(developer_messages),
+    })
+}
+
 pub(crate) fn usage_event<A: ProviderAdapter + ?Sized>(
     adapter: &A,
     source: &SourceLocation,

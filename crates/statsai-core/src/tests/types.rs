@@ -1,5 +1,6 @@
 use super::support::*;
 use super::*;
+use chrono::{DateTime, Utc};
 use std::path::Path;
 #[test]
 fn source_ids_are_stable_for_same_input() {
@@ -58,6 +59,82 @@ fn schema_types_serialize() {
     let schema = schemars::schema_for!(UsageSummary);
     let json = serde_json::to_value(schema).expect("summary schema should serialize");
     assert!(json.get("title").is_some());
+
+    let schema = schemars::schema_for!(SessionRollupV1);
+    let json = serde_json::to_value(schema).expect("session rollup schema should serialize");
+    assert!(json.get("title").is_some());
+}
+
+#[test]
+fn session_rollup_uses_snake_case_contract() {
+    let started = DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+        .expect("start")
+        .with_timezone(&Utc);
+    let rollup = SessionRollupV1 {
+        schema_version: SESSION_ROLLUP_SCHEMA_VERSION.to_string(),
+        session_id: "session_abc".to_string(),
+        device_id: "device".to_string(),
+        provider: "codex".to_string(),
+        source_id: SourceId("src".to_string()),
+        provider_account_id: None,
+        started_at: started,
+        ended_at: started,
+        duration_seconds: Some(0),
+        usage: UsageCounts::default(),
+        requests: 1,
+        cost: CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: None,
+            provider_reported_usd: None,
+            estimated_api_equivalent_micro_usd: Some(10),
+            provider_reported_micro_usd: None,
+            pricing_source: None,
+            pricing_version: None,
+            confidence: Confidence::Medium,
+        },
+        models: Vec::new(),
+        primary_model: Some("gpt-5".to_string()),
+        total_messages: Some(2),
+        user_messages: Some(1),
+        assistant_messages: Some(1),
+        developer_messages: None,
+        project: None,
+        title: Some("Fix parser".to_string()),
+        title_source: Some(SessionTitleSource::TaskSpan),
+        updated_at: started,
+    };
+    let json = serde_json::to_value(&rollup).expect("serialize");
+    for field in [
+        "schema_version",
+        "session_id",
+        "device_id",
+        "provider",
+        "source_id",
+        "provider_account_id",
+        "started_at",
+        "ended_at",
+        "duration_seconds",
+        "usage",
+        "requests",
+        "cost",
+        "models",
+        "primary_model",
+        "total_messages",
+        "user_messages",
+        "assistant_messages",
+        "developer_messages",
+        "project",
+        "title",
+        "title_source",
+        "updated_at",
+    ] {
+        assert!(json.get(field).is_some(), "missing {field}");
+    }
+    assert_eq!(json["schema_version"], "session_rollup.v1");
+    assert_eq!(json["title_source"], "task_span");
+    assert_eq!(json["requests"], 1);
+    let restored: SessionRollupV1 = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(restored, rollup);
 }
 
 #[test]

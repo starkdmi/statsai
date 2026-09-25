@@ -1,5 +1,8 @@
 use super::*;
-use crate::{EVENT_CONVERSATION_HASH_SQL, EVENT_SOURCE_FILE_HASH_SQL, QUOTA_PLAN_TYPE_SQL};
+use crate::{
+    EVENT_CONVERSATION_HASH_SQL, EVENT_SESSION_ID_SQL, EVENT_SOURCE_FILE_HASH_SQL,
+    QUOTA_PLAN_TYPE_SQL,
+};
 use rusqlite::params;
 use statsai_core::{account_plan_observation_id, AccountPlanObservationV1};
 
@@ -546,5 +549,32 @@ pub(crate) fn apply_migration_025(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    Ok(())
+}
+
+pub(crate) fn apply_migration_026(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_rollups (
+          session_id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          provider_account_id TEXT,
+          day_key TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          total_tokens INTEGER NOT NULL,
+          payload_hash TEXT NOT NULL,
+          dirty INTEGER NOT NULL DEFAULT 1,
+          payload TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS session_rollups_started_idx
+          ON session_rollups (started_at);
+        CREATE INDEX IF NOT EXISTS session_rollups_provider_day_idx
+          ON session_rollups (provider, day_key);
+        CREATE INDEX IF NOT EXISTS usage_events_session_idx
+          ON usage_events ({EVENT_SESSION_ID_SQL});
+        "#,
+    ))?;
     Ok(())
 }

@@ -8,7 +8,7 @@ mod v2;
 pub(crate) use v1::*;
 pub(crate) use v2::*;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 25;
+pub const CURRENT_SCHEMA_VERSION: i64 = 26;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -150,6 +150,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         23 => apply_migration_023(conn),
         24 => apply_migration_024(conn),
         25 => apply_migration_025(conn),
+        26 => apply_migration_026(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -442,21 +443,27 @@ mod tests {
               version INTEGER PRIMARY KEY,
               applied_at TEXT NOT NULL
             );
-            INSERT INTO schema_migrations (version, applied_at)
-            VALUES (26, '2026-08-23T00:00:00Z');
             "#,
+        )
+        .expect("prepare future schema marker");
+        let future = CURRENT_SCHEMA_VERSION + 1;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, '2026-08-23T00:00:00Z')",
+            [future],
         )
         .expect("create future schema marker");
 
-        let error = migrate(&conn).expect_err("schema 26 must be rejected by schema 25 binary");
+        let error = migrate(&conn).expect_err("newer schema must be rejected");
 
         assert_eq!(
             error.to_string(),
-            "database schema version 26 is newer than this StatsAI binary supports (25); upgrade StatsAI or use a compatible database"
+            format!(
+                "database schema version {future} is newer than this StatsAI binary supports ({CURRENT_SCHEMA_VERSION}); upgrade StatsAI or use a compatible database"
+            )
         );
         assert_eq!(
             current_schema_version(&conn).expect("read unchanged version"),
-            26
+            future
         );
     }
 

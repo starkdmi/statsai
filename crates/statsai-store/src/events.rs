@@ -1,11 +1,35 @@
 use super::*;
 use crate::dedupe::*;
 
+#[derive(Debug, Default)]
+pub(crate) struct EventWriteDirty {
+    pub(crate) buckets: BTreeSet<SyncRollupBucketKey>,
+    pub(crate) sessions: BTreeSet<String>,
+}
+
+impl EventWriteDirty {
+    fn from_event(event: &UsageEvent) -> Self {
+        let mut dirty = Self::default();
+        dirty.observe(event);
+        dirty
+    }
+
+    fn observe(&mut self, event: &UsageEvent) {
+        self.buckets.insert(sync_rollup_bucket_key(event));
+        self.sessions.insert(event.session.session_id.clone());
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.buckets.extend(other.buckets);
+        self.sessions.extend(other.sessions);
+    }
+}
+
 #[derive(Debug)]
 struct EventInsertOutcome {
     inserted: bool,
     canonical_event_id: EventId,
-    dirty_keys: BTreeSet<SyncRollupBucketKey>,
+    dirty: EventWriteDirty,
 }
 
 impl Store {
@@ -16,8 +40,8 @@ impl Store {
             let existing = self.event_by_id(&existing_id)?;
             let refreshed =
                 refreshed_duplicate_event(existing.as_ref(), &event, existing_id.as_str());
-            let dirty_keys = self.update_event_payload(&refreshed)?;
-            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
+            let dirty = self.update_event_payload(&refreshed)?;
+            self.refresh_event_rollups(&dirty)?;
             return Ok(false);
         }
 
@@ -45,10 +69,10 @@ impl Store {
             let existing = self.event_by_id(&event.event_id.0)?;
             let refreshed =
                 refreshed_duplicate_event(existing.as_ref(), &event, event.event_id.0.as_str());
-            let dirty_keys = self.update_event_payload(&refreshed)?;
-            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
+            let dirty = self.update_event_payload(&refreshed)?;
+            self.refresh_event_rollups(&dirty)?;
         } else {
-            self.refresh_sync_rollups_for_keys(&BTreeSet::from([sync_rollup_bucket_key(&event)]))?;
+            self.refresh_event_rollups(&EventWriteDirty::from_event(&event))?;
         }
         Ok(changed > 0)
     }
@@ -75,7 +99,7 @@ impl Store {
             let mut conflict_map = self.batch_load_conflicts(&conflict_keys)?;
             let mut inserted = 0u64;
             let mut canonical_event_ids = HashMap::with_capacity(events.len());
-            let mut dirty_keys = BTreeSet::new();
+            let mut dirty = EventWriteDirty::default();
             for (index, event) in events.iter().enumerate() {
                 let incoming_event_id = event.event_id.clone();
                 let matched_event =
@@ -99,7 +123,7 @@ impl Store {
                 if let Some((existing_id, existing)) = matched_event {
                     let refreshed =
                         refreshed_duplicate_event(Some(&existing), event, existing_id.as_str());
-                    dirty_keys.extend(self.update_event_payload(&refreshed)?);
+                    dirty.extend(self.update_event_payload(&refreshed)?);
                     canonical_event_ids.insert(incoming_event_id, EventId(existing_id.clone()));
                     let candidates = conflict_map
                         .entry(conflict_keys[index].clone())
@@ -123,7 +147,7 @@ impl Store {
                     inserted += 1;
                 }
                 canonical_event_ids.insert(incoming_event_id, outcome.canonical_event_id.clone());
-                dirty_keys.extend(outcome.dirty_keys);
+                dirty.extend(outcome.dirty);
                 conflict_map
                     .entry(conflict_keys[index].clone())
                     .or_default()
@@ -132,7 +156,7 @@ impl Store {
                         event: event.clone(),
                     });
             }
-            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
+            self.refresh_event_rollups(&dirty)?;
             Ok(EventInsertBatchResult {
                 inserted,
                 canonical_event_ids,
@@ -140,20 +164,20 @@ impl Store {
         })
     }
 
-    pub(crate) fn update_event_payload(
-        &self,
-        event: &UsageEvent,
-    ) -> Result<BTreeSet<SyncRollupBucketKey>> {
-        let existing_bucket = self
-            .event_by_id(&event.event_id.0)?
-            .map(|existing| sync_rollup_bucket_key(&existing));
-        let bucket = self.update_event_cost_payload(event)?;
-        let mut dirty_keys = BTreeSet::new();
-        if let Some(existing_bucket) = existing_bucket {
-            dirty_keys.insert(existing_bucket);
+    fn refresh_event_rollups(&self, dirty: &EventWriteDirty) -> Result<()> {
+        self.refresh_sync_rollups_for_keys(&dirty.buckets)?;
+        self.refresh_session_rollups_for_keys(&dirty.sessions)?;
+        Ok(())
+    }
+
+    pub(crate) fn update_event_payload(&self, event: &UsageEvent) -> Result<EventWriteDirty> {
+        let existing = self.event_by_id(&event.event_id.0)?;
+        self.update_event_cost_payload(event)?;
+        let mut dirty = EventWriteDirty::from_event(event);
+        if let Some(existing) = existing.as_ref() {
+            dirty.observe(existing);
         }
-        dirty_keys.insert(bucket);
-        Ok(dirty_keys)
+        Ok(dirty)
     }
 
     /// Updates a persisted event's payload without re-reading it.
@@ -224,13 +248,13 @@ impl Store {
             return Ok(EventInsertOutcome {
                 inserted: false,
                 canonical_event_id: event.event_id.clone(),
-                dirty_keys: self.update_event_payload(&refreshed)?,
+                dirty: self.update_event_payload(&refreshed)?,
             });
         }
         Ok(EventInsertOutcome {
             inserted: true,
             canonical_event_id: event.event_id.clone(),
-            dirty_keys: BTreeSet::from([sync_rollup_bucket_key(event)]),
+            dirty: EventWriteDirty::from_event(event),
         })
     }
 
@@ -569,12 +593,12 @@ impl Store {
         }
         self.with_immediate_transaction(|| {
             let mut changed = 0u64;
-            let mut dirty_keys = BTreeSet::new();
+            let mut dirty = EventWriteDirty::default();
             for event in events {
-                dirty_keys.extend(self.update_event_payload(event)?);
+                dirty.extend(self.update_event_payload(event)?);
                 changed += 1;
             }
-            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
+            self.refresh_event_rollups(&dirty)?;
             Ok(changed)
         })
     }
@@ -605,6 +629,7 @@ impl Store {
                 )? as u64;
             }
             self.delete_sync_rollups_for_sources_in_tx(source_ids)?;
+            self.delete_session_rollups_for_sources_in_tx(source_ids)?;
             Ok(impact)
         })
     }
@@ -620,7 +645,7 @@ impl Store {
 
         self.with_immediate_transaction(|| {
             let mut impact = EventDeletionImpact::default();
-            let mut dirty_keys = BTreeSet::new();
+            let mut dirty = EventWriteDirty::default();
 
             // Both statements filter on the expression `usage_events_source_file_idx`
             // indexes, so they read an index range rather than the whole table.
@@ -643,7 +668,7 @@ impl Store {
 
                 for payload in payloads {
                     let event: UsageEvent = serde_json::from_str(&payload)?;
-                    dirty_keys.insert(sync_rollup_bucket_key(&event));
+                    dirty.observe(&event);
                     impact.deleted_event_ids.push(event.event_id);
                 }
 
@@ -653,7 +678,7 @@ impl Store {
                     as u64;
             }
 
-            self.refresh_sync_rollups_for_keys(&dirty_keys)?;
+            self.refresh_event_rollups(&dirty)?;
             Ok(impact)
         })
     }

@@ -1,0 +1,327 @@
+use super::*;
+use statsai_core::{
+    hash_text, task_title_is_generic, IdentitySource, RuntimeInfo, SessionTitleSource, TaskSpan,
+    TaskSpanId, TASK_SPAN_SCHEMA_VERSION,
+};
+
+fn stamp_session(event: &mut UsageEvent, raw_id: &str) {
+    let hash = hash_text(raw_id);
+    event.session.session_id = format!("session_{}", &hash[..24]);
+    event.session.local_session_id_hash = Some(hash);
+}
+
+fn message_runtime(user: u64, assistant: u64) -> RuntimeInfo {
+    RuntimeInfo {
+        runtime_name: None,
+        host_id: None,
+        latency_ms: None,
+        latency_source: None,
+        time_to_first_token_ms: None,
+        prompt_eval_duration_ms: None,
+        eval_duration_ms: None,
+        total_messages: Some(user + assistant),
+        user_messages: Some(user),
+        assistant_messages: Some(assistant),
+        developer_messages: None,
+    }
+}
+
+#[test]
+fn session_rollup_sums_mixed_events() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-mixed"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 2, 9, 0, 0)
+        .single()
+        .expect("start");
+    let later = start + chrono::Duration::minutes(12);
+
+    let mut first = test_store_event(&source, start, "first");
+    stamp_session(&mut first, "raw-session");
+    first.session.ended_at = None;
+    first.usage.requests = Some(2);
+    first.usage.input_tokens = Some(10);
+    first.usage.output_tokens = Some(4);
+    first.usage.total_tokens = Some(14);
+    first.model = Some(ModelInfo {
+        normalized_name: Some("gpt-5".to_string()),
+        ..ModelInfo::default()
+    });
+    first.runtime = Some(message_runtime(1, 1));
+    first.cost.estimated_api_equivalent_micro_usd = Some(20_000);
+    first.created_at = start;
+
+    let mut second = test_store_event(&source, later, "second");
+    stamp_session(&mut second, "raw-session");
+    second.session.started_at = start;
+    second.session.ended_at = Some(later);
+    second.usage.requests = None;
+    second.usage.input_tokens = Some(5);
+    second.usage.output_tokens = Some(7);
+    second.usage.total_tokens = Some(12);
+    second.model = Some(ModelInfo {
+        normalized_name: Some("gpt-5-mini".to_string()),
+        ..ModelInfo::default()
+    });
+    second.usage.input_tokens = Some(30);
+    second.usage.output_tokens = Some(1);
+    second.usage.total_tokens = Some(31);
+    second.runtime = Some(message_runtime(2, 1));
+    second.cost.estimated_api_equivalent_micro_usd = Some(5_000);
+    second.created_at = later;
+
+    assert!(store.insert_event(&first).expect("insert first"));
+    assert!(store.insert_event(&second).expect("insert second"));
+
+    let rollups = store
+        .session_rollups_in_period(
+            None,
+            later + chrono::Duration::days(1),
+            &SessionFilter::default(),
+            SessionSort::Started,
+            10,
+            0,
+        )
+        .expect("rollups");
+    assert_eq!(rollups.len(), 1);
+    let rollup = &rollups[0];
+    assert_eq!(rollup.schema_version, "session_rollup.v1");
+    assert_eq!(rollup.session_id, first.session.session_id);
+    assert_eq!(rollup.usage.input_tokens, Some(40));
+    assert_eq!(rollup.usage.output_tokens, Some(5));
+    assert_eq!(rollup.usage.computed_total(), 45);
+    assert_eq!(rollup.requests, 3);
+    assert_eq!(rollup.cost.estimated_micro_usd(), Some(25_000));
+    assert_eq!(rollup.user_messages, Some(3));
+    assert_eq!(rollup.assistant_messages, Some(2));
+    assert_eq!(rollup.total_messages, Some(5));
+    assert_eq!(rollup.primary_model.as_deref(), Some("gpt-5-mini"));
+    assert_eq!(rollup.started_at, start);
+    assert_eq!(rollup.ended_at, later);
+    assert_eq!(rollup.duration_seconds, Some(12 * 60));
+    assert_eq!(rollup.models.len(), 2);
+}
+
+#[test]
+fn session_rollup_refreshes_on_insert_and_delete() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-refresh"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 3, 9, 0, 0)
+        .single()
+        .expect("start");
+    let mut kept = test_store_event(&source, start, "kept");
+    stamp_session(&mut kept, "refresh-session");
+    kept.usage.total_tokens = Some(10);
+    kept.parse_evidence = Some(ParseEvidence {
+        event_key_version: "test".to_string(),
+        source_file_path_hash: Some("file-kept".to_string()),
+        source_line_number: None,
+        source_record_id: None,
+        model_inferred: false,
+        timestamp_inferred: false,
+        account_identity_source: IdentitySource::Unresolved,
+    });
+    let mut dropped = test_store_event(&source, start + chrono::Duration::minutes(1), "dropped");
+    stamp_session(&mut dropped, "refresh-session");
+    dropped.session.started_at = start;
+    dropped.usage.total_tokens = Some(7);
+    dropped.parse_evidence = Some(ParseEvidence {
+        event_key_version: "test".to_string(),
+        source_file_path_hash: Some("file-dropped".to_string()),
+        source_line_number: None,
+        source_record_id: None,
+        model_inferred: false,
+        timestamp_inferred: false,
+        account_identity_source: IdentitySource::Unresolved,
+    });
+    store.insert_event(&kept).expect("kept");
+    store.insert_event(&dropped).expect("dropped");
+    let before = store.dirty_session_rollups().expect("dirty");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].usage.computed_total(), 17);
+
+    let impact = store
+        .delete_events_for_source_file_hashes(&source.source_id, &["file-dropped".to_string()])
+        .expect("delete");
+    assert_eq!(impact.deleted, 1);
+    let after = store.dirty_session_rollups().expect("after");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].usage.computed_total(), 10);
+
+    store
+        .delete_events_for_sources(std::slice::from_ref(&source.source_id))
+        .expect("delete source");
+    assert!(store.dirty_session_rollups().expect("gone").is_empty());
+}
+
+#[test]
+fn session_titles_prefer_event_then_task_span_then_archive() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-titles"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 4, 9, 0, 0)
+        .single()
+        .expect("start");
+    let raw_id = "provider-session-9";
+    let mut event = test_store_event(&source, start, "titled");
+    stamp_session(&mut event, raw_id);
+    store.insert_event(&event).expect("insert");
+
+    let generic = "hello";
+    assert!(task_title_is_generic(Some(generic)));
+    store
+        .upsert_task_spans(&[task_span(&source, raw_id, generic, start)])
+        .expect("generic span");
+    let unlabeled = store.dirty_session_rollups().expect("unlabeled");
+    assert_eq!(unlabeled[0].title, None);
+
+    let title = "Repair the session indexer";
+    assert!(!task_title_is_generic(Some(title)));
+    store
+        .upsert_task_spans(&[task_span(&source, raw_id, title, start)])
+        .expect("span");
+    let from_span = store.dirty_session_rollups().expect("span title");
+    assert_eq!(from_span[0].title.as_deref(), Some(title));
+    assert_eq!(
+        from_span[0].title_source,
+        Some(SessionTitleSource::TaskSpan)
+    );
+
+    event.session.title = Some("Event title wins".to_string());
+    store.insert_event(&event).expect("retitle");
+    let from_event = store.dirty_session_rollups().expect("event title");
+    assert_eq!(from_event[0].title.as_deref(), Some("Event title wins"));
+    assert_eq!(from_event[0].title_source, Some(SessionTitleSource::Event));
+}
+
+#[test]
+fn session_queries_filter_period_and_sort() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "claude_code",
+        "test",
+        "0",
+        Path::new("/tmp/session-query"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let early = Utc
+        .with_ymd_and_hms(2026, 6, 1, 8, 0, 0)
+        .single()
+        .expect("early");
+    let late = Utc
+        .with_ymd_and_hms(2026, 6, 10, 8, 0, 0)
+        .single()
+        .expect("late");
+    let mut small = test_store_event(&source, early, "small");
+    stamp_session(&mut small, "small-session");
+    small.provider = "claude_code".to_string();
+    small.usage.total_tokens = Some(5);
+    small.session.ended_at = Some(early + chrono::Duration::seconds(30));
+    let mut large = test_store_event(&source, late, "large");
+    stamp_session(&mut large, "large-session");
+    large.provider = "claude_code".to_string();
+    large.usage.total_tokens = Some(50);
+    large.session.ended_at = Some(late + chrono::Duration::seconds(90));
+    store.insert_event(&small).expect("small");
+    store.insert_event(&large).expect("large");
+
+    let filter = SessionFilter {
+        provider: Some("claude_code".to_string()),
+        ..SessionFilter::default()
+    };
+    let page = store
+        .session_rollups_in_period(
+            Some(Utc.with_ymd_and_hms(2026, 6, 5, 0, 0, 0).unwrap()),
+            late + chrono::Duration::days(1),
+            &filter,
+            SessionSort::Tokens,
+            10,
+            0,
+        )
+        .expect("page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].usage.computed_total(), 50);
+
+    let sorted = store
+        .session_rollups_in_period(None, late, &filter, SessionSort::Tokens, 10, 0)
+        .expect("sorted");
+    assert_eq!(sorted.len(), 2);
+    assert_eq!(sorted[0].usage.computed_total(), 50);
+    assert_eq!(sorted[1].usage.computed_total(), 5);
+    let stats = store
+        .session_stats_in_period(None, late, &filter)
+        .expect("stats");
+    assert_eq!(stats.sessions, 2);
+    assert_eq!(stats.total_tokens, 55);
+    assert_eq!(stats.avg_tokens, Some(27));
+    assert_eq!(stats.median_tokens, Some(27));
+    assert_eq!(stats.median_duration_seconds, Some(60));
+}
+
+fn task_span(
+    source: &statsai_core::SourceLocation,
+    raw_session_id: &str,
+    title: &str,
+    started_at: chrono::DateTime<Utc>,
+) -> TaskSpan {
+    TaskSpan {
+        schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+        span_id: TaskSpanId(format!("span-{raw_session_id}-{title}")),
+        provider: source.provider.clone(),
+        source_id: source.source_id.clone(),
+        span_kind: "test".to_string(),
+        source_record_id: None,
+        source_file_path_hash: None,
+        summary_id: None,
+        session_id: Some(raw_session_id.to_string()),
+        thread_id: None,
+        title: title.to_string(),
+        normalized_title: statsai_core::normalize_task_title(title),
+        title_source: Some("test".to_string()),
+        summary_preview: None,
+        todo_excerpt: None,
+        issue_keys: Vec::new(),
+        branch_family: None,
+        project_bucket: "bucket".to_string(),
+        project: None,
+        git: None,
+        usage: UsageCounts::default(),
+        estimated_cost_usd: None,
+        estimated_cost_micro_usd: None,
+        event_count: 0,
+        has_usage_evidence: false,
+        total_messages: 0,
+        user_messages: 0,
+        assistant_messages: 0,
+        developer_messages: 0,
+        linked_event_ids: Vec::new(),
+        confidence: Confidence::Medium,
+        is_meta: task_title_is_generic(Some(title)),
+        started_at,
+        ended_at: Some(started_at),
+        duration_seconds: Some(0),
+    }
+}

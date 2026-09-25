@@ -142,6 +142,14 @@ impl Store {
                 link_stmt.execute(params![&span.span_id.0, &event_id.0])?;
             }
         }
+        drop(span_stmt);
+        drop(delete_links);
+        drop(link_stmt);
+        let raw_session_ids = spans
+            .iter()
+            .filter_map(|span| span.session_id.clone())
+            .collect::<Vec<_>>();
+        self.refresh_session_rollups_for_raw_ids(&raw_session_ids)?;
         Ok(changed)
     }
 

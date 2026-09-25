@@ -5,12 +5,13 @@ use crate::model::{
 };
 use crate::ProviderAdapter;
 use crate::{
-    fallback_session_id, file_modified_timestamp, infer_missing_output, metadata_only_privacy,
-    number_at_any, project_context_from_path_fallback, push_deduped, read_bounded_jsonl_line,
-    resolve_project_context, resolve_project_context_cached, stats_cache_date_end,
-    timestamp_from_nested_value, timestamp_from_scalar, usage_event, usd_to_micro_usd,
-    value_as_u64, AdapterScan, BoundedLineRead, DuplicateSelection, EventDeduplication,
-    FileParseContext, ProjectContextCache, ProviderEventParts, ScanOptions, MAX_JSONL_RECORD_BYTES,
+    fallback_session_id, file_modified_timestamp, infer_missing_output, message_count_runtime,
+    metadata_only_privacy, number_at_any, project_context_from_path_fallback, push_deduped,
+    read_bounded_jsonl_line, resolve_project_context, resolve_project_context_cached,
+    stats_cache_date_end, timestamp_from_nested_value, timestamp_from_scalar, usage_event,
+    usd_to_micro_usd, value_as_u64, AdapterScan, BoundedLineRead, DuplicateSelection,
+    EventDeduplication, FileParseContext, ProjectContextCache, ProviderEventParts, ScanOptions,
+    MAX_JSONL_RECORD_BYTES,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -43,6 +44,10 @@ pub(crate) fn parse_claude_file(
 
     let mut line_bytes = Vec::new();
     let mut index = 0usize;
+    let mut pending_user_messages = HashMap::<String, u64>::new();
+    // Later snapshots of one provider record replace the event. User lines
+    // counted on the first snapshot have to ride along with that replacement.
+    let mut last_usage_users = HashMap::<String, (String, u64)>::new();
     loop {
         let line_status =
             read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
@@ -76,18 +81,43 @@ pub(crate) fn parse_claude_file(
         if reasoning.raw.is_some() {
             current_reasoning = reasoning;
         }
+        let session_raw = claude_session_raw(&value, path);
         let Some(usage_value) = value
             .pointer("/message/usage")
             .or_else(|| value.get("usage"))
         else {
+            if claude_record_is_user(&value) {
+                *pending_user_messages.entry(session_raw).or_default() += 1;
+            }
             continue;
         };
         ctx.scan.diagnostics.candidate_usage_rows += 1;
         let usage = claude_usage_counts_from_value(usage_value);
         if usage.computed_total() == 0 {
+            if claude_record_is_user(&value) {
+                *pending_user_messages.entry(session_raw).or_default() += 1;
+            }
             ctx.scan.diagnostics.skipped_zero_events += 1;
             continue;
         }
+        let record_id = claude_provider_record_id(&value);
+        let fresh_users = pending_user_messages.remove(&session_raw).unwrap_or(0);
+        let user_messages = match record_id.as_deref() {
+            Some(record_id) => {
+                let carried = last_usage_users
+                    .get(&session_raw)
+                    .filter(|(previous, _)| previous == record_id)
+                    .map(|(_, users)| *users)
+                    .unwrap_or(0);
+                let users = carried.saturating_add(fresh_users);
+                last_usage_users.insert(session_raw.clone(), (record_id.to_string(), users));
+                users
+            }
+            None => {
+                last_usage_users.remove(&session_raw);
+                fresh_users
+            }
+        };
         let (timestamp, timestamp_inferred) = timestamp_from_nested_value(&value)
             .map(|timestamp| (timestamp, false))
             .unwrap_or((fallback_timestamp, true));
@@ -106,12 +136,6 @@ pub(crate) fn parse_claude_file(
         let project =
             claude_project_context_from_value(&value, indexed_project_metadata, &mut project_cache)
                 .or_else(|| fallback_project.clone());
-        let session_raw = value
-            .get("sessionId")
-            .or_else(|| value.get("session_id"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| fallback_session_id(path));
         // Claude Code rewrites one streamed response as several records that
         // share a provider-record identity while cumulative usage grows, so the
         // last snapshot for that identity is the authoritative one. Records
@@ -139,7 +163,7 @@ pub(crate) fn parse_claude_file(
                 duration_seconds: None,
                 model,
                 usage,
-                runtime: None,
+                runtime: message_count_runtime(user_messages, 1, 0),
                 session_raw,
                 project,
                 event_kind: "claude_message_usage",
@@ -165,6 +189,20 @@ pub(crate) fn parse_claude_file(
     ctx.scan.diagnostics.activity_extract_ms += activity_started_at.elapsed().as_millis() as u64;
 
     Ok(())
+}
+
+fn claude_session_raw(value: &Value, path: &Path) -> String {
+    value
+        .get("sessionId")
+        .or_else(|| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback_session_id(path))
+}
+
+fn claude_record_is_user(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("user")
+        || value.pointer("/message/role").and_then(Value::as_str) == Some("user")
 }
 
 pub(crate) fn claude_provider_record_id(value: &Value) -> Option<String> {

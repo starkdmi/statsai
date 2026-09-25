@@ -499,6 +499,57 @@ fn claude_streaming_snapshots_keep_the_final_usage_for_one_request() {
 }
 
 #[test]
+fn claude_user_counts_stay_on_the_kept_streaming_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session");
+    writeln!(
+        file,
+        r#"{{"type":"user","timestamp":"2026-08-05T14:51:09.000Z","sessionId":"session-1","message":{{"role":"user","content":"hello"}}}}"#
+    )
+    .expect("user");
+    for (timestamp, uuid, output) in [
+        ("2026-08-05T14:51:09.702Z", "record-1", 10),
+        ("2026-08-05T14:51:11.102Z", "record-2", 40),
+    ] {
+        writeln!(
+            file,
+            r#"{{"timestamp":"{timestamp}","sessionId":"session-1","uuid":"{uuid}","requestId":"request-1","message":{{"id":"message-1","role":"assistant","model":"claude-opus-5","usage":{{"input_tokens":2,"output_tokens":{output}}}}}}}"#
+        )
+        .expect("snapshot");
+    }
+    writeln!(
+        file,
+        r#"{{"type":"user","timestamp":"2026-08-05T14:51:12.000Z","sessionId":"session-1","message":{{"role":"user","content":"again"}}}}"#
+    )
+    .expect("second user");
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-08-05T14:51:14.209Z","sessionId":"session-1","uuid":"record-3","requestId":"request-2","message":{{"id":"message-2","role":"assistant","model":"claude-opus-5","usage":{{"input_tokens":3,"output_tokens":5}}}}}}"#
+    )
+    .expect("second request");
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.events.len(), 2);
+    let first = scan.events[0].runtime.as_ref().expect("first runtime");
+    assert_eq!(first.user_messages, Some(1));
+    assert_eq!(first.assistant_messages, Some(1));
+    assert_eq!(scan.events[0].usage.output_tokens, Some(40));
+    let second = scan.events[1].runtime.as_ref().expect("second runtime");
+    assert_eq!(second.user_messages, Some(1));
+    assert_eq!(second.assistant_messages, Some(1));
+}
+
+#[test]
 fn claude_streaming_snapshots_with_equal_timestamps_resolve_by_source_line() {
     let dir = tempfile::tempdir().expect("tempdir");
     let projects = dir.path().join("projects");
@@ -1003,7 +1054,9 @@ fn claude_collects_effort_and_effective_speed_but_ignores_service_tier() {
         .expect("serialize model")
         .to_string()
         .contains("service_tier"));
-    assert!(scan.events[0].runtime.is_none());
+    let runtime = scan.events[0].runtime.as_ref().expect("message counts");
+    assert_eq!(runtime.assistant_messages, Some(1));
+    assert!(runtime.latency_ms.is_none());
 }
 
 #[test]
