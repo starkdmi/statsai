@@ -1508,6 +1508,7 @@ fn sync_batch_serialization_excludes_local_task_entities() {
         account_evidence_summaries: Vec::new(),
         activity_rollups: Vec::new(),
         activity_coverage: Vec::new(),
+        sessions: Vec::new(),
         events: Vec::new(),
         summaries: Vec::new(),
         task_buckets: Vec::new(),
@@ -1612,6 +1613,7 @@ fn build_sync_batch_respects_project_and_task_opt_ins() {
             include_projects: true,
             include_tasks: false,
             include_activity: false,
+            include_sessions: false,
         })
         .expect("persist sync preferences");
     let (persisted_batch, persisted_mode) =
@@ -1703,6 +1705,7 @@ fn code_change_metric_project_ids_follow_sync_project_preferences() {
             include_projects: true,
             include_tasks: false,
             include_activity: false,
+            include_sessions: false,
         })
         .expect("persist project opt-in");
     let exclude_command = SyncCommand {
@@ -2094,6 +2097,7 @@ fn activity_sync_payload_omits_paths_commands_and_invocation_ids() {
 
     let include_command = SyncCommand {
         include_activity: true,
+        include_sessions: false,
         ..test_sync_command("file")
     };
     let include_target = sync_target(&include_command).expect("target");

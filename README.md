@@ -156,13 +156,18 @@ dashboard.
 | Parse evidence and local source paths | Project labels and repository anchors |
 | Source text, diffs, file paths, and commit messages | Privacy-safe numeric code-change metrics |
 | — | Opt-in private task snapshots and verifications, including bounded task titles, summary previews, and todo excerpts |
+| Session prompts, raw session ids, and message text | Opt-in session rollups: totals, duration, message counts, and a bounded title |
 
 Raw usage events and complete archived conversation records stay local and are
 never included in hosted sync. StatsAI does not upload full prompts, full
 responses, or raw provider logs. When hosted task sync is explicitly enabled
 with `statsai sync --include-tasks`, the current `sync_batch.v5` payload may
 include bounded conversation-derived task titles, summary previews, and todo
-excerpts. You can inspect the exact sync contract in
+excerpts. Hosted session sync is separate and off by default.
+`statsai sync --include-sessions` adds `sessions` rows to `sync_batch.v6`:
+hashed session ids, token and request totals, duration, message counts, and a
+bounded title. `--exclude-sessions` stops sending them and leaves sessions
+already hosted in place. You can inspect the exact sync contract in
 [`docs/sync-contract.md`](docs/sync-contract.md) and verify the resolved sync
 target with:
 

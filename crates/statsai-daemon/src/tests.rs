@@ -24,6 +24,7 @@ fn empty_batch() -> SyncBatch {
         account_evidence_summaries: Vec::new(),
         activity_rollups: Vec::new(),
         activity_coverage: Vec::new(),
+        sessions: Vec::new(),
         events: Vec::new(),
         summaries: Vec::new(),
         task_buckets: Vec::new(),
@@ -327,6 +328,61 @@ fn ingest_v6_batch_refuses_activity_collections_it_cannot_store() {
     assert!(error
         .to_string()
         .contains("activity collections are not supported"));
+}
+
+#[test]
+fn ingest_refuses_session_rollups_the_loopback_daemon_cannot_store() {
+    let store = Store::in_memory().expect("store");
+    let mut batch = empty_batch();
+    batch.schema_version = SYNC_BATCH_V5_SCHEMA_VERSION.to_string();
+    batch.sessions.push(loopback_session(&batch.device_id));
+    let error = ingest_sync_batch(&store, &batch).expect_err("pre-v6 sessions");
+    assert!(error
+        .to_string()
+        .contains("session rollups require sync_batch.v6"));
+
+    batch.schema_version = SYNC_BATCH_V6_SCHEMA_VERSION.to_string();
+    let error = ingest_sync_batch(&store, &batch).expect_err("unsupported sessions");
+    assert!(error
+        .to_string()
+        .contains("session rollups are not supported"));
+}
+
+fn loopback_session(device_id: &str) -> statsai_core::SessionRollupV1 {
+    let now = Utc::now();
+    statsai_core::SessionRollupV1 {
+        schema_version: statsai_core::SESSION_ROLLUP_SCHEMA_VERSION.to_string(),
+        session_id: "session_loopback".to_string(),
+        device_id: device_id.to_string(),
+        provider: "codex".to_string(),
+        source_id: statsai_core::SourceId("source".to_string()),
+        provider_account_id: None,
+        started_at: now,
+        ended_at: now,
+        duration_seconds: Some(1),
+        usage: UsageCounts::default(),
+        requests: 1,
+        cost: statsai_core::CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: None,
+            provider_reported_usd: None,
+            estimated_api_equivalent_micro_usd: None,
+            provider_reported_micro_usd: None,
+            pricing_source: None,
+            pricing_version: None,
+            confidence: Confidence::Medium,
+        },
+        models: Vec::new(),
+        primary_model: None,
+        total_messages: None,
+        user_messages: None,
+        assistant_messages: None,
+        developer_messages: None,
+        project: None,
+        title: None,
+        title_source: None,
+        updated_at: now,
+    }
 }
 
 #[test]

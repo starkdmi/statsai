@@ -106,6 +106,8 @@ pub(super) fn test_sync_command(sink: &str) -> SyncCommand {
         exclude_tasks: false,
         include_activity: false,
         exclude_activity: false,
+        include_sessions: false,
+        exclude_sessions: false,
     }
 }
 

@@ -9,9 +9,10 @@ use statsai_core::{
 };
 use statsai_core::{
     project_contains_file_paths, sanitize_code_change_metric_for_sync,
-    sanitize_task_bucket_for_sync, IdentitySource, ProjectInfo, ProviderAccount,
-    SourceAccountAssignment, SourceKind, SourceLocation, Subscription, SyncAuthoritativeSnapshot,
-    SyncBatch, TaskVerificationCursor, UsageEvent, UsageSummary, SYNC_BATCH_SCHEMA_VERSION,
+    sanitize_session_rollup_for_sync, sanitize_task_bucket_for_sync, IdentitySource, ProjectInfo,
+    ProviderAccount, SourceAccountAssignment, SourceKind, SourceLocation, Subscription,
+    SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, UsageEvent, UsageSummary,
+    SYNC_BATCH_SCHEMA_VERSION,
 };
 use statsai_store::{QuotaQuery, Store};
 #[cfg(test)]
@@ -277,6 +278,28 @@ pub(crate) fn build_sync_batch_with_identity_key(
     } else {
         all_activity_coverage.clone()
     };
+    let all_sessions = if sync_preferences.include_sessions {
+        store
+            .all_session_rollups()?
+            .into_iter()
+            .map(|rollup| {
+                let mut rollup = sanitize_session_rollup_for_sync(rollup);
+                if !include_projects {
+                    rollup.project = None;
+                }
+                rollup
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let sessions = if !sync_preferences.include_sessions {
+        Vec::new()
+    } else if payload_mode == SyncPayloadMode::Rollups && !(command.full || state.is_none()) {
+        store.pending_session_rollups_for_sync(&command.sink, target, &all_sessions)?
+    } else {
+        all_sessions.clone()
+    };
 
     if payload_mode == SyncPayloadMode::Rollups {
         let label = rollup_mode_label(command);
@@ -327,6 +350,12 @@ pub(crate) fn build_sync_batch_with_identity_key(
                 .iter()
                 .map(|coverage| coverage.coverage_id.clone())
                 .collect(),
+            session_rollup_ids: sync_preferences.include_sessions.then(|| {
+                all_sessions
+                    .iter()
+                    .map(|rollup| rollup.session_id.clone())
+                    .collect()
+            }),
         };
         let failed_without_resume = state.as_ref().is_some_and(|state| {
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()
@@ -403,6 +432,7 @@ pub(crate) fn build_sync_batch_with_identity_key(
             quota_cycle_contributions,
             activity_rollups,
             activity_coverage,
+            sessions,
             authoritative_snapshot,
             created_at,
         },
@@ -466,6 +496,13 @@ pub(crate) fn record_rollup_sync_chunk_success(
             .map(|coverage| coverage.coverage_id.clone())
             .collect::<Vec<_>>(),
     )?;
+    store.mark_session_rollups_synced(
+        &batch
+            .sessions
+            .iter()
+            .map(|rollup| rollup.session_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
     snapshot::invalidate_dashboard_cache();
     Ok(())
 }
@@ -516,6 +553,7 @@ pub(crate) fn record_sync_batch_success(
     // the next sync to that target resent every rollup.
     store.record_activity_rollups_synced(sink, target, &batch.activity_rollups)?;
     store.record_activity_coverage_synced(sink, target, &batch.activity_coverage)?;
+    store.record_session_rollups_synced(sink, target, &batch.sessions)?;
     store.mark_activity_rollups_synced(
         &batch
             .activity_rollups
@@ -528,6 +566,13 @@ pub(crate) fn record_sync_batch_success(
             .activity_coverage
             .iter()
             .map(|coverage| coverage.coverage_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    store.mark_session_rollups_synced(
+        &batch
+            .sessions
+            .iter()
+            .map(|rollup| rollup.session_id.clone())
             .collect::<Vec<_>>(),
     )?;
     snapshot::invalidate_dashboard_cache();

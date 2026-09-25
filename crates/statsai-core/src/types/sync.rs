@@ -1,10 +1,10 @@
 use crate::{
     project_contains_file_paths, project_has_stable_identity, AccountEvidenceSummaryV1,
     AccountPlanProjectionV1, ActivityCoverageV1, ActivityRollupV1, CodeChangeMetric, ProjectInfo,
-    ProviderAccount, ProviderAccountId, QuotaCycleContributionV1, SourceAccountAssignment,
-    SourceAccountAssignmentId, SourceId, SourceLocation, Subscription, SubscriptionId, SummaryId,
-    TaskSpan, TaskVerification, TaskVerificationId, UsageEvent, UsageSummary, WorkItem,
-    WorkItemMember,
+    ProviderAccount, ProviderAccountId, QuotaCycleContributionV1, SessionRollupV1,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceLocation, Subscription,
+    SubscriptionId, SummaryId, TaskSpan, TaskVerification, TaskVerificationId, UsageEvent,
+    UsageSummary, WorkItem, WorkItemMember,
 };
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -56,6 +56,10 @@ pub struct SyncBatch {
     /// Per-source coverage for activity kinds, including zero-call days.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activity_coverage: Vec<ActivityCoverageV1>,
+    /// Opt-in session rollups. Empty batches omit the key. Each row is
+    /// `session_rollup.v1` with the closed ingest key set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<SessionRollupV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoritative_snapshot: Option<SyncAuthoritativeSnapshot>,
     pub created_at: DateTime<Utc>,
@@ -88,6 +92,11 @@ pub struct SyncAuthoritativeSnapshot {
     pub activity_rollup_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activity_coverage_ids: Vec<String>,
+    /// Present only when this collector is opting into session retirement.
+    /// An empty array prunes every hosted session for the device. Absence
+    /// leaves hosted sessions alone, including on pre-session v6 collectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_rollup_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -145,6 +154,9 @@ pub struct SyncEntityCounts {
     pub activity_rollups: u64,
     #[serde(default, skip_serializing_if = "sync_count_is_zero")]
     pub activity_coverage: u64,
+    /// Present on `sync_ack.v6`. Earlier acknowledgements omit it.
+    #[serde(default, skip_serializing_if = "sync_count_is_zero")]
+    pub sessions: u64,
 }
 
 fn sync_count_is_zero(value: &u64) -> bool {
@@ -208,4 +220,17 @@ pub fn sanitize_summary_for_sync(mut summary: UsageSummary) -> UsageSummary {
         summary.privacy.contains_file_paths = true;
     }
     summary
+}
+
+/// Drops unstable projects and generic or secret-looking titles before a
+/// session rollup leaves the device. `source_id` stays, matching summaries.
+/// Nested usage and cost already serialize to the closed ingest keys.
+#[must_use]
+pub fn sanitize_session_rollup_for_sync(mut rollup: SessionRollupV1) -> SessionRollupV1 {
+    rollup.project = rollup.project.and_then(sanitize_project_for_sync);
+    if crate::task_title_is_generic(rollup.title.as_deref()) {
+        rollup.title = None;
+        rollup.title_source = None;
+    }
+    rollup
 }

@@ -162,6 +162,21 @@ impl Store {
         )
     }
 
+    pub fn pending_session_rollups_for_sync(
+        &self,
+        sink: &str,
+        target: &str,
+        rollups: &[statsai_core::SessionRollupV1],
+    ) -> Result<Vec<statsai_core::SessionRollupV1>> {
+        self.pending_serialized_entities_for_sync(
+            sink,
+            target,
+            "session_rollup",
+            rollups,
+            |rollup| rollup.session_id.as_str(),
+        )
+    }
+
     pub fn pending_activity_coverage_for_sync(
         &self,
         sink: &str,
@@ -331,6 +346,13 @@ impl Store {
                     .collect::<BTreeSet<_>>(),
             ),
         ]);
+        let mut current_ids = current_ids;
+        if let Some(ids) = snapshot.session_rollup_ids.as_ref() {
+            current_ids.insert(
+                "session_rollup",
+                ids.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+            );
+        }
         let mut statement = self.conn.prepare(
             r#"
             SELECT entity_kind, entity_id
@@ -340,7 +362,7 @@ impl Store {
                 'source', 'account', 'source_account_assignment', 'subscription', 'summary',
                 'code_change_metric', 'quota_cycle_contribution',
                 'account_plan_observation', 'account_evidence_summary',
-                'activity_rollup', 'activity_coverage'
+                'activity_rollup', 'activity_coverage', 'session_rollup'
               )
             "#,
         )?;
@@ -564,6 +586,11 @@ impl Store {
                 .into_iter()
                 .map(|coverage| coverage.coverage_id)
                 .collect(),
+            session_rollup_ids: if self.sync_preferences()?.include_sessions {
+                Some(self.session_rollup_ids()?)
+            } else {
+                None
+            },
         })
     }
 }

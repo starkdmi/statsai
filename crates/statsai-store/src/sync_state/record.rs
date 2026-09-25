@@ -314,6 +314,26 @@ impl Store {
         })
     }
 
+    pub fn record_session_rollups_synced(
+        &self,
+        sink: &str,
+        target: &str,
+        rollups: &[statsai_core::SessionRollupV1],
+    ) -> Result<()> {
+        if rollups.is_empty() {
+            return Ok(());
+        }
+        self.with_immediate_transaction(|| {
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "session_rollup",
+                rollups,
+                |rollup| rollup.session_id.as_str(),
+            )
+        })
+    }
+
     pub fn record_activity_coverage_synced(
         &self,
         sink: &str,

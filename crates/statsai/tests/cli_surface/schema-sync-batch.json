@@ -86,6 +86,13 @@
     "schema_version": {
       "type": "string"
     },
+    "sessions": {
+      "description": "Opt-in session rollups. Empty batches omit the key. Each row is `session_rollup.v1` with the closed ingest key set.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SessionRollupV1"
+      }
+    },
     "source_account_assignments": {
       "type": "array",
       "items": {
@@ -1421,6 +1428,40 @@
         }
       }
     },
+    "SessionCostWire": {
+      "description": "Cost keys accepted on `session_rollup.v1`.",
+      "type": "object",
+      "properties": {
+        "estimated_api_equivalent_micro_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "estimated_api_equivalent_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "provider_reported_micro_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "provider_reported_usd": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
     "SessionInfo": {
       "type": "object",
       "required": [
@@ -1461,6 +1502,274 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "SessionModelWire": {
+      "description": "One model row on `session_rollup.v1`.",
+      "type": "object",
+      "required": [
+        "cost",
+        "model",
+        "usage"
+      ],
+      "properties": {
+        "cost": {
+          "$ref": "#/definitions/SessionCostWire"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SummaryModelMetrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "$ref": "#/definitions/ModelInfo"
+        },
+        "usage": {
+          "$ref": "#/definitions/SessionUsageWire"
+        }
+      }
+    },
+    "SessionRollupV1": {
+      "description": "One local session, aggregated from the usage events that share its hashed id.\n\n`session_id` is the hashed `session_…` identity already stored on each event. Raw provider session ids never appear on this record.",
+      "type": "object",
+      "required": [
+        "cost",
+        "device_id",
+        "duration_seconds",
+        "ended_at",
+        "models",
+        "provider",
+        "requests",
+        "schema_version",
+        "session_id",
+        "source_id",
+        "started_at",
+        "updated_at",
+        "usage"
+      ],
+      "properties": {
+        "assistant_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cost": {
+          "description": "Closed cost object. Currency, pricing source, and confidence stay local.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SessionCostWire"
+            }
+          ]
+        },
+        "developer_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "duration_seconds": {
+          "description": "Always a non-negative integer on the wire. Unknown durations serialize as 0 because `session_rollup.v1` rejects null.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SessionModelWire"
+          }
+        },
+        "primary_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProjectInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title_source": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SessionTitleSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "total_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "usage": {
+          "description": "Closed usage object. Cache-lifetime splits stay local; the ingest allowlist does not include them.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SessionUsageWire"
+            }
+          ]
+        },
+        "user_messages": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "SessionTitleSource": {
+      "description": "Where a session title was resolved from. Event titles win over task spans, which win over archived conversations.",
+      "type": "string",
+      "enum": [
+        "event",
+        "task_span",
+        "archive"
+      ]
+    },
+    "SessionUsageWire": {
+      "description": "Usage keys accepted on `session_rollup.v1`. Five-minute and one-hour cache splits are folded into `cache_creation_tokens` before this leaves the device.",
+      "type": "object",
+      "properties": {
+        "cache_creation_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_read_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "local_eval_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "local_prompt_eval_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "reasoning_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
         }
       }
     },
@@ -2051,6 +2360,16 @@
         },
         "quota_cycle_contribution_ids": {
           "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "session_rollup_ids": {
+          "description": "Present only when this collector is opting into session retirement. An empty array prunes every hosted session for the device. Absence leaves hosted sessions alone, including on pre-session v6 collectors.",
+          "type": [
+            "array",
+            "null"
+          ],
           "items": {
             "type": "string"
           }

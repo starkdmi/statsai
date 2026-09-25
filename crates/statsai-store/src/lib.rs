@@ -114,6 +114,7 @@ const SYNC_ROLLUP_SUMMARY_VERSION: &str = "14";
 const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
 const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
 const SYNC_INCLUDE_ACTIVITY_METADATA_KEY: &str = "sync.include_activity";
+const SYNC_INCLUDE_SESSIONS_METADATA_KEY: &str = "sync.include_sessions";
 const LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY: &str = "migration.legacy_codex_plan_evidence.v1";
 const SQLITE_BUSY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(50)
@@ -193,17 +194,19 @@ pub struct SyncPreferences {
     pub include_projects: bool,
     pub include_tasks: bool,
     pub include_activity: bool,
+    pub include_sessions: bool,
 }
 
 impl SyncPreferences {
     #[must_use]
     pub fn normalized(self) -> Self {
-        let include_projects = self.include_projects || self.include_tasks;
+        let include_projects = self.include_projects || self.include_tasks || self.include_sessions;
         let include_tasks = self.include_tasks && include_projects;
         Self {
             include_projects,
             include_tasks,
             include_activity: self.include_activity,
+            include_sessions: self.include_sessions,
         }
     }
 }

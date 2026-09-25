@@ -1,6 +1,18 @@
 use super::*;
 
 pub(crate) fn split_http_rollup_sync_batch_after_budget_error(batch: &SyncBatch) -> Vec<SyncBatch> {
+    if !batch.sessions.is_empty() && has_non_session_payload(batch) {
+        let mut without_sessions = batch.clone();
+        without_sessions.sessions.clear();
+        let mut chunks = split_http_session_chunks(batch);
+        chunks.extend(split_http_rollup_sync_batch_after_budget_error(
+            &without_sessions,
+        ));
+        return chunks;
+    }
+    if batch.sessions.len() > 1 {
+        return split_http_session_chunks_halved(batch);
+    }
     if (!batch.activity_rollups.is_empty() || !batch.activity_coverage.is_empty())
         && has_non_activity_payload(batch)
     {
@@ -143,6 +155,7 @@ pub(crate) fn has_non_code_change_payload(batch: &SyncBatch) -> bool {
         || !batch.quota_cycle_contributions.is_empty()
         || !batch.activity_rollups.is_empty()
         || !batch.activity_coverage.is_empty()
+        || !batch.sessions.is_empty()
 }
 
 pub(crate) fn has_non_quota_cycle_payload(batch: &SyncBatch) -> bool {
@@ -152,6 +165,19 @@ pub(crate) fn has_non_quota_cycle_payload(batch: &SyncBatch) -> bool {
         || !batch.task_buckets.is_empty()
         || !batch.task_verifications.is_empty()
         || !batch.code_change_metrics.is_empty()
+        || !batch.activity_rollups.is_empty()
+        || !batch.activity_coverage.is_empty()
+        || !batch.sessions.is_empty()
+}
+
+pub(crate) fn has_non_session_payload(batch: &SyncBatch) -> bool {
+    http_rollup_metadata_count(batch) > 0
+        || !batch.events.is_empty()
+        || !batch.summaries.is_empty()
+        || !batch.task_buckets.is_empty()
+        || !batch.task_verifications.is_empty()
+        || !batch.code_change_metrics.is_empty()
+        || !batch.quota_cycle_contributions.is_empty()
         || !batch.activity_rollups.is_empty()
         || !batch.activity_coverage.is_empty()
 }
@@ -164,6 +190,7 @@ pub(crate) fn has_non_activity_payload(batch: &SyncBatch) -> bool {
         || !batch.task_verifications.is_empty()
         || !batch.code_change_metrics.is_empty()
         || !batch.quota_cycle_contributions.is_empty()
+        || !batch.sessions.is_empty()
 }
 
 /// Records the backend writes one statement per row for.
@@ -258,6 +285,62 @@ pub(crate) fn split_http_quota_cycle_contribution_chunks(
             chunk
         })
         .collect()
+}
+
+pub(crate) fn split_http_session_chunks(batch: &SyncBatch) -> Vec<SyncBatch> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 2usize;
+    for session in &batch.sessions {
+        let row_bytes = serde_json::to_string(session)
+            .map(|row| row.len())
+            .unwrap_or(0);
+        let next_bytes = if current.is_empty() {
+            2 + row_bytes
+        } else {
+            current_bytes + 1 + row_bytes
+        };
+        if !current.is_empty()
+            && (current.len() >= HTTP_ROLLUP_SESSIONS_PER_BATCH
+                || next_bytes > TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK)
+        {
+            chunks.push(session_chunk(batch, chunks.len(), &current));
+            current.clear();
+            current_bytes = 2;
+        }
+        current.push(session.clone());
+        current_bytes = if current.len() == 1 {
+            2 + row_bytes
+        } else {
+            current_bytes + 1 + row_bytes
+        };
+    }
+    if !current.is_empty() {
+        chunks.push(session_chunk(batch, chunks.len(), &current));
+    }
+    chunks
+}
+
+fn split_http_session_chunks_halved(batch: &SyncBatch) -> Vec<SyncBatch> {
+    let midpoint = batch.sessions.len().div_ceil(2).max(1);
+    let mut chunks = Vec::new();
+    for (index, sessions) in batch.sessions.chunks(midpoint).enumerate() {
+        chunks.push(session_chunk(batch, index, sessions));
+    }
+    chunks
+}
+
+fn session_chunk(
+    batch: &SyncBatch,
+    index: usize,
+    sessions: &[statsai_core::SessionRollupV1],
+) -> SyncBatch {
+    let mut chunk = empty_http_rollup_chunk(
+        batch,
+        &HttpRollupIndexedChunkKind::Sessions.suffix(index + 1),
+    );
+    chunk.sessions = sessions.to_vec();
+    chunk
 }
 
 pub(crate) fn split_http_activity_chunks(batch: &SyncBatch, chunk_size: usize) -> Vec<SyncBatch> {
@@ -376,6 +459,7 @@ pub(crate) fn split_http_rollup_single_metadata_kind(
         | HttpRollupIndexedChunkKind::QuotaCycles
         | HttpRollupIndexedChunkKind::ActivityRollups
         | HttpRollupIndexedChunkKind::ActivityCoverage
+        | HttpRollupIndexedChunkKind::Sessions
         | HttpRollupIndexedChunkKind::Snapshot => Vec::new(),
     }
 }
@@ -411,6 +495,7 @@ pub(crate) fn split_http_rollup_summary_chunks(
             chunk.quota_cycle_contributions.clear();
             chunk.activity_rollups.clear();
             chunk.activity_coverage.clear();
+            chunk.sessions.clear();
             chunk.authoritative_snapshot = None;
             chunk
         })

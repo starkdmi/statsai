@@ -55,7 +55,7 @@ pub(crate) struct SyncCommand {
     pub(crate) include_projects: bool,
     #[arg(
         long,
-        conflicts_with_all = ["include_projects", "include_tasks"],
+        conflicts_with_all = ["include_projects", "include_tasks", "include_sessions"],
         help = "Disable project metadata sync for this device and future syncs"
     )]
     pub(crate) exclude_projects: bool,
@@ -83,4 +83,16 @@ pub(crate) struct SyncCommand {
         help = "Disable hosted agent activity sync and prune names on the next successful HTTP sync"
     )]
     pub(crate) exclude_activity: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["exclude_sessions", "exclude_projects"],
+        help = "Enable hosted session sync for this device and future syncs (implies --include-projects)"
+    )]
+    pub(crate) include_sessions: bool,
+    #[arg(
+        long,
+        conflicts_with = "include_sessions",
+        help = "Disable hosted session sync for this device and future syncs"
+    )]
+    pub(crate) exclude_sessions: bool,
 }

@@ -1058,6 +1058,8 @@ Options:
       --exclude-tasks            Disable hosted task sync for this device and future syncs
       --include-activity         Enable hosted agent activity sync for this device and future syncs
       --exclude-activity         Disable hosted agent activity sync and prune names on the next successful HTTP sync
+      --include-sessions         Enable hosted session sync for this device and future syncs (implies --include-projects)
+      --exclude-sessions         Disable hosted session sync for this device and future syncs
   -h, --help                     Print help
 ===== statsai schema --help =====
 Print JSON schemas for backend-facing contracts

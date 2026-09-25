@@ -102,6 +102,18 @@ pub(crate) fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     // ownership write, matching quota-cycle batching.
     let activity_queries = usize::from(!batch.activity_rollups.is_empty()) * 2
         + usize::from(!batch.activity_coverage.is_empty()) * 2;
+    // Session rows are one lookup plus one write. A closing snapshot that
+    // names session_rollup_ids also deletes orphans the device no longer owns.
+    let session_queries = usize::from(!batch.sessions.is_empty()) * 2
+        + usize::from(
+            batch
+                .authoritative_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.part_index.saturating_add(1) == snapshot.part_count
+                        && snapshot.session_rollup_ids.is_some()
+                }),
+        );
     let code_change_owner_metadata_refresh_queries = usize::from(
         batch.schema_version == SYNC_BATCH_SCHEMA_VERSION
             && batch
@@ -127,6 +139,7 @@ pub(crate) fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
         + code_change_metric_queries
         + quota_cycle_contribution_queries
         + activity_queries
+        + session_queries
         + code_change_owner_metadata_refresh_queries
         + estimate_http_rollup_task_queries(batch)
         + final_sync_bookkeeping_queries

@@ -192,6 +192,20 @@ impl Store {
         Ok(())
     }
 
+    pub fn all_session_rollups(&self) -> Result<Vec<SessionRollupV1>> {
+        self.session_rollups_by_sql(
+            "SELECT payload FROM session_rollups ORDER BY started_at, session_id",
+        )
+    }
+
+    pub fn session_rollup_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT session_id FROM session_rollups ORDER BY session_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn dirty_session_rollups(&self) -> Result<Vec<SessionRollupV1>> {
         self.session_rollups_by_sql(
             "SELECT payload FROM session_rollups WHERE dirty = 1 ORDER BY started_at, session_id",

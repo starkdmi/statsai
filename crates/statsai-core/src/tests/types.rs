@@ -133,8 +133,103 @@ fn session_rollup_uses_snake_case_contract() {
     assert_eq!(json["schema_version"], "session_rollup.v1");
     assert_eq!(json["title_source"], "task_span");
     assert_eq!(json["requests"], 1);
+    assert_eq!(json["duration_seconds"], 0);
+    assert!(json["usage"].get("cache_creation_5m_tokens").is_none());
+    assert!(json["usage"].get("cache_creation_1h_tokens").is_none());
+    assert!(json["cost"].get("currency").is_none());
+    assert!(json["cost"].get("pricing_source").is_none());
+    assert!(json["cost"].get("confidence").is_none());
     let restored: SessionRollupV1 = serde_json::from_value(json).expect("deserialize");
     assert_eq!(restored, rollup);
+}
+
+#[test]
+fn session_rollup_unknown_duration_serializes_as_zero() {
+    let started = DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+        .expect("start")
+        .with_timezone(&Utc);
+    let mut rollup = SessionRollupV1 {
+        schema_version: SESSION_ROLLUP_SCHEMA_VERSION.to_string(),
+        session_id: "session_abc".to_string(),
+        device_id: "device".to_string(),
+        provider: "codex".to_string(),
+        source_id: SourceId("src".to_string()),
+        provider_account_id: None,
+        started_at: started,
+        ended_at: started,
+        duration_seconds: None,
+        usage: UsageCounts::default(),
+        requests: 0,
+        cost: CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: None,
+            provider_reported_usd: None,
+            estimated_api_equivalent_micro_usd: None,
+            provider_reported_micro_usd: None,
+            pricing_source: None,
+            pricing_version: None,
+            confidence: Confidence::Medium,
+        },
+        models: Vec::new(),
+        primary_model: None,
+        total_messages: None,
+        user_messages: None,
+        assistant_messages: None,
+        developer_messages: None,
+        project: None,
+        title: None,
+        title_source: None,
+        updated_at: started,
+    };
+    let json = serde_json::to_value(&rollup).expect("serialize");
+    assert_eq!(json["duration_seconds"], 0);
+    rollup.duration_seconds = Some(0);
+    let restored: SessionRollupV1 = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(restored, rollup);
+}
+
+#[test]
+fn sync_batch_omits_empty_sessions_and_absent_session_retirement() {
+    let batch = SyncBatch {
+        schema_version: SYNC_BATCH_V6_SCHEMA_VERSION.to_string(),
+        batch_id: "batch-sessions".to_string(),
+        device_id: "device-1".to_string(),
+        sources: Vec::new(),
+        accounts: Vec::new(),
+        source_account_assignments: Vec::new(),
+        subscriptions: Vec::new(),
+        events: Vec::new(),
+        summaries: Vec::new(),
+        task_buckets: Vec::new(),
+        task_verifications: Vec::new(),
+        code_change_metrics: Vec::new(),
+        quota_cycle_contributions: Vec::new(),
+        account_plan_observations: Vec::new(),
+        account_evidence_summaries: Vec::new(),
+        activity_rollups: Vec::new(),
+        activity_coverage: Vec::new(),
+        sessions: Vec::new(),
+        authoritative_snapshot: Some(SyncAuthoritativeSnapshot::default()),
+        created_at: DateTime::parse_from_rfc3339("2026-05-31T10:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc),
+    };
+    let json = serde_json::to_value(&batch).expect("serialize");
+    assert!(json.get("sessions").is_none());
+    assert!(json["authoritative_snapshot"]
+        .get("session_rollup_ids")
+        .is_none());
+
+    let mut retiring = batch;
+    retiring.authoritative_snapshot = Some(SyncAuthoritativeSnapshot {
+        session_rollup_ids: Some(Vec::new()),
+        ..SyncAuthoritativeSnapshot::default()
+    });
+    let json = serde_json::to_value(&retiring).expect("serialize retirement");
+    assert_eq!(
+        json["authoritative_snapshot"]["session_rollup_ids"],
+        serde_json::json!([])
+    );
 }
 
 #[test]
@@ -172,6 +267,7 @@ fn sync_ack_v1_omits_zero_task_counters() {
             account_evidence_summaries: 0,
             activity_rollups: 0,
             activity_coverage: 0,
+            sessions: 0,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -188,6 +284,7 @@ fn sync_ack_v1_omits_zero_task_counters() {
             account_evidence_summaries: 0,
             activity_rollups: 0,
             activity_coverage: 0,
+            sessions: 0,
         },
         rejected: Vec::new(),
     };
@@ -200,6 +297,8 @@ fn sync_ack_v1_omits_zero_task_counters() {
     assert!(json["duplicates"].get("task_buckets").is_none());
     assert!(json["duplicates"].get("task_verifications").is_none());
     assert!(json["duplicates"].get("code_change_metrics").is_none());
+    assert!(json["accepted"].get("sessions").is_none());
+    assert!(json["duplicates"].get("sessions").is_none());
 }
 
 #[test]
@@ -222,6 +321,7 @@ fn sync_ack_v3_keeps_nonzero_task_and_code_change_counters() {
             account_evidence_summaries: 0,
             activity_rollups: 0,
             activity_coverage: 0,
+            sessions: 0,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -238,6 +338,7 @@ fn sync_ack_v3_keeps_nonzero_task_and_code_change_counters() {
             account_evidence_summaries: 0,
             activity_rollups: 0,
             activity_coverage: 0,
+            sessions: 0,
         },
         rejected: Vec::new(),
     };
@@ -272,6 +373,7 @@ fn sync_ack_v4_keeps_nonzero_quota_cycle_counters() {
             account_evidence_summaries: 0,
             activity_rollups: 0,
             activity_coverage: 0,
+            sessions: 0,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -288,6 +390,7 @@ fn sync_ack_v4_keeps_nonzero_quota_cycle_counters() {
             account_evidence_summaries: 0,
             activity_rollups: 0,
             activity_coverage: 0,
+            sessions: 0,
         },
         rejected: Vec::new(),
     };
