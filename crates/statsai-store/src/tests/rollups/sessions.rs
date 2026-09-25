@@ -110,6 +110,45 @@ fn session_rollup_sums_mixed_events() {
 }
 
 #[test]
+fn session_rollup_orders_inverted_event_times() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-inverted"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 2, 9, 0, 0)
+        .single()
+        .expect("start");
+    let later = start + chrono::Duration::minutes(12);
+    let mut event = test_store_event(&source, later, "inverted");
+    stamp_session(&mut event, "raw-inverted");
+    event.session.started_at = later;
+    event.session.ended_at = Some(start);
+    event.created_at = start;
+    assert!(store.insert_event(&event).expect("insert"));
+
+    let rollups = store
+        .session_rollups_in_period(
+            None,
+            later + chrono::Duration::days(1),
+            &SessionFilter::default(),
+            SessionSort::Started,
+            10,
+            0,
+        )
+        .expect("rollups");
+    assert_eq!(rollups.len(), 1);
+    assert_eq!(rollups[0].started_at, later);
+    assert_eq!(rollups[0].ended_at, later);
+    assert_eq!(rollups[0].duration_seconds, Some(0));
+}
+
+#[test]
 fn session_rollup_refreshes_on_insert_and_delete() {
     let store = Store::in_memory().expect("store");
     let source = SourceLocation::local_adapter(

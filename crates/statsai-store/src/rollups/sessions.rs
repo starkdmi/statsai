@@ -528,11 +528,16 @@ pub(crate) fn build_session_rollup(
         .map(|event| event.session.started_at)
         .min()
         .unwrap_or(oldest.session.started_at);
-    let ended_at = events
+    let mut ended_at = events
         .iter()
         .map(|event| event.session.ended_at.unwrap_or(event.created_at))
         .max()
         .unwrap_or(newest.created_at);
+    // A provider clock can record a completion before the session start.
+    // Ordering the interval keeps duration non-negative.
+    if ended_at < started_at {
+        ended_at = started_at;
+    }
     let duration_seconds = ended_at
         .signed_duration_since(started_at)
         .num_seconds()

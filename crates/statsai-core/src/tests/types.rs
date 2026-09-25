@@ -608,3 +608,273 @@ fn sanitize_summary_for_sync_marks_project_path_labels_as_file_paths() {
     );
     assert!(sanitized.privacy.contains_file_paths);
 }
+
+fn sample_session_rollup(started: DateTime<Utc>) -> SessionRollupV1 {
+    SessionRollupV1 {
+        schema_version: SESSION_ROLLUP_SCHEMA_VERSION.to_string(),
+        session_id: "session_abc".to_string(),
+        device_id: "device".to_string(),
+        provider: "codex".to_string(),
+        source_id: SourceId("src".to_string()),
+        provider_account_id: None,
+        started_at: started,
+        ended_at: started,
+        duration_seconds: Some(0),
+        usage: UsageCounts::default(),
+        requests: 1,
+        cost: CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: None,
+            provider_reported_usd: None,
+            estimated_api_equivalent_micro_usd: Some(10),
+            provider_reported_micro_usd: None,
+            pricing_source: None,
+            pricing_version: None,
+            confidence: Confidence::Medium,
+        },
+        models: Vec::new(),
+        primary_model: Some("gpt-5".to_string()),
+        total_messages: None,
+        user_messages: None,
+        assistant_messages: None,
+        developer_messages: None,
+        project: None,
+        title: Some("Fix parser".to_string()),
+        title_source: Some(SessionTitleSource::TaskSpan),
+        updated_at: started,
+    }
+}
+
+#[test]
+fn sanitize_session_rollup_repairs_values_ingest_rejects() {
+    let started = DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+        .expect("start")
+        .with_timezone(&Utc);
+    let mut inverted = sample_session_rollup(started + chrono::Duration::hours(2));
+    inverted.ended_at = started;
+    inverted.duration_seconds = None;
+    let sanitized = sanitize_session_rollup_for_sync(inverted);
+    assert_eq!(sanitized.ended_at, sanitized.started_at);
+    assert_eq!(sanitized.duration_seconds, Some(0));
+
+    let mut future = sample_session_rollup(started);
+    future.started_at = Utc::now() + chrono::Duration::hours(48);
+    future.ended_at = future.started_at;
+    let sanitized = sanitize_session_rollup_for_sync(future);
+    assert_eq!(sanitized.started_at, started);
+    assert_eq!(sanitized.ended_at, started);
+    assert!(sanitized.updated_at <= Utc::now() + chrono::Duration::hours(24));
+
+    let mut titled = sample_session_rollup(started);
+    let mut title = "A".repeat(300);
+    title.insert(10, '\n');
+    titled.title = Some(title);
+    titled.title_source = Some(SessionTitleSource::Event);
+    let sanitized = sanitize_session_rollup_for_sync(titled);
+    let title = sanitized.title.expect("repaired title");
+    assert!(!title.chars().any(|ch| ch.is_control()));
+    assert!(title.encode_utf16().count() <= 256);
+    assert_eq!(sanitized.title_source, Some(SessionTitleSource::Event));
+
+    let mut generic = sample_session_rollup(started);
+    generic.title = Some("work item".to_string());
+    generic.title_source = Some(SessionTitleSource::Archive);
+    let sanitized = sanitize_session_rollup_for_sync(generic);
+    assert!(sanitized.title.is_none());
+    assert!(sanitized.title_source.is_none());
+
+    let mut counted = sample_session_rollup(started);
+    counted.usage.input_tokens = Some(1_000_000_000_005);
+    counted.usage.requests = Some(1_000_000_005);
+    counted.requests = 1_000_000_005;
+    counted.cost.estimated_api_equivalent_micro_usd = Some(-25);
+    counted.total_messages = Some(u64::MAX);
+    counted.models = (0..65)
+        .map(|index| SummaryModelUsage {
+            model: ModelInfo {
+                normalized_name: Some(format!("m{index}")),
+                ..ModelInfo::default()
+            },
+            usage: UsageCounts {
+                total_tokens: Some(index),
+                ..UsageCounts::default()
+            },
+            cost: CostInfo {
+                currency: "USD".to_string(),
+                estimated_api_equivalent_usd: None,
+                provider_reported_usd: None,
+                estimated_api_equivalent_micro_usd: None,
+                provider_reported_micro_usd: None,
+                pricing_source: None,
+                pricing_version: None,
+                confidence: Confidence::Medium,
+            },
+            metrics: None,
+        })
+        .collect();
+    let sanitized = sanitize_session_rollup_for_sync(counted);
+    assert_eq!(sanitized.usage.input_tokens, Some(1_000_000_000_000));
+    assert_eq!(sanitized.usage.requests, Some(1_000_000_000));
+    assert_eq!(sanitized.requests, 1_000_000_000);
+    assert_eq!(sanitized.cost.estimated_api_equivalent_micro_usd, Some(0));
+    assert_eq!(sanitized.total_messages, Some((1_u64 << 53) - 1));
+    assert_eq!(sanitized.models.len(), 64);
+    assert!(sanitized
+        .models
+        .iter()
+        .all(|model| model.model.normalized_name.as_deref() != Some("m0")));
+}
+
+#[test]
+fn sanitized_session_rollup_uses_ingest_allowlist() {
+    let started = DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+        .expect("start")
+        .with_timezone(&Utc);
+    let mut rollup = sample_session_rollup(started);
+    rollup.usage.cache_creation_5m_tokens = Some(4);
+    rollup.usage.cache_creation_1h_tokens = Some(8);
+    rollup.usage.cache_creation_tokens = Some(12);
+    rollup.project = Some(ProjectInfo {
+        project_id: "project_path_only".to_string(),
+        project_label: Some("Scratch".to_string()),
+        repo_remote_hash: Some("remote".to_string()),
+        repo_label: Some("statsai".to_string()),
+        branch_hash: Some("branch".to_string()),
+        branch_label: Some("main".to_string()),
+        path_hash: Some("path".to_string()),
+        path_label: Some("/Users/example/Scratch".to_string()),
+    });
+    rollup.models = vec![SummaryModelUsage {
+        model: ModelInfo {
+            name: Some("GPT-5".to_string()),
+            normalized_name: Some("gpt-5".to_string()),
+            provider_model_id: Some("gpt-5".to_string()),
+            speed: Some("standard".to_string()),
+            reasoning_level: Some(ReasoningLevel::High),
+            reasoning_level_raw: Some("high".to_string()),
+        },
+        usage: UsageCounts {
+            input_tokens: Some(1),
+            cache_creation_5m_tokens: Some(2),
+            ..UsageCounts::default()
+        },
+        cost: rollup.cost.clone(),
+        metrics: Some(SummaryModelMetrics {
+            generated_tps: Some(SummaryMetricTotals {
+                samples: 1,
+                sum: 3.0,
+            }),
+        }),
+    }];
+    let json = serde_json::to_value(sanitize_session_rollup_for_sync(rollup)).expect("json");
+    assert_allowlist(
+        &json,
+        &[
+            "schema_version",
+            "session_id",
+            "device_id",
+            "provider",
+            "source_id",
+            "provider_account_id",
+            "started_at",
+            "ended_at",
+            "duration_seconds",
+            "usage",
+            "requests",
+            "cost",
+            "models",
+            "primary_model",
+            "total_messages",
+            "user_messages",
+            "assistant_messages",
+            "developer_messages",
+            "project",
+            "title",
+            "title_source",
+            "updated_at",
+        ],
+    );
+    assert_allowlist(
+        &json["usage"],
+        &[
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_tokens",
+            "cache_read_tokens",
+            "reasoning_tokens",
+            "local_prompt_eval_tokens",
+            "local_eval_tokens",
+            "requests",
+        ],
+    );
+    assert!(json["usage"].get("cache_creation_5m_tokens").is_none());
+    assert!(json["usage"].get("cache_creation_1h_tokens").is_none());
+    assert_allowlist(
+        &json["cost"],
+        &[
+            "provider_reported_usd",
+            "estimated_api_equivalent_usd",
+            "provider_reported_micro_usd",
+            "estimated_api_equivalent_micro_usd",
+        ],
+    );
+    assert!(json["cost"].get("currency").is_none());
+    assert!(json["cost"].get("confidence").is_none());
+    assert_allowlist(
+        &json["project"],
+        &[
+            "project_id",
+            "project_label",
+            "repo_remote_hash",
+            "repo_label",
+            "branch_hash",
+            "branch_label",
+            "path_hash",
+            "path_label",
+        ],
+    );
+    let model = &json["models"][0];
+    assert_allowlist(model, &["model", "usage", "cost", "metrics"]);
+    assert_allowlist(
+        &model["model"],
+        &[
+            "normalized_name",
+            "name",
+            "provider_model_id",
+            "speed",
+            "reasoning_level",
+            "reasoning_level_raw",
+        ],
+    );
+    assert_allowlist(
+        &model["usage"],
+        &[
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_tokens",
+            "cache_read_tokens",
+            "reasoning_tokens",
+            "local_prompt_eval_tokens",
+            "local_eval_tokens",
+            "requests",
+        ],
+    );
+    assert!(model["usage"].get("cache_creation_5m_tokens").is_none());
+    assert_allowlist(&model["metrics"], &["generated_tps"]);
+    assert_allowlist(
+        &model["metrics"]["generated_tps"],
+        &["samples", "avg", "min", "max", "p50", "p95", "sum"],
+    );
+}
+
+fn assert_allowlist(value: &serde_json::Value, allowed: &[&str]) {
+    let object = value.as_object().expect("object");
+    for key in object.keys() {
+        assert!(
+            allowed.contains(&key.as_str()),
+            "unexpected key {key} in {value}"
+        );
+    }
+}
