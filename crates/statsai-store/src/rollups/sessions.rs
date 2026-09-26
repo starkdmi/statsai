@@ -906,23 +906,36 @@ fn session_stats(rollups: &[SessionRollupV1]) -> SessionStats {
         .iter()
         .filter_map(|rollup| rollup.active_seconds)
         .collect::<Vec<_>>();
-    let mut model_tokens: BTreeMap<&str, u64> = BTreeMap::new();
+    // Each session's per-model usage, not its primary model's whole total: a
+    // session that is 60% one model and 40% another counts both. A session
+    // without per-model usage counts its primary model.
+    let mut model_tokens: BTreeMap<String, u64> = BTreeMap::new();
     for rollup in rollups {
-        if let Some(model) = rollup.primary_model.as_deref() {
-            let tokens = rollup.usage.computed_total();
-            let entry = model_tokens.entry(model).or_default();
-            *entry = (*entry).saturating_add(tokens);
+        let mut counted = false;
+        for usage in &rollup.models {
+            if let Some(label) = model_label(&usage.model) {
+                let entry = model_tokens.entry(label).or_default();
+                *entry = (*entry).saturating_add(usage.usage.computed_total());
+                counted = true;
+            }
+        }
+        if !counted {
+            if let Some(model) = rollup.primary_model.clone() {
+                let entry = model_tokens.entry(model).or_default();
+                *entry = (*entry).saturating_add(rollup.usage.computed_total());
+            }
         }
     }
     let top_model = model_tokens
         .into_iter()
-        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(left.0)))
-        .map(|(model, _)| model.to_string());
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .map(|(model, _)| model);
     SessionStats {
         sessions,
         total_tokens,
         total_cost_micro_usd,
-        avg_tokens: (sessions > 0).then_some(total_tokens / sessions),
+        // Lazily: `then_some` would divide by zero when nothing matches.
+        avg_tokens: (sessions > 0).then(|| total_tokens / sessions),
         median_tokens,
         avg_messages,
         median_duration_seconds: median_u64(&mut durations),

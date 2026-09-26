@@ -819,3 +819,65 @@ fn reported_turn_duration_bounds_a_late_completion() {
     assert_eq!(sessions[0].active_seconds, Some(21 * 60));
     assert_eq!(sessions[0].duration_seconds, Some(4 * 86_400));
 }
+
+#[test]
+fn session_stats_handle_no_matching_sessions() {
+    let store = Store::in_memory().expect("store");
+    let stats = store
+        .session_stats_in_period(None, Utc::now(), &SessionFilter::default())
+        .expect("stats");
+    assert_eq!(stats.sessions, 0);
+    assert_eq!(stats.avg_tokens, None);
+    assert_eq!(stats.top_model, None);
+}
+
+#[test]
+fn top_model_sums_each_sessions_per_model_usage() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-top-model"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 15, 9, 0, 0)
+        .single()
+        .expect("start");
+    let model = |name: &str| ModelInfo {
+        name: Some(name.to_string()),
+        normalized_name: Some(name.to_string()),
+        provider_model_id: None,
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+    // One session is model-a 60 and model-b 40; another is model-b 50. By
+    // primary model alone, model-a would win 100 to 50.
+    for (record, session, name, tokens) in [
+        ("mixed-a", "mixed-session", "model-a", 60),
+        ("mixed-b", "mixed-session", "model-b", 40),
+        ("single-b", "single-session", "model-b", 50),
+    ] {
+        let mut event = test_store_event(&source, start, record);
+        stamp_session(&mut event, session);
+        event.model = Some(model(name));
+        event.usage = UsageCounts {
+            input_tokens: Some(tokens),
+            total_tokens: Some(tokens),
+            ..UsageCounts::default()
+        };
+        store.insert_event(&event).expect("insert");
+    }
+
+    let stats = store
+        .session_stats_in_period(
+            None,
+            start + chrono::Duration::days(1),
+            &SessionFilter::default(),
+        )
+        .expect("stats");
+    assert_eq!(stats.top_model.as_deref(), Some("model-b"));
+}

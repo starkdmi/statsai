@@ -11,8 +11,12 @@ pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // activity-invocations.v34: Codex usage skips repeated token_count totals and
 // counts token_usage_record lines, including compaction, instead of the
 // token_count each one pairs with.
-pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v34";
-pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v28";
+// session-metadata.v35: Codex events carry thread names, sub-agents their
+// parent's name, and turns without a reported duration end at their last work.
+pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v35";
+// session-metadata.v29: Claude events carry the session's custom or AI title
+// and the prompt that started their turn.
+pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v29";
 // activity-invocations.v20: session rows report their message count as requests and
 // are priced per message, so long-context tiers stop being decided session-wide.
 pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v20";
