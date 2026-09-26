@@ -638,7 +638,13 @@ pub(crate) fn build_session_rollup(
         .iter()
         .rev()
         .find_map(|event| event.provider_account_id.clone());
-    let project = newest.project.clone().filter(project_has_stable_identity);
+    // The latest event that knows its project: a later event without project
+    // metadata must not erase it, since a session with neither a project nor
+    // a title is not kept.
+    let project = events
+        .iter()
+        .rev()
+        .find_map(|event| event.project.clone().filter(project_has_stable_identity));
     let (title, title_source) = resolve_title(events, titles);
     let models = model_buckets
         .into_iter()

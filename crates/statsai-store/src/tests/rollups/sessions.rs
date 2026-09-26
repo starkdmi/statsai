@@ -881,3 +881,31 @@ fn top_model_sums_each_sessions_per_model_usage() {
         .expect("stats");
     assert_eq!(stats.top_model.as_deref(), Some("model-b"));
 }
+
+#[test]
+fn a_later_event_without_a_project_keeps_the_sessions_project() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-project-gap"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 16, 9, 0, 0)
+        .single()
+        .expect("start");
+    let mut first = test_store_event(&source, start, "with-project");
+    stamp_session(&mut first, "project-gap-session");
+    store.insert_event(&first).expect("first");
+    let mut latest = test_store_event(&source, start + chrono::Duration::minutes(5), "no-project");
+    stamp_session(&mut latest, "project-gap-session");
+    latest.project = None;
+    store.insert_event(&latest).expect("latest");
+
+    let sessions = store.dirty_session_rollups().expect("sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].project, Some(session_test_project()));
+}
