@@ -659,6 +659,21 @@ fn sanitize_session_rollup_repairs_values_ingest_rejects() {
     assert_eq!(sanitized.ended_at, sanitized.started_at);
     assert_eq!(sanitized.duration_seconds, Some(0));
 
+    let mut provider_named = sample_session_rollup(started);
+    provider_named.title = Some("Review uncommitted changes".to_string());
+    provider_named.title_source = Some(SessionTitleSource::Event);
+    let sanitized = sanitize_session_rollup_for_sync(provider_named);
+    assert_eq!(
+        sanitized.title.as_deref(),
+        Some("Review uncommitted changes")
+    );
+    let mut prompt_derived = sample_session_rollup(started);
+    prompt_derived.title = Some("Review uncommitted changes".to_string());
+    prompt_derived.title_source = Some(SessionTitleSource::TaskSpan);
+    let sanitized = sanitize_session_rollup_for_sync(prompt_derived);
+    assert_eq!(sanitized.title, None);
+    assert_eq!(sanitized.title_source, None);
+
     let mut unknown = sample_session_rollup(started);
     unknown.duration_seconds = None;
     let sanitized = sanitize_session_rollup_for_sync(unknown);

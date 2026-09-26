@@ -366,7 +366,13 @@ fn clamp_session_title(rollup: &mut SessionRollupV1) {
         .title
         .as_deref()
         .and_then(|label| sync_label(label, SYNC_LABEL_UTF16_MAX))
-        .filter(|label| !crate::task_title_is_generic(Some(label)));
+        .filter(|label| match rollup.title_source {
+            // The provider named the session; keep its name unless unsafe.
+            Some(crate::SessionTitleSource::Event) => {
+                !crate::provider_session_title_is_unusable(Some(label))
+            }
+            _ => !crate::task_title_is_generic(Some(label)),
+        });
     if title.is_none() {
         rollup.title_source = None;
     }

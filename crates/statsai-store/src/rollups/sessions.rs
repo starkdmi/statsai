@@ -6,14 +6,15 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 use statsai_core::{
-    hash_text, project_has_stable_identity, task_title_is_generic, Confidence, CostAccumulator,
-    CostInfo, ModelInfo, SessionRollupV1, SessionTitleSource, SummaryModelUsage, UsageCounts,
-    UsageEvent, SESSION_ROLLUP_SCHEMA_VERSION,
+    hash_text, project_has_stable_identity, provider_session_title_is_unusable,
+    task_title_is_generic, Confidence, CostAccumulator, CostInfo, ModelInfo, SessionRollupV1,
+    SessionTitleSource, SummaryModelUsage, UsageCounts, UsageEvent, SESSION_ROLLUP_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 // v2 drops record-keyed rows, leaves single-instant durations unknown, and
-// joins Codex rollout-stem span titles.
+// joins Codex rollout-stem span titles. Hosted session tables were rebuilt
+// for the same release, so the v2 rebuild resends every session.
 const SESSION_ROLLUPS_BACKFILL_KEY: &str = "session_rollups_backfilled_v2";
 /// Matches the adapters' `provider_record_usage_event.v1` event key version.
 const PROVIDER_RECORD_ID_PREFIX: &str = "provider_record_usage_event.v1:";
@@ -59,6 +60,14 @@ impl Store {
             return Ok(());
         }
         self.rebuild_session_rollups()?;
+        // Hosted session tables were rebuilt empty for this release. Resends
+        // follow each target's acknowledgements, so forgetting them makes the
+        // next sync send every session; where a hosted row survived, that
+        // upsert writes nothing.
+        self.conn.execute(
+            "DELETE FROM entity_sync_state WHERE entity_kind = 'session_rollup'",
+            [],
+        )?;
         self.set_metadata_value(SESSION_ROLLUPS_BACKFILL_KEY, "1")?;
         Ok(())
     }
@@ -76,8 +85,10 @@ impl Store {
                 .push(event);
         }
         self.with_immediate_transaction(|| {
-            // Rows whose content is unchanged keep their sync state, so a
-            // rebuild after a builder change resends only what it changed.
+            // Every session is resent after a rebuild, since the hosted table
+            // may have been rebuilt with it. Unchanged rows keep their payload
+            // and updated_at, so where the hosted row survived, the resend is
+            // a no-op upsert that writes nothing.
             let existing = self.session_rollup_payload_hashes()?;
             for session_id in existing.keys() {
                 if !grouped.contains_key(session_id) {
@@ -98,6 +109,10 @@ impl Store {
                 let rollup = build_session_rollup(events, &titles, updated_at);
                 let payload_hash = session_rollup_content_hash(&rollup)?;
                 if existing.get(session_id) == Some(&payload_hash) {
+                    self.conn.execute(
+                        "UPDATE session_rollups SET dirty = 1 WHERE session_id = ?1",
+                        params![session_id],
+                    )?;
                     continue;
                 }
                 self.write_session_rollup(&rollup, &payload_hash, 1)?;
@@ -649,11 +664,9 @@ fn resolve_title(
     events: &[UsageEvent],
     titles: &BTreeMap<String, (String, SessionTitleSource)>,
 ) -> (Option<String>, Option<SessionTitleSource>) {
-    if let Some(title) = events
-        .iter()
-        .rev()
-        .find_map(|event| acceptable_session_title(event.session.title.as_deref()))
-    {
+    if let Some(title) = events.iter().rev().find_map(|event| {
+        acceptable_session_title(event.session.title.as_deref(), SessionTitleSource::Event)
+    }) {
         return (Some(title), Some(SessionTitleSource::Event));
     }
     for event in events.iter().rev() {
@@ -698,13 +711,15 @@ fn codex_rollout_session_uuid(raw_id: &str) -> Option<&str> {
     is_uuid.then_some(uuid)
 }
 
-fn acceptable_session_title(value: Option<&str>) -> Option<String> {
+/// Names the provider put on its events are kept unless unsafe. Task-span and
+/// archive titles can come from prompts, so they must not be generic.
+fn acceptable_session_title(value: Option<&str>, source: SessionTitleSource) -> Option<String> {
     let trimmed = value?.trim();
-    if trimmed.is_empty() || task_title_is_generic(Some(trimmed)) {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    let rejected = match source {
+        SessionTitleSource::Event => provider_session_title_is_unusable(Some(trimmed)),
+        _ => task_title_is_generic(Some(trimmed)),
+    };
+    (!trimmed.is_empty() && !rejected).then(|| trimmed.to_string())
 }
 
 fn remember_hashed_title(
@@ -714,7 +729,7 @@ fn remember_hashed_title(
     title: Option<&str>,
     source: SessionTitleSource,
 ) {
-    let Some(title) = acceptable_session_title(title) else {
+    let Some(title) = acceptable_session_title(title, source) else {
         return;
     };
     let hash = hash_text(raw_id);

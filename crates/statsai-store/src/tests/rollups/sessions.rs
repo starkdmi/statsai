@@ -510,7 +510,7 @@ fn codex_rollout_stem_span_titles_join_uuid_sessions() {
 }
 
 #[test]
-fn rebuild_keeps_unchanged_sessions_synced() {
+fn rebuild_resends_unchanged_sessions_without_restamping() {
     let store = Store::in_memory().expect("store");
     let source = SourceLocation::local_adapter(
         "codex",
@@ -533,8 +533,94 @@ fn rebuild_keeps_unchanged_sessions_synced() {
         .into_iter()
         .map(|session| session.session_id)
         .collect::<Vec<_>>();
+    let before = store.dirty_session_rollups().expect("before");
     store.mark_session_rollups_synced(&ids).expect("synced");
 
     store.rebuild_session_rollups().expect("rebuild");
-    assert!(store.dirty_session_rollups().expect("clean").is_empty());
+    let resent = store.dirty_session_rollups().expect("resent");
+    assert_eq!(resent, before);
+}
+
+#[test]
+fn provider_named_sessions_keep_plain_names_but_drop_placeholders() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-provider-titles"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 9, 9, 0, 0)
+        .single()
+        .expect("start");
+    let plain = "Review uncommitted changes";
+    assert!(task_title_is_generic(Some(plain)));
+    let mut review = test_store_event(&source, start, "review");
+    stamp_session(&mut review, "review-session");
+    review.session.title = Some(plain.to_string());
+    store.insert_event(&review).expect("review");
+
+    let mut placeholder = test_store_event(&source, start, "placeholder");
+    stamp_session(&mut placeholder, "placeholder-session");
+    placeholder.session.title = Some("New session - 2026-04-30T16:41:41.413Z".to_string());
+    store.insert_event(&placeholder).expect("placeholder");
+
+    let sessions = store.dirty_session_rollups().expect("sessions");
+    let title = |event: &UsageEvent| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == event.session.session_id)
+            .expect("session")
+            .title
+            .clone()
+    };
+    assert_eq!(title(&review).as_deref(), Some(plain));
+    assert_eq!(title(&placeholder), None);
+}
+
+#[test]
+fn session_backfill_resends_every_session_to_each_target() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-backfill-resend"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 10, 9, 0, 0)
+        .single()
+        .expect("start");
+    let mut event = test_store_event(&source, start, "backfill");
+    stamp_session(&mut event, "backfill-session");
+    store.insert_event(&event).expect("insert");
+    let sessions = store.all_session_rollups().expect("sessions");
+    store
+        .record_session_rollups_synced("http", "https://api.example.test", &sessions)
+        .expect("record");
+    assert!(store
+        .pending_session_rollups_for_sync("http", "https://api.example.test", &sessions)
+        .expect("pending")
+        .is_empty());
+
+    store
+        .conn
+        .execute(
+            "DELETE FROM local_metadata WHERE key LIKE 'session_rollups_backfilled_%'",
+            [],
+        )
+        .expect("forget backfill");
+    store
+        .backfill_session_rollups_if_needed()
+        .expect("backfill");
+
+    let pending = store
+        .pending_session_rollups_for_sync("http", "https://api.example.test", &sessions)
+        .expect("pending after backfill");
+    assert_eq!(pending, sessions);
 }

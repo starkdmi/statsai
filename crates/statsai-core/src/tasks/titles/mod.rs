@@ -96,6 +96,29 @@ pub fn task_title_signal_score(value: Option<&str>) -> i32 {
     score
 }
 
+/// Whether a session name the provider itself assigned is unfit to show.
+///
+/// Provider names are shown as the provider shows them, so "Review
+/// uncommitted changes" or "Say hi" stay. The genericness rules in
+/// [`task_title_is_generic`] rank prompt-derived task titles; here only a
+/// placeholder or text that looks like a secret or a locator is dropped.
+#[must_use]
+pub fn provider_session_title_is_unusable(value: Option<&str>) -> bool {
+    let Some(raw) = value else {
+        return true;
+    };
+    if looks_like_sensitive_locator_dump(raw) {
+        return true;
+    }
+    let Some(value) = clean_task_text(raw) else {
+        return true;
+    };
+    let value = polish_task_title_candidate(&value);
+    value.is_empty()
+        || looks_like_sensitive_locator_dump(&value.to_ascii_lowercase())
+        || looks_like_provider_placeholder_title(&value)
+}
+
 #[must_use]
 pub fn task_title_is_generic(value: Option<&str>) -> bool {
     let Some(raw) = value else {
