@@ -478,3 +478,35 @@ fn codex_subagents_borrow_their_parent_thread_name() {
     );
     assert_eq!(title_for("child-orphan"), None);
 }
+
+#[test]
+fn codex_turns_without_a_reported_duration_end_at_their_last_work() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    let sessions = codex_root.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let mut file = File::create(sessions.join("resumed.jsonl")).expect("rollout");
+    for line in [
+        r#"{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{"id":"resumed-thread"}}"#,
+        r#"{"timestamp":"2026-06-01T08:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        r#"{"timestamp":"2026-06-01T08:00:01Z","type":"event_msg","payload":{"type":"task_started","started_at":"2026-06-01T08:00:01Z"}}"#,
+        r#"{"timestamp":"2026-06-01T08:02:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120},"total_token_usage":{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120}}}}"#,
+        // The next prompt and the completion are written three days later,
+        // when the thread runs again, with no duration.
+        r#"{"timestamp":"2026-06-04T09:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Next step"}]}}"#,
+        r#"{"timestamp":"2026-06-04T09:00:00Z","type":"event_msg","payload":{"type":"task_complete","completed_at":"2026-06-04T09:00:00Z"}}"#,
+    ] {
+        writeln!(file, "{line}").expect("write line");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        &codex_root,
+        LocationOrigin::Configured,
+    );
+    let scan = scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.events[0].session.duration_seconds, Some(120));
+}

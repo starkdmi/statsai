@@ -789,3 +789,33 @@ fn session_aggregate_events_do_not_count_as_active_time() {
     assert_eq!(sessions[0].duration_seconds, Some(3 * 86_400));
     assert_eq!(sessions[0].active_seconds, None);
 }
+
+#[test]
+fn reported_turn_duration_bounds_a_late_completion() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-late-completion"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 7, 23, 17, 16, 0)
+        .single()
+        .expect("start");
+    // Codex reported 21 minutes of work but wrote the completion when the
+    // thread resumed four days later.
+    let completed = start + chrono::Duration::days(4);
+    let mut turn = test_store_event(&source, start, "late-turn");
+    stamp_session(&mut turn, "late-session");
+    turn.session.ended_at = Some(completed);
+    turn.session.duration_seconds = Some(21 * 60);
+    turn.created_at = completed;
+    store.insert_event(&turn).expect("insert");
+
+    let sessions = store.dirty_session_rollups().expect("sessions");
+    assert_eq!(sessions[0].active_seconds, Some(21 * 60));
+    assert_eq!(sessions[0].duration_seconds, Some(4 * 86_400));
+}

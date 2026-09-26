@@ -559,6 +559,7 @@ pub(crate) fn parse_codex_file(
                 accumulated_usage: record.usage.clone(),
                 prompt_previews: Vec::new(),
                 last_activity_at: record.timestamp,
+                last_work_at: started_at,
                 usage_lines: record
                     .usage
                     .as_ref()
@@ -583,6 +584,11 @@ pub(crate) fn parse_codex_file(
             }
             turn.timestamp_inferred |= record.timestamp_inferred;
             turn.last_activity_at = record.timestamp;
+            // Your next prompt can land inside the open turn just before Codex
+            // completes it; that is the start of the next turn, not work.
+            if !record.is_task_complete && record.message_role.as_deref() != Some("user") {
+                turn.last_work_at = record.timestamp;
+            }
             if record.project.is_some() {
                 turn.project = record.project.clone();
             }
@@ -684,8 +690,15 @@ pub(crate) fn parse_codex_file(
                 consumed_usage_lines.insert(record.line_number);
             }
             let explicit_duration_ms = record.task_duration_ms;
+            // Without a reported duration, the turn ran until its last record
+            // of work, not until the completion Codex may write on resume.
+            let worked_until = if turn.last_work_at > turn.started_at {
+                turn.last_work_at.min(completed_at)
+            } else {
+                completed_at
+            };
             let duration_ms = explicit_duration_ms
-                .or_else(|| codex_duration_from_turn_timestamps(turn.started_at, completed_at));
+                .or_else(|| codex_duration_from_turn_timestamps(turn.started_at, worked_until));
             let latency_source = explicit_duration_ms
                 .map(|_| LatencySource::Explicit)
                 .or_else(|| duration_ms.map(|_| LatencySource::Inferred));

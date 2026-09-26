@@ -703,10 +703,19 @@ fn session_active_seconds(events: &[UsageEvent]) -> Option<u64> {
         .filter(|event| !event.source.source_type.ends_with(":session"))
         .filter_map(|event| {
             let session = &event.session;
-            let (start, end) = match session.turn_started_at {
+            let (start, mut end) = match session.turn_started_at {
                 Some(turn) => (turn, session.ended_at.unwrap_or(session.started_at)),
                 None => (session.started_at, session.ended_at?),
             };
+            // A reported duration wins over the completion time. Codex writes a
+            // turn's completion when the thread next runs, so a turn that
+            // worked 21 minutes can complete four days after it started.
+            if let Some(reported) = session
+                .duration_seconds
+                .and_then(|seconds| i64::try_from(seconds).ok())
+            {
+                end = end.min(start + chrono::Duration::seconds(reported));
+            }
             (end >= start).then_some((start, end))
         })
         .collect::<Vec<_>>();

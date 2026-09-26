@@ -705,7 +705,8 @@ fn codex_rollout_turns_match_interleaved_records_by_session_id() {
             .to_rfc3339(),
         "2026-05-01T00:00:03+00:00"
     );
-    assert_eq!(events[0].session.duration_seconds, Some(3));
+    // Without a reported duration the turn ends at its last record of work.
+    assert_eq!(events[0].session.duration_seconds, Some(2));
 
     assert_eq!(events[1].usage.total_tokens, Some(280));
     assert_eq!(
@@ -728,7 +729,7 @@ fn codex_rollout_turns_match_interleaved_records_by_session_id() {
             .to_rfc3339(),
         "2026-05-01T00:00:05+00:00"
     );
-    assert_eq!(events[1].session.duration_seconds, Some(4));
+    assert_eq!(events[1].session.duration_seconds, Some(3));
 }
 
 #[test]
