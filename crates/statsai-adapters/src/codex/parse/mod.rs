@@ -341,10 +341,10 @@ pub(crate) fn parse_codex_file(
                 session_raw = declared_session_id;
             }
             if collect_tasks {
-                current_thread_id = declared_session_id;
-                let session_id = current_thread_id
-                    .clone()
-                    .or_else(|| Some(session_raw.clone()));
+                current_thread_id = declared_session_id.clone();
+            }
+            {
+                let session_id = declared_session_id.or_else(|| Some(session_raw.clone()));
                 current_title = value
                     .pointer("/payload/thread_name")
                     .and_then(Value::as_str)
@@ -694,7 +694,7 @@ pub(crate) fn parse_codex_file(
                 .map(|_| LatencySource::Explicit)
                 .or_else(|| duration_ms.map(|_| LatencySource::Inferred));
             let time_to_first_token_ms = record.time_to_first_token_ms;
-            let event = usage_event(
+            let mut event = usage_event(
                 ctx.adapter,
                 ctx.source,
                 ctx.options,
@@ -734,6 +734,7 @@ pub(crate) fn parse_codex_file(
                     dedupe_salt: None,
                 },
             );
+            event.session.title = turn.title.clone();
             let mut linked_quota_lines = turn.usage_lines.clone();
             linked_quota_lines.extend_from_slice(&turn.quota_lines);
             if record.usage.is_some() {
@@ -930,7 +931,8 @@ pub(crate) fn parse_codex_file(
         if consumed_usage_lines.contains(&record.line_number) {
             continue;
         }
-        let event = usage_event(
+        let session_title = record.session_title;
+        let mut event = usage_event(
             ctx.adapter,
             ctx.source,
             ctx.options,
@@ -966,6 +968,7 @@ pub(crate) fn parse_codex_file(
                 dedupe_salt: None,
             },
         );
+        event.session.title = session_title;
         // A record's paired token_count carries the quota sample for it.
         let mut linked_quota_lines = vec![record.line_number];
         linked_quota_lines.extend(paired_quota_lines.get(&record.line_number));

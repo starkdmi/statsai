@@ -31,13 +31,8 @@ pub struct SessionRollupV1 {
     pub provider_account_id: Option<ProviderAccountId>,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
-    /// Always a non-negative integer on the wire. Unknown durations serialize as 0
-    /// because `session_rollup.v1` rejects null.
-    #[serde(
-        serialize_with = "serialize_duration_seconds",
-        deserialize_with = "deserialize_duration_seconds"
-    )]
-    #[schemars(with = "u64")]
+    /// `None` when the session recorded only a start. Unknown durations go out
+    /// as null; ingest stores them without an end so they stay out of medians.
     pub duration_seconds: Option<u64>,
     /// Closed usage object. Cache-lifetime splits stay local; the ingest allowlist
     /// does not include them.
@@ -190,20 +185,6 @@ impl From<SessionModelWire> for SummaryModelUsage {
             metrics: usage.metrics,
         }
     }
-}
-
-fn serialize_duration_seconds<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_u64(value.unwrap_or(0))
-}
-
-fn deserialize_duration_seconds<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<u64>::deserialize(deserializer)
 }
 
 mod session_usage_serde {

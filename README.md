@@ -166,8 +166,11 @@ include bounded conversation-derived task titles, summary previews, and todo
 excerpts. Hosted session sync is separate and off by default.
 `statsai sync --include-sessions` adds `sessions` rows to `sync_batch.v6`:
 hashed session ids, token and request totals, duration, message counts, and a
-bounded title. `--exclude-sessions` stops sending them and leaves sessions
-already hosted in place. You can inspect the exact sync contract in
+bounded title. Titles come from the provider's own session name (Codex thread
+names, Claude Code and OpenCode session titles) or a local task title. Cursor's
+usage export names no session, so its local rows are not sessions.
+`--exclude-sessions` stops sending them and leaves sessions already hosted in
+place. You can inspect the exact sync contract in
 [`docs/sync-contract.md`](docs/sync-contract.md) and verify the resolved sync
 target with:
 

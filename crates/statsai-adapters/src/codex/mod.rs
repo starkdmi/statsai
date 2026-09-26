@@ -123,11 +123,8 @@ pub(crate) fn scan_codex_source(
     let source_path = PathBuf::from(path_label);
     let root = codex_source_root(&source_path);
     let cache_namespaces = scan_cache_namespaces(source, adapter.version());
-    let thread_titles = if options.should_collect_tasks() {
-        load_codex_thread_titles(&root)
-    } else {
-        HashMap::new()
-    };
+    // Thread names title sessions as well as tasks, so they load either way.
+    let thread_titles = load_codex_thread_titles(&root);
     let mut indexed_candidates = Vec::new();
     for (index, candidate) in codex_jsonl_candidates(source, &source_path, &cache_namespaces)?
         .into_iter()

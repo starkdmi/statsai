@@ -1171,3 +1171,47 @@ fn claude_scan_separates_oversized_rows_from_malformed_ones() {
     );
     assert_eq!(scan.events.len(), 1, "the usable row is still collected");
 }
+
+#[test]
+fn claude_session_titles_name_every_event_in_the_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session file");
+    for line in [
+        r#"{"type":"ai-title","aiTitle":"Generated name","sessionId":"titled"}"#,
+        r#"{"timestamp":"2026-05-01T00:00:00Z","sessionId":"titled","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        r#"{"timestamp":"2026-05-01T00:01:00Z","sessionId":"untitled","message":{"id":"m2","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        // A custom title outranks the generated one even though it comes later.
+        r#"{"type":"custom-title","customTitle":"Repair the session indexer","sessionId":"titled"}"#,
+        r#"{"type":"ai-title","aiTitle":"Later generated name","sessionId":"titled"}"#,
+    ] {
+        writeln!(file, "{line}").expect("write line");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.events.len(), 2);
+    let title_for = |session_raw: &str| {
+        let hash = statsai_core::hash_text(session_raw);
+        scan.events
+            .iter()
+            .find(|event| event.session.local_session_id_hash.as_deref() == Some(hash.as_str()))
+            .expect("event")
+            .session
+            .title
+            .clone()
+    };
+    assert_eq!(
+        title_for("titled").as_deref(),
+        Some("Repair the session indexer")
+    );
+    assert_eq!(title_for("untitled"), None);
+}

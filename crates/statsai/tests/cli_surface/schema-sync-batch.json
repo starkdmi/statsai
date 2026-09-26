@@ -1541,7 +1541,6 @@
       "required": [
         "cost",
         "device_id",
-        "duration_seconds",
         "ended_at",
         "models",
         "provider",
@@ -1582,8 +1581,11 @@
           "type": "string"
         },
         "duration_seconds": {
-          "description": "Always a non-negative integer on the wire. Unknown durations serialize as 0 because `session_rollup.v1` rejects null.",
-          "type": "integer",
+          "description": "`None` when the session recorded only a start. Unknown durations go out as null; ingest stores them without an end so they stay out of medians.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint64",
           "minimum": 0.0
         },

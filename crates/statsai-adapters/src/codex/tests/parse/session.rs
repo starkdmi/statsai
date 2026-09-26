@@ -394,4 +394,14 @@ fn codex_task_spans_capture_thread_id_from_session_meta() {
     // account bindings all meet on one key instead of a file path.
     assert_eq!(scan.task_spans[0].session_id.as_deref(), Some("thread-123"));
     assert_eq!(scan.task_spans[0].title, "Fix parser bug");
+
+    // The thread name titles the session even when tasks are not collected.
+    let without_tasks =
+        scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
+    assert!(without_tasks.task_spans.is_empty());
+    assert!(!without_tasks.events.is_empty());
+    assert!(without_tasks
+        .events
+        .iter()
+        .all(|event| event.session.title.as_deref() == Some("Fix parser bug")));
 }

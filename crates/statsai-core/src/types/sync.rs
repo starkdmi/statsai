@@ -311,6 +311,11 @@ fn clamp_session_timestamps(rollup: &mut SessionRollupV1) {
         rollup.ended_at = rollup.started_at;
     }
     rollup.updated_at = clamp_sync_timestamp(rollup.updated_at, latest, fallback);
+    // An unknown duration stays unknown; clamped timestamps must not turn it
+    // into a measured zero.
+    if rollup.duration_seconds.is_none() {
+        return;
+    }
     let seconds = rollup
         .ended_at
         .signed_duration_since(rollup.started_at)

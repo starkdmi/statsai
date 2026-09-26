@@ -17,9 +17,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 use statsai_core::{
-    canonical_display, expand_home_path, hash_text, summary_id, Confidence, EventSource,
-    IdentitySource, ParseEvidence, ProjectInfo, SourceKind, SourceLocation, SummaryMetadata,
-    UsageCounts, UsageSummary, USAGE_SUMMARY_SCHEMA_VERSION,
+    canonical_display, expand_home_path, hash_text, summarize_task_text, summary_id, Confidence,
+    EventSource, IdentitySource, ParseEvidence, ProjectInfo, SourceKind, SourceLocation,
+    SummaryMetadata, UsageCounts, UsageSummary, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{estimate_cost_at, pricing_changes_between, unknown_cost};
 use std::collections::HashMap;
@@ -48,6 +48,8 @@ pub(crate) fn parse_claude_file(
     // Later snapshots of one provider record replace the event. User lines
     // counted on the first snapshot have to ride along with that replacement.
     let mut last_usage_users = HashMap::<String, (String, u64)>::new();
+    let mut session_titles = HashMap::<String, (u8, String)>::new();
+    let events_start = ctx.scan.events.len();
     loop {
         let line_status =
             read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
@@ -82,6 +84,15 @@ pub(crate) fn parse_claude_file(
             current_reasoning = reasoning;
         }
         let session_raw = claude_session_raw(&value, path);
+        if let Some((rank, title)) = claude_session_title_from_value(&value) {
+            let replaces = session_titles
+                .get(&session_raw)
+                .is_none_or(|(current, _)| rank >= *current);
+            if replaces {
+                session_titles.insert(session_raw, (rank, title));
+            }
+            continue;
+        }
         let Some(usage_value) = value
             .pointer("/message/usage")
             .or_else(|| value.get("usage"))
@@ -179,6 +190,25 @@ pub(crate) fn parse_claude_file(
         push_deduped(ctx.scan, ctx.seen, event, duplicate_selection);
     }
 
+    // Title records can follow the usage they name, so titles land once the
+    // whole file has been read.
+    if !session_titles.is_empty() {
+        let titles_by_hash = session_titles
+            .into_iter()
+            .map(|(session_raw, (_, title))| (hash_text(&session_raw), title))
+            .collect::<HashMap<_, _>>();
+        for event in &mut ctx.scan.events[events_start..] {
+            if let Some(title) = event
+                .session
+                .local_session_id_hash
+                .as_deref()
+                .and_then(|hash| titles_by_hash.get(hash))
+            {
+                event.session.title = Some(title.clone());
+            }
+        }
+    }
+
     let activity_started_at = std::time::Instant::now();
     activity.finish(
         ctx.scan,
@@ -189,6 +219,19 @@ pub(crate) fn parse_claude_file(
     ctx.scan.diagnostics.activity_extract_ms += activity_started_at.elapsed().as_millis() as u64;
 
     Ok(())
+}
+
+/// Claude Code names a session with `custom-title` records, which a rename
+/// also writes, and occasionally `ai-title`. The later record of the stronger
+/// kind wins; the rank says which kind that is.
+fn claude_session_title_from_value(value: &Value) -> Option<(u8, String)> {
+    let (rank, key) = match value.get("type").and_then(Value::as_str)? {
+        "custom-title" => (1, "customTitle"),
+        "ai-title" => (0, "aiTitle"),
+        _ => return None,
+    };
+    let title = summarize_task_text(value.get(key).and_then(Value::as_str), 90)?;
+    Some((rank, title))
 }
 
 fn claude_session_raw(value: &Value, path: &Path) -> String {

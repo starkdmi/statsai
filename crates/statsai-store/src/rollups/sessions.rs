@@ -12,7 +12,11 @@ use statsai_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-const SESSION_ROLLUPS_BACKFILL_KEY: &str = "session_rollups_backfilled_v1";
+// v2 drops record-keyed rows, leaves single-instant durations unknown, and
+// joins Codex rollout-stem span titles.
+const SESSION_ROLLUPS_BACKFILL_KEY: &str = "session_rollups_backfilled_v2";
+/// Matches the adapters' `provider_record_usage_event.v1` event key version.
+const PROVIDER_RECORD_ID_PREFIX: &str = "provider_record_usage_event.v1:";
 const UNASSIGNED_ACCOUNT: &str = "unassigned";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,13 +67,26 @@ impl Store {
         let events = self.events()?;
         let mut grouped: BTreeMap<String, Vec<UsageEvent>> = BTreeMap::new();
         for event in events {
+            if event_has_own_record_session(&event) {
+                continue;
+            }
             grouped
                 .entry(event.session.session_id.clone())
                 .or_default()
                 .push(event);
         }
         self.with_immediate_transaction(|| {
-            self.conn.execute("DELETE FROM session_rollups", [])?;
+            // Rows whose content is unchanged keep their sync state, so a
+            // rebuild after a builder change resends only what it changed.
+            let existing = self.session_rollup_payload_hashes()?;
+            for session_id in existing.keys() {
+                if !grouped.contains_key(session_id) {
+                    self.conn.execute(
+                        "DELETE FROM session_rollups WHERE session_id = ?1",
+                        params![session_id],
+                    )?;
+                }
+            }
             let hashes = grouped
                 .values()
                 .flatten()
@@ -77,9 +94,12 @@ impl Store {
                 .collect::<Vec<_>>();
             let titles = self.session_titles_for_hashes(&hashes)?;
             let updated_at = Utc::now();
-            for events in grouped.values() {
+            for (session_id, events) in &grouped {
                 let rollup = build_session_rollup(events, &titles, updated_at);
                 let payload_hash = session_rollup_content_hash(&rollup)?;
+                if existing.get(session_id) == Some(&payload_hash) {
+                    continue;
+                }
                 self.write_session_rollup(&rollup, &payload_hash, 1)?;
             }
             Ok(grouped.len() as u64)
@@ -138,6 +158,7 @@ impl Store {
             .iter()
             .map(|raw_id| raw_id.trim())
             .filter(|raw_id| !raw_id.is_empty())
+            .flat_map(|raw_id| std::iter::once(raw_id).chain(codex_rollout_session_uuid(raw_id)))
             .map(hash_text)
             .collect::<Vec<_>>();
         let session_ids = self.session_ids_for_local_hashes(&hashes)?;
@@ -336,9 +357,22 @@ impl Store {
         let rows = statement.query_map(params![session_id], |row| row.get::<_, String>(0))?;
         let mut events = Vec::new();
         for row in rows {
-            events.push(serde_json::from_str(&row?)?);
+            let event: UsageEvent = serde_json::from_str(&row?)?;
+            if !event_has_own_record_session(&event) {
+                events.push(event);
+            }
         }
         Ok(events)
+    }
+
+    fn session_rollup_payload_hashes(&self) -> Result<BTreeMap<String, String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT session_id, payload_hash FROM session_rollups")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<Result<BTreeMap<_, _>, _>>()?)
     }
 
     fn session_ids_for_local_hashes(&self, hashes: &[String]) -> Result<BTreeSet<String>> {
@@ -418,13 +452,17 @@ impl Store {
             let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
                 continue;
             };
-            remember_hashed_title(
-                &mut titles,
-                &wanted,
-                &session_id,
-                title.as_deref(),
-                SessionTitleSource::TaskSpan,
-            );
+            let raw_ids =
+                std::iter::once(session_id.as_str()).chain(codex_rollout_session_uuid(&session_id));
+            for raw_id in raw_ids {
+                remember_hashed_title(
+                    &mut titles,
+                    &wanted,
+                    raw_id,
+                    title.as_deref(),
+                    SessionTitleSource::TaskSpan,
+                );
+            }
         }
         Ok(titles)
     }
@@ -538,11 +576,21 @@ pub(crate) fn build_session_rollup(
     if ended_at < started_at {
         ended_at = started_at;
     }
-    let duration_seconds = ended_at
-        .signed_duration_since(started_at)
-        .num_seconds()
-        .try_into()
-        .ok();
+    // One instant with no recorded end is a start, not a zero-length session.
+    // Counting it as 0s pulled the median to zero for every source that
+    // stamps a single time per row.
+    let has_recorded_end = events
+        .iter()
+        .any(|event| event.session.ended_at.is_some() || event.session.duration_seconds.is_some());
+    let duration_seconds = if has_recorded_end || ended_at > started_at {
+        ended_at
+            .signed_duration_since(started_at)
+            .num_seconds()
+            .try_into()
+            .ok()
+    } else {
+        None
+    };
     let provider_account_id = events
         .iter()
         .rev()
@@ -617,6 +665,37 @@ fn resolve_title(
         }
     }
     (None, None)
+}
+
+/// An event whose session identity is its own provider record belongs to no
+/// session. Cursor's usage export names no session, so each local row is keyed
+/// by itself, and treating those rows as sessions listed every request as one.
+pub(crate) fn event_has_own_record_session(event: &UsageEvent) -> bool {
+    let Some(session_hash) = event.session.local_session_id_hash.as_deref() else {
+        return false;
+    };
+    event
+        .parse_evidence
+        .as_ref()
+        .and_then(|evidence| evidence.source_record_id.as_deref())
+        .and_then(|record_id| record_id.strip_prefix(PROVIDER_RECORD_ID_PREFIX))
+        .and_then(|rest| rest.rsplit_once(':'))
+        .is_some_and(|(_, record_hash)| record_hash == session_hash)
+}
+
+/// Older Codex task spans name their session by the rollout file stem, while
+/// events hash the UUID the file declares. The stem ends in that UUID.
+fn codex_rollout_session_uuid(raw_id: &str) -> Option<&str> {
+    let stem = raw_id.rsplit('/').next()?;
+    if !stem.starts_with("rollout-") {
+        return None;
+    }
+    let uuid = stem.get(stem.len().checked_sub(36)?..)?;
+    let is_uuid = uuid.char_indices().all(|(index, character)| match index {
+        8 | 13 | 18 | 23 => character == '-',
+        _ => character.is_ascii_hexdigit(),
+    });
+    is_uuid.then_some(uuid)
 }
 
 fn acceptable_session_title(value: Option<&str>) -> Option<String> {

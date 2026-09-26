@@ -364,3 +364,177 @@ fn task_span(
         duration_seconds: Some(0),
     }
 }
+
+fn record_evidence(record_id: &str) -> ParseEvidence {
+    ParseEvidence {
+        event_key_version: "provider_record_usage_event.v1".to_string(),
+        source_file_path_hash: None,
+        source_line_number: None,
+        source_record_id: Some(record_id.to_string()),
+        model_inferred: false,
+        timestamp_inferred: false,
+        account_identity_source: IdentitySource::Unresolved,
+    }
+}
+
+#[test]
+fn record_keyed_events_do_not_form_sessions() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "cursor",
+        "test",
+        "0",
+        Path::new("/tmp/session-cursor"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 5, 9, 0, 0)
+        .single()
+        .expect("start");
+
+    // A local Cursor row is keyed by its own record, so its session hash is
+    // the record hash.
+    let mut row = test_store_event(&source, start, "cursor-row");
+    stamp_session(&mut row, "cursor-row-identity");
+    let row_hash = hash_text("cursor-row-identity");
+    row.parse_evidence = Some(record_evidence(&format!(
+        "provider_record_usage_event.v1:cursor_usage_event:{row_hash}"
+    )));
+    store.insert_event(&row).expect("row");
+
+    // A cloud agent groups its rows under one agent id.
+    let mut agent = test_store_event(&source, start, "cursor-agent-row");
+    stamp_session(&mut agent, "cursor_agent:agent-1");
+    let record_hash = hash_text("agent-row-identity");
+    agent.parse_evidence = Some(record_evidence(&format!(
+        "provider_record_usage_event.v1:cursor_usage_event:{record_hash}"
+    )));
+    store.insert_event(&agent).expect("agent");
+
+    let sessions = store.dirty_session_rollups().expect("sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, agent.session.session_id);
+
+    assert_eq!(store.rebuild_session_rollups().expect("rebuild"), 1);
+    let rebuilt = store.dirty_session_rollups().expect("rebuilt");
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].session_id, agent.session.session_id);
+}
+
+#[test]
+fn single_instant_sessions_have_unknown_duration() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-instant"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 6, 9, 0, 0)
+        .single()
+        .expect("start");
+    let mut lone = test_store_event(&source, start, "lone");
+    stamp_session(&mut lone, "lone-session");
+    lone.created_at = start;
+    store.insert_event(&lone).expect("lone");
+
+    let mut spanned = test_store_event(&source, start, "spanned-first");
+    stamp_session(&mut spanned, "spanned-session");
+    spanned.created_at = start;
+    store.insert_event(&spanned).expect("first");
+    let mut later = test_store_event(
+        &source,
+        start + chrono::Duration::minutes(3),
+        "spanned-last",
+    );
+    stamp_session(&mut later, "spanned-session");
+    later.created_at = start + chrono::Duration::minutes(3);
+    store.insert_event(&later).expect("last");
+
+    let sessions = store.dirty_session_rollups().expect("sessions");
+    let duration = |session_id: &str| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .expect("session")
+            .duration_seconds
+    };
+    assert_eq!(duration(&lone.session.session_id), None);
+    assert_eq!(duration(&spanned.session.session_id), Some(180));
+    let stats = store
+        .session_stats_in_period(
+            None,
+            start + chrono::Duration::days(1),
+            &SessionFilter::default(),
+        )
+        .expect("stats");
+    assert_eq!(stats.median_duration_seconds, Some(180));
+}
+
+#[test]
+fn codex_rollout_stem_span_titles_join_uuid_sessions() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-codex-stem"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 7, 9, 0, 0)
+        .single()
+        .expect("start");
+    let uuid = "019c537d-7d4b-7c33-bfc9-785a18e58f8c";
+    let mut event = test_store_event(&source, start, "codex-stem");
+    stamp_session(&mut event, uuid);
+    store.insert_event(&event).expect("insert");
+
+    let title = "Repair the rollout title join";
+    store
+        .upsert_task_spans(&[task_span(
+            &source,
+            &format!("2026/02/12/rollout-2026-02-12T23-14-18-{uuid}"),
+            title,
+            start,
+        )])
+        .expect("span");
+    store.rebuild_session_rollups().expect("rebuild");
+    let sessions = store.dirty_session_rollups().expect("sessions");
+    assert_eq!(sessions[0].title.as_deref(), Some(title));
+}
+
+#[test]
+fn rebuild_keeps_unchanged_sessions_synced() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-rebuild"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 8, 9, 0, 0)
+        .single()
+        .expect("start");
+    let mut event = test_store_event(&source, start, "rebuild");
+    stamp_session(&mut event, "rebuild-session");
+    store.insert_event(&event).expect("insert");
+    let ids = store
+        .dirty_session_rollups()
+        .expect("dirty")
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect::<Vec<_>>();
+    store.mark_session_rollups_synced(&ids).expect("synced");
+
+    store.rebuild_session_rollups().expect("rebuild");
+    assert!(store.dirty_session_rollups().expect("clean").is_empty());
+}

@@ -144,7 +144,7 @@ fn session_rollup_uses_snake_case_contract() {
 }
 
 #[test]
-fn session_rollup_unknown_duration_serializes_as_zero() {
+fn session_rollup_unknown_duration_serializes_as_null() {
     let started = DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
         .expect("start")
         .with_timezone(&Utc);
@@ -182,10 +182,12 @@ fn session_rollup_unknown_duration_serializes_as_zero() {
         updated_at: started,
     };
     let json = serde_json::to_value(&rollup).expect("serialize");
-    assert_eq!(json["duration_seconds"], 0);
-    rollup.duration_seconds = Some(0);
+    assert!(json["duration_seconds"].is_null());
     let restored: SessionRollupV1 = serde_json::from_value(json).expect("deserialize");
     assert_eq!(restored, rollup);
+    rollup.duration_seconds = Some(0);
+    let json = serde_json::to_value(&rollup).expect("serialize measured");
+    assert_eq!(json["duration_seconds"], 0);
 }
 
 #[test]
@@ -652,10 +654,15 @@ fn sanitize_session_rollup_repairs_values_ingest_rejects() {
         .with_timezone(&Utc);
     let mut inverted = sample_session_rollup(started + chrono::Duration::hours(2));
     inverted.ended_at = started;
-    inverted.duration_seconds = None;
+    inverted.duration_seconds = Some(7_200);
     let sanitized = sanitize_session_rollup_for_sync(inverted);
     assert_eq!(sanitized.ended_at, sanitized.started_at);
     assert_eq!(sanitized.duration_seconds, Some(0));
+
+    let mut unknown = sample_session_rollup(started);
+    unknown.duration_seconds = None;
+    let sanitized = sanitize_session_rollup_for_sync(unknown);
+    assert_eq!(sanitized.duration_seconds, None);
 
     let mut future = sample_session_rollup(started);
     future.started_at = Utc::now() + chrono::Duration::hours(48);
