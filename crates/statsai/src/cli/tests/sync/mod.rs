@@ -320,6 +320,102 @@ pub(crate) fn test_task_only_sync_batch(
     }
 }
 
+pub(crate) fn test_session_rollups(count: usize) -> Vec<statsai_core::SessionRollupV1> {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-http-session-budget"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let now = Utc
+        .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+        .single()
+        .expect("date");
+    let account_id = provider_account_id("codex", "personal");
+    for index in 0..count {
+        let mut event = test_event(
+            "codex",
+            &source,
+            now + Duration::minutes(index as i64),
+            Some(account_id.clone()),
+            TokenParts::total(10),
+        );
+        event.session.session_id = format!("session-budget-{index}");
+        event.project = Some(ProjectInfo {
+            project_id: format!("project-budget-{index}"),
+            project_label: Some(format!("Project {index}")),
+            repo_remote_hash: Some(format!("repo-hash-{index}")),
+            repo_label: Some(format!("owner/repo-{index}")),
+            branch_hash: None,
+            branch_label: None,
+            path_hash: Some(format!("path-hash-{index}")),
+            path_label: Some(format!("/tmp/project-{index}")),
+        });
+        store.insert_event(&event).expect("event");
+    }
+    let rollups = store.all_session_rollups().expect("session rollups");
+    assert_eq!(rollups.len(), count);
+    rollups
+}
+
+pub(crate) fn test_activity_rollup(
+    index: usize,
+    provider_account_id: Option<ProviderAccountId>,
+) -> statsai_core::ActivityRollupV1 {
+    let seen = Utc
+        .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+        .single()
+        .expect("date");
+    statsai_core::ActivityRollupV1 {
+        schema_version: statsai_core::ACTIVITY_ROLLUP_SCHEMA_VERSION.to_string(),
+        rollup_id: format!("activity-rollup-{index}"),
+        device_id: "device".to_string(),
+        source_id: SourceId("source".to_string()),
+        provider: "codex".to_string(),
+        provider_account_id,
+        day: "2026-06-20".to_string(),
+        kind: statsai_core::ActivityKind::Tool,
+        entity_key: "shell".to_string(),
+        display_name: "shell".to_string(),
+        family: statsai_core::ActivityFamily::Shell,
+        mcp_server: None,
+        mcp_tool: None,
+        plugin: None,
+        skill_catalog: None,
+        model: None,
+        calls: 1,
+        succeeded: 1,
+        failed: 0,
+        unknown: 0,
+        duration_samples: 1,
+        duration_sum_ms: 10,
+        duration_max_ms: Some(10),
+        duration_kind: Some(statsai_core::ActivityDurationKind::Reported),
+        first_seen: seen,
+        last_seen: seen,
+        evidence: "codex-native-items".to_string(),
+    }
+}
+
+pub(crate) fn test_activity_coverage(index: usize) -> statsai_core::ActivityCoverageV1 {
+    statsai_core::ActivityCoverageV1 {
+        schema_version: statsai_core::ACTIVITY_COVERAGE_SCHEMA_VERSION.to_string(),
+        coverage_id: format!("activity-coverage-{index}"),
+        device_id: "device".to_string(),
+        source_id: SourceId("source".to_string()),
+        provider: "codex".to_string(),
+        day: "2026-06-20".to_string(),
+        day_end: "2026-06-20".to_string(),
+        kind: statsai_core::ActivityKind::Tool,
+        level: statsai_core::ActivityCoverageLevel::Complete,
+        evidence: "codex-native-items".to_string(),
+        parser_revision: statsai_core::ACTIVITY_PARSER_REVISION.to_string(),
+    }
+}
+
 pub(crate) fn test_code_change_metric(
     index: usize,
     now: DateTime<Utc>,
