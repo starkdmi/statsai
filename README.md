@@ -168,7 +168,8 @@ excerpts. Hosted session sync is separate and off by default.
 hashed session ids, token and request totals, duration, message counts, and a
 bounded title. Titles come from the provider's own session name (Codex thread
 names, Claude Code and OpenCode session titles) or a local task title. Cursor's
-usage export names no session, so its local rows are not sessions.
+usage export names no session, so its local rows are not sessions, and a session
+with neither a project nor a title is not kept.
 `--exclude-sessions` stops sending them and leaves sessions already hosted in
 place. You can inspect the exact sync contract in
 [`docs/sync-contract.md`](docs/sync-contract.md) and verify the resolved sync

@@ -12,9 +12,10 @@ use statsai_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-// v2 drops record-keyed rows, leaves single-instant durations unknown, and
-// joins Codex rollout-stem span titles. Hosted session tables were rebuilt
-// for the same release, so the v2 rebuild resends every session.
+// v2 drops record-keyed rows and sessions with neither project nor title,
+// leaves single-instant durations unknown, and joins Codex rollout-stem span
+// titles. Hosted session tables were rebuilt for the same release, so the v2
+// rebuild resends every session.
 const SESSION_ROLLUPS_BACKFILL_KEY: &str = "session_rollups_backfilled_v2";
 /// Matches the adapters' `provider_record_usage_event.v1` event key version.
 const PROVIDER_RECORD_ID_PREFIX: &str = "provider_record_usage_event.v1:";
@@ -61,11 +62,12 @@ impl Store {
         }
         self.rebuild_session_rollups()?;
         // Hosted session tables were rebuilt empty for this release. Resends
-        // follow each target's acknowledgements, so forgetting them makes the
-        // next sync send every session; where a hosted row survived, that
-        // upsert writes nothing.
+        // follow each target's acknowledged payload hash, so clearing the hash
+        // makes the next sync send every session; where a hosted row survived,
+        // that upsert writes nothing. The acknowledgements themselves stay, so
+        // a session the rebuild dropped is still retired by the next snapshot.
         self.conn.execute(
-            "DELETE FROM entity_sync_state WHERE entity_kind = 'session_rollup'",
+            "UPDATE entity_sync_state SET payload_hash = '' WHERE entity_kind = 'session_rollup'",
             [],
         )?;
         self.set_metadata_value(SESSION_ROLLUPS_BACKFILL_KEY, "1")?;
@@ -90,14 +92,6 @@ impl Store {
             // and updated_at, so where the hosted row survived, the resend is
             // a no-op upsert that writes nothing.
             let existing = self.session_rollup_payload_hashes()?;
-            for session_id in existing.keys() {
-                if !grouped.contains_key(session_id) {
-                    self.conn.execute(
-                        "DELETE FROM session_rollups WHERE session_id = ?1",
-                        params![session_id],
-                    )?;
-                }
-            }
             let hashes = grouped
                 .values()
                 .flatten()
@@ -105,9 +99,26 @@ impl Store {
                 .collect::<Vec<_>>();
             let titles = self.session_titles_for_hashes(&hashes)?;
             let updated_at = Utc::now();
-            for (session_id, events) in &grouped {
-                let rollup = build_session_rollup(events, &titles, updated_at);
-                let payload_hash = session_rollup_content_hash(&rollup)?;
+            let rollups = grouped
+                .values()
+                .map(|events| build_session_rollup(events, &titles, updated_at))
+                .filter(session_rollup_is_identifiable)
+                .collect::<Vec<_>>();
+            let kept = rollups
+                .iter()
+                .map(|rollup| rollup.session_id.as_str())
+                .collect::<BTreeSet<_>>();
+            for session_id in existing.keys() {
+                if !kept.contains(session_id.as_str()) {
+                    self.conn.execute(
+                        "DELETE FROM session_rollups WHERE session_id = ?1",
+                        params![session_id],
+                    )?;
+                }
+            }
+            for rollup in &rollups {
+                let session_id = &rollup.session_id;
+                let payload_hash = session_rollup_content_hash(rollup)?;
                 if existing.get(session_id) == Some(&payload_hash) {
                     self.conn.execute(
                         "UPDATE session_rollups SET dirty = 1 WHERE session_id = ?1",
@@ -115,9 +126,9 @@ impl Store {
                     )?;
                     continue;
                 }
-                self.write_session_rollup(&rollup, &payload_hash, 1)?;
+                self.write_session_rollup(rollup, &payload_hash, 1)?;
             }
-            Ok(grouped.len() as u64)
+            Ok(rollups.len() as u64)
         })
     }
 
@@ -151,6 +162,13 @@ impl Store {
         let titles = self.session_titles_for_hashes(&hashes)?;
         for (session_id, events) in present {
             let rollup = build_session_rollup(&events, &titles, Utc::now());
+            if !session_rollup_is_identifiable(&rollup) {
+                self.conn.execute(
+                    "DELETE FROM session_rollups WHERE session_id = ?1",
+                    params![session_id],
+                )?;
+                continue;
+            }
             let payload_hash = session_rollup_content_hash(&rollup)?;
             let existing: Option<String> = self
                 .conn
@@ -678,6 +696,13 @@ fn resolve_title(
         }
     }
     (None, None)
+}
+
+/// A session with neither a project nor a title cannot be told apart from any
+/// other, so it is not kept. Cursor cloud agents are the case: the export names
+/// the agent by id only and records no project.
+fn session_rollup_is_identifiable(rollup: &SessionRollupV1) -> bool {
+    rollup.project.is_some() || rollup.title.is_some()
 }
 
 /// An event whose session identity is its own provider record belongs to no

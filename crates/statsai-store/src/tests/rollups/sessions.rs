@@ -4,10 +4,28 @@ use statsai_core::{
     TaskSpanId, TASK_SPAN_SCHEMA_VERSION,
 };
 
+/// Gives the event a session and a project. Sessions with neither a project
+/// nor a title are not kept, so tests of other behavior need one.
 fn stamp_session(event: &mut UsageEvent, raw_id: &str) {
     let hash = hash_text(raw_id);
     event.session.session_id = format!("session_{}", &hash[..24]);
     event.session.local_session_id_hash = Some(hash);
+    if event.project.is_none() {
+        event.project = Some(session_test_project());
+    }
+}
+
+fn session_test_project() -> ProjectInfo {
+    ProjectInfo {
+        project_id: "project-sessions".to_string(),
+        project_label: None,
+        repo_remote_hash: None,
+        repo_label: None,
+        branch_hash: None,
+        branch_label: None,
+        path_hash: Some("path-sessions".to_string()),
+        path_label: None,
+    }
 }
 
 fn message_runtime(user: u64, assistant: u64) -> RuntimeInfo {
@@ -629,4 +647,42 @@ fn session_backfill_resends_every_session_to_each_target() {
         .pending_session_rollups_for_sync("http", "https://api.example.test", &sessions)
         .expect("pending after backfill");
     assert_eq!(pending, sessions);
+
+    // The acknowledgement survives, so a session gone from the next snapshot
+    // is still retired on the target.
+    let snapshot = statsai_core::SyncAuthoritativeSnapshot {
+        session_rollup_ids: Some(Vec::new()),
+        ..statsai_core::SyncAuthoritativeSnapshot::default()
+    };
+    assert!(store
+        .sync_target_has_retired_entities("http", "https://api.example.test", &snapshot)
+        .expect("retired"));
+}
+
+#[test]
+fn sessions_without_project_or_title_are_not_kept() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "cursor",
+        "test",
+        "0",
+        Path::new("/tmp/session-unidentifiable"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 11, 9, 0, 0)
+        .single()
+        .expect("start");
+    let mut agent = test_store_event(&source, start, "agent");
+    stamp_session(&mut agent, "cursor_agent:agent-2");
+    agent.project = None;
+    store.insert_event(&agent).expect("agent");
+    assert!(store.dirty_session_rollups().expect("sessions").is_empty());
+
+    agent.session.title = Some("Upgrade the importer".to_string());
+    store.insert_event(&agent).expect("titled agent");
+    assert_eq!(store.dirty_session_rollups().expect("titled").len(), 1);
+
+    assert_eq!(store.rebuild_session_rollups().expect("rebuild"), 1);
 }
