@@ -609,6 +609,20 @@ impl Store {
     ) -> Result<EventDeletionImpact> {
         self.with_immediate_transaction(|| {
             let mut impact = EventDeletionImpact::default();
+            // A session can hold events from more than one source, so the
+            // sessions these events belong to are rebuilt from what remains
+            // rather than deleted by the source their newest event came from.
+            let mut session_ids = BTreeSet::new();
+            for source_id in source_ids {
+                let mut statement = self.conn.prepare(&format!(
+                    "SELECT DISTINCT {EVENT_SESSION_ID_SQL} FROM usage_events WHERE source_id = ?1"
+                ))?;
+                let rows = statement
+                    .query_map(params![&source_id.0], |row| row.get::<_, Option<String>>(0))?;
+                for row in rows {
+                    session_ids.extend(row?);
+                }
+            }
             for source_id in source_ids {
                 // `usage_events_source_idx` covers this, so naming the ids costs an
                 // index range read rather than a pass over the payloads.
@@ -629,7 +643,7 @@ impl Store {
                 )? as u64;
             }
             self.delete_sync_rollups_for_sources_in_tx(source_ids)?;
-            self.delete_session_rollups_for_sources_in_tx(source_ids)?;
+            self.refresh_session_rollups_for_keys(&session_ids)?;
             Ok(impact)
         })
     }

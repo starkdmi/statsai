@@ -909,3 +909,67 @@ fn a_later_event_without_a_project_keeps_the_sessions_project() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].project, Some(session_test_project()));
 }
+
+#[test]
+fn deleting_a_source_rebuilds_sessions_it_shared() {
+    let store = Store::in_memory().expect("store");
+    let older = SourceLocation::local_adapter(
+        "claude_code",
+        "test",
+        "0",
+        Path::new("/tmp/session-shared-older"),
+        LocationOrigin::Configured,
+    );
+    let newer = SourceLocation::local_adapter(
+        "claude_code",
+        "test",
+        "0",
+        Path::new("/tmp/session-shared-newer"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&older).expect("older source");
+    store.upsert_source(&newer).expect("newer source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 17, 9, 0, 0)
+        .single()
+        .expect("start");
+    for (source, record, at, tokens) in [
+        (&older, "older-event", start, 10),
+        (
+            &newer,
+            "newer-event",
+            start + chrono::Duration::minutes(5),
+            7,
+        ),
+    ] {
+        let mut event = test_store_event(source, at, record);
+        stamp_session(&mut event, "shared-session");
+        event.usage.total_tokens = Some(tokens);
+        store.insert_event(&event).expect("insert");
+    }
+    let total = |store: &Store| {
+        store
+            .all_session_rollups()
+            .expect("sessions")
+            .iter()
+            .map(|session| session.usage.computed_total())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(total(&store), vec![17]);
+
+    // The older source's tokens leave the session, which the newer one keeps.
+    store
+        .delete_events_for_sources(std::slice::from_ref(&older.source_id))
+        .expect("delete older");
+    assert_eq!(total(&store), vec![7]);
+
+    // And the other way round: the surviving events keep the session.
+    let mut again = test_store_event(&older, start, "older-again");
+    stamp_session(&mut again, "shared-session");
+    again.usage.total_tokens = Some(10);
+    store.insert_event(&again).expect("reinsert older");
+    store
+        .delete_events_for_sources(std::slice::from_ref(&newer.source_id))
+        .expect("delete newer");
+    assert_eq!(total(&store), vec![10]);
+}

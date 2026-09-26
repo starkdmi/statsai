@@ -17,9 +17,10 @@ pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v35"
 // session-metadata.v29: Claude events carry the session's custom or AI title
 // and the prompt that started their turn.
 pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v29";
-// activity-invocations.v20: session rows report their message count as requests and
-// are priced per message, so long-context tiers stop being decided session-wide.
-pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v20";
+// session-metadata.v21: events carry each session's user and assistant message
+// counts. (v20: session rows report their message count as requests and are
+// priced per message, so long-context tiers stop being decided session-wide.)
+pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v21";
 // Revisit Grok sessions whose Fast request was left unpriced because modelsUsed
 // also retained a selected standard model that made no inference.
 pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "grok-fast-pricing.v23";

@@ -297,20 +297,6 @@ impl Store {
         Ok(updated)
     }
 
-    pub(crate) fn delete_session_rollups_for_sources_in_tx(
-        &self,
-        source_ids: &[statsai_core::SourceId],
-    ) -> Result<u64> {
-        let mut deleted = 0u64;
-        for source_id in source_ids {
-            deleted += self.conn.execute(
-                "DELETE FROM session_rollups WHERE source_id = ?1",
-                params![&source_id.0],
-            )? as u64;
-        }
-        Ok(deleted)
-    }
-
     pub fn session_rollups_in_period(
         &self,
         since: Option<DateTime<Utc>>,
