@@ -83,8 +83,8 @@ fn print_sessions_table(view: &SessionsView) {
             .unwrap_or_else(|| "unknown".to_string())
     );
     println!(
-        "median duration: {}",
-        format_duration(stats.median_duration_seconds)
+        "median active time: {}",
+        format_duration(stats.median_active_seconds)
     );
     println!("messages: {}", format_u64(stats.total_messages));
     println!(
@@ -97,7 +97,7 @@ fn print_sessions_table(view: &SessionsView) {
     );
     println!();
     println!(
-        "{:<16} {:<12} {:<18} {:<24} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "{:<16} {:<12} {:<18} {:<24} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "started",
         "provider",
         "model",
@@ -107,11 +107,12 @@ fn print_sessions_table(view: &SessionsView) {
         "output",
         "total",
         "est_cost",
-        "duration"
+        "active",
+        "span"
     );
     for session in &view.sessions {
         println!(
-            "{:<16} {:<12} {:<18} {:<24} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "{:<16} {:<12} {:<18} {:<24} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
             session.started_at.format("%Y-%m-%d %H:%M"),
             truncate_label(&session.provider, 12),
             truncate_label(session.primary_model.as_deref().unwrap_or("unknown"), 18),
@@ -129,19 +130,24 @@ fn print_sessions_table(view: &SessionsView) {
                     .estimated_micro_usd()
                     .map(micro_usd_to_cents_rounded)
             ),
+            format_duration(session.active_seconds),
             format_duration(session.duration_seconds)
         );
     }
 }
 
-fn format_duration(seconds: Option<u64>) -> String {
+pub(crate) fn format_duration(seconds: Option<u64>) -> String {
     let Some(seconds) = seconds else {
         return "unknown".to_string();
     };
+    let days = seconds / 86_400;
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
     let secs = seconds % 60;
-    if hours > 0 {
+    // Past two days, hours stop being readable: "20d 18h", not "498h 15m".
+    if hours >= 48 {
+        format!("{days}d {:02}h", hours % 24)
+    } else if hours > 0 {
         format!("{hours}h {minutes:02}m")
     } else if minutes > 0 {
         format!("{minutes}m {secs:02}s")

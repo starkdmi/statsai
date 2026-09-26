@@ -360,6 +360,7 @@ fn loopback_session(device_id: &str) -> statsai_core::SessionRollupV1 {
         started_at: now,
         ended_at: now,
         duration_seconds: Some(1),
+        active_seconds: None,
         usage: UsageCounts::default(),
         requests: 1,
         cost: statsai_core::CostInfo {

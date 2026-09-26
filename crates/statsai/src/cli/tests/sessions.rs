@@ -98,3 +98,13 @@ fn sessions_view_reads_rollups_for_the_default_week() {
         Some(statsai_core::SessionTitleSource::Event)
     );
 }
+
+#[test]
+fn session_durations_switch_to_days_past_two_days() {
+    use crate::cli::sessions::format_duration;
+    assert_eq!(format_duration(None), "unknown");
+    assert_eq!(format_duration(Some(45)), "45s");
+    assert_eq!(format_duration(Some(3 * 60 + 5)), "3m 05s");
+    assert_eq!(format_duration(Some(47 * 3600 + 59 * 60)), "47h 59m");
+    assert_eq!(format_duration(Some(498 * 3600 + 15 * 60)), "20d 18h");
+}

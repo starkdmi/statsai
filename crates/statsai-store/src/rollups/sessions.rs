@@ -47,6 +47,7 @@ pub struct SessionStats {
     pub median_tokens: Option<u64>,
     pub avg_messages: Option<f64>,
     pub median_duration_seconds: Option<u64>,
+    pub median_active_seconds: Option<u64>,
     pub total_messages: u64,
     pub top_model: Option<String>,
 }
@@ -594,9 +595,17 @@ pub(crate) fn build_session_rollup(
         entry.1.add(&event.usage, requests, &event.cost);
     }
 
+    // A turn starts at its prompt, which can precede the turn's first event.
     let started_at = events
         .iter()
-        .map(|event| event.session.started_at)
+        .map(|event| {
+            event
+                .session
+                .turn_started_at
+                .map_or(event.session.started_at, |turn| {
+                    turn.min(event.session.started_at)
+                })
+        })
         .min()
         .unwrap_or(oldest.session.started_at);
     let mut ended_at = events
@@ -624,6 +633,7 @@ pub(crate) fn build_session_rollup(
     } else {
         None
     };
+    let active_seconds = session_active_seconds(events);
     let provider_account_id = events
         .iter()
         .rev()
@@ -647,6 +657,7 @@ pub(crate) fn build_session_rollup(
         started_at,
         ended_at,
         duration_seconds,
+        active_seconds,
         usage: totals.into_counts(),
         requests,
         cost: CostInfo {
@@ -676,6 +687,43 @@ pub(crate) fn build_session_rollup(
         title_source,
         updated_at,
     }
+}
+
+/// Time the agent was working: the union of the intervals the provider
+/// recorded for its turns. Codex records a turn's start and completion,
+/// OpenCode each message's, and Claude Code events carry the prompt that
+/// started their turn. Gaps between turns are idle and do not count; nothing
+/// here guesses where a session went idle.
+///
+/// An event that aggregates a whole session (OpenCode's `sqlite:session`
+/// fallback) carries the session's lifetime, which is a span, not a turn.
+fn session_active_seconds(events: &[UsageEvent]) -> Option<u64> {
+    let mut intervals = events
+        .iter()
+        .filter(|event| !event.source.source_type.ends_with(":session"))
+        .filter_map(|event| {
+            let session = &event.session;
+            let (start, end) = match session.turn_started_at {
+                Some(turn) => (turn, session.ended_at.unwrap_or(session.started_at)),
+                None => (session.started_at, session.ended_at?),
+            };
+            (end >= start).then_some((start, end))
+        })
+        .collect::<Vec<_>>();
+    intervals.sort();
+    let mut intervals = intervals.into_iter();
+    let (mut start, mut end) = intervals.next()?;
+    let mut total = chrono::Duration::zero();
+    for (next_start, next_end) in intervals {
+        if next_start <= end {
+            end = end.max(next_end);
+        } else {
+            total += end - start;
+            (start, end) = (next_start, next_end);
+        }
+    }
+    total += end - start;
+    u64::try_from(total.num_seconds()).ok()
 }
 
 fn resolve_title(
@@ -803,10 +851,11 @@ fn sort_sessions(sessions: &mut [SessionRollupV1], sort: SessionSort) {
                 .estimated_micro_usd()
                 .unwrap_or(0)
                 .cmp(&left.cost.estimated_micro_usd().unwrap_or(0)),
+            // Active time: a thread resumed weeks later is not a long session.
             SessionSort::Duration => right
-                .duration_seconds
+                .active_seconds
                 .unwrap_or(0)
-                .cmp(&left.duration_seconds.unwrap_or(0)),
+                .cmp(&left.active_seconds.unwrap_or(0)),
             SessionSort::Messages => right
                 .total_messages
                 .unwrap_or(0)
@@ -844,6 +893,10 @@ fn session_stats(rollups: &[SessionRollupV1]) -> SessionStats {
         .iter()
         .filter_map(|rollup| rollup.duration_seconds)
         .collect::<Vec<_>>();
+    let mut active = rollups
+        .iter()
+        .filter_map(|rollup| rollup.active_seconds)
+        .collect::<Vec<_>>();
     let mut model_tokens: BTreeMap<&str, u64> = BTreeMap::new();
     for rollup in rollups {
         if let Some(model) = rollup.primary_model.as_deref() {
@@ -864,6 +917,7 @@ fn session_stats(rollups: &[SessionRollupV1]) -> SessionStats {
         median_tokens,
         avg_messages,
         median_duration_seconds: median_u64(&mut durations),
+        median_active_seconds: median_u64(&mut active),
         total_messages,
         top_model,
     }

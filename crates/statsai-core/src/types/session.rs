@@ -31,9 +31,15 @@ pub struct SessionRollupV1 {
     pub provider_account_id: Option<ProviderAccountId>,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
+    /// Wall-clock span from the first event to the last, idle time included.
     /// `None` when the session recorded only a start. Unknown durations go out
     /// as null; ingest stores them without an end so they stay out of medians.
     pub duration_seconds: Option<u64>,
+    /// Time the agent was working: the union of its turns, each from the prompt
+    /// until the agent's last message, as the provider recorded them. Idle time
+    /// between turns does not count. `None` when no turn times were recorded.
+    #[serde(default)]
+    pub active_seconds: Option<u64>,
     /// Closed usage object. Cache-lifetime splits stay local; the ingest allowlist
     /// does not include them.
     #[serde(with = "session_usage_serde")]

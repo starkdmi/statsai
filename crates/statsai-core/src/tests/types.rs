@@ -80,6 +80,7 @@ fn session_rollup_uses_snake_case_contract() {
         started_at: started,
         ended_at: started,
         duration_seconds: Some(0),
+        active_seconds: None,
         usage: UsageCounts::default(),
         requests: 1,
         cost: CostInfo {
@@ -114,6 +115,7 @@ fn session_rollup_uses_snake_case_contract() {
         "started_at",
         "ended_at",
         "duration_seconds",
+        "active_seconds",
         "usage",
         "requests",
         "cost",
@@ -158,6 +160,7 @@ fn session_rollup_unknown_duration_serializes_as_null() {
         started_at: started,
         ended_at: started,
         duration_seconds: None,
+        active_seconds: None,
         usage: UsageCounts::default(),
         requests: 0,
         cost: CostInfo {
@@ -622,6 +625,7 @@ fn sample_session_rollup(started: DateTime<Utc>) -> SessionRollupV1 {
         started_at: started,
         ended_at: started,
         duration_seconds: Some(0),
+        active_seconds: None,
         usage: UsageCounts::default(),
         requests: 1,
         cost: CostInfo {
@@ -809,6 +813,7 @@ fn sanitized_session_rollup_uses_ingest_allowlist() {
             "started_at",
             "ended_at",
             "duration_seconds",
+            "active_seconds",
             "usage",
             "requests",
             "cost",

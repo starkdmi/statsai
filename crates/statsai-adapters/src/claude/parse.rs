@@ -49,6 +49,7 @@ pub(crate) fn parse_claude_file(
     // Later snapshots of one provider record replace the event. User lines
     // counted on the first snapshot have to ride along with that replacement.
     let mut last_usage_users = HashMap::<String, (String, u64)>::new();
+    let mut turn_started_at = HashMap::<String, chrono::DateTime<Utc>>::new();
     loop {
         let line_status =
             read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
@@ -86,6 +87,11 @@ pub(crate) fn parse_claude_file(
         if let Some((rank, title)) = claude_session_title_from_value(&value) {
             session_titles.remember(session_raw, rank, title);
             continue;
+        }
+        if claude_record_is_prompt(&value) {
+            if let Some(prompted_at) = timestamp_from_nested_value(&value) {
+                turn_started_at.insert(session_raw.clone(), prompted_at);
+            }
         }
         let Some(usage_value) = value
             .pointer("/message/usage")
@@ -157,7 +163,8 @@ pub(crate) fn parse_claude_file(
                 )
             },
         );
-        let event = usage_event(
+        let prompted_at = turn_started_at.get(&session_raw).copied();
+        let mut event = usage_event(
             ctx.adapter,
             ctx.source,
             ctx.options,
@@ -181,6 +188,7 @@ pub(crate) fn parse_claude_file(
                 dedupe_salt: None,
             },
         );
+        event.session.turn_started_at = prompted_at.filter(|prompted_at| *prompted_at <= timestamp);
         push_deduped(ctx.scan, ctx.seen, event, duplicate_selection);
     }
 
@@ -258,6 +266,29 @@ fn claude_session_raw(value: &Value, path: &Path) -> String {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| fallback_session_id(path))
+}
+
+/// A prompt starts a turn: typed text, an image, or a slash command. Tool
+/// results arrive as `user` records too, but they continue the turn, as do
+/// meta records and compaction summaries.
+fn claude_record_is_prompt(value: &Value) -> bool {
+    if !claude_record_is_user(value)
+        || value.get("toolUseResult").is_some()
+        || value.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
+    }
+    match value.pointer("/message/content") {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(blocks)) => blocks.iter().any(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("text" | "image")
+            )
+        }),
+        _ => false,
+    }
 }
 
 fn claude_record_is_user(value: &Value) -> bool {

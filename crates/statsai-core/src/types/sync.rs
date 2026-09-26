@@ -311,6 +311,9 @@ fn clamp_session_timestamps(rollup: &mut SessionRollupV1) {
         rollup.ended_at = rollup.started_at;
     }
     rollup.updated_at = clamp_sync_timestamp(rollup.updated_at, latest, fallback);
+    rollup.active_seconds = rollup
+        .active_seconds
+        .map(|value| value.min(SYNC_SAFE_INT_MAX));
     // An unknown duration stays unknown; clamped timestamps must not turn it
     // into a measured zero.
     if rollup.duration_seconds.is_none() {
@@ -323,6 +326,10 @@ fn clamp_session_timestamps(rollup: &mut SessionRollupV1) {
     rollup.duration_seconds = u64::try_from(seconds)
         .ok()
         .map(|value| value.min(SYNC_SAFE_INT_MAX));
+    // Active time is a part of the span, so repaired timestamps bound it too.
+    if let (Some(active), Some(span)) = (rollup.active_seconds, rollup.duration_seconds) {
+        rollup.active_seconds = Some(active.min(span));
+    }
 }
 
 fn sync_timestamp_ok(value: DateTime<Utc>, latest: DateTime<Utc>) -> bool {

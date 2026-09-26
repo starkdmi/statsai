@@ -686,3 +686,106 @@ fn sessions_without_project_or_title_are_not_kept() {
 
     assert_eq!(store.rebuild_session_rollups().expect("rebuild"), 1);
 }
+
+#[test]
+fn active_time_counts_turns_and_skips_idle_gaps() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "claude_code",
+        "test",
+        "0",
+        Path::new("/tmp/session-active"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let at = |hour: u32, minute: u32| {
+        Utc.with_ymd_and_hms(2026, 6, 12, hour, minute, 0)
+            .single()
+            .expect("time")
+    };
+    // Two turns of a Claude-style session, the second resumed hours later:
+    // each event carries the prompt that started its turn.
+    for (record, prompt, message) in [
+        ("first-a", at(10, 0), at(10, 1)),
+        ("first-b", at(10, 0), at(10, 5)),
+        ("second", at(14, 0), at(14, 2)),
+    ] {
+        let mut event = test_store_event(&source, message, record);
+        stamp_session(&mut event, "active-session");
+        event.created_at = message;
+        event.session.turn_started_at = Some(prompt);
+        store.insert_event(&event).expect("insert");
+    }
+
+    let sessions = store.dirty_session_rollups().expect("sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].started_at, at(10, 0));
+    // Wall-clock span keeps the idle afternoon; active time does not.
+    assert_eq!(sessions[0].duration_seconds, Some(4 * 3600 + 2 * 60));
+    assert_eq!(sessions[0].active_seconds, Some(7 * 60));
+}
+
+#[test]
+fn active_time_merges_overlapping_turn_intervals() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-active-overlap"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let at = |minute: u32| {
+        Utc.with_ymd_and_hms(2026, 6, 13, 9, minute, 0)
+            .single()
+            .expect("time")
+    };
+    // Codex-style turns carry their own start and completion. A record
+    // without an interval adds nothing.
+    for (record, start, end) in [
+        ("turn-a", at(0), Some(at(10))),
+        ("turn-b", at(5), Some(at(12))),
+        ("turn-c", at(30), Some(at(31))),
+        ("record", at(40), None),
+    ] {
+        let mut event = test_store_event(&source, start, record);
+        stamp_session(&mut event, "overlap-session");
+        event.created_at = end.unwrap_or(start);
+        event.session.ended_at = end;
+        store.insert_event(&event).expect("insert");
+    }
+
+    let sessions = store.dirty_session_rollups().expect("sessions");
+    assert_eq!(sessions[0].active_seconds, Some(13 * 60));
+    assert_eq!(sessions[0].duration_seconds, Some(40 * 60));
+}
+
+#[test]
+fn session_aggregate_events_do_not_count_as_active_time() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "opencode",
+        "test",
+        "0",
+        Path::new("/tmp/session-aggregate"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 14, 9, 0, 0)
+        .single()
+        .expect("start");
+    let end = start + chrono::Duration::days(3);
+    let mut aggregate = test_store_event(&source, end, "aggregate");
+    stamp_session(&mut aggregate, "aggregate-session");
+    aggregate.source.source_type = "sqlite:session".to_string();
+    aggregate.session.started_at = start;
+    aggregate.session.ended_at = Some(end);
+    aggregate.created_at = end;
+    store.insert_event(&aggregate).expect("insert");
+
+    let sessions = store.dirty_session_rollups().expect("sessions");
+    assert_eq!(sessions[0].duration_seconds, Some(3 * 86_400));
+    assert_eq!(sessions[0].active_seconds, None);
+}

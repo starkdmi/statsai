@@ -831,6 +831,7 @@ mod tests {
                 started_at: Utc::now(),
                 ended_at: None,
                 duration_seconds: None,
+                turn_started_at: None,
             },
             model: None,
             usage: statsai_core::UsageCounts::default(),

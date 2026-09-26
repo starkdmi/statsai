@@ -381,6 +381,7 @@ pub(crate) fn usage_event<A: ProviderAdapter + ?Sized>(
             started_at: session_started_at,
             ended_at: parts.session_ended_at,
             duration_seconds: parts.duration_seconds,
+            turn_started_at: None,
         },
         model: parts.model,
         runtime: parts.runtime,

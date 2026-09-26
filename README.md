@@ -165,8 +165,10 @@ with `statsai sync --include-tasks`, the current `sync_batch.v5` payload may
 include bounded conversation-derived task titles, summary previews, and todo
 excerpts. Hosted session sync is separate and off by default.
 `statsai sync --include-sessions` adds `sessions` rows to `sync_batch.v6`:
-hashed session ids, token and request totals, duration, message counts, and a
-bounded title. Titles come from the provider's own session name (Codex thread
+hashed session ids, token and request totals, active time and wall-clock span,
+message counts, and a bounded title. Active time is the union of the agent's
+turns, each from the prompt until its last message; idle time between turns is
+not counted. Titles come from the provider's own session name (Codex thread
 names, Claude Code and OpenCode session titles) or a local task title. Cursor's
 usage export names no session, so its local rows are not sessions, and a session
 with neither a project nor a title is not kept.

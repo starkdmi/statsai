@@ -60,6 +60,7 @@ fn test_event(
             started_at,
             ended_at: None,
             duration_seconds: None,
+            turn_started_at: None,
         },
         model: None,
         usage: UsageCounts {

@@ -1251,3 +1251,50 @@ fn claude_session_titles_reach_events_read_from_other_transcripts() {
         Some("Design tool/plugin")
     );
 }
+
+#[test]
+fn claude_events_carry_the_prompt_that_started_their_turn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session file");
+    for line in [
+        r#"{"type":"user","timestamp":"2026-05-01T10:00:00Z","sessionId":"turns","message":{"role":"user","content":"Fix the parser"}}"#,
+        r#"{"type":"assistant","timestamp":"2026-05-01T10:01:00Z","sessionId":"turns","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        r#"{"type":"user","timestamp":"2026-05-01T10:02:00Z","sessionId":"turns","toolUseResult":{},"message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#,
+        r#"{"type":"assistant","timestamp":"2026-05-01T10:03:00Z","sessionId":"turns","message":{"id":"m2","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        r#"{"type":"user","timestamp":"2026-05-01T15:00:00Z","sessionId":"turns","message":{"role":"user","content":[{"type":"text","text":"Now the tests"}]}}"#,
+        r#"{"type":"assistant","timestamp":"2026-05-01T15:04:00Z","sessionId":"turns","message":{"id":"m3","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+    ] {
+        writeln!(file, "{line}").expect("write line");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+    let mut turns = scan
+        .events
+        .iter()
+        .map(|event| {
+            (
+                event.session.started_at.to_rfc3339(),
+                event.session.turn_started_at.map(|at| at.to_rfc3339()),
+            )
+        })
+        .collect::<Vec<_>>();
+    turns.sort();
+    let prompt = |hour: &str| Some(format!("2026-05-01T{hour}:00:00+00:00"));
+    assert_eq!(
+        turns,
+        vec![
+            ("2026-05-01T10:01:00+00:00".to_string(), prompt("10")),
+            ("2026-05-01T10:03:00+00:00".to_string(), prompt("10")),
+            ("2026-05-01T15:04:00+00:00".to_string(), prompt("15")),
+        ]
+    );
+}

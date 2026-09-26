@@ -1502,6 +1502,14 @@
             "string",
             "null"
           ]
+        },
+        "turn_started_at": {
+          "description": "When the prompt that started this event's turn was sent, for providers that record one timestamp per message. The session's active time runs from here to the event.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
         }
       }
     },
@@ -1553,6 +1561,16 @@
         "usage"
       ],
       "properties": {
+        "active_seconds": {
+          "description": "Time the agent was working: the union of its turns, each from the prompt until the agent's last message, as the provider recorded them. Idle time between turns does not count. `None` when no turn times were recorded.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "assistant_messages": {
           "type": [
             "integer",
@@ -1581,7 +1599,7 @@
           "type": "string"
         },
         "duration_seconds": {
-          "description": "`None` when the session recorded only a start. Unknown durations go out as null; ingest stores them without an end so they stay out of medians.",
+          "description": "Wall-clock span from the first event to the last, idle time included. `None` when the session recorded only a start. Unknown durations go out as null; ingest stores them without an end so they stay out of medians.",
           "type": [
             "integer",
             "null"

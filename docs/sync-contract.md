@@ -27,8 +27,11 @@ The same batch schema carries opt-in `sessions` rows. Each row is
 `session_rollup.v1` with a closed key set: hashed session id, provider,
 source, account, time range, duration, usage, requests, cost, models, message
 counts, project, bounded title, and `title_source` (`event`, `task_span`, or
-`archive`). `duration_seconds` is null when a session recorded only a start;
-the backend must accept null before a collector sends it. Events keyed by their
+`archive`). `duration_seconds` is the wall-clock span and is null when a
+session recorded only a start; the backend must accept null before a collector
+sends it. `active_seconds` is the time the agent was working, the union of the
+turns the provider recorded, and is null when none were; collectors before it
+omit the key. Events keyed by their
 own provider record, such as Cursor's usage-export rows, belong to no session
 and are not sent, and neither is a session with no project and no title. Prompts, responses, paths, and raw provider session ids stay on
 the device. Session retirement is not implied by `sync_batch.v6`. A snapshot
