@@ -134,6 +134,7 @@ pub(crate) fn merge_adapter_scan(
         push_deduped(target, index, event, DuplicateSelection::KeepFirst);
     }
     target.summaries.append(&mut source.summaries);
+    target.session_names.append(&mut source.session_names);
     target.task_spans.append(&mut source.task_spans);
     target
         .quota_observations

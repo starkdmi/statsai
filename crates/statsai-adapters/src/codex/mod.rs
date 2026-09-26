@@ -148,6 +148,7 @@ pub(crate) fn scan_codex_source(
                 .map(|(session_id, title)| statsai_core::SessionName {
                     local_session_id_hash: hash_text(&session_id),
                     title,
+                    parent_local_session_id_hash: None,
                 }),
         );
     let mut indexed_candidates = Vec::new();

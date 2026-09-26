@@ -82,9 +82,10 @@ impl Store {
               span_id, provider, source_id, project_bucket, started_at, ended_at, title,
               normalized_title, is_meta, confidence, source_file_path_hash, event_count,
               has_usage_evidence, total_messages, user_messages, assistant_messages,
-              developer_messages, payload
+              developer_messages, payload, session_hash, session_uuid_hash
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                    ?19, ?20)
             ON CONFLICT(span_id) DO UPDATE SET
               provider = excluded.provider,
               source_id = excluded.source_id,
@@ -102,7 +103,9 @@ impl Store {
               user_messages = excluded.user_messages,
               assistant_messages = excluded.assistant_messages,
               developer_messages = excluded.developer_messages,
-              payload = excluded.payload
+              payload = excluded.payload,
+              session_hash = excluded.session_hash,
+              session_uuid_hash = excluded.session_uuid_hash
             "#,
         )?;
         let mut delete_links = self
@@ -117,6 +120,8 @@ impl Store {
         )?;
         for span in spans {
             let payload = serde_json::to_string(span)?;
+            let (session_hash, session_uuid_hash) =
+                crate::task_span_session_hashes(span.session_id.as_deref());
             changed += span_stmt.execute(params![
                 &span.span_id.0,
                 &span.provider,
@@ -136,6 +141,8 @@ impl Store {
                 safe_u64_to_i64(span.assistant_messages),
                 safe_u64_to_i64(span.developer_messages),
                 &payload,
+                session_hash,
+                session_uuid_hash,
             ])? as u64;
             delete_links.execute(params![&span.span_id.0])?;
             for event_id in &span.linked_event_ids {

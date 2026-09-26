@@ -54,11 +54,12 @@ pub(crate) fn codex_thread_titles_from_names(
 /// Codex never names its sub-agents. A spawned agent records its parent
 /// thread, and a guardian review carries the parent's id as `session_id`, so
 /// both borrow the parent's name, marked with the agent's nickname or kind.
-pub(crate) fn codex_subagent_session_title(
+/// The name is joined when the session is built, so a parent rename reaches
+/// its sub-agents without re-reading their rollouts.
+pub(crate) fn codex_subagent_session_name(
     value: &Value,
     session_id: &str,
-    thread_titles: &HashMap<String, String>,
-) -> Option<String> {
+) -> Option<statsai_core::SessionName> {
     let payload = value.get("payload")?;
     let subagent = payload.pointer("/source/subagent")?;
     let (parent, label) = if let Some(spawn) = subagent.get("thread_spawn") {
@@ -81,8 +82,11 @@ pub(crate) fn codex_subagent_session_title(
             .unwrap_or("sub-agent");
         (parent, label)
     };
-    let parent_title = thread_titles.get(parent)?;
-    statsai_core::provider_session_name(Some(&format!("{parent_title} · {label}")), 90)
+    Some(statsai_core::SessionName {
+        local_session_id_hash: hash_text(session_id),
+        title: statsai_core::provider_session_name(Some(label), 40)?,
+        parent_local_session_id_hash: Some(hash_text(parent)),
+    })
 }
 
 pub(crate) fn codex_project_context_from_value(

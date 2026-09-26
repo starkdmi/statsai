@@ -6,10 +6,10 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 use statsai_core::{
-    hash_text, project_has_stable_identity, provider_session_title_is_unusable,
-    task_title_is_generic, Confidence, CostAccumulator, CostInfo, ModelInfo, SessionName,
-    SessionRollupV1, SessionTitleSource, SummaryModelUsage, UsageCounts, UsageEvent,
-    SESSION_ROLLUP_SCHEMA_VERSION,
+    hash_text, project_has_stable_identity, provider_session_name,
+    provider_session_title_is_unusable, task_title_is_generic, Confidence, CostAccumulator,
+    CostInfo, ModelInfo, SessionName, SessionRollupV1, SessionTitleSource, SummaryModelUsage,
+    UsageCounts, UsageEvent, SESSION_ROLLUP_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -189,7 +189,8 @@ impl Store {
     }
 
     /// Records the names providers hold for sessions and refreshes the sessions
-    /// whose name changed. Unchanged names write nothing.
+    /// whose name changed, with the sub-agents that borrow it. Unchanged names
+    /// write nothing. A session's own name is never replaced by a borrowed one.
     pub fn upsert_session_names(&self, names: &[SessionName]) -> Result<u64> {
         if names.is_empty() {
             return Ok(0);
@@ -198,19 +199,39 @@ impl Store {
         {
             let mut statement = self.conn.prepare(
                 r#"
-                INSERT INTO session_names (local_session_id_hash, title, updated_at)
-                VALUES (?1, ?2, ?3)
+                INSERT INTO session_names (local_session_id_hash, title, parent_hash, updated_at)
+                VALUES (?1, ?2, ?3, ?4)
                 ON CONFLICT(local_session_id_hash) DO UPDATE SET
                   title = excluded.title,
+                  parent_hash = excluded.parent_hash,
                   updated_at = excluded.updated_at
-                WHERE session_names.title IS NOT excluded.title
+                WHERE (session_names.title IS NOT excluded.title
+                       OR session_names.parent_hash IS NOT excluded.parent_hash)
+                  AND (excluded.parent_hash IS NULL OR session_names.parent_hash IS NOT NULL)
                 "#,
             )?;
             let now = Utc::now().to_rfc3339();
             for name in names {
-                if statement.execute(params![&name.local_session_id_hash, &name.title, &now])? > 0 {
+                if statement.execute(params![
+                    &name.local_session_id_hash,
+                    &name.title,
+                    &name.parent_local_session_id_hash,
+                    &now
+                ])? > 0
+                {
                     changed_hashes.push(name.local_session_id_hash.clone());
                 }
+            }
+        }
+        for chunk in changed_hashes.clone().chunks(500) {
+            let placeholders = sqlite_in_clause_placeholders(chunk.len());
+            let mut statement = self.conn.prepare(&format!(
+                "SELECT local_session_id_hash FROM session_names WHERE parent_hash IN ({placeholders})"
+            ))?;
+            let params = sqlite_string_params(chunk);
+            let rows = statement.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                changed_hashes.push(row?);
             }
         }
         let session_ids = self.session_ids_for_local_hashes(&changed_hashes)?;
@@ -455,83 +476,108 @@ impl Store {
         &self,
         hashes: &[String],
     ) -> Result<BTreeMap<String, (String, SessionTitleSource)>> {
-        let wanted = hashes.iter().map(String::as_str).collect::<BTreeSet<_>>();
-        if wanted.is_empty() {
-            return Ok(BTreeMap::new());
-        }
+        let wanted = hashes
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut titles = BTreeMap::new();
-        let mut archive = self.conn.prepare(
-            "SELECT native_conversation_id, title
-             FROM archive_conversations
-             WHERE title IS NOT NULL
-             ORDER BY updated_at, conversation_id",
-        )?;
-        let archive_rows = archive.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
-        for row in archive_rows {
-            let (native_id, title) = row?;
-            remember_hashed_title(
+        if wanted.is_empty() {
+            return Ok(titles);
+        }
+        // Rows are gathered across chunks and then ordered, so the latest title
+        // wins no matter which chunk held it.
+        let mut archive_rows = Vec::new();
+        let mut span_rows = Vec::new();
+        let mut name_rows = Vec::new();
+        for chunk in wanted.chunks(300) {
+            let placeholders = sqlite_in_clause_placeholders(chunk.len());
+            let params = chunk
+                .iter()
+                .map(|hash| hash as &dyn rusqlite::types::ToSql)
+                .collect::<Vec<_>>();
+            let mut archive = self.conn.prepare(&format!(
+                "SELECT updated_at, conversation_id, session_hash, title
+                 FROM archive_conversations
+                 WHERE session_hash IN ({placeholders}) AND title IS NOT NULL"
+            ))?;
+            for row in archive.query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })? {
+                archive_rows.push(row?);
+            }
+            // A Codex span may name its session by rollout path; the events
+            // carry the thread id inside it.
+            let mut spans = self.conn.prepare(&format!(
+                "SELECT started_at, span_id,
+                        CASE WHEN session_hash IN ({placeholders}) THEN session_hash
+                             ELSE session_uuid_hash END,
+                        title
+                 FROM task_spans
+                 WHERE is_meta = 0
+                   AND (session_hash IN ({placeholders})
+                        OR session_uuid_hash IN ({placeholders}))"
+            ))?;
+            let mut span_params = params.clone();
+            span_params.extend(params.iter().copied());
+            span_params.extend(params.iter().copied());
+            for row in spans.query_map(span_params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })? {
+                span_rows.push(row?);
+            }
+            // A borrowed name reads the parent's own name as it is now.
+            let mut names = self.conn.prepare(&format!(
+                "SELECT child.local_session_id_hash,
+                        CASE WHEN child.parent_hash IS NULL THEN child.title
+                             WHEN parent.title IS NOT NULL
+                               THEN parent.title || ' · ' || child.title
+                        END
+                 FROM session_names child
+                 LEFT JOIN session_names parent
+                   ON parent.local_session_id_hash = child.parent_hash
+                  AND parent.parent_hash IS NULL
+                 WHERE child.local_session_id_hash IN ({placeholders})"
+            ))?;
+            for row in names.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })? {
+                name_rows.push(row?);
+            }
+        }
+        archive_rows.sort();
+        for (_, _, hash, title) in archive_rows {
+            remember_session_title(&mut titles, hash, Some(&title), SessionTitleSource::Archive);
+        }
+        span_rows.sort();
+        for (_, _, hash, title) in span_rows {
+            remember_session_title(
                 &mut titles,
-                &wanted,
-                &native_id,
+                hash,
                 title.as_deref(),
-                SessionTitleSource::Archive,
+                SessionTitleSource::TaskSpan,
             );
         }
-        drop(archive);
-
-        let mut spans = self.conn.prepare(
-            "SELECT json_extract(payload, '$.session_id'),
-                    json_extract(payload, '$.title'),
-                    json_extract(payload, '$.is_meta')
-             FROM task_spans
-             ORDER BY started_at, span_id",
-        )?;
-        let span_rows = spans.query_map([], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-            ))
-        })?;
-        for row in span_rows {
-            let (session_id, title, is_meta) = row?;
-            if is_meta.unwrap_or(0) != 0 {
-                continue;
-            }
-            let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
-                continue;
-            };
-            let raw_ids =
-                std::iter::once(session_id.as_str()).chain(codex_rollout_session_uuid(&session_id));
-            for raw_id in raw_ids {
-                remember_hashed_title(
-                    &mut titles,
-                    &wanted,
-                    raw_id,
-                    title.as_deref(),
-                    SessionTitleSource::TaskSpan,
-                );
-            }
-        }
-        drop(spans);
-
         // A provider-held name outranks task and archive titles for its session.
-        let mut names = self
-            .conn
-            .prepare("SELECT local_session_id_hash, title FROM session_names")?;
-        let name_rows = names.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in name_rows {
-            let (hash, title) = row?;
-            if !wanted.contains(hash.as_str()) {
-                continue;
-            }
-            if let Some(title) = acceptable_session_title(Some(&title), SessionTitleSource::Event) {
-                titles.insert(hash, (title, SessionTitleSource::Event));
-            }
+        for (hash, title) in name_rows {
+            let title = provider_session_name(title.as_deref(), 90);
+            remember_session_title(
+                &mut titles,
+                hash,
+                title.as_deref(),
+                SessionTitleSource::Event,
+            );
         }
         Ok(titles)
     }
@@ -858,21 +904,29 @@ fn acceptable_session_title(value: Option<&str>, source: SessionTitleSource) -> 
     (!trimmed.is_empty() && !rejected).then(|| trimmed.to_string())
 }
 
-fn remember_hashed_title(
+fn remember_session_title(
     titles: &mut BTreeMap<String, (String, SessionTitleSource)>,
-    wanted: &BTreeSet<&str>,
-    raw_id: &str,
+    hash: String,
     title: Option<&str>,
     source: SessionTitleSource,
 ) {
-    let Some(title) = acceptable_session_title(title, source) else {
-        return;
-    };
-    let hash = hash_text(raw_id);
-    if !wanted.contains(hash.as_str()) {
-        return;
+    if let Some(title) = acceptable_session_title(title, source) {
+        titles.insert(hash, (title, source));
     }
-    titles.insert(hash, (title, source));
+}
+
+/// The hashed keys a task span's session is looked up by: its session id, and
+/// for a Codex rollout path, the thread id inside it.
+pub(crate) fn task_span_session_hashes(
+    session_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
+        return (None, None);
+    };
+    (
+        Some(hash_text(session_id)),
+        codex_rollout_session_uuid(session_id).map(hash_text),
+    )
 }
 
 fn session_rollup_content_hash(rollup: &SessionRollupV1) -> Result<String> {

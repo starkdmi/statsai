@@ -483,6 +483,8 @@ impl Store {
             &current_account_evidence_summaries,
         )?;
         let current_snapshot = self.current_http_sync_authoritative_snapshot(
+            target,
+            include_projects,
             &current_rollups,
             &current_passthrough_summaries,
             &current_code_change_metrics,
@@ -525,8 +527,11 @@ impl Store {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn current_http_sync_authoritative_snapshot(
         &self,
+        target: &str,
+        include_projects: bool,
         rollups: &[UsageSummary],
         passthrough_summaries: &[UsageSummary],
         code_change_metrics: &[CodeChangeMetric],
@@ -586,11 +591,45 @@ impl Store {
                 .into_iter()
                 .map(|coverage| coverage.coverage_id)
                 .collect(),
-            session_rollup_ids: if self.sync_preferences()?.include_sessions {
-                Some(self.session_rollup_ids()?)
-            } else {
-                None
-            },
+            session_rollup_ids: self.authoritative_session_rollup_ids(
+                "http",
+                target,
+                self.sync_preferences()?.include_sessions,
+                include_projects,
+                || self.session_rollup_ids(),
+            )?,
         })
+    }
+
+    /// The session ids an authoritative snapshot names for a target.
+    ///
+    /// With session sync on, every local session. With projects excluded, an
+    /// empty list while the target still holds sessions from this device: each
+    /// carries its project, path, repository and branch, so excluding projects
+    /// retires them. With only session sync off, nothing, and hosted sessions
+    /// stay until it is turned back on.
+    pub fn authoritative_session_rollup_ids(
+        &self,
+        sink: &str,
+        target: &str,
+        include_sessions: bool,
+        include_projects: bool,
+        session_ids: impl FnOnce() -> Result<Vec<String>>,
+    ) -> Result<Option<Vec<String>>> {
+        if include_sessions {
+            return session_ids().map(Some);
+        }
+        if include_projects {
+            return Ok(None);
+        }
+        let tracked = self.conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM entity_sync_state
+               WHERE sink = ?1 AND target = ?2 AND entity_kind = 'session_rollup'
+             )",
+            params![sink, target],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(tracked.then(Vec::new))
     }
 }

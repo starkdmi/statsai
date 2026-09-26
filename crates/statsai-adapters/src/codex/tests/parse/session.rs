@@ -458,25 +458,25 @@ fn codex_subagents_borrow_their_parent_thread_name() {
         LocationOrigin::Configured,
     );
     let scan = scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
-    let title_for = |raw: &str| {
+    // The parent's name is joined when the session is built, so a rename of
+    // the parent reaches its sub-agents; here only the link is reported.
+    let link_for = |raw: &str| {
         let hash = statsai_core::hash_text(raw);
-        scan.events
+        scan.session_names
             .iter()
-            .find(|event| event.session.local_session_id_hash.as_deref() == Some(hash.as_str()))
-            .expect("event")
-            .session
-            .title
-            .clone()
+            .find(|name| name.local_session_id_hash == hash)
+            .cloned()
     };
+    let parent = Some(statsai_core::hash_text("parent-1"));
     assert_eq!(
-        title_for("child-spawned").as_deref(),
-        Some("Fix parser bug · Popper")
+        link_for("child-spawned").map(|name| (name.title, name.parent_local_session_id_hash)),
+        Some(("Popper".to_string(), parent.clone()))
     );
     assert_eq!(
-        title_for("child-guardian").as_deref(),
-        Some("Fix parser bug · guardian")
+        link_for("child-guardian").map(|name| (name.title, name.parent_local_session_id_hash)),
+        Some(("guardian".to_string(), parent))
     );
-    assert_eq!(title_for("child-orphan"), None);
+    assert_eq!(link_for("child-orphan"), None);
 }
 
 #[test]
@@ -536,6 +536,7 @@ fn codex_session_index_names_are_reported_on_every_scan() {
         vec![statsai_core::SessionName {
             local_session_id_hash: statsai_core::hash_text("thread-1"),
             title: "Design tool/plugin".to_string(),
+            parent_local_session_id_hash: None,
         }]
     );
 }

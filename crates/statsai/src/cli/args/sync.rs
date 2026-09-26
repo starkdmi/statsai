@@ -56,7 +56,7 @@ pub(crate) struct SyncCommand {
     #[arg(
         long,
         conflicts_with_all = ["include_projects", "include_tasks", "include_sessions"],
-        help = "Disable project metadata sync for this device and future syncs"
+        help = "Disable project metadata sync for this device and future syncs; hosted sessions are retired"
     )]
     pub(crate) exclude_projects: bool,
     #[arg(

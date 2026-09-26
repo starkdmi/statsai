@@ -350,12 +350,18 @@ pub(crate) fn build_sync_batch_with_identity_key(
                 .iter()
                 .map(|coverage| coverage.coverage_id.clone())
                 .collect(),
-            session_rollup_ids: sync_preferences.include_sessions.then(|| {
-                all_sessions
-                    .iter()
-                    .map(|rollup| rollup.session_id.clone())
-                    .collect()
-            }),
+            session_rollup_ids: store.authoritative_session_rollup_ids(
+                &command.sink,
+                target,
+                sync_preferences.include_sessions,
+                include_projects,
+                || {
+                    Ok(all_sessions
+                        .iter()
+                        .map(|rollup| rollup.session_id.clone())
+                        .collect())
+                },
+            )?,
         };
         let failed_without_resume = state.as_ref().is_some_and(|state| {
             state.failure_count > 0 && state.pending_resume_batch_id.is_none()

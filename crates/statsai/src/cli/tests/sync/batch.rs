@@ -2133,3 +2133,70 @@ fn activity_sync_payload_omits_paths_commands_and_invocation_ids() {
     assert!(excluded.get("activity_rollups").is_none());
     assert!(excluded.get("activity_coverage").is_none());
 }
+
+#[test]
+fn excluding_projects_retires_hosted_sessions_and_excluding_sessions_keeps_them() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-sessions-exclude-projects"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    store
+        .insert_event(&test_event(
+            "codex",
+            &source,
+            Utc::now(),
+            None,
+            TokenParts::total(15),
+        ))
+        .expect("event");
+    let command = |exclude_projects: bool, exclude_sessions: bool| SyncCommand {
+        exclude_projects,
+        exclude_sessions,
+        dry_run: true,
+        endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+        ..test_sync_command("http")
+    };
+    let target = sync_target(&command(false, false)).expect("target");
+    let snapshot_session_ids = |command: &SyncCommand| {
+        build_sync_batch(command, &store, "device", &target)
+            .expect("batch")
+            .0
+            .authoritative_snapshot
+            .and_then(|snapshot| snapshot.session_rollup_ids)
+    };
+
+    // Nothing hosted yet: excluding projects has no sessions to retire.
+    assert_eq!(snapshot_session_ids(&command(true, false)), None);
+
+    let now = Utc
+        .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+        .single()
+        .expect("date");
+    let mut synced = test_task_only_sync_batch(now, 0, 0);
+    synced.batch_id = "batch_sessions".to_string();
+    synced.sessions = test_session_rollups(2);
+    let logical_batch_id = logical_http_rollup_batch_id(&synced.batch_id).to_string();
+    record_rollup_sync_chunk_success(&store, "http", &target, &logical_batch_id, &synced)
+        .expect("record synced sessions");
+
+    // Hosted sessions carry their project, so excluding projects retires them.
+    assert_eq!(
+        snapshot_session_ids(&command(true, false)),
+        Some(Vec::new())
+    );
+    // Turning off only session sync leaves them in place.
+    store
+        .set_sync_preferences(SyncPreferences {
+            include_projects: true,
+            include_tasks: false,
+            include_activity: false,
+            include_sessions: true,
+        })
+        .expect("sessions on");
+    assert_eq!(snapshot_session_ids(&command(false, true)), None);
+}

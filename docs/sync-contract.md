@@ -37,7 +37,9 @@ and are not sent, and neither is a session with no project and no title. Prompts
 the device. Session retirement is not implied by `sync_batch.v6`. A snapshot
 retires hosted sessions only when it includes `session_rollup_ids`. An empty
 array prunes them. Omitting the key leaves hosted sessions in place, which is
-what the collector does when `include_sessions` is off. Pre-v6 acknowledgements
+what the collector does when `include_sessions` alone is off. With projects
+excluded, it sends the empty array until the target holds none of its sessions,
+since each hosted session carries a project. Pre-v6 acknowledgements
 omit the `sessions` counter.
 The collector owns local scanning, normalization, idempotent local storage, and
 privacy scrubbing. The backend owns authentication, validation, deduplication,

@@ -23,10 +23,16 @@ pub enum SessionTitleSource {
 /// in `session_index.jsonl`, and Claude Code writes a renamed title into the
 /// transcript that was resumed, while the usage stays in an unchanged one. A
 /// rename therefore reaches the session without re-parsing its events.
+///
+/// A sub-agent the provider never names borrows its parent's name instead:
+/// `parent_local_session_id_hash` points at the parent, `title` is the
+/// sub-agent's own label, and the session reads "{parent name} · {label}"
+/// with whatever name the parent holds at the time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionName {
     pub local_session_id_hash: String,
     pub title: String,
+    pub parent_local_session_id_hash: Option<String>,
 }
 
 /// One local session, aggregated from the usage events that share its hashed id.

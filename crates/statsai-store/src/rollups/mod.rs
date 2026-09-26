@@ -4,6 +4,7 @@ mod build;
 mod sessions;
 mod summaries;
 
+pub(crate) use sessions::task_span_session_hashes;
 pub use sessions::{SessionFilter, SessionSort, SessionStats};
 
 pub(crate) use build::*;

@@ -1053,7 +1053,7 @@ Options:
       --yes                      Confirm destructive sync reset actions
       --dry-run                  Build the sync batch without writing
       --include-projects         Enable project metadata sync for this device and future syncs
-      --exclude-projects         Disable project metadata sync for this device and future syncs
+      --exclude-projects         Disable project metadata sync for this device and future syncs; hosted sessions are retired
       --include-tasks            Enable hosted task sync for this device and future syncs (implies --include-projects)
       --exclude-tasks            Disable hosted task sync for this device and future syncs
       --include-activity         Enable hosted agent activity sync for this device and future syncs

@@ -120,7 +120,11 @@ fn apply_sync_preference_overrides(
                 "session sync enabled: the next sync backfills session rollups, and later snapshots retire hosted sessions this device no longer has"
             );
         }
-        if original.include_sessions && !preferences.include_sessions {
+        if original.include_projects && !preferences.include_projects {
+            eprintln!(
+                "project sync disabled: the next successful HTTP sync retires this device's hosted sessions, which carry project names and paths"
+            );
+        } else if original.include_sessions && !preferences.include_sessions {
             eprintln!(
                 "session sync disabled: hosted sessions stay in place until session sync is enabled again"
             );

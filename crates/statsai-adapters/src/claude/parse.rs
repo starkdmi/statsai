@@ -97,7 +97,7 @@ pub(crate) fn parse_claude_file(
             .pointer("/message/usage")
             .or_else(|| value.get("usage"))
         else {
-            if claude_record_is_user(&value) {
+            if claude_record_is_prompt(&value) {
                 *pending_user_messages.entry(session_raw).or_default() += 1;
             }
             continue;
@@ -105,7 +105,7 @@ pub(crate) fn parse_claude_file(
         ctx.scan.diagnostics.candidate_usage_rows += 1;
         let usage = claude_usage_counts_from_value(usage_value);
         if usage.computed_total() == 0 {
-            if claude_record_is_user(&value) {
+            if claude_record_is_prompt(&value) {
                 *pending_user_messages.entry(session_raw).or_default() += 1;
             }
             ctx.scan.diagnostics.skipped_zero_events += 1;
@@ -250,6 +250,7 @@ impl ClaudeSessionTitles {
             .map(|(local_session_id_hash, title)| statsai_core::SessionName {
                 local_session_id_hash,
                 title,
+                parent_local_session_id_hash: None,
             })
             .collect()
     }

@@ -594,3 +594,64 @@ pub(crate) fn apply_migration_027(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Hashed session keys on task spans and archive conversations, so a session
+/// refresh looks up the titles of its own sessions instead of reading both
+/// tables whole. Session names also record the parent a sub-agent borrows its
+/// name from.
+pub(crate) fn apply_migration_028(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE task_spans ADD COLUMN session_hash TEXT;
+        ALTER TABLE task_spans ADD COLUMN session_uuid_hash TEXT;
+        ALTER TABLE archive_conversations ADD COLUMN session_hash TEXT;
+        ALTER TABLE session_names ADD COLUMN parent_hash TEXT;
+        CREATE INDEX IF NOT EXISTS session_names_parent_idx
+          ON session_names (parent_hash) WHERE parent_hash IS NOT NULL;
+        "#,
+    )?;
+    let spans = {
+        let mut statement = conn.prepare(
+            "SELECT span_id, json_extract(payload, '$.session_id') FROM task_spans
+             WHERE json_extract(payload, '$.session_id') IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut update_span = conn.prepare(
+        "UPDATE task_spans SET session_hash = ?2, session_uuid_hash = ?3 WHERE span_id = ?1",
+    )?;
+    for (span_id, session_id) in spans {
+        let (session_hash, session_uuid_hash) = crate::task_span_session_hashes(Some(&session_id));
+        update_span.execute(params![span_id, session_hash, session_uuid_hash])?;
+    }
+    let conversations = {
+        let mut statement = conn
+            .prepare("SELECT conversation_id, native_conversation_id FROM archive_conversations")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut update_conversation = conn
+        .prepare("UPDATE archive_conversations SET session_hash = ?2 WHERE conversation_id = ?1")?;
+    for (conversation_id, native_id) in conversations {
+        update_conversation.execute(params![
+            conversation_id,
+            statsai_core::hash_text(&native_id)
+        ])?;
+    }
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS task_spans_session_hash_idx
+          ON task_spans (session_hash) WHERE session_hash IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS task_spans_session_uuid_hash_idx
+          ON task_spans (session_uuid_hash) WHERE session_uuid_hash IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS archive_conversations_session_hash_idx
+          ON archive_conversations (session_hash);
+        "#,
+    )?;
+    Ok(())
+}

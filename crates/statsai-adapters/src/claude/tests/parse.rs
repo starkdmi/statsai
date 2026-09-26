@@ -550,6 +550,49 @@ fn claude_user_counts_stay_on_the_kept_streaming_snapshot() {
 }
 
 #[test]
+fn claude_user_counts_skip_tool_results_meta_lines_and_compaction_summaries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session");
+    for line in [
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:00.000Z","sessionId":"session-1","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}"#,
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:01.000Z","sessionId":"session-1","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued"}}"#,
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:02.000Z","sessionId":"session-1","message":{"role":"user","content":"fix the parser"}}"#,
+        r#"{"timestamp":"2026-08-05T14:51:03.000Z","sessionId":"session-1","uuid":"record-1","requestId":"request-1","message":{"id":"message-1","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":2,"output_tokens":10}}}"#,
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:04.000Z","sessionId":"session-1","toolUseResult":{"stdout":"ok"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"ok"}]}}"#,
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:05.000Z","sessionId":"session-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-2","content":"ok"}]}}"#,
+        r#"{"timestamp":"2026-08-05T14:51:06.000Z","sessionId":"session-1","uuid":"record-2","requestId":"request-2","message":{"id":"message-2","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":3,"output_tokens":5}}}"#,
+    ] {
+        writeln!(file, "{line}").expect("line");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    // One typed prompt, followed by two tool results that are not prompts.
+    let user_messages = scan
+        .events
+        .iter()
+        .map(|event| {
+            event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.user_messages)
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    assert_eq!(scan.events.len(), 2);
+    assert_eq!(user_messages, 1);
+}
+
+#[test]
 fn claude_streaming_snapshots_with_equal_timestamps_resolve_by_source_line() {
     let dir = tempfile::tempdir().expect("tempdir");
     let projects = dir.path().join("projects");
@@ -1326,6 +1369,7 @@ fn claude_title_only_transcripts_report_session_names() {
         vec![statsai_core::SessionName {
             local_session_id_hash: statsai_core::hash_text("renamed"),
             title: "Renamed session".to_string(),
+            parent_local_session_id_hash: None,
         }]
     );
 }

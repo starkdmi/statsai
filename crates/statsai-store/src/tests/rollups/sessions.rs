@@ -1046,6 +1046,7 @@ fn a_provider_name_renames_a_stored_session_without_its_events() {
     let rename = |title: &str| statsai_core::SessionName {
         local_session_id_hash: hash_text("named-session"),
         title: title.to_string(),
+        parent_local_session_id_hash: None,
     };
     assert_eq!(
         store
@@ -1064,4 +1065,60 @@ fn a_provider_name_renames_a_stored_session_without_its_events() {
             .expect("same"),
         0
     );
+}
+
+#[test]
+fn a_sub_agent_borrows_its_parents_current_name() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-parent-names"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 19, 9, 0, 0)
+        .single()
+        .expect("start");
+    let mut event = test_store_event(&source, start, "child");
+    stamp_session(&mut event, "child-thread");
+    store.insert_event(&event).expect("insert");
+
+    let name = |raw: &str, title: &str, parent: Option<&str>| statsai_core::SessionName {
+        local_session_id_hash: hash_text(raw),
+        title: title.to_string(),
+        parent_local_session_id_hash: parent.map(hash_text),
+    };
+    let title = || {
+        store.all_session_rollups().expect("sessions")[0]
+            .title
+            .clone()
+    };
+    store
+        .upsert_session_names(&[
+            name("parent-thread", "Design tool/plugin", None),
+            name("child-thread", "Popper", Some("parent-thread")),
+        ])
+        .expect("names");
+    assert_eq!(title().as_deref(), Some("Design tool/plugin · Popper"));
+
+    // Renaming the parent renames the sub-agent, whose rollout is not re-read.
+    store
+        .upsert_session_names(&[name("parent-thread", "Plugin API", None)])
+        .expect("rename parent");
+    assert_eq!(title().as_deref(), Some("Plugin API · Popper"));
+
+    // A name of its own wins, and a borrowed one does not replace it.
+    store
+        .upsert_session_names(&[name("child-thread", "Review plugin", None)])
+        .expect("own name");
+    assert_eq!(
+        store
+            .upsert_session_names(&[name("child-thread", "Popper", Some("parent-thread"))])
+            .expect("borrowed again"),
+        0
+    );
+    assert_eq!(title().as_deref(), Some("Review plugin"));
 }

@@ -26,7 +26,7 @@ pub(crate) use rollups::{
     collect_pending_summary_days, event_with_valid_project, is_daily_rollup_summary,
     is_http_rollup_passthrough_summary, sanitize_summary_for_http_sync, summary_period_bounds,
     summary_sync_payload_hash, sync_rollup_bucket_key, sync_rollup_project_key,
-    SyncRollupBucketKey,
+    task_span_session_hashes, SyncRollupBucketKey,
 };
 pub(crate) use sql::{
     begin_immediate_transaction_with_retry, commit_transaction, enable_sqlite_defensive,
