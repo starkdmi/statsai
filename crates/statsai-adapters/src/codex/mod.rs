@@ -63,6 +63,18 @@ impl ProviderAdapter for CodexAdapter {
         codex_scan_candidates(source, self.version())
     }
 
+    fn archive_scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+        let Some(path_label) = source
+            .path_label
+            .as_deref()
+            .filter(|label| !label.is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+        let cache_namespaces = scan_cache_namespaces(source, self.version());
+        codex_jsonl_candidates(source, Path::new(path_label), &cache_namespaces)
+    }
+
     fn probe_verified_source_state(
         &self,
         source: &SourceLocation,
@@ -280,7 +292,15 @@ pub(crate) fn codex_scan_candidates(
     };
     let source_path = PathBuf::from(path_label);
     let cache_namespaces = scan_cache_namespaces(source, adapter_version);
-    codex_jsonl_candidates(source, &source_path, &cache_namespaces)
+    let mut candidates = codex_jsonl_candidates(source, &source_path, &cache_namespaces)?;
+    // Renaming a thread rewrites only the index, so it is tracked as a file of
+    // its own: a change to it rescans the source for names without selecting
+    // any rollout.
+    let index_path = codex_source_root(&source_path).join(CODEX_SESSION_INDEX_FILE);
+    if index_path.is_file() {
+        candidates.push(scan_candidate(index_path, None, &cache_namespaces));
+    }
+    Ok(candidates)
 }
 
 pub(crate) fn codex_jsonl_candidates(

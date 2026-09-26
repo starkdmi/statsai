@@ -1,9 +1,11 @@
 use super::*;
 
+pub(crate) const CODEX_SESSION_INDEX_FILE: &str = "session_index.jsonl";
+
 /// Thread names from `session_index.jsonl`, as the provider shows them. Task
 /// titles clean them further with the prompt rules; session names do not.
 pub(crate) fn load_codex_thread_names(root: &Path) -> HashMap<String, String> {
-    let index_path = root.join("session_index.jsonl");
+    let index_path = root.join(CODEX_SESSION_INDEX_FILE);
     let Ok(file) = File::open(&index_path) else {
         return HashMap::new();
     };

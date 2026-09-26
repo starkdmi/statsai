@@ -179,6 +179,65 @@ fn codex_scan_candidates_ignore_auth_json_changes() {
 }
 
 #[test]
+fn codex_session_index_is_a_scan_candidate_of_its_own() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let session_path = sessions.join("session.jsonl");
+    std::fs::write(
+        &session_path,
+        "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+    )
+    .expect("session");
+    let index_path = dir.path().join("session_index.jsonl");
+    std::fs::write(
+        &index_path,
+        "{\"id\":\"thread-1\",\"thread_name\":\"One\"}\n",
+    )
+    .expect("index one");
+
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let signature_of = |candidates: &[ScanCandidateFile], path: &Path| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.cache_key == canonical_display(path))
+            .map(|candidate| candidate.cache_signature.clone())
+    };
+
+    let first = codex_scan_candidates(&source, "test-adapter").expect("first candidates");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    std::fs::write(
+        &index_path,
+        "{\"id\":\"thread-1\",\"thread_name\":\"One\"}\n{\"id\":\"thread-1\",\"thread_name\":\"Two\"}\n",
+    )
+    .expect("index two");
+    let second = codex_scan_candidates(&source, "test-adapter").expect("second candidates");
+
+    assert_eq!(first.len(), 2);
+    // A rename marks the index changed and leaves every rollout cached.
+    assert_ne!(
+        signature_of(&first, &index_path),
+        signature_of(&second, &index_path)
+    );
+    assert_eq!(
+        signature_of(&first, &session_path),
+        signature_of(&second, &session_path)
+    );
+    // The index is not a conversation to archive.
+    let archive = CodexAdapter
+        .archive_scan_candidates(&source)
+        .expect("archive candidates");
+    assert_eq!(archive.len(), 1);
+    assert_eq!(archive[0].cache_key, canonical_display(&session_path));
+}
+
+#[test]
 fn codex_scan_candidates_accept_legacy_auth_dependent_signatures() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sessions = dir.path().join("sessions");
