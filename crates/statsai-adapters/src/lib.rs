@@ -168,6 +168,8 @@ pub struct AdapterScan {
     pub events: Vec<UsageEvent>,
     pub summaries: Vec<UsageSummary>,
     pub task_spans: Vec<TaskSpan>,
+    /// Session names read apart from usage events; see [`SessionName`].
+    pub session_names: Vec<statsai_core::SessionName>,
     pub quota_observations: Vec<QuotaObservationRecordV1>,
     pub activity_invocations: Vec<ActivityInvocationV1>,
     pub activity_coverage: Vec<ActivityCoverageV1>,

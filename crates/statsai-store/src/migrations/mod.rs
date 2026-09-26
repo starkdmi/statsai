@@ -8,7 +8,7 @@ mod v2;
 pub(crate) use v1::*;
 pub(crate) use v2::*;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 26;
+pub const CURRENT_SCHEMA_VERSION: i64 = 27;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -151,6 +151,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         24 => apply_migration_024(conn),
         25 => apply_migration_025(conn),
         26 => apply_migration_026(conn),
+        27 => apply_migration_027(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }

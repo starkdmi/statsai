@@ -290,6 +290,7 @@ pub struct ScanFileReplacement<'a> {
     pub reconciled_file_hashes: &'a [String],
     pub events: &'a [UsageEvent],
     pub summaries: &'a [UsageSummary],
+    pub session_names: &'a [statsai_core::SessionName],
     pub activity_invocations: &'a [ActivityInvocationV1],
     pub activity_coverage: &'a [ActivityCoverageV1],
     pub activity_persist_mode: ActivityPersistMode,

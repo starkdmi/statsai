@@ -1,12 +1,14 @@
 use super::*;
 
-pub(crate) fn load_codex_thread_titles(root: &Path) -> HashMap<String, String> {
+/// Thread names from `session_index.jsonl`, as the provider shows them. Task
+/// titles clean them further with the prompt rules; session names do not.
+pub(crate) fn load_codex_thread_names(root: &Path) -> HashMap<String, String> {
     let index_path = root.join("session_index.jsonl");
     let Ok(file) = File::open(&index_path) else {
         return HashMap::new();
     };
     let mut reader = BufReader::new(file);
-    let mut titles = HashMap::new();
+    let mut names = HashMap::new();
     let mut line_bytes = Vec::new();
     while let Ok(line_status) =
         read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)
@@ -26,14 +28,25 @@ pub(crate) fn load_codex_thread_titles(root: &Path) -> HashMap<String, String> {
         let Some(session_id) = value.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let Some(title) = value.get("thread_name").and_then(Value::as_str) else {
-            continue;
-        };
-        if let Some(title) = summarize_task_text(Some(title), 90) {
-            titles.insert(session_id.to_string(), title);
+        if let Some(name) = statsai_core::provider_session_name(
+            value.get("thread_name").and_then(Value::as_str),
+            90,
+        ) {
+            names.insert(session_id.to_string(), name);
         }
     }
-    titles
+    names
+}
+
+pub(crate) fn codex_thread_titles_from_names(
+    names: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    names
+        .iter()
+        .filter_map(|(session_id, name)| {
+            summarize_task_text(Some(name), 90).map(|title| (session_id.clone(), title))
+        })
+        .collect()
 }
 
 /// Codex never names its sub-agents. A spawned agent records its parent

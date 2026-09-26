@@ -17,6 +17,18 @@ pub enum SessionTitleSource {
     Archive,
 }
 
+/// A name the provider holds for a session, read apart from its usage events.
+///
+/// Names live in files the scan cache does not tie to usage: Codex keeps them
+/// in `session_index.jsonl`, and Claude Code writes a renamed title into the
+/// transcript that was resumed, while the usage stays in an unchanged one. A
+/// rename therefore reaches the session without re-parsing its events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionName {
+    pub local_session_id_hash: String,
+    pub title: String,
+}
+
 /// One local session, aggregated from the usage events that share its hashed id.
 ///
 /// `session_id` is the hashed `session_…` identity already stored on each event.

@@ -1298,3 +1298,34 @@ fn claude_events_carry_the_prompt_that_started_their_turn() {
         ]
     );
 }
+
+#[test]
+fn claude_title_only_transcripts_report_session_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    // A resumed transcript holding only the rename; the usage lives elsewhere.
+    let mut file = File::create(projects.join("resumed.jsonl")).expect("resumed");
+    writeln!(
+        file,
+        r#"{{"type":"custom-title","customTitle":"Renamed session","sessionId":"renamed"}}"#
+    )
+    .expect("write title");
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+    assert!(scan.events.is_empty());
+    assert_eq!(
+        scan.session_names,
+        vec![statsai_core::SessionName {
+            local_session_id_hash: statsai_core::hash_text("renamed"),
+            title: "Renamed session".to_string(),
+        }]
+    );
+}

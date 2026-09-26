@@ -510,3 +510,32 @@ fn codex_turns_without_a_reported_duration_end_at_their_last_work() {
     assert_eq!(scan.events.len(), 1);
     assert_eq!(scan.events[0].session.duration_seconds, Some(120));
 }
+
+#[test]
+fn codex_session_index_names_are_reported_on_every_scan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    std::fs::create_dir_all(codex_root.join("sessions")).expect("sessions");
+    std::fs::write(
+        codex_root.join("session_index.jsonl"),
+        "{\"id\":\"thread-1\",\"thread_name\":\"Design tool/plugin\"}\n",
+    )
+    .expect("session index");
+
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        &codex_root,
+        LocationOrigin::Configured,
+    );
+    let scan = scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
+    // No rollout changed, yet the index name is reported, uncleaned.
+    assert_eq!(
+        scan.session_names,
+        vec![statsai_core::SessionName {
+            local_session_id_hash: statsai_core::hash_text("thread-1"),
+            title: "Design tool/plugin".to_string(),
+        }]
+    );
+}

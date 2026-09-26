@@ -224,16 +224,18 @@ impl ClaudeSessionTitles {
         }
     }
 
-    pub(crate) fn apply(self, events: &mut [statsai_core::UsageEvent]) {
-        if self.0.is_empty() {
-            return;
-        }
+    /// Stamps the titles on this scan's events and returns them as session
+    /// names, which also reach sessions whose events this scan did not read.
+    pub(crate) fn apply(
+        self,
+        events: &mut [statsai_core::UsageEvent],
+    ) -> Vec<statsai_core::SessionName> {
         let titles_by_hash = self
             .0
             .into_iter()
             .map(|(session_raw, (_, title))| (hash_text(&session_raw), title))
             .collect::<HashMap<_, _>>();
-        for event in events {
+        for event in events.iter_mut() {
             if let Some(title) = event
                 .session
                 .local_session_id_hash
@@ -243,6 +245,13 @@ impl ClaudeSessionTitles {
                 event.session.title = Some(title.clone());
             }
         }
+        titles_by_hash
+            .into_iter()
+            .map(|(local_session_id_hash, title)| statsai_core::SessionName {
+                local_session_id_hash,
+                title,
+            })
+            .collect()
     }
 }
 

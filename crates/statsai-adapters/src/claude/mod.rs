@@ -230,7 +230,8 @@ pub(crate) fn scan_claude_source(
             )?;
         }
     }
-    session_titles.apply(&mut scan.events);
+    let session_names = session_titles.apply(&mut scan.events);
+    scan.session_names.extend(session_names);
 
     if let Some(candidate) = claude_stats_cache_candidate(&root, &cache_namespaces) {
         if options.should_scan(&candidate.cache_key) {

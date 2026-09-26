@@ -491,6 +491,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                     reconciled_file_hashes: &reconciled_file_hashes,
                                     events: &scan.events,
                                     summaries: &scan.summaries,
+                                    session_names: &scan.session_names,
                                     activity_invocations: &scan.activity_invocations,
                                     activity_coverage: &scan.activity_coverage,
                                     activity_persist_mode: ActivityPersistMode::for_scan(

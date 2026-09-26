@@ -973,3 +973,95 @@ fn deleting_a_source_rebuilds_sessions_it_shared() {
         .expect("delete newer");
     assert_eq!(total(&store), vec![10]);
 }
+
+#[test]
+fn deleting_the_span_that_titled_a_session_clears_the_title() {
+    let store = Store::in_memory().expect("store");
+    let usage_source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-span-usage"),
+        LocationOrigin::Configured,
+    );
+    let span_source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/session-span-titles"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&usage_source).expect("usage source");
+    store.upsert_source(&span_source).expect("span source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 18, 9, 0, 0)
+        .single()
+        .expect("start");
+    let raw_id = "span-titled-session";
+    let mut event = test_store_event(&usage_source, start, "span-usage");
+    stamp_session(&mut event, raw_id);
+    store.insert_event(&event).expect("insert");
+    let title = "Repair the span title cleanup";
+    store
+        .upsert_task_spans(&[task_span(&span_source, raw_id, title, start)])
+        .expect("span");
+    assert_eq!(
+        store.all_session_rollups().expect("titled")[0]
+            .title
+            .as_deref(),
+        Some(title)
+    );
+
+    let targets = store
+        .task_span_targets_for_sources(std::slice::from_ref(&span_source.source_id))
+        .expect("targets");
+    store
+        .delete_task_span_targets_in_tx(&targets)
+        .expect("delete spans");
+    let sessions = store.all_session_rollups().expect("after");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].title, None);
+}
+
+#[test]
+fn a_provider_name_renames_a_stored_session_without_its_events() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "claude_code",
+        "test",
+        "0",
+        Path::new("/tmp/session-names"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 6, 19, 9, 0, 0)
+        .single()
+        .expect("start");
+    let mut event = test_store_event(&source, start, "named");
+    stamp_session(&mut event, "named-session");
+    event.session.title = Some("Title when parsed".to_string());
+    store.insert_event(&event).expect("insert");
+
+    let rename = |title: &str| statsai_core::SessionName {
+        local_session_id_hash: hash_text("named-session"),
+        title: title.to_string(),
+    };
+    assert_eq!(
+        store
+            .upsert_session_names(&[rename("Renamed later")])
+            .expect("rename"),
+        1
+    );
+    let sessions = store.all_session_rollups().expect("sessions");
+    assert_eq!(sessions[0].title.as_deref(), Some("Renamed later"));
+    assert_eq!(sessions[0].title_source, Some(SessionTitleSource::Event));
+
+    // An unchanged name writes nothing.
+    assert_eq!(
+        store
+            .upsert_session_names(&[rename("Renamed later")])
+            .expect("same"),
+        0
+    );
+}

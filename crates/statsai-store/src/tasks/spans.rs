@@ -228,13 +228,32 @@ impl Store {
         let mut delete_spans = self
             .conn
             .prepare("DELETE FROM task_spans WHERE span_id = ?1")?;
+        // A deleted span can have been the source of a session's title, while
+        // the session's usage survives under another source.
+        let mut session_of_span = self.conn.prepare(
+            "SELECT json_extract(payload, '$.session_id') FROM task_spans WHERE span_id = ?1",
+        )?;
+        let mut raw_session_ids = Vec::new();
         let mut deleted = 0u64;
         let mut affected_project_buckets = BTreeSet::new();
         for target in targets {
             affected_project_buckets.insert(target.project_bucket.clone());
+            if let Some(session_id) = session_of_span
+                .query_row(params![&target.span_id.0], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .optional()?
+                .flatten()
+            {
+                raw_session_ids.push(session_id);
+            }
             delete_links.execute(params![&target.span_id.0])?;
             deleted += delete_spans.execute(params![&target.span_id.0])? as u64;
         }
+        drop(session_of_span);
+        drop(delete_links);
+        drop(delete_spans);
+        self.refresh_session_rollups_for_raw_ids(&raw_session_ids)?;
         Ok(TaskDeletionImpact {
             deleted,
             affected_project_buckets,

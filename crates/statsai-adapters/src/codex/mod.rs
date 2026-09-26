@@ -124,7 +124,20 @@ pub(crate) fn scan_codex_source(
     let root = codex_source_root(&source_path);
     let cache_namespaces = scan_cache_namespaces(source, adapter.version());
     // Thread names title sessions as well as tasks, so they load either way.
-    let thread_titles = load_codex_thread_titles(&root);
+    // The index is re-read on every scan and its names go out as session
+    // names: a rename there changes no rollout, so the scan cache would keep
+    // every rollout's old title.
+    let thread_names = load_codex_thread_names(&root);
+    let thread_titles = codex_thread_titles_from_names(&thread_names);
+    scan.session_names
+        .extend(
+            thread_names
+                .into_iter()
+                .map(|(session_id, title)| statsai_core::SessionName {
+                    local_session_id_hash: hash_text(&session_id),
+                    title,
+                }),
+        );
     let mut indexed_candidates = Vec::new();
     for (index, candidate) in codex_jsonl_candidates(source, &source_path, &cache_namespaces)?
         .into_iter()

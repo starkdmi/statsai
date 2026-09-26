@@ -7,8 +7,9 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
 use statsai_core::{
     hash_text, project_has_stable_identity, provider_session_title_is_unusable,
-    task_title_is_generic, Confidence, CostAccumulator, CostInfo, ModelInfo, SessionRollupV1,
-    SessionTitleSource, SummaryModelUsage, UsageCounts, UsageEvent, SESSION_ROLLUP_SCHEMA_VERSION,
+    task_title_is_generic, Confidence, CostAccumulator, CostInfo, ModelInfo, SessionName,
+    SessionRollupV1, SessionTitleSource, SummaryModelUsage, UsageCounts, UsageEvent,
+    SESSION_ROLLUP_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -185,6 +186,36 @@ impl Store {
             self.write_session_rollup(&rollup, &payload_hash, 1)?;
         }
         Ok(())
+    }
+
+    /// Records the names providers hold for sessions and refreshes the sessions
+    /// whose name changed. Unchanged names write nothing.
+    pub fn upsert_session_names(&self, names: &[SessionName]) -> Result<u64> {
+        if names.is_empty() {
+            return Ok(0);
+        }
+        let mut changed_hashes = Vec::new();
+        {
+            let mut statement = self.conn.prepare(
+                r#"
+                INSERT INTO session_names (local_session_id_hash, title, updated_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(local_session_id_hash) DO UPDATE SET
+                  title = excluded.title,
+                  updated_at = excluded.updated_at
+                WHERE session_names.title IS NOT excluded.title
+                "#,
+            )?;
+            let now = Utc::now().to_rfc3339();
+            for name in names {
+                if statement.execute(params![&name.local_session_id_hash, &name.title, &now])? > 0 {
+                    changed_hashes.push(name.local_session_id_hash.clone());
+                }
+            }
+        }
+        let session_ids = self.session_ids_for_local_hashes(&changed_hashes)?;
+        self.refresh_session_rollups_for_keys(&session_ids)?;
+        Ok(changed_hashes.len() as u64)
     }
 
     pub(crate) fn refresh_session_rollups_for_raw_ids(&self, raw_ids: &[String]) -> Result<()> {
@@ -484,6 +515,24 @@ impl Store {
                 );
             }
         }
+        drop(spans);
+
+        // A provider-held name outranks task and archive titles for its session.
+        let mut names = self
+            .conn
+            .prepare("SELECT local_session_id_hash, title FROM session_names")?;
+        let name_rows = names.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in name_rows {
+            let (hash, title) = row?;
+            if !wanted.contains(hash.as_str()) {
+                continue;
+            }
+            if let Some(title) = acceptable_session_title(Some(&title), SessionTitleSource::Event) {
+                titles.insert(hash, (title, SessionTitleSource::Event));
+            }
+        }
         Ok(titles)
     }
 
@@ -727,19 +776,32 @@ fn session_active_seconds(events: &[UsageEvent]) -> Option<u64> {
     u64::try_from(total.num_seconds()).ok()
 }
 
+/// Precedence: the name the provider holds now, then a title stamped on an
+/// event when it was parsed, then a task-span title, then an archive title.
 fn resolve_title(
     events: &[UsageEvent],
     titles: &BTreeMap<String, (String, SessionTitleSource)>,
 ) -> (Option<String>, Option<SessionTitleSource>) {
+    let hashes = || {
+        events
+            .iter()
+            .rev()
+            .filter_map(|event| event.session.local_session_id_hash.as_deref())
+    };
+    if let Some(title) = hashes().find_map(|hash| {
+        titles
+            .get(hash)
+            .filter(|(_, source)| *source == SessionTitleSource::Event)
+            .map(|(title, _)| title.clone())
+    }) {
+        return (Some(title), Some(SessionTitleSource::Event));
+    }
     if let Some(title) = events.iter().rev().find_map(|event| {
         acceptable_session_title(event.session.title.as_deref(), SessionTitleSource::Event)
     }) {
         return (Some(title), Some(SessionTitleSource::Event));
     }
-    for event in events.iter().rev() {
-        let Some(hash) = event.session.local_session_id_hash.as_deref() else {
-            continue;
-        };
+    for hash in hashes() {
         if let Some((title, source)) = titles.get(hash) {
             return (Some(title.clone()), Some(*source));
         }

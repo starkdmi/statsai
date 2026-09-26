@@ -578,3 +578,19 @@ pub(crate) fn apply_migration_026(conn: &Connection) -> Result<()> {
     ))?;
     Ok(())
 }
+
+/// Provider-held session names, keyed by the hashed session id. Session
+/// rollups read them ahead of titles stamped on events, so a rename reaches the
+/// session without re-parsing its transcripts.
+pub(crate) fn apply_migration_027(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_names (
+          local_session_id_hash TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
