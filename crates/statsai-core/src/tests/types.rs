@@ -667,6 +667,14 @@ fn sanitize_session_rollup_repairs_values_ingest_rejects() {
         sanitized.title.as_deref(),
         Some("Review uncommitted changes")
     );
+    let mut slashed = sample_session_rollup(started);
+    slashed.title = Some("Claude Design tool/plugin".to_string());
+    slashed.title_source = Some(SessionTitleSource::Event);
+    let sanitized = sanitize_session_rollup_for_sync(slashed);
+    assert_eq!(
+        sanitized.title.as_deref(),
+        Some("Claude Design tool/plugin")
+    );
     let mut prompt_derived = sample_session_rollup(started);
     prompt_derived.title = Some("Review uncommitted changes".to_string());
     prompt_derived.title_source = Some(SessionTitleSource::TaskSpan);

@@ -405,3 +405,76 @@ fn codex_task_spans_capture_thread_id_from_session_meta() {
         .iter()
         .all(|event| event.session.title.as_deref() == Some("Fix parser bug")));
 }
+
+#[test]
+fn codex_subagents_borrow_their_parent_thread_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    let sessions = codex_root.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    std::fs::write(
+        codex_root.join("session_index.jsonl"),
+        "{\"id\":\"parent-1\",\"thread_name\":\"Fix parser bug\"}\n",
+    )
+    .expect("session index");
+    for (index, (file, meta)) in [
+        (
+            "spawned.jsonl",
+            r#"{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{"id":"child-spawned","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1","depth":1,"agent_nickname":"Popper","agent_role":null}}}}}"#,
+        ),
+        (
+            "guardian.jsonl",
+            r#"{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{"id":"child-guardian","session_id":"parent-1","source":{"subagent":{"other":"guardian"}}}}"#,
+        ),
+        (
+            "orphan.jsonl",
+            r#"{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{"id":"child-orphan","source":{"subagent":{"other":"guardian"}}}}"#,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Distinct usage per rollout, or the path-independent dedupe keeps one.
+        let input = 60 + index;
+        let total = 120 + index;
+        let usage = format!(
+            r#"{{"timestamp":"2026-06-01T08:00:03Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":{total}}},"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":{total}}}}}}}}}"#
+        );
+        let mut handle = File::create(sessions.join(file)).expect("rollout");
+        writeln!(handle, "{meta}").expect("meta");
+        writeln!(
+            handle,
+            r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"turn_context","payload":{{"model":"gpt-5"}}}}"#
+        )
+        .expect("context");
+        writeln!(handle, "{usage}").expect("usage");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        &codex_root,
+        LocationOrigin::Configured,
+    );
+    let scan = scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
+    let title_for = |raw: &str| {
+        let hash = statsai_core::hash_text(raw);
+        scan.events
+            .iter()
+            .find(|event| event.session.local_session_id_hash.as_deref() == Some(hash.as_str()))
+            .expect("event")
+            .session
+            .title
+            .clone()
+    };
+    assert_eq!(
+        title_for("child-spawned").as_deref(),
+        Some("Fix parser bug · Popper")
+    );
+    assert_eq!(
+        title_for("child-guardian").as_deref(),
+        Some("Fix parser bug · guardian")
+    );
+    assert_eq!(title_for("child-orphan"), None);
+}

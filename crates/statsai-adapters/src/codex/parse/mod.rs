@@ -39,6 +39,9 @@ pub(crate) fn parse_codex_file(
     let mut current_model_is_fallback = false;
     let mut current_project: Option<ProjectInfo> = None;
     let mut current_title: Option<String> = None;
+    // Events only: a sub-agent borrows its parent thread's name, but task
+    // titles keep their own prompt-based rules.
+    let mut subagent_title: Option<String> = None;
     let mut current_thread_id: Option<String> = None;
     // Seeded from the file path, replaced by the session's own id as soon as
     // the `session_meta` line declares one. The embedded id is the same UUID
@@ -343,20 +346,13 @@ pub(crate) fn parse_codex_file(
             if collect_tasks {
                 current_thread_id = declared_session_id.clone();
             }
-            {
-                let session_id = declared_session_id.or_else(|| Some(session_raw.clone()));
-                current_title = value
-                    .pointer("/payload/thread_name")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .or_else(|| {
-                        session_id
-                            .as_ref()
-                            .and_then(|session_id| thread_titles.get(session_id))
-                            .cloned()
-                    })
-                    .or_else(|| thread_titles.get(&session_raw).cloned());
-            }
+            let session_id = declared_session_id.unwrap_or_else(|| session_raw.clone());
+            current_title = value
+                .pointer("/payload/thread_name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| thread_titles.get(&session_id).cloned());
+            subagent_title = codex_subagent_session_title(&value, &session_id, thread_titles);
             current_project = codex_project_context_from_value(&value, &mut project_cache);
             continue;
         }
@@ -734,7 +730,7 @@ pub(crate) fn parse_codex_file(
                     dedupe_salt: None,
                 },
             );
-            event.session.title = turn.title.clone();
+            event.session.title = turn.title.clone().or_else(|| subagent_title.clone());
             let mut linked_quota_lines = turn.usage_lines.clone();
             linked_quota_lines.extend_from_slice(&turn.quota_lines);
             if record.usage.is_some() {
@@ -931,7 +927,7 @@ pub(crate) fn parse_codex_file(
         if consumed_usage_lines.contains(&record.line_number) {
             continue;
         }
-        let session_title = record.session_title;
+        let session_title = record.session_title.or_else(|| subagent_title.clone());
         let mut event = usage_event(
             ctx.adapter,
             ctx.source,

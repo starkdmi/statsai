@@ -1215,3 +1215,39 @@ fn claude_session_titles_name_every_event_in_the_session() {
     );
     assert_eq!(title_for("untitled"), None);
 }
+
+#[test]
+fn claude_session_titles_reach_events_read_from_other_transcripts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    // A resumed session's copied messages dedupe onto the transcript that
+    // first held them, while the title is written to the resumed transcript.
+    let mut original = File::create(projects.join("original.jsonl")).expect("original");
+    writeln!(
+        original,
+        r#"{{"timestamp":"2026-05-01T00:00:00Z","sessionId":"resumed","message":{{"id":"m1","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#
+    )
+    .expect("write original");
+    let mut resumed = File::create(projects.join("resumed.jsonl")).expect("resumed");
+    writeln!(
+        resumed,
+        r#"{{"type":"custom-title","customTitle":"Design tool/plugin","sessionId":"resumed"}}"#
+    )
+    .expect("write resumed");
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(
+        scan.events[0].session.title.as_deref(),
+        Some("Design tool/plugin")
+    );
+}

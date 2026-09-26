@@ -568,6 +568,11 @@ fn provider_named_sessions_keep_plain_names_but_drop_placeholders() {
     placeholder.session.title = Some("New session - 2026-04-30T16:41:41.413Z".to_string());
     store.insert_event(&placeholder).expect("placeholder");
 
+    let mut bare = test_store_event(&source, start, "bare-placeholder");
+    stamp_session(&mut bare, "bare-placeholder-session");
+    bare.session.title = Some("New session".to_string());
+    store.insert_event(&bare).expect("bare placeholder");
+
     let sessions = store.dirty_session_rollups().expect("sessions");
     let title = |event: &UsageEvent| {
         sessions
@@ -579,6 +584,7 @@ fn provider_named_sessions_keep_plain_names_but_drop_placeholders() {
     };
     assert_eq!(title(&review).as_deref(), Some(plain));
     assert_eq!(title(&placeholder), None);
+    assert_eq!(title(&bare), None);
 }
 
 #[test]

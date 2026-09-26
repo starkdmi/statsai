@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 use statsai_core::{
-    canonical_display, expand_home_path, hash_text, summarize_task_text, summary_id, Confidence,
+    canonical_display, expand_home_path, hash_text, provider_session_name, summary_id, Confidence,
     EventSource, IdentitySource, ParseEvidence, ProjectInfo, SourceKind, SourceLocation,
     SummaryMetadata, UsageCounts, UsageSummary, USAGE_SUMMARY_SCHEMA_VERSION,
 };
@@ -31,6 +31,7 @@ pub(crate) fn parse_claude_file(
     ctx: &mut FileParseContext<'_, ClaudeCodeAdapter>,
     projects: &Path,
     session_projects: &HashMap<String, ClaudeSessionProjectMetadata>,
+    session_titles: &mut ClaudeSessionTitles,
     path: &Path,
 ) -> Result<()> {
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
@@ -48,8 +49,6 @@ pub(crate) fn parse_claude_file(
     // Later snapshots of one provider record replace the event. User lines
     // counted on the first snapshot have to ride along with that replacement.
     let mut last_usage_users = HashMap::<String, (String, u64)>::new();
-    let mut session_titles = HashMap::<String, (u8, String)>::new();
-    let events_start = ctx.scan.events.len();
     loop {
         let line_status =
             read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
@@ -85,12 +84,7 @@ pub(crate) fn parse_claude_file(
         }
         let session_raw = claude_session_raw(&value, path);
         if let Some((rank, title)) = claude_session_title_from_value(&value) {
-            let replaces = session_titles
-                .get(&session_raw)
-                .is_none_or(|(current, _)| rank >= *current);
-            if replaces {
-                session_titles.insert(session_raw, (rank, title));
-            }
+            session_titles.remember(session_raw, rank, title);
             continue;
         }
         let Some(usage_value) = value
@@ -190,25 +184,6 @@ pub(crate) fn parse_claude_file(
         push_deduped(ctx.scan, ctx.seen, event, duplicate_selection);
     }
 
-    // Title records can follow the usage they name, so titles land once the
-    // whole file has been read.
-    if !session_titles.is_empty() {
-        let titles_by_hash = session_titles
-            .into_iter()
-            .map(|(session_raw, (_, title))| (hash_text(&session_raw), title))
-            .collect::<HashMap<_, _>>();
-        for event in &mut ctx.scan.events[events_start..] {
-            if let Some(title) = event
-                .session
-                .local_session_id_hash
-                .as_deref()
-                .and_then(|hash| titles_by_hash.get(hash))
-            {
-                event.session.title = Some(title.clone());
-            }
-        }
-    }
-
     let activity_started_at = std::time::Instant::now();
     activity.finish(
         ctx.scan,
@@ -221,6 +196,48 @@ pub(crate) fn parse_claude_file(
     Ok(())
 }
 
+/// Session names found across one source's transcripts.
+///
+/// A resumed or forked session copies earlier messages into a new transcript,
+/// and those events dedupe onto the positions of the file that first held
+/// them. Titles are therefore applied once the whole source is read, by session
+/// hash, rather than to the events of the file that named the session.
+#[derive(Default)]
+pub(crate) struct ClaudeSessionTitles(HashMap<String, (u8, String)>);
+
+impl ClaudeSessionTitles {
+    fn remember(&mut self, session_raw: String, rank: u8, title: String) {
+        let replaces = self
+            .0
+            .get(&session_raw)
+            .is_none_or(|(current, _)| rank >= *current);
+        if replaces {
+            self.0.insert(session_raw, (rank, title));
+        }
+    }
+
+    pub(crate) fn apply(self, events: &mut [statsai_core::UsageEvent]) {
+        if self.0.is_empty() {
+            return;
+        }
+        let titles_by_hash = self
+            .0
+            .into_iter()
+            .map(|(session_raw, (_, title))| (hash_text(&session_raw), title))
+            .collect::<HashMap<_, _>>();
+        for event in events {
+            if let Some(title) = event
+                .session
+                .local_session_id_hash
+                .as_deref()
+                .and_then(|hash| titles_by_hash.get(hash))
+            {
+                event.session.title = Some(title.clone());
+            }
+        }
+    }
+}
+
 /// Claude Code names a session with `custom-title` records, which a rename
 /// also writes, and occasionally `ai-title`. The later record of the stronger
 /// kind wins; the rank says which kind that is.
@@ -230,7 +247,7 @@ fn claude_session_title_from_value(value: &Value) -> Option<(u8, String)> {
         "ai-title" => (0, "aiTitle"),
         _ => return None,
     };
-    let title = summarize_task_text(value.get(key).and_then(Value::as_str), 90)?;
+    let title = provider_session_name(value.get(key).and_then(Value::as_str), 90)?;
     Some((rank, title))
 }
 
