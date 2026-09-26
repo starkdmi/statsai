@@ -772,3 +772,114 @@ fn scan_rewrites_task_span_links_to_canonical_event_ids() {
         vec![existing_event.event_id.clone()]
     );
 }
+
+/// The real Codex adapter, pointed at one source instead of the machine's.
+struct PinnedCodexAdapter {
+    source: SourceLocation,
+}
+
+impl ProviderAdapter for PinnedCodexAdapter {
+    fn id(&self) -> &'static str {
+        statsai_adapters::CodexAdapter.id()
+    }
+
+    fn version(&self) -> &'static str {
+        statsai_adapters::CodexAdapter.version()
+    }
+
+    fn provider(&self) -> &'static str {
+        statsai_adapters::CodexAdapter.provider()
+    }
+
+    fn discover(&self) -> Vec<SourceLocation> {
+        vec![self.source.clone()]
+    }
+
+    fn scan_candidates(&self, source: &SourceLocation) -> Result<Vec<ScanCandidateFile>> {
+        statsai_adapters::CodexAdapter.scan_candidates(source)
+    }
+
+    fn scan(
+        &self,
+        source: &SourceLocation,
+        options: &ScanOptions,
+    ) -> Result<statsai_adapters::AdapterScan> {
+        statsai_adapters::CodexAdapter.scan(source, options)
+    }
+}
+
+#[test]
+fn cached_scan_picks_up_a_codex_thread_rename() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    let sessions = codex_root.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let index_path = codex_root.join("session_index.jsonl");
+    std::fs::write(
+        &index_path,
+        "{\"id\":\"thread-1\",\"thread_name\":\"First name\"}\n",
+    )
+    .expect("session index");
+    std::fs::write(
+        sessions.join("rollout.jsonl"),
+        [
+            r#"{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{"id":"thread-1"}}"#,
+            r#"{"timestamp":"2026-06-01T08:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            r#"{"timestamp":"2026-06-01T08:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120},"total_token_usage":{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120}}}}"#,
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .expect("rollout");
+
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "codex-local-jsonl",
+        statsai_adapters::CodexAdapter.version(),
+        &codex_root,
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let scan = || {
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(PinnedCodexAdapter {
+                source: source.clone(),
+            })],
+        )
+        .expect("scan");
+    };
+    let titles = || {
+        store
+            .all_session_rollups()
+            .expect("sessions")
+            .into_iter()
+            .map(|session| session.title)
+            .collect::<Vec<_>>()
+    };
+
+    scan();
+    assert_eq!(titles(), vec![Some("First name".to_string())]);
+
+    // Codex appends the rename to the index and leaves the rollout alone.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    std::fs::write(
+        &index_path,
+        "{\"id\":\"thread-1\",\"thread_name\":\"First name\"}\n\
+         {\"id\":\"thread-1\",\"thread_name\":\"Renamed thread\"}\n",
+    )
+    .expect("renamed index");
+    scan();
+    assert_eq!(titles(), vec![Some("Renamed thread".to_string())]);
+}

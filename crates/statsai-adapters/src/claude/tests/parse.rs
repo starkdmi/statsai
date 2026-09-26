@@ -499,6 +499,100 @@ fn claude_streaming_snapshots_keep_the_final_usage_for_one_request() {
 }
 
 #[test]
+fn claude_user_counts_stay_on_the_kept_streaming_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session");
+    writeln!(
+        file,
+        r#"{{"type":"user","timestamp":"2026-08-05T14:51:09.000Z","sessionId":"session-1","message":{{"role":"user","content":"hello"}}}}"#
+    )
+    .expect("user");
+    for (timestamp, uuid, output) in [
+        ("2026-08-05T14:51:09.702Z", "record-1", 10),
+        ("2026-08-05T14:51:11.102Z", "record-2", 40),
+    ] {
+        writeln!(
+            file,
+            r#"{{"timestamp":"{timestamp}","sessionId":"session-1","uuid":"{uuid}","requestId":"request-1","message":{{"id":"message-1","role":"assistant","model":"claude-opus-5","usage":{{"input_tokens":2,"output_tokens":{output}}}}}}}"#
+        )
+        .expect("snapshot");
+    }
+    writeln!(
+        file,
+        r#"{{"type":"user","timestamp":"2026-08-05T14:51:12.000Z","sessionId":"session-1","message":{{"role":"user","content":"again"}}}}"#
+    )
+    .expect("second user");
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-08-05T14:51:14.209Z","sessionId":"session-1","uuid":"record-3","requestId":"request-2","message":{{"id":"message-2","role":"assistant","model":"claude-opus-5","usage":{{"input_tokens":3,"output_tokens":5}}}}}}"#
+    )
+    .expect("second request");
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.events.len(), 2);
+    let first = scan.events[0].runtime.as_ref().expect("first runtime");
+    assert_eq!(first.user_messages, Some(1));
+    assert_eq!(first.assistant_messages, Some(1));
+    assert_eq!(scan.events[0].usage.output_tokens, Some(40));
+    let second = scan.events[1].runtime.as_ref().expect("second runtime");
+    assert_eq!(second.user_messages, Some(1));
+    assert_eq!(second.assistant_messages, Some(1));
+}
+
+#[test]
+fn claude_user_counts_skip_tool_results_meta_lines_and_compaction_summaries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session");
+    for line in [
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:00.000Z","sessionId":"session-1","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}"#,
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:01.000Z","sessionId":"session-1","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued"}}"#,
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:02.000Z","sessionId":"session-1","message":{"role":"user","content":"fix the parser"}}"#,
+        r#"{"timestamp":"2026-08-05T14:51:03.000Z","sessionId":"session-1","uuid":"record-1","requestId":"request-1","message":{"id":"message-1","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":2,"output_tokens":10}}}"#,
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:04.000Z","sessionId":"session-1","toolUseResult":{"stdout":"ok"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"ok"}]}}"#,
+        r#"{"type":"user","timestamp":"2026-08-05T14:51:05.000Z","sessionId":"session-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-2","content":"ok"}]}}"#,
+        r#"{"timestamp":"2026-08-05T14:51:06.000Z","sessionId":"session-1","uuid":"record-2","requestId":"request-2","message":{"id":"message-2","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":3,"output_tokens":5}}}"#,
+    ] {
+        writeln!(file, "{line}").expect("line");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    // One typed prompt, followed by two tool results that are not prompts.
+    let user_messages = scan
+        .events
+        .iter()
+        .map(|event| {
+            event
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.user_messages)
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    assert_eq!(scan.events.len(), 2);
+    assert_eq!(user_messages, 1);
+}
+
+#[test]
 fn claude_streaming_snapshots_with_equal_timestamps_resolve_by_source_line() {
     let dir = tempfile::tempdir().expect("tempdir");
     let projects = dir.path().join("projects");
@@ -1003,7 +1097,9 @@ fn claude_collects_effort_and_effective_speed_but_ignores_service_tier() {
         .expect("serialize model")
         .to_string()
         .contains("service_tier"));
-    assert!(scan.events[0].runtime.is_none());
+    let runtime = scan.events[0].runtime.as_ref().expect("message counts");
+    assert_eq!(runtime.assistant_messages, Some(1));
+    assert!(runtime.latency_ms.is_none());
 }
 
 #[test]
@@ -1117,4 +1213,163 @@ fn claude_scan_separates_oversized_rows_from_malformed_ones() {
         "a truncated row is still malformed"
     );
     assert_eq!(scan.events.len(), 1, "the usable row is still collected");
+}
+
+#[test]
+fn claude_session_titles_name_every_event_in_the_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session file");
+    for line in [
+        r#"{"type":"ai-title","aiTitle":"Generated name","sessionId":"titled"}"#,
+        r#"{"timestamp":"2026-05-01T00:00:00Z","sessionId":"titled","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        r#"{"timestamp":"2026-05-01T00:01:00Z","sessionId":"untitled","message":{"id":"m2","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        // A custom title outranks the generated one even though it comes later.
+        r#"{"type":"custom-title","customTitle":"Repair the session indexer","sessionId":"titled"}"#,
+        r#"{"type":"ai-title","aiTitle":"Later generated name","sessionId":"titled"}"#,
+    ] {
+        writeln!(file, "{line}").expect("write line");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.events.len(), 2);
+    let title_for = |session_raw: &str| {
+        let hash = statsai_core::hash_text(session_raw);
+        scan.events
+            .iter()
+            .find(|event| event.session.local_session_id_hash.as_deref() == Some(hash.as_str()))
+            .expect("event")
+            .session
+            .title
+            .clone()
+    };
+    assert_eq!(
+        title_for("titled").as_deref(),
+        Some("Repair the session indexer")
+    );
+    assert_eq!(title_for("untitled"), None);
+}
+
+#[test]
+fn claude_session_titles_reach_events_read_from_other_transcripts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    // A resumed session's copied messages dedupe onto the transcript that
+    // first held them, while the title is written to the resumed transcript.
+    let mut original = File::create(projects.join("original.jsonl")).expect("original");
+    writeln!(
+        original,
+        r#"{{"timestamp":"2026-05-01T00:00:00Z","sessionId":"resumed","message":{{"id":"m1","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#
+    )
+    .expect("write original");
+    let mut resumed = File::create(projects.join("resumed.jsonl")).expect("resumed");
+    writeln!(
+        resumed,
+        r#"{{"type":"custom-title","customTitle":"Design tool/plugin","sessionId":"resumed"}}"#
+    )
+    .expect("write resumed");
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(
+        scan.events[0].session.title.as_deref(),
+        Some("Design tool/plugin")
+    );
+}
+
+#[test]
+fn claude_events_carry_the_prompt_that_started_their_turn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    let mut file = File::create(projects.join("session.jsonl")).expect("session file");
+    for line in [
+        r#"{"type":"user","timestamp":"2026-05-01T10:00:00Z","sessionId":"turns","message":{"role":"user","content":"Fix the parser"}}"#,
+        r#"{"type":"assistant","timestamp":"2026-05-01T10:01:00Z","sessionId":"turns","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        r#"{"type":"user","timestamp":"2026-05-01T10:02:00Z","sessionId":"turns","toolUseResult":{},"message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#,
+        r#"{"type":"assistant","timestamp":"2026-05-01T10:03:00Z","sessionId":"turns","message":{"id":"m2","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        r#"{"type":"user","timestamp":"2026-05-01T15:00:00Z","sessionId":"turns","message":{"role":"user","content":[{"type":"text","text":"Now the tests"}]}}"#,
+        r#"{"type":"assistant","timestamp":"2026-05-01T15:04:00Z","sessionId":"turns","message":{"id":"m3","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+    ] {
+        writeln!(file, "{line}").expect("write line");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+    let mut turns = scan
+        .events
+        .iter()
+        .map(|event| {
+            (
+                event.session.started_at.to_rfc3339(),
+                event.session.turn_started_at.map(|at| at.to_rfc3339()),
+            )
+        })
+        .collect::<Vec<_>>();
+    turns.sort();
+    let prompt = |hour: &str| Some(format!("2026-05-01T{hour}:00:00+00:00"));
+    assert_eq!(
+        turns,
+        vec![
+            ("2026-05-01T10:01:00+00:00".to_string(), prompt("10")),
+            ("2026-05-01T10:03:00+00:00".to_string(), prompt("10")),
+            ("2026-05-01T15:04:00+00:00".to_string(), prompt("15")),
+        ]
+    );
+}
+
+#[test]
+fn claude_title_only_transcripts_report_session_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects");
+    // A resumed transcript holding only the rename; the usage lives elsewhere.
+    let mut file = File::create(projects.join("resumed.jsonl")).expect("resumed");
+    writeln!(
+        file,
+        r#"{{"type":"custom-title","customTitle":"Renamed session","sessionId":"renamed"}}"#
+    )
+    .expect("write title");
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+    assert!(scan.events.is_empty());
+    assert_eq!(
+        scan.session_names,
+        vec![statsai_core::SessionName {
+            local_session_id_hash: statsai_core::hash_text("renamed"),
+            title: "Renamed session".to_string(),
+            parent_local_session_id_hash: None,
+        }]
+    );
 }

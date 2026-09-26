@@ -39,6 +39,8 @@ pub(crate) fn parse_codex_file(
     let mut current_model_is_fallback = false;
     let mut current_project: Option<ProjectInfo> = None;
     let mut current_title: Option<String> = None;
+    // Events only: a sub-agent borrows its parent thread's name, but task
+    // titles keep their own prompt-based rules.
     let mut current_thread_id: Option<String> = None;
     // Seeded from the file path, replaced by the session's own id as soon as
     // the `session_meta` line declares one. The embedded id is the same UUID
@@ -341,22 +343,17 @@ pub(crate) fn parse_codex_file(
                 session_raw = declared_session_id;
             }
             if collect_tasks {
-                current_thread_id = declared_session_id;
-                let session_id = current_thread_id
-                    .clone()
-                    .or_else(|| Some(session_raw.clone()));
-                current_title = value
-                    .pointer("/payload/thread_name")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .or_else(|| {
-                        session_id
-                            .as_ref()
-                            .and_then(|session_id| thread_titles.get(session_id))
-                            .cloned()
-                    })
-                    .or_else(|| thread_titles.get(&session_raw).cloned());
+                current_thread_id = declared_session_id.clone();
             }
+            let session_id = declared_session_id.unwrap_or_else(|| session_raw.clone());
+            current_title = value
+                .pointer("/payload/thread_name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| thread_titles.get(&session_id).cloned());
+            ctx.scan
+                .session_names
+                .extend(codex_subagent_session_name(&value, &session_id));
             current_project = codex_project_context_from_value(&value, &mut project_cache);
             continue;
         }
@@ -563,6 +560,7 @@ pub(crate) fn parse_codex_file(
                 accumulated_usage: record.usage.clone(),
                 prompt_previews: Vec::new(),
                 last_activity_at: record.timestamp,
+                last_work_at: started_at,
                 usage_lines: record
                     .usage
                     .as_ref()
@@ -587,6 +585,11 @@ pub(crate) fn parse_codex_file(
             }
             turn.timestamp_inferred |= record.timestamp_inferred;
             turn.last_activity_at = record.timestamp;
+            // Your next prompt can land inside the open turn just before Codex
+            // completes it; that is the start of the next turn, not work.
+            if !record.is_task_complete && record.message_role.as_deref() != Some("user") {
+                turn.last_work_at = record.timestamp;
+            }
             if record.project.is_some() {
                 turn.project = record.project.clone();
             }
@@ -688,13 +691,20 @@ pub(crate) fn parse_codex_file(
                 consumed_usage_lines.insert(record.line_number);
             }
             let explicit_duration_ms = record.task_duration_ms;
+            // Without a reported duration, the turn ran until its last record
+            // of work, not until the completion Codex may write on resume.
+            let worked_until = if turn.last_work_at > turn.started_at {
+                turn.last_work_at.min(completed_at)
+            } else {
+                completed_at
+            };
             let duration_ms = explicit_duration_ms
-                .or_else(|| codex_duration_from_turn_timestamps(turn.started_at, completed_at));
+                .or_else(|| codex_duration_from_turn_timestamps(turn.started_at, worked_until));
             let latency_source = explicit_duration_ms
                 .map(|_| LatencySource::Explicit)
                 .or_else(|| duration_ms.map(|_| LatencySource::Inferred));
             let time_to_first_token_ms = record.time_to_first_token_ms;
-            let event = usage_event(
+            let mut event = usage_event(
                 ctx.adapter,
                 ctx.source,
                 ctx.options,
@@ -734,6 +744,7 @@ pub(crate) fn parse_codex_file(
                     dedupe_salt: None,
                 },
             );
+            event.session.title = turn.title.clone();
             let mut linked_quota_lines = turn.usage_lines.clone();
             linked_quota_lines.extend_from_slice(&turn.quota_lines);
             if record.usage.is_some() {
@@ -930,7 +941,8 @@ pub(crate) fn parse_codex_file(
         if consumed_usage_lines.contains(&record.line_number) {
             continue;
         }
-        let event = usage_event(
+        let session_title = record.session_title;
+        let mut event = usage_event(
             ctx.adapter,
             ctx.source,
             ctx.options,
@@ -966,6 +978,7 @@ pub(crate) fn parse_codex_file(
                 dedupe_salt: None,
             },
         );
+        event.session.title = session_title;
         // A record's paired token_count carries the quota sample for it.
         let mut linked_quota_lines = vec![record.line_number];
         linked_quota_lines.extend(paired_quota_lines.get(&record.line_number));

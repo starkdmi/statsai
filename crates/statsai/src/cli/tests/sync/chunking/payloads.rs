@@ -37,6 +37,7 @@ fn test_quota_only_sync_batch(now: DateTime<Utc>, count: usize) -> SyncBatch {
         account_evidence_summaries: vec![],
         activity_rollups: vec![],
         activity_coverage: vec![],
+        sessions: vec![],
         events: vec![],
         summaries: vec![],
         task_buckets: vec![],
@@ -215,6 +216,72 @@ fn http_rollup_retry_splits_code_change_only_payloads() {
 }
 
 #[test]
+fn http_rollup_retry_splits_sessions_and_activity_after_d1_budget_rejection() {
+    let now = Utc
+        .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+        .single()
+        .expect("date");
+    let budget_error = anyhow::anyhow!(
+        r#"sync endpoint returned HTTP 413: {{"error":"sync_batch_d1_query_budget_exceeded","estimatedQueries":70,"maxQueries":45}}"#
+    );
+    let mut sessions = test_task_only_sync_batch(now, 0, 0);
+    sessions.sessions = test_session_rollups(2);
+    assert!(should_retry_http_rollup_chunk_after_error(
+        &sessions,
+        &budget_error
+    ));
+    let session_chunks = split_http_rollup_sync_batch_after_budget_error(&sessions);
+    assert_eq!(session_chunks.len(), 2);
+    assert!(session_chunks.iter().all(|chunk| chunk.sessions.len() == 1));
+
+    let mut one_session = sessions.clone();
+    one_session.sessions.truncate(1);
+    assert!(!should_retry_http_rollup_chunk_after_error(
+        &one_session,
+        &budget_error
+    ));
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-http-session-mixed"),
+        LocationOrigin::Configured,
+    );
+    one_session.summaries = vec![test_summary("codex", &source, now, 10, None)];
+    assert!(should_retry_http_rollup_chunk_after_error(
+        &one_session,
+        &budget_error
+    ));
+
+    let mut activity = test_task_only_sync_batch(now, 0, 0);
+    activity.activity_rollups = vec![test_activity_rollup(0, None), test_activity_rollup(1, None)];
+    assert!(should_retry_http_rollup_chunk_after_error(
+        &activity,
+        &budget_error
+    ));
+    let activity_chunks = split_http_rollup_sync_batch_after_budget_error(&activity);
+    assert_eq!(activity_chunks.len(), 2);
+    assert!(activity_chunks
+        .iter()
+        .all(|chunk| chunk.activity_rollups.len() == 1));
+
+    let mut coverage = test_task_only_sync_batch(now, 0, 0);
+    coverage.activity_coverage = vec![test_activity_coverage(0), test_activity_coverage(1)];
+    assert!(should_retry_http_rollup_chunk_after_error(
+        &coverage,
+        &budget_error
+    ));
+
+    let mut mixed_activity = test_task_only_sync_batch(now, 0, 0);
+    mixed_activity.activity_rollups = vec![test_activity_rollup(0, None)];
+    mixed_activity.summaries = vec![test_summary("codex", &source, now, 10, None)];
+    assert!(should_retry_http_rollup_chunk_after_error(
+        &mixed_activity,
+        &budget_error
+    ));
+}
+
+#[test]
 fn http_rollup_retry_halves_task_only_bucket_chunks() {
     let now = Utc
         .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
@@ -264,6 +331,7 @@ fn http_rollup_sends_metadata_before_task_chunks() {
         account_evidence_summaries: vec![],
         activity_rollups: vec![],
         activity_coverage: vec![],
+        sessions: vec![],
         events: vec![],
         summaries: vec![],
         task_buckets: test_task_only_sync_batch(now, 1, 0).task_buckets,

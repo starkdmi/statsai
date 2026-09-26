@@ -434,6 +434,7 @@ fn local_refresh_preserves_metrics_ingested_from_another_device() {
             account_evidence_summaries: Vec::new(),
             activity_rollups: Vec::new(),
             activity_coverage: Vec::new(),
+            sessions: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets: Vec::new(),

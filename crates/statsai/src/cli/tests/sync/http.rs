@@ -55,6 +55,7 @@ fn http_rollup_sync_retries_smaller_batches_after_budget_rejection() {
         account_evidence_summaries: vec![],
         activity_rollups: vec![],
         activity_coverage: vec![],
+        sessions: vec![],
         events: vec![],
         summaries,
         task_buckets: vec![],
@@ -112,6 +113,50 @@ fn http_rollup_sync_retries_smaller_batches_after_budget_rejection() {
 }
 
 #[test]
+fn http_rollup_sync_retries_sessions_after_d1_budget_rejection() {
+    let store = Store::in_memory().expect("store");
+    let endpoint = "https://api.example.com/api/sync/batches".to_string();
+    let now = Utc
+        .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+        .single()
+        .expect("date");
+    let mut batch = test_task_only_sync_batch(now, 0, 0);
+    batch.batch_id = "batch_sessions".to_string();
+    batch.sessions = test_session_rollups(4);
+    let logical_batch_id = logical_http_rollup_batch_id(&batch.batch_id).to_string();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observed_for_send = Arc::clone(&observed);
+
+    send_http_rollup_chunk_with_retry_using(&batch, &|chunk| {
+        observed_for_send
+            .lock()
+            .expect("observed lock")
+            .push((chunk.batch_id.clone(), chunk.sessions.len()));
+        if chunk.sessions.len() > 2 {
+            return Err(anyhow::Error::msg(
+                r#"sync endpoint returned HTTP 413: {"error":"sync_batch_d1_query_budget_exceeded","estimatedQueries":70,"maxQueries":45}"#,
+            ));
+        }
+        record_rollup_sync_chunk_success(&store, "http", &endpoint, &logical_batch_id, chunk)
+    })
+    .expect("send");
+
+    let observed = observed.lock().expect("observed lock").clone();
+    assert_eq!(
+        observed,
+        vec![
+            ("batch_sessions".to_string(), 4),
+            ("batch_sessions_sessions_1".to_string(), 2),
+            ("batch_sessions_sessions_2".to_string(), 2),
+        ]
+    );
+    let pending = store
+        .pending_session_rollups_for_sync("http", &endpoint, &batch.sessions)
+        .expect("pending sessions");
+    assert!(pending.is_empty());
+}
+
+#[test]
 fn http_rollup_sync_retries_smaller_batches_after_payload_too_large() {
     let store = Store::in_memory().expect("store");
     let endpoint = "https://api.example.com/api/sync/batches".to_string();
@@ -152,6 +197,7 @@ fn http_rollup_sync_retries_smaller_batches_after_payload_too_large() {
         account_evidence_summaries: vec![],
         activity_rollups: vec![],
         activity_coverage: vec![],
+        sessions: vec![],
         events: vec![],
         summaries,
         task_buckets: vec![],

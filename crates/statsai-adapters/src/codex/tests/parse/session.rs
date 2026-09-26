@@ -394,4 +394,149 @@ fn codex_task_spans_capture_thread_id_from_session_meta() {
     // account bindings all meet on one key instead of a file path.
     assert_eq!(scan.task_spans[0].session_id.as_deref(), Some("thread-123"));
     assert_eq!(scan.task_spans[0].title, "Fix parser bug");
+
+    // The thread name titles the session even when tasks are not collected.
+    let without_tasks =
+        scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
+    assert!(without_tasks.task_spans.is_empty());
+    assert!(!without_tasks.events.is_empty());
+    assert!(without_tasks
+        .events
+        .iter()
+        .all(|event| event.session.title.as_deref() == Some("Fix parser bug")));
+}
+
+#[test]
+fn codex_subagents_borrow_their_parent_thread_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    let sessions = codex_root.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    std::fs::write(
+        codex_root.join("session_index.jsonl"),
+        "{\"id\":\"parent-1\",\"thread_name\":\"Fix parser bug\"}\n",
+    )
+    .expect("session index");
+    for (index, (file, meta)) in [
+        (
+            "spawned.jsonl",
+            r#"{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{"id":"child-spawned","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1","depth":1,"agent_nickname":"Popper","agent_role":null}}}}}"#,
+        ),
+        (
+            "guardian.jsonl",
+            r#"{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{"id":"child-guardian","session_id":"parent-1","source":{"subagent":{"other":"guardian"}}}}"#,
+        ),
+        (
+            "orphan.jsonl",
+            r#"{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{"id":"child-orphan","source":{"subagent":{"other":"guardian"}}}}"#,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Distinct usage per rollout, or the path-independent dedupe keeps one.
+        let input = 60 + index;
+        let total = 120 + index;
+        let usage = format!(
+            r#"{{"timestamp":"2026-06-01T08:00:03Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":{total}}},"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":{total}}}}}}}}}"#
+        );
+        let mut handle = File::create(sessions.join(file)).expect("rollout");
+        writeln!(handle, "{meta}").expect("meta");
+        writeln!(
+            handle,
+            r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"turn_context","payload":{{"model":"gpt-5"}}}}"#
+        )
+        .expect("context");
+        writeln!(handle, "{usage}").expect("usage");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        &codex_root,
+        LocationOrigin::Configured,
+    );
+    let scan = scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
+    // The parent's name is joined when the session is built, so a rename of
+    // the parent reaches its sub-agents; here only the link is reported.
+    let link_for = |raw: &str| {
+        let hash = statsai_core::hash_text(raw);
+        scan.session_names
+            .iter()
+            .find(|name| name.local_session_id_hash == hash)
+            .cloned()
+    };
+    let parent = Some(statsai_core::hash_text("parent-1"));
+    assert_eq!(
+        link_for("child-spawned").map(|name| (name.title, name.parent_local_session_id_hash)),
+        Some(("Popper".to_string(), parent.clone()))
+    );
+    assert_eq!(
+        link_for("child-guardian").map(|name| (name.title, name.parent_local_session_id_hash)),
+        Some(("guardian".to_string(), parent))
+    );
+    assert_eq!(link_for("child-orphan"), None);
+}
+
+#[test]
+fn codex_turns_without_a_reported_duration_end_at_their_last_work() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    let sessions = codex_root.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let mut file = File::create(sessions.join("resumed.jsonl")).expect("rollout");
+    for line in [
+        r#"{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{"id":"resumed-thread"}}"#,
+        r#"{"timestamp":"2026-06-01T08:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        r#"{"timestamp":"2026-06-01T08:00:01Z","type":"event_msg","payload":{"type":"task_started","started_at":"2026-06-01T08:00:01Z"}}"#,
+        r#"{"timestamp":"2026-06-01T08:02:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120},"total_token_usage":{"input_tokens":60,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":120}}}}"#,
+        // The next prompt and the completion are written three days later,
+        // when the thread runs again, with no duration.
+        r#"{"timestamp":"2026-06-04T09:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Next step"}]}}"#,
+        r#"{"timestamp":"2026-06-04T09:00:00Z","type":"event_msg","payload":{"type":"task_complete","completed_at":"2026-06-04T09:00:00Z"}}"#,
+    ] {
+        writeln!(file, "{line}").expect("write line");
+    }
+
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        &codex_root,
+        LocationOrigin::Configured,
+    );
+    let scan = scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.events[0].session.duration_seconds, Some(120));
+}
+
+#[test]
+fn codex_session_index_names_are_reported_on_every_scan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    std::fs::create_dir_all(codex_root.join("sessions")).expect("sessions");
+    std::fs::write(
+        codex_root.join("session_index.jsonl"),
+        "{\"id\":\"thread-1\",\"thread_name\":\"Design tool/plugin\"}\n",
+    )
+    .expect("session index");
+
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        &codex_root,
+        LocationOrigin::Configured,
+    );
+    let scan = scan_codex_source(&CodexAdapter, &source, &options_without_tasks()).expect("scan");
+    // No rollout changed, yet the index name is reported, uncleaned.
+    assert_eq!(
+        scan.session_names,
+        vec![statsai_core::SessionName {
+            local_session_id_hash: statsai_core::hash_text("thread-1"),
+            title: "Design tool/plugin".to_string(),
+            parent_local_session_id_hash: None,
+        }]
+    );
 }

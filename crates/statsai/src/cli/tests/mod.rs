@@ -8,6 +8,7 @@ mod import;
 mod quota;
 mod report;
 mod scan;
+mod sessions;
 mod source;
 mod status;
 mod subscription;

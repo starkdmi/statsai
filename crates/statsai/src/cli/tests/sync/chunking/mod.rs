@@ -41,6 +41,7 @@ fn http_rollup_sync_splits_large_summary_batches() {
         account_evidence_summaries: vec![],
         activity_rollups: vec![],
         activity_coverage: vec![],
+        sessions: vec![],
         events: vec![],
         summaries,
         task_buckets: vec![],
@@ -94,6 +95,7 @@ fn http_rollup_sync_sends_authoritative_snapshot_after_data_chunks() {
         account_evidence_summaries: Vec::new(),
         activity_rollups: Vec::new(),
         activity_coverage: Vec::new(),
+        sessions: Vec::new(),
         events: Vec::new(),
         summaries: Vec::new(),
         task_buckets: Vec::new(),
@@ -150,6 +152,7 @@ fn http_rollup_sync_bounds_authoritative_snapshot_chunks() {
         account_evidence_summaries: Vec::new(),
         activity_rollups: Vec::new(),
         activity_coverage: Vec::new(),
+        sessions: Vec::new(),
         events: Vec::new(),
         summaries: Vec::new(),
         task_buckets: Vec::new(),
@@ -274,6 +277,7 @@ fn http_rollup_sync_splits_metadata_away_from_summaries() {
         account_evidence_summaries: vec![],
         activity_rollups: vec![],
         activity_coverage: vec![],
+        sessions: vec![],
         events: vec![],
         summaries,
         task_buckets: vec![],
@@ -346,6 +350,7 @@ fn http_rollup_metadata_budget_retries_preserve_all_metadata_kinds() {
         account_evidence_summaries: vec![],
         activity_rollups: vec![],
         activity_coverage: vec![],
+        sessions: vec![],
         events: vec![],
         summaries: vec![],
         task_buckets: vec![],
@@ -381,4 +386,70 @@ fn http_rollup_metadata_budget_retries_preserve_all_metadata_kinds() {
     assert!(chunks.iter().all(|chunk| chunk.events.is_empty()));
     assert!(chunks.iter().any(|chunk| !chunk.sources.is_empty()));
     assert!(chunks.iter().any(|chunk| !chunk.accounts.is_empty()));
+}
+
+#[test]
+fn http_rollup_snapshot_preserves_opt_in_session_retirement() {
+    let now = Utc
+        .with_ymd_and_hms(2026, 5, 29, 10, 12, 43)
+        .single()
+        .expect("date");
+    let empty = SyncBatch {
+        schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+        batch_id: "batch_empty_sessions".to_string(),
+        device_id: "device".to_string(),
+        sources: Vec::new(),
+        accounts: Vec::new(),
+        source_account_assignments: Vec::new(),
+        subscriptions: Vec::new(),
+        account_plan_observations: Vec::new(),
+        account_evidence_summaries: Vec::new(),
+        activity_rollups: Vec::new(),
+        activity_coverage: Vec::new(),
+        sessions: Vec::new(),
+        events: Vec::new(),
+        summaries: Vec::new(),
+        task_buckets: Vec::new(),
+        task_verifications: Vec::new(),
+        code_change_metrics: Vec::new(),
+        quota_cycle_contributions: Vec::new(),
+        authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
+            session_rollup_ids: Some(Vec::new()),
+            ..SyncAuthoritativeSnapshot::default()
+        }),
+        created_at: now,
+    };
+    let empty_snapshot = split_http_rollup_sync_batches(&empty)
+        .into_iter()
+        .find_map(|chunk| chunk.authoritative_snapshot)
+        .expect("snapshot chunk");
+    assert_eq!(empty_snapshot.session_rollup_ids.as_deref(), Some(&[][..]));
+    let json = serde_json::to_value(&empty_snapshot).expect("serialize");
+    assert_eq!(json["session_rollup_ids"], serde_json::json!([]));
+
+    let ids = (0..=HTTP_ROLLUP_SNAPSHOT_IDS_PER_BATCH)
+        .map(|index| format!("session-{index}"))
+        .collect::<Vec<_>>();
+    let split = SyncBatch {
+        batch_id: "batch_split_sessions".to_string(),
+        authoritative_snapshot: Some(SyncAuthoritativeSnapshot {
+            session_rollup_ids: Some(ids.clone()),
+            ..SyncAuthoritativeSnapshot::default()
+        }),
+        ..empty
+    };
+    let parts = split_http_rollup_sync_batches(&split)
+        .into_iter()
+        .filter_map(|chunk| chunk.authoritative_snapshot)
+        .collect::<Vec<_>>();
+    assert!(parts.len() > 1);
+    let seen = parts
+        .iter()
+        .flat_map(|part| {
+            part.session_rollup_ids
+                .clone()
+                .expect("parts that carry session ids keep the retirement key")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(seen, ids);
 }

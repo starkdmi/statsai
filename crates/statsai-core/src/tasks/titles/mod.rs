@@ -96,6 +96,39 @@ pub fn task_title_signal_score(value: Option<&str>) -> i32 {
     score
 }
 
+/// Whether a session name the provider itself assigned is unfit to show.
+///
+/// Provider names are shown as the provider shows them, so "Review
+/// uncommitted changes" or "Say hi" stay. The genericness rules in
+/// [`task_title_is_generic`] rank prompt-derived task titles; here only a
+/// placeholder or text that looks like a secret or a locator is dropped.
+#[must_use]
+pub fn provider_session_title_is_unusable(value: Option<&str>) -> bool {
+    let Some(name) = super::normalize::provider_session_name(value, usize::MAX) else {
+        return true;
+    };
+    looks_like_sensitive_locator_dump(&name)
+        || looks_like_provider_placeholder_title(&name)
+        || looks_like_session_placeholder_name(&name)
+}
+
+/// Default names a tool gives a session before anything names it, such as
+/// OpenCode's "New session - 2026-04-30T16:41:41.413Z".
+const SESSION_PLACEHOLDER_NAMES: &[&str] = &[
+    "new session",
+    "new chat",
+    "new conversation",
+    "new thread",
+    "untitled",
+    "untitled session",
+];
+
+fn looks_like_session_placeholder_name(name: &str) -> bool {
+    let lowercase = name.to_ascii_lowercase();
+    let head = lowercase.split(" - ").next().unwrap_or_default().trim();
+    SESSION_PLACEHOLDER_NAMES.contains(&head)
+}
+
 #[must_use]
 pub fn task_title_is_generic(value: Option<&str>) -> bool {
     let Some(raw) = value else {

@@ -3,8 +3,23 @@ use super::*;
 impl Store {
     pub fn replace_task_bucket_snapshot(&self, snapshot: &TaskBucketSnapshot) -> Result<()> {
         self.with_immediate_transaction(|| {
+            let mut raw_session_ids =
+                self.task_span_raw_session_ids_for_bucket(&snapshot.project_bucket)?;
             self.delete_task_bucket_snapshot_in_tx(&snapshot.project_bucket)?;
             self.upsert_task_spans_in_tx(&snapshot.spans)?;
+            for span in &snapshot.spans {
+                if let Some(session_id) = span
+                    .session_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    raw_session_ids.insert(session_id.to_string());
+                }
+            }
+            self.refresh_session_rollups_for_raw_ids(
+                &raw_session_ids.into_iter().collect::<Vec<_>>(),
+            )?;
             self.insert_work_items_in_tx(&snapshot.work_items, &snapshot.members)?;
             let mut changed_buckets = BTreeSet::new();
             changed_buckets.insert(snapshot.project_bucket.clone());

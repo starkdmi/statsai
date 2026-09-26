@@ -34,8 +34,8 @@ impl Store {
                 INSERT INTO archive_conversations
                   (conversation_id, provider, source_id, native_conversation_id, title,
                    project_json, started_at, updated_at, completeness,
-                   missing_content_count, imported_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                   missing_content_count, imported_at, session_hash)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT(conversation_id) DO UPDATE SET
                   source_id = excluded.source_id,
                   title = COALESCE(excluded.title, archive_conversations.title),
@@ -68,6 +68,7 @@ impl Store {
                     conversation.completeness.as_str(),
                     conversation.missing_content_count,
                     &imported_at,
+                    statsai_core::hash_text(&conversation.native_conversation_id),
                 ],
             )?;
             result.conversations += 1;
@@ -201,6 +202,11 @@ impl Store {
                 ],
             )?;
         }
+        let raw_session_ids = conversations
+            .iter()
+            .map(|conversation| conversation.native_conversation_id.clone())
+            .collect::<Vec<_>>();
+        self.refresh_session_rollups_for_raw_ids(&raw_session_ids)?;
         Ok(result)
     }
 

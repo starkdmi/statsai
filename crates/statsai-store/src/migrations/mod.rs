@@ -8,7 +8,7 @@ mod v2;
 pub(crate) use v1::*;
 pub(crate) use v2::*;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 25;
+pub const CURRENT_SCHEMA_VERSION: i64 = 28;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -150,6 +150,9 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         23 => apply_migration_023(conn),
         24 => apply_migration_024(conn),
         25 => apply_migration_025(conn),
+        26 => apply_migration_026(conn),
+        27 => apply_migration_027(conn),
+        28 => apply_migration_028(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -390,6 +393,18 @@ mod tests {
                 "collect a payload's remaining references",
                 "SELECT 1 FROM quota_observations o WHERE o.payload_hash = ?1".to_string(),
             ),
+            (
+                "look up a session's archive titles",
+                "SELECT title FROM archive_conversations WHERE session_hash IN (?1, ?2)"
+                    .to_string(),
+            ),
+            (
+                "look up a session's task-span titles",
+                "SELECT title FROM task_spans
+                 WHERE is_meta = 0
+                   AND (session_hash IN (?1, ?2) OR session_uuid_hash IN (?1, ?2))"
+                    .to_string(),
+            ),
         ] {
             let plan = query_plan(&conn, &sql);
             assert!(
@@ -442,21 +457,27 @@ mod tests {
               version INTEGER PRIMARY KEY,
               applied_at TEXT NOT NULL
             );
-            INSERT INTO schema_migrations (version, applied_at)
-            VALUES (26, '2026-08-23T00:00:00Z');
             "#,
+        )
+        .expect("prepare future schema marker");
+        let future = CURRENT_SCHEMA_VERSION + 1;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, '2026-08-23T00:00:00Z')",
+            [future],
         )
         .expect("create future schema marker");
 
-        let error = migrate(&conn).expect_err("schema 26 must be rejected by schema 25 binary");
+        let error = migrate(&conn).expect_err("newer schema must be rejected");
 
         assert_eq!(
             error.to_string(),
-            "database schema version 26 is newer than this StatsAI binary supports (25); upgrade StatsAI or use a compatible database"
+            format!(
+                "database schema version {future} is newer than this StatsAI binary supports ({CURRENT_SCHEMA_VERSION}); upgrade StatsAI or use a compatible database"
+            )
         );
         assert_eq!(
             current_schema_version(&conn).expect("read unchanged version"),
-            26
+            future
         );
     }
 
@@ -500,6 +521,68 @@ mod tests {
             "account_evidence_checkpoints",
             "checkpoint_row_fingerprint"
         ));
+    }
+
+    #[test]
+    fn version_twenty_seven_backfills_session_title_keys() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        ensure_migrations_table(&conn).expect("ensure migrations table");
+        for version in 1..=27 {
+            apply_migration(&conn, version).expect("apply earlier migration");
+            record_migration(&conn, version).expect("record earlier migration");
+        }
+        let rollout =
+            "sessions/2026/06/01/rollout-2026-06-01T08-00-00-0199a0b1-c2d3-7e4f-8a9b-0c1d2e3f4a5b";
+        conn.execute_batch(&format!(
+            r#"
+            INSERT INTO task_spans (span_id, provider, source_id, project_bucket, started_at,
+              title, normalized_title, confidence, payload)
+            VALUES
+              ('span-rollout', 'codex', 'source-1', 'bucket', '2026-06-01T08:00:00Z',
+               'Fix parser', 'fix parser', 'high', '{{"session_id":"{rollout}"}}'),
+              ('span-none', 'codex', 'source-1', 'bucket', '2026-06-01T08:00:00Z',
+               'Other', 'other', 'high', '{{}}');
+            INSERT INTO archive_conversations (conversation_id, provider, source_id,
+              native_conversation_id, completeness, imported_at)
+            VALUES ('conversation-1', 'claude_code', 'source-2', 'claude-session', 'complete',
+              '2026-06-01T08:00:00Z');
+            "#
+        ))
+        .expect("seed version twenty-seven rows");
+
+        migrate(&conn).expect("migrate version twenty-seven database");
+
+        let span_keys = |span_id: &str| {
+            conn.query_row(
+                "SELECT session_hash, session_uuid_hash FROM task_spans WHERE span_id = ?1",
+                [span_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .expect("span keys")
+        };
+        assert_eq!(
+            span_keys("span-rollout"),
+            (
+                Some(statsai_core::hash_text(rollout)),
+                Some(statsai_core::hash_text(
+                    "0199a0b1-c2d3-7e4f-8a9b-0c1d2e3f4a5b"
+                )),
+            )
+        );
+        assert_eq!(span_keys("span-none"), (None, None));
+        let archive_key: String = conn
+            .query_row(
+                "SELECT session_hash FROM archive_conversations WHERE conversation_id = 'conversation-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("archive key");
+        assert_eq!(archive_key, statsai_core::hash_text("claude-session"));
     }
 
     #[test]

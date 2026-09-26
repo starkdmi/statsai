@@ -6,6 +6,7 @@ Usage: statsai [OPTIONS] <COMMAND>
 Commands:
   scan          Scan local provider sources for usage events
   report        Show usage reports (weekly, monthly, all-time, or a date range)
+  sessions      List local session rollups
   source        Manage configured source paths
   account       List canonical provider accounts
   subscription  Manage subscription periods
@@ -113,6 +114,22 @@ Options:
       --json                   Output as JSON
       --verbose                Show source paths and reasoning tokens
       --subscriptions          Include subscription-value rows
+  -h, --help                   Print help
+===== statsai sessions --help =====
+List local session rollups
+
+Usage: statsai sessions [OPTIONS]
+
+Options:
+      --from <FROM>            Range start (YYYY-MM-DD or RFC3339). Defaults to the last 7 days
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --to <TO>                Range end (YYYY-MM-DD or RFC3339). Defaults to now
+      --provider <PROVIDER>    Provider filter
+      --project <PROJECT>      Project id, key, or label
+      --sort <SORT>            Sort descending [default: started] [possible values: started, tokens, cost, duration, messages]
+      --limit <LIMIT>          Maximum sessions to print [default: 50]
+      --json                   Output as JSON
   -h, --help                   Print help
 ===== statsai source --help =====
 Manage configured source paths
@@ -1036,11 +1053,13 @@ Options:
       --yes                      Confirm destructive sync reset actions
       --dry-run                  Build the sync batch without writing
       --include-projects         Enable project metadata sync for this device and future syncs
-      --exclude-projects         Disable project metadata sync for this device and future syncs
+      --exclude-projects         Disable project metadata sync for this device and future syncs; hosted sessions are retired
       --include-tasks            Enable hosted task sync for this device and future syncs (implies --include-projects)
       --exclude-tasks            Disable hosted task sync for this device and future syncs
       --include-activity         Enable hosted agent activity sync for this device and future syncs
       --exclude-activity         Disable hosted agent activity sync and prune names on the next successful HTTP sync
+      --include-sessions         Enable hosted session sync for this device and future syncs (implies --include-projects)
+      --exclude-sessions         Disable hosted session sync for this device and future syncs
   -h, --help                     Print help
 ===== statsai schema --help =====
 Print JSON schemas for backend-facing contracts

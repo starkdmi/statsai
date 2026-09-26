@@ -205,6 +205,7 @@ pub(crate) fn scan_claude_source(
     let event_files = claude_jsonl_candidates(&projects, &cache_namespaces)?;
     let mut scanned_event_cache_keys = HashSet::new();
     let mut seen = EventDedupIndex::new();
+    let mut session_titles = ClaudeSessionTitles::default();
     {
         let mut ctx = FileParseContext {
             adapter,
@@ -220,9 +221,17 @@ pub(crate) fn scan_claude_source(
             }
             ctx.scan.diagnostics.files_scanned += 1;
             scanned_event_cache_keys.insert(candidate.cache_key.clone());
-            parse_claude_file(&mut ctx, &projects, &session_projects, &candidate.path)?;
+            parse_claude_file(
+                &mut ctx,
+                &projects,
+                &session_projects,
+                &mut session_titles,
+                &candidate.path,
+            )?;
         }
     }
+    let session_names = session_titles.apply(&mut scan.events);
+    scan.session_names.extend(session_names);
 
     if let Some(candidate) = claude_stats_cache_candidate(&root, &cache_namespaces) {
         if options.should_scan(&candidate.cache_key) {

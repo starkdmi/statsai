@@ -39,6 +39,7 @@ fn inserts_events_idempotently() {
             started_at: now,
             ended_at: None,
             duration_seconds: None,
+            turn_started_at: None,
         },
         model: None,
         usage: UsageCounts {

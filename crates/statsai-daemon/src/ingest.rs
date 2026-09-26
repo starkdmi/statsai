@@ -65,6 +65,9 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     {
         bail!("activity collections require sync_batch.v6");
     }
+    if batch.schema_version != SYNC_BATCH_V6_SCHEMA_VERSION && !batch.sessions.is_empty() {
+        bail!("session rollups require sync_batch.v6");
+    }
     if batch
         .code_change_metrics
         .iter()
@@ -91,6 +94,9 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
     if !batch.activity_rollups.is_empty() || !batch.activity_coverage.is_empty() {
         bail!("activity collections are not supported by the loopback daemon");
     }
+    if !batch.sessions.is_empty() {
+        bail!("session rollups are not supported by the loopback daemon");
+    }
 
     let result = store.ingest_sync_batch(batch)?;
 
@@ -112,6 +118,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             account_evidence_summaries: batch.account_evidence_summaries.len() as u64,
             activity_rollups: 0,
             activity_coverage: 0,
+            sessions: 0,
         },
         duplicates: SyncEntityCounts {
             sources: 0,
@@ -129,6 +136,7 @@ pub fn ingest_sync_batch(store: &Store, batch: &SyncBatch) -> Result<SyncAck> {
             account_evidence_summaries: 0,
             activity_rollups: 0,
             activity_coverage: 0,
+            sessions: 0,
         },
         rejected: Vec::<SyncRejectedRecord>::new(),
     })

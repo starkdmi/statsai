@@ -23,6 +23,24 @@ names leave the device only when the collector preference `include_activity` is
 on; turning it off sends an authoritative empty activity ID set so the backend
 prunes hosted names. Invocation IDs, arguments, outputs, commands, prompts, and
 file paths never appear in a v6 payload.
+The same batch schema carries opt-in `sessions` rows. Each row is
+`session_rollup.v1` with a closed key set: hashed session id, provider,
+source, account, time range, duration, usage, requests, cost, models, message
+counts, project, bounded title, and `title_source` (`event`, `task_span`, or
+`archive`). `duration_seconds` is the wall-clock span and is null when a
+session recorded only a start; the backend must accept null before a collector
+sends it. `active_seconds` is the time the agent was working, the union of the
+turns the provider recorded, and is null when none were; collectors before it
+omit the key. Events keyed by their
+own provider record, such as Cursor's usage-export rows, belong to no session
+and are not sent, and neither is a session with no project and no title. Prompts, responses, paths, and raw provider session ids stay on
+the device. Session retirement is not implied by `sync_batch.v6`. A snapshot
+retires hosted sessions only when it includes `session_rollup_ids`. An empty
+array prunes them. Omitting the key leaves hosted sessions in place, which is
+what the collector does when `include_sessions` alone is off. With projects
+excluded, it sends the empty array until the target holds none of its sessions,
+since each hosted session carries a project. Pre-v6 acknowledgements
+omit the `sessions` counter.
 The collector owns local scanning, normalization, idempotent local storage, and
 privacy scrubbing. The backend owns authentication, validation, deduplication,
 rollups, and user-facing queries. The production path sends sanitized batches to
@@ -273,7 +291,8 @@ observations and derives its own cycles from them, so acknowledging another
 device's cycles would tell the sender they had been stored when they had not.
 It likewise rejects `activity_rollups` and `activity_coverage`: hosted activity
 is a Cloudflare-only collection, and the loopback daemon has nowhere to store
-another device's names.
+another device's names. It rejects `sessions` for the same reason: hosted
+session rollups are stored only by `/api/sync/batches`.
 `/api/sync/batches` is the production contract. A compatible backend should:
 
 - require an authenticated device access token
@@ -289,7 +308,8 @@ another device's names.
   device; v3 fragments also carry code-change metric IDs; v4 fragments also
   carry quota-cycle contribution IDs; v5 fragments also carry account-plan
   observation and evidence-summary IDs; v6 fragments also carry activity
-  rollup and coverage IDs; each fragment carries zero-based `part_index` and a
+  rollup and coverage IDs and, when the collector opts into session retirement,
+  `session_rollup_ids`; each fragment carries zero-based `part_index` and a
   common `part_count`, with at most 200 IDs across its ID arrays
 - stage snapshot ownership without pruning until the final in-order fragment;
   then apply ownership and deletion reconciliation atomically, pruning a hosted
@@ -359,7 +379,8 @@ run immediately.
 `sync_batch.v5` returns `sync_ack.v5`, which additionally adds the
 `account_plan_observations` and `account_evidence_summaries` counters.
 `sync_batch.v6` returns `sync_ack.v6`, which additionally adds the
-`activity_rollups` and `activity_coverage` counters.
+`activity_rollups`, `activity_coverage`, and `sessions` counters. Earlier
+acknowledgements omit `sessions`.
 Collectors require the acknowledgement version to match the submitted batch
 version exactly; a v1 acknowledgement cannot successfully acknowledge a v2
 batch, a v2 acknowledgement cannot acknowledge a v3 batch, a v3
@@ -489,7 +510,7 @@ verification actions for `sync_batch.v2` and later, plus code-change
 metrics for `sync_batch.v3` and later, plus quota-cycle contributions for
 `sync_batch.v4` and later, plus privacy-safe account-plan evidence for
 `sync_batch.v5`, plus opt-in activity rollups and coverage for
-`sync_batch.v6`. The collector now prepares those
+`sync_batch.v6`, plus opt-in session rollups on that same v6 schema. The collector now prepares those
 daily rollups before HTTP sync, so a normal Cloudflare sync can populate the
 dashboard without shipping raw events. Repeated batches are idempotent by
 stable IDs.

@@ -11,11 +11,19 @@ pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // activity-invocations.v34: Codex usage skips repeated token_count totals and
 // counts token_usage_record lines, including compaction, instead of the
 // token_count each one pairs with.
-pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v34";
-pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v28";
-// activity-invocations.v20: session rows report their message count as requests and
-// are priced per message, so long-context tiers stop being decided session-wide.
-pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "activity-invocations.v20";
+// session-metadata.v35: Codex events carry thread names, sub-agents their
+// parent's name, and turns without a reported duration end at their last work.
+// session-metadata.v36: sub-agents report the parent they borrow a name from,
+// so the name is joined when the session is built.
+pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v36";
+// session-metadata.v30: Claude user-message counts include only typed prompts,
+// not tool results, meta lines, or compaction summaries. (v29: events carry the
+// session's custom or AI title and the prompt that started their turn.)
+pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v30";
+// session-metadata.v21: events carry each session's user and assistant message
+// counts. (v20: session rows report their message count as requests and are
+// priced per message, so long-context tiers stop being decided session-wide.)
+pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v21";
 // Revisit Grok sessions whose Fast request was left unpriced because modelsUsed
 // also retained a selected standard model that made no inference.
 pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "grok-fast-pricing.v23";
