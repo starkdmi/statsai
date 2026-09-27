@@ -54,10 +54,10 @@ pub(crate) use cache::{
     scan_candidate_with_compatible_dependencies, ScanCacheNamespaces,
 };
 pub(crate) use event::{
-    infer_missing_output, merge_adapter_scan, metadata_only_privacy, metadata_summary,
-    metric_from_samples, metric_single_sample, push_deduped, subtract_usage_counts,
-    sum_usage_counts, usage_event, usd_to_micro_usd, DuplicateSelection, EventDedupIndex,
-    EventDeduplication, MetadataSummaryParts, ProviderEventParts,
+    infer_missing_output, merge_adapter_scan, message_count_runtime, metadata_only_privacy,
+    metadata_summary, metric_from_samples, metric_single_sample, push_deduped,
+    subtract_usage_counts, sum_usage_counts, usage_event, usd_to_micro_usd, DuplicateSelection,
+    EventDedupIndex, EventDeduplication, MetadataSummaryParts, ProviderEventParts,
 };
 pub(crate) use json::{
     file_modified_timestamp, number_at_any, read_bounded_jsonl_line, read_json_file,
@@ -168,6 +168,8 @@ pub struct AdapterScan {
     pub events: Vec<UsageEvent>,
     pub summaries: Vec<UsageSummary>,
     pub task_spans: Vec<TaskSpan>,
+    /// Session names read apart from usage events; see [`SessionName`].
+    pub session_names: Vec<statsai_core::SessionName>,
     pub quota_observations: Vec<QuotaObservationRecordV1>,
     pub activity_invocations: Vec<ActivityInvocationV1>,
     pub activity_coverage: Vec<ActivityCoverageV1>,

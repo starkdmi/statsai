@@ -102,6 +102,32 @@ pub(crate) fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
     // ownership write, matching quota-cycle batching.
     let activity_queries = usize::from(!batch.activity_rollups.is_empty()) * 2
         + usize::from(!batch.activity_coverage.is_empty()) * 2;
+    // Sessions are one freshness lookup, one upsert, and one ownership write.
+    // A closing snapshot that names session_rollup_ids also deletes orphans.
+    let session_queries = usize::from(!batch.sessions.is_empty()) * 3
+        + usize::from(
+            batch
+                .authoritative_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.part_index.saturating_add(1) == snapshot.part_count
+                        && snapshot.session_rollup_ids.is_some()
+                }),
+        );
+    // Any session or activity row advances the dashboard revision. Summaries
+    // already pay for the full snapshot refresh above.
+    let dashboard_snapshot_timestamp_queries = usize::from(
+        !batch.sessions.is_empty()
+            || !batch.activity_rollups.is_empty()
+            || !batch.activity_coverage.is_empty(),
+    );
+    // Plan and evidence account ids already reserve the account-plan alias
+    // lookup. Sessions and activity share that one query, so charge it only
+    // when they name an account and nothing else already did.
+    let session_activity_alias_queries = usize::from(
+        !http_rollup_account_plan_names_provider_account(batch)
+            && http_rollup_session_or_activity_names_provider_account(batch),
+    );
     let code_change_owner_metadata_refresh_queries = usize::from(
         batch.schema_version == SYNC_BATCH_SCHEMA_VERSION
             && batch
@@ -127,6 +153,9 @@ pub(crate) fn estimate_http_rollup_d1_queries(batch: &SyncBatch) -> usize {
         + code_change_metric_queries
         + quota_cycle_contribution_queries
         + activity_queries
+        + session_queries
+        + dashboard_snapshot_timestamp_queries
+        + session_activity_alias_queries
         + code_change_owner_metadata_refresh_queries
         + estimate_http_rollup_task_queries(batch)
         + final_sync_bookkeeping_queries
@@ -373,12 +402,21 @@ pub(crate) fn http_rollup_project_count(batch: &SyncBatch) -> usize {
         .summaries
         .iter()
         .filter_map(http_rollup_summary_project_key)
+        .chain(
+            batch
+                .sessions
+                .iter()
+                .filter_map(|session| session.project.as_ref().and_then(http_rollup_project_key)),
+        )
         .collect::<BTreeSet<_>>()
         .len()
 }
 
 pub(crate) fn http_rollup_summary_project_key(summary: &UsageSummary) -> Option<String> {
-    let project = summary.project.as_ref()?;
+    summary.project.as_ref().and_then(http_rollup_project_key)
+}
+
+pub(crate) fn http_rollup_project_key(project: &statsai_core::ProjectInfo) -> Option<String> {
     if !project_has_stable_identity(project) {
         return None;
     }
@@ -396,12 +434,26 @@ pub(crate) fn http_rollup_project_location_count(batch: &SyncBatch) -> usize {
         .summaries
         .iter()
         .filter_map(http_rollup_summary_project_location_key)
+        .chain(batch.sessions.iter().filter_map(|session| {
+            session
+                .project
+                .as_ref()
+                .and_then(http_rollup_project_location_key)
+        }))
         .collect::<BTreeSet<_>>()
         .len()
 }
 
 pub(crate) fn http_rollup_summary_project_location_key(summary: &UsageSummary) -> Option<String> {
-    let project = summary.project.as_ref()?;
+    summary
+        .project
+        .as_ref()
+        .and_then(http_rollup_project_location_key)
+}
+
+pub(crate) fn http_rollup_project_location_key(
+    project: &statsai_core::ProjectInfo,
+) -> Option<String> {
     if !project_has_stable_identity(project) {
         return None;
     }
@@ -412,4 +464,34 @@ pub(crate) fn http_rollup_summary_project_location_key(summary: &UsageSummary) -
         return Some(format!("repo:{repo_remote_hash}:{}", project.project_id));
     }
     Some(format!("project:{}", project.project_id))
+}
+
+fn http_rollup_account_plan_names_provider_account(batch: &SyncBatch) -> bool {
+    !unique_non_empty_provider_account_ids(
+        batch
+            .account_plan_observations
+            .iter()
+            .map(|observation| observation.provider_account_id.0.as_str())
+            .chain(
+                batch
+                    .account_evidence_summaries
+                    .iter()
+                    .map(|summary| summary.provider_account_id.0.as_str()),
+            ),
+    )
+    .is_empty()
+}
+
+fn http_rollup_session_or_activity_names_provider_account(batch: &SyncBatch) -> bool {
+    batch.sessions.iter().any(|session| {
+        session
+            .provider_account_id
+            .as_ref()
+            .is_some_and(|account_id| !account_id.0.trim().is_empty())
+    }) || batch.activity_rollups.iter().any(|rollup| {
+        rollup
+            .provider_account_id
+            .as_ref()
+            .is_some_and(|account_id| !account_id.0.trim().is_empty())
+    })
 }

@@ -48,6 +48,7 @@ fn http_rollup_sync_proactively_splits_batches_to_fit_d1_budget() {
         account_evidence_summaries: vec![],
         activity_rollups: vec![],
         activity_coverage: vec![],
+        sessions: vec![],
         events: vec![],
         summaries,
         task_buckets: vec![],
@@ -201,6 +202,7 @@ fn http_rollup_project_counts_include_path_only_projects() {
         account_evidence_summaries: vec![],
         activity_rollups: vec![],
         activity_coverage: vec![],
+        sessions: vec![],
         events: vec![],
         summaries: vec![summary],
         task_buckets: vec![],
@@ -304,6 +306,7 @@ fn test_dense_task_only_sync_batch(now: DateTime<Utc>, span_count: usize) -> Syn
         account_evidence_summaries: Vec::new(),
         activity_rollups: Vec::new(),
         activity_coverage: Vec::new(),
+        sessions: Vec::new(),
         events: Vec::new(),
         summaries: Vec::new(),
         task_buckets: vec![TaskBucketSnapshot {
@@ -505,6 +508,7 @@ fn test_multi_bucket_dense_task_only_sync_batch(
         account_evidence_summaries: Vec::new(),
         activity_rollups: Vec::new(),
         activity_coverage: Vec::new(),
+        sessions: Vec::new(),
         events: Vec::new(),
         summaries: Vec::new(),
         task_buckets,
@@ -547,6 +551,99 @@ fn multi_bucket_dense_task_sync_splits_to_fit_chunked_write_budget() {
             .map(|chunk| chunk.task_buckets.len())
             .sum::<usize>(),
         batch.task_buckets.len()
+    );
+    assert!(chunks
+        .iter()
+        .all(|chunk| estimate_http_rollup_d1_queries(chunk) <= HTTP_ROLLUP_D1_QUERY_BUDGET));
+}
+
+#[test]
+fn session_project_and_activity_rows_match_the_backend_d1_cost() {
+    let now = Utc
+        .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+        .single()
+        .expect("date");
+    let baseline = test_task_only_sync_batch(now, 0, 0);
+    let baseline_queries = estimate_http_rollup_d1_queries(&baseline);
+
+    let mut bare_session = baseline.clone();
+    let mut sessions = test_session_rollups(1);
+    sessions[0].project = None;
+    sessions[0].provider_account_id = None;
+    bare_session.sessions = sessions;
+    assert_eq!(
+        estimate_http_rollup_d1_queries(&bare_session),
+        baseline_queries + 4,
+        "session lookup, write, ownership, and dashboard timestamp"
+    );
+
+    let mut named_session = baseline.clone();
+    named_session.sessions = test_session_rollups(1);
+    assert_eq!(http_rollup_project_count(&named_session), 1);
+    assert_eq!(http_rollup_project_location_count(&named_session), 1);
+    assert_eq!(
+        estimate_http_rollup_d1_queries(&named_session),
+        baseline_queries + 8,
+        "project, location, location lookup, and account-alias lookup"
+    );
+
+    let mut shared_project = named_session.clone();
+    let mut shared_sessions = test_session_rollups(2);
+    shared_sessions[1].project = shared_sessions[0].project.clone();
+    shared_project.sessions = shared_sessions;
+    assert_eq!(http_rollup_project_count(&shared_project), 1);
+    assert_eq!(http_rollup_project_location_count(&shared_project), 1);
+    assert_eq!(
+        estimate_http_rollup_d1_queries(&shared_project),
+        estimate_http_rollup_d1_queries(&named_session)
+    );
+
+    let mut activity = baseline.clone();
+    activity.activity_rollups = vec![test_activity_rollup(0, None)];
+    assert_eq!(
+        estimate_http_rollup_d1_queries(&activity),
+        baseline_queries + 3,
+        "activity write, ownership, and dashboard timestamp"
+    );
+    activity.activity_rollups = vec![test_activity_rollup(
+        0,
+        Some(provider_account_id("codex", "personal")),
+    )];
+    assert_eq!(
+        estimate_http_rollup_d1_queries(&activity),
+        baseline_queries + 4,
+        "activity rows with a provider account also pay for the alias lookup"
+    );
+    activity.activity_coverage = vec![test_activity_coverage(0)];
+    assert_eq!(
+        estimate_http_rollup_d1_queries(&activity),
+        baseline_queries + 6,
+        "coverage is its own write and ownership; the timestamp and alias stay one query"
+    );
+}
+
+#[test]
+fn session_batches_with_many_projects_split_under_the_d1_budget() {
+    let now = Utc
+        .with_ymd_and_hms(2026, 6, 20, 12, 0, 0)
+        .single()
+        .expect("date");
+    let mut batch = test_task_only_sync_batch(now, 0, 0);
+    batch.batch_id = "batch_session_projects".to_string();
+    batch.sessions = test_session_rollups(40);
+    assert_eq!(http_rollup_project_count(&batch), 40);
+    assert_eq!(http_rollup_project_location_count(&batch), 40);
+    assert!(estimate_http_rollup_d1_queries(&batch) > HTTP_ROLLUP_D1_QUERY_BUDGET);
+
+    let chunks = split_http_rollup_sync_batches(&batch);
+
+    assert!(chunks.len() > 1);
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.sessions.len())
+            .sum::<usize>(),
+        batch.sessions.len()
     );
     assert!(chunks
         .iter()

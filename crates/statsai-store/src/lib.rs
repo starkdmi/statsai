@@ -26,7 +26,7 @@ pub(crate) use rollups::{
     collect_pending_summary_days, event_with_valid_project, is_daily_rollup_summary,
     is_http_rollup_passthrough_summary, sanitize_summary_for_http_sync, summary_period_bounds,
     summary_sync_payload_hash, sync_rollup_bucket_key, sync_rollup_project_key,
-    SyncRollupBucketKey,
+    task_span_session_hashes, SyncRollupBucketKey,
 };
 pub(crate) use sql::{
     begin_immediate_transaction_with_retry, commit_transaction, enable_sqlite_defensive,
@@ -80,6 +80,7 @@ pub use pricing::{
     apply_current_estimated_pricing, RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY,
     APPLIED_PRICING_RULESET_VERSION_KEY,
 };
+pub use rollups::{SessionFilter, SessionSort, SessionStats};
 pub use snapshot::{
     clone_database_to, database_applied_pricing_ruleset_version, database_schema_version,
     DatabaseClone,
@@ -113,6 +114,7 @@ const SYNC_ROLLUP_SUMMARY_VERSION: &str = "14";
 const SYNC_INCLUDE_PROJECTS_METADATA_KEY: &str = "sync.include_projects";
 const SYNC_INCLUDE_TASKS_METADATA_KEY: &str = "sync.include_tasks";
 const SYNC_INCLUDE_ACTIVITY_METADATA_KEY: &str = "sync.include_activity";
+const SYNC_INCLUDE_SESSIONS_METADATA_KEY: &str = "sync.include_sessions";
 const LEGACY_CODEX_PLAN_CONVERSION_METADATA_KEY: &str = "migration.legacy_codex_plan_evidence.v1";
 const SQLITE_BUSY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(50)
@@ -142,6 +144,10 @@ pub(crate) const EVENT_SOURCE_FILE_HASH_SQL: &str = "CASE WHEN json_valid(payloa
      THEN json_extract(payload, '$.parse_evidence.source_file_path_hash') END";
 pub(crate) const EVENT_CONVERSATION_HASH_SQL: &str = "CASE WHEN json_valid(payload) \
      THEN json_extract(payload, '$.session.local_session_id_hash') END";
+/// Hashed `session_…` id. Indexed so a session refresh reads one conversation
+/// instead of scanning every usage payload.
+pub(crate) const EVENT_SESSION_ID_SQL: &str = "CASE WHEN json_valid(payload) \
+     THEN json_extract(payload, '$.session.session_id') END";
 /// The one field plan evidence needs out of a quota observation payload.
 pub(crate) const QUOTA_PLAN_TYPE_SQL: &str = "CASE WHEN json_valid(payload) \
      THEN json_extract(payload, '$.status.plan_type') END";
@@ -188,17 +194,19 @@ pub struct SyncPreferences {
     pub include_projects: bool,
     pub include_tasks: bool,
     pub include_activity: bool,
+    pub include_sessions: bool,
 }
 
 impl SyncPreferences {
     #[must_use]
     pub fn normalized(self) -> Self {
-        let include_projects = self.include_projects || self.include_tasks;
+        let include_projects = self.include_projects || self.include_tasks || self.include_sessions;
         let include_tasks = self.include_tasks && include_projects;
         Self {
             include_projects,
             include_tasks,
             include_activity: self.include_activity,
+            include_sessions: self.include_sessions,
         }
     }
 }
@@ -282,6 +290,7 @@ pub struct ScanFileReplacement<'a> {
     pub reconciled_file_hashes: &'a [String],
     pub events: &'a [UsageEvent],
     pub summaries: &'a [UsageSummary],
+    pub session_names: &'a [statsai_core::SessionName],
     pub activity_invocations: &'a [ActivityInvocationV1],
     pub activity_coverage: &'a [ActivityCoverageV1],
     pub activity_persist_mode: ActivityPersistMode,
@@ -355,6 +364,7 @@ impl Store {
         let store = Self { conn };
         store.migrate()?;
         store.configure_connection()?;
+        store.backfill_session_rollups_if_needed()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
     }
@@ -436,6 +446,7 @@ impl Store {
         store.conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         store.migrate()?;
         store.configure_connection()?;
+        store.backfill_session_rollups_if_needed()?;
         store.conn.execute_batch("PRAGMA optimize=0x10002;")?;
         Ok(store)
     }

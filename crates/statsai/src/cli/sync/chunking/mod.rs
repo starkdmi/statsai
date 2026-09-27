@@ -31,6 +31,7 @@ pub(crate) enum HttpRollupIndexedChunkKind {
     QuotaCycles,
     ActivityRollups,
     ActivityCoverage,
+    Sessions,
     Snapshot,
 }
 
@@ -48,6 +49,7 @@ impl HttpRollupIndexedChunkKind {
         Self::QuotaCycles,
         Self::ActivityRollups,
         Self::ActivityCoverage,
+        Self::Sessions,
         Self::Snapshot,
     ];
 
@@ -74,6 +76,7 @@ impl HttpRollupIndexedChunkKind {
             Self::QuotaCycles => "quota_cycles",
             Self::ActivityRollups => "activity_rollups",
             Self::ActivityCoverage => "activity_coverage",
+            Self::Sessions => "sessions",
             Self::Snapshot => "snapshot",
         }
     }
@@ -96,6 +99,8 @@ const HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH: usize = 1_000;
 const HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH: usize = 100;
 
 pub(crate) const HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH: usize = 500;
+
+pub(crate) const HTTP_ROLLUP_SESSIONS_PER_BATCH: usize = 200;
 
 pub(crate) const HTTP_ROLLUP_D1_QUERY_BUDGET: usize = 45;
 
@@ -156,7 +161,9 @@ fn split_authoritative_snapshot(
         quota_cycle_contribution_ids: Vec::new(),
         activity_rollup_ids: Vec::new(),
         activity_coverage_ids: Vec::new(),
+        session_rollup_ids: None,
     };
+    let session_rollup_ids = snapshot.session_rollup_ids;
     let mut parts = Vec::new();
     let mut current = empty_part();
 
@@ -194,7 +201,27 @@ fn split_authoritative_snapshot(
     );
     append_ids!(snapshot.activity_rollup_ids, activity_rollup_ids);
     append_ids!(snapshot.activity_coverage_ids, activity_coverage_ids);
-    if authoritative_snapshot_id_count(&current) > 0 || parts.is_empty() {
+    if let Some(ids) = session_rollup_ids {
+        if ids.is_empty() {
+            // An empty array is the retirement signal. It adds no IDs, so it
+            // can ride on the current part even when that part is already full.
+            current.session_rollup_ids = Some(Vec::new());
+        } else {
+            for id in ids {
+                if authoritative_snapshot_id_count(&current) == max_ids {
+                    parts.push(std::mem::replace(&mut current, empty_part()));
+                }
+                current
+                    .session_rollup_ids
+                    .get_or_insert_with(Vec::new)
+                    .push(id);
+            }
+        }
+    }
+    if authoritative_snapshot_id_count(&current) > 0
+        || current.session_rollup_ids.is_some()
+        || parts.is_empty()
+    {
         parts.push(current);
     }
     let part_count = u32::try_from(parts.len()).expect("snapshot part count fits u32");
@@ -217,6 +244,7 @@ fn authoritative_snapshot_id_count(snapshot: &SyncAuthoritativeSnapshot) -> usiz
         + snapshot.quota_cycle_contribution_ids.len()
         + snapshot.activity_rollup_ids.len()
         + snapshot.activity_coverage_ids.len()
+        + snapshot.session_rollup_ids.as_ref().map_or(0, Vec::len)
 }
 
 pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch) -> Vec<SyncBatch> {
@@ -232,13 +260,15 @@ pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch)
         || !batch.code_change_metrics.is_empty()
         || !batch.quota_cycle_contributions.is_empty()
         || !batch.activity_rollups.is_empty()
-        || !batch.activity_coverage.is_empty();
+        || !batch.activity_coverage.is_empty()
+        || !batch.sessions.is_empty();
     if !has_task_payload
         && batch.summaries.len() <= HTTP_ROLLUP_SUMMARIES_PER_BATCH
         && batch.code_change_metrics.len() <= HTTP_ROLLUP_CODE_CHANGE_METRICS_PER_BATCH
         && batch.quota_cycle_contributions.len() <= HTTP_ROLLUP_QUOTA_CYCLE_CONTRIBUTIONS_PER_BATCH
         && batch.activity_rollups.len() <= HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH
         && batch.activity_coverage.len() <= HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH
+        && sessions_fit_one_http_chunk(batch)
         && metadata_count <= HTTP_ROLLUP_METADATA_RECORDS_PER_BATCH
     {
         return fit_http_rollup_batches_to_d1_budget(vec![batch.clone()]);
@@ -268,12 +298,17 @@ pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch)
             .activity_coverage
             .len()
             .div_ceil(HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH);
+    let session_chunks = batch
+        .sessions
+        .len()
+        .div_ceil(HTTP_ROLLUP_SESSIONS_PER_BATCH);
     let mut chunks = Vec::with_capacity(
         total_chunks
             + metadata_chunks
             + code_change_chunks
             + quota_cycle_chunks
             + activity_chunks
+            + session_chunks
             + task_chunks.len(),
     );
 
@@ -294,6 +329,7 @@ pub(crate) fn split_http_rollup_sync_batches_without_snapshot(batch: &SyncBatch)
         batch,
         HTTP_ROLLUP_ACTIVITY_ROWS_PER_BATCH,
     ));
+    chunks.extend(split_http_session_chunks(batch));
     chunks.extend(split_http_rollup_summary_chunks(
         batch,
         HTTP_ROLLUP_SUMMARIES_PER_BATCH,
@@ -319,6 +355,14 @@ fn empty_http_rollup_chunk(batch: &SyncBatch, suffix: &str) -> SyncBatch {
     chunk.quota_cycle_contributions.clear();
     chunk.activity_rollups.clear();
     chunk.activity_coverage.clear();
+    chunk.sessions.clear();
     chunk.authoritative_snapshot = None;
     chunk
+}
+
+fn sessions_fit_one_http_chunk(batch: &SyncBatch) -> bool {
+    batch.sessions.len() <= HTTP_ROLLUP_SESSIONS_PER_BATCH
+        && serde_json::to_string(&batch.sessions)
+            .map(|payload| payload.len() <= TASK_SYNC_SQL_MAX_JSON_BYTES_PER_CHUNK)
+            .unwrap_or(false)
 }

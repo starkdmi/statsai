@@ -62,6 +62,7 @@ pub(crate) fn scan_opencode_source(
     let connection = open_sqlite_readonly(&db_path)?;
     let todos_by_session = load_opencode_todos(&connection)?;
     let recovered_session_models = load_opencode_session_models(&connection)?;
+    let message_role_counts = load_opencode_message_role_counts(&connection)?;
     let reconstructed_session_ids = recovered_session_models
         .iter()
         .filter_map(|(session_id, summary)| {
@@ -218,6 +219,9 @@ pub(crate) fn scan_opencode_source(
             })
             .filter(|cost| cost.estimated_micro_usd().is_some());
         let priced_from_messages = message_cost.is_some();
+        let runtime = message_role_counts.get(&session_id).and_then(|counts| {
+            message_count_runtime(counts.user, counts.assistant, counts.developer)
+        });
         let mut event = usage_event(
             adapter,
             source,
@@ -229,7 +233,7 @@ pub(crate) fn scan_opencode_source(
                 duration_seconds,
                 model,
                 usage,
-                runtime: None,
+                runtime,
                 session_raw: session_id,
                 project,
                 event_kind: "opencode_session_usage",
@@ -499,6 +503,40 @@ pub(crate) fn scan_opencode_source(
     Ok(scan)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct OpenCodeMessageCounts {
+    user: u64,
+    assistant: u64,
+    developer: u64,
+}
+
+fn load_opencode_message_role_counts(
+    connection: &Connection,
+) -> Result<HashMap<String, OpenCodeMessageCounts>> {
+    let mut statement =
+        match connection.prepare("SELECT session_id, json_extract(data, '$.role') FROM message") {
+            Ok(statement) => statement,
+            Err(error) if error.to_string().contains("no such table: message") => {
+                return Ok(HashMap::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+    let mut rows = statement.query([])?;
+    let mut counts = HashMap::<String, OpenCodeMessageCounts>::new();
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(0)?;
+        let role: Option<String> = row.get(1).ok().flatten();
+        let entry = counts.entry(session_id).or_default();
+        match role.as_deref() {
+            Some("user") => entry.user = entry.user.saturating_add(1),
+            Some("assistant") => entry.assistant = entry.assistant.saturating_add(1),
+            Some("developer") => entry.developer = entry.developer.saturating_add(1),
+            _ => {}
+        }
+    }
+    Ok(counts)
+}
+
 pub(crate) fn load_opencode_session_models(
     connection: &Connection,
 ) -> Result<HashMap<String, OpenCodeSessionModelSummary>> {
@@ -753,6 +791,7 @@ pub(crate) fn emit_opencode_message_events(
     let mut rows = statement.query([])?;
     let mut reconstructed_usage = HashMap::<String, OpenCodeReconstructedUsage>::new();
     let mut session_models = HashMap::<String, ModelInfo>::new();
+    let mut pending_user_messages = HashMap::<String, u64>::new();
     while let Some(row) = rows.next()? {
         let session_id: String = row.get(1)?;
         if !ctx.reconstructed_session_ids.contains(&session_id) {
@@ -776,7 +815,11 @@ pub(crate) fn emit_opencode_message_events(
             session_models.insert(session_id.clone(), model);
         }
         let usage = opencode_message_usage_counts(&value);
+        let role = value.get("role").and_then(Value::as_str);
         if usage.computed_total() == 0 {
+            if role == Some("user") {
+                *pending_user_messages.entry(session_id).or_default() += 1;
+            }
             ctx.scan.diagnostics.skipped_zero_events += 1;
             continue;
         }
@@ -785,6 +828,10 @@ pub(crate) fn emit_opencode_message_events(
             ctx.scan.diagnostics.model_fallbacks += 1;
             continue;
         };
+        let pending_users = pending_user_messages.remove(&session_id).unwrap_or(0);
+        let user_messages = pending_users.saturating_add(u64::from(role == Some("user")));
+        let assistant_messages = u64::from(role != Some("user") && role != Some("developer"));
+        let developer_messages = u64::from(role == Some("developer"));
         let started_at = value
             .pointer("/time/created")
             .and_then(value_as_u64)
@@ -817,7 +864,11 @@ pub(crate) fn emit_opencode_message_events(
                 duration_seconds,
                 model: Some(model),
                 usage,
-                runtime: None,
+                runtime: message_count_runtime(
+                    user_messages,
+                    assistant_messages,
+                    developer_messages,
+                ),
                 session_raw: session_id.clone(),
                 project,
                 event_kind: "opencode_message_usage",

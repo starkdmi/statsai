@@ -36,6 +36,7 @@ pub(crate) fn effective_sync_preferences(
     if command.exclude_projects {
         preferences.include_projects = false;
         preferences.include_tasks = false;
+        preferences.include_sessions = false;
     }
     if command.include_tasks {
         preferences.include_projects = true;
@@ -50,6 +51,13 @@ pub(crate) fn effective_sync_preferences(
     if command.exclude_activity {
         preferences.include_activity = false;
     }
+    if command.include_sessions {
+        preferences.include_projects = true;
+        preferences.include_sessions = true;
+    }
+    if command.exclude_sessions {
+        preferences.include_sessions = false;
+    }
 
     Ok(preferences.normalized())
 }
@@ -63,7 +71,7 @@ fn apply_sync_preference_overrides(
     if preferences != original {
         store.set_sync_preferences(preferences)?;
         eprintln!(
-            "sync preferences updated: projects={} tasks={} activity={}",
+            "sync preferences updated: projects={} tasks={} activity={} sessions={}",
             if preferences.include_projects {
                 "enabled"
             } else {
@@ -78,11 +86,17 @@ fn apply_sync_preference_overrides(
                 "enabled"
             } else {
                 "disabled"
+            },
+            if preferences.include_sessions {
+                "enabled"
+            } else {
+                "disabled"
             }
         );
         if (!original.include_projects && preferences.include_projects)
             || (!original.include_tasks && preferences.include_tasks)
             || (!original.include_activity && preferences.include_activity)
+            || (!original.include_sessions && preferences.include_sessions)
         {
             eprintln!(
                 "sync preferences changed privacy/backfill scope; the next sync may resend historical summaries to update the hosted mirror"
@@ -99,6 +113,20 @@ fn apply_sync_preference_overrides(
         if original.include_activity && !preferences.include_activity {
             eprintln!(
                 "activity sync disabled: the next successful HTTP sync sends an empty activity snapshot so hosted names are pruned"
+            );
+        }
+        if !original.include_sessions && preferences.include_sessions {
+            eprintln!(
+                "session sync enabled: the next sync backfills session rollups, and later snapshots retire hosted sessions this device no longer has"
+            );
+        }
+        if original.include_projects && !preferences.include_projects {
+            eprintln!(
+                "project sync disabled: the next successful HTTP sync retires this device's hosted sessions, which carry project names and paths"
+            );
+        } else if original.include_sessions && !preferences.include_sessions {
+            eprintln!(
+                "session sync disabled: hosted sessions stay in place until session sync is enabled again"
             );
         }
     }
@@ -174,20 +202,21 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
 
         if command.dry_run {
             eprintln!(
-            "dry run: sink={} mode={} include_projects={} include_tasks={} include_activity={} sources={} events={} summaries={} task_buckets={} task_verifications={} activity_rollups={} activity_coverage={}",
+            "dry run: sink={} mode={} include_projects={} include_tasks={} include_activity={} include_sessions={} sources={} events={} summaries={} task_buckets={} task_verifications={} activity_rollups={} activity_coverage={} sessions={}",
             command.sink,
             sync_payload_mode_name(payload_mode),
             sync_preferences.include_projects,
             sync_preferences.include_tasks,
             sync_preferences.include_activity,
+            sync_preferences.include_sessions,
             batch.sources.len(),
             batch.events.len(),
-            batch.summaries.len()
-            ,
+            batch.summaries.len(),
             batch.task_buckets.len(),
             batch.task_verifications.len(),
             batch.activity_rollups.len(),
             batch.activity_coverage.len(),
+            batch.sessions.len(),
         );
             return Ok(());
         }
@@ -903,6 +932,8 @@ mod tests {
             exclude_tasks: false,
             include_activity: false,
             exclude_activity: false,
+            include_sessions: false,
+            exclude_sessions: false,
         }
     }
 

@@ -49,6 +49,24 @@ pub fn summarize_task_text(value: Option<&str>, width: usize) -> Option<String> 
     truncate_task_text(clean_task_text(value?)?, width)
 }
 
+/// Normalizes a session name the provider assigned: control characters and
+/// runs of whitespace collapse to single spaces and the result is truncated.
+///
+/// [`summarize_task_text`] cleans prompts, and its line filters drop a name
+/// like "Design tool/plugin" as a file reference.
+#[must_use]
+pub fn provider_session_name(value: Option<&str>, width: usize) -> Option<String> {
+    let compact = value?
+        .split(|character: char| character.is_whitespace() || character.is_control())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    truncate_task_text(compact, width)
+}
+
 #[must_use]
 pub fn choose_best_task_title<'a>(
     primary: Option<&'a str>,

@@ -108,6 +108,9 @@ pub(crate) struct ActiveCodexTurn {
     pub(crate) accumulated_usage: Option<UsageCounts>,
     pub(crate) prompt_previews: Vec<CodexPromptPreviewCandidate>,
     pub(crate) last_activity_at: DateTime<Utc>,
+    /// The turn's last record before its completion. Codex writes a turn's
+    /// completion when the thread next runs, which can be days after the work.
+    pub(crate) last_work_at: DateTime<Utc>,
     pub(crate) usage_lines: Vec<usize>,
     /// `token_count` lines inside the turn that carry no usage, because they
     /// repeat a total or pair with a `token_usage_record`. Their quota

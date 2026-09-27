@@ -106,6 +106,8 @@ pub(super) fn test_sync_command(sink: &str) -> SyncCommand {
         exclude_tasks: false,
         include_activity: false,
         exclude_activity: false,
+        include_sessions: false,
+        exclude_sessions: false,
     }
 }
 
@@ -229,6 +231,7 @@ pub(super) fn test_event(
             started_at,
             ended_at: None,
             duration_seconds: None,
+            turn_started_at: None,
         },
         model: None,
         usage: UsageCounts {

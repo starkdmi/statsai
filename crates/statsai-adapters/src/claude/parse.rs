@@ -5,20 +5,21 @@ use crate::model::{
 };
 use crate::ProviderAdapter;
 use crate::{
-    fallback_session_id, file_modified_timestamp, infer_missing_output, metadata_only_privacy,
-    number_at_any, project_context_from_path_fallback, push_deduped, read_bounded_jsonl_line,
-    resolve_project_context, resolve_project_context_cached, stats_cache_date_end,
-    timestamp_from_nested_value, timestamp_from_scalar, usage_event, usd_to_micro_usd,
-    value_as_u64, AdapterScan, BoundedLineRead, DuplicateSelection, EventDeduplication,
-    FileParseContext, ProjectContextCache, ProviderEventParts, ScanOptions, MAX_JSONL_RECORD_BYTES,
+    fallback_session_id, file_modified_timestamp, infer_missing_output, message_count_runtime,
+    metadata_only_privacy, number_at_any, project_context_from_path_fallback, push_deduped,
+    read_bounded_jsonl_line, resolve_project_context, resolve_project_context_cached,
+    stats_cache_date_end, timestamp_from_nested_value, timestamp_from_scalar, usage_event,
+    usd_to_micro_usd, value_as_u64, AdapterScan, BoundedLineRead, DuplicateSelection,
+    EventDeduplication, FileParseContext, ProjectContextCache, ProviderEventParts, ScanOptions,
+    MAX_JSONL_RECORD_BYTES,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 use statsai_core::{
-    canonical_display, expand_home_path, hash_text, summary_id, Confidence, EventSource,
-    IdentitySource, ParseEvidence, ProjectInfo, SourceKind, SourceLocation, SummaryMetadata,
-    UsageCounts, UsageSummary, USAGE_SUMMARY_SCHEMA_VERSION,
+    canonical_display, expand_home_path, hash_text, provider_session_name, summary_id, Confidence,
+    EventSource, IdentitySource, ParseEvidence, ProjectInfo, SourceKind, SourceLocation,
+    SummaryMetadata, UsageCounts, UsageSummary, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_pricing::{estimate_cost_at, pricing_changes_between, unknown_cost};
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ pub(crate) fn parse_claude_file(
     ctx: &mut FileParseContext<'_, ClaudeCodeAdapter>,
     projects: &Path,
     session_projects: &HashMap<String, ClaudeSessionProjectMetadata>,
+    session_titles: &mut ClaudeSessionTitles,
     path: &Path,
 ) -> Result<()> {
     let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
@@ -43,6 +45,11 @@ pub(crate) fn parse_claude_file(
 
     let mut line_bytes = Vec::new();
     let mut index = 0usize;
+    let mut pending_user_messages = HashMap::<String, u64>::new();
+    // Later snapshots of one provider record replace the event. User lines
+    // counted on the first snapshot have to ride along with that replacement.
+    let mut last_usage_users = HashMap::<String, (String, u64)>::new();
+    let mut turn_started_at = HashMap::<String, chrono::DateTime<Utc>>::new();
     loop {
         let line_status =
             read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
@@ -76,18 +83,52 @@ pub(crate) fn parse_claude_file(
         if reasoning.raw.is_some() {
             current_reasoning = reasoning;
         }
+        let session_raw = claude_session_raw(&value, path);
+        if let Some((rank, title)) = claude_session_title_from_value(&value) {
+            session_titles.remember(session_raw, rank, title);
+            continue;
+        }
+        if claude_record_is_prompt(&value) {
+            if let Some(prompted_at) = timestamp_from_nested_value(&value) {
+                turn_started_at.insert(session_raw.clone(), prompted_at);
+            }
+        }
         let Some(usage_value) = value
             .pointer("/message/usage")
             .or_else(|| value.get("usage"))
         else {
+            if claude_record_is_prompt(&value) {
+                *pending_user_messages.entry(session_raw).or_default() += 1;
+            }
             continue;
         };
         ctx.scan.diagnostics.candidate_usage_rows += 1;
         let usage = claude_usage_counts_from_value(usage_value);
         if usage.computed_total() == 0 {
+            if claude_record_is_prompt(&value) {
+                *pending_user_messages.entry(session_raw).or_default() += 1;
+            }
             ctx.scan.diagnostics.skipped_zero_events += 1;
             continue;
         }
+        let record_id = claude_provider_record_id(&value);
+        let fresh_users = pending_user_messages.remove(&session_raw).unwrap_or(0);
+        let user_messages = match record_id.as_deref() {
+            Some(record_id) => {
+                let carried = last_usage_users
+                    .get(&session_raw)
+                    .filter(|(previous, _)| previous == record_id)
+                    .map(|(_, users)| *users)
+                    .unwrap_or(0);
+                let users = carried.saturating_add(fresh_users);
+                last_usage_users.insert(session_raw.clone(), (record_id.to_string(), users));
+                users
+            }
+            None => {
+                last_usage_users.remove(&session_raw);
+                fresh_users
+            }
+        };
         let (timestamp, timestamp_inferred) = timestamp_from_nested_value(&value)
             .map(|timestamp| (timestamp, false))
             .unwrap_or((fallback_timestamp, true));
@@ -106,12 +147,6 @@ pub(crate) fn parse_claude_file(
         let project =
             claude_project_context_from_value(&value, indexed_project_metadata, &mut project_cache)
                 .or_else(|| fallback_project.clone());
-        let session_raw = value
-            .get("sessionId")
-            .or_else(|| value.get("session_id"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| fallback_session_id(path));
         // Claude Code rewrites one streamed response as several records that
         // share a provider-record identity while cumulative usage grows, so the
         // last snapshot for that identity is the authoritative one. Records
@@ -128,7 +163,8 @@ pub(crate) fn parse_claude_file(
                 )
             },
         );
-        let event = usage_event(
+        let prompted_at = turn_started_at.get(&session_raw).copied();
+        let mut event = usage_event(
             ctx.adapter,
             ctx.source,
             ctx.options,
@@ -139,7 +175,7 @@ pub(crate) fn parse_claude_file(
                 duration_seconds: None,
                 model,
                 usage,
-                runtime: None,
+                runtime: message_count_runtime(user_messages, 1, 0),
                 session_raw,
                 project,
                 event_kind: "claude_message_usage",
@@ -152,6 +188,7 @@ pub(crate) fn parse_claude_file(
                 dedupe_salt: None,
             },
         );
+        event.session.turn_started_at = prompted_at.filter(|prompted_at| *prompted_at <= timestamp);
         push_deduped(ctx.scan, ctx.seen, event, duplicate_selection);
     }
 
@@ -165,6 +202,108 @@ pub(crate) fn parse_claude_file(
     ctx.scan.diagnostics.activity_extract_ms += activity_started_at.elapsed().as_millis() as u64;
 
     Ok(())
+}
+
+/// Session names found across one source's transcripts.
+///
+/// A resumed or forked session copies earlier messages into a new transcript,
+/// and those events dedupe onto the positions of the file that first held
+/// them. Titles are therefore applied once the whole source is read, by session
+/// hash, rather than to the events of the file that named the session.
+#[derive(Default)]
+pub(crate) struct ClaudeSessionTitles(HashMap<String, (u8, String)>);
+
+impl ClaudeSessionTitles {
+    fn remember(&mut self, session_raw: String, rank: u8, title: String) {
+        let replaces = self
+            .0
+            .get(&session_raw)
+            .is_none_or(|(current, _)| rank >= *current);
+        if replaces {
+            self.0.insert(session_raw, (rank, title));
+        }
+    }
+
+    /// Stamps the titles on this scan's events and returns them as session
+    /// names, which also reach sessions whose events this scan did not read.
+    pub(crate) fn apply(
+        self,
+        events: &mut [statsai_core::UsageEvent],
+    ) -> Vec<statsai_core::SessionName> {
+        let titles_by_hash = self
+            .0
+            .into_iter()
+            .map(|(session_raw, (_, title))| (hash_text(&session_raw), title))
+            .collect::<HashMap<_, _>>();
+        for event in events.iter_mut() {
+            if let Some(title) = event
+                .session
+                .local_session_id_hash
+                .as_deref()
+                .and_then(|hash| titles_by_hash.get(hash))
+            {
+                event.session.title = Some(title.clone());
+            }
+        }
+        titles_by_hash
+            .into_iter()
+            .map(|(local_session_id_hash, title)| statsai_core::SessionName {
+                local_session_id_hash,
+                title,
+                parent_local_session_id_hash: None,
+            })
+            .collect()
+    }
+}
+
+/// Claude Code names a session with `custom-title` records, which a rename
+/// also writes, and occasionally `ai-title`. The later record of the stronger
+/// kind wins; the rank says which kind that is.
+fn claude_session_title_from_value(value: &Value) -> Option<(u8, String)> {
+    let (rank, key) = match value.get("type").and_then(Value::as_str)? {
+        "custom-title" => (1, "customTitle"),
+        "ai-title" => (0, "aiTitle"),
+        _ => return None,
+    };
+    let title = provider_session_name(value.get(key).and_then(Value::as_str), 90)?;
+    Some((rank, title))
+}
+
+fn claude_session_raw(value: &Value, path: &Path) -> String {
+    value
+        .get("sessionId")
+        .or_else(|| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback_session_id(path))
+}
+
+/// A prompt starts a turn: typed text, an image, or a slash command. Tool
+/// results arrive as `user` records too, but they continue the turn, as do
+/// meta records and compaction summaries.
+fn claude_record_is_prompt(value: &Value) -> bool {
+    if !claude_record_is_user(value)
+        || value.get("toolUseResult").is_some()
+        || value.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
+    }
+    match value.pointer("/message/content") {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(blocks)) => blocks.iter().any(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("text" | "image")
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn claude_record_is_user(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("user")
+        || value.pointer("/message/role").and_then(Value::as_str) == Some("user")
 }
 
 pub(crate) fn claude_provider_record_id(value: &Value) -> Option<String> {

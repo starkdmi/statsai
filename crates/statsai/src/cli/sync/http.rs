@@ -12,7 +12,8 @@ use std::time::Duration as StdDuration;
 use super::super::args::SyncCommand;
 use super::batch::{record_rollup_sync_chunk_success, record_sync_batch_success};
 use super::chunking::{
-    has_non_code_change_payload, has_non_quota_cycle_payload, http_rollup_metadata_count,
+    has_non_activity_payload, has_non_code_change_payload, has_non_quota_cycle_payload,
+    has_non_session_payload, http_rollup_metadata_count,
     split_http_rollup_sync_batch_after_budget_error, split_http_rollup_sync_batches,
     HttpRollupIndexedChunkKind, HTTP_ROLLUP_SUMMARIES_PER_BATCH,
 };
@@ -379,6 +380,9 @@ pub(crate) fn should_retry_http_rollup_chunk_after_error(
     {
         return false;
     }
+    // Relinks rewrite three tables per location. The server decides that after
+    // reading stored projects, so a 413 on a splittable session or activity
+    // chunk has to be retried smaller even when the local estimate fit.
     chunk.summaries.len() > 1
         || chunk.sources.len() > 1
         || chunk.accounts.len() > 1
@@ -390,10 +394,16 @@ pub(crate) fn should_retry_http_rollup_chunk_after_error(
         || chunk.task_verifications.len() > 1
         || chunk.code_change_metrics.len() > 1
         || chunk.quota_cycle_contributions.len() > 1
+        || chunk.activity_rollups.len() > 1
+        || chunk.activity_coverage.len() > 1
+        || chunk.sessions.len() > 1
         || (!chunk.task_buckets.is_empty() && !chunk.task_verifications.is_empty())
         || (http_rollup_metadata_count(chunk) > 0 && !chunk.summaries.is_empty())
         || (!chunk.code_change_metrics.is_empty() && has_non_code_change_payload(chunk))
         || (!chunk.quota_cycle_contributions.is_empty() && has_non_quota_cycle_payload(chunk))
+        || (!chunk.sessions.is_empty() && has_non_session_payload(chunk))
+        || ((!chunk.activity_rollups.is_empty() || !chunk.activity_coverage.is_empty())
+            && has_non_activity_payload(chunk))
 }
 
 fn http_rollup_retry_error_label(error: &anyhow::Error) -> &'static str {

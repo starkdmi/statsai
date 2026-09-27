@@ -26,6 +26,7 @@ pub(crate) fn run() -> Result<()> {
             match command {
                 Command::Scan(command) => scan(command, &store, &device_id),
                 Command::Report(command) => report(command, &store),
+                Command::Sessions(command) => sessions(command, &store),
                 Command::Source(command) => source(command, &store, &device_id),
                 Command::Account(command) => account(command, &store),
                 Command::Subscription(command) => subscription(command, &store),
@@ -59,6 +60,7 @@ pub(crate) fn command_reprices_persisted_usage(command: &Command) -> bool {
         command,
         Command::Scan(_)
             | Command::Report(_)
+            | Command::Sessions(_)
             | Command::Import(_)
             | Command::Export(_)
             | Command::Task(_)

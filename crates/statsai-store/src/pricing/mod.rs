@@ -130,10 +130,12 @@ impl Store {
 
             let mut report = RepricingReport::default();
             let mut dirty_keys = BTreeSet::new();
+            let mut session_ids = BTreeSet::new();
 
-            self.reprice_events_in_tx(&mut report, &mut dirty_keys)?;
+            self.reprice_events_in_tx(&mut report, &mut dirty_keys, &mut session_ids)?;
             self.reprice_summaries_in_tx(&mut report)?;
             report.refreshed_rollups = self.refresh_sync_rollups_for_keys_counted(&dirty_keys)?;
+            self.refresh_session_rollups_for_keys(&session_ids)?;
             self.reprice_task_spans_in_tx(&mut report)?;
 
             self.set_metadata_value(
@@ -185,6 +187,7 @@ impl Store {
         &self,
         report: &mut RepricingReport,
         dirty_keys: &mut BTreeSet<SyncRollupBucketKey>,
+        session_ids: &mut BTreeSet<String>,
     ) -> Result<()> {
         let mut after: Option<String> = None;
         loop {
@@ -199,6 +202,7 @@ impl Store {
                 maybe_fail_after_event_writes(report.changed_events)?;
                 if let Some(updated) = reprice_event(&event) {
                     dirty_keys.insert(self.update_event_cost_payload(&updated)?);
+                    session_ids.insert(updated.session.session_id.clone());
                     report.changed_events += 1;
                 }
             }

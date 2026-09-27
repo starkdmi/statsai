@@ -139,6 +139,7 @@ pub(super) fn sample_usage_event(
             started_at,
             ended_at: None,
             duration_seconds: None,
+            turn_started_at: None,
         },
         model: None,
         usage: UsageCounts {

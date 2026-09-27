@@ -2,6 +2,7 @@ pub(super) use super::support::*;
 pub(crate) use super::*;
 
 mod build;
+mod sessions;
 
 #[test]
 fn renaming_a_repository_keeps_one_rollup_for_the_day() {

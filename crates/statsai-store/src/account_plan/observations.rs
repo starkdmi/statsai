@@ -571,15 +571,16 @@ impl Store {
             .collect::<Vec<_>>();
         self.apply_conversation_account_bindings(source_id, &mut events)?;
         let mut changed = 0u64;
-        let mut dirty_keys = BTreeSet::new();
+        let mut dirty = crate::events::EventWriteDirty::default();
         for (event, previous_account) in events.iter().zip(previous_accounts) {
             if event.provider_account_id == previous_account {
                 continue;
             }
-            dirty_keys.extend(self.update_event_payload(event)?);
+            dirty.extend(self.update_event_payload(event)?);
             changed += 1;
         }
-        self.refresh_sync_rollups_for_keys(&dirty_keys)?;
+        self.refresh_sync_rollups_for_keys(&dirty.buckets)?;
+        self.refresh_session_rollups_for_keys(&dirty.sessions)?;
         Ok(changed)
     }
 

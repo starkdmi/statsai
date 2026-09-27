@@ -33,6 +33,11 @@ pub struct SessionInfo {
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_seconds: Option<u64>,
+    /// When the prompt that started this event's turn was sent, for providers
+    /// that record one timestamp per message. The session's active time runs
+    /// from here to the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

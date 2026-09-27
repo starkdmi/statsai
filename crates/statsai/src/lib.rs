@@ -332,6 +332,7 @@ mod tests {
                     started_at,
                     ended_at: None,
                     duration_seconds: None,
+                    turn_started_at: None,
                 },
                 model: Some(ModelInfo {
                     name: Some("codex-auto-review".to_string()),

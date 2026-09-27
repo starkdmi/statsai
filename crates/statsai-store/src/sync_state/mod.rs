@@ -651,6 +651,20 @@ impl Store {
                     .map(|coverage| coverage.coverage_id.clone())
                     .collect::<Vec<_>>(),
             )?;
+            self.record_serialized_entities_synced_in_transaction(
+                sink,
+                target,
+                "session_rollup",
+                &batch.sessions,
+                |rollup| rollup.session_id.as_str(),
+            )?;
+            self.mark_session_rollups_synced_in_transaction(
+                &batch
+                    .sessions
+                    .iter()
+                    .map(|rollup| rollup.session_id.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             self.record_task_bucket_snapshots_synced_in_transaction(
                 sink,
                 target,

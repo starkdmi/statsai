@@ -336,6 +336,12 @@ fn validate_sync_ack(batch: &SyncBatch, ack: &SyncAck) -> Result<()> {
         ack.accepted.account_evidence_summaries,
         ack.duplicates.account_evidence_summaries,
     )?;
+    validate_sync_ack_counts(
+        "sessions",
+        batch.sessions.len() as u64,
+        ack.accepted.sessions,
+        ack.duplicates.sessions,
+    )?;
     Ok(())
 }
 
@@ -459,6 +465,7 @@ mod tests {
             account_evidence_summaries: Vec::new(),
             activity_rollups: Vec::new(),
             activity_coverage: Vec::new(),
+            sessions: Vec::new(),
             events: Vec::new(),
             summaries: Vec::new(),
             task_buckets: Vec::new(),
@@ -824,6 +831,7 @@ mod tests {
                 started_at: Utc::now(),
                 ended_at: None,
                 duration_seconds: None,
+                turn_started_at: None,
             },
             model: None,
             usage: statsai_core::UsageCounts::default(),

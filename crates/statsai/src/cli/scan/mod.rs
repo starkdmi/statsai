@@ -466,6 +466,7 @@ pub(crate) fn scan_with_adapters(
                 }
                 let insert_started_at = Instant::now();
                 let insert_result = store.insert_events_with_resolution(&scan.events)?;
+                store.upsert_session_names(&scan.session_names)?;
                 inserted_count += insert_result.inserted;
                 insert_events_duration_ms += insert_started_at.elapsed().as_millis() as u64;
                 rewrite_quota_usage_event_ids(

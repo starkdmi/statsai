@@ -255,6 +255,7 @@ impl Store {
             )?;
             let inserted_events = self.insert_events(replacement.events)?;
             let written_summaries = self.upsert_summaries(replacement.summaries)?;
+            self.upsert_session_names(replacement.session_names)?;
             // A quota observation can point at an event this just deleted, and the
             // daemon -- the only caller -- never touches quota rows itself, so nothing
             // else repairs the link. Run after the insert: a record that survives the

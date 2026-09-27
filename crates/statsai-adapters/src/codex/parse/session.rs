@@ -1,12 +1,16 @@
 use super::*;
 
-pub(crate) fn load_codex_thread_titles(root: &Path) -> HashMap<String, String> {
-    let index_path = root.join("session_index.jsonl");
+pub(crate) const CODEX_SESSION_INDEX_FILE: &str = "session_index.jsonl";
+
+/// Thread names from `session_index.jsonl`, as the provider shows them. Task
+/// titles clean them further with the prompt rules; session names do not.
+pub(crate) fn load_codex_thread_names(root: &Path) -> HashMap<String, String> {
+    let index_path = root.join(CODEX_SESSION_INDEX_FILE);
     let Ok(file) = File::open(&index_path) else {
         return HashMap::new();
     };
     let mut reader = BufReader::new(file);
-    let mut titles = HashMap::new();
+    let mut names = HashMap::new();
     let mut line_bytes = Vec::new();
     while let Ok(line_status) =
         read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)
@@ -26,14 +30,63 @@ pub(crate) fn load_codex_thread_titles(root: &Path) -> HashMap<String, String> {
         let Some(session_id) = value.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let Some(title) = value.get("thread_name").and_then(Value::as_str) else {
-            continue;
-        };
-        if let Some(title) = summarize_task_text(Some(title), 90) {
-            titles.insert(session_id.to_string(), title);
+        if let Some(name) = statsai_core::provider_session_name(
+            value.get("thread_name").and_then(Value::as_str),
+            90,
+        ) {
+            names.insert(session_id.to_string(), name);
         }
     }
-    titles
+    names
+}
+
+pub(crate) fn codex_thread_titles_from_names(
+    names: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    names
+        .iter()
+        .filter_map(|(session_id, name)| {
+            summarize_task_text(Some(name), 90).map(|title| (session_id.clone(), title))
+        })
+        .collect()
+}
+
+/// Codex never names its sub-agents. A spawned agent records its parent
+/// thread, and a guardian review carries the parent's id as `session_id`, so
+/// both borrow the parent's name, marked with the agent's nickname or kind.
+/// The name is joined when the session is built, so a parent rename reaches
+/// its sub-agents without re-reading their rollouts.
+pub(crate) fn codex_subagent_session_name(
+    value: &Value,
+    session_id: &str,
+) -> Option<statsai_core::SessionName> {
+    let payload = value.get("payload")?;
+    let subagent = payload.pointer("/source/subagent")?;
+    let (parent, label) = if let Some(spawn) = subagent.get("thread_spawn") {
+        let label = ["agent_nickname", "agent_role"]
+            .iter()
+            .find_map(|key| spawn.get(*key).and_then(Value::as_str))
+            .unwrap_or("sub-agent");
+        (
+            spawn.get("parent_thread_id").and_then(Value::as_str)?,
+            label,
+        )
+    } else {
+        let parent = payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|parent| *parent != session_id)?;
+        let label = subagent
+            .get("other")
+            .and_then(Value::as_str)
+            .unwrap_or("sub-agent");
+        (parent, label)
+    };
+    Some(statsai_core::SessionName {
+        local_session_id_hash: hash_text(session_id),
+        title: statsai_core::provider_session_name(Some(label), 40)?,
+        parent_local_session_id_hash: Some(hash_text(parent)),
+    })
 }
 
 pub(crate) fn codex_project_context_from_value(
