@@ -18,10 +18,12 @@ mod cycles;
 mod observations;
 mod reconstruct;
 mod sync;
+mod weekly;
 mod windows;
 
 pub(crate) use cycles::*;
 pub(crate) use reconstruct::*;
+pub use weekly::{weekly_cycle_containing, WeeklyResetAnchor, WEEKLY_RESET_PERIOD_SECONDS};
 
 pub(crate) const RESET_CLUSTER_TOLERANCE_SECONDS: i64 = 5 * 60;
 /// A window cannot be observed once it has reset: the provider issues a fresh

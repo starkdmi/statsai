@@ -102,3 +102,47 @@ installations cannot be blended.
 A logical cycle remains while any device still contributes it. Stale device
 contributions are retired through the same authoritative-snapshot ownership
 used by summaries and code-change metrics.
+
+## Manual weekly schedules
+
+Claude Code weekly value uses the same `quota_cycle_contribution.v1` record.
+There is no separate wire schema. A device stores one manual weekly reset
+anchor per Claude Code account (`statsai account weekly-reset`). The anchor is
+a single UTC instant. Every device of the account is expected to store the same
+phase; anchors that differ by a whole number of weeks are the same schedule.
+Automatic capture from the status line `resets_at` is future work.
+
+Cycles are half-open `[end - 604800s, end)` with `end ≡ anchor (mod 604800)`.
+An event exactly at a reset belongs to the following week. Arithmetic is UTC.
+The device timezone does not move the boundary. Only completed cycles are
+emitted (`end <= now`). The cycle that contains the current instant is omitted.
+
+A device emits a completed cycle when it has attributed Claude Code usage for
+that account inside the cycle, or anywhere on the UTC day that contains the
+cycle start or the UTC day that contains the cycle end. The second case covers
+a reset that falls during a UTC day: a device whose last use that day was
+before the reset still owes the following week a zero slice for the remainder
+of the day, because the backend requires a boundary slice from every device
+with usage on a boundary day. Weeks with no such usage are not emitted. The
+backend fills those gaps from other devices and from daily summaries.
+
+A manual contribution sets `provider` to `claude_code`, `limit_id` to null,
+`window_minutes` to `10080`, `representative_reset` to the cycle end,
+`has_schedule_overlap` to false, and `daily_envelopes` to empty. Boundary
+slices are the partial UTC days of `[start, end)`, including an explicit zero
+slice when the device has no events in that partial day. A boundary that falls
+on UTC midnight has no slice. Usage is not prorated. The contribution id is
+
+```text
+quota_cycle_ + hash("quota_cycle_contribution.v1:{device}:claude_code:{account}:default:10080:manual:{end_epoch}")[:32]
+```
+
+Unchanged completed weeks keep their payload hash, so an incremental sync does
+not resend them. Replacing the anchor with a different phase recomputes every
+id. Clearing the anchor drops this device's manual contributions. The next
+authoritative snapshot retires the ids that are no longer present.
+
+`account merge` transfers a schedule when only one account has one, keeps a
+single copy when the two phases match, and refuses the merge when the phases
+differ. `account remove` treats a stored schedule as a reference, so an account
+that still has one is not deleted.

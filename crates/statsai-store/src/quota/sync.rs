@@ -189,6 +189,7 @@ impl Store {
                 boundary_slices,
             });
         }
+        contributions.extend(self.manual_weekly_contributions(query, device_id, Utc::now())?);
         Ok(contributions)
     }
 

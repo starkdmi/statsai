@@ -6,6 +6,8 @@ use statsai_core::{
     IdentitySource, ProviderAccount, ProviderAccountId, Subscription,
 };
 use statsai_store::{QuotaQuery, Store};
+
+use super::weekly_reset::{weekly_reset, weekly_reset_phases_match};
 use std::collections::{BTreeMap, HashMap};
 
 use super::args::{AccountCommand, AccountSubcommand};
@@ -62,6 +64,7 @@ pub(crate) fn account(command: AccountCommand, store: &Store) -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        AccountSubcommand::WeeklyReset { command } => weekly_reset(command, store)?,
         AccountSubcommand::Remove {
             provider,
             account,
@@ -89,6 +92,7 @@ pub(crate) struct AccountReferenceCounts {
     pub(crate) identity_observations: usize,
     pub(crate) plan_observations: usize,
     pub(crate) conversation_bindings: usize,
+    pub(crate) weekly_reset_schedules: usize,
 }
 
 impl AccountReferenceCounts {
@@ -101,6 +105,7 @@ impl AccountReferenceCounts {
             + self.identity_observations
             + self.plan_observations
             + self.conversation_bindings
+            + self.weekly_reset_schedules
     }
 }
 
@@ -118,6 +123,8 @@ pub(crate) struct AccountMergeReport {
     pub(crate) moved_identity_observations: usize,
     pub(crate) moved_plan_observations: usize,
     pub(crate) moved_conversation_bindings: usize,
+    pub(crate) moved_weekly_reset_schedules: usize,
+    pub(crate) coalesced_weekly_reset_schedules: usize,
     pub(crate) deleted_source_account: bool,
     pub(crate) remaining_references: AccountReferenceCounts,
     pub(crate) reset_local_sync_tracking: bool,
@@ -174,8 +181,39 @@ pub(crate) fn merge_provider_accounts(
         .count();
     let evidence_to_move =
         store.account_evidence_reference_counts(provider, &from.provider_account_id)?;
+    let from_schedule = store.weekly_reset_anchor(provider, &from.provider_account_id)?;
+    let to_schedule = store.weekly_reset_anchor(provider, &to.provider_account_id)?;
+    let (moved_weekly_reset_schedules, coalesced_weekly_reset_schedules) = match (
+        &from_schedule,
+        &to_schedule,
+    ) {
+        (Some(from_anchor), Some(to_anchor)) => {
+            if !weekly_reset_phases_match(
+                from_anchor.anchor.timestamp(),
+                to_anchor.anchor.timestamp(),
+            ) {
+                bail!(
+                        "weekly reset schedules disagree: {} and {} use different weekly reset times. Align or clear one schedule before merging these accounts",
+                        display_account_identity(&from),
+                        display_account_identity(&to)
+                    );
+            }
+            (0, 1)
+        }
+        (Some(_), None) => (1, 0),
+        _ => (0, 0),
+    };
 
     if !dry_run {
+        if coalesced_weekly_reset_schedules == 1 {
+            store.delete_weekly_reset_anchor(provider, &from.provider_account_id)?;
+        } else if moved_weekly_reset_schedules == 1 {
+            store.move_weekly_reset_anchor(
+                provider,
+                &from.provider_account_id,
+                &to.provider_account_id,
+            )?;
+        }
         for assignment in &assignments_to_move {
             connect_source_to_account(
                 store,
@@ -225,6 +263,8 @@ pub(crate) fn merge_provider_accounts(
         moved_identity_observations: evidence_to_move.identity_observations,
         moved_plan_observations: evidence_to_move.plan_observations,
         moved_conversation_bindings: evidence_to_move.conversation_bindings,
+        moved_weekly_reset_schedules,
+        coalesced_weekly_reset_schedules,
         deleted_source_account,
         remaining_references,
         reset_local_sync_tracking: !dry_run,
@@ -243,7 +283,7 @@ pub(crate) fn remove_orphan_provider_account(
         account_reference_counts(store, &account.provider_account_id, Some(provider))?;
     if remaining_references.total() > 0 {
         bail!(
-            "account {} still has references: {} source assignments, {} subscriptions, {} events, {} summaries, {} quota observations, {} identity observations, {} plan observations, {} conversation bindings",
+            "account {} still has references: {} source assignments, {} subscriptions, {} events, {} summaries, {} quota observations, {} identity observations, {} plan observations, {} conversation bindings, {} weekly reset schedules",
             display_account_identity(&account),
             remaining_references.source_account_assignments,
             remaining_references.subscriptions,
@@ -252,7 +292,8 @@ pub(crate) fn remove_orphan_provider_account(
             remaining_references.quota_observations,
             remaining_references.identity_observations,
             remaining_references.plan_observations,
-            remaining_references.conversation_bindings
+            remaining_references.conversation_bindings,
+            remaining_references.weekly_reset_schedules
         );
     }
     let deleted = if dry_run {
@@ -586,6 +627,7 @@ pub(crate) fn account_reference_counts(
             conversation_bindings,
         }
     };
+    let weekly_reset_schedules = store.weekly_reset_anchor_count(provider, provider_account_id)?;
 
     Ok(AccountReferenceCounts {
         source_account_assignments,
@@ -596,5 +638,6 @@ pub(crate) fn account_reference_counts(
         identity_observations: evidence.identity_observations,
         plan_observations: evidence.plan_observations,
         conversation_bindings: evidence.conversation_bindings,
+        weekly_reset_schedules,
     })
 }

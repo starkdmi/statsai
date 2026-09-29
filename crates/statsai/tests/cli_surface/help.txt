@@ -309,11 +309,12 @@ List canonical provider accounts
 Usage: statsai account [OPTIONS] <COMMAND>
 
 Commands:
-  list    List canonical provider accounts
-  plans   Show detected plan evidence per account
-  merge   Merge a legacy/manual account into an existing canonical account
-  remove  Remove an unreferenced account row
-  help    Print this message or the help of the given subcommand(s)
+  list          List canonical provider accounts
+  plans         Show detected plan evidence per account
+  merge         Merge a legacy/manual account into an existing canonical account
+  weekly-reset  Manage the manual weekly reset anchor for a Claude Code account
+  remove        Remove an unreferenced account row
+  help          Print this message or the help of the given subcommand(s)
 
 Options:
       --store <STORE>          Path to SQLite store
@@ -352,6 +353,55 @@ Options:
       --from <FROM>            Source account identity (label, email, provider user id, or provider account id)
       --to <TO>                Destination account identity (label, email, provider user id, or provider account id)
       --dry-run                Preview the cleanup without writing
+  -h, --help                   Print help
+===== statsai account weekly-reset --help =====
+Manage the manual weekly reset anchor for a Claude Code account
+
+Usage: statsai account weekly-reset [OPTIONS] <COMMAND>
+
+Commands:
+  set    Store a manual weekly reset anchor
+  show   Show the manual weekly reset anchor and the cycle that contains now
+  clear  Remove the manual weekly reset anchor
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai account weekly-reset set --help =====
+Store a manual weekly reset anchor
+
+Usage: statsai account weekly-reset set [OPTIONS] --provider <PROVIDER> --account <ACCOUNT> --at <AT>
+
+Options:
+      --provider <PROVIDER>    Provider name. Only claude_code is accepted
+      --store <STORE>          Path to SQLite store
+      --account <ACCOUNT>      Account identity (label, email, provider user id, or provider account id)
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --at <AT>                Weekly reset instant as RFC3339 with an explicit offset or Z. Past and future instants are both accepted and stored as whole-second UTC
+  -h, --help                   Print help
+===== statsai account weekly-reset show --help =====
+Show the manual weekly reset anchor and the cycle that contains now
+
+Usage: statsai account weekly-reset show [OPTIONS] --provider <PROVIDER> --account <ACCOUNT>
+
+Options:
+      --provider <PROVIDER>    Provider name. Only claude_code is accepted
+      --store <STORE>          Path to SQLite store
+      --account <ACCOUNT>      Account identity (label, email, provider user id, or provider account id)
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai account weekly-reset clear --help =====
+Remove the manual weekly reset anchor
+
+Usage: statsai account weekly-reset clear [OPTIONS] --provider <PROVIDER> --account <ACCOUNT>
+
+Options:
+      --provider <PROVIDER>    Provider name. Only claude_code is accepted
+      --store <STORE>          Path to SQLite store
+      --account <ACCOUNT>      Account identity (label, email, provider user id, or provider account id)
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
   -h, --help                   Print help
 ===== statsai account remove --help =====
 Remove an unreferenced account row

@@ -101,7 +101,10 @@ pub use privacy::{
     FilteredConversationMetadata, FilteredConversationRecord, PrivacyDatasetStatus,
     PrivacyFailureRecord, PrivacyFindingRecord,
 };
-pub use quota::{QuotaDateRange, QuotaQuery, QuotaStatus};
+pub use quota::{
+    weekly_cycle_containing, QuotaDateRange, QuotaQuery, QuotaStatus, WeeklyResetAnchor,
+    WEEKLY_RESET_PERIOD_SECONDS,
+};
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
