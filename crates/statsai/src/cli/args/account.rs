@@ -39,6 +39,11 @@ pub(crate) enum AccountSubcommand {
         #[arg(long, help = "Preview the cleanup without writing")]
         dry_run: bool,
     },
+    #[command(about = "Manage the manual weekly reset anchor for a Claude Code account")]
+    WeeklyReset {
+        #[command(subcommand)]
+        command: WeeklyResetSubcommand,
+    },
     #[command(about = "Remove an unreferenced account row")]
     Remove {
         #[arg(long, help = "Provider name (claude_code, codex)")]
@@ -50,5 +55,44 @@ pub(crate) enum AccountSubcommand {
         account: String,
         #[arg(long, help = "Preview the cleanup without writing")]
         dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum WeeklyResetSubcommand {
+    #[command(about = "Store a manual weekly reset anchor")]
+    Set {
+        #[arg(long, help = "Provider name. Only claude_code is accepted")]
+        provider: String,
+        #[arg(
+            long,
+            help = "Account identity (label, email, provider user id, or provider account id)"
+        )]
+        account: String,
+        #[arg(
+            long,
+            help = "Weekly reset instant as RFC3339 with an explicit offset or Z. Past and future instants are both accepted and stored as whole-second UTC"
+        )]
+        at: String,
+    },
+    #[command(about = "Show the manual weekly reset anchor and the cycle that contains now")]
+    Show {
+        #[arg(long, help = "Provider name. Only claude_code is accepted")]
+        provider: String,
+        #[arg(
+            long,
+            help = "Account identity (label, email, provider user id, or provider account id)"
+        )]
+        account: String,
+    },
+    #[command(about = "Remove the manual weekly reset anchor")]
+    Clear {
+        #[arg(long, help = "Provider name. Only claude_code is accepted")]
+        provider: String,
+        #[arg(
+            long,
+            help = "Account identity (label, email, provider user id, or provider account id)"
+        )]
+        account: String,
     },
 }

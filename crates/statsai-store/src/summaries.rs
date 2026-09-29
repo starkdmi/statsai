@@ -112,8 +112,7 @@ impl Store {
         if summaries.is_empty() {
             return Ok(0);
         }
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let mut changed = 0u64;
             for summary in summaries {
                 if self.upsert_summary(summary)? {
@@ -121,18 +120,7 @@ impl Store {
                 }
             }
             Ok(changed)
-        })();
-
-        match result {
-            Ok(changed) => {
-                commit_transaction(&self.conn)?;
-                Ok(changed)
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub fn summaries_after(

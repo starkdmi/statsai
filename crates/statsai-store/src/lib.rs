@@ -101,7 +101,10 @@ pub use privacy::{
     FilteredConversationMetadata, FilteredConversationRecord, PrivacyDatasetStatus,
     PrivacyFailureRecord, PrivacyFindingRecord,
 };
-pub use quota::{QuotaDateRange, QuotaQuery, QuotaStatus};
+pub use quota::{
+    weekly_cycle_containing, QuotaDateRange, QuotaQuery, QuotaStatus, WeeklyResetAnchor,
+    WEEKLY_RESET_PERIOD_SECONDS,
+};
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
@@ -529,6 +532,14 @@ impl Store {
     /// Returns the operation error and rolls back every scanner write, or an
     /// error if the transaction cannot be started or committed.
     pub fn apply_scan_update<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.with_immediate_transaction(|| operation(self))
+    }
+
+    /// Runs one account merge's writes in a single transaction.
+    ///
+    /// Nested store operations join this transaction. A failure rolls every
+    /// write back, including a weekly reset anchor moved before a later check.
+    pub fn apply_account_merge<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
         self.with_immediate_transaction(|| operation(self))
     }
 

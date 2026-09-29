@@ -8,7 +8,7 @@ mod v2;
 pub(crate) use v1::*;
 pub(crate) use v2::*;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 28;
+pub const CURRENT_SCHEMA_VERSION: i64 = 29;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -153,6 +153,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         26 => apply_migration_026(conn),
         27 => apply_migration_027(conn),
         28 => apply_migration_028(conn),
+        29 => apply_migration_029(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -350,6 +351,11 @@ mod tests {
         assert!(table_exists(&conn, "activity_rollups"));
         assert!(table_exists(&conn, "activity_coverage"));
         assert!(table_exists(&conn, "activity_scan_cursors"));
+        assert!(table_exists(&conn, "weekly_reset_anchors"));
+        assert!(index_exists(
+            &conn,
+            "usage_events_provider_account_started_idx"
+        ));
     }
 
     /// The scan filters are only fast while SQLite can match them to the indexes

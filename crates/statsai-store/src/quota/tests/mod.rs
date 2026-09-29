@@ -5,4 +5,5 @@ mod observations;
 mod reconstruct;
 mod support;
 mod sync;
+mod weekly;
 mod windows;

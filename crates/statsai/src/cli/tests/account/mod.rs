@@ -3,6 +3,7 @@ pub(crate) use super::*;
 
 mod claude_plans;
 mod merge;
+mod weekly_reset;
 
 #[test]
 fn canonicalization_skips_accounts_without_surviving_evidence() {

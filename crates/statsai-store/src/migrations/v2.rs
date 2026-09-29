@@ -655,3 +655,32 @@ pub(crate) fn apply_migration_028(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Manual weekly reset anchors, and the event index those anchors read through.
+///
+/// A Claude weekly contribution asks two questions of `usage_events`: which UTC
+/// days this account has any usage on, and which events fall on the partial
+/// days at each reset. `usage_events_semantic_lookup_idx` leads with provider
+/// and then source, so it cannot bound a single provider account, and both
+/// questions would scan every provider's events. The new index serves
+/// `(provider, provider_account_id, started_at)` as a range.
+pub(crate) fn apply_migration_029(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS weekly_reset_anchors (
+          provider TEXT NOT NULL,
+          provider_account_id TEXT NOT NULL,
+          anchor_epoch_seconds INTEGER NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (provider, provider_account_id),
+          CHECK (provider = 'claude_code'),
+          CHECK (source = 'manual')
+        );
+        CREATE INDEX IF NOT EXISTS usage_events_provider_account_started_idx
+          ON usage_events (provider, provider_account_id, started_at);
+        "#,
+    )?;
+    Ok(())
+}

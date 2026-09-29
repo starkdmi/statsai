@@ -19,6 +19,7 @@ pub(super) mod store_admin;
 pub(super) mod subscription;
 pub(super) mod sync;
 pub(super) mod task;
+pub(super) mod weekly_reset;
 
 pub(crate) use account::*;
 pub(crate) use activity::*;
