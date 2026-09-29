@@ -385,45 +385,30 @@ impl Store {
         if days.is_empty() {
             return Ok(Vec::new());
         }
-        const CHUNK_SIZE: usize = 64;
-        let mut events = Vec::new();
-        for chunk in days.chunks(CHUNK_SIZE) {
-            let mut sql = String::from(
-                "SELECT payload FROM usage_events
-                 WHERE provider = 'claude_code'
-                   AND provider_account_id = ?1 ",
-            );
-            let mut bindings: Vec<Box<dyn rusqlite::types::ToSql>> =
-                vec![Box::new(provider_account_id.0.clone())];
+        // One indexed range per UTC day. Bundled SQLite drops `started_at` from
+        // the provider/account index when those ranges are combined with OR, and
+        // then each batch scans the account's whole history.
+        let sql = boundary_day_events_sql(days.len(), source_id.is_some());
+        let mut statement = self.conn.prepare(&sql)?;
+        let mut bindings: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for day in days {
+            let start = day.and_hms_opt(0, 0, 0).expect("utc midnight").and_utc();
+            let end = start + Duration::days(1);
+            bindings.push(Box::new(provider_account_id.0.clone()));
             if let Some(source_id) = source_id {
-                sql.push_str("AND source_id = ?2 ");
                 bindings.push(Box::new(source_id.0.clone()));
             }
-            sql.push_str("AND (");
-            for (index, day) in chunk.iter().enumerate() {
-                if index > 0 {
-                    sql.push_str(" OR ");
-                }
-                let start_index = bindings.len() + 1;
-                let end_index = start_index + 1;
-                sql.push_str(&format!(
-                    "(started_at >= ?{start_index} AND started_at < ?{end_index})"
-                ));
-                let start = day.and_hms_opt(0, 0, 0).expect("utc midnight").and_utc();
-                let end = start + Duration::days(1);
-                bindings.push(Box::new(start.to_rfc3339()));
-                bindings.push(Box::new(end.to_rfc3339()));
-            }
-            sql.push_str(") ORDER BY started_at, event_id");
-            let mut statement = self.conn.prepare(&sql)?;
-            let params = bindings
-                .iter()
-                .map(|value| value.as_ref() as &dyn rusqlite::types::ToSql)
-                .collect::<Vec<_>>();
-            let rows = statement.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
-            for row in rows {
-                events.push(serde_json::from_str(&row?)?);
-            }
+            bindings.push(Box::new(start.to_rfc3339()));
+            bindings.push(Box::new(end.to_rfc3339()));
+        }
+        let params = bindings
+            .iter()
+            .map(|value| value.as_ref() as &dyn rusqlite::types::ToSql)
+            .collect::<Vec<_>>();
+        let rows = statement.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(serde_json::from_str(&row?)?);
         }
         Ok(events)
     }
@@ -448,6 +433,39 @@ fn cycle_end_after(anchor_epoch: i64, instant_epoch: i64) -> i64 {
 
 fn usage_day_cell(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
     row.get(0)
+}
+
+/// `UNION ALL` of one provider/account/start-time range per UTC day.
+///
+/// Each arm keeps `started_at` inside the index constraint. An `OR` of the same
+/// ranges does not, on the SQLite build this crate bundles.
+pub(crate) fn boundary_day_events_sql(day_count: usize, with_source: bool) -> String {
+    let mut arms = Vec::with_capacity(day_count);
+    for index in 0..day_count {
+        let base = if with_source {
+            index * 4 + 1
+        } else {
+            index * 3 + 1
+        };
+        let source_clause = if with_source {
+            format!("AND source_id = ?{} ", base + 1)
+        } else {
+            String::new()
+        };
+        let start_param = if with_source { base + 2 } else { base + 1 };
+        let end_param = start_param + 1;
+        arms.push(format!(
+            "SELECT payload, started_at, event_id FROM usage_events \
+             WHERE provider = 'claude_code' \
+               AND provider_account_id = ?{base} \
+               {source_clause}AND started_at >= ?{start_param} \
+               AND started_at < ?{end_param}"
+        ));
+    }
+    format!(
+        "SELECT payload FROM ({}) ORDER BY started_at, event_id",
+        arms.join(" UNION ALL ")
+    )
 }
 
 fn cycle_overlaps_query(end_epoch: i64, query: &QuotaQuery) -> bool {

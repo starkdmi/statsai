@@ -1,3 +1,4 @@
+use super::super::weekly::boundary_day_events_sql;
 use super::support::*;
 use super::*;
 use chrono::TimeZone;
@@ -461,16 +462,21 @@ fn usage_day_reads_use_the_provider_account_index() {
         plan.contains("usage_events_provider_account_started_idx"),
         "usage day lookup does not use the account index: {plan}"
     );
-    let bounded = query_plan(
-        &store,
-        "SELECT payload FROM usage_events
-         WHERE provider = 'claude_code'
-           AND provider_account_id = ?1
-           AND (started_at >= ?2 AND started_at < ?3)",
-    );
+    for day_count in [1usize, 2, 64] {
+        let bounded = query_plan(&store, &boundary_day_events_sql(day_count, false));
+        assert!(
+            bounded.contains("usage_events_provider_account_started_idx"),
+            "{day_count}-day boundary lookup misses the account index: {bounded}"
+        );
+        assert!(
+            bounded.contains("started_at"),
+            "{day_count}-day boundary lookup dropped its timestamp bounds: {bounded}"
+        );
+    }
+    let sourced = query_plan(&store, &boundary_day_events_sql(2, true));
     assert!(
-        bounded.contains("usage_events_provider_account_started_idx"),
-        "boundary day lookup does not use the account index: {bounded}"
+        sourced.contains("started_at"),
+        "source-filtered boundary lookup dropped its timestamp bounds: {sourced}"
     );
 }
 
