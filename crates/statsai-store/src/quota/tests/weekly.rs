@@ -530,6 +530,129 @@ fn quota_cycle_contributions_appends_completed_manual_weeks() {
             && contribution.provider_account_id == account_id));
 }
 
+#[test]
+fn manual_contributions_honor_source_limit_and_time_filters() {
+    let store = Store::in_memory().expect("store");
+    let account_id = anchor_account(&store, at(2026, 1, 8, 18, 0, 0));
+    claude_event(
+        &store,
+        &account_id,
+        at(2026, 1, 10, 12, 0, 0),
+        "first-week",
+        simple_usage(4),
+        4,
+    );
+    claude_event(
+        &store,
+        &account_id,
+        at(2026, 1, 20, 12, 0, 0),
+        "second-week",
+        simple_usage(6),
+        6,
+    );
+    let source_id = store
+        .events()
+        .expect("events")
+        .into_iter()
+        .find(|event| event.provider == "claude_code")
+        .expect("claude event")
+        .source_id;
+    let all = store
+        .quota_cycle_contributions(&QuotaQuery::default(), "device-weekly")
+        .expect("all");
+    let claude = all
+        .iter()
+        .filter(|contribution| contribution.provider == "claude_code")
+        .count();
+    assert_eq!(claude, 2);
+
+    let other_source = store
+        .quota_cycle_contributions(
+            &QuotaQuery {
+                source_id: Some(SourceId("other-source".to_string())),
+                ..QuotaQuery::default()
+            },
+            "device-weekly",
+        )
+        .expect("other source");
+    assert!(other_source
+        .iter()
+        .all(|contribution| contribution.provider != "claude_code"));
+
+    let matching_source = store
+        .quota_cycle_contributions(
+            &QuotaQuery {
+                source_id: Some(source_id),
+                ..QuotaQuery::default()
+            },
+            "device-weekly",
+        )
+        .expect("matching source");
+    assert_eq!(
+        matching_source
+            .iter()
+            .filter(|contribution| contribution.provider == "claude_code")
+            .count(),
+        2
+    );
+
+    let limited = store
+        .quota_cycle_contributions(
+            &QuotaQuery {
+                limit_id: Some("five_hour".to_string()),
+                ..QuotaQuery::default()
+            },
+            "device-weekly",
+        )
+        .expect("limit");
+    assert!(limited
+        .iter()
+        .all(|contribution| contribution.provider != "claude_code"));
+
+    let future = store
+        .quota_cycle_contributions(
+            &QuotaQuery {
+                from: Some(at(2030, 1, 1, 0, 0, 0)),
+                ..QuotaQuery::default()
+            },
+            "device-weekly",
+        )
+        .expect("future");
+    assert!(future
+        .iter()
+        .all(|contribution| contribution.provider != "claude_code"));
+
+    let before = store
+        .quota_cycle_contributions(
+            &QuotaQuery {
+                to: Some(at(2020, 1, 1, 0, 0, 0)),
+                ..QuotaQuery::default()
+            },
+            "device-weekly",
+        )
+        .expect("before");
+    assert!(before
+        .iter()
+        .all(|contribution| contribution.provider != "claude_code"));
+
+    let second_only = store
+        .quota_cycle_contributions(
+            &QuotaQuery {
+                from: Some(at(2026, 1, 16, 0, 0, 0)),
+                to: Some(at(2026, 1, 21, 0, 0, 0)),
+                ..QuotaQuery::default()
+            },
+            "device-weekly",
+        )
+        .expect("second week");
+    let resets = second_only
+        .iter()
+        .filter(|contribution| contribution.provider == "claude_code")
+        .map(|contribution| contribution.representative_reset)
+        .collect::<Vec<_>>();
+    assert_eq!(resets, vec![at(2026, 1, 22, 18, 0, 0)]);
+}
+
 fn query_plan(store: &Store, sql: &str) -> String {
     let explain = format!("EXPLAIN QUERY PLAN {sql}");
     let mut statement = store.conn.prepare(&explain).expect("explain");

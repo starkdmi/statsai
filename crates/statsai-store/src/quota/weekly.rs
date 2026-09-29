@@ -188,11 +188,17 @@ impl Store {
         {
             return Ok(Vec::new());
         }
+        // Manual cycles have no provider limit. A limit filter matches the
+        // reconstructed path, which drops windows whose limit id differs.
+        if query.limit_id.is_some() {
+            return Ok(Vec::new());
+        }
         let anchors = self.weekly_reset_anchors(query.provider_account_id.as_ref())?;
         let mut contributions = Vec::new();
         for anchor in anchors {
-            contributions
-                .extend(self.manual_weekly_contributions_for_anchor(device_id, &anchor, now)?);
+            contributions.extend(
+                self.manual_weekly_contributions_for_anchor(device_id, &anchor, query, now)?,
+            );
         }
         Ok(contributions)
     }
@@ -243,11 +249,16 @@ impl Store {
         &self,
         device_id: &str,
         anchor: &WeeklyResetAnchor,
+        query: &QuotaQuery,
         now: DateTime<Utc>,
     ) -> Result<Vec<QuotaCycleContributionV1>> {
-        let usage_days = self.claude_code_usage_days(&anchor.provider_account_id)?;
+        let usage_days =
+            self.claude_code_usage_days(&anchor.provider_account_id, query.source_id.as_ref())?;
         let ends =
-            emitted_manual_cycle_ends(anchor.anchor.timestamp(), now.timestamp(), &usage_days);
+            emitted_manual_cycle_ends(anchor.anchor.timestamp(), now.timestamp(), &usage_days)
+                .into_iter()
+                .filter(|end_epoch| cycle_overlaps_query(*end_epoch, query))
+                .collect::<Vec<_>>();
         if ends.is_empty() {
             return Ok(Vec::new());
         }
@@ -264,7 +275,11 @@ impl Store {
             );
             slices_by_end.insert(*end_epoch, builders.slices);
         }
-        self.fill_manual_boundary_slices(&anchor.provider_account_id, &mut slices_by_end)?;
+        self.fill_manual_boundary_slices(
+            &anchor.provider_account_id,
+            query.source_id.as_ref(),
+            &mut slices_by_end,
+        )?;
 
         let mut contributions = Vec::with_capacity(ends.len());
         for end_epoch in ends {
@@ -293,17 +308,30 @@ impl Store {
     fn claude_code_usage_days(
         &self,
         provider_account_id: &ProviderAccountId,
+        source_id: Option<&SourceId>,
     ) -> Result<BTreeSet<NaiveDate>> {
-        let mut statement = self.conn.prepare(
+        let sql = if source_id.is_some() {
+            r#"
+            SELECT DISTINCT substr(started_at, 1, 10)
+            FROM usage_events
+            WHERE provider = 'claude_code' AND provider_account_id = ?1 AND source_id = ?2
+            "#
+        } else {
             r#"
             SELECT DISTINCT substr(started_at, 1, 10)
             FROM usage_events
             WHERE provider = 'claude_code' AND provider_account_id = ?1
-            "#,
-        )?;
-        let rows = statement.query_map(params![&provider_account_id.0], |row| {
-            row.get::<_, String>(0)
-        })?;
+            "#
+        };
+        let mut statement = self.conn.prepare(sql)?;
+        let rows = if let Some(source_id) = source_id {
+            statement.query_map(
+                params![&provider_account_id.0, &source_id.0],
+                usage_day_cell,
+            )?
+        } else {
+            statement.query_map(params![&provider_account_id.0], usage_day_cell)?
+        };
         let mut days = BTreeSet::new();
         for row in rows {
             let day = row?;
@@ -317,6 +345,7 @@ impl Store {
     fn fill_manual_boundary_slices(
         &self,
         provider_account_id: &ProviderAccountId,
+        source_id: Option<&SourceId>,
         slices_by_end: &mut BTreeMap<i64, Vec<QuotaUsageSliceV1>>,
     ) -> Result<()> {
         let mut days = BTreeSet::new();
@@ -329,7 +358,9 @@ impl Store {
             return Ok(());
         }
         let day_list = days.into_iter().collect::<Vec<_>>();
-        for event in self.claude_code_events_on_utc_days(provider_account_id, &day_list)? {
+        for event in
+            self.claude_code_events_on_utc_days(provider_account_id, source_id, &day_list)?
+        {
             let estimated_cost = event.cost.estimated_micro_usd();
             for slices in slices_by_end.values_mut() {
                 for slice in slices.iter_mut() {
@@ -348,6 +379,7 @@ impl Store {
     fn claude_code_events_on_utc_days(
         &self,
         provider_account_id: &ProviderAccountId,
+        source_id: Option<&SourceId>,
         days: &[NaiveDate],
     ) -> Result<Vec<statsai_core::UsageEvent>> {
         if days.is_empty() {
@@ -359,11 +391,15 @@ impl Store {
             let mut sql = String::from(
                 "SELECT payload FROM usage_events
                  WHERE provider = 'claude_code'
-                   AND provider_account_id = ?1
-                   AND (",
+                   AND provider_account_id = ?1 ",
             );
             let mut bindings: Vec<Box<dyn rusqlite::types::ToSql>> =
                 vec![Box::new(provider_account_id.0.clone())];
+            if let Some(source_id) = source_id {
+                sql.push_str("AND source_id = ?2 ");
+                bindings.push(Box::new(source_id.0.clone()));
+            }
+            sql.push_str("AND (");
             for (index, day) in chunk.iter().enumerate() {
                 if index > 0 {
                     sql.push_str(" OR ");
@@ -408,6 +444,16 @@ fn cycle_end_after(anchor_epoch: i64, instant_epoch: i64) -> i64 {
     } else {
         instant_epoch - instant_mod + phase + WEEKLY_RESET_PERIOD_SECONDS
     }
+}
+
+fn usage_day_cell(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    row.get(0)
+}
+
+fn cycle_overlaps_query(end_epoch: i64, query: &QuotaQuery) -> bool {
+    let start_epoch = end_epoch - WEEKLY_RESET_PERIOD_SECONDS;
+    query.from.is_none_or(|from| end_epoch > from.timestamp())
+        && query.to.is_none_or(|to| start_epoch <= to.timestamp())
 }
 
 fn first_weekly_end_on_or_after(anchor_epoch: i64, instant_epoch: i64) -> i64 {
