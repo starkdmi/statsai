@@ -204,51 +204,56 @@ pub(crate) fn merge_provider_accounts(
         _ => (0, 0),
     };
 
-    if !dry_run {
-        if coalesced_weekly_reset_schedules == 1 {
-            store.delete_weekly_reset_anchor(provider, &from.provider_account_id)?;
-        } else if moved_weekly_reset_schedules == 1 {
-            store.move_weekly_reset_anchor(
+    let (remaining_references, deleted_source_account) = if dry_run {
+        (
+            account_reference_counts(store, &from.provider_account_id, Some(provider))?,
+            false,
+        )
+    } else {
+        store.apply_account_merge(|store| {
+            if coalesced_weekly_reset_schedules == 1 {
+                store.delete_weekly_reset_anchor(provider, &from.provider_account_id)?;
+            } else if moved_weekly_reset_schedules == 1 {
+                store.move_weekly_reset_anchor(
+                    provider,
+                    &from.provider_account_id,
+                    &to.provider_account_id,
+                )?;
+            }
+            for assignment in &assignments_to_move {
+                connect_source_to_account(
+                    store,
+                    ConnectSourceToAccountInput {
+                        source_id: &assignment.source_id,
+                        provider_account_id_value: Some(&to.provider_account_id.0),
+                        provider_user_id: None,
+                        email: None,
+                        label: None,
+                        started_at: assignment.started_at,
+                        ended_at: assignment.ended_at,
+                    },
+                )?;
+            }
+            for subscription in &subscriptions_to_move {
+                move_subscription_to_account(store, subscription, &to.provider_account_id)?;
+            }
+            move_direct_account_records(
+                store,
                 provider,
                 &from.provider_account_id,
                 &to.provider_account_id,
             )?;
-        }
-        for assignment in &assignments_to_move {
-            connect_source_to_account(
-                store,
-                ConnectSourceToAccountInput {
-                    source_id: &assignment.source_id,
-                    provider_account_id_value: Some(&to.provider_account_id.0),
-                    provider_user_id: None,
-                    email: None,
-                    label: None,
-                    started_at: assignment.started_at,
-                    ended_at: assignment.ended_at,
-                },
-            )?;
-        }
-        for subscription in &subscriptions_to_move {
-            move_subscription_to_account(store, subscription, &to.provider_account_id)?;
-        }
-        move_direct_account_records(
-            store,
-            provider,
-            &from.provider_account_id,
-            &to.provider_account_id,
-        )?;
-    }
-
-    let remaining_references =
-        account_reference_counts(store, &from.provider_account_id, Some(provider))?;
-    let deleted_source_account = if !dry_run && remaining_references.total() == 0 {
-        store.delete_account(&from.provider_account_id)?
-    } else {
-        false
+            let remaining_references =
+                account_reference_counts(store, &from.provider_account_id, Some(provider))?;
+            let deleted_source_account = if remaining_references.total() == 0 {
+                store.delete_account(&from.provider_account_id)?
+            } else {
+                false
+            };
+            store.clear_sync_tracking()?;
+            Ok((remaining_references, deleted_source_account))
+        })?
     };
-    if !dry_run {
-        store.clear_sync_tracking()?;
-    }
 
     Ok(AccountMergeReport {
         provider: provider.to_string(),

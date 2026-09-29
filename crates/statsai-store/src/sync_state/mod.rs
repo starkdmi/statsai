@@ -186,25 +186,13 @@ impl Store {
     }
 
     pub fn clear_sync_tracking(&self) -> Result<()> {
-        begin_immediate_transaction_with_retry(&self.conn)?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             self.conn.execute("DELETE FROM entity_sync_state", [])?;
             self.conn
                 .execute("DELETE FROM task_bucket_sync_state", [])?;
             self.conn.execute("DELETE FROM sync_state", [])?;
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                commit_transaction(&self.conn)?;
-                Ok(())
-            }
-            Err(error) => {
-                rollback(&self.conn);
-                Err(error)
-            }
-        }
+        })
     }
 
     /// The cursor upsert without a transaction of its own, so a caller that must

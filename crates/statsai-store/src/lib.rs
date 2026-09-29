@@ -535,6 +535,14 @@ impl Store {
         self.with_immediate_transaction(|| operation(self))
     }
 
+    /// Runs one account merge's writes in a single transaction.
+    ///
+    /// Nested store operations join this transaction. A failure rolls every
+    /// write back, including a weekly reset anchor moved before a later check.
+    pub fn apply_account_merge<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.with_immediate_transaction(|| operation(self))
+    }
+
     /// Applies a complete incoming sync batch in one transaction.
     ///
     /// # Errors

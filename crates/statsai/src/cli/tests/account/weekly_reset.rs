@@ -178,6 +178,84 @@ fn merge_transfers_coalesces_and_rejects_weekly_reset_schedules() {
 }
 
 #[test]
+fn failed_merge_keeps_the_source_weekly_reset_anchor() {
+    let store = Store::in_memory().expect("store");
+    let from = claude_account(&store, "legacy");
+    let to = claude_account(&store, "canonical");
+    let anchor = at(2026, 1, 8, 18, 0, 0);
+    let started_at = at(2026, 1, 1, 0, 0, 0);
+    store
+        .upsert_weekly_reset_anchor("claude_code", &from.provider_account_id, anchor)
+        .expect("anchor");
+    for (account_id, plan) in [
+        (&from.provider_account_id, "Pro"),
+        (&to.provider_account_id, "Max"),
+    ] {
+        store
+            .upsert_subscription(&Subscription {
+                schema_version: SUBSCRIPTION_SCHEMA_VERSION.to_string(),
+                subscription_id: subscription_id("claude_code", account_id, plan, started_at),
+                provider: "claude_code".to_string(),
+                provider_account_id: account_id.clone(),
+                plan_name: plan.to_string(),
+                price: 2000,
+                currency: "USD".to_string(),
+                billing_period: BillingPeriod::Monthly,
+                paid_at: Some(started_at),
+                renewal_day: Some(1),
+                started_at,
+                ended_at: None,
+                current_period_ends_at: None,
+                status: SubscriptionStatus::Active,
+                record_source: IdentitySource::LocalAuth,
+                verified_at: Some(started_at),
+                notes: None,
+            })
+            .expect("subscription");
+    }
+
+    let rejected = merge_provider_accounts(&store, "claude_code", "legacy", "canonical", false)
+        .expect_err("overlap");
+    assert!(rejected.to_string().contains("subscription overlaps"));
+    assert_eq!(
+        store
+            .weekly_reset_anchor("claude_code", &from.provider_account_id)
+            .expect("source schedule")
+            .expect("anchor restored")
+            .anchor,
+        anchor
+    );
+    assert!(store
+        .weekly_reset_anchor("claude_code", &to.provider_account_id)
+        .expect("destination schedule")
+        .is_none());
+
+    let equivalent = at(2026, 1, 15, 18, 0, 0);
+    store
+        .upsert_weekly_reset_anchor("claude_code", &to.provider_account_id, equivalent)
+        .expect("destination anchor");
+    let coalesced = merge_provider_accounts(&store, "claude_code", "legacy", "canonical", false)
+        .expect_err("coalesce overlap");
+    assert!(coalesced.to_string().contains("subscription overlaps"));
+    assert_eq!(
+        store
+            .weekly_reset_anchor("claude_code", &from.provider_account_id)
+            .expect("source schedule")
+            .expect("source anchor kept")
+            .anchor,
+        anchor
+    );
+    assert_eq!(
+        store
+            .weekly_reset_anchor("claude_code", &to.provider_account_id)
+            .expect("destination schedule")
+            .expect("destination anchor kept")
+            .anchor,
+        equivalent
+    );
+}
+
+#[test]
 fn remove_treats_a_weekly_reset_schedule_as_a_reference() {
     let store = Store::in_memory().expect("store");
     let account = claude_account(&store, "work");
