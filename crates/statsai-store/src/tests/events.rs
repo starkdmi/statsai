@@ -68,6 +68,7 @@ fn inserts_events_idempotently() {
         },
         created_at: now,
         imported_at: now,
+        context: None,
     };
 
     assert!(store.insert_event(&event).expect("insert"));

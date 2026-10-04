@@ -1,6 +1,7 @@
 pub(crate) use super::*;
 
 mod accounts;
+mod cache;
 mod dedupe;
 mod events;
 mod open;

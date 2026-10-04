@@ -910,3 +910,127 @@ fn test_task_verification() -> TaskVerification {
         updated_at: created_at,
     }
 }
+
+#[test]
+fn cache_report_query_reads_percent_encoded_filters() {
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let query = cache_report_query(
+        "from=2026-07-01&to=2026-07-03T00%3A00%3A00%2B02%3A00&provider=claude_code&account=unassigned&session=session_ab&timeline=true",
+        now,
+    )
+    .expect("query");
+    assert_eq!(
+        query.since,
+        Some(Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap())
+    );
+    assert_eq!(
+        query.until,
+        Utc.with_ymd_and_hms(2026, 7, 2, 22, 0, 0).unwrap()
+    );
+    assert_eq!(query.provider.as_deref(), Some("claude_code"));
+    assert_eq!(query.account.as_deref(), Some("unassigned"));
+    assert_eq!(query.session.as_deref(), Some("session_ab"));
+    assert!(query.timeline);
+    assert!(!query.details, "per-call details stay with the CLI");
+
+    let default = cache_report_query("", now).expect("default");
+    assert_eq!(default.since, Some(now - chrono::Duration::days(7)));
+    let all = cache_report_query("all=true", now).expect("all");
+    assert_eq!((all.since, all.until), (None, now));
+    for rejected in [
+        "details=true",
+        "from=a&from=b",
+        "timeline=maybe",
+        "from=not-a-date",
+        "all=true&from=2026-07-01",
+        "all=maybe",
+    ] {
+        assert!(cache_report_query(rejected, now).is_err(), "{rejected}");
+    }
+}
+
+#[test]
+fn cache_report_route_requires_the_bearer_token() {
+    assert_eq!(
+        validate_http_request(
+            &Method::Get,
+            "/reports/cache?from=2026-07-01",
+            &[],
+            None,
+            "secret"
+        ),
+        Err(HttpRejection {
+            status: StatusCode(401),
+            message: "missing or invalid bearer token",
+        })
+    );
+}
+
+#[test]
+fn the_cache_report_route_serves_the_cli_report() {
+    let store = Store::in_memory().expect("store");
+    let event = |id: &str, at: &str, read: u64, write: u64| -> statsai_core::UsageEvent {
+        serde_json::from_value(json!({
+            "schema_version": "usage_event.v1",
+            "event_id": id,
+            "device_id": "device",
+            "provider": "claude_code",
+            "source_id": "src_daemon_cache",
+            "provider_account_id": null,
+            "subscription_id": null,
+            "source": {
+                "adapter_id": "test", "adapter_version": "0", "source_kind": "local_adapter",
+                "location_origin": null, "source_type": "jsonl", "source_path_hash": null,
+                "source_record_id": null, "parse_confidence": "high"
+            },
+            "session": {
+                "session_id": "session_daemon", "local_session_id_hash": null, "title": null,
+                "started_at": at, "ended_at": null, "duration_seconds": null
+            },
+            "model": null,
+            "usage": { "input_tokens": 10, "cache_read_tokens": read, "cache_creation_tokens": write, "requests": 1 },
+            "runtime": null,
+            "cost": { "currency": "USD", "estimated_api_equivalent_usd": null, "provider_reported_usd": null, "pricing_source": null, "pricing_version": null, "confidence": "low" },
+            "parse_evidence": null,
+            "project": null,
+            "git": null,
+            "privacy": { "mode": "metadata_only", "contains_prompt_text": false, "contains_response_text": false, "contains_file_paths": false },
+            "created_at": at,
+            "imported_at": at
+        }))
+        .expect("event")
+    };
+    store
+        .insert_events(&[
+            event("event_a", "2026-07-01T10:00:00Z", 0, 50_000),
+            event("event_b", "2026-07-01T11:30:00Z", 0, 50_010),
+        ])
+        .expect("insert");
+    let expected = {
+        let query = cache_report_query("from=2026-07-01&to=2026-07-02", Utc::now()).expect("query");
+        serde_json::to_value(store.cache_report(&query, &chrono::Local).expect("report"))
+            .expect("json")
+    };
+    assert_eq!(expected["diagnostics"]["losses"], 1);
+
+    let server = Server::http("127.0.0.1:0").expect("server");
+    let address = server.server_addr().to_ip().expect("ip address");
+    let store = Arc::new(Mutex::new(store));
+    let handle = std::thread::spawn(move || {
+        let request = server.recv().expect("request");
+        handle_request(request, &store, "secret").expect("handled");
+    });
+    let mut stream = std::net::TcpStream::connect(address).expect("connect");
+    std::io::Write::write_all(
+        &mut stream,
+        b"GET /reports/cache?from=2026-07-01&to=2026-07-02 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n",
+    )
+    .expect("request");
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut response).expect("response");
+    handle.join().expect("server thread");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response.split_once("\r\n\r\n").expect("body").1;
+    let served: serde_json::Value = serde_json::from_str(body).expect("json body");
+    assert_eq!(served, expected);
+}

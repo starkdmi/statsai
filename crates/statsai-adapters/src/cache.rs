@@ -15,11 +15,15 @@ pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // parent's name, and turns without a reported duration end at their last work.
 // session-metadata.v36: sub-agents report the parent they borrow a name from,
 // so the name is joined when the session is built.
-pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v36";
+// call-context.v38: turn events list their model calls, with request starts,
+// compaction boundaries, and each call's model, for the prompt-cache report.
+pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "call-context.v38";
 // session-metadata.v30: Claude user-message counts include only typed prompts,
 // not tool results, meta lines, or compaction summaries. (v29: events carry the
 // session's custom or AI title and the prompt that started their turn.)
-pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v30";
+// call-context.v31: events record their request start, sub-agent, and
+// compaction boundary for the prompt-cache report.
+pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "call-context.v31";
 // session-metadata.v21: events carry each session's user and assistant message
 // counts. (v20: session rows report their message count as requests and are
 // priced per message, so long-context tiers stop being decided session-wide.)

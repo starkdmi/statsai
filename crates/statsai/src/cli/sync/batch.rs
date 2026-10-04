@@ -14,7 +14,7 @@ use statsai_core::{
     SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, UsageEvent, UsageSummary,
     SYNC_BATCH_SCHEMA_VERSION,
 };
-use statsai_store::{QuotaQuery, Store};
+use statsai_store::{summary_for_sync_target, QuotaQuery, Store};
 #[cfg(test)]
 use std::collections::BTreeMap;
 
@@ -46,6 +46,13 @@ pub(crate) fn build_sync_batch_with_identity_key(
     let batch_id = format!("batch_{}", created_at.timestamp_millis());
     let sync_preferences = effective_sync_preferences(store, command)?;
     let include_projects = sync_preferences.include_projects;
+    let accepts_cache_health = store.sync_target_accepts_cache_health(&command.sink, target)?;
+    let for_target = |summary: UsageSummary| {
+        summary_for_sync_target(
+            sanitize_summary_for_sync_with_projects(summary, include_projects),
+            accepts_cache_health,
+        )
+    };
     let payload_mode = sync_payload_mode(command)?;
     let state = if command.sink == "http" || command.since_last {
         store.sync_state(&command.sink, target)?
@@ -81,7 +88,7 @@ pub(crate) fn build_sync_batch_with_identity_key(
         store
             .summaries()?
             .into_iter()
-            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
+            .map(for_target)
             .filter(is_http_rollup_passthrough_summary)
             .collect()
     } else {
@@ -93,7 +100,7 @@ pub(crate) fn build_sync_batch_with_identity_key(
         store
             .summaries_after(summary_cursor)?
             .into_iter()
-            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
+            .map(for_target)
             .collect()
     };
     let all_sources: Vec<_> = store
@@ -323,7 +330,7 @@ pub(crate) fn build_sync_batch_with_identity_key(
         let all_rollups: Vec<_> = store
             .all_sync_rollup_summaries()?
             .into_iter()
-            .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
+            .map(for_target)
             .collect();
         let current_authoritative_snapshot = SyncAuthoritativeSnapshot {
             snapshot_id: format!("{batch_id}_authoritative"),
@@ -412,11 +419,7 @@ pub(crate) fn build_sync_batch_with_identity_key(
             }
         );
         summaries.extend(passthrough_summaries);
-        summaries.extend(
-            rollups
-                .into_iter()
-                .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects)),
-        );
+        summaries.extend(rollups.into_iter().map(for_target));
     }
 
     Ok((
@@ -624,6 +627,9 @@ pub(crate) fn sanitize_source_account_assignment_for_sync(
 }
 
 pub(crate) fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
+    // Per-call timing and sub-agent identity stay on the device. Daily
+    // summaries carry the counts derived from them.
+    event.context = None;
     event.source.source_record_id = None;
     if let Some(evidence) = event.parse_evidence.as_mut() {
         evidence.source_line_number = None;

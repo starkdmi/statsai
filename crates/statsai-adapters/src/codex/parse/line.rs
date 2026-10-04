@@ -48,6 +48,8 @@ pub(crate) enum CodexLineKind {
     TokenCount,
     TokenUsageRecord,
     Compacted,
+    /// A remote compaction's replacement history, written as a response item.
+    ResponseItemCompaction,
     TaskStarted,
     TaskComplete,
     HeadlessUsage,
@@ -114,6 +116,8 @@ pub(crate) fn codex_line_kind(line: &str) -> CodexLineKind {
             || header.contains("\"payload\":{\"type\":\"tool_search_call\"")
         {
             CodexLineKind::ResponseItemToolCall
+        } else if header.contains("\"payload\":{\"type\":\"compaction\"") {
+            CodexLineKind::ResponseItemCompaction
         } else {
             CodexLineKind::Irrelevant
         };

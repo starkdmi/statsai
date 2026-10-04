@@ -857,6 +857,7 @@ mod tests {
             },
             created_at: Utc::now(),
             imported_at: Utc::now(),
+            context: None,
         }
     }
 

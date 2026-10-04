@@ -8,6 +8,10 @@ use std::io::{BufReader, Cursor};
 
 pub(crate) const MAX_JSONL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
+/// Leading bytes of an oversized record kept for classification. Enough for
+/// the record type and timestamp, which providers write first.
+pub(crate) const OVERSIZED_RECORD_HEADER_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BoundedLineRead {
     Eof,
@@ -30,7 +34,7 @@ pub(crate) fn read_bounded_jsonl_line(
                 return Ok(BoundedLineRead::Eof);
             }
             if oversized || line.len() > max_bytes {
-                line.clear();
+                line.truncate(oversized_header_len(max_bytes));
                 return Ok(BoundedLineRead::Oversized);
             }
             return Ok(BoundedLineRead::Complete);
@@ -62,7 +66,10 @@ pub(crate) fn read_bounded_jsonl_line(
             if record_bytes <= max_bytes || deferred_cr {
                 line.extend_from_slice(&available[..consumed]);
             } else {
-                line.clear();
+                let header_len = oversized_header_len(max_bytes);
+                line.truncate(header_len);
+                let missing = header_len - line.len();
+                line.extend_from_slice(&available[..consumed.min(missing)]);
                 oversized = true;
             }
         }
@@ -75,6 +82,10 @@ pub(crate) fn read_bounded_jsonl_line(
             });
         }
     }
+}
+
+fn oversized_header_len(max_bytes: usize) -> usize {
+    OVERSIZED_RECORD_HEADER_BYTES.min(max_bytes)
 }
 
 pub(crate) fn number_at_any(value: &Value, keys: &[&str]) -> Option<u64> {
@@ -168,7 +179,7 @@ fn bounded_jsonl_reader_discards_an_oversized_record_and_recovers_next_line() {
         read_bounded_jsonl_line(&mut reader, &mut line, 8).expect("oversized line"),
         BoundedLineRead::Oversized
     );
-    assert!(line.is_empty());
+    assert_eq!(line, b"xxxxxxxx", "keeps the record's leading bytes");
     assert_eq!(
         read_bounded_jsonl_line(&mut reader, &mut line, 32).expect("next line"),
         BoundedLineRead::Complete
@@ -209,5 +220,5 @@ fn bounded_jsonl_reader_handles_crlf_split_across_buffers_at_the_limit() {
             .expect("unterminated trailing CR"),
         BoundedLineRead::Oversized
     );
-    assert!(line.is_empty());
+    assert_eq!(line, b"12345678");
 }

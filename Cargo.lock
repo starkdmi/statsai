@@ -2929,6 +2929,7 @@ dependencies = [
  "libc",
  "log",
  "notify",
+ "percent-encoding",
  "serde",
  "serde_json",
  "statsai-adapters",

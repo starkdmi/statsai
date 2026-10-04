@@ -120,6 +120,9 @@ fn pending_http_sync_summary_counts_include_retirement_only_reconciliation() {
     );
     store.upsert_source(&source).expect("source");
     let target = "https://api.example.com/api/sync/batches";
+    store
+        .record_sync_target_cache_health_support("http", target, true)
+        .expect("receiver support");
     let event = test_store_event(&source, Utc::now(), "retired-event");
     store.insert_event(&event).expect("event");
     let rollups = store.all_sync_rollup_summaries().expect("initial rollups");

@@ -634,6 +634,15 @@ pub(crate) fn remote_hosted_tasks_enabled(remote: &Value) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether the receiver stores `metrics.cache_health` in the version this
+/// build writes. Receivers that predate it do not advertise it.
+pub(crate) fn remote_accepts_cache_health(remote: Option<&Value>) -> bool {
+    remote
+        .and_then(|remote| remote.pointer("/capabilities/cacheHealth"))
+        .and_then(Value::as_u64)
+        == Some(u64::from(statsai_core::CACHE_HEALTH_VERSION))
+}
+
 pub(crate) fn remote_code_change_identity_key(remote: &Value) -> Result<Option<[u8; 32]>> {
     let Some(value) = remote.pointer("/capabilities/codeChangeIdentityKey") else {
         return Ok(None);

@@ -332,14 +332,8 @@ fn http_rollup_sync_restarts_full_snapshot_after_snapshot_failure() {
         .expect("pending sources")
         .is_empty());
 
-    let sync_rollups: Vec<_> = store
-        .all_sync_rollup_summaries()
-        .expect("rollups")
-        .into_iter()
-        .map(sanitize_summary_for_sync)
-        .collect();
     let pending_rollups = store
-        .pending_summaries_for_sync("http", &target, &sync_rollups)
+        .pending_http_sync_rollup_summaries(&target)
         .expect("pending rollups");
     assert!(pending_rollups.is_empty());
     let state = store

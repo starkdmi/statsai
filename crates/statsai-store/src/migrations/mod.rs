@@ -8,7 +8,7 @@ mod v2;
 pub(crate) use v1::*;
 pub(crate) use v2::*;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 29;
+pub const CURRENT_SCHEMA_VERSION: i64 = 30;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -154,6 +154,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         27 => apply_migration_027(conn),
         28 => apply_migration_028(conn),
         29 => apply_migration_029(conn),
+        30 => apply_migration_030(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -291,7 +292,10 @@ pub fn schema_version(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EVENT_CONVERSATION_HASH_SQL, EVENT_SOURCE_FILE_HASH_SQL, QUOTA_PLAN_TYPE_SQL};
+    use crate::{
+        EVENT_CONVERSATION_HASH_SQL, EVENT_SESSION_ID_SQL, EVENT_SOURCE_FILE_HASH_SQL,
+        QUOTA_PLAN_TYPE_SQL,
+    };
     use rusqlite::Connection;
 
     #[test]
@@ -356,6 +360,40 @@ mod tests {
             &conn,
             "usage_events_provider_account_started_idx"
         ));
+        assert!(index_exists(&conn, "usage_events_session_started_idx"));
+        assert!(!index_exists(&conn, "usage_events_session_idx"));
+    }
+
+    /// Session reads come back in time order straight from the index, and the
+    /// calls after a changed event are a range of it, so neither sorts nor
+    /// scans the session.
+    #[test]
+    fn session_reads_are_ordered_ranges_of_the_session_index() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        migrate(&conn).expect("migrate fresh database");
+
+        for (label, sql) in [
+            (
+                "read a session in order",
+                format!(
+                    "SELECT payload FROM usage_events WHERE {EVENT_SESSION_ID_SQL} = ?1
+                     ORDER BY started_at, event_id"
+                ),
+            ),
+            (
+                "find the events after a changed one",
+                format!(
+                    "SELECT provider FROM usage_events
+                     WHERE {EVENT_SESSION_ID_SQL} = ?1 AND started_at >= ?2"
+                ),
+            ),
+        ] {
+            let plan = query_plan(&conn, &sql);
+            assert!(
+                plan.contains("usage_events_session_started_idx") && !plan.contains("TEMP B-TREE"),
+                "{label} does not read the session index in order: {plan}"
+            );
+        }
     }
 
     /// The scan filters are only fast while SQLite can match them to the indexes

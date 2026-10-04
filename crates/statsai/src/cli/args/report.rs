@@ -56,4 +56,31 @@ pub(crate) enum ReportSubcommand {
         #[arg(long, help = "Include subscription-value rows")]
         subscriptions: bool,
     },
+    #[command(about = "Show prompt-cache reuse, suspected cache losses, and context per call")]
+    Cache(CacheReportArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CacheReportArgs {
+    #[arg(
+        long,
+        help = "Range start (YYYY-MM-DD or RFC3339). Date-only values are UTC days. Defaults to the last 7 days"
+    )]
+    pub(crate) from: Option<String>,
+    #[arg(long, help = "Range end (YYYY-MM-DD or RFC3339). Defaults to now")]
+    pub(crate) to: Option<String>,
+    #[arg(long, conflicts_with_all = ["from", "to"], help = "Report all stored history")]
+    pub(crate) all: bool,
+    #[arg(long, help = "Provider filter")]
+    pub(crate) provider: Option<String>,
+    #[arg(long, help = "Provider account id, or `unassigned`")]
+    pub(crate) account: Option<String>,
+    #[arg(long, help = "Session id (session_…) or a prefix of one")]
+    pub(crate) session: Option<String>,
+    #[arg(long, help = "Add local 10-minute buckets of calls")]
+    pub(crate) timeline: bool,
+    #[arg(long, help = "List every call with its verdict and evidence")]
+    pub(crate) details: bool,
+    #[arg(long, help = "Output as JSON")]
+    pub(crate) json: bool,
 }

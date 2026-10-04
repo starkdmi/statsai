@@ -643,6 +643,9 @@ fn sync_local_verify_uses_sanitized_rollup_hashes() {
     store.rebuild_sync_rollups().expect("rebuild");
 
     let target = "https://api.example.com/api/sync/batches".to_string();
+    store
+        .record_sync_target_cache_health_support("http", &target, true)
+        .expect("receiver support");
     let rollups: Vec<_> = store
         .all_sync_rollup_summaries()
         .expect("rollups")
@@ -700,6 +703,9 @@ fn sync_local_verify_respects_project_sync_opt_in() {
     store.rebuild_sync_rollups().expect("rebuild");
 
     let target = "https://api.example.com/api/sync/batches".to_string();
+    store
+        .record_sync_target_cache_health_support("http", &target, true)
+        .expect("receiver support");
     let rollups: Vec<_> = store
         .all_sync_rollup_summaries()
         .expect("rollups")

@@ -48,7 +48,10 @@ pub(crate) fn event_with_valid_project(event: &UsageEvent) -> UsageEvent {
     event
 }
 
-pub(crate) fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
+pub(crate) fn build_sync_rollup_summary(
+    events: &[UsageEvent],
+    cache_health: Option<CacheHealthV1>,
+) -> UsageSummary {
     let first = events.first().expect("rollup bucket must contain events");
     // Events arrive oldest first. A bucket can now span a repository rename, so
     // project metadata comes from the newest event: it names the remote the
@@ -177,14 +180,12 @@ pub(crate) fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
                 tracked_reasoning_tokens.saturating_add(event.usage.reasoning_tokens.unwrap_or(0));
         }
 
-        let prompt_tokens = event
-            .usage
-            .input_tokens
-            .unwrap_or(0)
-            .saturating_add(event.usage.cache_read_tokens.unwrap_or(0));
-        if prompt_tokens > 0 {
-            cache_hit_ratio_values
-                .push(event.usage.cache_read_tokens.unwrap_or(0) as f64 / prompt_tokens as f64);
+        if let Some(ratio) = cache_hit_ratio(
+            event.usage.input_tokens.unwrap_or(0),
+            event.usage.cache_creation_tokens.unwrap_or(0),
+            event.usage.cache_read_tokens.unwrap_or(0),
+        ) {
+            cache_hit_ratio_values.push(ratio);
         }
         let generated_tokens = event
             .usage
@@ -318,6 +319,7 @@ pub(crate) fn build_sync_rollup_summary(events: &[UsageEvent]) -> UsageSummary {
         user_messages: (user_messages > 0).then_some(user_messages),
         assistant_messages: (assistant_messages > 0).then_some(assistant_messages),
         developer_messages: (developer_messages > 0).then_some(developer_messages),
+        cache_health,
     });
     let total_sessions = (!session_ids.is_empty()).then_some(session_ids.len() as u64);
     let total_messages_metadata = summary_metrics
@@ -424,23 +426,7 @@ fn percentile_nearest_rank(values: &[f64], percentile: f64) -> Option<f64> {
 }
 
 fn summary_metrics_or_none(metrics: SummaryMetrics) -> Option<SummaryMetrics> {
-    let has_metrics = metrics.active_seconds.is_some()
-        || metrics.tracked_requests.is_some()
-        || metrics.tracked_output_tokens.is_some()
-        || metrics.tracked_reasoning_tokens.is_some()
-        || metrics.latency_ms.is_some()
-        || metrics.time_to_first_token_ms.is_some()
-        || metrics.generated_tps.is_some()
-        || metrics.visible_tps.is_some()
-        || metrics.overall_generated_tps.is_some()
-        || metrics.overall_visible_tps.is_some()
-        || metrics.cache_hit_ratio.is_some()
-        || metrics.reasoning_share.is_some()
-        || metrics.total_messages.is_some()
-        || metrics.user_messages.is_some()
-        || metrics.assistant_messages.is_some()
-        || metrics.developer_messages.is_some();
-    has_metrics.then_some(metrics)
+    (!metrics.is_empty()).then_some(metrics)
 }
 
 #[derive(Debug, Default)]

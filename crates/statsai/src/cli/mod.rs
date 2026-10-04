@@ -2,6 +2,7 @@ pub(super) mod account;
 pub(super) mod activity;
 pub(super) mod args;
 pub(super) mod auth;
+pub(super) mod cache;
 pub(super) mod conversation;
 pub(super) mod daemon;
 mod dispatch;

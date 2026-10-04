@@ -84,7 +84,7 @@ impl Store {
         if stale_count > 0 {
             self.rebuild_sync_rollups()?;
         }
-        Ok(())
+        self.ensure_cache_health_rollups()
     }
 
     pub fn sync_rollup_period_stats(&self, cutoff_day: NaiveDate) -> Result<RollupPeriodStats> {
@@ -257,10 +257,16 @@ impl Store {
     }
 
     fn pending_sync_rollup_counts(&self, sink: &str, target: &str) -> Result<(u64, u64)> {
+        let accepts_cache_health = self.sync_target_accepts_cache_health(sink, target)?;
         let rollups = self
             .all_sync_rollup_summaries()?
             .into_iter()
-            .map(sanitize_summary_for_default_http_sync)
+            .map(|summary| {
+                summary_for_sync_target(
+                    sanitize_summary_for_default_http_sync(summary),
+                    accepts_cache_health,
+                )
+            })
             .collect::<Vec<_>>();
         let pending = self.pending_summaries_for_sync(sink, target, &rollups)?;
         let days = collect_pending_summary_days(pending.iter());
@@ -269,7 +275,12 @@ impl Store {
 
     pub fn reconcile_sync_rollup_dirty_flags(&self, sink: &str, target: &str) -> Result<u64> {
         self.ensure_current_sync_rollup_versions()?;
-        let summaries = self.all_sync_rollup_summaries()?;
+        let accepts_cache_health = self.sync_target_accepts_cache_health(sink, target)?;
+        let summaries = self
+            .all_sync_rollup_summaries()?
+            .into_iter()
+            .map(|summary| summary_for_sync_target(summary, accepts_cache_health))
+            .collect::<Vec<_>>();
         self.with_immediate_transaction(|| {
             self.reconcile_sync_rollup_dirty_flags_in_transaction(sink, target, &summaries)
         })
@@ -470,16 +481,21 @@ impl Store {
         &self,
         keys: &BTreeSet<SyncRollupBucketKey>,
     ) -> Result<u64> {
+        let mut memo = CacheSessionMemo::default();
         let mut refreshed = 0u64;
         for key in keys {
-            if self.refresh_sync_rollup_for_key(key)? {
+            if self.refresh_sync_rollup_for_key(key, &mut memo)? {
                 refreshed += 1;
             }
         }
         Ok(refreshed)
     }
 
-    fn refresh_sync_rollup_for_key(&self, key: &SyncRollupBucketKey) -> Result<bool> {
+    fn refresh_sync_rollup_for_key(
+        &self,
+        key: &SyncRollupBucketKey,
+        memo: &mut CacheSessionMemo,
+    ) -> Result<bool> {
         let events = self.sync_rollup_events(key)?;
         if events.is_empty() {
             let deleted = self.conn.execute(
@@ -489,7 +505,8 @@ impl Store {
             return Ok(deleted > 0);
         }
 
-        let summary = build_sync_rollup_summary(&events);
+        let cache_health = self.bucket_cache_health(key, &events, memo)?;
+        let summary = build_sync_rollup_summary(&events, cache_health);
         let payload = serde_json::to_string(&summary)?;
         let payload_hash = summary_sync_payload_hash(&summary)?;
         let existing: Option<(String, i64)> = self

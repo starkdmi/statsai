@@ -553,6 +553,148 @@
         "custom"
       ]
     },
+    "CacheHealthV1": {
+      "description": "Bounded prompt-cache diagnostics for one daily summary.\n\nOnly counts leave the device: no timestamps, ids, or per-call values. Token totals stay on the summary's `usage`, so this adds only what they cannot say. `requests` equals `unclassifiable + first_observed + boundaries + below_threshold + uncached + comparable`, and the gap bins add up to `comparable`, `losses`, and `missed_tokens`. Monthly rollups embed every day's object, so the fields most days leave at zero are left out then.",
+      "type": "object",
+      "required": [
+        "below_threshold",
+        "boundaries",
+        "comparable",
+        "first_cold",
+        "first_observed",
+        "full_losses",
+        "gap_comparable",
+        "gap_losses",
+        "losses",
+        "requests",
+        "timing_estimated",
+        "unclassifiable",
+        "version",
+        "write_split_unavailable_input_tokens"
+      ],
+      "properties": {
+        "below_threshold": {
+          "description": "Calls whose predecessor left too little reusable context to judge.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "boundaries": {
+          "description": "Calls after a model change, compaction, or unclassifiable usage.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "comparable": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "first_cold": {
+          "description": "First calls that read nothing from the cache.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "first_observed": {
+          "description": "First calls of their stream.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "full_losses": {
+          "description": "Suspected losses that read nothing from the cache.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "gap_comparable": {
+          "description": "Comparable calls by gap since the previous call, one count per bin of [`super::CACHE_GAP_BIN_UPPER_MINUTES`]: `<1m` first, `60m+` last.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "gap_losses": {
+          "description": "Suspected losses in the same bins.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "gap_missed_tokens": {
+          "description": "Missed tokens in the same bins.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "losses": {
+          "description": "Suspected cache losses among comparable calls.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "missed_cost_micro_usd": {
+          "description": "What that missed reuse cost at API prices, in micro-USD.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "missed_tokens": {
+          "description": "Reusable context suspected losses did not read from the cache.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "description": "Model calls of providers the detector covers.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "timing_estimated": {
+          "description": "Comparable calls whose gap was measured between recorded responses rather than from a recorded request start.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "uncached": {
+          "description": "Calls that neither read nor wrote the cache, so did not use it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unclassifiable": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unpriced_losses": {
+          "description": "Suspected losses on models without known pricing, left out of `missed_cost_micro_usd`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "write_split_unavailable_input_tokens": {
+          "description": "Ordinary input from calls whose provider did not report cache writes, so it may include writes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
     "CodeChangeMetric": {
       "type": "object",
       "required": [
@@ -2150,6 +2292,17 @@
           ],
           "format": "uint64",
           "minimum": 0.0
+        },
+        "cache_health": {
+          "description": "Prompt-cache diagnostics, for providers whose events record call order.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CacheHealthV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "cache_hit_ratio": {
           "anyOf": [

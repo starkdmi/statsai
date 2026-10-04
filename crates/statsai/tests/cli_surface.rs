@@ -114,3 +114,10 @@ fn schema_quota_window_projection_matches_golden() {
     let golden = include_str!("cli_surface/schema-quota-window-projection.json");
     assert_eq!(captured, golden);
 }
+
+#[test]
+fn schema_cache_report_matches_golden() {
+    let captured = run_statsai(&["schema", "cache-report"]);
+    let golden = include_str!("cli_surface/schema-cache-report.json");
+    assert_eq!(captured, golden);
+}

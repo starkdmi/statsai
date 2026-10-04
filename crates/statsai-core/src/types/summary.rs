@@ -2,6 +2,7 @@ use super::event::{
     CostInfo, EventSource, MetricStats, ModelInfo, ParseEvidence, PrivacyInfo, ProjectInfo,
     UsageCounts,
 };
+use crate::cache::CacheHealthV1;
 use crate::ids::{ProviderAccountId, SourceId, SummaryId};
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -30,6 +31,48 @@ pub struct SummaryMetrics {
     pub user_messages: Option<u64>,
     pub assistant_messages: Option<u64>,
     pub developer_messages: Option<u64>,
+    /// Prompt-cache diagnostics, for providers whose events record call order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_health: Option<CacheHealthV1>,
+}
+
+impl SummaryMetrics {
+    /// Whether no metric is set, in which case a summary carries `None`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.active_seconds.is_none()
+            && self.tracked_requests.is_none()
+            && self.tracked_output_tokens.is_none()
+            && self.tracked_reasoning_tokens.is_none()
+            && self.latency_ms.is_none()
+            && self.time_to_first_token_ms.is_none()
+            && self.generated_tps.is_none()
+            && self.visible_tps.is_none()
+            && self.overall_generated_tps.is_none()
+            && self.overall_visible_tps.is_none()
+            && self.cache_hit_ratio.is_none()
+            && self.reasoning_share.is_none()
+            && self.total_messages.is_none()
+            && self.user_messages.is_none()
+            && self.assistant_messages.is_none()
+            && self.developer_messages.is_none()
+            && self.cache_health.is_none()
+    }
+}
+
+impl UsageSummary {
+    /// The summary as a receiver without `cache_health` support stores it:
+    /// the object removed, and metrics dropped when nothing else is left.
+    #[must_use]
+    pub fn without_cache_health(mut self) -> Self {
+        if let Some(metrics) = self.metrics.as_mut() {
+            metrics.cache_health = None;
+        }
+        if self.metrics.as_ref().is_some_and(SummaryMetrics::is_empty) {
+            self.metrics = None;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

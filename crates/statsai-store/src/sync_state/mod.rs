@@ -563,7 +563,12 @@ impl Store {
             .filter(|summary| is_daily_rollup_summary(summary))
             .map(|summary| summary.summary_id.clone())
             .collect();
-        let rollup_summaries = self.all_sync_rollup_summaries()?;
+        let accepts_cache_health = self.sync_target_accepts_cache_health(sink, target)?;
+        let rollup_summaries = self
+            .all_sync_rollup_summaries()?
+            .into_iter()
+            .map(|summary| summary_for_sync_target(summary, accepts_cache_health))
+            .collect::<Vec<_>>();
         let task_verification_cursor = Self::sync_batch_task_verification_cursor(batch);
 
         self.with_immediate_transaction(|| {

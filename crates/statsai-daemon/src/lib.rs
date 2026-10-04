@@ -89,6 +89,16 @@ fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>, auth_token: &
         return respond_json(request, StatusCode(200), &health_payload());
     }
 
+    let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
+    if path == "/reports/cache" {
+        let report_query = match cache_report_query(query, chrono::Utc::now()) {
+            Ok(report_query) => report_query,
+            Err(error) => return respond_text(request, StatusCode(400), &format!("{error:#}")),
+        };
+        let report = lock_store(store).cache_report(&report_query, &chrono::Local)?;
+        return respond_json(request, StatusCode(200), &report);
+    }
+
     let s = lock_store(store);
     let payload = match url.as_str() {
         "/status" => json!({
@@ -113,6 +123,47 @@ fn handle_request(mut request: Request, store: &Arc<Mutex<Store>>, auth_token: &
     drop(s);
 
     respond_json(request, StatusCode(200), &payload)
+}
+
+/// Reads `from`, `to`, `provider`, `account`, `session`, and `timeline` from
+/// a percent-encoded query. Per-call details are left to the CLI.
+fn cache_report_query(
+    query: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<statsai_store::CacheReportQuery> {
+    let mut params = std::collections::BTreeMap::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let value = percent_encoding::percent_decode_str(value)
+            .decode_utf8()
+            .context("query values must be UTF-8")?;
+        if params.insert(key, value.into_owned()).is_some() {
+            bail!("repeated query parameter {key}");
+        }
+    }
+    let (from, to) = (params.remove("from"), params.remove("to"));
+    let mut report_query = match params.remove("all").as_deref() {
+        None | Some("0" | "false") => {
+            statsai_store::CacheReportQuery::for_range(from.as_deref(), to.as_deref(), now)?
+        }
+        Some("1" | "true") if from.is_none() && to.is_none() => {
+            statsai_store::CacheReportQuery::all_time(now)
+        }
+        Some("1" | "true") => bail!("all cannot be combined with from or to"),
+        Some(other) => bail!("all must be true or false, not {other}"),
+    };
+    report_query.provider = params.remove("provider");
+    report_query.account = params.remove("account");
+    report_query.session = params.remove("session");
+    report_query.timeline = match params.remove("timeline").as_deref() {
+        None | Some("0" | "false") => false,
+        Some("1" | "true") => true,
+        Some(other) => bail!("timeline must be true or false, not {other}"),
+    };
+    if let Some(key) = params.keys().next() {
+        bail!("unknown query parameter {key}");
+    }
+    Ok(report_query)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

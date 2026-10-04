@@ -14,6 +14,9 @@ use super::format::{
 };
 
 pub(crate) fn report(command: ReportCommand, store: &Store) -> Result<()> {
+    if let ReportSubcommand::Cache(args) = command.command {
+        return super::cache::cache_report(args, store);
+    }
     let now = Utc::now();
     let (report, json_output, verbose, include_subscriptions) =
         usage_report_from_command(command, store, now)?;
@@ -60,6 +63,7 @@ pub(crate) fn usage_report_from_command(
             verbose,
             subscriptions,
         ),
+        ReportSubcommand::Cache(_) => bail!("the cache report has its own output"),
     };
     let (since, until) = period.window(now);
     let (events, summaries) = match period {
