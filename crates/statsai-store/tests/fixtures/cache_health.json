@@ -1,0 +1,785 @@
+{
+  "report": {
+    "days": [
+      {
+        "day": "2026-07-01",
+        "losses": 1,
+        "missed": 27000,
+        "missed_cost_micro_usd": 93150
+      },
+      {
+        "day": "2026-07-02",
+        "losses": 2,
+        "missed": 67784,
+        "missed_cost_micro_usd": 196262
+      }
+    ],
+    "diagnostics": {
+      "below_threshold": 1,
+      "boundaries": 1,
+      "comparable": 8,
+      "first_cold": 3,
+      "first_observed": 3,
+      "full_losses": 1,
+      "gap_comparable": [
+        3,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        2
+      ],
+      "gap_losses": [
+        1,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "gap_missed_tokens": [
+        27000,
+        0,
+        22784,
+        0,
+        0,
+        0,
+        0,
+        45000
+      ],
+      "losses": 3,
+      "missed_cost_micro_usd": 289412,
+      "missed_tokens": 94784,
+      "requests": 16,
+      "timing_estimated": 7,
+      "uncached": 1,
+      "unclassifiable": 2,
+      "version": 1,
+      "write_split_unavailable_input_tokens": 4000
+    },
+    "gap_histogram": [
+      {
+        "comparable": 3,
+        "label": "<1m",
+        "losses": 1,
+        "max_minutes": 1,
+        "min_minutes": 0,
+        "missed_tokens": 27000
+      },
+      {
+        "comparable": 1,
+        "label": "1–5m",
+        "losses": 0,
+        "max_minutes": 5,
+        "min_minutes": 1,
+        "missed_tokens": 0
+      },
+      {
+        "comparable": 2,
+        "label": "5–10m",
+        "losses": 1,
+        "max_minutes": 10,
+        "min_minutes": 5,
+        "missed_tokens": 22784
+      },
+      {
+        "comparable": 0,
+        "label": "10–15m",
+        "losses": 0,
+        "max_minutes": 15,
+        "min_minutes": 10,
+        "missed_tokens": 0
+      },
+      {
+        "comparable": 0,
+        "label": "15–30m",
+        "losses": 0,
+        "max_minutes": 30,
+        "min_minutes": 15,
+        "missed_tokens": 0
+      },
+      {
+        "comparable": 0,
+        "label": "30–45m",
+        "losses": 0,
+        "max_minutes": 45,
+        "min_minutes": 30,
+        "missed_tokens": 0
+      },
+      {
+        "comparable": 0,
+        "label": "45–60m",
+        "losses": 0,
+        "max_minutes": 60,
+        "min_minutes": 45,
+        "missed_tokens": 0
+      },
+      {
+        "comparable": 2,
+        "label": "60m+",
+        "losses": 1,
+        "max_minutes": null,
+        "min_minutes": 60,
+        "missed_tokens": 45000
+      }
+    ],
+    "totals": {
+      "avg_logical_input_per_request": 34261.17647058824,
+      "cache_creation_tokens": 135500,
+      "cache_hit_ratio": 0.578119634640478,
+      "cache_read_tokens": 336720,
+      "input_tokens": 110220,
+      "logical_input_tokens": 582440,
+      "requests": 17
+    }
+  },
+  "summaries": [
+    {
+      "cost": {
+        "confidence": "medium",
+        "currency": "USD",
+        "estimated_api_equivalent_usd": null,
+        "pricing_source": "local_rollup",
+        "pricing_version": null,
+        "provider_reported_usd": null
+      },
+      "device_id": "device_fixture",
+      "imported_at": "2026-07-02T11:00:00Z",
+      "metadata": {
+        "last_computed_at": "2026-07-02T11:00:00Z",
+        "summary_format": "daily_rollup.v1",
+        "summary_version": "14",
+        "total_messages": null,
+        "total_sessions": 1
+      },
+      "metrics": {
+        "active_seconds": null,
+        "assistant_messages": null,
+        "cache_health": {
+          "below_threshold": 1,
+          "boundaries": 0,
+          "comparable": 1,
+          "first_cold": 1,
+          "first_observed": 1,
+          "full_losses": 0,
+          "gap_comparable": [
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "gap_losses": [
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "gap_missed_tokens": [
+            0,
+            0,
+            22784,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "losses": 1,
+          "missed_cost_micro_usd": 41012,
+          "missed_tokens": 22784,
+          "requests": 5,
+          "timing_estimated": 0,
+          "unclassifiable": 2,
+          "version": 1,
+          "write_split_unavailable_input_tokens": 4000
+        },
+        "cache_hit_ratio": {
+          "avg": 0.6618419683728672,
+          "max": 0.9375,
+          "min": 0.3861839367457345,
+          "p50": 0.3861839367457345,
+          "p95": 0.9375,
+          "samples": 2,
+          "sum": 1.3236839367457345
+        },
+        "developer_messages": null,
+        "generated_tps": null,
+        "latency_ms": null,
+        "overall_generated_tps": null,
+        "overall_visible_tps": null,
+        "reasoning_share": {
+          "avg": 0.0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0,
+          "samples": 2,
+          "sum": 0.0
+        },
+        "time_to_first_token_ms": null,
+        "total_messages": null,
+        "tracked_output_tokens": null,
+        "tracked_reasoning_tokens": null,
+        "tracked_requests": null,
+        "user_messages": null,
+        "visible_tps": null
+      },
+      "model": null,
+      "models": [
+        {
+          "cost": {
+            "confidence": "medium",
+            "currency": "USD",
+            "estimated_api_equivalent_usd": null,
+            "pricing_source": "local_rollup",
+            "pricing_version": null,
+            "provider_reported_usd": null
+          },
+          "model": {
+            "name": null,
+            "normalized_name": "gpt-6-sol",
+            "provider_model_id": null,
+            "reasoning_level": null,
+            "reasoning_level_raw": null,
+            "speed": null
+          },
+          "usage": {
+            "cache_creation_1h_tokens": 0,
+            "cache_creation_5m_tokens": 0,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 97120,
+            "input_tokens": 63000,
+            "local_eval_tokens": null,
+            "local_prompt_eval_tokens": null,
+            "output_tokens": 200,
+            "reasoning_tokens": 0,
+            "requests": 5,
+            "total_tokens": 160320
+          }
+        }
+      ],
+      "observed_at": "2026-07-02T11:00:00Z",
+      "parse_evidence": null,
+      "period_end": "2026-07-03T00:00:00Z",
+      "period_start": "2026-07-02T00:00:00Z",
+      "privacy": {
+        "contains_file_paths": false,
+        "contains_prompt_text": false,
+        "contains_response_text": false,
+        "mode": "metadata_only"
+      },
+      "project": null,
+      "provider": "codex",
+      "provider_account_id": null,
+      "schema_version": "usage_summary.v1",
+      "source": {
+        "adapter_id": "fixture",
+        "adapter_version": "0",
+        "location_origin": "configured",
+        "parse_confidence": "high",
+        "source_kind": "local_adapter",
+        "source_path_hash": null,
+        "source_record_id": null,
+        "source_type": "jsonl"
+      },
+      "source_id": "src_fixture_codex",
+      "summary_id": "sum_547c6aa40f5895680f0045854f4a95e3",
+      "usage": {
+        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 97120,
+        "input_tokens": 63000,
+        "local_eval_tokens": null,
+        "local_prompt_eval_tokens": null,
+        "output_tokens": 200,
+        "reasoning_tokens": 0,
+        "requests": 5,
+        "total_tokens": 160320
+      }
+    },
+    {
+      "cost": {
+        "confidence": "medium",
+        "currency": "USD",
+        "estimated_api_equivalent_usd": null,
+        "pricing_source": "local_rollup",
+        "pricing_version": null,
+        "provider_reported_usd": null
+      },
+      "device_id": "device_fixture",
+      "imported_at": "2026-07-02T12:00:00Z",
+      "metadata": {
+        "last_computed_at": "2026-07-02T12:00:00Z",
+        "summary_format": "daily_rollup.v1",
+        "summary_version": "14",
+        "total_messages": null,
+        "total_sessions": 1
+      },
+      "metrics": {
+        "active_seconds": null,
+        "assistant_messages": null,
+        "cache_hit_ratio": {
+          "avg": 0.8571428571428571,
+          "max": 0.8571428571428571,
+          "min": 0.8571428571428571,
+          "p50": 0.8571428571428571,
+          "p95": 0.8571428571428571,
+          "samples": 1,
+          "sum": 0.8571428571428571
+        },
+        "developer_messages": null,
+        "generated_tps": null,
+        "latency_ms": null,
+        "overall_generated_tps": null,
+        "overall_visible_tps": null,
+        "reasoning_share": {
+          "avg": 0.0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0,
+          "samples": 1,
+          "sum": 0.0
+        },
+        "time_to_first_token_ms": null,
+        "total_messages": null,
+        "tracked_output_tokens": null,
+        "tracked_reasoning_tokens": null,
+        "tracked_requests": null,
+        "user_messages": null,
+        "visible_tps": null
+      },
+      "model": null,
+      "models": [
+        {
+          "cost": {
+            "confidence": "medium",
+            "currency": "USD",
+            "estimated_api_equivalent_usd": null,
+            "pricing_source": "local_rollup",
+            "pricing_version": null,
+            "provider_reported_usd": null
+          },
+          "model": {
+            "name": null,
+            "normalized_name": "cursor-model",
+            "provider_model_id": null,
+            "reasoning_level": null,
+            "reasoning_level_raw": null,
+            "speed": null
+          },
+          "usage": {
+            "cache_creation_1h_tokens": 0,
+            "cache_creation_5m_tokens": 0,
+            "cache_creation_tokens": 500,
+            "cache_read_tokens": 9000,
+            "input_tokens": 1000,
+            "local_eval_tokens": null,
+            "local_prompt_eval_tokens": null,
+            "output_tokens": 100,
+            "reasoning_tokens": 0,
+            "requests": 1,
+            "total_tokens": 10600
+          }
+        }
+      ],
+      "observed_at": "2026-07-02T12:00:00Z",
+      "parse_evidence": null,
+      "period_end": "2026-07-03T00:00:00Z",
+      "period_start": "2026-07-02T00:00:00Z",
+      "privacy": {
+        "contains_file_paths": false,
+        "contains_prompt_text": false,
+        "contains_response_text": false,
+        "mode": "metadata_only"
+      },
+      "project": null,
+      "provider": "cursor",
+      "provider_account_id": null,
+      "schema_version": "usage_summary.v1",
+      "source": {
+        "adapter_id": "fixture",
+        "adapter_version": "0",
+        "location_origin": "configured",
+        "parse_confidence": "high",
+        "source_kind": "local_adapter",
+        "source_path_hash": null,
+        "source_record_id": null,
+        "source_type": "jsonl"
+      },
+      "source_id": "src_fixture_cursor",
+      "summary_id": "sum_8e4eef2e63c1cf9e4c9c0caa09b6f554",
+      "usage": {
+        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_creation_tokens": 500,
+        "cache_read_tokens": 9000,
+        "input_tokens": 1000,
+        "local_eval_tokens": null,
+        "local_prompt_eval_tokens": null,
+        "output_tokens": 100,
+        "reasoning_tokens": 0,
+        "requests": 1,
+        "total_tokens": 10600
+      }
+    },
+    {
+      "cost": {
+        "confidence": "medium",
+        "currency": "USD",
+        "estimated_api_equivalent_usd": null,
+        "pricing_source": "local_rollup",
+        "pricing_version": null,
+        "provider_reported_usd": null
+      },
+      "device_id": "device_fixture",
+      "imported_at": "2026-07-02T01:05:00Z",
+      "metadata": {
+        "last_computed_at": "2026-07-02T01:05:00Z",
+        "summary_format": "daily_rollup.v1",
+        "summary_version": "14",
+        "total_messages": null,
+        "total_sessions": 1
+      },
+      "metrics": {
+        "active_seconds": null,
+        "assistant_messages": null,
+        "cache_health": {
+          "below_threshold": 0,
+          "boundaries": 1,
+          "comparable": 2,
+          "first_cold": 0,
+          "first_observed": 0,
+          "full_losses": 1,
+          "gap_comparable": [
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
+          "gap_losses": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
+          "gap_missed_tokens": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            45000
+          ],
+          "losses": 1,
+          "missed_cost_micro_usd": 155250,
+          "missed_tokens": 45000,
+          "requests": 4,
+          "timing_estimated": 2,
+          "uncached": 1,
+          "unclassifiable": 0,
+          "version": 1,
+          "write_split_unavailable_input_tokens": 0
+        },
+        "cache_hit_ratio": {
+          "avg": 0.24554541503694047,
+          "max": 0.982181660147762,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.982181660147762,
+          "samples": 4,
+          "sum": 0.982181660147762
+        },
+        "developer_messages": null,
+        "generated_tps": null,
+        "latency_ms": null,
+        "overall_generated_tps": null,
+        "overall_visible_tps": null,
+        "reasoning_share": {
+          "avg": 0.0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0,
+          "samples": 4,
+          "sum": 0.0
+        },
+        "time_to_first_token_ms": null,
+        "total_messages": null,
+        "tracked_output_tokens": null,
+        "tracked_reasoning_tokens": null,
+        "tracked_requests": null,
+        "user_messages": null,
+        "visible_tps": null
+      },
+      "model": null,
+      "models": [
+        {
+          "cost": {
+            "confidence": "medium",
+            "currency": "USD",
+            "estimated_api_equivalent_usd": null,
+            "pricing_source": "local_rollup",
+            "pricing_version": null,
+            "provider_reported_usd": null
+          },
+          "model": {
+            "name": null,
+            "normalized_name": "claude-sonnet-4-5",
+            "provider_model_id": null,
+            "reasoning_level": null,
+            "reasoning_level_raw": null,
+            "speed": null
+          },
+          "usage": {
+            "cache_creation_1h_tokens": 0,
+            "cache_creation_5m_tokens": 0,
+            "cache_creation_tokens": 55000,
+            "cache_read_tokens": 45200,
+            "input_tokens": 46080,
+            "local_eval_tokens": null,
+            "local_prompt_eval_tokens": null,
+            "output_tokens": 400,
+            "reasoning_tokens": 0,
+            "requests": 4,
+            "total_tokens": 146680
+          }
+        }
+      ],
+      "observed_at": "2026-07-02T01:05:00Z",
+      "parse_evidence": null,
+      "period_end": "2026-07-03T00:00:00Z",
+      "period_start": "2026-07-02T00:00:00Z",
+      "privacy": {
+        "contains_file_paths": false,
+        "contains_prompt_text": false,
+        "contains_response_text": false,
+        "mode": "metadata_only"
+      },
+      "project": null,
+      "provider": "claude_code",
+      "provider_account_id": null,
+      "schema_version": "usage_summary.v1",
+      "source": {
+        "adapter_id": "fixture",
+        "adapter_version": "0",
+        "location_origin": "configured",
+        "parse_confidence": "high",
+        "source_kind": "local_adapter",
+        "source_path_hash": null,
+        "source_record_id": null,
+        "source_type": "jsonl"
+      },
+      "source_id": "src_fixture_claude_code",
+      "summary_id": "sum_9ebe14eb7cbd9f700433ec92c14e824d",
+      "usage": {
+        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_creation_tokens": 55000,
+        "cache_read_tokens": 45200,
+        "input_tokens": 46080,
+        "local_eval_tokens": null,
+        "local_prompt_eval_tokens": null,
+        "output_tokens": 400,
+        "reasoning_tokens": 0,
+        "requests": 4,
+        "total_tokens": 146680
+      }
+    },
+    {
+      "cost": {
+        "confidence": "medium",
+        "currency": "USD",
+        "estimated_api_equivalent_usd": null,
+        "pricing_source": "local_rollup",
+        "pricing_version": null,
+        "provider_reported_usd": null
+      },
+      "device_id": "device_fixture",
+      "imported_at": "2026-07-01T23:50:00Z",
+      "metadata": {
+        "last_computed_at": "2026-07-01T23:50:00Z",
+        "summary_format": "daily_rollup.v1",
+        "summary_version": "14",
+        "total_messages": null,
+        "total_sessions": 1
+      },
+      "metrics": {
+        "active_seconds": null,
+        "assistant_messages": null,
+        "cache_health": {
+          "below_threshold": 0,
+          "boundaries": 0,
+          "comparable": 5,
+          "first_cold": 2,
+          "first_observed": 2,
+          "full_losses": 0,
+          "gap_comparable": [
+            2,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
+          "gap_losses": [
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "gap_missed_tokens": [
+            27000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "losses": 1,
+          "missed_cost_micro_usd": 93150,
+          "missed_tokens": 27000,
+          "requests": 7,
+          "timing_estimated": 5,
+          "unclassifiable": 0,
+          "version": 1,
+          "write_split_unavailable_input_tokens": 0
+        },
+        "cache_hit_ratio": {
+          "avg": 0.6066831814028905,
+          "max": 0.986228342958685,
+          "min": 0.0,
+          "p50": 0.951927653498334,
+          "p95": 0.986228342958685,
+          "samples": 7,
+          "sum": 4.246782269820233
+        },
+        "developer_messages": null,
+        "generated_tps": null,
+        "latency_ms": null,
+        "overall_generated_tps": null,
+        "overall_visible_tps": null,
+        "reasoning_share": {
+          "avg": 0.0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0,
+          "samples": 7,
+          "sum": 0.0
+        },
+        "time_to_first_token_ms": null,
+        "total_messages": null,
+        "tracked_output_tokens": null,
+        "tracked_reasoning_tokens": null,
+        "tracked_requests": null,
+        "user_messages": null,
+        "visible_tps": null
+      },
+      "model": null,
+      "models": [
+        {
+          "cost": {
+            "confidence": "medium",
+            "currency": "USD",
+            "estimated_api_equivalent_usd": null,
+            "pricing_source": "local_rollup",
+            "pricing_version": null,
+            "provider_reported_usd": null
+          },
+          "model": {
+            "name": null,
+            "normalized_name": "claude-sonnet-4-5",
+            "provider_model_id": null,
+            "reasoning_level": null,
+            "reasoning_level_raw": null,
+            "speed": null
+          },
+          "usage": {
+            "cache_creation_1h_tokens": 0,
+            "cache_creation_5m_tokens": 0,
+            "cache_creation_tokens": 80000,
+            "cache_read_tokens": 185400,
+            "input_tokens": 140,
+            "local_eval_tokens": null,
+            "local_prompt_eval_tokens": null,
+            "output_tokens": 700,
+            "reasoning_tokens": 0,
+            "requests": 7,
+            "total_tokens": 266240
+          }
+        }
+      ],
+      "observed_at": "2026-07-01T23:50:00Z",
+      "parse_evidence": null,
+      "period_end": "2026-07-02T00:00:00Z",
+      "period_start": "2026-07-01T00:00:00Z",
+      "privacy": {
+        "contains_file_paths": false,
+        "contains_prompt_text": false,
+        "contains_response_text": false,
+        "mode": "metadata_only"
+      },
+      "project": null,
+      "provider": "claude_code",
+      "provider_account_id": null,
+      "schema_version": "usage_summary.v1",
+      "source": {
+        "adapter_id": "fixture",
+        "adapter_version": "0",
+        "location_origin": "configured",
+        "parse_confidence": "high",
+        "source_kind": "local_adapter",
+        "source_path_hash": null,
+        "source_record_id": null,
+        "source_type": "jsonl"
+      },
+      "source_id": "src_fixture_claude_code",
+      "summary_id": "sum_bf315597fd8d01330eb4d20bcff5b1ab",
+      "usage": {
+        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_creation_tokens": 80000,
+        "cache_read_tokens": 185400,
+        "input_tokens": 140,
+        "local_eval_tokens": null,
+        "local_prompt_eval_tokens": null,
+        "output_tokens": 700,
+        "reasoning_tokens": 0,
+        "requests": 7,
+        "total_tokens": 266240
+      }
+    }
+  ]
+}

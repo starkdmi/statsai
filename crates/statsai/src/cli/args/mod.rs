@@ -280,6 +280,8 @@ pub(crate) enum SchemaSubcommand {
     SyncBatch,
     #[command(about = "Print the quota_window_sync_projection.v1 JSON Schema")]
     QuotaWindowProjection,
+    #[command(about = "Print the cache_report.v1 JSON Schema")]
+    CacheReport,
 }
 
 #[derive(Debug, Args)]

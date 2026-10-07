@@ -23,6 +23,10 @@ pub(crate) struct CodexLineRecord {
     pub(crate) task_completed_at: Option<DateTime<Utc>>,
     pub(crate) task_duration_ms: Option<u64>,
     pub(crate) time_to_first_token_ms: Option<u64>,
+    /// For usage lines: when the request was sent, if the rollout says.
+    pub(crate) requested_at: Option<DateTime<Utc>>,
+    /// For usage lines: the conversation was compacted before this call.
+    pub(crate) after_compaction: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -117,4 +121,50 @@ pub(crate) struct ActiveCodexTurn {
     /// observations still belong to this turn's event.
     pub(crate) quota_lines: Vec<usize>,
     pub(crate) project: Option<ProjectInfo>,
+    /// The model calls whose usage the turn accumulates, in order.
+    pub(crate) calls: Vec<ModelCall>,
+}
+
+/// When each session's model calls were requested, for the prompt-cache
+/// report.
+///
+/// A `token_usage_record` is written as the response completes, before any
+/// tool runs, so the latest prompt, tool output, or turn start after it is
+/// when the next request went out. A `token_count` alone is written after the
+/// response's tools have run, so it cannot place a request start. Rollouts can
+/// carry copied history with older timestamps, so this follows file order.
+#[derive(Default)]
+pub(crate) struct CodexCallClock {
+    last_input_at: HashMap<String, DateTime<Utc>>,
+    last_call_at: HashMap<String, DateTime<Utc>>,
+    pending_compaction: HashSet<String>,
+}
+
+impl CodexCallClock {
+    pub(crate) fn input(&mut self, session_raw: &str, at: DateTime<Utc>) {
+        self.last_input_at.insert(session_raw.to_string(), at);
+    }
+
+    pub(crate) fn compaction(&mut self, session_raw: &str) {
+        self.pending_compaction.insert(session_raw.to_string());
+    }
+
+    /// Records a call completing and returns its request start, when the
+    /// rollout places one, and whether it follows a compaction.
+    pub(crate) fn call(
+        &mut self,
+        session_raw: &str,
+        completed_at: DateTime<Utc>,
+        record_placed: bool,
+    ) -> (Option<DateTime<Utc>>, bool) {
+        let previous_call_at = self
+            .last_call_at
+            .insert(session_raw.to_string(), completed_at);
+        let requested_at = record_placed
+            .then(|| self.last_input_at.get(session_raw).copied())
+            .flatten()
+            .filter(|at| *at <= completed_at)
+            .filter(|at| previous_call_at.is_none_or(|previous| *at >= previous));
+        (requested_at, self.pending_compaction.remove(session_raw))
+    }
 }

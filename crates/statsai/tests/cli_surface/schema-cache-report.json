@@ -1,0 +1,863 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CacheReport",
+  "description": "The prompt-cache report for a period, as `statsai report cache --json` and the local API print it.",
+  "type": "object",
+  "required": [
+    "boundaries",
+    "days",
+    "detector_version",
+    "diagnostics",
+    "filters",
+    "gap_histogram",
+    "label",
+    "providers",
+    "schema_version",
+    "totals",
+    "until"
+  ],
+  "properties": {
+    "boundaries": {
+      "$ref": "#/definitions/CacheBoundaryCounts"
+    },
+    "days": {
+      "description": "UTC days, matching the daily summaries that sync.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CacheDayRow"
+      }
+    },
+    "details": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/definitions/AnalyzedCacheCall"
+      }
+    },
+    "detector_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "diagnostics": {
+      "description": "Detector counts across the providers it covers.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CacheHealthV1"
+        }
+      ]
+    },
+    "filters": {
+      "$ref": "#/definitions/CacheReportFilters"
+    },
+    "gap_histogram": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CacheGapRow"
+      }
+    },
+    "label": {
+      "type": "string"
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CacheProviderRow"
+      }
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "since": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "timeline": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/definitions/CacheTimelineRow"
+      }
+    },
+    "totals": {
+      "description": "Token totals across every provider in scope.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CacheTokenTotals"
+        }
+      ]
+    },
+    "until": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "definitions": {
+    "AnalyzedCacheCall": {
+      "description": "One model call and its verdict, or one unclassifiable block of usage.",
+      "type": "object",
+      "required": [
+        "cache_read_tokens",
+        "call_index",
+        "completed_at",
+        "event_id",
+        "input_tokens",
+        "provider",
+        "requests",
+        "session_id",
+        "source_id",
+        "verdict"
+      ],
+      "properties": {
+        "agent_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cache_creation_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_read_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "call_index": {
+          "description": "Position inside an aggregated event; zero for single-call events.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "requests": {
+          "description": "Model calls this entry stands for: one, or an aggregated event's count.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "verdict": {
+          "$ref": "#/definitions/CacheCallVerdict"
+        },
+        "write_ttl": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CacheWriteTtl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "CacheBoundaryCounts": {
+      "description": "Boundary counts by reason. Local only: the synced object carries the total.",
+      "type": "object",
+      "required": [
+        "compaction",
+        "evidence_gap",
+        "model_change"
+      ],
+      "properties": {
+        "compaction": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "evidence_gap": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "model_change": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "CacheBoundaryReason": {
+      "oneOf": [
+        {
+          "description": "The model changed. Prompt caches are per model.",
+          "type": "string",
+          "enum": [
+            "model_change"
+          ]
+        },
+        {
+          "description": "The provider compacted the conversation, which rewrites the prompt.",
+          "type": "string",
+          "enum": [
+            "compaction"
+          ]
+        },
+        {
+          "description": "The previous usage in this stream could not be classified.",
+          "type": "string",
+          "enum": [
+            "evidence_gap"
+          ]
+        }
+      ]
+    },
+    "CacheCallClass": {
+      "description": "How the detector classified one model call.",
+      "oneOf": [
+        {
+          "description": "The first call observed in its stream. Nothing earlier to compare with.",
+          "type": "string",
+          "enum": [
+            "first_observed"
+          ]
+        },
+        {
+          "description": "The comparison restarts here; see [`CacheBoundaryReason`].",
+          "type": "string",
+          "enum": [
+            "boundary"
+          ]
+        },
+        {
+          "description": "The previous call left too little reusable context to judge a loss.",
+          "type": "string",
+          "enum": [
+            "below_threshold"
+          ]
+        },
+        {
+          "description": "Compared with the previous call in its stream.",
+          "type": "string",
+          "enum": [
+            "comparable"
+          ]
+        },
+        {
+          "description": "The call neither read nor wrote the cache, so it did not use it, as when a custom endpoint serves the request. Not judged, and it leaves nothing reusable for the next call.",
+          "type": "string",
+          "enum": [
+            "uncached"
+          ]
+        },
+        {
+          "description": "Usage that cannot be placed in order or split into calls.",
+          "type": "string",
+          "enum": [
+            "unclassifiable"
+          ]
+        }
+      ]
+    },
+    "CacheCallVerdict": {
+      "type": "object",
+      "required": [
+        "class"
+      ],
+      "properties": {
+        "baseline_tokens": {
+          "description": "Reusable context the previous call left, bounded by this call's input.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "boundary": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CacheBoundaryReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "class": {
+          "$ref": "#/definitions/CacheCallClass"
+        },
+        "gap_seconds": {
+          "description": "Seconds since the previous call in the stream completed.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "gap_timing": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CacheGapTiming"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "loss": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CacheLoss"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "missed_cost_micro_usd": {
+          "description": "What the missed reuse cost at API prices: the call's cost minus its cost had the missed tokens been cache reads. Set by the caller that prices calls; `None` when the model's pricing is unknown.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "missed_tokens": {
+          "description": "For a suspected loss, the reusable context it did not read from the cache: the baseline minus its cached reads.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "previous_model": {
+          "description": "The model before a model change.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "previous_write_ttl": {
+          "description": "Cache lifetime the previous call's writes asked for, when recorded.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CacheWriteTtl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unclassifiable": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CacheUnclassifiableReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "CacheDayRow": {
+      "type": "object",
+      "required": [
+        "day",
+        "totals"
+      ],
+      "properties": {
+        "day": {
+          "type": "string"
+        },
+        "diagnostics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CacheHealthV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "totals": {
+          "$ref": "#/definitions/CacheTokenTotals"
+        }
+      }
+    },
+    "CacheGapRow": {
+      "type": "object",
+      "required": [
+        "comparable",
+        "label",
+        "losses",
+        "min_minutes",
+        "missed_tokens"
+      ],
+      "properties": {
+        "comparable": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "label": {
+          "type": "string"
+        },
+        "losses": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_minutes": {
+          "description": "Exclusive upper bound; `None` for the open last bin.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "min_minutes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "missed_tokens": {
+          "description": "Reusable context the bin's suspected losses did not read from the cache.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "CacheGapTiming": {
+      "description": "What a request gap was measured between.",
+      "oneOf": [
+        {
+          "description": "From the previous response to the record that sent this request.",
+          "type": "string",
+          "enum": [
+            "request_start"
+          ]
+        },
+        {
+          "description": "Between the two recorded responses. Includes this call's own run time, so it overstates idle time.",
+          "type": "string",
+          "enum": [
+            "recorded_events"
+          ]
+        }
+      ]
+    },
+    "CacheHealthV1": {
+      "description": "Bounded prompt-cache diagnostics for one daily summary.\n\nOnly counts leave the device: no timestamps, ids, or per-call values. Token totals stay on the summary's `usage`, so this adds only what they cannot say. `requests` equals `unclassifiable + first_observed + boundaries + below_threshold + uncached + comparable`, and the gap bins add up to `comparable`, `losses`, and `missed_tokens`. Monthly rollups embed every day's object, so the fields most days leave at zero are left out then.",
+      "type": "object",
+      "required": [
+        "below_threshold",
+        "boundaries",
+        "comparable",
+        "first_cold",
+        "first_observed",
+        "full_losses",
+        "gap_comparable",
+        "gap_losses",
+        "losses",
+        "requests",
+        "timing_estimated",
+        "unclassifiable",
+        "version",
+        "write_split_unavailable_input_tokens"
+      ],
+      "properties": {
+        "below_threshold": {
+          "description": "Calls whose predecessor left too little reusable context to judge.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "boundaries": {
+          "description": "Calls after a model change, compaction, or unclassifiable usage.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "comparable": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "first_cold": {
+          "description": "First calls that read nothing from the cache.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "first_observed": {
+          "description": "First calls of their stream.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "full_losses": {
+          "description": "Suspected losses that read nothing from the cache.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "gap_comparable": {
+          "description": "Comparable calls by gap since the previous call, one count per bin of [`super::CACHE_GAP_BIN_UPPER_MINUTES`]: `<1m` first, `60m+` last.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "gap_losses": {
+          "description": "Suspected losses in the same bins.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "gap_missed_tokens": {
+          "description": "Missed tokens in the same bins.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "losses": {
+          "description": "Suspected cache losses among comparable calls.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "missed_cost_micro_usd": {
+          "description": "What that missed reuse cost at API prices, in micro-USD.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "missed_tokens": {
+          "description": "Reusable context suspected losses did not read from the cache.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "description": "Model calls of providers the detector covers.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "timing_estimated": {
+          "description": "Comparable calls whose gap was measured between recorded responses rather than from a recorded request start.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "uncached": {
+          "description": "Calls that neither read nor wrote the cache, so did not use it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unclassifiable": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unpriced_losses": {
+          "description": "Suspected losses on models without known pricing, left out of `missed_cost_micro_usd`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "write_split_unavailable_input_tokens": {
+          "description": "Ordinary input from calls whose provider did not report cache writes, so it may include writes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "CacheLoss": {
+      "oneOf": [
+        {
+          "description": "No cached reads remained.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        },
+        {
+          "description": "Some cached context was still read.",
+          "type": "string",
+          "enum": [
+            "partial"
+          ]
+        }
+      ]
+    },
+    "CacheProviderRow": {
+      "type": "object",
+      "required": [
+        "provider",
+        "totals"
+      ],
+      "properties": {
+        "diagnostics": {
+          "description": "`None` for providers the detector does not cover.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CacheHealthV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "totals": {
+          "$ref": "#/definitions/CacheTokenTotals"
+        }
+      }
+    },
+    "CacheReportFilters": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "CacheTimelineRow": {
+      "description": "One local-time bucket of model calls, keyed by when each call completed.",
+      "type": "object",
+      "required": [
+        "boundaries",
+        "cache_read_tokens",
+        "first_observed",
+        "logical_input_tokens",
+        "losses",
+        "missed_tokens",
+        "requests",
+        "start"
+      ],
+      "properties": {
+        "boundaries": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_hit_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "cache_read_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "first_observed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "logical_input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "losses": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "missed_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "start": {
+          "description": "Bucket start in local time, RFC 3339 with offset.",
+          "type": "string"
+        }
+      }
+    },
+    "CacheTokenTotals": {
+      "type": "object",
+      "required": [
+        "cache_creation_tokens",
+        "cache_read_tokens",
+        "input_tokens",
+        "logical_input_tokens",
+        "requests"
+      ],
+      "properties": {
+        "avg_logical_input_per_request": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "cache_creation_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "cache_hit_ratio": {
+          "description": "Cache reads over logical input.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "cache_read_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "logical_input_tokens": {
+          "description": "Ordinary input, cache writes, and cache reads: the context processed.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "CacheUnclassifiableReason": {
+      "oneOf": [
+        {
+          "description": "The record had no timestamp, so its place in the stream is unknown.",
+          "type": "string",
+          "enum": [
+            "timestamp_missing"
+          ]
+        },
+        {
+          "description": "Several calls were recorded as one total with no per-call breakdown.",
+          "type": "string",
+          "enum": [
+            "aggregated"
+          ]
+        },
+        {
+          "description": "The provider reported no input or cache counts.",
+          "type": "string",
+          "enum": [
+            "no_input_telemetry"
+          ]
+        },
+        {
+          "description": "Another call in the stream has the same timestamp and no recorded order.",
+          "type": "string",
+          "enum": [
+            "ambiguous_order"
+          ]
+        }
+      ]
+    },
+    "CacheWriteTtl": {
+      "description": "The cache lifetime a call's writes asked for, as Claude Code records it.",
+      "type": "string",
+      "enum": [
+        "five_minutes",
+        "one_hour",
+        "mixed"
+      ]
+    }
+  }
+}

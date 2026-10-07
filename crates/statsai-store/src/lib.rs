@@ -4,6 +4,7 @@ mod account_plan;
 mod accounts;
 mod activity;
 mod archive;
+mod cache;
 mod code_changes;
 mod dedupe;
 mod events;
@@ -49,18 +50,18 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use statsai_core::{
-    daily_rollup_project_key, hash_text, micro_usd_to_cents_rounded, normalize_email,
-    normalize_provider_user_id, periods_overlap, project_contains_file_paths,
+    cache_hit_ratio, daily_rollup_project_key, hash_text, micro_usd_to_cents_rounded,
+    normalize_email, normalize_provider_user_id, periods_overlap, project_contains_file_paths,
     project_has_stable_identity, provider_account_id, provider_account_id_from_identity,
     sanitize_code_change_metric_for_sync, sanitize_summary_for_sync, semantic_event_fingerprint,
     source_account_assignment_id, subscription_id, summary_id, timestamp_in_period,
     AccountEvidenceSummaryV1, AccountPlanProjectionV1, ActivityCoverageV1, ActivityInvocationV1,
-    BillingPeriod, CodeChangeMetric, Confidence, CostAccumulator, CostInfo, DailyRollup, EventId,
-    EventSource, IdentitySource, LatencySource, MetricStats, ModelInfo, PrivacyInfo, PrivacyMode,
-    ProviderAccount, ProviderAccountId, SemanticFingerprintInput, SourceAccountAssignment,
-    SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation, SourceVerificationMode,
-    Subscription, SubscriptionId, SubscriptionStatus, SummaryId, SummaryMetadata,
-    SummaryMetricTotals, SummaryMetrics, SummaryModelMetrics, SummaryModelUsage,
+    BillingPeriod, CacheHealthV1, CodeChangeMetric, Confidence, CostAccumulator, CostInfo,
+    DailyRollup, EventId, EventSource, IdentitySource, LatencySource, MetricStats, ModelInfo,
+    PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId, SemanticFingerprintInput,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
+    SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SummaryId,
+    SummaryMetadata, SummaryMetricTotals, SummaryMetrics, SummaryModelMetrics, SummaryModelUsage,
     SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, TaskVerificationId, UsageCounts,
     UsageEvent, UsageSummary, VerifiedSourceObservation, VerifiedSourceState,
     VerifiedSubscriptionState, PROVIDER_ACCOUNT_SCHEMA_VERSION,
@@ -96,6 +97,8 @@ const INFERRED_SOURCE_OBSERVATION_HASH_PREFIX: &str = "inferred_source.v1:";
 const VERIFIED_SOURCE_OBSERVATION_HASH_PREFIX: &str = "verified_source.v2:";
 
 pub use archive::{ArchiveConversationSummary, ArchiveSearchHit, ArchiveStats, ArchiveWriteResult};
+pub(crate) use cache::CacheSessionMemo;
+pub use cache::{summary_for_sync_target, CacheReportQuery, CACHE_REPORT_UNASSIGNED_ACCOUNT};
 pub use code_changes::CodeChangeRefreshReport;
 pub use privacy::{
     FilteredConversationMetadata, FilteredConversationRecord, PrivacyDatasetStatus,

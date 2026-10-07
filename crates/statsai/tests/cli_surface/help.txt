@@ -59,6 +59,7 @@ Commands:
   monthly   Show usage for the last 30 days
   all-time  Show all stored usage
   range     Show usage for an explicit date range
+  cache     Show prompt-cache reuse, suspected cache losses, and context per call
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -114,6 +115,24 @@ Options:
       --json                   Output as JSON
       --verbose                Show source paths and reasoning tokens
       --subscriptions          Include subscription-value rows
+  -h, --help                   Print help
+===== statsai report cache --help =====
+Show prompt-cache reuse, suspected cache losses, and context per call
+
+Usage: statsai report cache [OPTIONS]
+
+Options:
+      --from <FROM>            Range start (YYYY-MM-DD or RFC3339). Date-only values are UTC days. Defaults to the last 7 days
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+      --to <TO>                Range end (YYYY-MM-DD or RFC3339). Defaults to now
+      --all                    Report all stored history
+      --provider <PROVIDER>    Provider filter
+      --account <ACCOUNT>      Provider account id, or `unassigned`
+      --session <SESSION>      Session id (session_…) or a prefix of one
+      --timeline               Add local 10-minute buckets of calls
+      --details                List every call with its verdict and evidence
+      --json                   Output as JSON
   -h, --help                   Print help
 ===== statsai sessions --help =====
 List local session rollups
@@ -1119,6 +1138,7 @@ Usage: statsai schema [OPTIONS] <COMMAND>
 Commands:
   sync-batch               Print the sync_batch.v6 JSON Schema
   quota-window-projection  Print the quota_window_sync_projection.v1 JSON Schema
+  cache-report             Print the cache_report.v1 JSON Schema
   help                     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1138,6 +1158,15 @@ Options:
 Print the quota_window_sync_projection.v1 JSON Schema
 
 Usage: statsai schema quota-window-projection [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai schema cache-report --help =====
+Print the cache_report.v1 JSON Schema
+
+Usage: statsai schema cache-report [OPTIONS]
 
 Options:
       --store <STORE>          Path to SQLite store

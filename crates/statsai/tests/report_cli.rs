@@ -89,6 +89,7 @@ fn test_event(
         },
         created_at: started_at,
         imported_at: started_at,
+        context: None,
     }
 }
 

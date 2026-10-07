@@ -2200,3 +2200,65 @@ fn excluding_projects_retires_hosted_sessions_and_excluding_sessions_keeps_them(
         .expect("sessions on");
     assert_eq!(snapshot_session_ids(&command(false, true)), None);
 }
+
+#[test]
+fn cache_health_reaches_only_receivers_that_advertise_it() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-cache-health"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let mut event = test_event("codex", &source, Utc::now(), None, TokenParts::total(15));
+    event.usage.requests = Some(1);
+    event.context = Some(statsai_core::CallContext {
+        requested_at: Some(event.created_at),
+        ..statsai_core::CallContext::default()
+    });
+    store.insert_event(&event).expect("event");
+
+    let command = SyncCommand {
+        endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+        ..test_sync_command("http")
+    };
+    let target = sync_target(&command).expect("target");
+    let has_cache_health = |batch: &SyncBatch| {
+        batch.summaries.iter().any(|summary| {
+            summary
+                .metrics
+                .as_ref()
+                .is_some_and(|metrics| metrics.cache_health.is_some())
+        })
+    };
+
+    let (batch, _) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+    assert!(!has_cache_health(&batch), "unknown receivers get none");
+
+    store
+        .record_sync_target_cache_health_support("http", &target, true)
+        .expect("support");
+    let (batch, _) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+    assert!(has_cache_health(&batch));
+
+    let (batch, _) =
+        build_sync_batch(&test_sync_command("stdout"), &store, "device", "stdout").expect("batch");
+    assert!(batch.events.iter().all(|event| event.context.is_none()));
+}
+
+#[test]
+fn receivers_advertise_the_cache_health_version_they_store() {
+    let remote = |value: serde_json::Value| serde_json::json!({ "capabilities": value });
+    assert!(remote_accepts_cache_health(Some(&remote(
+        serde_json::json!({ "cacheHealth": statsai_core::CACHE_HEALTH_VERSION })
+    ))));
+    assert!(!remote_accepts_cache_health(Some(&remote(
+        serde_json::json!({ "cacheHealth": statsai_core::CACHE_HEALTH_VERSION + 1 })
+    ))));
+    assert!(!remote_accepts_cache_health(Some(&remote(
+        serde_json::json!({ "hostedTasks": true })
+    ))));
+    assert!(!remote_accepts_cache_health(None));
+}

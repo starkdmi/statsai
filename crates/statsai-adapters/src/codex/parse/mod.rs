@@ -54,6 +54,7 @@ pub(crate) fn parse_codex_file(
     let mut line_bytes = Vec::new();
     let mut index = 0usize;
     let mut activity = crate::activity::CodexActivityExtractor::default();
+    let mut call_clock = CodexCallClock::default();
 
     loop {
         let line_status =
@@ -65,6 +66,18 @@ pub(crate) fn parse_codex_file(
         if line_status == BoundedLineRead::Oversized {
             ctx.scan.diagnostics.raw_rows += 1;
             ctx.scan.diagnostics.oversized_rows += 1;
+            // A compaction row carries the whole replacement history and can
+            // outgrow the record limit. Its header still marks the boundary.
+            let header = String::from_utf8_lossy(&line_bytes);
+            if matches!(
+                codex_line_kind(&header),
+                CodexLineKind::Compacted | CodexLineKind::ResponseItemCompaction
+            ) {
+                let session =
+                    codex_json_string_prefix_after_marker(&header, "\"session_id\":\"", 256)
+                        .unwrap_or_else(|| session_raw.clone());
+                call_clock.compaction(&session);
+            }
             continue;
         }
         let Ok(line) = std::str::from_utf8(&line_bytes) else {
@@ -95,6 +108,18 @@ pub(crate) fn parse_codex_file(
             continue;
         }
         if line_kind == CodexLineKind::ResponseItemToolCall {
+            let header = codex_line_header(line);
+            if header.contains("\"payload\":{\"type\":\"function_call_output\"")
+                || header.contains("\"payload\":{\"type\":\"custom_tool_call_output\"")
+            {
+                if let (timestamp, false) = codex_timestamp_from_text(
+                    codex_json_string_prefix_after_marker(header, "\"timestamp\":\"", 64)
+                        .as_deref(),
+                    fallback_timestamp,
+                ) {
+                    call_clock.input(&session_raw, timestamp);
+                }
+            }
             let activity_started_at = std::time::Instant::now();
             activity.observe_legacy_line(
                 ctx.source,
@@ -118,6 +143,13 @@ pub(crate) fn parse_codex_file(
             )
             .unwrap_or_else(|| session_raw.clone());
             unpaired_records.remove(&session);
+            call_clock.compaction(&session);
+            continue;
+        }
+        if line_kind == CodexLineKind::ResponseItemCompaction {
+            // Pairing is left alone: unlike `compacted`, this row does not end
+            // a token_usage_record's pairing window.
+            call_clock.compaction(&session_raw);
             continue;
         }
         if line_kind == CodexLineKind::Irrelevant && !is_codex_quota_line_structurally(line) {
@@ -148,6 +180,8 @@ pub(crate) fn parse_codex_file(
                 );
                 if timestamp_inferred {
                     ctx.scan.diagnostics.timestamp_fallbacks += 1;
+                } else if codex_role_sends_input(role.as_deref()) {
+                    call_clock.input(&session_raw, timestamp);
                 }
                 let mut model_inferred = false;
                 let model = current_model
@@ -197,6 +231,8 @@ pub(crate) fn parse_codex_file(
                     task_completed_at: None,
                     task_duration_ms: None,
                     time_to_first_token_ms: None,
+                    requested_at: None,
+                    after_compaction: false,
                 });
                 continue;
             }
@@ -208,6 +244,8 @@ pub(crate) fn parse_codex_file(
                 codex_timestamp_from_text(parsed.timestamp.as_deref(), fallback_timestamp);
             if timestamp_inferred {
                 ctx.scan.diagnostics.timestamp_fallbacks += 1;
+            } else if codex_role_sends_input(parsed.payload.role.as_deref()) {
+                call_clock.input(&session_raw, timestamp);
             }
             let mut model_inferred = false;
             let model = current_model
@@ -263,18 +301,23 @@ pub(crate) fn parse_codex_file(
                 task_completed_at: None,
                 task_duration_ms: None,
                 time_to_first_token_ms: None,
+                requested_at: None,
+                after_compaction: false,
             });
             continue;
         }
         if line_kind == CodexLineKind::EventUserMessage {
-            if !collect_tasks {
-                continue;
-            }
             let header = codex_line_header(line);
             let (timestamp, timestamp_inferred) = codex_timestamp_from_text(
                 codex_json_string_prefix_after_marker(header, "\"timestamp\":\"", 64).as_deref(),
                 fallback_timestamp,
             );
+            if !timestamp_inferred {
+                call_clock.input(&session_raw, timestamp);
+            }
+            if !collect_tasks {
+                continue;
+            }
             if timestamp_inferred {
                 ctx.scan.diagnostics.timestamp_fallbacks += 1;
             }
@@ -326,6 +369,8 @@ pub(crate) fn parse_codex_file(
                 task_completed_at: None,
                 task_duration_ms: None,
                 time_to_first_token_ms: None,
+                requested_at: None,
+                after_compaction: false,
             });
             continue;
         }
@@ -456,6 +501,11 @@ pub(crate) fn parse_codex_file(
             .unwrap_or((fallback_timestamp, true));
         if timestamp_inferred {
             ctx.scan.diagnostics.timestamp_fallbacks += 1;
+        } else if is_task_started {
+            call_clock.input(
+                &event_session_raw,
+                task_started_at.unwrap_or(timestamp).min(timestamp),
+            );
         }
         if let Some(quota) = codex_quota_observation(
             ctx.source,
@@ -514,6 +564,12 @@ pub(crate) fn parse_codex_file(
             }
         });
 
+        let (requested_at, after_compaction) = match usage.as_ref() {
+            Some(_) if !timestamp_inferred => {
+                call_clock.call(&event_session_raw, timestamp, is_token_usage_record)
+            }
+            _ => (None, false),
+        };
         records.push(CodexLineRecord {
             line_number: index,
             timestamp,
@@ -538,6 +594,8 @@ pub(crate) fn parse_codex_file(
             task_completed_at,
             task_duration_ms,
             time_to_first_token_ms,
+            requested_at,
+            after_compaction,
         });
     }
 
@@ -568,6 +626,12 @@ pub(crate) fn parse_codex_file(
                     .unwrap_or_default(),
                 quota_lines: Vec::new(),
                 project: record.project.clone(),
+                calls: record
+                    .usage
+                    .as_ref()
+                    .map(|usage| codex_model_call(record, usage))
+                    .into_iter()
+                    .collect(),
             });
             if record.usage.is_some() {
                 consumed_usage_lines.insert(record.line_number);
@@ -659,6 +723,7 @@ pub(crate) fn parse_codex_file(
                             .map(|accumulated| sum_usage_counts(accumulated, &usage))
                             .unwrap_or_else(|| usage.clone()),
                     );
+                    turn.calls.push(codex_model_call(record, &usage));
                     turn.last_usage = Some(usage);
                     turn.usage_lines.push(record.line_number);
                 }
@@ -745,6 +810,24 @@ pub(crate) fn parse_codex_file(
                 },
             );
             event.session.title = turn.title.clone();
+            // The completion's own usage, when present, replaces the calls',
+            // but a compaction anywhere in the turn still came before it.
+            if record.usage.is_none() && !turn.calls.is_empty() {
+                event.context = Some(CallContext {
+                    calls: turn.calls.clone(),
+                    ..CallContext::default()
+                });
+            } else if record.usage.is_some() {
+                let after_compaction =
+                    record.after_compaction || turn.calls.iter().any(|call| call.after_compaction);
+                if record.requested_at.is_some() || after_compaction {
+                    event.context = Some(CallContext {
+                        requested_at: record.requested_at,
+                        after_compaction,
+                        ..CallContext::default()
+                    });
+                }
+            }
             let mut linked_quota_lines = turn.usage_lines.clone();
             linked_quota_lines.extend_from_slice(&turn.quota_lines);
             if record.usage.is_some() {
@@ -979,6 +1062,13 @@ pub(crate) fn parse_codex_file(
             },
         );
         event.session.title = session_title;
+        if record.requested_at.is_some() || record.after_compaction {
+            event.context = Some(CallContext {
+                requested_at: record.requested_at,
+                after_compaction: record.after_compaction,
+                ..CallContext::default()
+            });
+        }
         // A record's paired token_count carries the quota sample for it.
         let mut linked_quota_lines = vec![record.line_number];
         linked_quota_lines.extend(paired_quota_lines.get(&record.line_number));
@@ -1002,4 +1092,25 @@ pub(crate) fn parse_codex_file(
     ctx.scan.diagnostics.activity_extract_ms += activity_started_at.elapsed().as_millis() as u64;
 
     Ok(())
+}
+
+/// Prompts and developer instructions are input to the next request.
+fn codex_role_sends_input(role: Option<&str>) -> bool {
+    matches!(role, Some("user" | "developer"))
+}
+
+fn codex_model_call(record: &CodexLineRecord, usage: &UsageCounts) -> ModelCall {
+    ModelCall {
+        completed_at: record.timestamp,
+        requested_at: record.requested_at,
+        input_tokens: usage.input_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
+        after_compaction: record.after_compaction,
+        model: record
+            .model
+            .as_ref()
+            .filter(|_| !record.model_inferred)
+            .and_then(statsai_core::cache_model_name),
+    }
 }

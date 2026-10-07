@@ -5,6 +5,9 @@ use crate::dedupe::*;
 pub(crate) struct EventWriteDirty {
     pub(crate) buckets: BTreeSet<SyncRollupBucketKey>,
     pub(crate) sessions: BTreeSet<String>,
+    /// Earliest changed event per session, for providers with prompt-cache
+    /// diagnostics. Later calls in the session may need their verdicts redone.
+    pub(crate) cache_floors: BTreeMap<String, DateTime<Utc>>,
 }
 
 impl EventWriteDirty {
@@ -17,11 +20,24 @@ impl EventWriteDirty {
     fn observe(&mut self, event: &UsageEvent) {
         self.buckets.insert(sync_rollup_bucket_key(event));
         self.sessions.insert(event.session.session_id.clone());
+        if statsai_core::provider_has_cache_diagnostics(&event.provider) {
+            self.observe_cache_floor(&event.session.session_id, event.session.started_at);
+        }
+    }
+
+    fn observe_cache_floor(&mut self, session_id: &str, started_at: DateTime<Utc>) {
+        self.cache_floors
+            .entry(session_id.to_string())
+            .and_modify(|floor| *floor = (*floor).min(started_at))
+            .or_insert(started_at);
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
         self.buckets.extend(other.buckets);
         self.sessions.extend(other.sessions);
+        for (session_id, started_at) in other.cache_floors {
+            self.observe_cache_floor(&session_id, started_at);
+        }
     }
 }
 
@@ -164,8 +180,10 @@ impl Store {
         })
     }
 
-    fn refresh_event_rollups(&self, dirty: &EventWriteDirty) -> Result<()> {
-        self.refresh_sync_rollups_for_keys(&dirty.buckets)?;
+    pub(crate) fn refresh_event_rollups(&self, dirty: &EventWriteDirty) -> Result<()> {
+        let mut buckets = self.cache_successor_buckets(&dirty.cache_floors)?;
+        buckets.extend(dirty.buckets.iter().cloned());
+        self.refresh_sync_rollups_for_keys(&buckets)?;
         self.refresh_session_rollups_for_keys(&dirty.sessions)?;
         Ok(())
     }

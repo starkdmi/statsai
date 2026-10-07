@@ -396,6 +396,54 @@ pub struct PrivacyInfo {
     pub contains_file_paths: bool,
 }
 
+/// Where a usage event sits in its conversation, for the prompt-cache report.
+///
+/// Recorded only by adapters that can see the boundaries, and kept on the
+/// device: sync strips it from events and only bounded counts leave in daily
+/// summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CallContext {
+    /// Hashed sub-agent identity. Sub-agents share their parent's session but
+    /// keep their own context, so each one is a separate cache stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_hash: Option<String>,
+    /// When the request was sent, read from the record that triggered it: a
+    /// prompt or a tool result. Single-call events only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<DateTime<Utc>>,
+    /// The provider compacted the conversation before this request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_compaction: bool,
+    /// The model calls inside an event that aggregates several, such as a Codex
+    /// turn, oldest first. Empty for single-call events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<ModelCall>,
+}
+
+/// One model call inside an aggregated usage event. Token fields follow the
+/// additive `UsageCounts` contract: ordinary input excludes cache reads and
+/// writes, and `None` means the provider did not report the count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ModelCall {
+    pub completed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// `None` when the provider did not report cache writes for this call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_compaction: bool,
+    /// The model that served this call, as `cache_model_name` names it.
+    /// `None` when the transcript did not say, so a model change cannot be
+    /// read from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct UsageEvent {
     pub schema_version: String,
@@ -417,6 +465,10 @@ pub struct UsageEvent {
     pub privacy: PrivacyInfo,
     pub created_at: DateTime<Utc>,
     pub imported_at: DateTime<Utc>,
+    /// Local only: sync removes it, so it is not part of the sync schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub context: Option<CallContext>,
 }
 
 impl UsageCounts {

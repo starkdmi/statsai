@@ -77,6 +77,7 @@ pub(super) fn test_store_event(
         },
         created_at: now,
         imported_at: now,
+        context: None,
     }
 }
 

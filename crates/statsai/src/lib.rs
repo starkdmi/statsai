@@ -372,6 +372,7 @@ mod tests {
                 },
                 created_at: started_at,
                 imported_at: started_at,
+                context: None,
             };
             store.insert_event(&event).expect("legacy event");
             assert_eq!(store.applied_pricing_ruleset_version().expect("meta"), None);

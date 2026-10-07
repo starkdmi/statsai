@@ -1,5 +1,5 @@
 use anyhow::Result;
-use statsai_core::{QuotaWindowSyncProjectionV1, SyncBatch};
+use statsai_core::{CacheReport, QuotaWindowSyncProjectionV1, SyncBatch};
 
 use super::args::{SchemaCommand, SchemaSubcommand};
 
@@ -11,6 +11,10 @@ pub(crate) fn schema(command: SchemaCommand) -> Result<()> {
         }
         SchemaSubcommand::QuotaWindowProjection => {
             let schema = schemars::schema_for!(QuotaWindowSyncProjectionV1);
+            println!("{}", serde_json::to_string_pretty(&schema)?);
+        }
+        SchemaSubcommand::CacheReport => {
+            let schema = schemars::schema_for!(CacheReport);
             println!("{}", serde_json::to_string_pretty(&schema)?);
         }
     }

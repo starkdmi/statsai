@@ -330,6 +330,7 @@ pub(crate) fn parse_grok_summary(
             user_messages,
             assistant_messages,
             developer_messages: None,
+            cache_health: None,
         });
     }
     scan.diagnostics.raw_rows += stats

@@ -2,6 +2,7 @@
 
 mod account_plan;
 mod archive;
+mod cache;
 mod code_changes;
 mod daemon_presence;
 mod ids;
@@ -14,6 +15,7 @@ mod types;
 
 pub use account_plan::*;
 pub use archive::*;
+pub use cache::*;
 pub use code_changes::*;
 pub use daemon_presence::*;
 pub use ids::*;

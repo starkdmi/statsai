@@ -116,3 +116,27 @@ fn price_derived_commands_reprice_and_diagnostic_commands_do_not() {
     let doctor = Cli::try_parse_from(["statsai", "doctor"]).expect("parse doctor");
     assert!(!command_reprices_persisted_usage(&doctor.command));
 }
+
+#[test]
+fn cache_report_all_covers_every_stored_call_and_excludes_a_range() {
+    let cli = Cli::try_parse_from(["statsai", "report", "cache", "--all", "--provider", "codex"])
+        .expect("parse --all");
+    let Command::Report(ReportCommand {
+        command: ReportSubcommand::Cache(args),
+        ..
+    }) = cli.command
+    else {
+        panic!("expected the cache report");
+    };
+    let now = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let query = cache::cache_report_query(&args, now).expect("query");
+    assert_eq!((query.since, query.until), (None, now));
+
+    for range in ["--from", "--to"] {
+        assert!(
+            Cli::try_parse_from(["statsai", "report", "cache", "--all", range, "2026-07-01"])
+                .is_err(),
+            "--all with {range}"
+        );
+    }
+}

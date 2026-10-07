@@ -1373,3 +1373,204 @@ fn claude_title_only_transcripts_report_session_names() {
         }]
     );
 }
+
+#[test]
+fn claude_events_record_request_starts_sub_agents_and_compaction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let project = dir.path().join("projects").join("example");
+    let agents = project.join("session-1").join("subagents");
+    std::fs::create_dir_all(&agents).expect("projects");
+    let assistant = |timestamp: &str, message: &str, request: &str, extra: &str| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","sessionId":"session-1"{extra},"type":"assistant","requestId":"{request}","message":{{"id":"{message}","role":"assistant","model":"claude-opus-5","usage":{{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":9000,"output_tokens":5}}}}}}"#
+        )
+    };
+    let main = [
+        r#"{"timestamp":"2026-08-05T10:00:00Z","sessionId":"session-1","type":"user","message":{"role":"user","content":"hello"}}"#.to_string(),
+        assistant("2026-08-05T10:00:05Z", "m1", "r1", ""),
+        assistant("2026-08-05T10:00:07Z", "m1", "r1", ""),
+        r#"{"timestamp":"2026-08-05T10:00:20Z","sessionId":"session-1","type":"user","toolUseResult":{},"message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#.to_string(),
+        r#"{"timestamp":"2026-08-05T10:00:30Z","sessionId":"session-1","type":"system","subtype":"compact_boundary"}"#.to_string(),
+        r#"{"timestamp":"2026-08-05T10:00:31Z","sessionId":"session-1","type":"user","isCompactSummary":true,"message":{"role":"user","content":"summary"}}"#.to_string(),
+        assistant("2026-08-05T10:00:40Z", "m2", "r2", ""),
+        assistant("2026-08-05T10:00:50Z", "m4", "r4", ""),
+    ];
+    std::fs::write(project.join("session-1.jsonl"), main.join("\n") + "\n").expect("main");
+    let agent = [
+        r#"{"timestamp":"2026-08-05T10:00:08Z","sessionId":"session-1","agentId":"a1","isSidechain":true,"type":"user","message":{"role":"user","content":"task"}}"#.to_string(),
+        assistant(
+            "2026-08-05T10:00:12Z",
+            "m3",
+            "r3",
+            r#","agentId":"a1","isSidechain":true"#,
+        ),
+    ];
+    std::fs::write(agents.join("agent-a1.jsonl"), agent.join("\n") + "\n").expect("agent");
+
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+    let event_at = |timestamp: &str| {
+        let at = timestamp
+            .parse::<chrono::DateTime<Utc>>()
+            .expect("timestamp");
+        scan.events
+            .iter()
+            .find(|event| event.created_at == at)
+            .unwrap_or_else(|| panic!("event at {timestamp}"))
+    };
+    let at = |timestamp: &str| Some(timestamp.parse::<chrono::DateTime<Utc>>().expect("time"));
+
+    assert_eq!(scan.events.len(), 4, "streamed snapshots are one call");
+    let first = event_at("2026-08-05T10:00:07Z")
+        .context
+        .as_ref()
+        .expect("context");
+    assert_eq!(first.requested_at, at("2026-08-05T10:00:00Z"));
+    assert!(!first.after_compaction);
+    assert_eq!(first.agent_hash, None);
+
+    let compacted = event_at("2026-08-05T10:00:40Z")
+        .context
+        .as_ref()
+        .expect("context");
+    assert_eq!(compacted.requested_at, at("2026-08-05T10:00:31Z"));
+    assert!(compacted.after_compaction);
+
+    // No input since the previous response: no request start, and the
+    // compaction marked only the call after it.
+    assert_eq!(event_at("2026-08-05T10:00:50Z").context, None);
+
+    let sub_agent = event_at("2026-08-05T10:00:12Z")
+        .context
+        .as_ref()
+        .expect("context");
+    assert!(sub_agent.agent_hash.is_some());
+    assert_eq!(sub_agent.requested_at, at("2026-08-05T10:00:08Z"));
+}
+
+#[test]
+fn claude_compaction_copies_do_not_shift_request_starts_or_the_boundary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let project = dir.path().join("projects").join("example");
+    std::fs::create_dir_all(&project).expect("projects");
+    let user = |timestamp: &str| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","sessionId":"session-1","type":"user","message":{{"role":"user","content":"go"}}}}"#
+        )
+    };
+    let assistant = |timestamp: &str, message: &str| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","sessionId":"session-1","type":"assistant","requestId":"r-{message}","message":{{"id":"{message}","role":"assistant","model":"claude-opus-5","usage":{{"input_tokens":2,"cache_read_input_tokens":9000,"output_tokens":5}}}}}}"#
+        )
+    };
+    let lines = [
+        user("2026-08-05T10:00:00Z"),
+        assistant("2026-08-05T10:00:05Z", "m1"),
+        user("2026-08-05T11:00:00Z"),
+        assistant("2026-08-05T11:00:05Z", "m2"),
+        r#"{"timestamp":"2026-08-05T11:30:00Z","sessionId":"session-1","type":"system","subtype":"compact_boundary"}"#.to_string(),
+        // The preserved segment, rewritten with its original timestamps.
+        user("2026-08-05T10:00:00Z"),
+        assistant("2026-08-05T10:00:05Z", "m1"),
+        user("2026-08-05T11:31:00Z"),
+        assistant("2026-08-05T11:31:05Z", "m3"),
+    ];
+    std::fs::write(project.join("session-1.jsonl"), lines.join("\n") + "\n").expect("transcript");
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+    let context = |timestamp: &str| {
+        let at = timestamp
+            .parse::<chrono::DateTime<Utc>>()
+            .expect("timestamp");
+        scan.events
+            .iter()
+            .find(|event| event.created_at == at)
+            .and_then(|event| event.context.clone())
+            .unwrap_or_default()
+    };
+
+    assert_eq!(scan.events.len(), 3);
+    assert!(
+        !context("2026-08-05T10:00:05Z").after_compaction,
+        "a copy is not the next call"
+    );
+    let next = context("2026-08-05T11:31:05Z");
+    assert!(next.after_compaction);
+    assert_eq!(
+        next.requested_at,
+        Some("2026-08-05T11:31:00Z".parse().expect("timestamp"))
+    );
+}
+
+#[test]
+fn claude_compaction_copies_keep_the_marks_of_the_call_they_copy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let project = dir.path().join("projects").join("example");
+    std::fs::create_dir_all(&project).expect("projects");
+    let user = |timestamp: &str| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","sessionId":"session-1","type":"user","message":{{"role":"user","content":"go"}}}}"#
+        )
+    };
+    let assistant = |timestamp: &str, message: &str| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","sessionId":"session-1","type":"assistant","requestId":"r-{message}","message":{{"id":"{message}","role":"assistant","model":"claude-opus-5","usage":{{"input_tokens":2,"cache_read_input_tokens":9000,"output_tokens":5}}}}}}"#
+        )
+    };
+    let boundary = |timestamp: &str| {
+        format!(
+            r#"{{"timestamp":"{timestamp}","sessionId":"session-1","type":"system","subtype":"compact_boundary"}}"#
+        )
+    };
+    let lines = [
+        user("2026-08-05T10:00:00Z"),
+        assistant("2026-08-05T10:00:05Z", "m1"),
+        boundary("2026-08-05T10:30:00Z"),
+        user("2026-08-05T10:31:00Z"),
+        assistant("2026-08-05T10:31:05Z", "m2"),
+        boundary("2026-08-05T11:30:00Z"),
+        // A second compaction keeps the call that followed the first one.
+        user("2026-08-05T10:31:00Z"),
+        assistant("2026-08-05T10:31:05Z", "m2"),
+    ];
+    std::fs::write(project.join("session-1.jsonl"), lines.join("\n") + "\n").expect("transcript");
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+    let at = "2026-08-05T10:31:05Z"
+        .parse::<chrono::DateTime<Utc>>()
+        .expect("timestamp");
+    let copied = scan
+        .events
+        .iter()
+        .filter(|event| event.created_at == at)
+        .collect::<Vec<_>>();
+
+    assert_eq!(copied.len(), 1);
+    let context = copied[0].context.clone().unwrap_or_default();
+    assert!(
+        context.after_compaction,
+        "the copy keeps its compaction mark"
+    );
+    assert_eq!(
+        context.requested_at,
+        Some("2026-08-05T10:31:00Z".parse().expect("timestamp"))
+    );
+}

@@ -50,6 +50,7 @@ pub(crate) fn parse_claude_file(
     // counted on the first snapshot have to ride along with that replacement.
     let mut last_usage_users = HashMap::<String, (String, u64)>::new();
     let mut turn_started_at = HashMap::<String, chrono::DateTime<Utc>>::new();
+    let mut call_streams = HashMap::<(String, Option<String>), ClaudeCallStream>::new();
     loop {
         let line_status =
             read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;
@@ -84,6 +85,11 @@ pub(crate) fn parse_claude_file(
             current_reasoning = reasoning;
         }
         let session_raw = claude_session_raw(&value, path);
+        let agent_hash = claude_agent_hash(&value);
+        call_streams
+            .entry((session_raw.clone(), agent_hash.clone()))
+            .or_default()
+            .observe(&value);
         if let Some((rank, title)) = claude_session_title_from_value(&value) {
             session_titles.remember(session_raw, rank, title);
             continue;
@@ -176,7 +182,7 @@ pub(crate) fn parse_claude_file(
                 model,
                 usage,
                 runtime: message_count_runtime(user_messages, 1, 0),
-                session_raw,
+                session_raw: session_raw.clone(),
                 project,
                 event_kind: "claude_message_usage",
                 source_file: path,
@@ -189,6 +195,9 @@ pub(crate) fn parse_claude_file(
             },
         );
         event.session.turn_started_at = prompted_at.filter(|prompted_at| *prompted_at <= timestamp);
+        event.context = call_streams
+            .get_mut(&(session_raw, agent_hash.clone()))
+            .and_then(|stream| stream.call_context(record_id.as_deref(), timestamp, agent_hash));
         push_deduped(ctx.scan, ctx.seen, event, duplicate_selection);
     }
 
@@ -202,6 +211,121 @@ pub(crate) fn parse_claude_file(
     ctx.scan.diagnostics.activity_extract_ms += activity_started_at.elapsed().as_millis() as u64;
 
     Ok(())
+}
+
+/// Prompt-cache context for one agent's calls in one session.
+///
+/// A request goes out when Claude Code records the prompt or tool result that
+/// triggers it, so the latest such record before a response is the request
+/// start. A streamed response is written as several records sharing one
+/// provider-record id; all of them describe the same call, and so does any
+/// later copy of it, which keeps the marks its first record got.
+///
+/// Transcripts are not in time order: compaction rewrites the messages it
+/// keeps after its boundary, with their original timestamps. Everything here
+/// therefore follows file order, and a record older than the compaction
+/// boundary is one of those copies, not the call that follows it.
+#[derive(Default)]
+struct ClaudeCallStream {
+    last_input_at: Option<chrono::DateTime<Utc>>,
+    last_completed_at: Option<chrono::DateTime<Utc>>,
+    pending_compaction: Option<ClaudeCompaction>,
+    marks_by_record: HashMap<String, ClaudeCallMarks>,
+}
+
+#[derive(Clone, Copy)]
+enum ClaudeCompaction {
+    At(chrono::DateTime<Utc>),
+    Unplaced,
+}
+
+#[derive(Clone, Copy)]
+struct ClaudeCallMarks {
+    requested_at: Option<chrono::DateTime<Utc>>,
+    after_compaction: bool,
+}
+
+impl ClaudeCallStream {
+    fn observe(&mut self, value: &Value) {
+        if claude_record_is_compact_boundary(value) {
+            self.pending_compaction = Some(
+                timestamp_from_nested_value(value)
+                    .map_or(ClaudeCompaction::Unplaced, ClaudeCompaction::At),
+            );
+        } else if claude_record_is_user(value) {
+            if let Some(timestamp) = timestamp_from_nested_value(value) {
+                self.last_input_at = Some(timestamp);
+            }
+        }
+    }
+
+    fn call_context(
+        &mut self,
+        record_id: Option<&str>,
+        completed_at: chrono::DateTime<Utc>,
+        agent_hash: Option<String>,
+    ) -> Option<statsai_core::CallContext> {
+        let known = record_id.and_then(|record_id| self.marks_by_record.get(record_id));
+        let marks = match known {
+            Some(marks) => {
+                // A later record of a known call: another streamed part, or a
+                // copy compaction wrote with the original timestamp.
+                let marks = *marks;
+                self.last_completed_at = self.last_completed_at.max(Some(completed_at));
+                marks
+            }
+            None => {
+                // Input recorded before the previous response belongs to an
+                // earlier exchange, as when a call retries without new input.
+                let previous = self.last_completed_at;
+                let after_compaction = match self.pending_compaction {
+                    Some(ClaudeCompaction::At(at)) if completed_at < at => false,
+                    Some(_) => {
+                        self.pending_compaction = None;
+                        true
+                    }
+                    None => false,
+                };
+                let marks = ClaudeCallMarks {
+                    requested_at: self.last_input_at.filter(|at| {
+                        *at <= completed_at && previous.is_none_or(|previous| *at >= previous)
+                    }),
+                    after_compaction,
+                };
+                if let Some(record_id) = record_id {
+                    self.marks_by_record.insert(record_id.to_string(), marks);
+                }
+                self.last_completed_at = Some(completed_at);
+                marks
+            }
+        };
+        let context = statsai_core::CallContext {
+            agent_hash,
+            requested_at: marks.requested_at,
+            after_compaction: marks.after_compaction,
+            calls: Vec::new(),
+        };
+        (context != statsai_core::CallContext::default()).then_some(context)
+    }
+}
+
+/// Sub-agent identity. Sub-agents write their own transcripts, marked as
+/// sidechains, under the parent's session id.
+fn claude_agent_hash(value: &Value) -> Option<String> {
+    if let Some(agent_id) = value
+        .get("agentId")
+        .and_then(Value::as_str)
+        .filter(|agent_id| !agent_id.trim().is_empty())
+    {
+        return Some(hash_text(&format!("claude_agent:{agent_id}"))[..24].to_string());
+    }
+    (value.get("isSidechain").and_then(Value::as_bool) == Some(true))
+        .then(|| hash_text("claude_agent:sidechain")[..24].to_string())
+}
+
+fn claude_record_is_compact_boundary(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("system")
+        && value.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
 }
 
 /// Session names found across one source's transcripts.

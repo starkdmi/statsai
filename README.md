@@ -323,6 +323,28 @@ The benchmark becomes a meaningful quality gate after you record verified
 ground truth. See [`docs/task-collection.md`](docs/task-collection.md) and
 [`docs/task-benchmarking.md`](docs/task-benchmarking.md).
 
+### See how well the prompt cache is working
+
+```sh
+statsai report cache
+statsai report cache --from 2026-06-01 --to 2026-06-07 --provider claude_code
+statsai report cache --all --provider codex
+statsai report cache --session session_1a2b --details
+statsai report cache --timeline --json
+```
+
+The cache report shows how much logical input (ordinary input, cache writes,
+and cache reads) was served from the prompt cache, how much context each model
+call processed, and when reuse dropped. For Claude Code and Codex it also walks
+each agent's calls in order: a call whose cached reads fall at least half, and
+at least 4,096 tokens, below what the previous call left reusable is a
+suspected cache loss. Losses are grouped by the gap since the previous call, so
+drops after a pause read apart from drops during active use. It is a heuristic
+over recorded token counts, not a provider-confirmed miss, and calls that
+cannot be ordered or split are reported as unclassifiable rather than as
+healthy. `--timeline` adds local 10-minute buckets and `--details` lists every
+call with its evidence; per-call details never leave the device.
+
 ### Keep a durable conversation archive
 
 Collect complete conversations into the local SQLite store, then search or
@@ -394,6 +416,7 @@ statsai report monthly --subscriptions
 statsai report all-time --json --verbose
 statsai report range --from 2026-01-01 --to 2026-03-31
 statsai report range --from 2026-05-01 --json
+statsai report cache --from 2026-05-01 --details
 ```
 
 Normal scans use a per-source file signature cache. `--no-cache` forces a
@@ -439,6 +462,7 @@ statsai sync --sink http --since-last
 statsai sync --sink http --verify
 statsai sync --status
 statsai schema sync-batch
+statsai schema cache-report
 ```
 
 HTTP sync uses the stored device session unless `--auth-token` or
@@ -458,6 +482,10 @@ stored at `~/.statsai/daemon-token`.
 curl -H "Authorization: Bearer $(cat ~/.statsai/daemon-token)" \
   http://127.0.0.1:8765/accounts
 ```
+
+`/reports/cache` returns the `statsai report cache --json` report and accepts
+`from`, `to`, `all`, `provider`, `account`, `session`, and `timeline` query
+parameters.
 
 Browser-originated requests are rejected. Sync writes must use
 `Content-Type: application/json` and stay below 8 MiB.

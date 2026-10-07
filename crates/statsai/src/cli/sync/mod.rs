@@ -166,6 +166,11 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
             &target,
             preflight.remote.as_ref(),
         )?;
+        store.record_sync_target_cache_health_support(
+            &command.sink,
+            &target,
+            remote_accepts_cache_health(preflight.remote.as_ref()),
+        )?;
         Some(preflight)
     } else {
         None
@@ -633,16 +638,23 @@ pub(crate) fn sync_local_verify(
             .map(|subscription| subscription.subscription_id.0.as_str())
             .collect(),
     )?;
+    let accepts_cache_health = store.sync_target_accepts_cache_health(sink, target)?;
+    let for_target = |summary| {
+        statsai_store::summary_for_sync_target(
+            sanitize_summary_for_sync_with_projects(summary, include_projects),
+            accepts_cache_health,
+        )
+    };
     let passthrough_summaries: Vec<_> = store
         .summaries()?
         .into_iter()
-        .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
+        .map(for_target)
         .filter(is_http_rollup_passthrough_summary)
         .collect();
     let rollup_summaries: Vec<_> = store
         .all_sync_rollup_summaries()?
         .into_iter()
-        .map(|summary| sanitize_summary_for_sync_with_projects(summary, include_projects))
+        .map(for_target)
         .collect();
 
     Ok(SyncLocalVerify {

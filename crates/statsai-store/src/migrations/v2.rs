@@ -684,3 +684,22 @@ pub(crate) fn apply_migration_029(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Orders each session's events by time in the session index.
+///
+/// The prompt-cache detector judges each call against the one before it in
+/// its session, so it reads sessions whole, and after a late arrival or a
+/// correction it looks up the session's events at or after the changed one.
+/// Leading with the session and then `started_at` serves both as index range
+/// scans, and gives session reads their order without a sort. It replaces
+/// `usage_events_session_idx`, whose session lookups it also covers.
+pub(crate) fn apply_migration_030(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        r#"
+        CREATE INDEX IF NOT EXISTS usage_events_session_started_idx
+          ON usage_events ({EVENT_SESSION_ID_SQL}, started_at, event_id);
+        DROP INDEX IF EXISTS usage_events_session_idx;
+        "#,
+    ))?;
+    Ok(())
+}

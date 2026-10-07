@@ -402,6 +402,7 @@ pub(crate) fn usage_event<A: ProviderAdapter + ?Sized>(
         privacy: metadata_only_privacy(),
         created_at: parts.timestamp,
         imported_at: Utc::now(),
+        context: None,
     }
 }
 
@@ -491,6 +492,7 @@ pub(crate) fn runtime_to_summary_metrics(runtime: RuntimeInfo) -> SummaryMetrics
         user_messages: runtime.user_messages,
         assistant_messages: runtime.assistant_messages,
         developer_messages: runtime.developer_messages,
+        cache_health: None,
     }
 }
 

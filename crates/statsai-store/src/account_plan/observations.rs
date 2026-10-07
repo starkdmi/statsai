@@ -579,8 +579,7 @@ impl Store {
             dirty.extend(self.update_event_payload(event)?);
             changed += 1;
         }
-        self.refresh_sync_rollups_for_keys(&dirty.buckets)?;
-        self.refresh_session_rollups_for_keys(&dirty.sessions)?;
+        self.refresh_event_rollups(&dirty)?;
         Ok(changed)
     }
 

@@ -8,6 +8,11 @@ pub use statsai_core as core;
 pub use statsai_store as store;
 pub use statsai_sync as sync;
 
+/// The prompt-cache report: `Store::cache_report` with a [`CacheReportQuery`]
+/// returns the same [`CacheReport`] that `statsai report cache --json` prints.
+pub use statsai_core::{AnalyzedCacheCall, CacheHealthV1, CacheReport};
+pub use statsai_store::CacheReportQuery;
+
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;

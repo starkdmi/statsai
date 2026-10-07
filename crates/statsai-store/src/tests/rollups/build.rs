@@ -30,7 +30,7 @@ fn sync_rollup_counts_underlying_requests_in_codex_turn_events() {
         ..ModelInfo::default()
     });
 
-    let summary = build_sync_rollup_summary(&[first, second, legacy]);
+    let summary = build_sync_rollup_summary(&[first, second, legacy], None);
 
     assert_eq!(summary.usage.requests, Some(9));
     assert_eq!(summary.models.len(), 2);
@@ -188,7 +188,7 @@ fn sync_rollup_sums_micro_usd_before_rounding_to_cents() {
     event.cost.set_estimated_micro_usd(2_250);
     let events = vec![event; 1_000];
 
-    let summary = build_sync_rollup_summary(&events);
+    let summary = build_sync_rollup_summary(&events, None);
 
     assert_eq!(
         summary.cost.estimated_api_equivalent_micro_usd,
