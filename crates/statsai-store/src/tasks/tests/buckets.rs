@@ -156,3 +156,93 @@ fn buckets_acknowledged_before_a_sanitizer_change_are_resent_once() {
         0
     );
 }
+
+#[test]
+fn acknowledged_tombstones_stay_clean_across_a_sanitizer_change() {
+    let target = "https://example.invalid/api/sync/batches";
+    let path = tempfile::tempdir()
+        .expect("tempdir")
+        .keep()
+        .join("store.db");
+    let started_at = Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 0).unwrap();
+    let kept = test_task_bucket_snapshot("bucket-kept", "span-kept", "Keep me", started_at);
+    let gone = test_task_bucket_snapshot("bucket-gone", "span-gone", "Delete me", started_at);
+
+    {
+        // A collector from before the sanitizer change syncs both buckets,
+        // deletes one locally, and syncs its tombstone.
+        let store = Store::open(&path).expect("store");
+        for snapshot in [&kept, &gone] {
+            store
+                .replace_task_bucket_snapshot(snapshot)
+                .expect("replace snapshot");
+        }
+        store
+            .record_task_bucket_snapshots_synced(
+                "http",
+                target,
+                "device-1",
+                &[kept.clone(), gone.clone()],
+            )
+            .expect("record buckets");
+        store
+            .replace_task_bucket_snapshot(&TaskBucketSnapshot {
+                project_bucket: "bucket-gone".to_string(),
+                generated_at: started_at,
+                applied_verification_cursor: None,
+                work_items: Vec::new(),
+                members: Vec::new(),
+                spans: Vec::new(),
+            })
+            .expect("delete bucket locally");
+        let tombstones = store
+            .pending_task_bucket_snapshots_for_sync("http", target, "device-1", false, None)
+            .expect("tombstone selection");
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].project_bucket, "bucket-gone");
+        assert!(tombstones[0].spans.is_empty());
+        store
+            .record_task_bucket_snapshots_synced("http", target, "device-1", &tombstones)
+            .expect("record tombstone");
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE task_bucket_sync_state DROP COLUMN sanitizer_version;
+                 DELETE FROM schema_migrations WHERE version = 31;",
+            )
+            .expect("roll back to the previous schema");
+    }
+
+    let store = Store::open(&path).expect("reopened store");
+    let status = store
+        .task_bucket_sync_status("http", target, "device-1")
+        .expect("status");
+    assert_eq!((status.dirty, status.total), (1, 2));
+    let pending = store
+        .pending_task_bucket_snapshots_for_sync("http", target, "device-1", false, None)
+        .expect("incremental selection");
+    assert_eq!(
+        pending
+            .iter()
+            .map(|snapshot| snapshot.project_bucket.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bucket-kept"],
+        "only the bucket with content is re-sent"
+    );
+    let full = store
+        .pending_task_bucket_snapshots_for_sync("http", target, "device-1", true, None)
+        .expect("full selection");
+    assert_eq!(full.len(), 1);
+
+    store
+        .record_task_bucket_snapshots_synced("http", target, "device-1", &pending)
+        .expect("record resend");
+    let status = store
+        .task_bucket_sync_status("http", target, "device-1")
+        .expect("status after resend");
+    assert_eq!((status.dirty, status.total), (0, 2));
+    assert!(store
+        .pending_task_bucket_snapshots_for_sync("http", target, "device-1", false, None)
+        .expect("incremental selection after resend")
+        .is_empty());
+}
