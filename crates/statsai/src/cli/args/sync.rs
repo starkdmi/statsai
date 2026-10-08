@@ -50,7 +50,7 @@ pub(crate) struct SyncCommand {
     pub(crate) dry_run: bool,
     #[arg(
         long,
-        help = "Enable project metadata sync for this device and future syncs"
+        help = "Enable project metadata sync for this device and future syncs. Sends project name, repo owner/repo, branch names, and folder path (home shown as ~)"
     )]
     pub(crate) include_projects: bool,
     #[arg(
@@ -62,7 +62,7 @@ pub(crate) struct SyncCommand {
     #[arg(
         long,
         conflicts_with_all = ["exclude_tasks", "exclude_projects"],
-        help = "Enable hosted task sync for this device and future syncs (implies --include-projects)"
+        help = "Enable hosted task sync for this device and future syncs (implies --include-projects). Sends task titles, short prompt previews, and todo excerpts"
     )]
     pub(crate) include_tasks: bool,
     #[arg(
@@ -74,7 +74,7 @@ pub(crate) struct SyncCommand {
     #[arg(
         long,
         conflicts_with = "exclude_activity",
-        help = "Enable hosted agent activity sync for this device and future syncs"
+        help = "Enable hosted agent activity sync for this device and future syncs. Sends tool, MCP, plugin, skill, and command names with call counts"
     )]
     pub(crate) include_activity: bool,
     #[arg(
@@ -86,7 +86,7 @@ pub(crate) struct SyncCommand {
     #[arg(
         long,
         conflicts_with_all = ["exclude_sessions", "exclude_projects"],
-        help = "Enable hosted session sync for this device and future syncs (implies --include-projects)"
+        help = "Enable hosted session sync for this device and future syncs (implies --include-projects). Sends per-session stats and a session title, which may be derived from the first prompt"
     )]
     pub(crate) include_sessions: bool,
     #[arg(

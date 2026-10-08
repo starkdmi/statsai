@@ -83,23 +83,11 @@ impl Store {
         full: bool,
         applied_verification_cursor: Option<TaskVerificationCursor>,
     ) -> Result<Vec<TaskBucketSnapshot>> {
-        let local_buckets = self.task_project_buckets()?;
-        let tracked_dirty_buckets =
-            self.dirty_task_bucket_keys_for_sync(sink, target, device_id)?;
+        let pending = self.task_bucket_sync_selection(sink, target, device_id)?;
         let bucket_ids = if full {
-            local_buckets
-                .union(&tracked_dirty_buckets)
-                .cloned()
-                .collect::<BTreeSet<_>>()
+            pending.local.union(&pending.pending).cloned().collect()
         } else {
-            local_buckets
-                .iter()
-                .filter(|bucket| {
-                    !self.task_bucket_is_clean_for_sync(sink, target, device_id, bucket)
-                })
-                .cloned()
-                .chain(tracked_dirty_buckets.difference(&local_buckets).cloned())
-                .collect::<BTreeSet<_>>()
+            pending.pending
         };
         bucket_ids
             .into_iter()
@@ -157,13 +145,15 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             INSERT INTO task_bucket_sync_state (
-              sink, target, device_id, project_bucket, dirty, payload_hash, updated_at
+              sink, target, device_id, project_bucket, dirty, payload_hash, updated_at,
+              sanitizer_version
             )
-            VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+            VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)
             ON CONFLICT(sink, target, device_id, project_bucket) DO UPDATE SET
               dirty = 0,
               payload_hash = excluded.payload_hash,
-              updated_at = excluded.updated_at
+              updated_at = excluded.updated_at,
+              sanitizer_version = excluded.sanitizer_version
             "#,
         )?;
         for snapshot in snapshots {
@@ -174,6 +164,7 @@ impl Store {
                 &snapshot.project_bucket,
                 task_bucket_snapshot_payload_hash(snapshot)?,
                 &now,
+                TASK_BUCKET_SYNC_SANITIZER_VERSION,
             ])?;
         }
         Ok(())
@@ -216,50 +207,57 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn dirty_task_bucket_keys_for_sync(
+    /// Which task buckets the target still needs, by the one predicate both
+    /// sync selection and sync status use: [`task_bucket_needs_sync`].
+    pub(crate) fn task_bucket_sync_selection(
         &self,
         sink: &str,
         target: &str,
         device_id: &str,
-    ) -> Result<BTreeSet<String>> {
+    ) -> Result<TaskBucketSyncSelection> {
+        let local = self.task_project_buckets()?;
         let mut statement = self.conn.prepare(
             r#"
-            SELECT project_bucket
+            SELECT project_bucket, dirty, sanitizer_version
             FROM task_bucket_sync_state
-            WHERE sink = ?1 AND target = ?2 AND device_id = ?3 AND dirty = 1
-            ORDER BY project_bucket
+            WHERE sink = ?1 AND target = ?2 AND device_id = ?3
             "#,
         )?;
         let rows = statement.query_map(params![sink, target, device_id], |row| {
-            row.get::<_, String>(0)
+            Ok((
+                row.get::<_, String>(0)?,
+                TrackedTaskBucket {
+                    dirty: row.get::<_, i64>(1)? != 0,
+                    sanitizer_version: row.get::<_, i64>(2)?,
+                },
+            ))
         })?;
-        let mut buckets = BTreeSet::new();
+        let mut tracked = BTreeMap::new();
         for row in rows {
-            buckets.insert(row?);
+            let (project_bucket, state) = row?;
+            tracked.insert(project_bucket, state);
         }
-        Ok(buckets)
-    }
-
-    pub(crate) fn task_bucket_is_clean_for_sync(
-        &self,
-        sink: &str,
-        target: &str,
-        device_id: &str,
-        project_bucket: &str,
-    ) -> bool {
-        self.conn
-            .query_row(
-                r#"
-                SELECT dirty
-                FROM task_bucket_sync_state
-                WHERE sink = ?1 AND target = ?2 AND device_id = ?3 AND project_bucket = ?4
-                "#,
-                params![sink, target, device_id, project_bucket],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map(|row| row.is_some_and(|dirty| dirty == 0))
-            .unwrap_or(false)
+        let pending = local
+            .iter()
+            .chain(tracked.keys())
+            .filter(|bucket| {
+                task_bucket_needs_sync(
+                    tracked.get(bucket.as_str()),
+                    local.contains(bucket.as_str()),
+                )
+            })
+            .cloned()
+            .collect();
+        let total = local
+            .iter()
+            .filter(|bucket| !tracked.contains_key(bucket.as_str()))
+            .count()
+            + tracked.len();
+        Ok(TaskBucketSyncSelection {
+            local,
+            pending,
+            total,
+        })
     }
 
     pub(crate) fn mark_task_buckets_dirty_in_tx(
@@ -283,6 +281,41 @@ impl Store {
             self.conn.execute(&sql, params.as_slice())?;
         }
         Ok(())
+    }
+}
+
+pub(crate) struct TaskBucketSyncSelection {
+    /// Buckets that exist locally.
+    pub(crate) local: BTreeSet<String>,
+    /// Buckets an incremental sync sends: local or tracked ones the target
+    /// does not hold as they are now.
+    pub(crate) pending: BTreeSet<String>,
+    /// Local buckets plus tracked ones that no longer exist locally.
+    pub(crate) total: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrackedTaskBucket {
+    pub(crate) dirty: bool,
+    pub(crate) sanitizer_version: i64,
+}
+
+/// Whether the target needs this bucket sent, given its acknowledgement (if
+/// any) and whether the bucket still exists locally.
+///
+/// A local bucket is pending until acknowledged, after any change, and when
+/// it was acknowledged under an older sync sanitizer: the target then holds a
+/// payload the current sanitizer would not send. A bucket that no longer
+/// exists locally can only go out as an empty deletion tombstone, which
+/// carries no labels, so only a change since its acknowledgement makes it
+/// pending -- a sanitizer change alone would re-send a tombstone forever
+/// without changing anything the target holds.
+pub(crate) fn task_bucket_needs_sync(tracked: Option<&TrackedTaskBucket>, local: bool) -> bool {
+    match tracked {
+        None => local,
+        Some(state) => {
+            state.dirty || (local && state.sanitizer_version < TASK_BUCKET_SYNC_SANITIZER_VERSION)
+        }
     }
 }
 

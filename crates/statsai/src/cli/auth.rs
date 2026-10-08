@@ -11,6 +11,6 @@ pub(crate) fn auth(command: AuthCommand) -> Result<()> {
             device_name,
         } => auth::login(no_open, headless, device_name),
         AuthSubcommand::Status => auth::status(),
-        AuthSubcommand::Logout => auth::logout(),
+        AuthSubcommand::Logout { local_only } => auth::logout(local_only),
     }
 }

@@ -1121,13 +1121,13 @@ Options:
       --reset-remote             Delete mirrored hosted sync data for this paired device and clear local sync tracking (http only)
       --yes                      Confirm destructive sync reset actions
       --dry-run                  Build the sync batch without writing
-      --include-projects         Enable project metadata sync for this device and future syncs
+      --include-projects         Enable project metadata sync for this device and future syncs. Sends project name, repo owner/repo, branch names, and folder path (home shown as ~)
       --exclude-projects         Disable project metadata sync for this device and future syncs; hosted sessions are retired
-      --include-tasks            Enable hosted task sync for this device and future syncs (implies --include-projects)
+      --include-tasks            Enable hosted task sync for this device and future syncs (implies --include-projects). Sends task titles, short prompt previews, and todo excerpts
       --exclude-tasks            Disable hosted task sync for this device and future syncs
-      --include-activity         Enable hosted agent activity sync for this device and future syncs
+      --include-activity         Enable hosted agent activity sync for this device and future syncs. Sends tool, MCP, plugin, skill, and command names with call counts
       --exclude-activity         Disable hosted agent activity sync and prune names on the next successful HTTP sync
-      --include-sessions         Enable hosted session sync for this device and future syncs (implies --include-projects)
+      --include-sessions         Enable hosted session sync for this device and future syncs (implies --include-projects). Sends per-session stats and a session title, which may be derived from the first prompt
       --exclude-sessions         Disable hosted session sync for this device and future syncs
   -h, --help                     Print help
 ===== statsai schema --help =====
@@ -1264,7 +1264,7 @@ Usage: statsai auth [OPTIONS] <COMMAND>
 Commands:
   login   Log in to the hosted sync backend
   status  Check authentication status for the Better Auth device session
-  logout  Log out and clear stored Better Auth device credentials
+  logout  Log out: revoke this device's session on the server, then clear stored credentials
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1293,11 +1293,12 @@ Options:
       --device-id <DEVICE_ID>  Device identifier for multi-device sync
   -h, --help                   Print help
 ===== statsai auth logout --help =====
-Log out and clear stored Better Auth device credentials
+Log out: revoke this device's session on the server, then clear stored credentials
 
 Usage: statsai auth logout [OPTIONS]
 
 Options:
+      --local-only             Only clear credentials stored on this machine; do not contact the server
       --store <STORE>          Path to SQLite store
       --device-id <DEVICE_ID>  Device identifier for multi-device sync
   -h, --help                   Print help

@@ -5,7 +5,7 @@ use statsai_core::{
     task_verification_id, title_topic_tokens, work_item_id, Confidence, TaskBucketSnapshot,
     TaskSpan, TaskSpanId, TaskStatus, TaskVerification, TaskVerificationAction,
     TaskVerificationCursor, UsageCounts, WorkItem, WorkItemId, WorkItemMember,
-    TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
+    TASK_BUCKET_SYNC_SANITIZER_VERSION, TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;

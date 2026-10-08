@@ -158,6 +158,16 @@ dashboard.
 | — | Opt-in private task snapshots and verifications, including bounded task titles, summary previews, and todo excerpts |
 | Session prompts, raw session ids, and message text | Opt-in session rollups: totals, duration, message counts, and a bounded title |
 
+Each opt-in sync flag adds a specific set of fields to the hosted dataset:
+
+- `--include-projects`: project name, repository owner/repo, branch names, and
+  the project folder path, with the home directory shown as `~`.
+- `--include-tasks`: task titles, short prompt previews, and todo excerpts.
+- `--include-sessions`: per-session stats and a session title, which may be
+  derived from the first prompt.
+- `--include-activity`: tool, MCP, plugin, skill, and command names with call
+  counts.
+
 Raw usage events and complete archived conversation records stay local and are
 never included in hosted sync. StatsAI does not upload full prompts, full
 responses, or raw provider logs. When hosted task sync is explicitly enabled
@@ -457,6 +467,8 @@ statsai auth login
 statsai auth login --no-open
 statsai auth login --headless --device-name "Mini server"
 statsai auth status
+statsai auth logout
+statsai auth logout --local-only
 statsai sync --sink file --output ./statsai-sync-batch.json
 statsai sync --sink http --since-last
 statsai sync --sink http --verify
@@ -467,6 +479,10 @@ statsai schema cache-report
 
 HTTP sync uses the stored device session unless `--auth-token` or
 `STATSAI_SYNC_TOKEN` is provided. Access tokens are refreshed automatically.
+`statsai auth logout` revokes this device's session on the server before
+clearing local credentials; if the server cannot be reached it still logs out
+locally, and the session expires within 30 days or can be revoked from the
+dashboard's Devices page. `--local-only` skips the server call.
 
 </details>
 

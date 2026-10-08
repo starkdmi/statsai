@@ -13,6 +13,9 @@ pub(crate) fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
     summary.metadata.summary_format == "daily_rollup.v1"
 }
 
+/// The summary as an HTTP sync batch carries it: sanitized, without a project
+/// unless projects are included, and with a project path label under the
+/// home directory shown as `~/...`. Never stored locally.
 pub(crate) fn sanitize_summary_for_http_sync(
     summary: UsageSummary,
     include_projects: bool,
@@ -21,7 +24,7 @@ pub(crate) fn sanitize_summary_for_http_sync(
     if !include_projects {
         summary.project = None;
     }
-    summary
+    statsai_core::collapse_summary_home_for_sync(summary, statsai_core::home_dir().as_deref())
 }
 
 pub(crate) fn summary_sync_day(summary: &UsageSummary) -> NaiveDate {

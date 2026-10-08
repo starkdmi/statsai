@@ -22,7 +22,7 @@ IDs. Versions 1–5 never treat absent activity fields as authoritative. Activit
 names leave the device only when the collector preference `include_activity` is
 on; turning it off sends an authoritative empty activity ID set so the backend
 prunes hosted names. Invocation IDs, arguments, outputs, commands, prompts, and
-file paths never appear in a v6 payload.
+file paths never appear in activity rows.
 The same batch schema carries opt-in `sessions` rows. Each row is
 `session_rollup.v1` with a closed key set: hashed session id, provider,
 source, account, time range, duration, usage, requests, cost, models, message
@@ -33,8 +33,9 @@ sends it. `active_seconds` is the time the agent was working, the union of the
 turns the provider recorded, and is null when none were; collectors before it
 omit the key. Events keyed by their
 own provider record, such as Cursor's usage-export rows, belong to no session
-and are not sent, and neither is a session with no project and no title. Prompts, responses, paths, and raw provider session ids stay on
-the device. Session retirement is not implied by `sync_batch.v6`. A snapshot
+and are not sent, and neither is a session with no project and no title. Prompts, responses, and raw provider session ids stay on
+the device. The only path a session row carries is its project's `path_label`,
+with the home directory shown as `~`. Session retirement is not implied by `sync_batch.v6`. A snapshot
 retires hosted sessions only when it includes `session_rollup_ids`. An empty
 array prunes them. Omitting the key leaves hosted sessions in place, which is
 what the collector does when `include_sessions` alone is off. With projects
@@ -239,9 +240,17 @@ through the branch's own commits. Conflict resolutions carried only by a merge
 commit are consequently not counted.
 
 `ProjectInfo.path_label` is retained for owner-facing project location displays,
-manual project linking, and hosted task review. Hashed path, source, event, and
-summary identifiers remain so the server can deduplicate records and keep
-stable location identity.
+manual project linking, and hosted task review. A path under the user's home
+directory is sent as `~/...` (the home directory itself as `~`); paths outside
+home are sent unchanged. This applies to `summaries[].project`,
+`sessions[].project`, and task `work_items[].path_label` and
+`spans[].project.path_label`. Only the label is rewritten: the local store keeps
+the full path, and `path_hash` is still computed from it. After upgrading from
+a collector that sent full paths, the next incremental sync re-sends affected
+summaries and sessions once (their payload hash changed) and every task bucket
+acknowledged under the older task sanitizer version. Hashed path, source,
+event, and summary identifiers remain so the server can deduplicate records and
+keep stable location identity.
 
 Canonical provider account identity may now sync through
 `ProviderAccount.provider_user_id` and `ProviderAccount.email`. Hosted task

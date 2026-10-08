@@ -365,7 +365,7 @@ impl Store {
             // rebuilds or deletes a bucket in that window updates nothing and leaves
             // no trace. Putting the captured `dirty = 0` back would then declare that
             // change already synced, and nothing compares hashes afterwards to catch
-            // it: `task_bucket_is_clean_for_sync` trusts this flag alone. Re-sending
+            // it: `task_bucket_needs_sync` trusts this flag, not hashes. Re-sending
             // the tracked buckets once costs a fraction of the re-upload restoring the
             // cursor avoids, and adoption made the same trade for the same reason.
             for (device_id, project_bucket, payload_hash, updated_at) in &snapshot.buckets {
@@ -699,31 +699,10 @@ impl Store {
         target: &str,
         device_id: &str,
     ) -> Result<TaskBucketSyncStatus> {
-        let local_buckets = self.task_project_buckets()?;
-        let mut statement = self.conn.prepare(
-            r#"
-            SELECT project_bucket, dirty
-            FROM task_bucket_sync_state
-            WHERE sink = ?1 AND target = ?2 AND device_id = ?3
-            "#,
-        )?;
-        let rows = statement.query_map(params![sink, target, device_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        let mut tracked = HashMap::<String, i64>::new();
-        for row in rows {
-            let (project_bucket, dirty) = row?;
-            tracked.insert(project_bucket, dirty);
-        }
-        let tracked_total = tracked.len() as u64;
-        let tracked_dirty = tracked.values().filter(|dirty| **dirty == 1).count() as u64;
-        let missing_local = local_buckets
-            .iter()
-            .filter(|project_bucket| !tracked.contains_key(project_bucket.as_str()))
-            .count() as u64;
+        let selection = self.task_bucket_sync_selection(sink, target, device_id)?;
         Ok(TaskBucketSyncStatus {
-            total: tracked_total.saturating_add(missing_local),
-            dirty: tracked_dirty.saturating_add(missing_local),
+            total: selection.total as u64,
+            dirty: selection.pending.len() as u64,
         })
     }
 
