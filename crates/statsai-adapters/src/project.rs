@@ -79,10 +79,10 @@ pub(crate) fn resolve_project_context(
             git.as_ref()
                 .and_then(|metadata| metadata.repo_label.clone())
         });
-    let branch_label = branch.or_else(|| {
-        git.as_ref()
-            .and_then(|metadata| metadata.branch_label.clone())
-    });
+    // Only the branch the record carries. The checkout's HEAD at scan time says
+    // nothing about where a past session ran, and a label read from it would
+    // move every time a re-import happens on another branch.
+    let branch_label = branch.filter(|branch| !branch.trim().is_empty());
     let branch_hash = branch_label.as_ref().map(|branch| hash_text(branch));
     let project_label = project_path
         .as_deref()
@@ -122,7 +122,6 @@ pub(crate) fn project_context_from_path_fallback(root: &Path, path: &Path) -> Op
 pub(crate) struct GitRepositoryMetadata {
     normalized_remote: Option<String>,
     repo_label: Option<String>,
-    branch_label: Option<String>,
 }
 
 pub(crate) fn read_git_repository_metadata(path: &Path) -> Option<GitRepositoryMetadata> {
@@ -144,7 +143,6 @@ pub(crate) fn read_git_repository_metadata(path: &Path) -> Option<GitRepositoryM
     Some(GitRepositoryMetadata {
         normalized_remote,
         repo_label,
-        branch_label: read_git_head_branch(&git_dir),
     })
 }
 
@@ -233,12 +231,6 @@ pub(crate) fn read_git_remote_url(config_path: &Path) -> Option<String> {
     }
 
     origin_remote_url.or(first_remote_url)
-}
-
-pub(crate) fn read_git_head_branch(git_dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head = text.trim();
-    head.strip_prefix("ref: refs/heads/").map(ToOwned::to_owned)
 }
 
 pub(crate) fn repo_label_from_normalized_remote(remote: &str) -> String {

@@ -475,3 +475,75 @@ fn opencode_session_usage_beyond_its_messages_stays_untiered() {
         Some(1_180_000)
     );
 }
+
+#[test]
+fn opencode_rescan_on_another_checkout_leaves_the_branch_unset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let db_path = dir.path().join("opencode.db");
+    let connection = Connection::open(&db_path).expect("db");
+    connection
+        .execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                model TEXT,
+                cost REAL,
+                tokens_input INTEGER NOT NULL,
+                tokens_output INTEGER NOT NULL,
+                tokens_reasoning INTEGER NOT NULL,
+                tokens_cache_read INTEGER NOT NULL,
+                tokens_cache_write INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                directory TEXT
+            );",
+        )
+        .expect("schema");
+    connection
+        .execute(
+            "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                "ses_branch",
+                "Past session",
+                r#"{"id":"grok-build-0.1","providerID":"xai"}"#,
+                0.5_f64,
+                100_i64,
+                20_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                1_767_225_600_000_i64,
+                1_767_225_660_000_i64,
+                workspace.to_string_lossy().to_string(),
+            ],
+        )
+        .expect("insert");
+    let source = SourceLocation::local_adapter(
+        OPENCODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+
+    // OpenCode records no branch, and the checkout's HEAD at scan time says
+    // nothing about where a past session ran.
+    for checkout in ["main", "feature/new-work"] {
+        crate::tests::write_git_fixture(
+            &workspace,
+            "https://github.com/example-org/example-workspace.git",
+            checkout,
+        );
+        let scan = scan_opencode_source(&OpenCodeAdapter, &source, &options()).expect("scan");
+        assert_eq!(scan.events.len(), 1);
+        let project = scan.events[0].project.as_ref().expect("project");
+        assert_eq!(
+            project.repo_label.as_deref(),
+            Some("example-org/example-workspace")
+        );
+        assert_eq!(project.branch_label, None, "checked out on {checkout}");
+        assert_eq!(project.branch_hash, None, "checked out on {checkout}");
+    }
+}

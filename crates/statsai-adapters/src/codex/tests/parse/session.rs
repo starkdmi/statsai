@@ -51,6 +51,167 @@ fn codex_extracts_cwd_and_git_metadata_from_session_meta() {
     assert_eq!(project.branch_label.as_deref(), Some("main"));
 }
 
+const BRANCH_TEST_REMOTE: &str = "git@github.com:example-org/example-workspace.git";
+
+/// A session whose `session_meta` names `cwd` and, when given, `branch`,
+/// followed by the `turn_context` and token count of one turn in `turn_cwd`.
+fn write_codex_branch_session(path: &Path, cwd: &Path, turn_cwd: &Path, branch: Option<&str>) {
+    let git = branch
+        .map(|branch| {
+            format!(r#","git":{{"repository_url":"{BRANCH_TEST_REMOTE}","branch":"{branch}"}}"#)
+        })
+        .unwrap_or_default();
+    let mut file = File::create(path).expect("session file");
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-06-01T08:00:00Z","type":"session_meta","payload":{{"id":"branch-session","cwd":"{}"{git}}}}}"#,
+        cwd.display()
+    )
+    .expect("write session meta");
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-06-01T08:00:01Z","type":"turn_context","payload":{{"cwd":"{}","model":"gpt-5","approval_policy":"never"}}}}"#,
+        turn_cwd.display()
+    )
+    .expect("write turn context");
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-06-01T08:00:05Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}},"total_token_usage":{{"input_tokens":80,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":120}}}}}}}}"#
+    )
+    .expect("write tokens");
+}
+
+/// `(branch_label, branch_hash, repo_label)` of one event's project.
+type BranchLabels = (Option<String>, Option<String>, Option<String>);
+
+/// Scans `codex_root` once per checked-out branch and returns each scan's
+/// labels for every event, in order.
+fn codex_branches_per_checkout(
+    codex_root: &Path,
+    workspace: &Path,
+    checkouts: &[&str],
+) -> Vec<Vec<BranchLabels>> {
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        codex_root,
+        LocationOrigin::Configured,
+    );
+    checkouts
+        .iter()
+        .map(|checkout| {
+            write_git_fixture(workspace, BRANCH_TEST_REMOTE, checkout);
+            let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+            assert!(!scan.events.is_empty(), "the session must produce events");
+            scan.events
+                .iter()
+                .map(|event| {
+                    let project = event.project.as_ref().expect("project");
+                    (
+                        project.branch_label.clone(),
+                        project.branch_hash.clone(),
+                        project.repo_label.clone(),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn codex_rescan_on_another_checkout_keeps_the_session_meta_branch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    let sessions = codex_root.join("sessions");
+    let workspace = dir.path().join("workspace").join("ai-stats");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    // The session ran on `main`; `turn_context` repeats its cwd but, as in
+    // real rollouts, carries no `git` block.
+    write_codex_branch_session(
+        &sessions.join("rollout.jsonl"),
+        &workspace,
+        &workspace,
+        Some("main"),
+    );
+
+    let scans = codex_branches_per_checkout(
+        &codex_root,
+        &workspace,
+        &["main", "feature/new-work", "release/next"],
+    );
+
+    let expected = (
+        Some("main".to_string()),
+        Some(hash_text("main")),
+        Some("example-org/example-workspace".to_string()),
+    );
+    for scan in &scans {
+        assert!(scan.iter().all(|labels| *labels == expected), "{scans:?}");
+    }
+}
+
+#[test]
+fn codex_session_without_recorded_branch_never_takes_the_checkout_head() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    let sessions = codex_root.join("sessions");
+    let workspace = dir.path().join("workspace").join("ai-stats");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    write_codex_branch_session(
+        &sessions.join("rollout.jsonl"),
+        &workspace,
+        &workspace,
+        None,
+    );
+
+    let scans = codex_branches_per_checkout(&codex_root, &workspace, &["main", "feature/new-work"]);
+
+    // The repository still comes from the checkout's remote; only the branch,
+    // which the checkout cannot know for a past session, stays unset.
+    let expected = (
+        None,
+        None,
+        Some("example-org/example-workspace".to_string()),
+    );
+    for scan in &scans {
+        assert!(scan.iter().all(|labels| *labels == expected), "{scans:?}");
+    }
+}
+
+#[test]
+fn codex_turn_in_another_directory_does_not_inherit_the_session_branch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_root = dir.path().join("codex");
+    let sessions = codex_root.join("sessions");
+    let started_in = dir.path().join("workspace").join("started-here");
+    let workspace = dir.path().join("workspace").join("ai-stats");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    std::fs::create_dir_all(&started_in).expect("start dir");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    // `session_meta`'s branch describes the directory it names. A turn that
+    // moved to another checkout has no recorded branch there.
+    write_codex_branch_session(
+        &sessions.join("rollout.jsonl"),
+        &started_in,
+        &workspace,
+        Some("topic/started-here"),
+    );
+
+    let scans = codex_branches_per_checkout(&codex_root, &workspace, &["main", "feature/new-work"]);
+
+    let expected = (
+        None,
+        None,
+        Some("example-org/example-workspace".to_string()),
+    );
+    for scan in &scans {
+        assert!(scan.iter().all(|labels| *labels == expected), "{scans:?}");
+    }
+}
+
 #[test]
 fn codex_line_filter_skips_non_message_response_items() {
     let reasoning = r#"{"timestamp":"2026-06-03T09:36:21.793Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"abc"}}"#;

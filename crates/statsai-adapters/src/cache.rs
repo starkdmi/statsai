@@ -17,20 +17,30 @@ pub(crate) const SCAN_CACHE_SIGNATURE_VERSION: &str = "scan-cache.v1";
 // so the name is joined when the session is built.
 // call-context.v38: turn events list their model calls, with request starts,
 // compaction boundaries, and each call's model, for the prompt-cache report.
-pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "call-context.v38";
+// branch-label.v39: turn_context lines keep the branch session_meta recorded
+// instead of taking the checkout's HEAD at scan time.
+pub(crate) const CODEX_SCAN_CACHE_PARSER_REVISION: &str = "branch-label.v39";
 // session-metadata.v30: Claude user-message counts include only typed prompts,
 // not tool results, meta lines, or compaction summaries. (v29: events carry the
 // session's custom or AI title and the prompt that started their turn.)
 // call-context.v31: events record their request start, sub-agent, and
 // compaction boundary for the prompt-cache report.
-pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "call-context.v31";
+// branch-label.v32: lines without a gitBranch leave the branch unset instead of
+// taking the checkout's HEAD at scan time, and archived conversations carry the
+// branch their lines record.
+pub(crate) const CLAUDE_SCAN_CACHE_PARSER_REVISION: &str = "branch-label.v32";
 // session-metadata.v21: events carry each session's user and assistant message
 // counts. (v20: session rows report their message count as requests and are
 // priced per message, so long-context tiers stop being decided session-wide.)
-pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "session-metadata.v21";
+// branch-label.v22: OpenCode records no branch, so sessions leave it unset
+// instead of taking the checkout's HEAD at scan time.
+pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "branch-label.v22";
 // Revisit Grok sessions whose Fast request was left unpriced because modelsUsed
 // also retained a selected standard model that made no inference.
-pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "grok-fast-pricing.v23";
+// branch-label.v24: sessions without a head_branch leave the branch unset
+// instead of taking the checkout's HEAD at scan time, and archived
+// conversations carry the branch and remote their summary records.
+pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "branch-label.v24";
 
 pub(crate) fn scan_candidate(
     path: PathBuf,

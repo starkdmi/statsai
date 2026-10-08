@@ -327,7 +327,10 @@ fn claude_jsonl_project_context_overrides_stale_session_index_path() {
         project.repo_label.as_deref(),
         Some("example-org/current-workspace")
     );
-    assert_eq!(project.branch_label.as_deref(), Some("main"));
+    // The stale index's branch belongs to another directory, and the line
+    // records none, so the checkout's HEAD must not stand in for it.
+    assert_eq!(project.branch_label, None);
+    assert_eq!(project.branch_hash, None);
 
     assert_eq!(scan.task_spans.len(), 1);
     let task = &scan.task_spans[0];

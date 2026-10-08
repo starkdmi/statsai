@@ -54,7 +54,21 @@ pub(crate) fn collect_grok(
                     .pointer("/info/cwd")
                     .and_then(Value::as_str)
                     .map(expand_home_path)
-                    .and_then(|path| resolve_project_context(Some(path), None, None));
+                    .and_then(|path| {
+                        resolve_project_context(
+                            Some(path),
+                            value
+                                .get("git_remotes")
+                                .and_then(Value::as_array)
+                                .and_then(|remotes| remotes.first())
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned),
+                            value
+                                .get("head_branch")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned),
+                        )
+                    });
             }
         }
         let file = File::open(&chat_path)?;

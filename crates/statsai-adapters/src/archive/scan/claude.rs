@@ -125,7 +125,13 @@ pub(crate) fn collect_claude_file(
                 .get("cwd")
                 .and_then(Value::as_str)
                 .map(expand_home_path)
-                .and_then(|path| resolve_project_context(Some(path), None, None));
+                .and_then(|path| {
+                    let branch = value
+                        .get("gitBranch")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    resolve_project_context(Some(path), None, branch)
+                });
         }
         let message = value.get("message").unwrap_or(&value);
         let role = message
