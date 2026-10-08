@@ -1,4 +1,6 @@
-use super::logout::{logout_backend, post_device_logout, revoke_server_session, ServerRevocation};
+use super::logout::{
+    logout_backend, logout_from_base, post_device_logout, revoke_server_session, ServerRevocation,
+};
 use super::session::{with_device_id_retry, DeviceSessionRequestError};
 use super::*;
 use std::cell::Cell;
@@ -332,6 +334,111 @@ fn logout_skips_the_server_without_a_stored_refresh_token() {
         ServerRevocation::NotAttempted
     );
     assert_eq!(calls.get(), 0);
+}
+
+fn auth_refresh_lock_is_held(base: &Path, api_base_url: &str) -> bool {
+    let lock_path = auth_path_for_api_base_url(base, api_base_url).with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    match file.try_lock() {
+        Ok(()) => false,
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(error)) => panic!("try lock: {error}"),
+    }
+}
+
+#[test]
+fn logout_holds_the_refresh_lock_through_revocation_and_cleanup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let api_base_url = "https://api.example.com";
+    let path = seed_logout_credentials(dir.path(), api_base_url, Some("refresh-secret"));
+    let revoked = std::cell::RefCell::new(None);
+
+    let removed = logout_from_base(
+        dir.path(),
+        api_base_url,
+        false,
+        |_, token| {
+            assert!(auth_refresh_lock_is_held(dir.path(), api_base_url));
+            *revoked.borrow_mut() = Some(token.to_string());
+            Ok(())
+        },
+        |_| {
+            assert!(auth_refresh_lock_is_held(dir.path(), api_base_url));
+            Ok(())
+        },
+    )
+    .expect("logout");
+
+    assert!(removed);
+    assert_eq!(revoked.borrow().as_deref(), Some("refresh-secret"));
+    assert!(!path.exists());
+    assert!(!auth_refresh_lock_is_held(dir.path(), api_base_url));
+}
+
+#[test]
+fn local_only_logout_clears_credentials_under_the_refresh_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let api_base_url = "https://api.example.com";
+    let path = seed_logout_credentials(dir.path(), api_base_url, Some("refresh-secret"));
+
+    let removed = logout_from_base(
+        dir.path(),
+        api_base_url,
+        true,
+        |_, _| panic!("--local-only must not contact the server"),
+        |_| {
+            assert!(auth_refresh_lock_is_held(dir.path(), api_base_url));
+            Ok(())
+        },
+    )
+    .expect("logout");
+
+    assert!(removed);
+    assert!(!path.exists());
+}
+
+#[test]
+fn logout_waits_for_an_in_flight_refresh_and_revokes_the_rotated_token() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = dir.path().to_path_buf();
+    let api_base_url = "https://api.example.com";
+    let path = seed_logout_credentials(&base, api_base_url, Some("refresh-old"));
+
+    // A sync is mid-refresh: it holds the lock and is about to rotate.
+    let refresh_lock = acquire_auth_refresh_lock(&path).expect("refresh lock");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let logout_base = base.clone();
+    let logout = std::thread::spawn(move || {
+        logout_from_base(
+            &logout_base,
+            api_base_url,
+            false,
+            |_, token| {
+                sender.send(token.to_string()).expect("send token");
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+    });
+    assert!(
+        receiver.recv_timeout(Duration::from_millis(200)).is_err(),
+        "logout must not read the token while a refresh holds the lock"
+    );
+    seed_logout_credentials(&base, api_base_url, Some("refresh-rotated"));
+    drop(refresh_lock);
+
+    assert_eq!(
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("revoked token"),
+        "refresh-rotated"
+    );
+    assert!(logout.join().expect("logout thread").expect("logout"));
+    assert!(!path.exists());
 }
 
 #[test]
