@@ -1121,13 +1121,13 @@ Options:
       --reset-remote             Delete mirrored hosted sync data for this paired device and clear local sync tracking (http only)
       --yes                      Confirm destructive sync reset actions
       --dry-run                  Build the sync batch without writing
-      --include-projects         Enable project metadata sync for this device and future syncs
+      --include-projects         Enable project metadata sync for this device and future syncs. Sends project name, repo owner/repo, branch names, and folder path (home shown as ~)
       --exclude-projects         Disable project metadata sync for this device and future syncs; hosted sessions are retired
-      --include-tasks            Enable hosted task sync for this device and future syncs (implies --include-projects)
+      --include-tasks            Enable hosted task sync for this device and future syncs (implies --include-projects). Sends task titles, short prompt previews, and todo excerpts
       --exclude-tasks            Disable hosted task sync for this device and future syncs
-      --include-activity         Enable hosted agent activity sync for this device and future syncs
+      --include-activity         Enable hosted agent activity sync for this device and future syncs. Sends tool, MCP, plugin, skill, and command names with call counts
       --exclude-activity         Disable hosted agent activity sync and prune names on the next successful HTTP sync
-      --include-sessions         Enable hosted session sync for this device and future syncs (implies --include-projects)
+      --include-sessions         Enable hosted session sync for this device and future syncs (implies --include-projects). Sends per-session stats and a session title, which may be derived from the first prompt
       --exclude-sessions         Disable hosted session sync for this device and future syncs
   -h, --help                     Print help
 ===== statsai schema --help =====
