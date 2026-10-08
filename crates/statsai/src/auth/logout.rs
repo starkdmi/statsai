@@ -41,9 +41,11 @@ pub(crate) fn logout_from_base(
     };
     if !local_only {
         if let ServerRevocation::Failed(reason) = revoke_server_session(base, api_base_url, send) {
-            eprintln!("Warning: could not revoke this device's session on the server: {reason}");
             eprintln!(
-                "It expires within 30 days, or you can revoke it now from the Devices page of the dashboard."
+                "Warning: could not revoke this device's session on the server, so it may still be active: {reason}"
+            );
+            eprintln!(
+                "Revoke it from the Devices page of the dashboard; otherwise it expires within 30 days."
             );
         }
     }
@@ -60,12 +62,18 @@ pub(crate) enum ServerRevocation {
 
 /// Best-effort server-side revocation of the stored device session. Never
 /// fails: the caller clears local credentials whatever the outcome.
+///
+/// The caller holds the auth refresh lock. If an earlier refresh left a
+/// pending rotation -- the server may have rotated the token and the response
+/// was lost -- the stored token may already be revoked while its successor is
+/// live, and revoking the stored one would change nothing. The rotation is
+/// replayed first, as the next refresh would, and the successor is revoked.
 pub(crate) fn revoke_server_session(
     base: &Path,
     api_base_url: &str,
     send: impl FnOnce(&str, &str) -> Result<()>,
 ) -> ServerRevocation {
-    let refresh_token = match stored_refresh_token(base, api_base_url) {
+    let refresh_token = match current_refresh_token(base, api_base_url) {
         Ok(Some(token)) => token,
         Ok(None) => return ServerRevocation::NotAttempted,
         Err(error) => return ServerRevocation::Failed(format!("{error:#}")),
@@ -76,13 +84,26 @@ pub(crate) fn revoke_server_session(
     }
 }
 
-fn stored_refresh_token(base: &Path, api_base_url: &str) -> Result<Option<String>> {
+/// The refresh token that currently names this device's server session,
+/// after finishing any interrupted rotation.
+fn current_refresh_token(base: &Path, api_base_url: &str) -> Result<Option<String>> {
     if !auth_record_candidate_exists(base, api_base_url)? {
         return Ok(None);
     }
-    let Some((_path, credentials)) = auth_record_for_backend(base, api_base_url)? else {
+    let Some((path, mut credentials)) = auth_record_for_backend(base, api_base_url)? else {
         return Ok(None);
     };
+    let has_token = credentials
+        .cloudflare_refresh_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty());
+    if !has_token {
+        return Ok(None);
+    }
+    if pending_refresh_rotation_path(&path).exists() {
+        refresh_cloudflare_access_token(&path, &mut credentials, api_base_url)
+            .context("finish an interrupted token refresh")?;
+    }
     Ok(credentials
         .cloudflare_refresh_token
         .filter(|token| !token.trim().is_empty()))

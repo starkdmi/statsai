@@ -441,6 +441,141 @@ fn logout_waits_for_an_in_flight_refresh_and_revokes_the_rotated_token() {
     assert!(!path.exists());
 }
 
+/// Serves one request per response in order, closing each connection, and
+/// hands back every raw request (headers and body).
+fn serve_auth_requests(
+    responses: Vec<(&'static str, String)>,
+) -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("addr");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for (status_line, body) in responses {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut seen = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+                if seen.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let length = String::from_utf8_lossy(&seen)
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            let mut request_body = vec![0_u8; length];
+            stream.read_exact(&mut request_body).expect("body");
+            seen.extend_from_slice(&request_body);
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("respond");
+            if sender
+                .send(String::from_utf8_lossy(&seen).into_owned())
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    (format!("http://{address}"), receiver)
+}
+
+fn request_json(request: &str) -> serde_json::Value {
+    let body = request.split("\r\n\r\n").nth(1).expect("body");
+    serde_json::from_str(body).expect("json body")
+}
+
+#[test]
+fn logout_finishes_an_interrupted_rotation_and_revokes_the_successor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rotated = serde_json::json!({
+        "accessToken": "access-new",
+        "accessExpiresAt": 4_102_444_800_u64,
+        "refreshToken": "refresh-new",
+        "refreshExpiresAt": 4_102_444_800_u64,
+    })
+    .to_string();
+    let (api_base_url, requests) = serve_auth_requests(vec![
+        ("HTTP/1.1 200 OK", rotated),
+        ("HTTP/1.1 204 No Content", String::new()),
+    ]);
+    let path = seed_logout_credentials(dir.path(), &api_base_url, Some("refresh-old"));
+    // An earlier refresh reached the server, but its response was lost.
+    let rotation_id =
+        load_or_create_pending_refresh_rotation(&path, "refresh-old").expect("pending rotation");
+
+    let removed = logout_from_base(dir.path(), &api_base_url, false, post_device_logout, |_| {
+        Ok(())
+    })
+    .expect("logout");
+
+    let exchange = requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("exchange");
+    assert!(
+        exchange.starts_with("POST /api/devices/token HTTP/1.1\r\n"),
+        "{exchange}"
+    );
+    let exchange = request_json(&exchange);
+    assert_eq!(exchange["refreshToken"], "refresh-old");
+    assert_eq!(exchange["rotationId"], rotation_id.as_str());
+    let revocation = requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("revocation");
+    assert!(
+        revocation.starts_with("POST /api/devices/logout HTTP/1.1\r\n"),
+        "{revocation}"
+    );
+    assert_eq!(
+        request_json(&revocation),
+        serde_json::json!({ "refreshToken": "refresh-new" })
+    );
+    assert!(removed);
+    assert!(!path.exists());
+    assert!(!pending_refresh_rotation_path(&path).exists());
+}
+
+#[test]
+fn logout_reports_an_unfinished_rotation_and_still_clears_local_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (api_base_url, requests) = serve_auth_requests(vec![(
+        "HTTP/1.1 500 Internal Server Error",
+        "{}".to_string(),
+    )]);
+    let path = seed_logout_credentials(dir.path(), &api_base_url, Some("refresh-old"));
+    load_or_create_pending_refresh_rotation(&path, "refresh-old").expect("pending rotation");
+
+    let outcome = revoke_server_session(dir.path(), &api_base_url, |_, _| {
+        panic!("revoking the possibly rotated-away token would report a false success")
+    });
+    match outcome {
+        ServerRevocation::Failed(reason) => {
+            assert!(reason.contains("interrupted token refresh"), "{reason}");
+            assert!(reason.contains("HTTP 500"), "{reason}");
+        }
+        other => panic!("expected a failed revocation, got {other:?}"),
+    }
+    assert!(requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("exchange")
+        .starts_with("POST /api/devices/token HTTP/1.1\r\n"));
+
+    let removed = logout_backend(dir.path(), &api_base_url, |_| Ok(())).expect("logout");
+    assert!(removed);
+    assert!(!path.exists());
+    assert!(!pending_refresh_rotation_path(&path).exists());
+}
+
 #[test]
 fn logout_revocation_refuses_plain_http_to_remote_hosts() {
     let error = post_device_logout("http://api.example.com", "refresh-secret")
