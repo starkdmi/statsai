@@ -159,12 +159,7 @@ impl Store {
             for mut binding in bindings.iter().cloned() {
                 let previous_id = binding.binding_id.clone();
                 binding.provider_account_id = target_provider_account_id.clone();
-                binding.binding_id = conversation_account_binding_id(
-                    &binding.source_id,
-                    &binding.conversation_id_hash,
-                    binding.turn_id_hash.as_deref(),
-                    target_provider_account_id,
-                );
+                binding.binding_id = binding.derived_binding_id();
                 self.upsert_conversation_account_bindings(std::slice::from_ref(&binding))?;
                 if previous_id != binding.binding_id {
                     self.conn.execute(
@@ -202,11 +197,32 @@ impl Store {
         };
         let identity_ids = load_ids("account_identity_observations", "observation_id")?;
         let plan_ids = load_ids("account_plan_observations", "observation_id")?;
-        let binding_ids = load_ids("conversation_account_bindings", "binding_id")?;
         identity_observations
             .retain(|observation| !identity_ids.contains(&observation.observation_id));
         plan_observations.retain(|observation| !plan_ids.contains(&observation.observation_id));
-        conversation_bindings.retain(|binding| !binding_ids.contains(&binding.binding_id));
+        // A known binding still counts as new when it saw more than the stored one.
+        let mut statement = self.conn.prepare(
+            "SELECT binding_id, payload FROM conversation_account_bindings WHERE source_id = ?1",
+        )?;
+        let stored_bindings = statement
+            .query_map([&source_id.0], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        let mut retained = Vec::with_capacity(conversation_bindings.len());
+        for binding in conversation_bindings.drain(..) {
+            let unseen = match stored_bindings.get(&binding.binding_id) {
+                None => true,
+                Some(payload) => {
+                    let stored: ConversationAccountBindingV1 = serde_json::from_str(payload)?;
+                    super::observations::strengthened_binding(&stored, &binding).is_some()
+                }
+            };
+            if unseen {
+                retained.push(binding);
+            }
+        }
+        *conversation_bindings = retained;
         Ok(())
     }
 

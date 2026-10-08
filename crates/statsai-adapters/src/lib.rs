@@ -232,12 +232,7 @@ pub fn remap_account_evidence_account_ids(
     for binding in &mut evidence.conversation_bindings {
         if let Some(canonical_id) = canonical_ids.get(&binding.provider_account_id) {
             binding.provider_account_id = canonical_id.clone();
-            binding.binding_id = conversation_account_binding_id(
-                &binding.source_id,
-                &binding.conversation_id_hash,
-                binding.turn_id_hash.as_deref(),
-                canonical_id,
-            );
+            binding.binding_id = binding.derived_binding_id();
         }
     }
 }

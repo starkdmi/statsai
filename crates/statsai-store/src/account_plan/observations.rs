@@ -1,5 +1,6 @@
 use super::*;
 use crate::{parse_rfc3339_for_row, QUOTA_PLAN_TYPE_SQL};
+use rusqlite::OptionalExtension;
 use std::cmp::Reverse;
 
 /// What deciding a plan run needs from a quota observation, and nothing else.
@@ -428,6 +429,12 @@ impl Store {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
+    /// Records new bindings, and strengthens known ones in place.
+    ///
+    /// A binding's ID names its account and takeover instant, so a later scan
+    /// can rediscover it having seen more: a longer certain range, or the
+    /// account holding the conversation alone where it was once only inferred.
+    /// That is kept; nothing a later scan sees can shrink or weaken it.
     pub fn upsert_conversation_account_bindings(
         &self,
         bindings: &[ConversationAccountBindingV1],
@@ -437,7 +444,7 @@ impl Store {
         }
         self.with_immediate_transaction(|| {
             let mut written = 0u64;
-            let mut statement = self.conn.prepare(
+            let mut insert = self.conn.prepare(
                 r#"
                 INSERT INTO conversation_account_bindings (
                   binding_id, provider, source_id, provider_account_id,
@@ -447,8 +454,14 @@ impl Store {
                 ON CONFLICT(binding_id) DO NOTHING
                 "#,
             )?;
+            let mut stored = self.conn.prepare(
+                "SELECT payload FROM conversation_account_bindings WHERE binding_id = ?1",
+            )?;
+            let mut update = self.conn.prepare(
+                "UPDATE conversation_account_bindings SET payload = ?2 WHERE binding_id = ?1",
+            )?;
             for binding in bindings {
-                written += statement.execute(params![
+                let inserted = insert.execute(params![
                     &binding.binding_id,
                     &binding.provider,
                     &binding.source_id.0,
@@ -457,7 +470,25 @@ impl Store {
                     binding.turn_id_hash.as_deref(),
                     binding.observed_at.to_rfc3339(),
                     serde_json::to_string(binding)?,
-                ])? as u64;
+                ])?;
+                if inserted > 0 {
+                    written += 1;
+                    continue;
+                }
+                let payload = stored
+                    .query_row([&binding.binding_id], |row| row.get::<_, String>(0))
+                    .optional()?;
+                let Some(payload) = payload else {
+                    continue;
+                };
+                let existing: ConversationAccountBindingV1 = serde_json::from_str(&payload)?;
+                if let Some(strengthened) = strengthened_binding(&existing, binding) {
+                    update.execute(params![
+                        &binding.binding_id,
+                        serde_json::to_string(&strengthened)?,
+                    ])?;
+                    written += 1;
+                }
             }
             Ok(written)
         })
@@ -488,26 +519,51 @@ impl Store {
         events: &mut [UsageEvent],
     ) -> Result<()> {
         let bindings = self.conversation_account_bindings(Some(source_id))?;
-        let mut accounts_by_conversation: HashMap<&str, HashSet<&ProviderAccountId>> =
+        // A turn-scoped reset-history record cannot safely relabel every event in its
+        // conversation. Usage events currently expose only conversation identity, so
+        // retain that binding as evidence until an exact turn locator is available.
+        let conversation_bindings = || {
+            bindings
+                .iter()
+                .filter(|binding| binding.turn_id_hash.is_none())
+        };
+        let accounts_by_conversation = effective_binding_accounts(conversation_bindings());
+        let mut certain_by_conversation: HashMap<&str, Vec<&ConversationAccountBindingV1>> =
             HashMap::new();
-        for binding in bindings
-            .iter()
-            // A turn-scoped reset-history record cannot safely relabel every event in its
-            // conversation. Usage events currently expose only conversation identity, so retain
-            // that binding as evidence until an exact turn locator is available.
-            .filter(|binding| binding.turn_id_hash.is_none())
-        {
-            accounts_by_conversation
+        for binding in conversation_bindings().filter(|binding| binding.certain_until.is_some()) {
+            certain_by_conversation
                 .entry(binding.conversation_id_hash.as_str())
                 .or_default()
-                .insert(&binding.provider_account_id);
+                .push(binding);
         }
         for event in events {
             let Some(conversation_id_hash) = event.session.local_session_id_hash.as_deref() else {
                 continue;
             };
-            let Some(accounts) = accounts_by_conversation.get(conversation_id_hash) else {
-                continue;
+            let at = event.session.started_at;
+            // Inside a range a binding saw for certain, nothing inferred later
+            // can relabel the event; elsewhere the latest takeover decides.
+            let certain = certain_by_conversation
+                .get(conversation_id_hash)
+                .and_then(|bindings| certain_accounts_at(bindings, at));
+            let accounts = match certain {
+                Some(accounts) => accounts,
+                None => {
+                    let Some((_, takeover)) = accounts_by_conversation
+                        .get(conversation_id_hash)
+                        .and_then(|takeovers| takeovers.range(..=Some(at)).next_back())
+                    else {
+                        continue;
+                    };
+                    // With every binding past its last activity, the
+                    // conversation may have been resumed elsewhere: leave it to
+                    // the source.
+                    let accounts = takeover.accounts_at(at);
+                    if accounts.is_empty() {
+                        continue;
+                    }
+                    accounts
+                }
             };
             if accounts.len() != 1 {
                 // Conflicting bindings are weaker evidence than a person telling
@@ -635,25 +691,25 @@ impl Store {
         let observations = self.account_identity_observations(None)?;
         let bindings = self.conversation_account_bindings(None)?;
         let mut conversations_by_account = HashMap::<ProviderAccountId, HashSet<String>>::new();
-        let mut accounts_by_conversation = HashMap::<String, HashSet<ProviderAccountId>>::new();
         for binding in &bindings {
             conversations_by_account
                 .entry(binding.provider_account_id.clone())
                 .or_default()
                 .insert(binding.conversation_id_hash.clone());
-            accounts_by_conversation
-                .entry(binding.conversation_id_hash.clone())
-                .or_default()
-                .insert(binding.provider_account_id.clone());
         }
+        // A conversation another account took over part-way is not a conflict;
+        // two accounts claiming the same stretch with equal confidence is.
         let mut conflicting_conversations_by_account = HashMap::<ProviderAccountId, u64>::new();
-        for accounts in accounts_by_conversation
-            .values()
-            .filter(|accounts| accounts.len() > 1)
-        {
-            for account in accounts {
+        for takeovers in effective_binding_accounts(bindings.iter()).values() {
+            let conflicting = takeovers
+                .values()
+                .map(TakeoverAccounts::accounts)
+                .filter(|accounts| accounts.len() > 1)
+                .flatten()
+                .collect::<HashSet<_>>();
+            for account in conflicting {
                 *conflicting_conversations_by_account
-                    .entry(account.clone())
+                    .entry((*account).clone())
                     .or_default() += 1;
             }
         }
@@ -677,8 +733,27 @@ impl Store {
                 .or_default()
                 .push(observation);
         }
+        // An account known only from conversation bindings, such as one the
+        // Claude desktop app ran sessions under, still has evidence to report.
+        let mut binding_kinds =
+            BTreeMap::<(String, ProviderAccountId), BTreeSet<AccountEvidenceKind>>::new();
+        for binding in &bindings {
+            let key = (
+                binding.provider.clone(),
+                binding.provider_account_id.clone(),
+            );
+            binding_kinds
+                .entry(key.clone())
+                .or_default()
+                .insert(binding.evidence_kind);
+            grouped.entry(key).or_default();
+        }
         let mut summaries = Vec::with_capacity(grouped.len());
         for ((provider, provider_account_id), observations) in grouped {
+            let bound_kinds = binding_kinds
+                .get(&(provider.clone(), provider_account_id.clone()))
+                .cloned()
+                .unwrap_or_default();
             let strong = observations
                 .iter()
                 .filter(|observation| observation.evidence_kind.is_strong_identity())
@@ -687,6 +762,7 @@ impl Store {
             let evidence_kinds = observations
                 .iter()
                 .map(|observation| observation.evidence_kind)
+                .chain(bound_kinds)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -837,4 +913,127 @@ fn quota_plan_observations_from_runs(
             }
         })
         .collect()
+}
+
+/// Per conversation, the accounts bound from each takeover instant.
+type BindingAccounts<'a> =
+    HashMap<&'a str, BTreeMap<Option<chrono::DateTime<chrono::Utc>>, TakeoverAccounts<'a>>>;
+
+/// The accounts bound from one takeover instant, and how far their evidence reaches.
+#[derive(Default)]
+struct TakeoverAccounts<'a> {
+    /// Each binding's account and the last activity it saw; `None` sets no limit.
+    members: Vec<(&'a ProviderAccountId, Option<chrono::DateTime<chrono::Utc>>)>,
+}
+
+impl<'a> TakeoverAccounts<'a> {
+    fn accounts(&self) -> HashSet<&'a ProviderAccountId> {
+        self.members.iter().map(|(account, _)| *account).collect()
+    }
+
+    /// The accounts still claiming `at`. Past the last activity a binding saw,
+    /// the conversation may have been resumed elsewhere, so that binding drops
+    /// out rather than contest the others.
+    fn accounts_at(&self, at: chrono::DateTime<chrono::Utc>) -> HashSet<&'a ProviderAccountId> {
+        let grace = chrono::Duration::seconds(CONVERSATION_ACTIVITY_GRACE_SECONDS);
+        self.members
+            .iter()
+            .filter(|(_, reach)| reach.is_none_or(|reach| at <= reach + grace))
+            .map(|(account, _)| *account)
+            .collect()
+    }
+}
+
+/// Per conversation, the accounts bound from each takeover instant.
+///
+/// `None` sorts first, so an unbounded binding covers everything before the
+/// first takeover. Where bindings for one instant disagree, only the most
+/// confident ones count: a binding inferred from copied history must not
+/// unseat one recorded while only a single account held the conversation.
+/// Disagreement at the same confidence is left for the caller to treat as a
+/// conflict.
+fn effective_binding_accounts<'a>(
+    bindings: impl Iterator<Item = &'a ConversationAccountBindingV1>,
+) -> BindingAccounts<'a> {
+    // Per (conversation, takeover instant): the best confidence seen and the
+    // bindings at it.
+    let mut strongest: HashMap<_, (u8, TakeoverAccounts<'a>)> = HashMap::new();
+    for binding in bindings {
+        // Outside its certain range a bounded binding is only an inference,
+        // however confident the range itself was; callers consult certain
+        // ranges first.
+        let rank = if binding.observed_until.is_some() {
+            confidence_rank(&Confidence::Medium)
+        } else {
+            confidence_rank(&binding.confidence)
+        };
+        let entry = strongest
+            .entry((binding.conversation_id_hash.as_str(), binding.active_from))
+            .or_insert_with(|| (rank, TakeoverAccounts::default()));
+        if rank > entry.0 {
+            *entry = (rank, TakeoverAccounts::default());
+        }
+        if rank == entry.0 {
+            entry
+                .1
+                .members
+                .push((&binding.provider_account_id, binding.observed_until));
+        }
+    }
+    let mut accounts_by_conversation = BindingAccounts::new();
+    for ((conversation_id_hash, active_from), (_, takeover)) in strongest {
+        accounts_by_conversation
+            .entry(conversation_id_hash)
+            .or_default()
+            .insert(active_from, takeover);
+    }
+    accounts_by_conversation
+}
+
+/// The accounts whose certain range covers `at`, taking the latest-starting
+/// range when several do, or `None` when no certain range covers it.
+fn certain_accounts_at<'a>(
+    bindings: &[&'a ConversationAccountBindingV1],
+    at: chrono::DateTime<chrono::Utc>,
+) -> Option<HashSet<&'a ProviderAccountId>> {
+    let covering = bindings
+        .iter()
+        .filter(|binding| binding.active_from.is_none_or(|from| from <= at))
+        .filter(|binding| binding.certain_until.is_some_and(|until| at <= until))
+        .collect::<Vec<_>>();
+    let latest = covering.iter().map(|binding| binding.active_from).max()?;
+    Some(
+        covering
+            .into_iter()
+            .filter(|binding| binding.active_from == latest)
+            .map(|binding| &binding.provider_account_id)
+            .collect(),
+    )
+}
+
+/// `stored` with whatever more `incoming` saw, or `None` when it saw nothing more.
+///
+/// Only the certain range and the confidence can grow; everything else is the
+/// ledger's first record.
+pub(super) fn strengthened_binding(
+    stored: &ConversationAccountBindingV1,
+    incoming: &ConversationAccountBindingV1,
+) -> Option<ConversationAccountBindingV1> {
+    let mut strengthened = stored.clone();
+    if confidence_rank(&incoming.confidence) > confidence_rank(&stored.confidence) {
+        strengthened.confidence = incoming.confidence.clone();
+    }
+    // `None` sorts first, so a range only ever extends. The two ranges merge
+    // separately: an inference reaching further never makes it certain.
+    strengthened.observed_until = stored.observed_until.max(incoming.observed_until);
+    strengthened.certain_until = stored.certain_until.max(incoming.certain_until);
+    (strengthened != *stored).then_some(strengthened)
+}
+
+fn confidence_rank(confidence: &Confidence) -> u8 {
+    match confidence {
+        Confidence::Low => 0,
+        Confidence::Medium => 1,
+        Confidence::High => 2,
+    }
 }
