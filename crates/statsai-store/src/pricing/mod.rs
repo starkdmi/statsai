@@ -427,6 +427,7 @@ fn reprice_event(event: &UsageEvent) -> Option<UsageEvent> {
     // feeds grouping as well as pricing, so refresh it here rather than only
     // working around it at lookup time.
     let model = event.model.as_ref().map(model_with_refreshed_normalization);
+    let usage = usage_without_stale_request_count(event);
     // An adapter that priced from per-request rows beat what this event's
     // aggregate can express, so only the model normalization is refreshed here.
     // A rescan, which re-reads those rows, is what refreshes the estimate.
@@ -436,18 +437,41 @@ fn reprice_event(event: &UsageEvent) -> Option<UsageEvent> {
         let estimated = estimate_cost_at(
             &event.provider,
             model.as_ref(),
-            &event.usage,
+            &usage,
             &event.session.started_at,
         );
         overlay_estimated_cost(&event.cost, estimated)
     };
-    if cost == event.cost && model == event.model {
+    if cost == event.cost && model == event.model && usage == event.usage {
         return None;
     }
     let mut updated = event.clone();
     updated.model = model;
+    updated.usage = usage;
     updated.cost = cost;
     Some(updated)
+}
+
+/// Event kind of the Codex adapter's loose `usage` lines, read back from the
+/// parse-evidence key `{key_version}:{event_kind}:...`.
+const CODEX_HEADLESS_USAGE_EVENT_KIND: &str = "codex_headless_usage";
+
+/// Usage with the `requests: 1` older Codex parsers stamped on loose `usage`
+/// lines cleared. Such a line can be a thread's running total, and a
+/// single-request count would apply a per-request context tier to all of it.
+fn usage_without_stale_request_count(event: &UsageEvent) -> statsai_core::UsageCounts {
+    let is_codex_headless_usage = event.provider == "codex"
+        && event
+            .parse_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.source_record_id.as_deref())
+            .and_then(|key| key.split(':').nth(1))
+            == Some(CODEX_HEADLESS_USAGE_EVENT_KIND);
+    let mut usage = event.usage.clone();
+    if is_codex_headless_usage {
+        usage.requests = None;
+    }
+    usage
 }
 
 /// Overlays this binary's estimated pricing onto a summary.

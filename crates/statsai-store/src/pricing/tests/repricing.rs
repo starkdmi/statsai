@@ -601,6 +601,60 @@ fn dangling_task_span_links_clear_stale_cost() {
 }
 
 #[test]
+fn codex_headless_usage_events_drop_their_request_count_but_token_counts_keep_it() {
+    let (store, source) = store_with_source("/tmp/codex-headless-usage");
+    let started_at = parse_utc("2026-10-07T12:00:00Z");
+    let usage = UsageCounts {
+        input_tokens: Some(300_000),
+        output_tokens: Some(10_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let with_kind = |record_id: &str, event_kind: &str| {
+        let mut event = test_event(
+            &source,
+            started_at,
+            record_id,
+            "gpt-6-sol",
+            usage.clone(),
+            missing_cost(),
+        );
+        event.parse_evidence = Some(statsai_core::ParseEvidence {
+            event_key_version: "semantic_usage_event.v1".to_string(),
+            source_file_path_hash: None,
+            source_line_number: Some(1),
+            source_record_id: Some(format!("semantic_usage_event.v1:{event_kind}:{record_id}")),
+            model_inferred: false,
+            timestamp_inferred: false,
+            account_identity_source: statsai_core::IdentitySource::Unresolved,
+        });
+        event
+    };
+    let headless = with_kind("headless", "codex_headless_usage");
+    let mut token_count = with_kind("token-count", "codex_token_count");
+    token_count.session.local_session_id_hash = Some("other-session".to_string());
+    store.insert_event(&headless).expect("insert headless");
+    store
+        .insert_event(&token_count)
+        .expect("insert token count");
+
+    store.ensure_current_pricing().expect("reprice");
+    let headless = stored_event(&store, &headless.event_id.0);
+    let token_count = stored_event(&store, &token_count.event_id.0);
+
+    assert_eq!(headless.usage.requests, None);
+    assert_eq!(
+        headless.cost.estimated_api_equivalent_micro_usd,
+        Some(700_000)
+    );
+    assert_eq!(token_count.usage.requests, Some(1));
+    assert_eq!(
+        token_count.cost.estimated_api_equivalent_micro_usd,
+        Some(1_350_000)
+    );
+}
+
+#[test]
 fn stats_cache_totals_drop_their_request_count_and_never_take_a_per_request_tier() {
     let (store, source) = store_with_source("/tmp/claude-stats-cache-haiku");
     let start = parse_utc("2026-10-07T00:00:00Z");
