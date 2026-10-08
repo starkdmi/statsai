@@ -5,7 +5,7 @@ use statsai_core::{
     task_verification_id, title_topic_tokens, work_item_id, Confidence, TaskBucketSnapshot,
     TaskSpan, TaskSpanId, TaskStatus, TaskVerification, TaskVerificationAction,
     TaskVerificationCursor, UsageCounts, WorkItem, WorkItemId, WorkItemMember,
-    TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
+    TASK_BUCKET_SYNC_SANITIZER_VERSION, TASK_VERIFICATION_SCHEMA_VERSION, WORK_ITEM_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
@@ -20,6 +20,7 @@ mod work_items;
 
 pub(crate) use super::{sqlite_in_clause_placeholders, sqlite_string_params};
 pub(crate) use benchmark::*;
+pub(crate) use buckets::task_bucket_ack_is_clean;
 pub(crate) use grouping::*;
 pub(crate) use titles::*;
 pub(crate) use verification::*;

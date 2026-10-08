@@ -157,13 +157,15 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             INSERT INTO task_bucket_sync_state (
-              sink, target, device_id, project_bucket, dirty, payload_hash, updated_at
+              sink, target, device_id, project_bucket, dirty, payload_hash, updated_at,
+              sanitizer_version
             )
-            VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+            VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)
             ON CONFLICT(sink, target, device_id, project_bucket) DO UPDATE SET
               dirty = 0,
               payload_hash = excluded.payload_hash,
-              updated_at = excluded.updated_at
+              updated_at = excluded.updated_at,
+              sanitizer_version = excluded.sanitizer_version
             "#,
         )?;
         for snapshot in snapshots {
@@ -174,6 +176,7 @@ impl Store {
                 &snapshot.project_bucket,
                 task_bucket_snapshot_payload_hash(snapshot)?,
                 &now,
+                TASK_BUCKET_SYNC_SANITIZER_VERSION,
             ])?;
         }
         Ok(())
@@ -250,15 +253,19 @@ impl Store {
         self.conn
             .query_row(
                 r#"
-                SELECT dirty
+                SELECT dirty, sanitizer_version
                 FROM task_bucket_sync_state
                 WHERE sink = ?1 AND target = ?2 AND device_id = ?3 AND project_bucket = ?4
                 "#,
                 params![sink, target, device_id, project_bucket],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
-            .map(|row| row.is_some_and(|dirty| dirty == 0))
+            .map(|row| {
+                row.is_some_and(|(dirty, sanitizer_version)| {
+                    task_bucket_ack_is_clean(dirty, sanitizer_version)
+                })
+            })
             .unwrap_or(false)
     }
 
@@ -284,6 +291,14 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// A bucket is clean for a target only when nothing changed since it was
+/// acknowledged and the acknowledged payload went through the current sync
+/// sanitizer. An older sanitizer version means the target holds a payload the
+/// current one would not send, so the bucket goes out once more.
+pub(crate) fn task_bucket_ack_is_clean(dirty: i64, sanitizer_version: i64) -> bool {
+    dirty == 0 && sanitizer_version >= TASK_BUCKET_SYNC_SANITIZER_VERSION
 }
 
 pub(crate) fn task_bucket_snapshot_payload_hash(snapshot: &TaskBucketSnapshot) -> Result<String> {

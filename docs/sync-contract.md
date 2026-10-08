@@ -245,7 +245,10 @@ directory is sent as `~/...` (the home directory itself as `~`); paths outside
 home are sent unchanged. This applies to `summaries[].project`,
 `sessions[].project`, and task `work_items[].path_label` and
 `spans[].project.path_label`. Only the label is rewritten: the local store keeps
-the full path, and `path_hash` is still computed from it. Hashed path, source,
+the full path, and `path_hash` is still computed from it. After upgrading from
+a collector that sent full paths, the next incremental sync re-sends affected
+summaries and sessions once (their payload hash changed) and every task bucket
+acknowledged under the older task sanitizer version. Hashed path, source,
 event, and summary identifiers remain so the server can deduplicate records and
 keep stable location identity.
 

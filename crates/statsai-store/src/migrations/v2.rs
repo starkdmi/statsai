@@ -703,3 +703,16 @@ pub(crate) fn apply_migration_030(conn: &Connection) -> Result<()> {
     ))?;
     Ok(())
 }
+
+/// Records which version of the task-bucket sync sanitizer produced each
+/// acknowledged bucket. Rows acknowledged before this column existed read as
+/// version 0, so a sanitizer change reaches buckets the target already holds
+/// on the next incremental sync instead of waiting for the bucket to change.
+pub(crate) fn apply_migration_031(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "task_bucket_sync_state",
+        "sanitizer_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+}

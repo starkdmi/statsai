@@ -8,7 +8,7 @@ mod v2;
 pub(crate) use v1::*;
 pub(crate) use v2::*;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 30;
+pub const CURRENT_SCHEMA_VERSION: i64 = 31;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     if let Some(current) = existing_schema_version(conn)? {
@@ -155,6 +155,7 @@ fn apply_migration(conn: &Connection, version: i64) -> Result<()> {
         28 => apply_migration_028(conn),
         29 => apply_migration_029(conn),
         30 => apply_migration_030(conn),
+        31 => apply_migration_031(conn),
         _ => bail!("unsupported schema migration version {version}"),
     }
 }
@@ -308,6 +309,11 @@ mod tests {
         );
         assert!(sync_state_has_pending_resume_batch_id(&conn).expect("inspect sync_state"));
         assert!(table_exists(&conn, "task_bucket_sync_state"));
+        assert!(column_exists(
+            &conn,
+            "task_bucket_sync_state",
+            "sanitizer_version"
+        ));
         assert!(column_exists(&conn, "scan_file_state", "tasks_collected"));
         assert!(table_exists(&conn, "archive_missing_content_state"));
         assert!(table_exists(&conn, "archive_artifact_dependencies"));

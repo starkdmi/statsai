@@ -702,21 +702,28 @@ impl Store {
         let local_buckets = self.task_project_buckets()?;
         let mut statement = self.conn.prepare(
             r#"
-            SELECT project_bucket, dirty
+            SELECT project_bucket, dirty, sanitizer_version
             FROM task_bucket_sync_state
             WHERE sink = ?1 AND target = ?2 AND device_id = ?3
             "#,
         )?;
         let rows = statement.query_map(params![sink, target, device_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
-        let mut tracked = HashMap::<String, i64>::new();
+        let mut tracked = HashMap::<String, bool>::new();
         for row in rows {
-            let (project_bucket, dirty) = row?;
-            tracked.insert(project_bucket, dirty);
+            let (project_bucket, dirty, sanitizer_version) = row?;
+            tracked.insert(
+                project_bucket,
+                !crate::tasks::task_bucket_ack_is_clean(dirty, sanitizer_version),
+            );
         }
         let tracked_total = tracked.len() as u64;
-        let tracked_dirty = tracked.values().filter(|dirty| **dirty == 1).count() as u64;
+        let tracked_dirty = tracked.values().filter(|pending| **pending).count() as u64;
         let missing_local = local_buckets
             .iter()
             .filter(|project_bucket| !tracked.contains_key(project_bucket.as_str()))

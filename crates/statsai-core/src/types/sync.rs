@@ -119,6 +119,14 @@ pub struct TaskBucketSnapshot {
     pub spans: Vec<TaskSpan>,
 }
 
+/// Version of what [`sanitize_task_bucket_for_sync`] sends. Task buckets are
+/// re-sent only when they change, so the collector records this version with
+/// each acknowledged bucket and re-sends buckets acknowledged under an older
+/// one. Bump it whenever the sanitizer changes what leaves the device.
+///
+/// 1: path labels under the home directory are sent as `~/...`.
+pub const TASK_BUCKET_SYNC_SANITIZER_VERSION: i64 = 1;
+
 /// Removes provider-local task locators before a snapshot leaves the device,
 /// and shows path labels under the home directory as `~/...`.
 #[must_use]
