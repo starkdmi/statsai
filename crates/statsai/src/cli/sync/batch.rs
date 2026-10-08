@@ -846,6 +846,8 @@ pub(crate) fn sanitize_summary_for_sync(summary: UsageSummary) -> UsageSummary {
     statsai_core::sanitize_summary_for_sync(summary)
 }
 
+/// Matches the store's HTTP summary sanitizer, so pending-sync selection and
+/// acknowledgements hash the same payload that is sent.
 pub(crate) fn sanitize_summary_for_sync_with_projects(
     summary: UsageSummary,
     include_projects: bool,
@@ -854,7 +856,7 @@ pub(crate) fn sanitize_summary_for_sync_with_projects(
     if !include_projects {
         summary.project = None;
     }
-    summary
+    statsai_core::collapse_summary_home_for_sync(summary, statsai_core::home_dir().as_deref())
 }
 
 pub(crate) fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {

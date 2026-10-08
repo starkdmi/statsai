@@ -913,3 +913,255 @@ fn assert_allowlist(value: &serde_json::Value, allowed: &[&str]) {
         );
     }
 }
+
+#[test]
+fn collapse_home_path_label_rewrites_paths_under_a_unix_home() {
+    let home = Path::new("/Users/alice");
+    let cases = [
+        ("/Users/alice/code/app", "~/code/app"),
+        ("/Users/alice", "~"),
+        ("/Users/alice/", "~"),
+        ("/Users/alice2/code/app", "/Users/alice2/code/app"),
+        ("/Users/alice2", "/Users/alice2"),
+        ("/Users/bob/code", "/Users/bob/code"),
+        ("/opt/work/app", "/opt/work/app"),
+        ("~/code/app", "~/code/app"),
+        ("/users/alice/code", "/users/alice/code"),
+        ("relative/Users/alice", "relative/Users/alice"),
+        ("", ""),
+    ];
+    for (label, expected) in cases {
+        assert_eq!(collapse_home_path_label(label, home), expected, "{label}");
+    }
+    assert_eq!(
+        collapse_home_path_label("/Users/alice/code", Path::new("/Users/alice/")),
+        "~/code"
+    );
+}
+
+#[test]
+fn collapse_home_path_label_never_treats_a_root_home_as_home() {
+    assert_eq!(
+        collapse_home_path_label("/srv/app", Path::new("/")),
+        "/srv/app"
+    );
+    assert_eq!(
+        collapse_home_path_label("/srv/app", Path::new("")),
+        "/srv/app"
+    );
+    assert_eq!(
+        collapse_home_path_label(r"C:\work\app", Path::new(r"C:\")),
+        r"C:\work\app"
+    );
+}
+
+#[test]
+fn collapse_home_path_label_handles_windows_style_homes() {
+    let home = Path::new(r"C:\Users\alice");
+    let cases = [
+        (r"C:\Users\alice\code\app", r"~\code\app"),
+        (r"C:\Users\alice", "~"),
+        (r"c:\users\ALICE\code", r"~\code"),
+        ("C:/Users/alice/code", "~/code"),
+        (r"C:\Users\alice2\code", r"C:\Users\alice2\code"),
+        (r"D:\Users\alice\code", r"D:\Users\alice\code"),
+    ];
+    for (label, expected) in cases {
+        assert_eq!(collapse_home_path_label(label, home), expected, "{label}");
+    }
+}
+
+fn home_project(path_label: Option<&str>) -> ProjectInfo {
+    ProjectInfo {
+        project_id: "project_home".to_string(),
+        project_label: Some("app".to_string()),
+        repo_remote_hash: Some("remote-hash".to_string()),
+        repo_label: Some("owner/app".to_string()),
+        branch_hash: Some("branch-hash".to_string()),
+        branch_label: Some("main".to_string()),
+        path_hash: Some("path-hash".to_string()),
+        path_label: path_label.map(ToOwned::to_owned),
+    }
+}
+
+#[test]
+fn collapse_project_home_for_sync_only_rewrites_the_path_label() {
+    let home = Path::new("/Users/alice");
+    let project = home_project(Some("/Users/alice/code/app"));
+
+    let collapsed = collapse_project_home_for_sync(project.clone(), Some(home));
+
+    assert_eq!(collapsed.path_label.as_deref(), Some("~/code/app"));
+    assert_eq!(
+        ProjectInfo {
+            path_label: project.path_label.clone(),
+            ..collapsed
+        },
+        project
+    );
+    assert_eq!(
+        collapse_project_home_for_sync(project.clone(), None),
+        project
+    );
+    assert_eq!(
+        collapse_project_home_for_sync(home_project(None), Some(home)),
+        home_project(None)
+    );
+}
+
+#[test]
+fn sanitize_summary_for_sync_keeps_the_full_path_label() {
+    // Its output is also the locally stored payload; the home collapse is a
+    // separate step that only sync payloads take.
+    let now = mk_dt(2026, 5, 25);
+    let source = test_source("codex", "/tmp/codex");
+    let mut summary = test_summary("codex", &source, now, now, now, 100);
+    summary.project = Some(home_project(Some("/Users/alice/code/app")));
+
+    let sanitized = sanitize_summary_for_sync(summary);
+    assert_eq!(
+        sanitized
+            .project
+            .as_ref()
+            .and_then(|project| project.path_label.as_deref()),
+        Some("/Users/alice/code/app")
+    );
+
+    let collapsed = collapse_summary_home_for_sync(sanitized, Some(Path::new("/Users/alice")));
+    let project = collapsed.project.as_ref().expect("project");
+    assert_eq!(project.path_label.as_deref(), Some("~/code/app"));
+    assert_eq!(project.path_hash.as_deref(), Some("path-hash"));
+    assert!(collapsed.privacy.contains_file_paths);
+}
+
+#[test]
+fn sanitize_session_rollup_for_sync_collapses_the_home_directory() {
+    let mut rollup = sample_session_rollup(mk_dt(2026, 5, 25));
+    rollup.project = Some(home_project(Some("/Users/alice/code/app")));
+
+    let sanitized =
+        sanitize_session_rollup_for_sync_with_home(rollup.clone(), Some(Path::new("/Users/alice")));
+    let project = sanitized.project.expect("project");
+    assert_eq!(project.path_label.as_deref(), Some("~/code/app"));
+    assert_eq!(project.path_hash.as_deref(), Some("path-hash"));
+
+    let outside = sanitize_session_rollup_for_sync_with_home(rollup, Some(Path::new("/Users/bob")));
+    assert_eq!(
+        outside.project.and_then(|project| project.path_label),
+        Some("/Users/alice/code/app".to_string())
+    );
+}
+
+fn home_task_span(path_label: &str) -> TaskSpan {
+    let now = mk_dt(2026, 5, 25);
+    TaskSpan {
+        schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+        span_id: TaskSpanId("span_home".to_string()),
+        provider: "codex".to_string(),
+        source_id: SourceId("source_home".to_string()),
+        span_kind: "test".to_string(),
+        source_record_id: Some("record".to_string()),
+        source_file_path_hash: None,
+        summary_id: None,
+        session_id: Some("session".to_string()),
+        thread_id: Some("thread".to_string()),
+        title: "Fix the build".to_string(),
+        normalized_title: "fix the build".to_string(),
+        title_source: None,
+        summary_preview: None,
+        todo_excerpt: None,
+        issue_keys: Vec::new(),
+        branch_family: None,
+        project_bucket: "bucket".to_string(),
+        project: Some(home_project(Some(path_label))),
+        git: None,
+        usage: UsageCounts::default(),
+        estimated_cost_usd: None,
+        estimated_cost_micro_usd: None,
+        event_count: 0,
+        has_usage_evidence: false,
+        total_messages: 0,
+        user_messages: 0,
+        assistant_messages: 0,
+        developer_messages: 0,
+        linked_event_ids: Vec::new(),
+        confidence: Confidence::Medium,
+        is_meta: false,
+        started_at: now,
+        ended_at: Some(now),
+        duration_seconds: Some(0),
+    }
+}
+
+fn home_work_item(path_label: &str) -> WorkItem {
+    let now = mk_dt(2026, 5, 25);
+    WorkItem {
+        schema_version: WORK_ITEM_SCHEMA_VERSION.to_string(),
+        work_item_id: WorkItemId("work_home".to_string()),
+        anchor_span_id: TaskSpanId("span_home".to_string()),
+        tail_span_id: TaskSpanId("span_home".to_string()),
+        project_bucket: "bucket".to_string(),
+        title: "Fix the build".to_string(),
+        normalized_title: "fix the build".to_string(),
+        status: TaskStatus::Auto,
+        confidence: Confidence::Medium,
+        started_at: now,
+        ended_at: now,
+        duration_seconds: Some(0),
+        span_count: 1,
+        event_count: 0,
+        total_input_tokens: 0,
+        total_cache_creation_tokens: 0,
+        total_cache_read_tokens: 0,
+        total_output_tokens: 0,
+        total_reasoning_tokens: 0,
+        total_tokens: 0,
+        estimated_cost_usd: None,
+        estimated_cost_micro_usd: None,
+        providers: Vec::new(),
+        issue_keys: Vec::new(),
+        repo_label: None,
+        branch_labels: Vec::new(),
+        path_label: Some(path_label.to_string()),
+        summary_preview: None,
+        todo_excerpt: None,
+        no_git: true,
+        cross_provider: false,
+        continuation_reasons: Vec::new(),
+        review_reasons: Vec::new(),
+    }
+}
+
+#[test]
+fn sanitize_task_bucket_for_sync_collapses_work_item_and_span_paths() {
+    let snapshot = TaskBucketSnapshot {
+        project_bucket: "bucket".to_string(),
+        generated_at: mk_dt(2026, 5, 25),
+        applied_verification_cursor: None,
+        work_items: vec![
+            home_work_item("/Users/alice/code/app"),
+            home_work_item("/Users/alice2/code/app"),
+        ],
+        members: Vec::new(),
+        spans: vec![home_task_span("/Users/alice")],
+    };
+
+    let sanitized =
+        sanitize_task_bucket_for_sync_with_home(snapshot, Some(Path::new("/Users/alice")));
+
+    assert_eq!(
+        sanitized.work_items[0].path_label.as_deref(),
+        Some("~/code/app")
+    );
+    assert_eq!(
+        sanitized.work_items[1].path_label.as_deref(),
+        Some("/Users/alice2/code/app")
+    );
+    let span = &sanitized.spans[0];
+    let project = span.project.as_ref().expect("project");
+    assert_eq!(project.path_label.as_deref(), Some("~"));
+    assert_eq!(project.path_hash.as_deref(), Some("path-hash"));
+    assert_eq!(span.source_record_id, None);
+    assert_eq!(span.session_id, None);
+    assert_eq!(span.thread_id, None);
+}

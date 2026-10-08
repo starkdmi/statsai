@@ -2262,3 +2262,66 @@ fn receivers_advertise_the_cache_health_version_they_store() {
     ))));
     assert!(!remote_accepts_cache_health(None));
 }
+
+#[test]
+fn http_sync_shows_project_paths_under_home_as_tilde() {
+    let Some(home) = statsai_core::home_dir().filter(|home| home.parent().is_some()) else {
+        return;
+    };
+    let full_path_label = home.join("work").join("app").to_string_lossy().into_owned();
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-http-home-label"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let mut event = test_event("codex", &source, Utc::now(), None, TokenParts::total(100));
+    event.project = Some(ProjectInfo {
+        project_id: "project-home".to_string(),
+        project_label: Some("app".to_string()),
+        repo_remote_hash: None,
+        repo_label: None,
+        branch_hash: None,
+        branch_label: None,
+        path_hash: Some("path-hash".to_string()),
+        path_label: Some(full_path_label.clone()),
+    });
+    store.insert_event(&event).expect("event");
+    store.rebuild_sync_rollups().expect("rebuild");
+
+    let command = SyncCommand {
+        endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+        include_projects: true,
+        ..test_sync_command("http")
+    };
+    let target = sync_target(&command).expect("target");
+    let (batch, _) = build_sync_batch(&command, &store, "device", &target).expect("batch");
+
+    assert_eq!(batch.summaries.len(), 1);
+    let project = batch.summaries[0].project.as_ref().expect("project");
+    let separator = std::path::MAIN_SEPARATOR;
+    assert_eq!(
+        project.path_label.as_deref(),
+        Some(format!("~{separator}work{separator}app").as_str())
+    );
+    assert_eq!(project.path_hash.as_deref(), Some("path-hash"));
+    let stored = store.all_sync_rollup_summaries().expect("stored rollups");
+    assert_eq!(
+        stored[0]
+            .project
+            .as_ref()
+            .and_then(|project| project.path_label.as_deref()),
+        Some(full_path_label.as_str()),
+        "the local rollup keeps the full path"
+    );
+
+    record_rollup_sync_success(&store, "http", &target, &batch).expect("record sync");
+    let (repeat, _) = build_sync_batch(&command, &store, "device", &target).expect("repeat");
+    assert!(
+        repeat.summaries.is_empty(),
+        "an acknowledged rollup must not look pending again"
+    );
+}

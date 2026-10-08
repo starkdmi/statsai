@@ -1,14 +1,15 @@
 use crate::{
-    project_contains_file_paths, project_has_stable_identity, AccountEvidenceSummaryV1,
-    AccountPlanProjectionV1, ActivityCoverageV1, ActivityRollupV1, CodeChangeMetric, ProjectInfo,
-    ProviderAccount, ProviderAccountId, QuotaCycleContributionV1, SessionRollupV1,
-    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceLocation, Subscription,
-    SubscriptionId, SummaryId, TaskSpan, TaskVerification, TaskVerificationId, UsageEvent,
-    UsageSummary, WorkItem, WorkItemMember,
+    collapse_home_path_label, home_dir, project_contains_file_paths, project_has_stable_identity,
+    AccountEvidenceSummaryV1, AccountPlanProjectionV1, ActivityCoverageV1, ActivityRollupV1,
+    CodeChangeMetric, ProjectInfo, ProviderAccount, ProviderAccountId, QuotaCycleContributionV1,
+    SessionRollupV1, SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceLocation,
+    Subscription, SubscriptionId, SummaryId, TaskSpan, TaskVerification, TaskVerificationId,
+    UsageEvent, UsageSummary, WorkItem, WorkItemMember,
 };
 use chrono::{DateTime, Datelike, Duration, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncBatch {
@@ -118,13 +119,33 @@ pub struct TaskBucketSnapshot {
     pub spans: Vec<TaskSpan>,
 }
 
-/// Removes provider-local task locators before a snapshot leaves the device.
+/// Removes provider-local task locators before a snapshot leaves the device,
+/// and shows path labels under the home directory as `~/...`.
 #[must_use]
-pub fn sanitize_task_bucket_for_sync(mut snapshot: TaskBucketSnapshot) -> TaskBucketSnapshot {
+pub fn sanitize_task_bucket_for_sync(snapshot: TaskBucketSnapshot) -> TaskBucketSnapshot {
+    sanitize_task_bucket_for_sync_with_home(snapshot, home_dir().as_deref())
+}
+
+/// [`sanitize_task_bucket_for_sync`] with an explicit home directory.
+#[must_use]
+pub fn sanitize_task_bucket_for_sync_with_home(
+    mut snapshot: TaskBucketSnapshot,
+    home: Option<&Path>,
+) -> TaskBucketSnapshot {
+    for item in &mut snapshot.work_items {
+        item.path_label = item
+            .path_label
+            .take()
+            .map(|label| collapse_home_label_for_sync(label, home));
+    }
     for span in &mut snapshot.spans {
         span.source_record_id = None;
         span.session_id = None;
         span.thread_id = None;
+        span.project = span
+            .project
+            .take()
+            .map(|project| collapse_project_home_for_sync(project, home));
     }
     snapshot
 }
@@ -208,6 +229,43 @@ pub fn sanitize_project_for_sync(project: ProjectInfo) -> Option<ProjectInfo> {
     Some(project)
 }
 
+/// Shows a project path label under `home` as `~/...` before it leaves the
+/// device. Only the label changes: `path_hash` and the other identity fields
+/// keep the values computed from the full local path.
+#[must_use]
+pub fn collapse_project_home_for_sync(
+    mut project: ProjectInfo,
+    home: Option<&Path>,
+) -> ProjectInfo {
+    project.path_label = project
+        .path_label
+        .take()
+        .map(|label| collapse_home_label_for_sync(label, home));
+    project
+}
+
+/// Applies [`collapse_project_home_for_sync`] to a summary's project. Kept out
+/// of [`sanitize_summary_for_sync`], whose output is also the locally stored
+/// payload and payload hash.
+#[must_use]
+pub fn collapse_summary_home_for_sync(
+    mut summary: UsageSummary,
+    home: Option<&Path>,
+) -> UsageSummary {
+    summary.project = summary
+        .project
+        .take()
+        .map(|project| collapse_project_home_for_sync(project, home));
+    summary
+}
+
+fn collapse_home_label_for_sync(label: String, home: Option<&Path>) -> String {
+    match home {
+        Some(home) => collapse_home_path_label(&label, home),
+        None => label,
+    }
+}
+
 #[must_use]
 pub fn sanitize_summary_for_sync(mut summary: UsageSummary) -> UsageSummary {
     summary.source.source_record_id = None;
@@ -242,12 +300,24 @@ const SYNC_FUTURE_SKEW: Duration = Duration::seconds(24 * 60 * 60);
 /// Values the ingest would reject are repaired here. One bad row fails the
 /// batch, and session chunks are sent before the snapshot, so a permanent
 /// rejection also leaves hosted rows that should have been retired.
+///
+/// A project path label under the home directory is shown as `~/...`.
 #[must_use]
-pub fn sanitize_session_rollup_for_sync(mut rollup: SessionRollupV1) -> SessionRollupV1 {
+pub fn sanitize_session_rollup_for_sync(rollup: SessionRollupV1) -> SessionRollupV1 {
+    sanitize_session_rollup_for_sync_with_home(rollup, home_dir().as_deref())
+}
+
+/// [`sanitize_session_rollup_for_sync`] with an explicit home directory.
+#[must_use]
+pub fn sanitize_session_rollup_for_sync_with_home(
+    mut rollup: SessionRollupV1,
+    home: Option<&Path>,
+) -> SessionRollupV1 {
     clamp_session_timestamps(&mut rollup);
     rollup.project = rollup
         .project
         .and_then(sanitize_project_for_sync)
+        .map(|project| collapse_project_home_for_sync(project, home))
         .map(clamp_project_labels);
     clamp_session_title(&mut rollup);
     rollup.primary_model = rollup

@@ -239,9 +239,14 @@ through the branch's own commits. Conflict resolutions carried only by a merge
 commit are consequently not counted.
 
 `ProjectInfo.path_label` is retained for owner-facing project location displays,
-manual project linking, and hosted task review. Hashed path, source, event, and
-summary identifiers remain so the server can deduplicate records and keep
-stable location identity.
+manual project linking, and hosted task review. A path under the user's home
+directory is sent as `~/...` (the home directory itself as `~`); paths outside
+home are sent unchanged. This applies to `summaries[].project`,
+`sessions[].project`, and task `work_items[].path_label` and
+`spans[].project.path_label`. Only the label is rewritten: the local store keeps
+the full path, and `path_hash` is still computed from it. Hashed path, source,
+event, and summary identifiers remain so the server can deduplicate records and
+keep stable location identity.
 
 Canonical provider account identity may now sync through
 `ProviderAccount.provider_user_id` and `ProviderAccount.email`. Hosted task
