@@ -38,6 +38,7 @@ pub(crate) fn parse_codex_file(
     let mut current_reasoning = ModelReasoningState::default();
     let mut current_model_is_fallback = false;
     let mut current_project: Option<ProjectInfo> = None;
+    let mut session_project_inputs = CodexProjectInputs::default();
     let mut current_title: Option<String> = None;
     // Events only: a sub-agent borrows its parent thread's name, but task
     // titles keep their own prompt-based rules.
@@ -399,7 +400,11 @@ pub(crate) fn parse_codex_file(
             ctx.scan
                 .session_names
                 .extend(codex_subagent_session_name(&value, &session_id));
-            current_project = codex_project_context_from_value(&value, &mut project_cache);
+            session_project_inputs = codex_project_inputs_from_value(&value);
+            current_project = codex_project_context_from_inputs(
+                session_project_inputs.clone(),
+                &mut project_cache,
+            );
             continue;
         }
 
@@ -411,7 +416,11 @@ pub(crate) fn parse_codex_file(
                 current_model = Some(model_name);
                 current_model_is_fallback = false;
             }
-            if let Some(project) = codex_project_context_from_value(&value, &mut project_cache) {
+            if let Some(project) = codex_turn_context_project_from_value(
+                &value,
+                &session_project_inputs,
+                &mut project_cache,
+            ) {
                 current_project = Some(project);
             }
             continue;

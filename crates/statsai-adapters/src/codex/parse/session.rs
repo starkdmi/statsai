@@ -89,26 +89,68 @@ pub(crate) fn codex_subagent_session_name(
     })
 }
 
+/// The directory, remote, and branch one Codex line records for its project.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CodexProjectInputs {
+    project_path: Option<PathBuf>,
+    repository_url: Option<String>,
+    branch: Option<String>,
+}
+
+pub(crate) fn codex_project_inputs_from_value(value: &Value) -> CodexProjectInputs {
+    let payload = value.get("payload");
+    let git = payload.and_then(|payload| payload.get("git"));
+    let git_text = |key: &str| {
+        git.and_then(|git| git.get(key))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(ToOwned::to_owned)
+    };
+    CodexProjectInputs {
+        project_path: payload
+            .and_then(|payload| payload.get("cwd"))
+            .and_then(Value::as_str)
+            .map(expand_home_path),
+        repository_url: git_text("repository_url"),
+        branch: git_text("branch"),
+    }
+}
+
+pub(crate) fn codex_project_context_from_inputs(
+    inputs: CodexProjectInputs,
+    cache: &mut ProjectContextCache,
+) -> Option<ProjectInfo> {
+    resolve_project_context_cached(
+        inputs.project_path,
+        inputs.repository_url,
+        inputs.branch,
+        cache,
+    )
+}
+
 pub(crate) fn codex_project_context_from_value(
     value: &Value,
     cache: &mut ProjectContextCache,
 ) -> Option<ProjectInfo> {
-    let payload = value.get("payload");
-    let project_path = payload
-        .and_then(|payload| payload.get("cwd"))
-        .and_then(Value::as_str)
-        .map(expand_home_path);
-    let repository_url = payload
-        .and_then(|payload| payload.get("git"))
-        .and_then(|git| git.get("repository_url"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let branch = payload
-        .and_then(|payload| payload.get("git"))
-        .and_then(|git| git.get("branch"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    resolve_project_context_cached(project_path, repository_url, branch, cache)
+    codex_project_context_from_inputs(codex_project_inputs_from_value(value), cache)
+}
+
+/// `turn_context` repeats the session's cwd but never its `git` block, so a
+/// turn in the directory `session_meta` named keeps the remote and branch it
+/// recorded. A turn in another directory has no recorded branch.
+pub(crate) fn codex_turn_context_project_from_value(
+    value: &Value,
+    session: &CodexProjectInputs,
+    cache: &mut ProjectContextCache,
+) -> Option<ProjectInfo> {
+    let mut inputs = codex_project_inputs_from_value(value);
+    if inputs.project_path.is_some() && inputs.project_path == session.project_path {
+        inputs.repository_url = inputs
+            .repository_url
+            .or_else(|| session.repository_url.clone());
+        inputs.branch = inputs.branch.or_else(|| session.branch.clone());
+    }
+    codex_project_context_from_inputs(inputs, cache)
 }
 
 pub(crate) fn codex_headless_usage_value(value: &Value) -> Option<&Value> {
