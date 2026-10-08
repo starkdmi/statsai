@@ -943,9 +943,10 @@ fn opus_5_5_prices_both_cache_write_lifetimes_without_long_context_surcharge() {
 }
 
 #[test]
-fn gpt_6_sol_and_luna_reprice_entire_request_above_272k() {
+fn gpt_6_sol_6_1_sol_and_luna_reprice_entire_request_above_272k() {
     let at = parse_utc("2026-09-22T12:00:00Z");
     for (name, short_cost, long_cost, fast_long_cost) in [
+        ("gpt-6.1-sol", 557_200, 1_064_600, 2_129_200),
         ("gpt-6-sol", 564_400, 1_079_200, 2_158_400),
         ("gpt-6-luna", 28_220, 53_960, 107_920),
     ] {

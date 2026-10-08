@@ -1,4 +1,6 @@
 use super::*;
+use crate::catalog::pricing_for_model_on;
+
 #[test]
 fn sonnet_5_reports_aggregate_periods_that_cross_its_price_change() {
     let before = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).expect("before boundary");
@@ -79,4 +81,22 @@ fn gpt_5_6_sol_reports_aggregate_periods_that_cross_its_promotional_cut() {
     // Sol's promotion is its own boundary, not the July cut the others share.
     assert!(!pricing_changes_between("gpt-5.6-luna", before, after));
     assert!(!pricing_changes_between("gpt-5.6-terra", before, after));
+}
+
+#[test]
+fn gpt_6_1_sol_halves_gpt_6_sol_cached_input_with_no_price_boundary() {
+    let launch = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).expect("launch date");
+    let later = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).expect("later date");
+    let sol_6_1 = pricing_for_model_on("gpt-6.1-sol", launch).expect("gpt-6.1-sol priced");
+    let sol_6 = pricing_for_model_on("gpt-6-sol", launch).expect("gpt-6-sol priced");
+
+    assert!((sol_6_1.input_per_million - 2.0).abs() < f64::EPSILON);
+    assert!((sol_6_1.cache_creation_per_million - 2.5).abs() < f64::EPSILON);
+    assert!((sol_6_1.cached_input_per_million - 0.1).abs() < f64::EPSILON);
+    assert!((sol_6_1.output_per_million - 10.0).abs() < f64::EPSILON);
+    assert!(
+        (sol_6_1.cached_input_per_million * 2.0 - sol_6.cached_input_per_million).abs()
+            < f64::EPSILON
+    );
+    assert!(!pricing_changes_between("gpt-6.1-sol", launch, later));
 }

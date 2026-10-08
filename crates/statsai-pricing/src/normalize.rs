@@ -91,6 +91,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("gpt-6-astra") {
         return Some("gpt-6-astra");
     }
+    if lower.contains("gpt-6.1-sol") {
+        return Some("gpt-6.1-sol");
+    }
     if lower.contains("gpt-6-sol") {
         return Some("gpt-6-sol");
     }
@@ -274,6 +277,7 @@ pub fn normalize_model_name(name: &str) -> String {
         "gpt-5.4" => "gpt-5.4".to_string(),
         "gpt-5.4-mini" => "gpt-5.4-mini".to_string(),
         "gpt-6-astra" | "gpt-6-astra-codex" => "gpt-6-astra".to_string(),
+        "gpt-6.1-sol" => "gpt-6.1-sol".to_string(),
         "gpt-6-sol" => "gpt-6-sol".to_string(),
         "gpt-6-luna" => "gpt-6-luna".to_string(),
         "gpt-5.6-sol" => "gpt-5.6-sol".to_string(),
