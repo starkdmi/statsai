@@ -871,7 +871,7 @@ fn applies_gpt_5_6_long_context_rates() {
 }
 
 #[test]
-fn sonnet_5_pricing_uses_usage_date() {
+fn sonnet_5_keeps_launch_pricing_after_the_cancelled_september_increase() {
     let model = statsai_core::ModelInfo {
         name: Some("claude-sonnet-5".to_string()),
         normalized_name: Some("claude-sonnet-5".to_string()),
@@ -885,18 +885,90 @@ fn sonnet_5_pricing_uses_usage_date() {
         output_tokens: Some(1_000_000),
         ..UsageCounts::default()
     };
-    let introductory_date = chrono::DateTime::parse_from_rfc3339("2026-08-31T23:59:59Z")
-        .expect("valid timestamp")
-        .with_timezone(&chrono::Utc);
-    let standard_date = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
-        .expect("valid timestamp")
-        .with_timezone(&chrono::Utc);
+    let before = estimate_cost_at(
+        "claude_code",
+        Some(&model),
+        &usage,
+        &parse_utc("2026-08-31T23:59:59Z"),
+    );
+    let after = estimate_cost_at(
+        "claude_code",
+        Some(&model),
+        &usage,
+        &parse_utc("2026-09-01T00:00:00Z"),
+    );
 
-    let introductory = estimate_cost_at("claude_code", Some(&model), &usage, &introductory_date);
-    let standard = estimate_cost_at("claude_code", Some(&model), &usage, &standard_date);
+    assert_eq!(before.estimated_api_equivalent_usd, Some(1_200));
+    assert_eq!(after.estimated_api_equivalent_usd, Some(1_200));
+}
 
-    assert_eq!(introductory.estimated_api_equivalent_usd, Some(1_200));
-    assert_eq!(standard.estimated_api_equivalent_usd, Some(1_800));
+#[test]
+fn sonnet_5_5_halves_cache_reads_from_october_7_and_is_not_priced_as_sonnet_5() {
+    let model = test_model("claude-sonnet-5.5");
+    let usage = UsageCounts {
+        cache_creation_tokens: Some(100_000),
+        cache_creation_1h_tokens: Some(100_000),
+        cache_read_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+
+    let before = estimate_cost_at(
+        "claude_code",
+        Some(&model),
+        &usage,
+        &parse_utc("2026-10-06T23:59:59Z"),
+    );
+    let after = estimate_cost_at(
+        "claude_code",
+        Some(&model),
+        &usage,
+        &parse_utc("2026-10-07T00:00:00Z"),
+    );
+
+    assert_eq!(before.estimated_api_equivalent_micro_usd, Some(600_000));
+    assert_eq!(after.estimated_api_equivalent_micro_usd, Some(500_000));
+    assert_eq!(
+        after.pricing_source.as_deref(),
+        Some("claude_code_api_pricing:claude-sonnet-5-5")
+    );
+}
+
+#[test]
+fn haiku_5_5_reprices_a_single_request_above_100k_at_five_times_every_rate() {
+    let model = test_model("claude-haiku-5-5");
+    let at = parse_utc("2026-10-07T12:00:00Z");
+    let short_usage = UsageCounts {
+        input_tokens: Some(50_000),
+        cache_creation_tokens: Some(30_000),
+        cache_creation_5m_tokens: Some(20_000),
+        cache_creation_1h_tokens: Some(10_000),
+        cache_read_tokens: Some(20_000),
+        output_tokens: Some(10_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let long_usage = UsageCounts {
+        cache_read_tokens: Some(30_000),
+        ..short_usage.clone()
+    };
+    let aggregate_usage = UsageCounts {
+        requests: Some(2),
+        ..long_usage.clone()
+    };
+
+    let short = estimate_cost_at("claude_code", Some(&model), &short_usage, &at);
+    let long = estimate_cost_at("claude_code", Some(&model), &long_usage, &at);
+    let aggregate = estimate_cost_at("claude_code", Some(&model), &aggregate_usage, &at);
+
+    assert_eq!(short.estimated_api_equivalent_micro_usd, Some(14_700));
+    assert_eq!(long.estimated_api_equivalent_micro_usd, Some(74_000));
+    // Tokens split across several requests cannot be assigned a tier.
+    assert_eq!(aggregate.estimated_api_equivalent_micro_usd, Some(14_800));
+    assert_eq!(
+        long.pricing_source.as_deref(),
+        Some("claude_code_api_pricing:claude-haiku-5-5")
+    );
 }
 fn test_model(name: &str) -> statsai_core::ModelInfo {
     statsai_core::ModelInfo {

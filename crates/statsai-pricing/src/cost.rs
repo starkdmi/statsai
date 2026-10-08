@@ -167,6 +167,7 @@ fn pricing_multipliers(
     const OPENAI_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
     const XAI_LONG_CONTEXT_THRESHOLD: u64 = 200_000;
     const CURSOR_GROK_4_7_LONG_CONTEXT_THRESHOLD: u64 = 256_000;
+    const CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD: u64 = 100_000;
 
     let prompt_tokens = usage
         .input_tokens
@@ -187,6 +188,17 @@ fn pricing_multipliers(
         }
         // Never fall through to xAI's >=200k API tier for Cursor usage.
         return (MULTIPLIER_SCALE, MULTIPLIER_SCALE);
+    }
+
+    if model_name == "claude-haiku-5-5" {
+        // Every Haiku 5.5 rate, cache writes and reads included, is 5x above 100k.
+        return if usage.requests == Some(1)
+            && prompt_tokens > CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD
+        {
+            (50_000, 50_000)
+        } else {
+            (MULTIPLIER_SCALE, MULTIPLIER_SCALE)
+        };
     }
 
     let is_openai_long_context_model = matches!(

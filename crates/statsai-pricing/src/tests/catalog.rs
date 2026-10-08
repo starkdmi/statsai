@@ -2,19 +2,36 @@ use super::*;
 use crate::catalog::pricing_for_model_on;
 
 #[test]
-fn sonnet_5_reports_aggregate_periods_that_cross_its_price_change() {
-    let before = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).expect("before boundary");
-    let boundary = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).expect("boundary");
-    let after = chrono::NaiveDate::from_ymd_opt(2026, 9, 2).expect("after boundary");
+fn sonnet_5_5_reports_aggregate_periods_that_cross_its_cache_read_cut() {
+    let before = chrono::NaiveDate::from_ymd_opt(2026, 10, 6).expect("before boundary");
+    let boundary = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).expect("boundary");
+    let after = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).expect("after boundary");
 
-    assert!(pricing_changes_between("claude-sonnet-5", before, boundary));
     assert!(pricing_changes_between(
-        "anthropic/claude-sonnet-5",
+        "claude-sonnet-5-5",
+        before,
+        boundary
+    ));
+    assert!(pricing_changes_between(
+        "anthropic/claude-sonnet-5.5",
         after,
         before
     ));
-    assert!(!pricing_changes_between("claude-sonnet-5", boundary, after));
-    assert!(!pricing_changes_between("claude-opus-5", before, after));
+    assert!(!pricing_changes_between(
+        "claude-sonnet-5-5",
+        boundary,
+        after
+    ));
+    assert!(!pricing_changes_between("claude-sonnet-5", before, after));
+    assert!(!pricing_changes_between("claude-haiku-5-5", before, after));
+}
+
+#[test]
+fn sonnet_5_has_no_price_boundary_at_the_cancelled_september_increase() {
+    let before = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).expect("before");
+    let after = chrono::NaiveDate::from_ymd_opt(2026, 9, 2).expect("after");
+
+    assert!(!pricing_changes_between("claude-sonnet-5", before, after));
 }
 #[test]
 fn codex_auto_review_reports_aggregate_periods_that_cross_its_equivalent_change() {

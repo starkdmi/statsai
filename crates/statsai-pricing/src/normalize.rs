@@ -17,12 +17,14 @@ fn normalize_reversed_claude_model_name(lower: &str) -> Option<&'static str> {
         ("opus", "4.5") => "claude-opus-4-5",
         ("opus", "4.1") => "claude-opus-4-1",
         ("opus", "4") => "claude-opus-4",
+        ("sonnet", "5.5") => "claude-sonnet-5-5",
         ("sonnet", "5") => "claude-sonnet-5",
         ("sonnet", "4.6") => "claude-sonnet-4-6",
         ("sonnet", "4.5") => "claude-sonnet-4-5",
         ("sonnet", "4") => "claude-sonnet-4",
         ("sonnet", "3.7") => "claude-sonnet-3-7",
         ("sonnet", "3.5") => "claude-sonnet-3-5",
+        ("haiku", "5.5") => "claude-haiku-5-5",
         ("haiku", "4.5") => "claude-haiku-4-5",
         ("haiku", "3.5") => "claude-haiku-3-5",
         _ => return None,
@@ -45,6 +47,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     }
     if lower.contains("claude-opus-5") {
         return Some("claude-opus-5");
+    }
+    if lower.contains("claude-sonnet-5-5") || lower.contains("claude-sonnet-5.5") {
+        return Some("claude-sonnet-5-5");
     }
     if lower.contains("claude-sonnet-5") {
         return Some("claude-sonnet-5");
@@ -69,6 +74,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     }
     if lower.contains("claude-sonnet-4-5") || lower.contains("claude-sonnet-4.5") {
         return Some("claude-sonnet-4-5");
+    }
+    if lower.contains("claude-haiku-5-5") || lower.contains("claude-haiku-5.5") {
+        return Some("claude-haiku-5-5");
     }
     if lower.contains("claude-haiku-4-5") || lower.contains("claude-haiku-4.5") {
         return Some("claude-haiku-4-5");
@@ -242,6 +250,9 @@ pub fn normalize_model_name(name: &str) -> String {
             "claude-opus-5-5".to_string()
         }
         "claude-opus-5" | "claude-opus-5-thinking" => "claude-opus-5".to_string(),
+        "claude-sonnet-5-5" | "claude-sonnet-5-5-thinking" | "claude-sonnet-5.5" => {
+            "claude-sonnet-5-5".to_string()
+        }
         "claude-sonnet-5" | "claude-sonnet-5-thinking" => "claude-sonnet-5".to_string(),
         "claude-3-5-sonnet-20241022" | "claude-sonnet-3-5" => "claude-sonnet-3-5".to_string(),
         "claude-3-7-sonnet" | "claude-sonnet-3-7" => "claude-sonnet-3-7".to_string(),
@@ -264,6 +275,7 @@ pub fn normalize_model_name(name: &str) -> String {
         "claude-sonnet-4-6" | "claude-sonnet-4-6-thinking" | "claude-sonnet-4.6" => {
             "claude-sonnet-4-6".to_string()
         }
+        "claude-haiku-5-5" | "claude-haiku-5.5" => "claude-haiku-5-5".to_string(),
         "claude-haiku-4-5" | "claude-haiku-4.5" => "claude-haiku-4-5".to_string(),
         "claude-haiku-3-5" | "claude-haiku-3.5" => "claude-haiku-3-5".to_string(),
         "gpt-5" | "gpt-5-chat-latest" => "gpt-5".to_string(),

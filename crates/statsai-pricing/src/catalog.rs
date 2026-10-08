@@ -11,7 +11,8 @@ pub struct ModelPricing {
     pub output_per_million: f64,
 }
 
-const CLAUDE_SONNET_5_STANDARD_PRICING_START: (i32, u32, u32) = (2026, 9, 1);
+/// Sonnet 5.5 cache reads dropped from $0.20/M to $0.10/M; its other rates held.
+const CLAUDE_SONNET_5_5_CACHE_READ_CUT_START: (i32, u32, u32) = (2026, 10, 7);
 const GPT_5_6_LUNA_TERRA_PRICE_CUT_START: (i32, u32, u32) = (2026, 7, 30);
 /// Promotional, announced to hold at least through 2026-11-21. When it lapses,
 /// add an end date here rather than reverting: usage priced under the promotion
@@ -109,6 +110,14 @@ pub(crate) fn api_equivalent_pricing_model(
     }
 }
 
+fn claude_sonnet_5_5_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
+    if date_tuple(usage_date) >= CLAUDE_SONNET_5_5_CACHE_READ_CUT_START {
+        pricing_with_cache_creation(2.0, 2.5, 0.1, 10.0)
+    } else {
+        pricing_with_cache_creation(2.0, 2.5, 0.2, 10.0)
+    }
+}
+
 fn gpt_5_6_luna_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
     if date_tuple(usage_date) >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START {
         pricing_with_cache_creation(0.2, 0.25, 0.02, 1.2)
@@ -149,14 +158,10 @@ pub(crate) fn pricing_for_model_on(
         }
         "claude-opus-5-5" => Some(pricing_with_cache_creation(4.0, 5.0, 0.2, 20.0)),
         "claude-opus-5" => Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 25.0)),
-        "claude-sonnet-5" => {
-            let date = (usage_date.year(), usage_date.month(), usage_date.day());
-            if date >= CLAUDE_SONNET_5_STANDARD_PRICING_START {
-                Some(pricing_with_cache_creation(3.0, 3.75, 0.3, 15.0))
-            } else {
-                Some(pricing_with_cache_creation(2.0, 2.5, 0.2, 10.0))
-            }
-        }
+        "claude-sonnet-5-5" => Some(claude_sonnet_5_5_pricing(usage_date)),
+        // The $2/$10 launch price became standard; the rise to $3/$15 scheduled
+        // for 2026-09-01 was cancelled.
+        "claude-sonnet-5" => Some(pricing_with_cache_creation(2.0, 2.5, 0.2, 10.0)),
         "claude-opus-4" | "claude-opus-4-1" => {
             Some(pricing_with_cache_creation(15.0, 18.75, 1.5, 75.0))
         }
@@ -166,6 +171,10 @@ pub(crate) fn pricing_for_model_on(
         "claude-sonnet-4" | "claude-sonnet-4-5" | "claude-sonnet-4-6" => {
             Some(pricing_with_cache_creation(3.0, 3.75, 0.3, 15.0))
         }
+        // The rate for prompts up to 100k tokens. A larger prompt reprices the
+        // whole request at 5x, applied by `pricing_multipliers` where a record
+        // is one known request.
+        "claude-haiku-5-5" => Some(pricing_with_cache_creation(0.1, 0.125, 0.01, 0.5)),
         "claude-haiku-4-5" => Some(pricing_with_cache_creation(1.0, 1.25, 0.1, 5.0)),
         // The default rate, covering the 272k context window Codex runs by
         // default. A larger prompt reprices the whole request at 20/25/2/75,
@@ -229,9 +238,9 @@ pub fn pricing_changes_between(
     let end = date_tuple(period_end);
 
     match normalize_model_name(model_name).as_str() {
-        "claude-sonnet-5" => {
-            start < CLAUDE_SONNET_5_STANDARD_PRICING_START
-                && end >= CLAUDE_SONNET_5_STANDARD_PRICING_START
+        "claude-sonnet-5-5" => {
+            start < CLAUDE_SONNET_5_5_CACHE_READ_CUT_START
+                && end >= CLAUDE_SONNET_5_5_CACHE_READ_CUT_START
         }
         "gpt-5.6-luna" | "gpt-5.6-terra" | "codex-auto-review" => {
             start < GPT_5_6_LUNA_TERRA_PRICE_CUT_START && end >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START

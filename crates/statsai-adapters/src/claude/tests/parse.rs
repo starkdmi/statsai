@@ -748,12 +748,12 @@ fn claude_stats_cache_does_not_estimate_aggregate_across_pricing_boundary() {
         dir.path().join("stats-cache.json"),
         r#"{
           "version": 2,
-          "lastComputedDate": "2026-09-01",
-          "firstSessionDate": "2026-08-31T00:00:00Z",
+          "lastComputedDate": "2026-10-07",
+          "firstSessionDate": "2026-10-06T00:00:00Z",
           "totalSessions": 2,
           "totalMessages": 4,
           "modelUsage": {
-            "claude-sonnet-5": {
+            "claude-sonnet-5-5": {
               "inputTokens": 1000000,
               "outputTokens": 1000000,
               "cacheReadInputTokens": 0,
