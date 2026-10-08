@@ -786,6 +786,49 @@ fn claude_stats_cache_does_not_estimate_aggregate_across_pricing_boundary() {
 }
 
 #[test]
+fn claude_stats_cache_totals_never_take_a_per_request_context_tier() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("projects")).expect("projects");
+    std::fs::write(
+        dir.path().join("stats-cache.json"),
+        r#"{
+          "version": 2,
+          "lastComputedDate": "2026-10-08",
+          "firstSessionDate": "2026-10-07T00:00:00Z",
+          "totalSessions": 2,
+          "totalMessages": 4,
+          "modelUsage": {
+            "claude-haiku-5-5": {
+              "inputTokens": 120000,
+              "outputTokens": 20000,
+              "cacheReadInputTokens": 0,
+              "cacheCreationInputTokens": 0
+            }
+          }
+        }"#,
+    )
+    .expect("stats cache");
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.summaries.len(), 1);
+    assert_eq!(scan.summaries[0].usage.requests, None);
+    // 120k input and 20k output at the up-to-100k rates; the aggregate cannot
+    // show that any one request crossed the threshold.
+    assert_eq!(
+        scan.summaries[0].cost.estimated_api_equivalent_micro_usd,
+        Some(22_000)
+    );
+}
+
+#[test]
 fn claude_scan_respects_selected_cache_keys() {
     let dir = tempfile::tempdir().expect("tempdir");
     let projects = dir.path().join("projects");

@@ -601,6 +601,36 @@ fn dangling_task_span_links_clear_stale_cost() {
 }
 
 #[test]
+fn stats_cache_totals_drop_their_request_count_and_never_take_a_per_request_tier() {
+    let (store, source) = store_with_source("/tmp/claude-stats-cache-haiku");
+    let start = parse_utc("2026-10-07T00:00:00Z");
+    let end = parse_utc("2026-10-08T00:00:00Z");
+    let mut summary = test_summary(&source, "claude-haiku-5-5", start, end, missing_cost());
+    summary.provider = "claude_code".to_string();
+    summary.source.source_kind = SourceKind::LocalSummary;
+    summary.metadata.summary_format = "claude_stats_cache".to_string();
+    summary.usage = UsageCounts {
+        input_tokens: Some(120_000),
+        output_tokens: Some(20_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    store.upsert_summary(&summary).expect("summary");
+
+    let report = store.ensure_current_pricing().expect("reprice");
+    let stored = store
+        .summaries()
+        .expect("summaries")
+        .into_iter()
+        .next()
+        .expect("one summary");
+
+    assert_eq!(report.changed_summaries, 1);
+    assert_eq!(stored.usage.requests, None);
+    assert_eq!(stored.cost.estimated_api_equivalent_micro_usd, Some(22_000));
+}
+
+#[test]
 fn summary_inside_one_pricing_window_is_repriced() {
     let (store, source) = store_with_source("/tmp/codex-window-summary");
     let start = parse_utc("2026-07-28T00:00:00Z");

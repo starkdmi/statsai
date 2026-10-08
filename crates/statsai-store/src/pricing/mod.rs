@@ -466,7 +466,7 @@ fn reprice_summary(summary: &UsageSummary) -> Option<UsageSummary> {
     let (period_start, period_end) = summary_period_bounds(summary);
     let pricing_at = summary.period_end.unwrap_or(summary.observed_at);
     let mut updated = summary.clone();
-    let mut changed = false;
+    let mut changed = clear_stats_cache_request_counts(&mut updated);
 
     if !updated.models.is_empty() {
         for model_usage in &mut updated.models {
@@ -501,6 +501,21 @@ fn reprice_summary(summary: &UsageSummary) -> Option<UsageSummary> {
     }
 
     changed.then_some(updated)
+}
+
+/// Clears the `requests: 1` older parsers stamped on Claude stats-cache totals.
+///
+/// Those totals span every cached session, and a single-request count would
+/// let the estimator apply a per-request context tier to the whole aggregate.
+fn clear_stats_cache_request_counts(summary: &mut UsageSummary) -> bool {
+    if summary.metadata.summary_format != "claude_stats_cache" {
+        return false;
+    }
+    let mut changed = summary.usage.requests.take().is_some();
+    for model_usage in &mut summary.models {
+        changed |= model_usage.usage.requests.take().is_some();
+    }
+    changed
 }
 
 fn estimated_summary_cost(

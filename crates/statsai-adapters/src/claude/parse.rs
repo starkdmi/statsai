@@ -549,7 +549,12 @@ pub(crate) fn parse_claude_stats_cache(
 
     for (model_name, usage_value) in model_usage {
         scan.diagnostics.candidate_usage_rows += 1;
-        let usage = claude_usage_counts_from_value(usage_value);
+        // A per-model total over every cached session, not one request, so it
+        // must not carry the single-request count that selects a context tier.
+        let usage = UsageCounts {
+            requests: None,
+            ..claude_usage_counts_from_value(usage_value)
+        };
         if usage.computed_total() == 0 {
             scan.diagnostics.skipped_zero_events += 1;
             continue;
