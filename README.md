@@ -457,6 +457,8 @@ statsai auth login
 statsai auth login --no-open
 statsai auth login --headless --device-name "Mini server"
 statsai auth status
+statsai auth logout
+statsai auth logout --local-only
 statsai sync --sink file --output ./statsai-sync-batch.json
 statsai sync --sink http --since-last
 statsai sync --sink http --verify
@@ -467,6 +469,10 @@ statsai schema cache-report
 
 HTTP sync uses the stored device session unless `--auth-token` or
 `STATSAI_SYNC_TOKEN` is provided. Access tokens are refreshed automatically.
+`statsai auth logout` revokes this device's session on the server before
+clearing local credentials; if the server cannot be reached it still logs out
+locally, and the session expires within 30 days or can be revoked from the
+dashboard's Devices page. `--local-only` skips the server call.
 
 </details>
 

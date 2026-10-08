@@ -1264,7 +1264,7 @@ Usage: statsai auth [OPTIONS] <COMMAND>
 Commands:
   login   Log in to the hosted sync backend
   status  Check authentication status for the Better Auth device session
-  logout  Log out and clear stored Better Auth device credentials
+  logout  Log out: revoke this device's session on the server, then clear stored credentials
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1293,11 +1293,12 @@ Options:
       --device-id <DEVICE_ID>  Device identifier for multi-device sync
   -h, --help                   Print help
 ===== statsai auth logout --help =====
-Log out and clear stored Better Auth device credentials
+Log out: revoke this device's session on the server, then clear stored credentials
 
 Usage: statsai auth logout [OPTIONS]
 
 Options:
+      --local-only             Only clear credentials stored on this machine; do not contact the server
       --store <STORE>          Path to SQLite store
       --device-id <DEVICE_ID>  Device identifier for multi-device sync
   -h, --help                   Print help

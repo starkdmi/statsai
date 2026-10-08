@@ -1,4 +1,4 @@
-use super::logout::logout_backend;
+use super::logout::{logout_backend, post_device_logout, revoke_server_session, ServerRevocation};
 use super::session::{with_device_id_retry, DeviceSessionRequestError};
 use super::*;
 use std::cell::Cell;
@@ -190,6 +190,155 @@ fn logout_preserves_legacy_metadata_for_another_backend() {
 
     assert!(!removed);
     assert!(legacy_path.exists());
+}
+
+fn seed_logout_credentials(
+    base: &Path,
+    api_base_url: &str,
+    refresh_token: Option<&str>,
+) -> PathBuf {
+    let path = auth_path_for_api_base_url(base, api_base_url);
+    let credentials = AuthCredentials {
+        backend: Some("cloudflare".to_string()),
+        api_base_url: Some(api_base_url.to_string()),
+        cloudflare_refresh_token: refresh_token.map(ToOwned::to_owned),
+        cloudflare_refresh_expires_at_secs: 10,
+        cloudflare_access_token: Some("access-token".to_string()),
+        cloudflare_access_expires_at_secs: 10,
+        device_id: Some("device-1".to_string()),
+    };
+    write_credentials(&path, &credentials).expect("seed credentials");
+    path
+}
+
+/// Accepts one request, replies with `status_line`, and hands back the raw
+/// request (headers and body) for inspection.
+fn serve_one_logout_request(
+    status_line: &'static str,
+) -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("addr");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut seen = Vec::new();
+        let mut byte = [0_u8; 1];
+        while stream.read(&mut byte).unwrap_or(0) == 1 {
+            seen.push(byte[0]);
+            if seen.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let length = String::from_utf8_lossy(&seen)
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0_u8; length];
+        stream.read_exact(&mut body).expect("body");
+        seen.extend_from_slice(&body);
+        let response = format!("{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(response.as_bytes()).expect("respond");
+        sender
+            .send(String::from_utf8_lossy(&seen).into_owned())
+            .expect("send request");
+    });
+    (format!("http://{address}"), receiver)
+}
+
+#[test]
+fn logout_revokes_stored_refresh_token_on_the_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (api_base_url, request) = serve_one_logout_request("HTTP/1.1 204 No Content");
+    seed_logout_credentials(dir.path(), &api_base_url, Some("refresh-secret"));
+
+    let outcome = revoke_server_session(dir.path(), &api_base_url, post_device_logout);
+
+    assert_eq!(outcome, ServerRevocation::Revoked);
+    let request = request
+        .recv_timeout(Duration::from_secs(5))
+        .expect("request");
+    assert!(
+        request.starts_with("POST /api/devices/logout HTTP/1.1\r\n"),
+        "{request}"
+    );
+    let body = request.split("\r\n\r\n").nth(1).expect("body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("json body");
+    assert_eq!(
+        json,
+        serde_json::json!({ "refreshToken": "refresh-secret" })
+    );
+}
+
+#[test]
+fn logout_reports_server_errors_and_still_clears_local_credentials() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (api_base_url, request) = serve_one_logout_request("HTTP/1.1 500 Internal Server Error");
+    let path = seed_logout_credentials(dir.path(), &api_base_url, Some("refresh-secret"));
+
+    let outcome = revoke_server_session(dir.path(), &api_base_url, post_device_logout);
+
+    request
+        .recv_timeout(Duration::from_secs(5))
+        .expect("request");
+    match outcome {
+        ServerRevocation::Failed(reason) => assert!(reason.contains("HTTP 500"), "{reason}"),
+        other => panic!("expected a failed revocation, got {other:?}"),
+    }
+    assert!(path.exists(), "revocation must not touch local credentials");
+    let removed = logout_backend(dir.path(), &api_base_url, |_| Ok(())).expect("logout");
+    assert!(removed);
+    assert!(!path.exists());
+}
+
+#[test]
+fn logout_reports_unreachable_server_without_failing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let api_base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    drop(listener);
+    seed_logout_credentials(dir.path(), &api_base_url, Some("refresh-secret"));
+
+    let outcome = revoke_server_session(dir.path(), &api_base_url, post_device_logout);
+
+    assert!(
+        matches!(outcome, ServerRevocation::Failed(_)),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn logout_skips_the_server_without_a_stored_refresh_token() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let api_base_url = "https://api.example.com";
+    let calls = Cell::new(0);
+    let send = |_: &str, _: &str| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+
+    assert_eq!(
+        revoke_server_session(dir.path(), api_base_url, send),
+        ServerRevocation::NotAttempted
+    );
+
+    seed_logout_credentials(dir.path(), api_base_url, None);
+    assert_eq!(
+        revoke_server_session(dir.path(), api_base_url, send),
+        ServerRevocation::NotAttempted
+    );
+    assert_eq!(calls.get(), 0);
+}
+
+#[test]
+fn logout_revocation_refuses_plain_http_to_remote_hosts() {
+    let error = post_device_logout("http://api.example.com", "refresh-secret")
+        .expect_err("insecure transport");
+    assert!(error.to_string().contains("must use HTTPS"), "{error:#}");
 }
 
 #[test]

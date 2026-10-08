@@ -128,8 +128,16 @@ pub(crate) enum AuthSubcommand {
     },
     #[command(about = "Check authentication status for the Better Auth device session")]
     Status,
-    #[command(about = "Log out and clear stored Better Auth device credentials")]
-    Logout,
+    #[command(
+        about = "Log out: revoke this device's session on the server, then clear stored credentials"
+    )]
+    Logout {
+        #[arg(
+            long,
+            help = "Only clear credentials stored on this machine; do not contact the server"
+        )]
+        local_only: bool,
+    },
 }
 
 #[derive(Debug, Args)]
