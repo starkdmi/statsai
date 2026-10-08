@@ -212,6 +212,37 @@ fn codex_headless_usage_shapes_are_parsed() {
 }
 
 #[test]
+fn codex_headless_turn_totals_never_take_a_per_request_context_tier() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let mut file = File::create(sessions.join("exec.jsonl")).expect("fixture");
+    writeln!(
+        file,
+        r#"{{"type":"turn.completed","timestamp":"2026-10-07T12:00:00Z","model":"gpt-6-sol","usage":{{"input_tokens":300000,"cached_input_tokens":0,"output_tokens":10000}}}}"#
+    )
+    .expect("write");
+    let source = SourceLocation::local_adapter(
+        CODEX_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+
+    let scan = scan_codex_source(&CodexAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.events[0].usage.requests, None);
+    // `codex exec --json` writes the thread's running total here, so the
+    // 272k threshold says nothing about any one request.
+    assert_eq!(
+        scan.events[0].cost.estimated_api_equivalent_micro_usd,
+        Some(700_000)
+    );
+}
+
+#[test]
 fn codex_usage_counts_normalize_inclusive_subtotals() {
     let value: Value = serde_json::json!({
         "input_tokens": 100,

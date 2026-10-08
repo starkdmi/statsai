@@ -488,7 +488,13 @@ pub(crate) fn parse_codex_file(
                 }
             })
         } else {
-            codex_headless_usage_value(&value).map(codex_usage_counts_from_value)
+            // A loose `usage` line has no fixed granularity: `codex exec --json`
+            // writes the thread's running total on `turn.completed`. It must not
+            // carry the single-request count that selects a context tier.
+            codex_headless_usage_value(&value).map(|usage| UsageCounts {
+                requests: None,
+                ..codex_usage_counts_from_value(usage)
+            })
         };
         let quota_usage_sample = if is_token_count_event {
             token_count_usage

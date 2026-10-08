@@ -748,12 +748,12 @@ fn claude_stats_cache_does_not_estimate_aggregate_across_pricing_boundary() {
         dir.path().join("stats-cache.json"),
         r#"{
           "version": 2,
-          "lastComputedDate": "2026-09-01",
-          "firstSessionDate": "2026-08-31T00:00:00Z",
+          "lastComputedDate": "2026-10-07",
+          "firstSessionDate": "2026-10-06T00:00:00Z",
           "totalSessions": 2,
           "totalMessages": 4,
           "modelUsage": {
-            "claude-sonnet-5": {
+            "claude-sonnet-5-5": {
               "inputTokens": 1000000,
               "outputTokens": 1000000,
               "cacheReadInputTokens": 0,
@@ -782,6 +782,49 @@ fn claude_stats_cache_does_not_estimate_aggregate_across_pricing_boundary() {
     assert_eq!(
         scan.summaries[0].cost.pricing_source.as_deref(),
         Some("unknown")
+    );
+}
+
+#[test]
+fn claude_stats_cache_totals_never_take_a_per_request_context_tier() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("projects")).expect("projects");
+    std::fs::write(
+        dir.path().join("stats-cache.json"),
+        r#"{
+          "version": 2,
+          "lastComputedDate": "2026-10-08",
+          "firstSessionDate": "2026-10-07T00:00:00Z",
+          "totalSessions": 2,
+          "totalMessages": 4,
+          "modelUsage": {
+            "claude-haiku-5-5": {
+              "inputTokens": 120000,
+              "outputTokens": 20000,
+              "cacheReadInputTokens": 0,
+              "cacheCreationInputTokens": 0
+            }
+          }
+        }"#,
+    )
+    .expect("stats cache");
+    let source = SourceLocation::local_adapter(
+        CLAUDE_CODE_PROVIDER,
+        "test",
+        "0",
+        dir.path(),
+        LocationOrigin::Configured,
+    );
+
+    let scan = scan_claude_source(&ClaudeCodeAdapter, &source, &options()).expect("scan");
+
+    assert_eq!(scan.summaries.len(), 1);
+    assert_eq!(scan.summaries[0].usage.requests, None);
+    // 120k input and 20k output at the up-to-100k rates; the aggregate cannot
+    // show that any one request crossed the threshold.
+    assert_eq!(
+        scan.summaries[0].cost.estimated_api_equivalent_micro_usd,
+        Some(22_000)
     );
 }
 

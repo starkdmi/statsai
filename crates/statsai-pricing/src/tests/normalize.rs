@@ -55,6 +55,46 @@ fn normalizes_gpt_6_astra() {
 }
 
 #[test]
+fn normalizes_sonnet_and_haiku_5_5_without_collapsing_into_older_models() {
+    assert_eq!(
+        normalize_model_name("claude-sonnet-5-5"),
+        "claude-sonnet-5-5"
+    );
+    assert_eq!(
+        normalize_model_name("claude-sonnet-5.5"),
+        "claude-sonnet-5-5"
+    );
+    assert_eq!(
+        normalize_model_name("claude-5.5-sonnet"),
+        "claude-sonnet-5-5"
+    );
+    assert_eq!(
+        normalize_model_name("openrouter/claude-sonnet-5-5-thinking"),
+        "claude-sonnet-5-5"
+    );
+    assert_eq!(normalize_model_name("claude-sonnet-5"), "claude-sonnet-5");
+    assert_eq!(
+        normalize_model_name("openrouter/claude-sonnet-5"),
+        "claude-sonnet-5"
+    );
+    assert_eq!(normalize_model_name("claude-haiku-5-5"), "claude-haiku-5-5");
+    assert_eq!(normalize_model_name("claude-haiku-5.5"), "claude-haiku-5-5");
+    assert_eq!(normalize_model_name("claude-5.5-haiku"), "claude-haiku-5-5");
+    assert_eq!(
+        normalize_model_name("anthropic/claude-haiku-5-5"),
+        "claude-haiku-5-5"
+    );
+}
+
+#[test]
+fn normalizes_gpt_6_1_sol_without_collapsing_into_gpt_6_sol() {
+    assert_eq!(normalize_model_name("gpt-6.1-sol"), "gpt-6.1-sol");
+    assert_eq!(normalize_model_name("GPT-6.1-Sol"), "gpt-6.1-sol");
+    assert_eq!(normalize_model_name("openai/gpt-6.1-sol"), "gpt-6.1-sol");
+    assert_eq!(normalize_model_name("openai/gpt-6-sol"), "gpt-6-sol");
+}
+
+#[test]
 fn normalizes_new_opus_and_gpt_6_models_without_collapsing_opus_5_5() {
     assert_eq!(normalize_model_name("claude-opus-5-5"), "claude-opus-5-5");
     assert_eq!(normalize_model_name("claude-opus-5.5"), "claude-opus-5-5");

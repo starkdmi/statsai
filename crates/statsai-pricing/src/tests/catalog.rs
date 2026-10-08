@@ -1,18 +1,37 @@
 use super::*;
-#[test]
-fn sonnet_5_reports_aggregate_periods_that_cross_its_price_change() {
-    let before = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).expect("before boundary");
-    let boundary = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).expect("boundary");
-    let after = chrono::NaiveDate::from_ymd_opt(2026, 9, 2).expect("after boundary");
+use crate::catalog::pricing_for_model_on;
 
-    assert!(pricing_changes_between("claude-sonnet-5", before, boundary));
+#[test]
+fn sonnet_5_5_reports_aggregate_periods_that_cross_its_cache_read_cut() {
+    let before = chrono::NaiveDate::from_ymd_opt(2026, 10, 6).expect("before boundary");
+    let boundary = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).expect("boundary");
+    let after = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).expect("after boundary");
+
     assert!(pricing_changes_between(
-        "anthropic/claude-sonnet-5",
+        "claude-sonnet-5-5",
+        before,
+        boundary
+    ));
+    assert!(pricing_changes_between(
+        "anthropic/claude-sonnet-5.5",
         after,
         before
     ));
-    assert!(!pricing_changes_between("claude-sonnet-5", boundary, after));
-    assert!(!pricing_changes_between("claude-opus-5", before, after));
+    assert!(!pricing_changes_between(
+        "claude-sonnet-5-5",
+        boundary,
+        after
+    ));
+    assert!(!pricing_changes_between("claude-sonnet-5", before, after));
+    assert!(!pricing_changes_between("claude-haiku-5-5", before, after));
+}
+
+#[test]
+fn sonnet_5_has_no_price_boundary_at_the_cancelled_september_increase() {
+    let before = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).expect("before");
+    let after = chrono::NaiveDate::from_ymd_opt(2026, 9, 2).expect("after");
+
+    assert!(!pricing_changes_between("claude-sonnet-5", before, after));
 }
 #[test]
 fn codex_auto_review_reports_aggregate_periods_that_cross_its_equivalent_change() {
@@ -79,4 +98,22 @@ fn gpt_5_6_sol_reports_aggregate_periods_that_cross_its_promotional_cut() {
     // Sol's promotion is its own boundary, not the July cut the others share.
     assert!(!pricing_changes_between("gpt-5.6-luna", before, after));
     assert!(!pricing_changes_between("gpt-5.6-terra", before, after));
+}
+
+#[test]
+fn gpt_6_1_sol_halves_gpt_6_sol_cached_input_with_no_price_boundary() {
+    let launch = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).expect("launch date");
+    let later = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).expect("later date");
+    let sol_6_1 = pricing_for_model_on("gpt-6.1-sol", launch).expect("gpt-6.1-sol priced");
+    let sol_6 = pricing_for_model_on("gpt-6-sol", launch).expect("gpt-6-sol priced");
+
+    assert!((sol_6_1.input_per_million - 2.0).abs() < f64::EPSILON);
+    assert!((sol_6_1.cache_creation_per_million - 2.5).abs() < f64::EPSILON);
+    assert!((sol_6_1.cached_input_per_million - 0.1).abs() < f64::EPSILON);
+    assert!((sol_6_1.output_per_million - 10.0).abs() < f64::EPSILON);
+    assert!(
+        (sol_6_1.cached_input_per_million * 2.0 - sol_6.cached_input_per_million).abs()
+            < f64::EPSILON
+    );
+    assert!(!pricing_changes_between("gpt-6.1-sol", launch, later));
 }
