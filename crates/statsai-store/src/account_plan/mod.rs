@@ -5,13 +5,13 @@ use super::{
 use anyhow::Result;
 use rusqlite::params;
 use statsai_core::{
-    account_plan_observation_id, conversation_account_binding_id, hash_text, normalize_plan_name,
-    periods_overlap, plan_projection_from_observation, source_account_assignment_id,
-    AccountEvidenceCheckpointV1, AccountEvidenceKind, AccountEvidenceSummaryV1,
-    AccountIdentityObservationV1, AccountPlanObservationV1, AccountPlanProjectionV1, Confidence,
-    ConversationAccountBindingV1, IdentitySource, ProviderAccountId, QuotaObservationRecordV1,
-    SourceAccountAssignment, SourceId, UsageEvent, ACCOUNT_EVIDENCE_SUMMARY_SCHEMA_VERSION,
-    ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
+    account_plan_observation_id, hash_text, normalize_plan_name, periods_overlap,
+    plan_projection_from_observation, source_account_assignment_id, AccountEvidenceCheckpointV1,
+    AccountEvidenceKind, AccountEvidenceSummaryV1, AccountIdentityObservationV1,
+    AccountPlanObservationV1, AccountPlanProjectionV1, Confidence, ConversationAccountBindingV1,
+    IdentitySource, ProviderAccountId, QuotaObservationRecordV1, SourceAccountAssignment, SourceId,
+    UsageEvent, ACCOUNT_EVIDENCE_SUMMARY_SCHEMA_VERSION, ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION,
+    CONVERSATION_ACTIVITY_GRACE_SECONDS, SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -101,6 +101,9 @@ mod tests {
             provider_account_id: account_id,
             conversation_id_hash: "b".repeat(64),
             turn_id_hash: None,
+            active_from: None,
+            observed_until: None,
+            certain_until: None,
             observed_at,
             evidence_kind: AccountEvidenceKind::ResetHistory,
             confidence: Confidence::High,

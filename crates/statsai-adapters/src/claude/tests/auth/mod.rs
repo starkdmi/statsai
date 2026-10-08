@@ -1,5 +1,6 @@
 pub(crate) use super::*;
 
+mod desktop;
 mod overrides;
 mod plans;
 mod projects;

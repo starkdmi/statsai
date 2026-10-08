@@ -15,10 +15,12 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use url::Url;
 
+mod desktop;
 mod overrides;
 mod plans;
 mod projects;
 
+pub(crate) use desktop::*;
 pub(crate) use overrides::*;
 pub(crate) use plans::*;
 pub use projects::ClaudeProjectPathMemo;
@@ -99,6 +101,12 @@ pub(crate) fn claude_auth_dependency_paths(
     if let Some(managed_settings_root) = claude_managed_settings_root() {
         paths.push(managed_settings_root);
     }
+    // Desktop session records decide which account ran each desktop session;
+    // the app rewrites them after the transcript, so they must trigger a rescan
+    // of their own.
+    if let Some(desktop_sessions_root) = claude_desktop_sessions_root_for(root) {
+        paths.push(desktop_sessions_root);
+    }
     if let Some(project_paths) = claude_project_paths_from_session_indexes(&root.join("projects")) {
         for project_path in project_paths {
             for project_settings_root in claude_project_settings_roots(&project_path) {
@@ -148,7 +156,13 @@ pub(crate) fn claude_verification_dependency_topology_changed(
     changed: &[PathBuf],
 ) -> bool {
     let projects_root = root.join("projects");
+    let desktop_sessions_root = claude_desktop_sessions_root_for(root);
     changed.iter().any(|path| {
+        // Created after the watch plan was built: it is then watched from its
+        // nearest existing ancestor until the plan is rebuilt recursively.
+        if desktop_sessions_root.as_ref() == Some(path) {
+            return true;
+        }
         if path == &projects_root {
             return true;
         }

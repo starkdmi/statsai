@@ -103,10 +103,50 @@ pub struct ConversationAccountBindingV1 {
     pub provider_account_id: ProviderAccountId,
     pub conversation_id_hash: String,
     pub turn_id_hash: Option<String>,
+    /// When this account took the conversation over. `None` binds the whole
+    /// conversation. A conversation continued under a second account carries
+    /// one binding per account, and each event belongs to the binding with the
+    /// latest `active_from` at or before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_from: Option<DateTime<Utc>>,
+    /// How far the evidence reaches: the last activity seen under this account
+    /// from `active_from`. Usage more than
+    /// [`CONVERSATION_ACTIVITY_GRACE_SECONDS`] later is not this binding's to
+    /// claim, since the conversation may have been resumed elsewhere. `None`
+    /// sets no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_until: Option<DateTime<Utc>>,
+    /// How far the binding is certain: the conversation was seen held by this
+    /// account alone from `active_from` through this instant. A certain range
+    /// outranks any binding inferred later; outside it a bounded binding is
+    /// only an inference. Never later than `observed_until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certain_until: Option<DateTime<Utc>>,
     pub observed_at: DateTime<Utc>,
     pub evidence_kind: AccountEvidenceKind,
     pub confidence: Confidence,
 }
+
+impl ConversationAccountBindingV1 {
+    /// The deterministic ID for this binding's current account and locators.
+    #[must_use]
+    pub fn derived_binding_id(&self) -> String {
+        conversation_account_binding_id_from(
+            &self.source_id,
+            &self.conversation_id_hash,
+            self.turn_id_hash.as_deref(),
+            &self.provider_account_id,
+            self.active_from,
+        )
+    }
+}
+
+/// How long recorded conversation activity may trail the usage it covers.
+///
+/// The Claude desktop app stamps a session's last activity before the reply's
+/// final usage is written, by up to tens of seconds. Resuming the conversation
+/// elsewhere, or under another account, takes far longer than this.
+pub const CONVERSATION_ACTIVITY_GRACE_SECONDS: i64 = 5 * 60;
 
 pub const ACCOUNT_EVIDENCE_CHECKPOINT_SCHEMA_VERSION: &str = "account_evidence_checkpoint.v1";
 
@@ -237,15 +277,37 @@ pub fn conversation_account_binding_id(
     turn_id_hash: Option<&str>,
     provider_account_id: &ProviderAccountId,
 ) -> String {
-    format!(
-        "conversation_binding_{}",
-        &hash_text(&format!(
-            "conversation_account_binding.v1:{}:{conversation_id_hash}:{}:{}",
-            source_id.0,
-            turn_id_hash.unwrap_or("none"),
-            provider_account_id.0
-        ))[..32]
+    conversation_account_binding_id_from(
+        source_id,
+        conversation_id_hash,
+        turn_id_hash,
+        provider_account_id,
+        None,
     )
+}
+
+/// [`conversation_account_binding_id`] for a binding that starts at `active_from`.
+///
+/// An unbounded binding keeps the ID it had before bindings could start late,
+/// so existing ledger rows stay deduplicated.
+#[must_use]
+pub fn conversation_account_binding_id_from(
+    source_id: &SourceId,
+    conversation_id_hash: &str,
+    turn_id_hash: Option<&str>,
+    provider_account_id: &ProviderAccountId,
+    active_from: Option<DateTime<Utc>>,
+) -> String {
+    let mut key = format!(
+        "conversation_account_binding.v1:{}:{conversation_id_hash}:{}:{}",
+        source_id.0,
+        turn_id_hash.unwrap_or("none"),
+        provider_account_id.0
+    );
+    if let Some(active_from) = active_from {
+        key.push_str(&format!(":from:{}", active_from.timestamp_millis()));
+    }
+    format!("conversation_binding_{}", &hash_text(&key)[..32])
 }
 
 #[must_use]

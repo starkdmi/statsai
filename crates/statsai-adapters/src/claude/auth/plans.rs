@@ -90,12 +90,16 @@ pub(crate) fn collect_claude_account_evidence(
     location_origin: &LocationOrigin,
 ) -> AccountEvidenceScan {
     let managed_settings_root = claude_managed_settings_root();
-    collect_claude_account_evidence_with_probe_context(
+    let mut scan = collect_claude_account_evidence_with_probe_context(
         source,
         root,
         location_origin,
         managed_settings_root.as_deref(),
-    )
+    );
+    if let Some(desktop_sessions_root) = claude_desktop_sessions_root_for(root) {
+        collect_claude_desktop_session_evidence(source, &desktop_sessions_root, &mut scan);
+    }
+    scan
 }
 
 /// Collect the cached Claude subscription plan for one source.
