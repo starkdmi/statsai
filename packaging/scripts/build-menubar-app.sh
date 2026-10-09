@@ -10,8 +10,12 @@ X64_TARGET="x86_64-apple-darwin"
 
 cd "${ROOT}"
 
-if ! command -v cargo-bundle >/dev/null 2>&1; then
-  cargo install cargo-bundle --locked
+# Pinned: cargo-bundle 0.12.0 dropped the `hardened_runtime` key under
+# [package.metadata.bundle.macos] and fails the build; 0.11.0 is what every
+# shipped release was bundled with.
+CARGO_BUNDLE_VERSION="0.11.0"
+if ! cargo-bundle --version 2>/dev/null | grep -q "cargo-bundle ${CARGO_BUNDLE_VERSION}"; then
+  cargo install cargo-bundle --version "${CARGO_BUNDLE_VERSION}" --locked --force
 fi
 
 has_target() {
