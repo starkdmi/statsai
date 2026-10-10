@@ -39,6 +39,16 @@ const WATCH_SCAN_LOCK_RETRY_DELAY: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(1)
 };
+/// How long a pass leaves the scan lock free after releasing it.
+///
+/// A busy watcher can start its next pass microseconds after the last one,
+/// while `statsai scan` and `statsai sync` look for a free lock only every
+/// 50 ms, so without a gap they could wait out their whole timeout and skip.
+const WATCH_SCAN_LOCK_YIELD: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_millis(200)
+};
 
 pub fn watch_and_serve(
     addr: &str,

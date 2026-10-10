@@ -1,9 +1,12 @@
 //! The advisory lock that keeps two scanners off one store at a time.
 //!
-//! `statsai scan`, the scanning paths of `statsai sync`, `statsai daemon
-//! --watch`, and any other process that collects into the store take this lock
-//! first. It lives in a file beside the database rather than in SQLite, so a
-//! process can learn that a scan is running without opening the store.
+//! `statsai scan`, `statsai sync` (except `--status` and `--verify`), and each
+//! pass of `statsai daemon --watch` take this lock first. Other commands that
+//! write collected data, such as `statsai import`, `statsai conversation
+//! collect`, and `statsai source remove --delete-data`, do not take it yet, so
+//! they can still run alongside a scan; bringing them under it is a follow-up.
+//! It lives in a file beside the database rather than in SQLite, so a process
+//! can learn that a scan is running without opening the store.
 //!
 //! The lock is the operating system's whole-file lock: `flock` on Unix and
 //! `LockFileEx` on Windows, through [`File::try_lock`]. Both belong to the open
@@ -27,12 +30,22 @@ const SCAN_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// The scan lock for the store at `store_path`: `scan.lock` in the same
 /// directory, so `~/.statsai/statsai.sqlite` is guarded by
 /// `~/.statsai/scan.lock`.
+///
+/// Symlinks are resolved, so a link to the store, or a path through a linked
+/// directory, finds the same lock as the store's own path. When the store
+/// does not exist yet, its directory is resolved instead, and when that does
+/// not exist either, the path is used as written. Hard links to the store are
+/// not detected: each directory that holds one has its own lock.
 #[must_use]
 pub fn scan_lock_path(store_path: &Path) -> PathBuf {
-    store_path
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join(SCAN_LOCK_FILE_NAME)
+    let parent = store_path.parent().unwrap_or_else(|| Path::new(""));
+    let directory = match std::fs::canonicalize(store_path) {
+        Ok(store) => store
+            .parent()
+            .map_or_else(|| parent.to_path_buf(), Path::to_path_buf),
+        Err(_) => std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()),
+    };
+    directory.join(SCAN_LOCK_FILE_NAME)
 }
 
 /// Proof that this process holds the scan lock. Dropping it releases the lock.
@@ -158,6 +171,35 @@ mod tests {
             scan_lock_path(Path::new("statsai.sqlite")),
             PathBuf::from("scan.lock")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_to_the_store_shares_the_store_s_lock() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let real_directory = directory.path().join("real");
+        let link_directory = directory.path().join("link");
+        std::fs::create_dir(&real_directory).expect("real directory");
+        std::fs::create_dir(&link_directory).expect("link directory");
+        let store = real_directory.join("statsai.sqlite");
+        std::fs::write(&store, b"").expect("store file");
+        let linked_store = link_directory.join("statsai.sqlite");
+        std::os::unix::fs::symlink(&store, &linked_store).expect("symlink");
+
+        let lock = scan_lock_path(&store);
+        assert_eq!(scan_lock_path(&linked_store), lock);
+        assert_eq!(
+            lock,
+            std::fs::canonicalize(&real_directory)
+                .expect("canonical directory")
+                .join(SCAN_LOCK_FILE_NAME)
+        );
+        let _held = try_acquire_scan_lock(&lock)
+            .expect("acquire")
+            .expect("uncontended lock");
+        assert!(try_acquire_scan_lock(&scan_lock_path(&linked_store))
+            .expect("try through the link")
+            .is_none());
     }
 
     #[test]

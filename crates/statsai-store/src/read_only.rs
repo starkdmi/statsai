@@ -1,14 +1,14 @@
 //! Read-only access for processes that must never write the store.
 
 use super::{
-    configure_read_cache, enable_sqlite_defensive, migrations::existing_schema_version,
-    CacheReportQuery, QuotaQuery, QuotaStatus, SessionFilter, SessionSort, SessionStats, Store,
-    SyncState, WeeklyResetAnchor, CURRENT_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT,
+    configure_read_cache, migrations::existing_schema_version, snapshot, CacheReportQuery,
+    QuotaQuery, QuotaStatus, SessionFilter, SessionSort, SessionStats, Store, SyncState,
+    WeeklyResetAnchor, CURRENT_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::config::DbConfig;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use statsai_core::{
     CacheReport, DailyRollup, ProviderAccount, ProviderAccountId, QuotaObservationRecordV1,
     QuotaWindowV1, SessionRollupV1, SourceAccountAssignment, SourceLocation, Subscription,
@@ -49,11 +49,13 @@ pub enum ReadOnlyOpenError {
         expected: i64,
     },
     /// SQLite could not open the file or read its schema version.
-    #[error("open StatsAI store read-only at {}", .path.display())]
+    ///
+    /// The message includes `reason`. It is deliberately not the error's
+    /// `source`, so printing the error through a cause chain does not repeat it.
+    #[error("open StatsAI store read-only at {}: {reason:#}", .path.display())]
     Open {
         path: PathBuf,
-        #[source]
-        source: anyhow::Error,
+        reason: anyhow::Error,
     },
 }
 
@@ -77,6 +79,11 @@ pub enum ReadOnlyOpenError {
 /// [`ReadStore::with_read_snapshot`] to see one point in time, and compare
 /// [`ReadStore::data_version`] to notice that a writer has committed since.
 ///
+/// The schema version is checked when the store opens, but a writer such as a
+/// newer `statsai` may migrate the store while it stays open. A long-lived
+/// reader should call [`ReadStore::check_schema`] whenever `data_version`
+/// changes, and reopen or stop reading when it fails.
+///
 /// In WAL mode SQLite coordinates readers through the `-wal` and `-shm` files
 /// beside the database. When no other connection has the store open they may
 /// not exist, and SQLite creates them for this connection, which needs write
@@ -85,13 +92,14 @@ pub enum ReadOnlyOpenError {
 /// unless those files already exist.
 pub struct ReadStore {
     store: Store,
+    path: PathBuf,
 }
 
 impl std::fmt::Debug for ReadStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ReadStore")
-            .field("path", &self.store.conn.path())
+            .field("path", &self.path)
             .finish_non_exhaustive()
     }
 }
@@ -105,38 +113,61 @@ impl ReadStore {
                 path: path.to_path_buf(),
             });
         }
-        let open_error = |source: anyhow::Error| ReadOnlyOpenError::Open {
+        let conn = open_read_only_connection(path).map_err(|reason| ReadOnlyOpenError::Open {
             path: path.to_path_buf(),
-            source,
+            reason,
+        })?;
+        let reader = Self {
+            store: Store { conn },
+            path: path.to_path_buf(),
         };
-        let conn = open_read_only_connection(path).map_err(open_error)?;
-        // A store that predates `schema_migrations` has version zero, as
-        // `database_schema_version` reports it.
-        let found = existing_schema_version(&conn)
-            .map_err(open_error)?
-            .unwrap_or(0);
+        reader.check_schema()?;
+        Ok(reader)
+    }
+
+    /// The schema version recorded in the store now.
+    ///
+    /// It was [`CURRENT_SCHEMA_VERSION`] when the store opened, but a writer
+    /// may have migrated the store since; see [`ReadStore::check_schema`].
+    /// A store that predates `schema_migrations` has version zero, as
+    /// [`crate::database_schema_version`] reports it.
+    pub fn schema_version(&self) -> Result<i64> {
+        // Not `Store::schema_version`: that creates `schema_migrations` and
+        // sets the journal mode first, which a read-only connection must not.
+        Ok(existing_schema_version(&self.store.conn)?.unwrap_or(0))
+    }
+
+    /// Checks again, as the open did, that the store's schema is the one this
+    /// binary reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadOnlyOpenError::SchemaTooOld`] or
+    /// [`ReadOnlyOpenError::SchemaTooNew`] when a writer has changed the
+    /// schema since the open, or [`ReadOnlyOpenError::Open`] when the version
+    /// cannot be read.
+    pub fn check_schema(&self) -> std::result::Result<(), ReadOnlyOpenError> {
+        let path = || self.path.clone();
+        let found = self
+            .schema_version()
+            .map_err(|reason| ReadOnlyOpenError::Open {
+                path: path(),
+                reason,
+            })?;
         let expected = CURRENT_SCHEMA_VERSION;
         match found.cmp(&expected) {
             Ordering::Less => Err(ReadOnlyOpenError::SchemaTooOld {
-                path: path.to_path_buf(),
+                path: path(),
                 found,
                 expected,
             }),
             Ordering::Greater => Err(ReadOnlyOpenError::SchemaTooNew {
-                path: path.to_path_buf(),
+                path: path(),
                 found,
                 expected,
             }),
-            Ordering::Equal => Ok(Self {
-                store: Store { conn },
-            }),
+            Ordering::Equal => Ok(()),
         }
-    }
-
-    /// The store's schema version, which is [`CURRENT_SCHEMA_VERSION`]
-    /// whenever the open succeeded.
-    pub fn schema_version(&self) -> Result<i64> {
-        self.store.schema_version()
     }
 
     /// See [`Store::data_version`]: changes when another connection commits.
@@ -268,17 +299,10 @@ impl ReadStore {
     }
 }
 
-/// Opens `path` so that nothing this connection does can change the file.
-///
-/// `SQLITE_OPEN_READONLY` is what the `mode=ro` URI parameter sets; passing the
-/// flag avoids escaping the path into a URI. Without `SQLITE_OPEN_CREATE` a
-/// missing file is an error rather than a new database.
+/// [`snapshot::open_read_only`], set up for a reader that stays open while
+/// other processes write.
 fn open_read_only_connection(path: &Path) -> Result<Connection> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    enable_sqlite_defensive(&conn)?;
+    let conn = snapshot::open_read_only(path)?;
     // A read-only connection cannot checkpoint anyway; this keeps it from
     // trying when it is the last one to close.
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;

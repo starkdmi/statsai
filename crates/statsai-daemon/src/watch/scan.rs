@@ -58,7 +58,10 @@ pub(super) enum BackgroundScanOutcome {
 /// Runs one pass of the background scan worker under the scan lock.
 ///
 /// The lock is taken for the scan alone, never while the worker waits for
-/// file events or for a retry, so `statsai scan` gets its turn between passes.
+/// file events or for a retry, and is left free for
+/// [`super::WATCH_SCAN_LOCK_YIELD`] after each pass, so `statsai scan` gets
+/// its turn between passes. The lock is advisory: when its file cannot be
+/// opened or locked, the pass scans without it rather than failing.
 pub(super) fn process_background_scan(
     pending: &Arc<Mutex<PendingWatch>>,
     signal: &mpsc::SyncSender<()>,
@@ -70,19 +73,32 @@ pub(super) fn process_background_scan(
     if notice.paths().is_empty() && !notice.rescan_all() {
         return BackgroundScanOutcome::Completed;
     }
-    let result = match scan_lock.map(try_acquire_scan_lock).transpose() {
-        // Another process is scanning: keep the paths and look again shortly.
-        Ok(Some(None)) => {
-            requeue_background_scan(pending, signal, notice, super::WATCH_SCAN_LOCK_RETRY_DELAY);
-            return BackgroundScanOutcome::Deferred;
-        }
-        // Held (or not configured) for exactly the length of the scan.
-        Ok(guard) => {
-            let _guard = guard.flatten();
-            scan(&notice)
-        }
-        Err(error) => Err(error),
+    let guard = match scan_lock {
+        None => None,
+        Some(lock_path) => match try_acquire_scan_lock(lock_path) {
+            Ok(Some(guard)) => Some(guard),
+            // Another process is scanning: keep the paths and look again
+            // shortly.
+            Ok(None) => {
+                requeue_background_scan(
+                    pending,
+                    signal,
+                    notice,
+                    super::WATCH_SCAN_LOCK_RETRY_DELAY,
+                );
+                return BackgroundScanOutcome::Deferred;
+            }
+            Err(error) => {
+                warn_scan_lock_unavailable(lock_path, &error);
+                None
+            }
+        },
     };
+    let result = scan(&notice);
+    if let Some(guard) = guard {
+        drop(guard);
+        std::thread::sleep(super::WATCH_SCAN_LOCK_YIELD);
+    }
     match result {
         Ok(()) => BackgroundScanOutcome::Completed,
         Err(error) => {
@@ -91,6 +107,18 @@ pub(super) fn process_background_scan(
             BackgroundScanOutcome::Failed
         }
     }
+}
+
+/// Reports an unusable scan lock once per process: every later pass would
+/// report the same thing.
+fn warn_scan_lock_unavailable(lock_path: &Path, error: &anyhow::Error) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "daemon: warning: could not use scan lock {}: {error:#}; scanning without it",
+            lock_path.display()
+        );
+    });
 }
 
 fn requeue_background_scan(

@@ -15,10 +15,12 @@ use std::path::{Path, PathBuf};
 
 /// The lock that keeps scanners of one store from running at once.
 ///
-/// `statsai scan`, the scanning paths of `statsai sync`, and each pass of
-/// `statsai daemon --watch` hold it; any other process that collects into the
-/// store should take it too. It is implemented in `statsai-store` so the
-/// daemon crate can share it, and re-exported here beside the default paths.
+/// `statsai scan`, `statsai sync` (except `--status` and `--verify`), and each
+/// pass of `statsai daemon --watch` hold it. `statsai import`, `statsai
+/// conversation collect`, and `statsai source remove --delete-data` also write
+/// collected data but do not take it yet. It is implemented in `statsai-store`
+/// so the daemon crate can share it, and re-exported here beside the default
+/// paths.
 pub use statsai_store::{
     acquire_scan_lock_with_timeout, scan_lock_path, try_acquire_scan_lock, ScanLockGuard,
     SCAN_LOCK_FILE_NAME,
@@ -434,12 +436,21 @@ mod tests {
     #[test]
     fn the_default_scan_lock_sits_beside_the_default_store() {
         let lock = default_scan_lock_path();
-        assert_eq!(lock.parent(), default_store_path().parent());
         assert_eq!(
             lock.file_name(),
             Some(std::ffi::OsStr::new(SCAN_LOCK_FILE_NAME))
         );
-        assert!(lock.ends_with(".statsai/scan.lock"));
+        // The same directory, though `scan_lock_path` resolves symlinks in it
+        // once it exists.
+        let resolved = |directory: &Path| {
+            std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf())
+        };
+        let store_directory = default_store_path();
+        let store_directory = store_directory.parent().expect("store directory");
+        assert_eq!(
+            resolved(lock.parent().expect("lock directory")),
+            resolved(store_directory)
+        );
     }
 
     #[test]

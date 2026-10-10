@@ -394,7 +394,80 @@ fn a_file_that_is_not_a_database_is_an_open_error() {
     )
     .expect("write junk");
 
-    assert!(matches!(open_error(&path), ReadOnlyOpenError::Open { .. }));
+    let error = open_error(&path);
+    assert!(matches!(error, ReadOnlyOpenError::Open { .. }), "{error:?}");
+    // The message says why, on its own and not again through `source`.
+    let message = error.to_string();
+    assert!(message.contains("file is not a database"), "{message}");
+    assert!(std::error::Error::source(&error).is_none());
+}
+
+/// Reading the version must not set the journal mode or create
+/// `schema_migrations`, as the writer's version check does: on a store in
+/// rollback-journal mode, or inside a read transaction, that is a write.
+#[test]
+fn the_schema_version_is_read_without_writing_even_from_a_rollback_journal_store() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = store_path(&directory);
+    written_store(&path, 1);
+    let journal_mode: String = Connection::open(&path)
+        .expect("raw connection")
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .expect("leave WAL mode");
+    assert_eq!(journal_mode, "delete");
+    let before = std::fs::read(&path).expect("database bytes");
+
+    let reader = Store::open_read_only(&path).expect("open read-only");
+    assert_eq!(
+        reader.schema_version().expect("schema version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        reader
+            .with_read_snapshot(|snapshot| snapshot.schema_version())
+            .expect("schema version in a snapshot"),
+        CURRENT_SCHEMA_VERSION
+    );
+    reader.check_schema().expect("current schema");
+    read_everything(&reader);
+    drop(reader);
+
+    assert_eq!(
+        std::fs::read(&path).expect("database bytes"),
+        before,
+        "reading the schema version changed the database file"
+    );
+}
+
+#[test]
+fn check_schema_reports_a_migration_made_after_the_open() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = store_path(&directory);
+    written_store(&path, 1);
+    let reader = Store::open_read_only(&path).expect("open read-only");
+    reader.check_schema().expect("current schema at open");
+
+    let future = CURRENT_SCHEMA_VERSION + 1;
+    Connection::open(&path)
+        .expect("writer connection")
+        .execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, '2026-10-01T00:00:00Z')",
+            [future],
+        )
+        .expect("a newer binary migrates the store");
+
+    assert_eq!(reader.schema_version().expect("schema version"), future);
+    match reader.check_schema() {
+        Err(ReadOnlyOpenError::SchemaTooNew {
+            path: reported,
+            found,
+            expected,
+        }) => {
+            assert_eq!(reported, path);
+            assert_eq!((found, expected), (future, CURRENT_SCHEMA_VERSION));
+        }
+        other => panic!("expected SchemaTooNew, got {other:?}"),
+    }
 }
 
 #[test]

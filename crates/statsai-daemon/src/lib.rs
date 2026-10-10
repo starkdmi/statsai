@@ -296,7 +296,8 @@ pub fn watch_and_serve(
 /// `scan_lock` is the lock file other scanners of this store take, normally
 /// `statsai_store::scan_lock_path(store_path)`. Each rescan holds it and only
 /// that long: while another process holds it the pass waits, and the changed
-/// paths stay queued until the lock is free. `None` scans without it.
+/// paths stay queued until the lock is free. `None` scans without it, and so
+/// does a pass that cannot open or lock the file, after one warning.
 #[cfg(feature = "watch")]
 pub fn watch_and_serve(
     addr: &str,

@@ -432,12 +432,16 @@ statsai report cache --from 2026-05-01 --details
 Normal scans use a per-source file signature cache. `--no-cache` forces a
 one-off reread; `--replace` performs a destructive source rebuild.
 
-One scan runs against a store at a time. `statsai scan`, `statsai sync` (other
-than `--status`, `--verify`, and `--reset-remote`), and each pass of `statsai
-daemon --watch` hold `scan.lock` beside the database (`~/.statsai/scan.lock` by
-default). While another scan holds it, `scan` and `sync` wait up to 5 seconds,
-then print `Another statsai scan is running (lock: …); skipping.` and exit
-successfully; the daemon keeps changed files queued until the lock is free.
+`statsai scan`, `statsai sync` (other than `--status` and `--verify`), and each
+pass of `statsai daemon --watch` take turns through `scan.lock` beside the
+database (`~/.statsai/scan.lock` by default). While another of them holds it,
+`scan` and `sync` wait up to 5 seconds, then print `Another statsai scan is
+running (lock: …); skipping.` (for `sync`, `…; skipping this sync. Nothing was
+sent.`) and exit successfully. A skipped `sync` still saves its
+`--include-*`/`--exclude-*` preference flags. The daemon keeps changed files
+queued until the lock is free. The lock is advisory: if its file cannot be
+opened or locked, these commands warn and run without it. `statsai import`,
+`conversation collect`, and `source remove --delete-data` do not take it yet.
 
 JSONL input is streamed with a 16 MiB per-record ceiling. Invalid or oversized
 records are counted and discarded through the next newline, after which parsing

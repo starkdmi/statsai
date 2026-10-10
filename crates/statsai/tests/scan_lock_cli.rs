@@ -1,6 +1,7 @@
 //! `statsai scan` and `statsai sync` wait for a running scanner, then skip
 //! without failing.
 
+use statsai_store::{Store, SyncPreferences};
 use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -50,11 +51,18 @@ fn scan_and_sync_skip_cleanly_while_another_scan_holds_the_lock() {
             batch.to_str().expect("utf-8 path"),
         ],
     );
-    let expected = format!(
-        "Another statsai scan is running (lock: {}); skipping.",
+    let busy = format!(
+        "Another statsai scan is running (lock: {});",
         lock.display()
     );
-    for (name, child) in [("scan", scan), ("sync", sync)] {
+    for (name, child, expected) in [
+        ("scan", scan, format!("{busy} skipping.")),
+        (
+            "sync",
+            sync,
+            format!("{busy} skipping this sync. Nothing was sent."),
+        ),
+    ] {
         let (output, stderr) = finish(child);
         assert!(
             stderr.contains(&expected),
@@ -67,6 +75,78 @@ fn scan_and_sync_skip_cleanly_while_another_scan_holds_the_lock() {
         "a skipped command must not have opened (and created) the store"
     );
     assert!(!batch.exists(), "a skipped sync must not have sent a batch");
+}
+
+#[test]
+fn an_invalid_sync_is_an_error_even_while_another_scan_holds_the_lock() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = directory.path().join("statsai.sqlite");
+    let _other_scanner = statsai::try_acquire_scan_lock(&statsai::scan_lock_path(&store))
+        .expect("acquire")
+        .expect("uncontended lock");
+
+    let output = run_statsai(
+        directory.path(),
+        &store,
+        &["sync", "--since-last", "--full"],
+    )
+    .wait_with_output()
+    .expect("statsai output");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "an invalid sync succeeded: {stderr}"
+    );
+    assert!(
+        stderr.contains("--since-last cannot be combined with --full or --rebuild-rollups"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Another statsai scan is running"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_skipped_sync_still_records_a_preference_opt_out() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store_path = directory.path().join("statsai.sqlite");
+    Store::open(&store_path)
+        .expect("create store")
+        .set_sync_preferences(SyncPreferences {
+            include_projects: true,
+            ..SyncPreferences::default()
+        })
+        .expect("opt in to project sync");
+    let lock = statsai::scan_lock_path(&store_path);
+    let _other_scanner = statsai::try_acquire_scan_lock(&lock)
+        .expect("acquire")
+        .expect("uncontended lock");
+
+    let sync = run_statsai(
+        directory.path(),
+        &store_path,
+        &["sync", "--sink", "stdout", "--exclude-projects"],
+    );
+    let (output, stderr) = finish(sync);
+
+    assert!(
+        stderr.contains(&format!(
+            "Another statsai scan is running (lock: {}); skipping this sync. Nothing was sent.",
+            lock.display()
+        )),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "a skipped sync sent a batch");
+    let preferences = Store::open(&store_path)
+        .expect("reopen store")
+        .sync_preferences()
+        .expect("sync preferences");
+    assert!(
+        !preferences.include_projects,
+        "the --exclude-projects opt-out was lost: {preferences:?}"
+    );
 }
 
 #[test]

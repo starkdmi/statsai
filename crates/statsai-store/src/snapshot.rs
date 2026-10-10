@@ -389,7 +389,13 @@ fn checkpoint_wal_while_writer_is_held(connection: &Connection, source: &Path) -
     }
 }
 
-fn open_read_only(path: &Path) -> Result<Connection> {
+/// Opens `path` so that nothing this connection does can change the file.
+///
+/// `SQLITE_OPEN_READONLY` is what the `mode=ro` URI parameter sets; passing the
+/// flag avoids escaping the path into a URI. Without `SQLITE_OPEN_CREATE` a
+/// missing file is an error rather than a new database. [`crate::ReadStore`]
+/// builds its connection on this one.
+pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

@@ -123,6 +123,38 @@ fn a_failed_background_scan_releases_the_scan_lock_before_its_retry() {
         .is_some());
 }
 
+#[test]
+fn a_background_scan_runs_without_a_scan_lock_it_cannot_use() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    // A regular file where the lock's directory should be: the lock file can
+    // be neither created nor opened.
+    let not_a_directory = directory.path().join("not-a-directory");
+    std::fs::write(&not_a_directory, b"").expect("regular file");
+    let lock = not_a_directory.join(statsai_store::SCAN_LOCK_FILE_NAME);
+    let pending = Arc::new(Mutex::new(PendingWatch::default()));
+    let (signal_tx, signal_rx) = mpsc::sync_channel(1);
+    let scanned = std::cell::Cell::new(false);
+
+    let outcome = process_background_scan(
+        &pending,
+        &signal_tx,
+        WatchNotice::RescanAll,
+        Duration::ZERO,
+        Some(&lock),
+        |_| {
+            scanned.set(true);
+            Ok(())
+        },
+    );
+
+    assert_eq!(outcome, BackgroundScanOutcome::Completed);
+    assert!(scanned.get(), "the pass did not scan");
+    assert!(
+        signal_rx.try_recv().is_err(),
+        "a completed pass is not retried"
+    );
+}
+
 pub(super) struct TestAdapter {
     pub(super) provider: &'static str,
     pub(super) verified_observation: VerifiedSourceObservation,
