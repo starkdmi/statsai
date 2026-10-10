@@ -146,10 +146,15 @@ pub(crate) fn apply_sync_preference_overrides(
     Ok(preferences)
 }
 
-/// Rejects flag combinations that cannot run together. It needs no store, so
+/// Rejects an unknown sink and flag combinations that cannot run together, so
+/// a bad command fails the same way whether or not it would wait. It needs no
+/// store, so
 /// the caller can check before waiting for the scan lock, and a sync that a
 /// running scan turns away still reports them.
 pub(crate) fn validate_sync_command(command: &SyncCommand) -> Result<()> {
+    if !matches!(command.sink.as_str(), "stdout" | "file" | "http") {
+        bail!("unsupported sync sink {}", command.sink);
+    }
     if command.since_last && (command.full || command.rebuild_rollups) {
         bail!("--since-last cannot be combined with --full or --rebuild-rollups");
     }

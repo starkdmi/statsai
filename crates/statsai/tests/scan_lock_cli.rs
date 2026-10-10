@@ -85,27 +85,28 @@ fn an_invalid_sync_is_an_error_even_while_another_scan_holds_the_lock() {
         .expect("acquire")
         .expect("uncontended lock");
 
-    let output = run_statsai(
-        directory.path(),
-        &store,
-        &["sync", "--since-last", "--full"],
-    )
-    .wait_with_output()
-    .expect("statsai output");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    for (args, expected) in [
+        (
+            &["sync", "--since-last", "--full"][..],
+            "--since-last cannot be combined with --full or --rebuild-rollups",
+        ),
+        (
+            &["sync", "--sink", "htpp"][..],
+            "unsupported sync sink htpp",
+        ),
+    ] {
+        let output = run_statsai(directory.path(), &store, args)
+            .wait_with_output()
+            .expect("statsai output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        !output.status.success(),
-        "an invalid sync succeeded: {stderr}"
-    );
-    assert!(
-        stderr.contains("--since-last cannot be combined with --full or --rebuild-rollups"),
-        "{stderr}"
-    );
-    assert!(
-        !stderr.contains("Another statsai scan is running"),
-        "{stderr}"
-    );
+        assert!(!output.status.success(), "{args:?} succeeded: {stderr}");
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("Another statsai scan is running"),
+            "{args:?}: {stderr}"
+        );
+    }
 }
 
 #[test]

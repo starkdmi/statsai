@@ -528,9 +528,9 @@ file, and returns a `ReadStore` with only the read APIs: session, daily, and
 cache reports, quota and list queries, `data_version`, and
 `with_read_snapshot`. A missing store, or one whose schema is older or newer
 than the binary's, is a typed `ReadOnlyOpenError` the caller can act on. Each
-read checks the schema again in its own snapshot, so a reader left open while a
-newer `statsai` migrates the store gets that error (inside the `anyhow::Error`)
-instead of misreading the new schema. A
+read checks the schema version again in its own snapshot, so a reader left open
+while a newer `statsai` migrates the store gets that error (inside the
+`anyhow::Error`) once the migration has recorded its version. A
 process that collects into the store should hold the scan lock, via
 `statsai::try_acquire_scan_lock` or `statsai::acquire_scan_lock_with_timeout`
 with `statsai::default_scan_lock_path()`.

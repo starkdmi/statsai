@@ -5,7 +5,7 @@ use super::{
     QuotaQuery, QuotaStatus, SessionFilter, SessionSort, SessionStats, Store, SyncState,
     WeeklyResetAnchor, CURRENT_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::config::DbConfig;
 use rusqlite::Connection;
@@ -81,9 +81,11 @@ pub enum ReadOnlyOpenError {
 ///
 /// A writer such as a newer `statsai` may migrate the store while it stays
 /// open, so the schema version is checked again at the start of each of those
-/// transactions, in the same snapshot as the reads. A read of a store whose
-/// schema has changed since the open fails with a [`ReadOnlyOpenError`] that
-/// `anyhow::Error::downcast_ref` recovers; reopen, or stop reading.
+/// transactions, in the same snapshot as the reads. Once a migration has
+/// recorded its version, a read fails with a [`ReadOnlyOpenError::SchemaTooNew`]
+/// (or `SchemaTooOld`) that `anyhow::Error::downcast_ref` recovers; reopen, or
+/// stop reading. A migration records its version after its schema changes, so
+/// a read that lands while one is still running is not caught.
 ///
 /// In WAL mode SQLite coordinates readers through the `-wal` and `-shm` files
 /// beside the database. When no other connection has the store open they may
@@ -149,26 +151,32 @@ impl ReadStore {
     /// schema since the open, or [`ReadOnlyOpenError::Open`] when the version
     /// cannot be read.
     pub fn check_schema(&self) -> std::result::Result<(), ReadOnlyOpenError> {
-        let path = || self.path.clone();
         let found = self
             .schema_version()
             .map_err(|reason| ReadOnlyOpenError::Open {
-                path: path(),
+                path: self.path.clone(),
                 reason,
             })?;
+        self.schema_mismatch(found).map_or(Ok(()), Err)
+    }
+
+    /// The error for a store at schema version `found`, if this binary does
+    /// not read that version.
+    fn schema_mismatch(&self, found: i64) -> Option<ReadOnlyOpenError> {
+        let path = self.path.clone();
         let expected = CURRENT_SCHEMA_VERSION;
         match found.cmp(&expected) {
-            Ordering::Less => Err(ReadOnlyOpenError::SchemaTooOld {
-                path: path(),
+            Ordering::Less => Some(ReadOnlyOpenError::SchemaTooOld {
+                path,
                 found,
                 expected,
             }),
-            Ordering::Greater => Err(ReadOnlyOpenError::SchemaTooNew {
-                path: path(),
+            Ordering::Greater => Some(ReadOnlyOpenError::SchemaTooNew {
+                path,
                 found,
                 expected,
             }),
-            Ordering::Equal => Ok(()),
+            Ordering::Equal => None,
         }
     }
 
@@ -194,7 +202,14 @@ impl ReadStore {
             return operation(&self.store);
         }
         self.store.with_read_snapshot(|store| {
-            self.check_schema()?;
+            // Only a mismatch is a `ReadOnlyOpenError`. A failure to read the
+            // version, such as a busy or I/O error, is the read's own error.
+            let found = self
+                .schema_version()
+                .context("read the store's schema version")?;
+            if let Some(mismatch) = self.schema_mismatch(found) {
+                return Err(mismatch.into());
+            }
             operation(store)
         })
     }
@@ -317,10 +332,10 @@ impl ReadStore {
     }
 }
 
-/// [`snapshot::open_read_only`], set up for a reader that stays open while
-/// other processes write.
+/// [`snapshot::open_read_only_unlabelled`], set up for a reader that stays open
+/// while other processes write. [`ReadOnlyOpenError::Open`] names the path.
 fn open_read_only_connection(path: &Path) -> Result<Connection> {
-    let conn = snapshot::open_read_only(path)?;
+    let conn = snapshot::open_read_only_unlabelled(path)?;
     // A read-only connection cannot checkpoint anyway; this keeps it from
     // trying when it is the last one to close.
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
@@ -333,6 +348,64 @@ fn open_read_only_connection(path: &Path) -> Result<Connection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_busy_store_is_the_read_s_own_error_not_a_schema_error() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("statsai.sqlite");
+        drop(Store::open(&path).expect("create store"));
+        let writer = Connection::open(&path).expect("writer");
+        writer
+            .execute_batch("PRAGMA journal_mode = DELETE;")
+            .expect("rollback journal");
+        let reader = Store::open_read_only(&path).expect("open read-only");
+        reader
+            .store
+            .conn
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("no busy wait");
+
+        // An exclusive lock in rollback-journal mode keeps every reader out.
+        writer
+            .execute_batch("BEGIN EXCLUSIVE;")
+            .expect("exclusive lock");
+        let error = reader.event_count().expect_err("the store is locked");
+        assert!(
+            error.downcast_ref::<ReadOnlyOpenError>().is_none(),
+            "a busy store was reported as a schema or open error: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("read the store's schema version"),
+            "{error:#}"
+        );
+
+        writer.execute_batch("COMMIT;").expect("release");
+        reader.event_count().expect("read once the lock is gone");
+    }
+
+    #[test]
+    fn a_failed_open_names_the_path_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        // A directory exists, so it gets past the missing-file check, but
+        // SQLite cannot open it.
+        let path = directory.path().join("statsai.sqlite");
+        std::fs::create_dir(&path).expect("directory");
+
+        let error = Store::open_read_only(&path).expect_err("not a database file");
+        assert!(matches!(error, ReadOnlyOpenError::Open { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "open StatsAI store read-only at {}: ",
+                path.display()
+            )),
+            "{message}"
+        );
+        assert!(
+            !message.contains("open database read-only at"),
+            "the snapshot open's context repeats the path: {message}"
+        );
+    }
 
     #[test]
     fn the_read_only_connection_refuses_writes() {
