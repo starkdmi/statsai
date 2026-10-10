@@ -32,12 +32,20 @@ const WATCH_SCAN_MAX_RETRY_DELAY: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(5)
 };
+/// How long a pass waits before trying again while another process holds the
+/// scan lock.
+const WATCH_SCAN_LOCK_RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(1)
+};
 
 pub fn watch_and_serve(
     addr: &str,
     store: Arc<Mutex<Store>>,
     device_id: &str,
     auth_token: &str,
+    scan_lock: Option<&Path>,
 ) -> Result<()> {
     let bind_addr = super::resolve_loopback_addr(addr)?;
     let startup_executable = current_executable_stamp();
@@ -91,6 +99,7 @@ pub fn watch_and_serve(
             pending_changed_paths,
             startup_executable,
             bind_addr,
+            scan_lock,
         )
     }
     #[cfg(not(target_os = "macos"))]
@@ -114,6 +123,7 @@ pub fn watch_and_serve(
             pending_changed_paths,
             startup_executable,
             bind_addr,
+            scan_lock,
         )
     }
 }
@@ -146,11 +156,13 @@ fn run_watch_loop<W: Watcher>(
     pending_changed_paths: Arc<Mutex<PendingWatch>>,
     startup_executable: Option<ExecutableStamp>,
     bind_addr: std::net::SocketAddr,
+    scan_lock: Option<&Path>,
 ) -> Result<()> {
     let background_store = {
         let store = super::lock_store(&store);
         store.reopen()
     };
+    let worker_scan_lock = scan_lock.map(Path::to_path_buf);
     let (scan_signal_tx, scan_signal_rx) = mpsc::sync_channel(1);
     let worker_scan_signal_tx = scan_signal_tx.clone();
     let pending_scan_paths = Arc::new(Mutex::new(PendingWatch::default()));
@@ -162,6 +174,7 @@ fn run_watch_loop<W: Watcher>(
         .name("statsai-watch-scan".to_string())
         .spawn(move || {
             let mut retry_delay = WATCH_SCAN_INITIAL_RETRY_DELAY;
+            let mut reported_scan_lock_wait = false;
             while scan_signal_rx.recv().is_ok() {
                 let notice = worker_pending_scan_paths
                     .lock()
@@ -174,11 +187,12 @@ fn run_watch_loop<W: Watcher>(
                     .read()
                     .unwrap_or_else(|error| error.into_inner())
                     .clone();
-                let scan_succeeded = process_background_scan(
+                let outcome = process_background_scan(
                     &worker_pending_scan_paths,
                     &worker_scan_signal_tx,
                     notice,
                     retry_delay,
+                    worker_scan_lock.as_deref(),
                     |notice| match background_store.as_ref() {
                         Ok(store) => rescan_changed_sources(
                             store,
@@ -205,13 +219,31 @@ fn run_watch_loop<W: Watcher>(
                         }
                     },
                 );
-                retry_delay = if scan_succeeded {
-                    WATCH_SCAN_INITIAL_RETRY_DELAY
-                } else {
-                    retry_delay
-                        .saturating_mul(2)
-                        .min(WATCH_SCAN_MAX_RETRY_DELAY)
-                };
+                match outcome {
+                    BackgroundScanOutcome::Completed => {
+                        retry_delay = WATCH_SCAN_INITIAL_RETRY_DELAY;
+                        reported_scan_lock_wait = false;
+                    }
+                    BackgroundScanOutcome::Failed => {
+                        retry_delay = retry_delay
+                            .saturating_mul(2)
+                            .min(WATCH_SCAN_MAX_RETRY_DELAY);
+                        reported_scan_lock_wait = false;
+                    }
+                    // Said once per wait: the pass retries every
+                    // WATCH_SCAN_LOCK_RETRY_DELAY while a long scan runs.
+                    BackgroundScanOutcome::Deferred => {
+                        if !reported_scan_lock_wait {
+                            if let Some(lock) = worker_scan_lock.as_deref() {
+                                eprintln!(
+                                    "daemon: another statsai scan is running (lock: {}); watching resumes when it finishes",
+                                    lock.display()
+                                );
+                            }
+                            reported_scan_lock_wait = true;
+                        }
+                    }
+                }
             }
         })
         .context("start background scan worker")?;

@@ -13,6 +13,17 @@ use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+/// The lock that keeps scanners of one store from running at once.
+///
+/// `statsai scan`, the scanning paths of `statsai sync`, and each pass of
+/// `statsai daemon --watch` hold it; any other process that collects into the
+/// store should take it too. It is implemented in `statsai-store` so the
+/// daemon crate can share it, and re-exported here beside the default paths.
+pub use statsai_store::{
+    acquire_scan_lock_with_timeout, scan_lock_path, try_acquire_scan_lock, ScanLockGuard,
+    SCAN_LOCK_FILE_NAME,
+};
+
 /// Opens a store for a command that reads or publishes price-derived data and
 /// applies the compiled pricing ruleset first.
 pub fn open_operational_store(path: &Path) -> Result<Store> {
@@ -33,6 +44,14 @@ pub fn default_store_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".statsai")
         .join("statsai.sqlite")
+}
+
+/// `~/.statsai/scan.lock`, the scan lock for [`default_store_path`].
+///
+/// A store opened elsewhere with `--store` has its lock beside it instead; use
+/// [`scan_lock_path`] for that.
+pub fn default_scan_lock_path() -> PathBuf {
+    scan_lock_path(&default_store_path())
 }
 
 pub fn default_device_id() -> String {
@@ -410,6 +429,17 @@ mod tests {
             statsai_store::database_applied_pricing_ruleset_version(&path).expect("unchanged"),
             Some(99)
         );
+    }
+
+    #[test]
+    fn the_default_scan_lock_sits_beside_the_default_store() {
+        let lock = default_scan_lock_path();
+        assert_eq!(lock.parent(), default_store_path().parent());
+        assert_eq!(
+            lock.file_name(),
+            Some(std::ffi::OsStr::new(SCAN_LOCK_FILE_NAME))
+        );
+        assert!(lock.ends_with(".statsai/scan.lock"));
     }
 
     #[test]

@@ -284,20 +284,28 @@ pub fn watch_and_serve(
     _store: Arc<Mutex<Store>>,
     _device_id: &str,
     _auth_token: &str,
+    _scan_lock: Option<&std::path::Path>,
 ) -> Result<()> {
     anyhow::bail!(
         "daemon --watch requires the `watch` cargo feature (enable with --features watch)"
     )
 }
 
+/// Serves the loopback API and rescans sources as their files change.
+///
+/// `scan_lock` is the lock file other scanners of this store take, normally
+/// `statsai_store::scan_lock_path(store_path)`. Each rescan holds it and only
+/// that long: while another process holds it the pass waits, and the changed
+/// paths stay queued until the lock is free. `None` scans without it.
 #[cfg(feature = "watch")]
 pub fn watch_and_serve(
     addr: &str,
     store: Arc<Mutex<Store>>,
     device_id: &str,
     auth_token: &str,
+    scan_lock: Option<&std::path::Path>,
 ) -> Result<()> {
-    watch::watch_and_serve(addr, store, device_id, auth_token)
+    watch::watch_and_serve(addr, store, device_id, auth_token, scan_lock)
 }
 
 fn resolve_loopback_addr(addr: &str) -> Result<SocketAddr> {

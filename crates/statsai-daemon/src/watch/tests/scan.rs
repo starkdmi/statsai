@@ -32,20 +32,95 @@ fn failed_background_scan_is_requeued_for_retry() {
     let (signal_tx, signal_rx) = mpsc::sync_channel(1);
     let changed = PathBuf::from("/tmp/statsai-scan-retry");
 
-    let scan_succeeded = process_background_scan(
+    let outcome = process_background_scan(
         &pending,
         &signal_tx,
         WatchNotice::Paths(vec![changed.clone()]),
         Duration::ZERO,
+        None,
         |_| anyhow::bail!("database is locked"),
     );
 
-    assert!(!scan_succeeded);
+    assert_eq!(outcome, BackgroundScanOutcome::Failed);
     signal_rx.try_recv().expect("retry wakeup");
     assert_eq!(
         pending.lock().expect("pending scan paths").paths(),
         &HashSet::from([changed])
     );
+}
+
+#[test]
+fn a_background_scan_waits_while_another_scanner_holds_the_scan_lock() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let lock = directory.path().join(statsai_store::SCAN_LOCK_FILE_NAME);
+    let pending = Arc::new(Mutex::new(PendingWatch::default()));
+    let (signal_tx, signal_rx) = mpsc::sync_channel(1);
+    let changed = PathBuf::from("/tmp/statsai-scan-locked");
+    let other_scanner = statsai_store::try_acquire_scan_lock(&lock)
+        .expect("acquire")
+        .expect("uncontended lock");
+
+    let outcome = process_background_scan(
+        &pending,
+        &signal_tx,
+        WatchNotice::Paths(vec![changed.clone()]),
+        Duration::ZERO,
+        Some(&lock),
+        |_| panic!("scanned while another scanner held the lock"),
+    );
+
+    assert_eq!(outcome, BackgroundScanOutcome::Deferred);
+    signal_rx.try_recv().expect("retry wakeup");
+    let notice = pending.lock().expect("pending scan paths").take();
+    assert_eq!(notice, WatchNotice::Paths(vec![changed.clone()]));
+
+    drop(other_scanner);
+    let outcome = process_background_scan(
+        &pending,
+        &signal_tx,
+        notice,
+        Duration::ZERO,
+        Some(&lock),
+        |notice| {
+            assert_eq!(notice.paths(), std::slice::from_ref(&changed));
+            assert!(
+                statsai_store::try_acquire_scan_lock(&lock)?.is_none(),
+                "the pass must hold the scan lock while it scans"
+            );
+            Ok(())
+        },
+    );
+    assert_eq!(outcome, BackgroundScanOutcome::Completed);
+    assert!(
+        statsai_store::try_acquire_scan_lock(&lock)
+            .expect("try")
+            .is_some(),
+        "the pass must release the scan lock when it finishes"
+    );
+}
+
+#[test]
+fn a_failed_background_scan_releases_the_scan_lock_before_its_retry() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let lock = directory.path().join(statsai_store::SCAN_LOCK_FILE_NAME);
+    let pending = Arc::new(Mutex::new(PendingWatch::default()));
+    let (signal_tx, signal_rx) = mpsc::sync_channel(1);
+
+    let outcome = process_background_scan(
+        &pending,
+        &signal_tx,
+        WatchNotice::RescanAll,
+        Duration::ZERO,
+        Some(&lock),
+        |_| anyhow::bail!("database is locked"),
+    );
+
+    assert_eq!(outcome, BackgroundScanOutcome::Failed);
+    signal_rx.try_recv().expect("retry wakeup");
+    assert!(pending.lock().expect("pending scan paths").rescan_all());
+    assert!(statsai_store::try_acquire_scan_lock(&lock)
+        .expect("try")
+        .is_some());
 }
 
 pub(super) struct TestAdapter {

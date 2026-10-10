@@ -12,7 +12,9 @@ mod migrations;
 mod pricing;
 mod privacy;
 mod quota;
+mod read_only;
 mod rollups;
+mod scan_lock;
 mod scan_state;
 mod snapshot;
 mod sources;
@@ -81,7 +83,12 @@ pub use pricing::{
     apply_current_estimated_pricing, RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY,
     APPLIED_PRICING_RULESET_VERSION_KEY,
 };
+pub use read_only::{ReadOnlyOpenError, ReadStore};
 pub use rollups::{SessionFilter, SessionSort, SessionStats};
+pub use scan_lock::{
+    acquire_scan_lock_with_timeout, scan_lock_path, try_acquire_scan_lock, ScanLockGuard,
+    SCAN_LOCK_FILE_NAME,
+};
 pub use snapshot::{
     clone_database_to, database_applied_pricing_ruleset_version, database_schema_version,
     DatabaseClone,
@@ -382,22 +389,10 @@ impl Store {
     /// subscriptions, account assignments, privacy identity — and none of that
     /// can be collected again from local files. Relaxing durability is scoped
     /// to the imports that can, in [`Store::relax_durability_for_bulk_import`].
-    ///
-    /// The page cache is raised because these archives are far larger than the
-    /// 2MB default, which turns index maintenance into a stream of single-page
-    /// reads.
-    ///
-    /// `mmap_size` covers what the cache cannot. A store with a year of history runs
-    /// to several gigabytes, so the reads that miss the cache are the ones that hurt,
-    /// and serving those from a mapping spares them a `pread` apiece. A gigabyte is
-    /// deliberately short of the whole file: it comfortably spans the tables scanning
-    /// touches without mapping the archive content that only full-text search reads.
     fn configure_connection(&self) -> Result<()> {
+        configure_read_cache(&self.conn)?;
         self.conn.execute_batch(
-            "PRAGMA cache_size = -65536;
-             PRAGMA mmap_size = 1073741824;
-             PRAGMA temp_store = MEMORY;
-             CREATE TEMP TABLE IF NOT EXISTS incoming_records (
+            "CREATE TEMP TABLE IF NOT EXISTS incoming_records (
                source_record_id TEXT,
                item_id TEXT NOT NULL
              );
@@ -428,6 +423,22 @@ impl Store {
             .filter(|path| !path.trim().is_empty())
             .context("cannot reopen an in-memory statsai store")?;
         Self::open(Path::new(path))
+    }
+
+    /// Opens an existing store for reading only, without changing it.
+    ///
+    /// Unlike [`Store::open`], this never creates the file, migrates, backfills,
+    /// reprices, or changes permissions, and refuses a schema version other than
+    /// [`CURRENT_SCHEMA_VERSION`] with a typed error, so a process that only
+    /// reads (a desktop dashboard, say) can share the store with the CLI and
+    /// daemon while they scan. See [`ReadStore`] for what it can read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadOnlyOpenError`] when the file is missing, its schema is
+    /// older or newer than this binary's, or SQLite cannot open it.
+    pub fn open_read_only(path: &Path) -> std::result::Result<ReadStore, ReadOnlyOpenError> {
+        ReadStore::open(path)
     }
 
     /// Returns SQLite's connection-local database generation.
@@ -641,6 +652,29 @@ impl Store {
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     }
+}
+
+/// Sizes the page cache and memory map for large stores, on any connection.
+///
+/// The page cache is raised because these archives are far larger than the
+/// 2MB default, which turns index maintenance into a stream of single-page
+/// reads.
+///
+/// `mmap_size` covers what the cache cannot. A store with a year of history runs
+/// to several gigabytes, so the reads that miss the cache are the ones that hurt,
+/// and serving those from a mapping spares them a `pread` apiece. A gigabyte is
+/// deliberately short of the whole file: it comfortably spans the tables scanning
+/// touches without mapping the archive content that only full-text search reads.
+///
+/// These settings are local to the connection and write nothing to the file,
+/// so read-only connections use them too.
+fn configure_read_cache(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA cache_size = -65536;
+         PRAGMA mmap_size = 1073741824;
+         PRAGMA temp_store = MEMORY;",
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
