@@ -1,7 +1,8 @@
 //! The advisory lock that keeps two scanners off one store at a time.
 //!
-//! `statsai scan`, `statsai sync` (except `--status` and `--verify`), and each
-//! pass of `statsai daemon --watch` take this lock first. Other commands that
+//! `statsai scan`, `statsai sync` (except `--status`, `--verify`, and
+//! `--reset-remote --dry-run`), and each pass of `statsai daemon --watch` take
+//! this lock first. Other commands that
 //! write collected data, such as `statsai import`, `statsai conversation
 //! collect`, and `statsai source remove --delete-data`, do not take it yet, so
 //! they can still run alongside a scan; bringing them under it is a follow-up.

@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 
 /// The lock that keeps scanners of one store from running at once.
 ///
-/// `statsai scan`, `statsai sync` (except `--status` and `--verify`), and each
-/// pass of `statsai daemon --watch` hold it. `statsai import`, `statsai
+/// `statsai scan`, `statsai sync` (except `--status`, `--verify`, and
+/// `--reset-remote --dry-run`), and each pass of `statsai daemon --watch` hold
+/// it. `statsai import`, `statsai
 /// conversation collect`, and `statsai source remove --delete-data` also write
 /// collected data but do not take it yet. It is implemented in `statsai-store`
 /// so the daemon crate can share it, and re-exported here beside the default

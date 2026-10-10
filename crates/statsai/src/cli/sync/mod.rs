@@ -255,8 +255,9 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
             return Ok(());
         }
 
-        let persisted_sync_preferences = apply_sync_preference_overrides(store, &command)?;
-        debug_assert_eq!(persisted_sync_preferences, sync_preferences);
+        // The stored preferences can differ from `sync_preferences` by now: a
+        // sync that this run's scan lock turned away still saves its flags.
+        apply_sync_preference_overrides(store, &command)?;
 
         reached_send.set(true);
         let result = (|| -> Result<()> {
