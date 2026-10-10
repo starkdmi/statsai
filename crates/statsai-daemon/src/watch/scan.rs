@@ -13,12 +13,12 @@ use statsai_core::{
     UsageSummary, ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
-    find_existing_provider_account, reconcile_verified_source_state, upsert_provider_account,
-    verified_source_observation_hash, ActivityPersistMode, ActivityScanCursor, ScanFileReplacement,
-    ScanFileStateEntry, Store, UpsertProviderAccountInput,
+    find_existing_provider_account, reconcile_verified_source_state, try_acquire_scan_lock,
+    upsert_provider_account, verified_source_observation_hash, ActivityPersistMode,
+    ActivityScanCursor, ScanFileReplacement, ScanFileStateEntry, Store, UpsertProviderAccountInput,
 };
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,27 +43,96 @@ pub(super) fn enqueue_watch_notice(
     let _ = signal.try_send(());
 }
 
+/// What became of one pass of the background scan worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackgroundScanOutcome {
+    /// The pass scanned, or had nothing to scan.
+    Completed,
+    /// The scan failed; its paths were queued again after `retry_delay`.
+    Failed,
+    /// Another process held the scan lock; the paths were queued again after
+    /// [`super::WATCH_SCAN_LOCK_RETRY_DELAY`] without scanning.
+    Deferred,
+}
+
+/// Runs one pass of the background scan worker under the scan lock.
+///
+/// The lock is taken for the scan alone, never while the worker waits for
+/// file events or for a retry, and is left free for
+/// [`super::WATCH_SCAN_LOCK_YIELD`] after each pass, so `statsai scan` gets
+/// its turn between passes. The lock is advisory: when its file cannot be
+/// opened or locked, the pass scans without it rather than failing.
 pub(super) fn process_background_scan(
     pending: &Arc<Mutex<PendingWatch>>,
     signal: &mpsc::SyncSender<()>,
     notice: WatchNotice,
     retry_delay: Duration,
+    scan_lock: Option<&Path>,
     scan: impl FnOnce(&WatchNotice) -> Result<()>,
-) -> bool {
+) -> BackgroundScanOutcome {
     if notice.paths().is_empty() && !notice.rescan_all() {
-        return true;
+        return BackgroundScanOutcome::Completed;
     }
-    if let Err(error) = scan(&notice) {
-        eprintln!("daemon: background scan failed and will be retried: {error:#}");
-        std::thread::sleep(retry_delay);
-        pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .restore_failed(notice);
-        let _ = signal.try_send(());
-        return false;
+    let guard = match scan_lock {
+        None => None,
+        Some(lock_path) => match try_acquire_scan_lock(lock_path) {
+            Ok(Some(guard)) => Some(guard),
+            // Another process is scanning: keep the paths and look again
+            // shortly.
+            Ok(None) => {
+                requeue_background_scan(
+                    pending,
+                    signal,
+                    notice,
+                    super::WATCH_SCAN_LOCK_RETRY_DELAY,
+                );
+                return BackgroundScanOutcome::Deferred;
+            }
+            Err(error) => {
+                warn_scan_lock_unavailable(lock_path, &error);
+                None
+            }
+        },
+    };
+    let result = scan(&notice);
+    if let Some(guard) = guard {
+        drop(guard);
+        std::thread::sleep(super::WATCH_SCAN_LOCK_YIELD);
     }
-    true
+    match result {
+        Ok(()) => BackgroundScanOutcome::Completed,
+        Err(error) => {
+            eprintln!("daemon: background scan failed and will be retried: {error:#}");
+            requeue_background_scan(pending, signal, notice, retry_delay);
+            BackgroundScanOutcome::Failed
+        }
+    }
+}
+
+/// Reports an unusable scan lock once per process: every later pass would
+/// report the same thing.
+fn warn_scan_lock_unavailable(lock_path: &Path, error: &anyhow::Error) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "daemon: warning: could not use scan lock {}: {error:#}; scanning without it",
+            lock_path.display()
+        );
+    });
+}
+
+fn requeue_background_scan(
+    pending: &Arc<Mutex<PendingWatch>>,
+    signal: &mpsc::SyncSender<()>,
+    notice: WatchNotice,
+    delay: Duration,
+) {
+    std::thread::sleep(delay);
+    pending
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .restore_failed(notice);
+    let _ = signal.try_send(());
 }
 
 pub(super) fn rescan_changed_sources(
