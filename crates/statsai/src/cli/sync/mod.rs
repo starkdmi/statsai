@@ -156,6 +156,14 @@ pub(crate) fn validate_sync_command(command: &SyncCommand) -> Result<()> {
     if command.reset_remote && (command.status || command.verify) {
         bail!("--reset-remote cannot be combined with --status or --verify");
     }
+    if command.reset_remote && command.sink != "http" {
+        bail!("--reset-remote is currently supported only with --sink http");
+    }
+    if command.reset_remote && !command.dry_run && !command.yes {
+        bail!(
+            "--reset-remote deletes mirrored hosted sync data for this paired device; rerun with --yes"
+        );
+    }
     Ok(())
 }
 
@@ -405,11 +413,9 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
     Ok(None)
 }
 
+/// Runs `--reset-remote`. [`validate_sync_command`] has already required
+/// `--sink http`, and `--yes` unless this is a dry run.
 fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
-    if command.sink != "http" {
-        bail!("--reset-remote is currently supported only with --sink http");
-    }
-
     let endpoint = http_sync_endpoint(&command)?;
     if command.dry_run {
         println!(
@@ -425,12 +431,6 @@ fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
             }))?
         );
         return Ok(());
-    }
-
-    if !command.yes {
-        bail!(
-            "--reset-remote deletes mirrored hosted sync data for this paired device; rerun with --yes"
-        );
     }
 
     eprintln!(

@@ -432,13 +432,14 @@ statsai report cache --from 2026-05-01 --details
 Normal scans use a per-source file signature cache. `--no-cache` forces a
 one-off reread; `--replace` performs a destructive source rebuild.
 
-`statsai scan`, `statsai sync` (other than `--status` and `--verify`), and each
-pass of `statsai daemon --watch` take turns through `scan.lock` beside the
-database (`~/.statsai/scan.lock` by default). While another of them holds it,
-`scan` and `sync` wait up to 5 seconds, then print `Another statsai scan is
-running (lock: …); skipping.` (for `sync`, `…; skipping this sync. Nothing was
-sent.`) and exit successfully. A skipped `sync` still saves its
-`--include-*`/`--exclude-*` preference flags. The daemon keeps changed files
+`statsai scan`, `statsai sync` (other than `--status`, `--verify`, and
+`--reset-remote --dry-run`), and each pass of `statsai daemon --watch` take
+turns through `scan.lock` beside the database (`~/.statsai/scan.lock` by
+default). While another of them holds it, `scan` and `sync` wait up to 5
+seconds, then print `Another statsai scan is running (lock: …); skipping.` (for
+`sync`, `…; skipping this sync. Nothing was sent.`) and exit successfully. A
+skipped `sync` still saves its `--include-*`/`--exclude-*` preference flags.
+`sync --reset-remote` fails instead, having deleted nothing. The daemon keeps changed files
 queued until the lock is free. The lock is advisory: if its file cannot be
 opened or locked, these commands warn and run without it. `statsai import`,
 `conversation collect`, and `source remove --delete-data` do not take it yet.
@@ -526,7 +527,10 @@ never creates, migrates, backfills, reprices, or changes the permissions of the
 file, and returns a `ReadStore` with only the read APIs: session, daily, and
 cache reports, quota and list queries, `data_version`, and
 `with_read_snapshot`. A missing store, or one whose schema is older or newer
-than the binary's, is a typed `ReadOnlyOpenError` the caller can act on. A
+than the binary's, is a typed `ReadOnlyOpenError` the caller can act on. Each
+read checks the schema again in its own snapshot, so a reader left open while a
+newer `statsai` migrates the store gets that error (inside the `anyhow::Error`)
+instead of misreading the new schema. A
 process that collects into the store should hold the scan lock, via
 `statsai::try_acquire_scan_lock` or `statsai::acquire_scan_lock_with_timeout`
 with `statsai::default_scan_lock_path()`.

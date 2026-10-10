@@ -471,6 +471,36 @@ fn check_schema_reports_a_migration_made_after_the_open() {
 }
 
 #[test]
+fn every_read_refuses_a_store_migrated_after_the_open() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = store_path(&directory);
+    written_store(&path, 1);
+    let reader = Store::open_read_only(&path).expect("open read-only");
+    assert_eq!(reader.event_count().expect("read at open"), 1);
+
+    let future = CURRENT_SCHEMA_VERSION + 1;
+    Connection::open(&path)
+        .expect("writer connection")
+        .execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, '2026-10-01T00:00:00Z')",
+            [future],
+        )
+        .expect("a newer binary migrates the store");
+
+    let refused = |error: anyhow::Error| match error.downcast_ref::<ReadOnlyOpenError>() {
+        Some(ReadOnlyOpenError::SchemaTooNew { found, .. }) => assert_eq!(*found, future),
+        _ => panic!("expected SchemaTooNew, got {error:#}"),
+    };
+    refused(reader.event_count().expect_err("a single read"));
+    refused(reader.list_sources().expect_err("a list read"));
+    refused(
+        reader
+            .with_read_snapshot(|reader| reader.event_count())
+            .expect_err("a read snapshot"),
+    );
+}
+
+#[test]
 fn reads_proceed_during_a_write_and_see_it_once_committed() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = store_path(&directory);

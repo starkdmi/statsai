@@ -27,6 +27,15 @@ fn scanning_commands_take_the_scan_lock_and_others_do_not() {
         "--reset-remote",
         "--yes"
     ]));
+    // A dry run only prints what it would reset.
+    assert!(!takes(&[
+        "statsai",
+        "sync",
+        "--sink",
+        "http",
+        "--reset-remote",
+        "--dry-run"
+    ]));
     assert!(!takes(&["statsai", "sync", "--status"]));
     assert!(!takes(&["statsai", "sync", "--verify"]));
     // The watch daemon takes it per pass, not for its lifetime.

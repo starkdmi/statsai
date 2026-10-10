@@ -1,5 +1,5 @@
 //! `statsai scan` and `statsai sync` wait for a running scanner, then skip
-//! without failing.
+//! without failing, except `sync --reset-remote`, which fails.
 
 use statsai_store::{Store, SyncPreferences};
 use std::path::Path;
@@ -106,6 +106,47 @@ fn an_invalid_sync_is_an_error_even_while_another_scan_holds_the_lock() {
         !stderr.contains("Another statsai scan is running"),
         "{stderr}"
     );
+}
+
+#[test]
+fn a_remote_reset_fails_rather_than_skips_while_another_scan_holds_the_lock() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = directory.path().join("statsai.sqlite");
+    let lock = statsai::scan_lock_path(&store);
+    let _other_scanner = statsai::try_acquire_scan_lock(&lock)
+        .expect("acquire")
+        .expect("uncontended lock");
+
+    // The first two are flag errors, reported before any wait.
+    for (args, expected) in [
+        (
+            &["sync", "--reset-remote", "--yes"][..],
+            "--reset-remote is currently supported only with --sink http".to_owned(),
+        ),
+        (
+            &["sync", "--sink", "http", "--reset-remote"][..],
+            "rerun with --yes".to_owned(),
+        ),
+        (
+            &["sync", "--sink", "http", "--reset-remote", "--yes"][..],
+            format!(
+                "Another statsai scan is running (lock: {}); --reset-remote did not run and nothing was deleted.",
+                lock.display()
+            ),
+        ),
+    ] {
+        let output = run_statsai(directory.path(), &store, args)
+            .wait_with_output()
+            .expect("statsai output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{args:?} succeeded while the lock was busy: {stderr}"
+        );
+        assert!(stderr.contains(&expected), "{args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{args:?} wrote output");
+    }
+    assert!(!store.exists(), "a turned-away reset opened the store");
 }
 
 #[test]

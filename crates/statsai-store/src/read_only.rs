@@ -79,10 +79,11 @@ pub enum ReadOnlyOpenError {
 /// [`ReadStore::with_read_snapshot`] to see one point in time, and compare
 /// [`ReadStore::data_version`] to notice that a writer has committed since.
 ///
-/// The schema version is checked when the store opens, but a writer such as a
-/// newer `statsai` may migrate the store while it stays open. A long-lived
-/// reader should call [`ReadStore::check_schema`] whenever `data_version`
-/// changes, and reopen or stop reading when it fails.
+/// A writer such as a newer `statsai` may migrate the store while it stays
+/// open, so the schema version is checked again at the start of each of those
+/// transactions, in the same snapshot as the reads. A read of a store whose
+/// schema has changed since the open fails with a [`ReadOnlyOpenError`] that
+/// `anyhow::Error::downcast_ref` recovers; reopen, or stop reading.
 ///
 /// In WAL mode SQLite coordinates readers through the `-wal` and `-shm` files
 /// beside the database. When no other connection has the store open they may
@@ -138,7 +139,8 @@ impl ReadStore {
     }
 
     /// Checks again, as the open did, that the store's schema is the one this
-    /// binary reads.
+    /// binary reads. Every read already does this; this checks without
+    /// reading anything else.
     ///
     /// # Errors
     ///
@@ -175,25 +177,41 @@ impl ReadStore {
         self.store.data_version()
     }
 
-    /// Runs several reads against one point-in-time view. See
+    /// Runs several reads against one point-in-time view, after checking that
+    /// the schema in that view is still the one this binary reads. See
     /// [`Store::with_read_snapshot`].
     pub fn with_read_snapshot<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
-        self.store.with_read_snapshot(|_| operation(self))
+        self.read(|_| operation(self))
+    }
+
+    /// Runs `operation` in a read transaction that first checks the schema.
+    /// The check is the transaction's first read, so it and `operation` see
+    /// the same snapshot and a migration cannot land between them. Inside
+    /// [`ReadStore::with_read_snapshot`] it joins that transaction, which has
+    /// already checked.
+    fn read<T>(&self, operation: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        if !self.store.conn.is_autocommit() {
+            return operation(&self.store);
+        }
+        self.store.with_read_snapshot(|store| {
+            self.check_schema()?;
+            operation(store)
+        })
     }
 
     /// The pricing ruleset the store's costs were last computed with. A reader
     /// never reprices, so this can trail the binary's own ruleset until a
     /// writer such as `statsai scan` next opens the store.
     pub fn applied_pricing_ruleset_version(&self) -> Result<Option<u64>> {
-        self.store.applied_pricing_ruleset_version()
+        self.read(|store| store.applied_pricing_ruleset_version())
     }
 
     pub fn event_count(&self) -> Result<u64> {
-        self.store.event_count()
+        self.read(|store| store.event_count())
     }
 
     pub fn token_total(&self) -> Result<u64> {
-        self.store.token_total()
+        self.read(|store| store.token_total())
     }
 
     /// See [`Store::session_rollups_in_period`].
@@ -206,8 +224,9 @@ impl ReadStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SessionRollupV1>> {
-        self.store
-            .session_rollups_in_period(since, until, filter, sort, limit, offset)
+        self.read(|store| {
+            store.session_rollups_in_period(since, until, filter, sort, limit, offset)
+        })
     }
 
     /// See [`Store::session_stats_in_period`].
@@ -217,7 +236,7 @@ impl ReadStore {
         until: DateTime<Utc>,
         filter: &SessionFilter,
     ) -> Result<SessionStats> {
-        self.store.session_stats_in_period(since, until, filter)
+        self.read(|store| store.session_stats_in_period(since, until, filter))
     }
 
     /// Every daily summary as stored. Unlike
@@ -225,7 +244,7 @@ impl ReadStore {
     /// are returned as they are rather than rebuilt; the next writer that
     /// reads them through [`Store`] rebuilds them.
     pub fn all_sync_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
-        self.store.stored_sync_rollup_summaries()
+        self.read(|store| store.stored_sync_rollup_summaries())
     }
 
     /// See [`Store::daily_rollups_between`].
@@ -234,7 +253,7 @@ impl ReadStore {
         start_date: &str,
         end_date: &str,
     ) -> Result<Vec<DailyRollup>> {
-        self.store.daily_rollups_between(start_date, end_date)
+        self.read(|store| store.daily_rollups_between(start_date, end_date))
     }
 
     /// See [`Store::cache_report`].
@@ -246,17 +265,17 @@ impl ReadStore {
     where
         Tz::Offset: std::fmt::Display,
     {
-        self.store.cache_report(query, timeline_zone)
+        self.read(|store| store.cache_report(query, timeline_zone))
     }
 
     /// See [`Store::quota_status`].
     pub fn quota_status(&self, query: &QuotaQuery) -> Result<QuotaStatus> {
-        self.store.quota_status(query)
+        self.read(|store| store.quota_status(query))
     }
 
     /// See [`Store::quota_windows`].
     pub fn quota_windows(&self, query: &QuotaQuery) -> Result<Vec<QuotaWindowV1>> {
-        self.store.quota_windows(query)
+        self.read(|store| store.quota_windows(query))
     }
 
     /// See [`Store::quota_observations`].
@@ -265,7 +284,7 @@ impl ReadStore {
         query: &QuotaQuery,
         collapse_duplicates: bool,
     ) -> Result<Vec<QuotaObservationRecordV1>> {
-        self.store.quota_observations(query, collapse_duplicates)
+        self.read(|store| store.quota_observations(query, collapse_duplicates))
     }
 
     /// See [`Store::weekly_reset_anchor`].
@@ -274,28 +293,27 @@ impl ReadStore {
         provider: &str,
         provider_account_id: &ProviderAccountId,
     ) -> Result<Option<WeeklyResetAnchor>> {
-        self.store
-            .weekly_reset_anchor(provider, provider_account_id)
+        self.read(|store| store.weekly_reset_anchor(provider, provider_account_id))
     }
 
     pub fn list_sources(&self) -> Result<Vec<SourceLocation>> {
-        self.store.list_sources()
+        self.read(|store| store.list_sources())
     }
 
     pub fn list_accounts(&self) -> Result<Vec<ProviderAccount>> {
-        self.store.list_accounts()
+        self.read(|store| store.list_accounts())
     }
 
     pub fn list_source_account_assignments(&self) -> Result<Vec<SourceAccountAssignment>> {
-        self.store.list_source_account_assignments()
+        self.read(|store| store.list_source_account_assignments())
     }
 
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>> {
-        self.store.list_subscriptions()
+        self.read(|store| store.list_subscriptions())
     }
 
     pub fn list_sync_states(&self) -> Result<Vec<SyncState>> {
-        self.store.list_sync_states()
+        self.read(|store| store.list_sync_states())
     }
 }
 

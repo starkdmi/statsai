@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use statsai::{default_device_id, default_store_path, snapshot, ScanLockGuard};
 use statsai_store::Store;
@@ -102,13 +102,13 @@ pub(crate) fn command_reprices_persisted_usage(command: &Command) -> bool {
 ///
 /// `sync` refreshes git code-change scans and rebuilds daily summaries before
 /// it sends, and `--reset-remote` clears the sync tracking a running sync
-/// records, so it must not interleave with one. Only `--status` and
-/// `--verify`, which read, go without it. The watch daemon is not listed: it
-/// takes the lock for each pass instead of for its lifetime.
+/// records, so it must not interleave with one. Only `--status`, `--verify`
+/// and `--reset-remote --dry-run`, which read, go without it. The watch daemon
+/// is not listed: it takes the lock for each pass instead of for its lifetime.
 pub(crate) fn command_takes_scan_lock(command: &Command) -> bool {
     match command {
         Command::Scan(_) => true,
-        Command::Sync(sync) => !(sync.status || sync.verify),
+        Command::Sync(sync) => !(sync.status || sync.verify || (sync.reset_remote && sync.dry_run)),
         _ => false,
     }
 }
@@ -150,6 +150,10 @@ pub(crate) fn acquire_command_scan_lock(
 /// the run it skips would have: they apply to every later sync, and an
 /// opt-out must not be lost because a scan happened to be running. It collects
 /// and sends nothing.
+///
+/// `sync --reset-remote` fails instead. It is a one-off the user asked for,
+/// and a script that resets and then resyncs must not carry on as if the reset
+/// had happened.
 fn skip_for_running_scan(command: &Command, store_path: &Path, lock_path: &Path) -> Result<()> {
     let Command::Sync(sync) = command else {
         eprintln!(
@@ -158,8 +162,14 @@ fn skip_for_running_scan(command: &Command, store_path: &Path, lock_path: &Path)
         );
         return Ok(());
     };
-    // `--dry-run` and `--reset-remote` never record preferences.
-    if !sync.dry_run && !sync.reset_remote && sync_command_sets_preferences(sync) {
+    if sync.reset_remote {
+        bail!(
+            "Another statsai scan is running (lock: {}); --reset-remote did not run and nothing was deleted. Retry when it finishes.",
+            lock_path.display()
+        );
+    }
+    // `--dry-run` never records preferences.
+    if !sync.dry_run && sync_command_sets_preferences(sync) {
         apply_sync_preference_overrides(&Store::open(store_path)?, sync)?;
     }
     eprintln!(
