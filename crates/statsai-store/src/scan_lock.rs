@@ -32,21 +32,67 @@ const SCAN_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// directory, so `~/.statsai/statsai.sqlite` is guarded by
 /// `~/.statsai/scan.lock`.
 ///
-/// Symlinks are resolved, so a link to the store, or a path through a linked
-/// directory, finds the same lock as the store's own path. When the store
-/// does not exist yet, its directory is resolved instead, and when that does
-/// not exist either, the path is used as written. Hard links to the store are
-/// not detected: each directory that holds one has its own lock.
+/// Every process that names one store must get the same lock file, however it
+/// spells the path and whatever exists yet:
+///
+/// - A symlink at the store path is followed, even before its target exists,
+///   so a link to the store shares the store's lock.
+/// - The longest part of the directory that exists is resolved, and the
+///   directories that don't exist yet are appended as written, so the path is
+///   the same before and after a scanner creates them, including through a
+///   linked directory such as macOS's `/var` → `/private/var`.
+/// - A bare file name is taken relative to the current directory.
+///
+/// Hard links to the store are not detected: each directory that holds one has
+/// its own lock.
 #[must_use]
 pub fn scan_lock_path(store_path: &Path) -> PathBuf {
-    let parent = store_path.parent().unwrap_or_else(|| Path::new(""));
-    let directory = match std::fs::canonicalize(store_path) {
-        Ok(store) => store
-            .parent()
-            .map_or_else(|| parent.to_path_buf(), Path::to_path_buf),
-        Err(_) => std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()),
+    let store = follow_symlinks(store_path);
+    let directory = match store.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     };
-    directory.join(SCAN_LOCK_FILE_NAME)
+    resolve_existing_prefix(directory).join(SCAN_LOCK_FILE_NAME)
+}
+
+/// `path` with any symlink at its last component followed, even one whose
+/// target does not exist.
+fn follow_symlinks(path: &Path) -> PathBuf {
+    // Bounded, so a link cycle cannot loop; the open reports those.
+    const MAX_LINKS: usize = 40;
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        let Ok(target) = std::fs::read_link(&path) else {
+            break;
+        };
+        // An absolute target replaces the parent in `join`.
+        path = path
+            .parent()
+            .map_or_else(|| target.clone(), |parent| parent.join(&target));
+    }
+    path
+}
+
+/// `path` with its longest existing prefix canonicalized and the rest appended
+/// as written, or `path` itself when no prefix resolves.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(existing) {
+            return missing
+                .iter()
+                .rev()
+                .fold(resolved, |resolved, name| resolved.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// Proof that this process holds the scan lock. Dropping it releases the lock.
@@ -164,14 +210,64 @@ mod tests {
 
     #[test]
     fn the_lock_lives_beside_the_store() {
+        let root = std::fs::canonicalize("/").expect("root");
         assert_eq!(
-            scan_lock_path(Path::new("/home/me/.statsai/statsai.sqlite")),
-            PathBuf::from("/home/me/.statsai/scan.lock")
+            scan_lock_path(Path::new("/statsai-test-missing/.statsai/statsai.sqlite")),
+            root.join("statsai-test-missing")
+                .join(".statsai")
+                .join(SCAN_LOCK_FILE_NAME)
         );
         assert_eq!(
             scan_lock_path(Path::new("statsai.sqlite")),
-            PathBuf::from("scan.lock")
+            std::fs::canonicalize(".")
+                .expect("current directory")
+                .join(SCAN_LOCK_FILE_NAME)
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_lock_path_is_the_same_before_and_after_the_store_directory_exists() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let real_directory = directory.path().join("real");
+        let link_directory = directory.path().join("link");
+        std::fs::create_dir(&real_directory).expect("real directory");
+        std::os::unix::fs::symlink(&real_directory, &link_directory).expect("symlink");
+        let store = link_directory.join("data").join("statsai.sqlite");
+
+        let before = scan_lock_path(&store);
+        assert_eq!(
+            before,
+            std::fs::canonicalize(&real_directory)
+                .expect("canonical directory")
+                .join("data")
+                .join(SCAN_LOCK_FILE_NAME)
+        );
+        std::fs::create_dir(link_directory.join("data")).expect("data directory");
+        assert_eq!(scan_lock_path(&store), before);
+        std::fs::write(&store, b"").expect("store file");
+        assert_eq!(scan_lock_path(&store), before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_to_a_store_not_yet_created_shares_the_store_s_lock() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let real_directory = directory.path().join("real");
+        let link_directory = directory.path().join("link");
+        std::fs::create_dir(&real_directory).expect("real directory");
+        std::fs::create_dir(&link_directory).expect("link directory");
+        let store = real_directory.join("statsai.sqlite");
+        let linked_store = link_directory.join("statsai.sqlite");
+        // Relative, and dangling until the store is created.
+        std::os::unix::fs::symlink(Path::new("../real/statsai.sqlite"), &linked_store)
+            .expect("symlink");
+
+        let lock = scan_lock_path(&store);
+        assert_eq!(scan_lock_path(&linked_store), lock);
+        std::fs::write(&store, b"").expect("store file");
+        assert_eq!(scan_lock_path(&linked_store), lock);
+        assert_eq!(scan_lock_path(&store), lock);
     }
 
     #[test]
