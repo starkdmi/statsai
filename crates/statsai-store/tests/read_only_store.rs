@@ -4,13 +4,28 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use rusqlite::Connection;
 use statsai_core::{
-    Confidence, CostInfo, EventId, EventSource, LocationOrigin, ModelInfo, PrivacyInfo,
-    PrivacyMode, SessionInfo, SourceKind, SourceLocation, UsageCounts, UsageEvent,
-    USAGE_EVENT_SCHEMA_VERSION,
+    account_identity_observation_id, account_plan_observation_id, activity_invocation_id,
+    provider_account_id, source_account_assignment_id, summary_id, AccountEvidenceKind,
+    AccountEvidenceSummaryV1, AccountIdentityObservationV1, AccountPlanObservationV1,
+    AccountPlanProjectionV1, ActivityCoverageLevel, ActivityCoverageV1, ActivityDurationKind,
+    ActivityFamily, ActivityInvocationV1, ActivityKind, ActivityOutcome, ActivityRollupV1,
+    CodeChangeMetric, CodeChangeMetricKind, CodeLineCounts, Confidence, CostInfo, CoverageStatus,
+    EventId, EventSource, IdentitySource, LocationOrigin, ModelInfo, PrivacyInfo, PrivacyMode,
+    ProviderAccount, ProviderAccountId, QuotaCycleContributionV1, QuotaObservationRecordV1,
+    SessionInfo, SessionRollupV1, SourceAccountAssignment, SourceKind, SourceLocation,
+    SummaryMetadata, SyncBatch, TaskBucketSnapshot, TaskSpan, TaskSpanId, TaskStatus,
+    TaskVerification, TaskVerificationAction, TaskVerificationId, UsageCounts, UsageEvent,
+    UsageSummary, WorkItem, WorkItemId, WorkItemMember,
+    ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION, ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION,
+    ACTIVITY_COVERAGE_SCHEMA_VERSION, ACTIVITY_INVOCATION_SCHEMA_VERSION, ACTIVITY_PARSER_REVISION,
+    CODE_CHANGE_METRIC_SCHEMA_VERSION, PROVIDER_ACCOUNT_SCHEMA_VERSION,
+    SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION, SYNC_BATCH_SCHEMA_VERSION, TASK_SPAN_SCHEMA_VERSION,
+    TASK_VERIFICATION_SCHEMA_VERSION, USAGE_EVENT_SCHEMA_VERSION, USAGE_SUMMARY_SCHEMA_VERSION,
+    WORK_ITEM_SCHEMA_VERSION,
 };
 use statsai_store::{
-    CacheReportQuery, QuotaQuery, ReadOnlyOpenError, ReadStore, SessionFilter, SessionSort, Store,
-    CURRENT_SCHEMA_VERSION,
+    ActivityPersistMode, ActivityStatus, CacheReportQuery, QuotaQuery, ReadOnlyOpenError,
+    ReadStore, SessionFilter, SessionSort, Store, CURRENT_SCHEMA_VERSION,
 };
 use std::path::{Path, PathBuf};
 
@@ -110,6 +125,505 @@ fn written_store(path: &Path, events: u32) {
     store.insert_events(&events).expect("events");
 }
 
+fn claude_source() -> SourceLocation {
+    SourceLocation::local_adapter(
+        "claude_code",
+        "read-only-test",
+        "0",
+        Path::new("/tmp/statsai-read-only-test-claude"),
+        LocationOrigin::Configured,
+    )
+}
+
+fn codex_account_id() -> ProviderAccountId {
+    provider_account_id("codex", "read-only")
+}
+
+fn claude_account_id() -> ProviderAccountId {
+    provider_account_id("claude_code", "read-only")
+}
+
+fn account(provider: &str, id: ProviderAccountId) -> ProviderAccount {
+    let at = started_at(0);
+    ProviderAccount {
+        schema_version: PROVIDER_ACCOUNT_SCHEMA_VERSION.to_string(),
+        provider_account_id: id,
+        provider: provider.to_string(),
+        identity_source: IdentitySource::UserConfigured,
+        provider_user_id: None,
+        provider_user_id_hash: Some(format!("user-hash-{provider}")),
+        email_hash: None,
+        email: None,
+        org_id_hash: None,
+        account_label: Some(format!("{provider} read-only")),
+        plan_name: None,
+        confidence: Confidence::High,
+        verified_at: None,
+        created_at: at,
+        updated_at: at,
+    }
+}
+
+fn assignment(source: &SourceLocation, account: &ProviderAccountId) -> SourceAccountAssignment {
+    let from = started_at(0) - Duration::days(30);
+    SourceAccountAssignment {
+        schema_version: SOURCE_ACCOUNT_ASSIGNMENT_SCHEMA_VERSION.to_string(),
+        assignment_id: source_account_assignment_id(&source.source_id, account, from),
+        source_id: source.source_id.clone(),
+        provider: source.provider.clone(),
+        provider_account_id: account.clone(),
+        started_at: from,
+        ended_at: None,
+        record_source: IdentitySource::UserConfigured,
+        verified_at: None,
+        created_at: from,
+        updated_at: from,
+    }
+}
+
+fn manual_summary(name: &str, format: &str) -> UsageSummary {
+    let start = Utc
+        .with_ymd_and_hms(2026, 7, 2, 0, 0, 0)
+        .single()
+        .expect("summary day");
+    UsageSummary {
+        schema_version: USAGE_SUMMARY_SCHEMA_VERSION.to_string(),
+        summary_id: summary_id("codex", &source().source_id, name),
+        device_id: "device_read_only".to_string(),
+        provider: "codex".to_string(),
+        source_id: source().source_id,
+        provider_account_id: Some(codex_account_id()),
+        source: EventSource {
+            adapter_id: "read-only-test".to_string(),
+            adapter_version: "0".to_string(),
+            source_kind: SourceKind::Manual,
+            location_origin: Some(LocationOrigin::Configured),
+            source_type: "json".to_string(),
+            source_path_hash: None,
+            source_record_id: Some(format!("record:{name}")),
+            parse_confidence: Confidence::Medium,
+        },
+        model: None,
+        models: Vec::new(),
+        usage: UsageCounts {
+            input_tokens: Some(2_000),
+            total_tokens: Some(2_000),
+            ..UsageCounts::default()
+        },
+        cost: CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: None,
+            provider_reported_usd: None,
+            estimated_api_equivalent_micro_usd: Some(40_000),
+            provider_reported_micro_usd: None,
+            pricing_source: None,
+            pricing_version: None,
+            confidence: Confidence::Medium,
+        },
+        parse_evidence: None,
+        project: None,
+        privacy: PrivacyInfo {
+            mode: PrivacyMode::MetadataOnly,
+            contains_prompt_text: false,
+            contains_response_text: false,
+            contains_file_paths: false,
+        },
+        metrics: None,
+        period_start: Some(start),
+        period_end: Some(start + Duration::days(1)),
+        observed_at: start,
+        metadata: SummaryMetadata {
+            summary_format: format.to_string(),
+            summary_version: Some("1".to_string()),
+            total_sessions: None,
+            total_messages: None,
+            last_computed_at: Some(start),
+        },
+        imported_at: start,
+    }
+}
+
+fn quota_record(index: u32, used_percent: f64) -> QuotaObservationRecordV1 {
+    let observed_at = started_at(0) + Duration::hours(i64::from(index) * 6);
+    let resets_at = started_at(0) + Duration::days(5);
+    serde_json::from_value(serde_json::json!({
+        "observation": {
+            "schema_version": "quota_observation.v1",
+            "observation_id": format!("quota-observation-read-only-{index}"),
+            "semantic_fingerprint": format!("quota-semantic-read-only-{index}"),
+            "provider": "codex",
+            "source_id": source().source_id,
+            "provider_account_id": null,
+            "observed_at": observed_at,
+            "source_file_path_hash": "quota-file",
+            "source_record_id": format!("quota-record-{index}"),
+            "source_line_number": index + 1,
+            "payload_hash": format!("quota-payload-{index}"),
+            "usage_sample": null,
+            "usage_event_id": null,
+            "usage_link_kind": "none",
+            "status": {
+                "plan_type": "pro",
+                "individual_limit": null,
+                "spend_control_state": null,
+                "reached_type": null,
+                "credits": {
+                    "has_credits": false,
+                    "unlimited": false,
+                    "balance": null,
+                    "balance_raw": null
+                }
+            }
+        },
+        "windows": [{
+            "schema_version": "quota_window_observation.v1",
+            "window_observation_id": format!("quota-window-read-only-{index}"),
+            "observation_id": format!("quota-observation-read-only-{index}"),
+            "provider_slot": "secondary",
+            "limit_id": "codex",
+            "window_minutes": 10080,
+            "used_percent": used_percent,
+            "resets_at": resets_at,
+            "resets_at_epoch_seconds": resets_at.timestamp()
+        }],
+        "raw_rate_limits": {"secondary": {"used_percent": used_percent}}
+    }))
+    .expect("quota record")
+}
+
+fn work_item_and_span(index: u32) -> (WorkItem, WorkItemMember, TaskSpan) {
+    let begun = started_at(index * 10);
+    let ended = begun + Duration::minutes(5);
+    let bucket = format!("bucket-read-only-{index}");
+    let span_id = TaskSpanId(format!("span-read-only-{index}"));
+    let work_item_id = WorkItemId(format!("work-read-only-{index}"));
+    let usage = UsageCounts {
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        total_tokens: Some(15),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let item = WorkItem {
+        schema_version: WORK_ITEM_SCHEMA_VERSION.to_string(),
+        work_item_id: work_item_id.clone(),
+        anchor_span_id: span_id.clone(),
+        tail_span_id: span_id.clone(),
+        project_bucket: bucket.clone(),
+        title: format!("Task {index}"),
+        normalized_title: format!("task {index}"),
+        status: TaskStatus::NeedsReview,
+        confidence: Confidence::Medium,
+        started_at: begun,
+        ended_at: ended,
+        duration_seconds: Some(300),
+        span_count: 1,
+        event_count: 1,
+        total_input_tokens: 10,
+        total_cache_creation_tokens: 0,
+        total_cache_read_tokens: 0,
+        total_output_tokens: 5,
+        total_reasoning_tokens: 0,
+        total_tokens: 15,
+        estimated_cost_usd: None,
+        estimated_cost_micro_usd: Some(250_000),
+        providers: vec!["codex".to_string()],
+        issue_keys: Vec::new(),
+        repo_label: Some("owner/repo".to_string()),
+        branch_labels: vec!["main".to_string()],
+        path_label: Some("/tmp/statsai-read-only-project".to_string()),
+        summary_preview: None,
+        todo_excerpt: None,
+        no_git: false,
+        cross_provider: false,
+        continuation_reasons: Vec::new(),
+        review_reasons: vec!["needs_review".to_string()],
+    };
+    let member = WorkItemMember {
+        work_item_id,
+        span_id: span_id.clone(),
+        ordinal: 0,
+    };
+    let span = TaskSpan {
+        schema_version: TASK_SPAN_SCHEMA_VERSION.to_string(),
+        span_id,
+        provider: "codex".to_string(),
+        source_id: source().source_id,
+        span_kind: "codex_task".to_string(),
+        source_record_id: Some(format!("task-record-{index}")),
+        source_file_path_hash: None,
+        summary_id: None,
+        session_id: Some(format!("task-session-{index}")),
+        thread_id: Some(format!("task-thread-{index}")),
+        title: format!("Task {index}"),
+        normalized_title: format!("task {index}"),
+        title_source: Some("thread_name".to_string()),
+        summary_preview: None,
+        todo_excerpt: None,
+        issue_keys: Vec::new(),
+        branch_family: Some("main".to_string()),
+        project_bucket: bucket,
+        project: None,
+        git: None,
+        usage,
+        estimated_cost_usd: None,
+        estimated_cost_micro_usd: Some(250_000),
+        event_count: 1,
+        has_usage_evidence: true,
+        total_messages: 2,
+        user_messages: 1,
+        assistant_messages: 1,
+        developer_messages: 0,
+        linked_event_ids: Vec::new(),
+        confidence: Confidence::High,
+        is_meta: false,
+        started_at: begun,
+        ended_at: Some(ended),
+        duration_seconds: Some(300),
+    };
+    (item, member, span)
+}
+
+/// Tasks, task verifications and code-change metrics, received the way a
+/// synced batch delivers them.
+fn task_and_code_change_batch() -> SyncBatch {
+    let task_buckets = (0..2)
+        .map(|index| {
+            let (item, member, span) = work_item_and_span(index);
+            TaskBucketSnapshot {
+                project_bucket: item.project_bucket.clone(),
+                generated_at: item.ended_at,
+                applied_verification_cursor: None,
+                work_items: vec![item],
+                members: vec![member],
+                spans: vec![span],
+            }
+        })
+        .collect();
+    let verified_at = started_at(30);
+    let code_change_metric = |index: u32| CodeChangeMetric {
+        schema_version: CODE_CHANGE_METRIC_SCHEMA_VERSION.to_string(),
+        metric_id: format!("metric-read-only-{index}"),
+        device_id: "device_read_only".to_string(),
+        day: started_at(0).date_naive(),
+        project_id: Some("project-read-only".to_string()),
+        repository_hash: Some("repository-read-only".to_string()),
+        commit_hash: None,
+        kind: CodeChangeMetricKind::AgentEdit,
+        counts: CodeLineCounts::default(),
+        attribution_confidence: None,
+        trace_coverage: CoverageStatus::Complete,
+        git_coverage: CoverageStatus::Complete,
+    };
+    SyncBatch {
+        schema_version: SYNC_BATCH_SCHEMA_VERSION.to_string(),
+        batch_id: "batch_read_only".to_string(),
+        device_id: "device_read_only".to_string(),
+        sources: Vec::new(),
+        accounts: Vec::new(),
+        source_account_assignments: Vec::new(),
+        subscriptions: Vec::new(),
+        account_plan_observations: Vec::new(),
+        account_evidence_summaries: Vec::new(),
+        events: Vec::new(),
+        summaries: Vec::new(),
+        task_buckets,
+        task_verifications: vec![TaskVerification {
+            schema_version: TASK_VERIFICATION_SCHEMA_VERSION.to_string(),
+            verification_id: TaskVerificationId("tvf-read-only".to_string()),
+            action_key: "status:span-read-only-0".to_string(),
+            action: TaskVerificationAction::Accept {
+                work_item_id: WorkItemId("work-read-only-0".to_string()),
+                anchor_span_id: TaskSpanId("span-read-only-0".to_string()),
+            },
+            created_at: verified_at,
+            updated_at: verified_at,
+        }],
+        code_change_metrics: vec![code_change_metric(0), code_change_metric(1)],
+        quota_cycle_contributions: Vec::new(),
+        activity_rollups: Vec::new(),
+        activity_coverage: Vec::new(),
+        sessions: Vec::new(),
+        authoritative_snapshot: None,
+        created_at: verified_at,
+    }
+}
+
+/// A store with a row in every table the dashboard-facing reads use: usage,
+/// imported summaries, accounts, quota windows and a manual weekly schedule,
+/// plan and identity evidence, activity, sessions, tasks and code changes.
+fn written_store_with_everything(path: &Path) {
+    let store = Store::open(path).expect("create store");
+    let codex = source();
+    let claude = claude_source();
+    store.upsert_source(&codex).expect("codex source");
+    store.upsert_source(&claude).expect("claude source");
+    for (provider, id) in [
+        ("codex", codex_account_id()),
+        ("claude_code", claude_account_id()),
+    ] {
+        store
+            .upsert_account(&account(provider, id))
+            .expect("account");
+    }
+    store
+        .upsert_source_account_assignment(&assignment(&codex, &codex_account_id()))
+        .expect("codex assignment");
+    store
+        .upsert_source_account_assignment(&assignment(&claude, &claude_account_id()))
+        .expect("claude assignment");
+
+    let mut events = (0..6).map(event).collect::<Vec<_>>();
+    for event in &mut events {
+        event.provider_account_id = Some(codex_account_id());
+    }
+    events.extend((0..3).map(|index| {
+        let mut event = event(100 + index);
+        event.event_id = EventId(format!("event_read_only_claude_{index}"));
+        event.provider = "claude_code".to_string();
+        event.source_id = claude.source_id.clone();
+        event.provider_account_id = Some(claude_account_id());
+        event.session.session_id = "session_read_only_claude".to_string();
+        event.session.local_session_id_hash = Some("session_hash_read_only_claude".to_string());
+        event
+    }));
+    store.insert_events(&events).expect("events");
+
+    for (name, format) in [
+        ("manual-daily", "manual_daily"),
+        ("ccusage-daily", "ccusage_daily"),
+    ] {
+        store
+            .upsert_summary(&manual_summary(name, format))
+            .expect("summary");
+    }
+
+    store
+        .upsert_quota_observations(&[
+            quota_record(0, 10.0),
+            quota_record(1, 35.5),
+            quota_record(2, 50.0),
+        ])
+        .expect("quota observations");
+    store
+        .upsert_weekly_reset_anchor(
+            "claude_code",
+            &claude_account_id(),
+            started_at(0) - Duration::hours(3),
+        )
+        .expect("weekly reset anchor");
+
+    let evidence_at = started_at(0) - Duration::hours(1);
+    store
+        .upsert_account_plan_observations(&[AccountPlanObservationV1 {
+            schema_version: ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: account_plan_observation_id(
+                &codex.source_id,
+                Some(&codex_account_id()),
+                "pro",
+                "Pro",
+                evidence_at,
+                AccountEvidenceKind::AuthSnapshot,
+            ),
+            provider: "codex".to_string(),
+            source_id: codex.source_id.clone(),
+            provider_account_id: Some(codex_account_id()),
+            raw_plan_name: "pro".to_string(),
+            plan_name: "Pro".to_string(),
+            observed_at: evidence_at,
+            active_from: None,
+            active_until: None,
+            is_current_snapshot: true,
+            evidence_kind: AccountEvidenceKind::AuthSnapshot,
+            confidence: Confidence::High,
+            parser_version: "read-only-test".to_string(),
+            artifact_path_hash: "a".repeat(64),
+            record_fingerprint: "b".repeat(64),
+        }])
+        .expect("plan observation");
+    store
+        .upsert_account_identity_observations(&[AccountIdentityObservationV1 {
+            schema_version: ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION.to_string(),
+            observation_id: account_identity_observation_id(
+                &codex.source_id,
+                AccountEvidenceKind::AuthSnapshot,
+                evidence_at,
+                "identity-read-only",
+            ),
+            provider: "codex".to_string(),
+            source_id: codex.source_id.clone(),
+            provider_account_id: Some(codex_account_id()),
+            provider_user_id_hash: Some("user-hash-codex".to_string()),
+            email_hash: None,
+            conversation_id_hash: None,
+            turn_id_hash: None,
+            observed_at: evidence_at,
+            evidence_kind: AccountEvidenceKind::AuthSnapshot,
+            confidence: Confidence::High,
+            auth_mode: None,
+            application_version: None,
+            parser_version: "read-only-test".to_string(),
+            artifact_kind: "auth_json".to_string(),
+            artifact_path_hash: "c".repeat(64),
+            record_fingerprint: "identity-read-only".to_string(),
+        }])
+        .expect("identity observation");
+
+    let invocation = |index: u32, name: &str, family| ActivityInvocationV1 {
+        schema_version: ACTIVITY_INVOCATION_SCHEMA_VERSION.to_string(),
+        invocation_id: activity_invocation_id(&["codex", "read-only", &index.to_string()]),
+        provider: "codex".to_string(),
+        source_id: codex.source_id.clone(),
+        provider_account_id: Some(codex_account_id()),
+        source_file_path_hash: "activity-file".to_string(),
+        observed_at: started_at(index),
+        kind: ActivityKind::Tool,
+        display_name: name.to_string(),
+        family,
+        mcp_server: None,
+        mcp_tool: None,
+        plugin: None,
+        skill_catalog: None,
+        model: None,
+        outcome: ActivityOutcome::Succeeded,
+        duration_ms: Some(100),
+        duration_kind: Some(ActivityDurationKind::Reported),
+        evidence: "codex-native-items".to_string(),
+        parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
+    };
+    let day = started_at(0).date_naive().to_string();
+    store
+        .persist_activity_scan(
+            "device_read_only",
+            &codex.source_id,
+            &[
+                invocation(0, "exec", ActivityFamily::Shell),
+                invocation(1, "apply_patch", ActivityFamily::FileWrite),
+            ],
+            &[ActivityCoverageV1 {
+                schema_version: ACTIVITY_COVERAGE_SCHEMA_VERSION.to_string(),
+                coverage_id: "activity-coverage-read-only".to_string(),
+                device_id: "device_read_only".to_string(),
+                source_id: codex.source_id.clone(),
+                provider: "codex".to_string(),
+                day: day.clone(),
+                day_end: day,
+                kind: ActivityKind::Tool,
+                level: ActivityCoverageLevel::Complete,
+                evidence: "codex-native-items".to_string(),
+                parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
+            }],
+            &["activity-file".to_string()],
+            ActivityPersistMode::ReplaceFiles,
+            None,
+        )
+        .expect("activity");
+
+    store
+        .ingest_sync_batch(&task_and_code_change_batch())
+        .expect("tasks and code changes");
+}
+
 fn recorded_schema_version(path: &Path) -> Option<i64> {
     statsai_store::database_schema_version(path).expect("schema version")
 }
@@ -176,6 +690,45 @@ fn read_everything(reader: &ReadStore) {
         .expect("source account assignments");
     reader.list_subscriptions().expect("subscriptions");
     reader.list_sync_states().expect("sync states");
+    reader.summaries().expect("summaries");
+    reader.account(&codex_account_id()).expect("one account");
+    reader
+        .quota_cycle_contributions(&QuotaQuery::default(), "device_read_only")
+        .expect("quota cycle contributions");
+    reader
+        .account_plan_projections("device_read_only")
+        .expect("plan projections");
+    reader
+        .account_evidence_summaries("device_read_only")
+        .expect("evidence summaries");
+    reader.all_activity_rollups().expect("activity rollups");
+    reader.all_activity_coverage().expect("activity coverage");
+    reader
+        .activity_invocation_count()
+        .expect("activity invocation count");
+    reader
+        .activity_status(None, None, true)
+        .expect("activity status");
+    reader.all_session_rollups().expect("all session rollups");
+    let work_items = reader.work_items().expect("work items");
+    let work_item_id = work_items
+        .first()
+        .map(|item| item.work_item_id.clone())
+        .unwrap_or_else(|| WorkItemId("work_read_only".to_string()));
+    reader.work_item(&work_item_id).expect("one work item");
+    reader.task_spans().expect("task spans");
+    reader
+        .task_spans_for_work_item(&work_item_id)
+        .expect("work item spans");
+    reader.task_verifications().expect("task verifications");
+    for bucket in reader.task_project_buckets().expect("task buckets") {
+        reader
+            .task_bucket_snapshot(&bucket, None)
+            .expect("task bucket snapshot");
+    }
+    reader
+        .list_code_change_metrics(false)
+        .expect("code change metrics");
     reader
         .with_read_snapshot(|snapshot| snapshot.event_count())
         .expect("read snapshot");
@@ -302,6 +855,156 @@ fn a_current_v31_store_reads_like_the_writer_and_is_left_byte_for_byte_unchanged
             .expect("sessions"),
         reader_sessions
     );
+}
+
+/// What the reads beyond usage totals return, in a form two stores can be
+/// compared by. A bucket snapshot's `generated_at` is the time of the read,
+/// so it is left out.
+#[derive(Debug, PartialEq)]
+struct BeyondUsage {
+    summaries: Vec<UsageSummary>,
+    account: Option<ProviderAccount>,
+    quota_cycle_contributions: Vec<QuotaCycleContributionV1>,
+    account_plan_projections: Vec<AccountPlanProjectionV1>,
+    account_evidence_summaries: Vec<AccountEvidenceSummaryV1>,
+    activity_rollups: Vec<ActivityRollupV1>,
+    activity_coverage: Vec<ActivityCoverageV1>,
+    activity_invocation_count: u64,
+    activity_status: ActivityStatus,
+    session_rollups: Vec<SessionRollupV1>,
+    work_items: Vec<WorkItem>,
+    work_item: Option<WorkItem>,
+    task_spans: Vec<TaskSpan>,
+    work_item_spans: Vec<TaskSpan>,
+    task_verifications: Vec<TaskVerification>,
+    task_project_buckets: Vec<String>,
+    task_bucket_snapshots: Vec<TaskBucketSnapshot>,
+    code_change_metrics: Vec<CodeChangeMetric>,
+}
+
+macro_rules! read_beyond_usage {
+    ($store:expr) => {{
+        let store = $store;
+        let work_items = store.work_items().expect("work items");
+        let work_item_id = work_items
+            .first()
+            .expect("a work item")
+            .work_item_id
+            .clone();
+        let task_project_buckets = store
+            .task_project_buckets()
+            .expect("task buckets")
+            .into_iter()
+            .collect::<Vec<_>>();
+        let task_bucket_snapshots = task_project_buckets
+            .iter()
+            .map(|bucket| {
+                let mut snapshot = store
+                    .task_bucket_snapshot(bucket, None)
+                    .expect("task bucket snapshot");
+                snapshot.generated_at = DateTime::<Utc>::UNIX_EPOCH;
+                snapshot
+            })
+            .collect();
+        BeyondUsage {
+            summaries: store.summaries().expect("summaries"),
+            account: store.account(&codex_account_id()).expect("account"),
+            quota_cycle_contributions: store
+                .quota_cycle_contributions(&QuotaQuery::default(), "device_read_only")
+                .expect("quota cycle contributions"),
+            account_plan_projections: store
+                .account_plan_projections("device_read_only")
+                .expect("plan projections"),
+            account_evidence_summaries: store
+                .account_evidence_summaries("device_read_only")
+                .expect("evidence summaries"),
+            activity_rollups: store.all_activity_rollups().expect("activity rollups"),
+            activity_coverage: store.all_activity_coverage().expect("activity coverage"),
+            activity_invocation_count: store.activity_invocation_count().expect("invocation count"),
+            activity_status: store
+                .activity_status(None, None, true)
+                .expect("activity status"),
+            session_rollups: store.all_session_rollups().expect("session rollups"),
+            work_items,
+            work_item: store.work_item(&work_item_id).expect("work item"),
+            task_spans: store.task_spans().expect("task spans"),
+            work_item_spans: store
+                .task_spans_for_work_item(&work_item_id)
+                .expect("work item spans"),
+            task_verifications: store.task_verifications().expect("verifications"),
+            task_project_buckets,
+            task_bucket_snapshots,
+            code_change_metrics: store
+                .list_code_change_metrics(false)
+                .expect("code change metrics"),
+        }
+    }};
+}
+
+#[test]
+fn the_reads_beyond_usage_match_the_writer_and_leave_the_store_unchanged() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = store_path(&directory);
+    written_store_with_everything(&path);
+    let before = std::fs::read(&path).expect("database bytes");
+
+    let reader = Store::open_read_only(&path).expect("open read-only");
+    read_everything(&reader);
+    let read = read_beyond_usage!(&reader);
+    drop(reader);
+
+    // The fixture reaches every read: none of them came back empty.
+    assert_eq!(read.summaries.len(), 2);
+    assert_eq!(
+        read.account
+            .as_ref()
+            .map(|account| account.provider_account_id.clone()),
+        Some(codex_account_id())
+    );
+    for provider in ["codex", "claude_code"] {
+        assert!(
+            read.quota_cycle_contributions
+                .iter()
+                .any(|contribution| contribution.provider == provider),
+            "no {provider} quota cycle contribution: {:?}",
+            read.quota_cycle_contributions
+        );
+    }
+    assert_eq!(read.account_plan_projections.len(), 1);
+    assert_eq!(read.account_evidence_summaries.len(), 1);
+    assert_eq!(read.activity_rollups.len(), 2);
+    assert_eq!(read.activity_coverage.len(), 1);
+    assert_eq!(read.activity_invocation_count, 2);
+    assert_eq!(read.activity_status.tool_calls, 2);
+    assert_eq!(read.session_rollups.len(), 4);
+    assert_eq!(read.work_items.len(), 2);
+    assert_eq!(read.work_item.as_ref(), read.work_items.first());
+    assert_eq!(read.task_spans.len(), 2);
+    assert_eq!(read.work_item_spans.len(), 1);
+    assert_eq!(read.task_verifications.len(), 1);
+    assert_eq!(read.task_project_buckets.len(), 2);
+    assert!(read
+        .task_bucket_snapshots
+        .iter()
+        .all(|snapshot| snapshot.work_items.len() == 1 && snapshot.spans.len() == 1));
+    assert_eq!(read.code_change_metrics.len(), 2);
+
+    assert_eq!(
+        std::fs::read(&path).expect("database bytes"),
+        before,
+        "reading changed the database file"
+    );
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    if wal.exists() {
+        assert_eq!(
+            std::fs::metadata(&wal).expect("wal").len(),
+            0,
+            "a reader wrote to the WAL"
+        );
+    }
+
+    let writer = Store::open(&path).expect("writer");
+    assert_eq!(read_beyond_usage!(&writer), read);
 }
 
 #[test]

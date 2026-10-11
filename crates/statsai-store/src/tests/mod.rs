@@ -10,5 +10,6 @@ mod scan_state;
 mod sources;
 mod summaries;
 mod support;
+mod sync_payload;
 mod sync_state;
 mod verified;
