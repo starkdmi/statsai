@@ -46,8 +46,18 @@ fn summary_for_sync_drops_the_project_unless_included_and_record_ids_always() {
     let store = store_with_project_usage();
     let summaries = store.all_sync_rollup_summaries().expect("rollups");
     assert_eq!(summaries.len(), 1);
-    let stored = summaries[0].clone();
+    let mut stored = summaries[0].clone();
     assert!(stored.project.is_some());
+    stored.source.source_record_id = Some("payload-record".to_string());
+    stored.parse_evidence = Some(ParseEvidence {
+        event_key_version: "test.v1".to_string(),
+        source_file_path_hash: Some("file-hash".to_string()),
+        source_line_number: Some(7),
+        source_record_id: Some("payload-record".to_string()),
+        model_inferred: false,
+        timestamp_inferred: false,
+        account_identity_source: statsai_core::IdentitySource::UserConfigured,
+    });
 
     for include_projects in [false, true] {
         for accepts_cache_health in [false, true] {
@@ -61,6 +71,10 @@ fn summary_for_sync_drops_the_project_unless_included_and_record_ids_always() {
             );
             assert_eq!(sent.project.is_some(), include_projects);
             assert_eq!(sent.source.source_record_id, None);
+            let evidence = sent.parse_evidence.as_ref().expect("parse evidence");
+            assert_eq!(evidence.source_record_id, None);
+            assert_eq!(evidence.source_line_number, None);
+            assert_eq!(evidence.source_file_path_hash.as_deref(), Some("file-hash"));
         }
     }
 }

@@ -14,8 +14,8 @@ use statsai_core::{
     ProviderAccount, ProviderAccountId, QuotaCycleContributionV1, QuotaObservationRecordV1,
     SessionInfo, SessionRollupV1, SourceAccountAssignment, SourceKind, SourceLocation,
     SummaryMetadata, SyncBatch, TaskBucketSnapshot, TaskSpan, TaskSpanId, TaskStatus,
-    TaskVerification, TaskVerificationAction, TaskVerificationId, UsageCounts, UsageEvent,
-    UsageSummary, WorkItem, WorkItemId, WorkItemMember,
+    TaskVerification, TaskVerificationAction, TaskVerificationCursor, TaskVerificationId,
+    UsageCounts, UsageEvent, UsageSummary, WorkItem, WorkItemId, WorkItemMember,
     ACCOUNT_IDENTITY_OBSERVATION_SCHEMA_VERSION, ACCOUNT_PLAN_OBSERVATION_SCHEMA_VERSION,
     ACTIVITY_COVERAGE_SCHEMA_VERSION, ACTIVITY_INVOCATION_SCHEMA_VERSION, ACTIVITY_PARSER_REVISION,
     CODE_CHANGE_METRIC_SCHEMA_VERSION, PROVIDER_ACCOUNT_SCHEMA_VERSION,
@@ -449,9 +449,10 @@ fn task_and_code_change_batch() -> SyncBatch {
     }
 }
 
-/// A store with a row in every table the dashboard-facing reads use: usage,
-/// imported summaries, accounts, quota windows and a manual weekly schedule,
-/// plan and identity evidence, activity, sessions, tasks and code changes.
+/// A store with rows for every read beyond usage totals: usage, imported
+/// summaries, accounts, quota windows and a manual weekly schedule, plan and
+/// identity evidence, activity, sessions, tasks and code changes. It has no
+/// subscriptions or sync state.
 fn written_store_with_everything(path: &Path) {
     let store = Store::open(path).expect("create store");
     let codex = source();
@@ -859,18 +860,21 @@ fn a_current_v31_store_reads_like_the_writer_and_is_left_byte_for_byte_unchanged
 
 /// What the reads beyond usage totals return, in a form two stores can be
 /// compared by. A bucket snapshot's `generated_at` is the time of the read,
-/// so it is left out.
+/// so it is left out. Reads that take arguments are made with values that
+/// change the result, so a reader that ignored one would not match.
 #[derive(Debug, PartialEq)]
 struct BeyondUsage {
     summaries: Vec<UsageSummary>,
     account: Option<ProviderAccount>,
     quota_cycle_contributions: Vec<QuotaCycleContributionV1>,
+    codex_quota_cycle_contributions: Vec<QuotaCycleContributionV1>,
     account_plan_projections: Vec<AccountPlanProjectionV1>,
     account_evidence_summaries: Vec<AccountEvidenceSummaryV1>,
     activity_rollups: Vec<ActivityRollupV1>,
     activity_coverage: Vec<ActivityCoverageV1>,
     activity_invocation_count: u64,
     activity_status: ActivityStatus,
+    claude_activity_status: ActivityStatus,
     session_rollups: Vec<SessionRollupV1>,
     work_items: Vec<WorkItem>,
     work_item: Option<WorkItem>,
@@ -880,6 +884,15 @@ struct BeyondUsage {
     task_project_buckets: Vec<String>,
     task_bucket_snapshots: Vec<TaskBucketSnapshot>,
     code_change_metrics: Vec<CodeChangeMetric>,
+    dirty_code_change_metrics: Vec<CodeChangeMetric>,
+}
+
+/// The cursor a bucket snapshot echoes back as applied.
+fn applied_cursor() -> TaskVerificationCursor {
+    TaskVerificationCursor {
+        updated_at: started_at(30),
+        verification_id: TaskVerificationId("tvf-read-only".to_string()),
+    }
 }
 
 macro_rules! read_beyond_usage {
@@ -900,7 +913,7 @@ macro_rules! read_beyond_usage {
             .iter()
             .map(|bucket| {
                 let mut snapshot = store
-                    .task_bucket_snapshot(bucket, None)
+                    .task_bucket_snapshot(bucket, Some(applied_cursor()))
                     .expect("task bucket snapshot");
                 snapshot.generated_at = DateTime::<Utc>::UNIX_EPOCH;
                 snapshot
@@ -912,6 +925,15 @@ macro_rules! read_beyond_usage {
             quota_cycle_contributions: store
                 .quota_cycle_contributions(&QuotaQuery::default(), "device_read_only")
                 .expect("quota cycle contributions"),
+            codex_quota_cycle_contributions: store
+                .quota_cycle_contributions(
+                    &QuotaQuery {
+                        provider: Some("codex".to_string()),
+                        ..QuotaQuery::default()
+                    },
+                    "device_read_only",
+                )
+                .expect("codex quota cycle contributions"),
             account_plan_projections: store
                 .account_plan_projections("device_read_only")
                 .expect("plan projections"),
@@ -924,6 +946,9 @@ macro_rules! read_beyond_usage {
             activity_status: store
                 .activity_status(None, None, true)
                 .expect("activity status"),
+            claude_activity_status: store
+                .activity_status(Some("claude_code"), Some(ActivityKind::Tool), false)
+                .expect("claude activity status"),
             session_rollups: store.all_session_rollups().expect("session rollups"),
             work_items,
             work_item: store.work_item(&work_item_id).expect("work item"),
@@ -937,6 +962,9 @@ macro_rules! read_beyond_usage {
             code_change_metrics: store
                 .list_code_change_metrics(false)
                 .expect("code change metrics"),
+            dirty_code_change_metrics: store
+                .list_code_change_metrics(true)
+                .expect("dirty code change metrics"),
         }
     }};
 }
@@ -953,7 +981,8 @@ fn the_reads_beyond_usage_match_the_writer_and_leave_the_store_unchanged() {
     let read = read_beyond_usage!(&reader);
     drop(reader);
 
-    // The fixture reaches every read: none of them came back empty.
+    // Every read beyond usage totals came back non-empty, and each argument
+    // changed what came back.
     assert_eq!(read.summaries.len(), 2);
     assert_eq!(
         read.account
@@ -970,12 +999,21 @@ fn the_reads_beyond_usage_match_the_writer_and_leave_the_store_unchanged() {
             read.quota_cycle_contributions
         );
     }
+    assert!(!read.codex_quota_cycle_contributions.is_empty());
+    assert!(read
+        .codex_quota_cycle_contributions
+        .iter()
+        .all(|contribution| contribution.provider == "codex"));
+    assert!(read.codex_quota_cycle_contributions.len() < read.quota_cycle_contributions.len());
     assert_eq!(read.account_plan_projections.len(), 1);
     assert_eq!(read.account_evidence_summaries.len(), 1);
     assert_eq!(read.activity_rollups.len(), 2);
     assert_eq!(read.activity_coverage.len(), 1);
     assert_eq!(read.activity_invocation_count, 2);
     assert_eq!(read.activity_status.tool_calls, 2);
+    assert!(read.activity_status.include_activity);
+    assert_eq!(read.claude_activity_status.tool_calls, 0);
+    assert!(!read.claude_activity_status.include_activity);
     assert_eq!(read.session_rollups.len(), 4);
     assert_eq!(read.work_items.len(), 2);
     assert_eq!(read.work_item.as_ref(), read.work_items.first());
@@ -983,11 +1021,14 @@ fn the_reads_beyond_usage_match_the_writer_and_leave_the_store_unchanged() {
     assert_eq!(read.work_item_spans.len(), 1);
     assert_eq!(read.task_verifications.len(), 1);
     assert_eq!(read.task_project_buckets.len(), 2);
-    assert!(read
-        .task_bucket_snapshots
-        .iter()
-        .all(|snapshot| snapshot.work_items.len() == 1 && snapshot.spans.len() == 1));
+    assert!(read.task_bucket_snapshots.iter().all(|snapshot| {
+        snapshot.work_items.len() == 1
+            && snapshot.spans.len() == 1
+            && snapshot.applied_verification_cursor == Some(applied_cursor())
+    }));
     assert_eq!(read.code_change_metrics.len(), 2);
+    // Metrics received in a batch are already synced, so none is dirty.
+    assert!(read.dirty_code_change_metrics.is_empty());
 
     assert_eq!(
         std::fs::read(&path).expect("database bytes"),

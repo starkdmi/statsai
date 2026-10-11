@@ -56,11 +56,12 @@ fn is_exact_period_passthrough_summary(summary: &UsageSummary) -> bool {
     )
 }
 
-/// The cache report's and the pending counts' copy of
-/// [`crate::sync_payload::is_http_rollup_passthrough_summary`], which the batch
-/// uses. It differs in one case: it swaps bounds that run backwards, so a daily
-/// report whose end precedes its start by up to 25 hours across two dates
-/// counts here but is not sent.
+/// The copy of [`crate::sync_payload::is_http_rollup_passthrough_summary`]
+/// that the cache report and [`Store::pending_http_sync_summary_counts`] use.
+/// The batch and `sync --verify` use that one. This copy differs in one case:
+/// it swaps bounds that run backwards. So a daily report whose end precedes
+/// its start on an earlier date, by at most 25 hours, counts here but is not
+/// sent.
 pub(crate) fn is_http_rollup_passthrough_summary(summary: &UsageSummary) -> bool {
     if summary.metadata.summary_format == "daily_rollup.v1" {
         return false;

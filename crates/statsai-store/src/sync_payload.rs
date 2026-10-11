@@ -1,16 +1,23 @@
 //! The form local records take in a sync batch.
 //!
 //! `statsai sync` builds every batch through these functions, so a program
-//! that reads the store and applies them gets the records a sync would send,
-//! with the same fields removed or rewritten. Selection by sync state (what is
-//! pending for a target) is not part of this: it is the store's sync ledger.
+//! that reads the store and applies them removes and rewrites the same fields
+//! a sync does. Some things stay outside this module:
+//!
+//! - Selection by sync state (what is pending for a target) belongs to the
+//!   store's sync ledger.
+//! - Upkeep a sync runs before reading, such as rebuilding stale daily rollups
+//!   or refreshing code-change metrics.
+//! - The device's opt-ins and the target's capabilities. The caller passes
+//!   them in as `include_projects` and `accepts_cache_health`. Without
+//!   `include_projects`, records leave the device without their project.
+//!
+//! Path labels under the home directory are shown as `~/...`, relative to the
+//! home directory of the process that calls these functions.
 //!
 //! The sanitizers for summaries, sessions, tasks and code-change metrics live
 //! in `statsai-core` with their types, and are re-exported here so that this
 //! module lists every transform a batch applies.
-//!
-//! Functions that take `include_projects` follow the device's project opt-in:
-//! without it, records leave the device without their project.
 
 use chrono::Duration;
 use statsai_core::{
@@ -43,10 +50,10 @@ pub fn summary_for_sync(
     )
 }
 
-/// The summary as a sync batch carries it: sanitized, without a project
-/// unless projects are included, and with a project path label under the
-/// home directory shown as `~/...`. Never stored locally: pending-sync
-/// selection and acknowledgements hash this form, the payload that is sent.
+/// The part of [`summary_for_sync`] that does not depend on the target: the
+/// summary sanitized, without a project unless projects are included, and
+/// with a project path label under the home directory shown as `~/...`.
+/// Never stored locally.
 #[must_use]
 pub fn sanitize_summary_for_sync_with_projects(
     summary: UsageSummary,
@@ -79,16 +86,21 @@ pub fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
 }
 
 /// Whether an HTTP rollup batch sends this stored summary alongside the daily
-/// rollups. Summaries from a provider adapter always go. A daily report
-/// (`manual_daily`, `external_daily`, `custom_daily`, `ccusage_daily`) goes
-/// when it covers one report day: one UTC date, or at most 25 hours. A period
-/// report (`manual_period_summary`, `custom_period_summary`) goes when it
-/// spans more than one UTC date. Daily rollups, the Claude stats cache, local
-/// summaries and other formats never do.
+/// rollups.
+///
+/// - Daily rollups, the Claude stats cache and summaries from a
+///   `local_summary` source never go.
+/// - Any other summary from a `local_adapter` source always goes.
+/// - A daily report (`manual_daily`, `external_daily`, `custom_daily`,
+///   `ccusage_daily`) goes when it covers one report day: its bounds fall on
+///   one UTC date, or are at most 25 hours apart.
+/// - A period report (`manual_period_summary`, `custom_period_summary`) goes
+///   when its bounds fall on different UTC dates.
+/// - Other formats never go.
 ///
 /// A missing bound falls back to the other bound, then to `observed_at`.
-/// Bounds that run backwards are not swapped, so such a daily report spanning
-/// two dates is not sent.
+/// Bounds that run backwards are not swapped, so a daily report whose end
+/// precedes its start on an earlier date is not sent.
 #[must_use]
 pub fn is_http_rollup_passthrough_summary(summary: &UsageSummary) -> bool {
     if is_daily_rollup_summary(summary) {

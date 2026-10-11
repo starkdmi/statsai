@@ -257,8 +257,11 @@ impl ReadStore {
         self.read(|store| store.session_stats_in_period(since, until, filter))
     }
 
-    /// Every stored summary other than the daily rollups: imported reports and
-    /// summaries a provider adapter recorded. See [`Store::summaries`].
+    /// Every row of the summaries table: imported reports, summaries a
+    /// provider adapter recorded, and summaries received in a sync batch, which
+    /// may include daily rollups. The daily rollups built from this store's
+    /// events are [`ReadStore::all_sync_rollup_summaries`]. See
+    /// [`Store::summaries`].
     /// [`crate::sync_payload::is_http_rollup_passthrough_summary`] picks the
     /// ones a rollup sync sends with the daily rollups.
     pub fn summaries(&self) -> Result<Vec<UsageSummary>> {
@@ -361,7 +364,7 @@ impl ReadStore {
     }
 
     /// See [`Store::account_plan_projections`]. `device_id` is stamped on each
-    /// projection.
+    /// projection and goes into its `projection_id`.
     pub fn account_plan_projections(
         &self,
         device_id: &str,
@@ -370,7 +373,7 @@ impl ReadStore {
     }
 
     /// See [`Store::account_evidence_summaries`]. `device_id` is stamped on
-    /// each summary.
+    /// each summary and goes into its `summary_id`.
     pub fn account_evidence_summaries(
         &self,
         device_id: &str,
