@@ -31,7 +31,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn existing_schema_version(conn: &Connection) -> Result<Option<i64>> {
+/// The recorded schema version, or `None` before `schema_migrations` exists.
+///
+/// Only reads, so a read-only connection can use it.
+pub(crate) fn existing_schema_version(conn: &Connection) -> Result<Option<i64>> {
     let has_migrations_table = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
         [],

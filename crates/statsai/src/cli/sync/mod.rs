@@ -62,7 +62,20 @@ pub(crate) fn effective_sync_preferences(
     Ok(preferences.normalized())
 }
 
-fn apply_sync_preference_overrides(
+/// Whether the command carries any flag that changes the stored sync
+/// preferences.
+pub(crate) fn sync_command_sets_preferences(command: &SyncCommand) -> bool {
+    command.include_projects
+        || command.exclude_projects
+        || command.include_tasks
+        || command.exclude_tasks
+        || command.include_activity
+        || command.exclude_activity
+        || command.include_sessions
+        || command.exclude_sessions
+}
+
+pub(crate) fn apply_sync_preference_overrides(
     store: &Store,
     command: &SyncCommand,
 ) -> Result<SyncPreferences> {
@@ -133,17 +146,38 @@ fn apply_sync_preference_overrides(
     Ok(preferences)
 }
 
-pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
+/// Rejects an unknown sink and flag combinations that cannot run together, so
+/// a bad command fails the same way whether or not it would wait. It needs no
+/// store, so
+/// the caller can check before waiting for the scan lock, and a sync that a
+/// running scan turns away still reports them.
+pub(crate) fn validate_sync_command(command: &SyncCommand) -> Result<()> {
+    if !matches!(command.sink.as_str(), "stdout" | "file" | "http") {
+        bail!("unsupported sync sink {}", command.sink);
+    }
     if command.since_last && (command.full || command.rebuild_rollups) {
         bail!("--since-last cannot be combined with --full or --rebuild-rollups");
     }
+    if command.reset_remote && (command.status || command.verify) {
+        bail!("--reset-remote cannot be combined with --status or --verify");
+    }
+    if command.reset_remote && command.sink != "http" {
+        bail!("--reset-remote is currently supported only with --sink http");
+    }
+    if command.reset_remote && !command.dry_run && !command.yes {
+        bail!(
+            "--reset-remote deletes mirrored hosted sync data for this paired device; rerun with --yes"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Result<()> {
+    validate_sync_command(&command)?;
 
     let sync_preferences = effective_sync_preferences(store, &command)?;
 
     if command.reset_remote {
-        if command.status || command.verify {
-            bail!("--reset-remote cannot be combined with --status or --verify");
-        }
         return sync_remote_reset(command, store);
     }
 
@@ -226,8 +260,9 @@ pub(crate) fn sync(command: SyncCommand, store: &Store, device_id: &str) -> Resu
             return Ok(());
         }
 
-        let persisted_sync_preferences = apply_sync_preference_overrides(store, &command)?;
-        debug_assert_eq!(persisted_sync_preferences, sync_preferences);
+        // The stored preferences can differ from `sync_preferences` by now: a
+        // sync that this run's scan lock turned away still saves its flags.
+        apply_sync_preference_overrides(store, &command)?;
 
         reached_send.set(true);
         let result = (|| -> Result<()> {
@@ -384,11 +419,9 @@ fn maybe_reset_http_sync_tracking_if_remote_changed(
     Ok(None)
 }
 
+/// Runs `--reset-remote`. [`validate_sync_command`] has already required
+/// `--sink http`, and `--yes` unless this is a dry run.
 fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
-    if command.sink != "http" {
-        bail!("--reset-remote is currently supported only with --sink http");
-    }
-
     let endpoint = http_sync_endpoint(&command)?;
     if command.dry_run {
         println!(
@@ -404,12 +437,6 @@ fn sync_remote_reset(command: SyncCommand, store: &Store) -> Result<()> {
             }))?
         );
         return Ok(());
-    }
-
-    if !command.yes {
-        bail!(
-            "--reset-remote deletes mirrored hosted sync data for this paired device; rerun with --yes"
-        );
     }
 
     eprintln!(

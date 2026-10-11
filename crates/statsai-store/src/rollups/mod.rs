@@ -27,6 +27,12 @@ impl Store {
 
     pub fn all_sync_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
         self.ensure_current_sync_rollup_versions()?;
+        self.stored_sync_rollup_summaries()
+    }
+
+    /// Every daily summary exactly as stored, without first rebuilding the
+    /// ones an older binary wrote. Only reads, so a read-only store can use it.
+    pub(crate) fn stored_sync_rollup_summaries(&self) -> Result<Vec<UsageSummary>> {
         self.sync_rollup_summaries_by_sql(
             "SELECT payload FROM sync_rollups ORDER BY updated_at, summary_id",
         )

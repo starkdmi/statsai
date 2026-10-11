@@ -3032,6 +3032,7 @@ dependencies = [
  "statsai-core",
  "statsai-pricing",
  "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

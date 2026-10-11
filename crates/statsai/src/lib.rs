@@ -13,6 +13,20 @@ use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+/// The lock that keeps scanners of one store from running at once.
+///
+/// `statsai scan`, `statsai sync` (except `--status`, `--verify`, and
+/// `--reset-remote --dry-run`), and each pass of `statsai daemon --watch` hold
+/// it. `statsai import`, `statsai
+/// conversation collect`, and `statsai source remove --delete-data` also write
+/// collected data but do not take it yet. It is implemented in `statsai-store`
+/// so the daemon crate can share it, and re-exported here beside the default
+/// paths.
+pub use statsai_store::{
+    acquire_scan_lock_with_timeout, scan_lock_path, try_acquire_scan_lock, ScanLockGuard,
+    SCAN_LOCK_FILE_NAME,
+};
+
 /// Opens a store for a command that reads or publishes price-derived data and
 /// applies the compiled pricing ruleset first.
 pub fn open_operational_store(path: &Path) -> Result<Store> {
@@ -33,6 +47,14 @@ pub fn default_store_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".statsai")
         .join("statsai.sqlite")
+}
+
+/// `~/.statsai/scan.lock`, the scan lock for [`default_store_path`].
+///
+/// A store opened elsewhere with `--store` has its lock beside it instead; use
+/// [`scan_lock_path`] for that.
+pub fn default_scan_lock_path() -> PathBuf {
+    scan_lock_path(&default_store_path())
 }
 
 pub fn default_device_id() -> String {
@@ -409,6 +431,26 @@ mod tests {
         assert_eq!(
             statsai_store::database_applied_pricing_ruleset_version(&path).expect("unchanged"),
             Some(99)
+        );
+    }
+
+    #[test]
+    fn the_default_scan_lock_sits_beside_the_default_store() {
+        let lock = default_scan_lock_path();
+        assert_eq!(
+            lock.file_name(),
+            Some(std::ffi::OsStr::new(SCAN_LOCK_FILE_NAME))
+        );
+        // The same directory, though `scan_lock_path` resolves symlinks in it
+        // once it exists.
+        let resolved = |directory: &Path| {
+            std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf())
+        };
+        let store_directory = default_store_path();
+        let store_directory = store_directory.parent().expect("store directory");
+        assert_eq!(
+            resolved(lock.parent().expect("lock directory")),
+            resolved(store_directory)
         );
     }
 
