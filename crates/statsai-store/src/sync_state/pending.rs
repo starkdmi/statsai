@@ -425,12 +425,7 @@ impl Store {
         let rollups = self
             .all_sync_rollup_summaries()?
             .into_iter()
-            .map(|summary| {
-                summary_for_sync_target(
-                    sanitize_summary_for_http_sync(summary, include_projects),
-                    accepts_cache_health,
-                )
-            })
+            .map(|summary| summary_for_sync(summary, include_projects, accepts_cache_health))
             .collect::<Vec<_>>();
         self.pending_summaries_for_sync("http", target, &rollups)
     }
@@ -453,24 +448,14 @@ impl Store {
         let current_rollups = self
             .all_sync_rollup_summaries()?
             .into_iter()
-            .map(|summary| {
-                summary_for_sync_target(
-                    sanitize_summary_for_http_sync(summary, include_projects),
-                    accepts_cache_health,
-                )
-            })
+            .map(|summary| summary_for_sync(summary, include_projects, accepts_cache_health))
             .collect::<Vec<_>>();
         let rollups = self.pending_summaries_for_sync("http", target, &current_rollups)?;
         let current_passthrough_summaries = self
             .summaries()?
             .into_iter()
             .filter(is_http_rollup_passthrough_summary)
-            .map(|summary| {
-                summary_for_sync_target(
-                    sanitize_summary_for_http_sync(summary, include_projects),
-                    accepts_cache_health,
-                )
-            })
+            .map(|summary| summary_for_sync(summary, include_projects, accepts_cache_health))
             .collect::<Vec<_>>();
         let passthrough_summaries =
             self.pending_summaries_for_sync("http", target, &current_passthrough_summaries)?;

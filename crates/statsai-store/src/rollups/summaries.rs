@@ -5,28 +5,6 @@ pub(crate) fn summary_sync_payload_hash(summary: &UsageSummary) -> Result<String
     Ok(hash_text(&payload))
 }
 
-pub(crate) fn sanitize_summary_for_default_http_sync(summary: UsageSummary) -> UsageSummary {
-    sanitize_summary_for_http_sync(summary, false)
-}
-
-pub(crate) fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
-    summary.metadata.summary_format == "daily_rollup.v1"
-}
-
-/// The summary as an HTTP sync batch carries it: sanitized, without a project
-/// unless projects are included, and with a project path label under the
-/// home directory shown as `~/...`. Never stored locally.
-pub(crate) fn sanitize_summary_for_http_sync(
-    summary: UsageSummary,
-    include_projects: bool,
-) -> UsageSummary {
-    let mut summary = sanitize_summary_for_sync(summary);
-    if !include_projects {
-        summary.project = None;
-    }
-    statsai_core::collapse_summary_home_for_sync(summary, statsai_core::home_dir().as_deref())
-}
-
 pub(crate) fn summary_sync_day(summary: &UsageSummary) -> NaiveDate {
     summary
         .period_start
@@ -50,11 +28,6 @@ pub(crate) fn summary_period_bounds(summary: &UsageSummary) -> (DateTime<Utc>, D
     }
 }
 
-fn summary_spans_single_day(summary: &UsageSummary) -> bool {
-    let (start, end) = summary_period_bounds(summary);
-    start.date_naive() == end.date_naive()
-}
-
 fn summary_fits_single_daily_report_day(summary: &UsageSummary) -> bool {
     let (start, end) = summary_period_bounds(summary);
     if start.date_naive() == end.date_naive() {
@@ -69,30 +42,6 @@ fn is_exact_daily_passthrough_summary(summary: &UsageSummary) -> bool {
         summary.metadata.summary_format.as_str(),
         "external_daily" | "manual_daily" | "custom_daily" | "ccusage_daily"
     )
-}
-
-fn is_exact_period_passthrough_summary(summary: &UsageSummary) -> bool {
-    matches!(
-        summary.metadata.summary_format.as_str(),
-        "manual_period_summary" | "custom_period_summary"
-    )
-}
-
-pub(crate) fn is_http_rollup_passthrough_summary(summary: &UsageSummary) -> bool {
-    if summary.metadata.summary_format == "daily_rollup.v1" {
-        return false;
-    }
-    if summary.metadata.summary_format == "claude_stats_cache" {
-        return false;
-    }
-    if summary.source.source_kind == SourceKind::LocalSummary {
-        return false;
-    }
-    if summary.source.source_kind == SourceKind::LocalAdapter {
-        return true;
-    }
-    (is_exact_daily_passthrough_summary(summary) && summary_fits_single_daily_report_day(summary))
-        || (is_exact_period_passthrough_summary(summary) && !summary_spans_single_day(summary))
 }
 
 pub(crate) fn collect_pending_summary_days<'a>(

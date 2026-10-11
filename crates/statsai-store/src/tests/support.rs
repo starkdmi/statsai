@@ -1,9 +1,8 @@
 use super::*;
 pub(super) use crate::dedupe::model_key;
-pub(super) use crate::rollups::{
-    build_sync_rollup_summary, sanitize_summary_for_default_http_sync,
-};
+pub(super) use crate::rollups::build_sync_rollup_summary;
 pub(super) use crate::sql::is_sqlite_busy_or_locked;
+pub(super) use crate::sync_payload::sanitize_summary_for_sync_with_projects;
 pub(super) use crate::verified::upsert_verified_source_assignment;
 // Task spans still key on the remote-inclusive bucket; rollups do not.
 pub(super) use chrono::{TimeZone, Utc};

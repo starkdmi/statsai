@@ -1165,3 +1165,30 @@ fn sanitize_task_bucket_for_sync_collapses_work_item_and_span_paths() {
     assert_eq!(span.session_id, None);
     assert_eq!(span.thread_id, None);
 }
+
+#[test]
+fn work_items_and_spans_sanitize_alone_as_they_do_in_a_bucket() {
+    let home = Some(Path::new("/Users/alice"));
+    let item = home_work_item("/Users/alice/code/app");
+    let span = home_task_span("/Users/alice");
+    let bucket = sanitize_task_bucket_for_sync_with_home(
+        TaskBucketSnapshot {
+            project_bucket: "bucket".to_string(),
+            generated_at: mk_dt(2026, 5, 25),
+            applied_verification_cursor: None,
+            work_items: vec![item.clone()],
+            members: Vec::new(),
+            spans: vec![span.clone()],
+        },
+        home,
+    );
+
+    assert_eq!(
+        sanitize_work_item_for_sync_with_home(item, home),
+        bucket.work_items[0]
+    );
+    assert_eq!(
+        sanitize_task_span_for_sync_with_home(span, home),
+        bucket.spans[0]
+    );
+}

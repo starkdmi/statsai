@@ -406,9 +406,7 @@ fn a_receiver_without_cache_health_is_not_offered_summaries_that_differ_only_by_
         .all_sync_rollup_summaries()
         .expect("summaries")
         .into_iter()
-        .map(|summary| {
-            summary_for_sync_target(sanitize_summary_for_default_http_sync(summary), false)
-        })
+        .map(|summary| summary_for_sync(summary, false, false))
         .collect::<Vec<_>>();
     assert!(stripped.iter().all(|summary| summary
         .metrics

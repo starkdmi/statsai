@@ -1,20 +1,24 @@
 use anyhow::Result;
 #[cfg(test)]
 use chrono::DateTime;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 #[cfg(test)]
 use statsai_core::{
     micro_usd_to_cents_rounded, summary_id, Confidence, CostInfo, EventSource, PrivacyInfo,
-    PrivacyMode, SummaryMetadata, UsageCounts, USAGE_SUMMARY_SCHEMA_VERSION,
+    PrivacyMode, SummaryMetadata, UsageCounts, UsageEvent, USAGE_SUMMARY_SCHEMA_VERSION,
 };
 use statsai_core::{
-    project_contains_file_paths, sanitize_code_change_metric_for_sync,
-    sanitize_session_rollup_for_sync, sanitize_task_bucket_for_sync, IdentitySource, ProjectInfo,
-    ProviderAccount, SourceAccountAssignment, SourceKind, SourceLocation, Subscription,
-    SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, UsageEvent, UsageSummary,
+    SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, UsageSummary,
     SYNC_BATCH_SCHEMA_VERSION,
 };
-use statsai_store::{summary_for_sync_target, QuotaQuery, Store};
+use statsai_store::sync_payload::{
+    is_http_rollup_passthrough_summary, is_syncable_subscription, sanitize_account_for_sync,
+    sanitize_code_change_metric_for_sync, sanitize_event_for_sync_with_projects,
+    sanitize_session_rollup_for_sync_with_projects, sanitize_source_account_assignment_for_sync,
+    sanitize_source_for_sync, sanitize_subscription_for_sync, sanitize_task_bucket_for_sync,
+    summary_for_sync,
+};
+use statsai_store::{QuotaQuery, Store};
 #[cfg(test)]
 use std::collections::BTreeMap;
 
@@ -47,12 +51,8 @@ pub(crate) fn build_sync_batch_with_identity_key(
     let sync_preferences = effective_sync_preferences(store, command)?;
     let include_projects = sync_preferences.include_projects;
     let accepts_cache_health = store.sync_target_accepts_cache_health(&command.sink, target)?;
-    let for_target = |summary: UsageSummary| {
-        summary_for_sync_target(
-            sanitize_summary_for_sync_with_projects(summary, include_projects),
-            accepts_cache_health,
-        )
-    };
+    let for_target =
+        |summary: UsageSummary| summary_for_sync(summary, include_projects, accepts_cache_health);
     let payload_mode = sync_payload_mode(command)?;
     let state = if command.sink == "http" || command.since_last {
         store.sync_state(&command.sink, target)?
@@ -289,13 +289,7 @@ pub(crate) fn build_sync_batch_with_identity_key(
         store
             .all_session_rollups()?
             .into_iter()
-            .map(|rollup| {
-                let mut rollup = sanitize_session_rollup_for_sync(rollup);
-                if !include_projects {
-                    rollup.project = None;
-                }
-                rollup
-            })
+            .map(|rollup| sanitize_session_rollup_for_sync_with_projects(rollup, include_projects))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -600,60 +594,6 @@ fn sync_batch_task_verification_cursor(batch: &SyncBatch) -> Option<TaskVerifica
         })
 }
 
-pub(crate) fn sanitize_source_for_sync(mut source: SourceLocation) -> SourceLocation {
-    source.path_label = None;
-    source
-}
-
-pub(crate) fn sanitize_account_for_sync(mut account: ProviderAccount) -> ProviderAccount {
-    if !matches!(account.identity_source, IdentitySource::UserConfigured) {
-        account.account_label = None;
-    }
-    // The email and provider user id stay. They are how a person tells one of
-    // their own accounts from another in the dashboard, which is the whole
-    // point of syncing accounts at all; stripping them left every account
-    // showing as a bare `acct_` hash. The new evidence types are the ones that
-    // must never carry them -- those travel as hashes and are covered by their
-    // own contracts. `plan_name` still goes, because a plan is now evidence
-    // rather than an account attribute.
-    account.plan_name = None;
-    account
-}
-
-pub(crate) fn sanitize_source_account_assignment_for_sync(
-    assignment: SourceAccountAssignment,
-) -> SourceAccountAssignment {
-    assignment
-}
-
-pub(crate) fn sanitize_event_for_sync(mut event: UsageEvent) -> UsageEvent {
-    // Per-call timing and sub-agent identity stay on the device. Daily
-    // summaries carry the counts derived from them.
-    event.context = None;
-    event.source.source_record_id = None;
-    if let Some(evidence) = event.parse_evidence.as_mut() {
-        evidence.source_line_number = None;
-        evidence.source_record_id = None;
-    }
-    event.project = event.project.and_then(sanitize_project_for_sync);
-    if project_contains_file_paths(event.project.as_ref()) {
-        event.privacy.contains_file_paths = true;
-    }
-    event
-}
-
-fn sanitize_event_for_sync_with_projects(event: UsageEvent, include_projects: bool) -> UsageEvent {
-    let mut event = sanitize_event_for_sync(event);
-    if !include_projects {
-        event.project = None;
-    }
-    event
-}
-
-fn sanitize_project_for_sync(project: ProjectInfo) -> Option<ProjectInfo> {
-    statsai_core::sanitize_project_for_sync(project)
-}
-
 #[cfg(test)]
 #[derive(Debug, Clone)]
 struct SyncRollupStatsAccumulator {
@@ -840,102 +780,4 @@ pub(crate) fn build_sync_rollup_stats_summaries(
             imported_at: Utc::now(),
         })
         .collect()
-}
-
-pub(crate) fn sanitize_summary_for_sync(summary: UsageSummary) -> UsageSummary {
-    statsai_core::sanitize_summary_for_sync(summary)
-}
-
-/// Matches the store's HTTP summary sanitizer, so pending-sync selection and
-/// acknowledgements hash the same payload that is sent.
-pub(crate) fn sanitize_summary_for_sync_with_projects(
-    summary: UsageSummary,
-    include_projects: bool,
-) -> UsageSummary {
-    let mut summary = sanitize_summary_for_sync(summary);
-    if !include_projects {
-        summary.project = None;
-    }
-    statsai_core::collapse_summary_home_for_sync(summary, statsai_core::home_dir().as_deref())
-}
-
-pub(crate) fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
-    summary.metadata.summary_format == "daily_rollup.v1"
-}
-
-fn summary_spans_single_day(summary: &UsageSummary) -> bool {
-    let start = summary
-        .period_start
-        .as_ref()
-        .or(summary.period_end.as_ref())
-        .unwrap_or(&summary.observed_at);
-    let end = summary
-        .period_end
-        .as_ref()
-        .or(summary.period_start.as_ref())
-        .unwrap_or(&summary.observed_at);
-    start.date_naive() == end.date_naive()
-}
-
-fn summary_fits_single_daily_report_day(summary: &UsageSummary) -> bool {
-    let start = summary
-        .period_start
-        .as_ref()
-        .or(summary.period_end.as_ref())
-        .unwrap_or(&summary.observed_at);
-    let end = summary
-        .period_end
-        .as_ref()
-        .or(summary.period_start.as_ref())
-        .unwrap_or(&summary.observed_at);
-    if start.date_naive() == end.date_naive() {
-        return true;
-    }
-    let duration = *end - *start;
-    duration >= Duration::zero() && duration <= Duration::hours(25)
-}
-
-fn is_exact_daily_passthrough_summary(summary: &UsageSummary) -> bool {
-    matches!(
-        summary.metadata.summary_format.as_str(),
-        "external_daily" | "manual_daily" | "custom_daily" | "ccusage_daily"
-    )
-}
-
-fn is_exact_period_passthrough_summary(summary: &UsageSummary) -> bool {
-    matches!(
-        summary.metadata.summary_format.as_str(),
-        "manual_period_summary" | "custom_period_summary"
-    )
-}
-
-pub(crate) fn is_http_rollup_passthrough_summary(summary: &UsageSummary) -> bool {
-    if is_daily_rollup_summary(summary) {
-        return false;
-    }
-    if summary.metadata.summary_format == "claude_stats_cache" {
-        return false;
-    }
-    if summary.source.source_kind == SourceKind::LocalSummary {
-        return false;
-    }
-    if summary.source.source_kind == SourceKind::LocalAdapter {
-        return true;
-    }
-    (is_exact_daily_passthrough_summary(summary) && summary_fits_single_daily_report_day(summary))
-        || (is_exact_period_passthrough_summary(summary) && !summary_spans_single_day(summary))
-}
-
-pub(crate) fn sanitize_subscription_for_sync(mut subscription: Subscription) -> Subscription {
-    subscription.notes = None;
-    subscription
-}
-
-/// Local-auth subscriptions are evidence this device derived for itself and are
-/// never uploaded, so every count that is compared against the remote mirror has
-/// to drop them the same way the batch does. Counting them as pending would keep
-/// the subscription mirror check permanently disabled; counting them in the total
-/// would report a gap the remote can never close.
-pub(crate) fn is_syncable_subscription(subscription: &Subscription) -> bool {
-    subscription.record_source != IdentitySource::LocalAuth
 }

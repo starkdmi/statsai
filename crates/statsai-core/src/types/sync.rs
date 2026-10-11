@@ -122,7 +122,8 @@ pub struct TaskBucketSnapshot {
 /// Version of what [`sanitize_task_bucket_for_sync`] sends. Task buckets are
 /// re-sent only when they change, so the collector records this version with
 /// each acknowledged bucket and re-sends buckets acknowledged under an older
-/// one. Bump it whenever the sanitizer changes what leaves the device.
+/// one. Bump it whenever the sanitizer, or the work-item and span sanitizers it
+/// applies, changes what leaves the device.
 ///
 /// 1: path labels under the home directory are sent as `~/...`.
 pub const TASK_BUCKET_SYNC_SANITIZER_VERSION: i64 = 1;
@@ -140,22 +141,55 @@ pub fn sanitize_task_bucket_for_sync_with_home(
     mut snapshot: TaskBucketSnapshot,
     home: Option<&Path>,
 ) -> TaskBucketSnapshot {
-    for item in &mut snapshot.work_items {
-        item.path_label = item
-            .path_label
-            .take()
-            .map(|label| collapse_home_label_for_sync(label, home));
-    }
-    for span in &mut snapshot.spans {
-        span.source_record_id = None;
-        span.session_id = None;
-        span.thread_id = None;
-        span.project = span
-            .project
-            .take()
-            .map(|project| collapse_project_home_for_sync(project, home));
-    }
+    snapshot.work_items = snapshot
+        .work_items
+        .into_iter()
+        .map(|item| sanitize_work_item_for_sync_with_home(item, home))
+        .collect();
+    snapshot.spans = snapshot
+        .spans
+        .into_iter()
+        .map(|span| sanitize_task_span_for_sync_with_home(span, home))
+        .collect();
     snapshot
+}
+
+/// A work item as [`sanitize_task_bucket_for_sync`] sends it: its path label
+/// under the home directory is shown as `~/...`.
+#[must_use]
+pub fn sanitize_work_item_for_sync(item: WorkItem) -> WorkItem {
+    sanitize_work_item_for_sync_with_home(item, home_dir().as_deref())
+}
+
+/// [`sanitize_work_item_for_sync`] with an explicit home directory.
+#[must_use]
+pub fn sanitize_work_item_for_sync_with_home(mut item: WorkItem, home: Option<&Path>) -> WorkItem {
+    item.path_label = item
+        .path_label
+        .take()
+        .map(|label| collapse_home_label_for_sync(label, home));
+    item
+}
+
+/// A task span as [`sanitize_task_bucket_for_sync`] sends it: without its
+/// provider-local record, session and thread ids, and with its project path
+/// label under the home directory shown as `~/...`.
+#[must_use]
+pub fn sanitize_task_span_for_sync(span: TaskSpan) -> TaskSpan {
+    sanitize_task_span_for_sync_with_home(span, home_dir().as_deref())
+}
+
+/// [`sanitize_task_span_for_sync`] with an explicit home directory.
+#[must_use]
+pub fn sanitize_task_span_for_sync_with_home(mut span: TaskSpan, home: Option<&Path>) -> TaskSpan {
+    span.source_record_id = None;
+    span.session_id = None;
+    span.thread_id = None;
+    span.project = span
+        .project
+        .take()
+        .map(|project| collapse_project_home_for_sync(project, home));
+    span
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

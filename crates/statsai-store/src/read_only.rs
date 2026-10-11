@@ -1,20 +1,23 @@
 //! Read-only access for processes that must never write the store.
 
 use super::{
-    configure_read_cache, migrations::existing_schema_version, snapshot, CacheReportQuery,
-    QuotaQuery, QuotaStatus, SessionFilter, SessionSort, SessionStats, Store, SyncState,
-    WeeklyResetAnchor, CURRENT_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT,
+    configure_read_cache, migrations::existing_schema_version, snapshot, ActivityStatus,
+    CacheReportQuery, QuotaQuery, QuotaStatus, SessionFilter, SessionSort, SessionStats, Store,
+    SyncState, WeeklyResetAnchor, CURRENT_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::config::DbConfig;
 use rusqlite::Connection;
 use statsai_core::{
-    CacheReport, DailyRollup, ProviderAccount, ProviderAccountId, QuotaObservationRecordV1,
-    QuotaWindowV1, SessionRollupV1, SourceAccountAssignment, SourceLocation, Subscription,
-    UsageSummary,
+    AccountEvidenceSummaryV1, AccountPlanProjectionV1, ActivityCoverageV1, ActivityKind,
+    ActivityRollupV1, CacheReport, CodeChangeMetric, DailyRollup, ProviderAccount,
+    ProviderAccountId, QuotaCycleContributionV1, QuotaObservationRecordV1, QuotaWindowV1,
+    SessionRollupV1, SourceAccountAssignment, SourceLocation, Subscription, TaskBucketSnapshot,
+    TaskSpan, TaskVerification, TaskVerificationCursor, UsageSummary, WorkItem, WorkItemId,
 };
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Why [`Store::open_read_only`] did not open a store.
@@ -254,6 +257,17 @@ impl ReadStore {
         self.read(|store| store.session_stats_in_period(since, until, filter))
     }
 
+    /// Every row of the summaries table: imported reports, summaries a
+    /// provider adapter recorded, and summaries received in a sync batch, which
+    /// may include daily rollups. The daily rollups built from this store's
+    /// events are [`ReadStore::all_sync_rollup_summaries`]. See
+    /// [`Store::summaries`].
+    /// [`crate::sync_payload::is_http_rollup_passthrough_summary`] picks the
+    /// ones a rollup sync sends with the daily rollups.
+    pub fn summaries(&self) -> Result<Vec<UsageSummary>> {
+        self.read(|store| store.summaries())
+    }
+
     /// Every daily summary as stored. Unlike
     /// [`Store::all_sync_rollup_summaries`], summaries an older binary built
     /// are returned as they are rather than rebuilt; the next writer that
@@ -302,6 +316,17 @@ impl ReadStore {
         self.read(|store| store.quota_observations(query, collapse_duplicates))
     }
 
+    /// See [`Store::quota_cycle_contributions`]. A sync builds them with
+    /// [`QuotaQuery::default`], and `device_id` goes into each contribution's
+    /// id.
+    pub fn quota_cycle_contributions(
+        &self,
+        query: &QuotaQuery,
+        device_id: &str,
+    ) -> Result<Vec<QuotaCycleContributionV1>> {
+        self.read(|store| store.quota_cycle_contributions(query, device_id))
+    }
+
     /// See [`Store::weekly_reset_anchor`].
     pub fn weekly_reset_anchor(
         &self,
@@ -319,6 +344,13 @@ impl ReadStore {
         self.read(|store| store.list_accounts())
     }
 
+    pub fn account(
+        &self,
+        provider_account_id: &ProviderAccountId,
+    ) -> Result<Option<ProviderAccount>> {
+        self.read(|store| store.account(provider_account_id))
+    }
+
     pub fn list_source_account_assignments(&self) -> Result<Vec<SourceAccountAssignment>> {
         self.read(|store| store.list_source_account_assignments())
     }
@@ -329,6 +361,102 @@ impl ReadStore {
 
     pub fn list_sync_states(&self) -> Result<Vec<SyncState>> {
         self.read(|store| store.list_sync_states())
+    }
+
+    /// See [`Store::account_plan_projections`]. `device_id` is stamped on each
+    /// projection and goes into its `projection_id`.
+    pub fn account_plan_projections(
+        &self,
+        device_id: &str,
+    ) -> Result<Vec<AccountPlanProjectionV1>> {
+        self.read(|store| store.account_plan_projections(device_id))
+    }
+
+    /// See [`Store::account_evidence_summaries`]. `device_id` is stamped on
+    /// each summary and goes into its `summary_id`.
+    pub fn account_evidence_summaries(
+        &self,
+        device_id: &str,
+    ) -> Result<Vec<AccountEvidenceSummaryV1>> {
+        self.read(|store| store.account_evidence_summaries(device_id))
+    }
+
+    /// Every daily activity rollup, ordered by day.
+    pub fn all_activity_rollups(&self) -> Result<Vec<ActivityRollupV1>> {
+        self.read(|store| store.all_activity_rollups())
+    }
+
+    /// Every activity coverage row, ordered by day.
+    pub fn all_activity_coverage(&self) -> Result<Vec<ActivityCoverageV1>> {
+        self.read(|store| store.all_activity_coverage())
+    }
+
+    /// How many activity invocations the store holds.
+    pub fn activity_invocation_count(&self) -> Result<u64> {
+        self.read(|store| store.activity_invocation_count())
+    }
+
+    /// See [`Store::activity_status`], which summarizes the stored
+    /// invocations. `include_activity` is reported back as given.
+    pub fn activity_status(
+        &self,
+        provider: Option<&str>,
+        kind: Option<ActivityKind>,
+        include_activity: bool,
+    ) -> Result<ActivityStatus> {
+        self.read(|store| store.activity_status(provider, kind, include_activity))
+    }
+
+    /// Every session rollup as stored, ordered by start.
+    /// [`crate::sync_payload::sanitize_session_rollup_for_sync`] gives the form
+    /// a sync sends.
+    pub fn all_session_rollups(&self) -> Result<Vec<SessionRollupV1>> {
+        self.read(|store| store.all_session_rollups())
+    }
+
+    /// See [`Store::work_items`].
+    pub fn work_items(&self) -> Result<Vec<WorkItem>> {
+        self.read(|store| store.work_items())
+    }
+
+    pub fn work_item(&self, work_item_id: &WorkItemId) -> Result<Option<WorkItem>> {
+        self.read(|store| store.work_item(work_item_id))
+    }
+
+    /// Every task span, ordered by project bucket, then start.
+    pub fn task_spans(&self) -> Result<Vec<TaskSpan>> {
+        self.read(|store| store.task_spans())
+    }
+
+    /// The spans of one work item, in member order.
+    pub fn task_spans_for_work_item(&self, work_item_id: &WorkItemId) -> Result<Vec<TaskSpan>> {
+        self.read(|store| store.task_spans_for_work_item(work_item_id))
+    }
+
+    /// See [`Store::task_verifications`].
+    pub fn task_verifications(&self) -> Result<Vec<TaskVerification>> {
+        self.read(|store| store.task_verifications())
+    }
+
+    /// The project buckets that have task spans.
+    pub fn task_project_buckets(&self) -> Result<BTreeSet<String>> {
+        self.read(|store| store.task_project_buckets())
+    }
+
+    /// See [`Store::task_bucket_snapshot`].
+    /// [`crate::sync_payload::sanitize_task_bucket_for_sync`] gives the form a
+    /// sync sends.
+    pub fn task_bucket_snapshot(
+        &self,
+        project_bucket: &str,
+        applied_verification_cursor: Option<TaskVerificationCursor>,
+    ) -> Result<TaskBucketSnapshot> {
+        self.read(|store| store.task_bucket_snapshot(project_bucket, applied_verification_cursor))
+    }
+
+    /// See [`Store::list_code_change_metrics`].
+    pub fn list_code_change_metrics(&self, dirty_only: bool) -> Result<Vec<CodeChangeMetric>> {
+        self.read(|store| store.list_code_change_metrics(dirty_only))
     }
 }
 

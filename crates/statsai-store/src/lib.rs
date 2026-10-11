@@ -20,14 +20,14 @@ mod snapshot;
 mod sources;
 mod sql;
 mod summaries;
+pub mod sync_payload;
 mod sync_state;
 mod tasks;
 mod verified;
 
 pub(crate) use accounts::deserialize_subscription_payload;
 pub(crate) use rollups::{
-    collect_pending_summary_days, event_with_valid_project, is_daily_rollup_summary,
-    is_http_rollup_passthrough_summary, sanitize_summary_for_http_sync, summary_period_bounds,
+    collect_pending_summary_days, event_with_valid_project, summary_period_bounds,
     summary_sync_payload_hash, sync_rollup_bucket_key, sync_rollup_project_key,
     task_span_session_hashes, SyncRollupBucketKey,
 };
@@ -61,7 +61,7 @@ use statsai_core::{
     BillingPeriod, CacheHealthV1, CodeChangeMetric, Confidence, CostAccumulator, CostInfo,
     DailyRollup, EventId, EventSource, IdentitySource, LatencySource, MetricStats, ModelInfo,
     PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId, SemanticFingerprintInput,
-    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceLocation,
     SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SummaryId,
     SummaryMetadata, SummaryMetricTotals, SummaryMetrics, SummaryModelMetrics, SummaryModelUsage,
     SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, TaskVerificationId, UsageCounts,
@@ -105,7 +105,7 @@ const VERIFIED_SOURCE_OBSERVATION_HASH_PREFIX: &str = "verified_source.v2:";
 
 pub use archive::{ArchiveConversationSummary, ArchiveSearchHit, ArchiveStats, ArchiveWriteResult};
 pub(crate) use cache::CacheSessionMemo;
-pub use cache::{summary_for_sync_target, CacheReportQuery, CACHE_REPORT_UNASSIGNED_ACCOUNT};
+pub use cache::{CacheReportQuery, CACHE_REPORT_UNASSIGNED_ACCOUNT};
 pub use code_changes::CodeChangeRefreshReport;
 pub use privacy::{
     FilteredConversationMetadata, FilteredConversationRecord, PrivacyDatasetStatus,
@@ -114,6 +114,10 @@ pub use privacy::{
 pub use quota::{
     weekly_cycle_containing, QuotaDateRange, QuotaQuery, QuotaStatus, WeeklyResetAnchor,
     WEEKLY_RESET_PERIOD_SECONDS,
+};
+pub use sync_payload::summary_for_sync_target;
+pub(crate) use sync_payload::{
+    is_daily_rollup_summary, is_http_rollup_passthrough_summary, summary_for_sync,
 };
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
