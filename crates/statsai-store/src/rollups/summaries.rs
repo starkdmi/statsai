@@ -5,28 +5,6 @@ pub(crate) fn summary_sync_payload_hash(summary: &UsageSummary) -> Result<String
     Ok(hash_text(&payload))
 }
 
-pub(crate) fn sanitize_summary_for_default_http_sync(summary: UsageSummary) -> UsageSummary {
-    sanitize_summary_for_http_sync(summary, false)
-}
-
-pub(crate) fn is_daily_rollup_summary(summary: &UsageSummary) -> bool {
-    summary.metadata.summary_format == "daily_rollup.v1"
-}
-
-/// The summary as an HTTP sync batch carries it: sanitized, without a project
-/// unless projects are included, and with a project path label under the
-/// home directory shown as `~/...`. Never stored locally.
-pub(crate) fn sanitize_summary_for_http_sync(
-    summary: UsageSummary,
-    include_projects: bool,
-) -> UsageSummary {
-    let mut summary = sanitize_summary_for_sync(summary);
-    if !include_projects {
-        summary.project = None;
-    }
-    statsai_core::collapse_summary_home_for_sync(summary, statsai_core::home_dir().as_deref())
-}
-
 pub(crate) fn summary_sync_day(summary: &UsageSummary) -> NaiveDate {
     summary
         .period_start
@@ -78,6 +56,11 @@ fn is_exact_period_passthrough_summary(summary: &UsageSummary) -> bool {
     )
 }
 
+/// The cache report's and the pending counts' copy of
+/// [`crate::sync_payload::is_http_rollup_passthrough_summary`], which the batch
+/// uses. It differs in one case: it swaps bounds that run backwards, so a daily
+/// report whose end precedes its start by up to 25 hours across two dates
+/// counts here but is not sent.
 pub(crate) fn is_http_rollup_passthrough_summary(summary: &UsageSummary) -> bool {
     if summary.metadata.summary_format == "daily_rollup.v1" {
         return false;

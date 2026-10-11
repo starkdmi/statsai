@@ -456,17 +456,6 @@ impl Store {
     }
 }
 
-/// A summary in the form a target stores it. Selection and the recorded
-/// payload hash both see this form, so a receiver without `cache_health`
-/// support is not re-sent summaries that differ only by it.
-pub fn summary_for_sync_target(summary: UsageSummary, accepts_cache_health: bool) -> UsageSummary {
-    if accepts_cache_health {
-        summary
-    } else {
-        summary.without_cache_health()
-    }
-}
-
 /// A summary that starts within the report's range. The dashboard's period
 /// views count a summary the same way, including one that spans several days.
 fn cache_report_includes_summary(query: &CacheReportQuery, summary: &UsageSummary) -> bool {

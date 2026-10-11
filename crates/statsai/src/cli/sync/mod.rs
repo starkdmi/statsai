@@ -3,6 +3,11 @@ use chrono::DateTime;
 use serde::Serialize;
 use serde_json::{json, Value};
 use statsai_core::SyncBatch;
+use statsai_store::sync_payload::{
+    is_http_rollup_passthrough_summary, is_syncable_subscription, sanitize_account_for_sync,
+    sanitize_source_account_assignment_for_sync, sanitize_source_for_sync,
+    sanitize_subscription_for_sync, summary_for_sync,
+};
 use statsai_store::{Store, SyncPreferences, SyncState, SyncTrackingSnapshot};
 use statsai_sync::{FileSink, StdoutSink, SyncSink};
 use std::path::PathBuf;
@@ -666,12 +671,7 @@ pub(crate) fn sync_local_verify(
             .collect(),
     )?;
     let accepts_cache_health = store.sync_target_accepts_cache_health(sink, target)?;
-    let for_target = |summary| {
-        statsai_store::summary_for_sync_target(
-            sanitize_summary_for_sync_with_projects(summary, include_projects),
-            accepts_cache_health,
-        )
-    };
+    let for_target = |summary| summary_for_sync(summary, include_projects, accepts_cache_health);
     let passthrough_summaries: Vec<_> = store
         .summaries()?
         .into_iter()

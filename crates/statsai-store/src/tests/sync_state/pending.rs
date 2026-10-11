@@ -195,7 +195,10 @@ fn pending_http_sync_summary_counts_match_default_http_passthrough_payloads() {
         .record_summaries_synced(
             "http",
             target,
-            &[sanitize_summary_for_default_http_sync(summary.clone())],
+            &[sanitize_summary_for_sync_with_projects(
+                summary.clone(),
+                false,
+            )],
         )
         .expect("record synced");
 
@@ -242,7 +245,10 @@ fn pending_http_sync_summary_counts_with_projects_detect_opt_in_backfill() {
         .record_summaries_synced(
             "http",
             target,
-            &[sanitize_summary_for_default_http_sync(summary.clone())],
+            &[sanitize_summary_for_sync_with_projects(
+                summary.clone(),
+                false,
+            )],
         )
         .expect("record synced");
 

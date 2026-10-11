@@ -1,4 +1,5 @@
 pub(crate) use super::*;
+pub(crate) use statsai_store::sync_payload::*;
 
 mod account;
 mod args;

@@ -267,12 +267,7 @@ impl Store {
         let rollups = self
             .all_sync_rollup_summaries()?
             .into_iter()
-            .map(|summary| {
-                summary_for_sync_target(
-                    sanitize_summary_for_default_http_sync(summary),
-                    accepts_cache_health,
-                )
-            })
+            .map(|summary| summary_for_sync(summary, false, accepts_cache_health))
             .collect::<Vec<_>>();
         let pending = self.pending_summaries_for_sync(sink, target, &rollups)?;
         let days = collect_pending_summary_days(pending.iter());
