@@ -9,11 +9,14 @@
 //! - Upkeep a sync runs before reading, such as rebuilding stale daily rollups
 //!   or refreshing code-change metrics.
 //! - The device's opt-ins and the target's capabilities. The caller passes
-//!   them in as `include_projects` and `accepts_cache_health`. Without
-//!   `include_projects`, records leave the device without their project.
+//!   them in as `include_projects` and `accepts_cache_health`. A function
+//!   that takes `include_projects` drops the record's project unless it is
+//!   set. The task sanitizers take no such flag and keep projects, because a
+//!   sync sends tasks only when projects are included.
 //!
-//! Path labels under the home directory are shown as `~/...`, relative to the
-//! home directory of the process that calls these functions.
+//! The summary, session and task transforms show path labels under the home
+//! directory as `~/...`, relative to the home directory of the process that
+//! calls them. The event sanitizer leaves an event's path labels as stored.
 //!
 //! The sanitizers for summaries, sessions, tasks and code-change metrics live
 //! in `statsai-core` with their types, and are re-exported here so that this

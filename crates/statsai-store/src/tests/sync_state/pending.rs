@@ -755,3 +755,41 @@ fn disabling_activity_retires_acknowledgements_so_re_enabling_backfills() {
         1
     );
 }
+
+/// A daily report whose end falls on an earlier date than its start is never
+/// sent, so it must not count as pending either, or the count never drains.
+#[test]
+fn a_daily_report_with_reversed_bounds_is_not_counted_as_pending() {
+    let store = Store::in_memory().expect("store");
+    let source = statsai_core::SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-reversed-daily-report"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let start = Utc
+        .with_ymd_and_hms(2026, 7, 2, 10, 0, 0)
+        .single()
+        .expect("start");
+    let mut summary = test_store_summary(&source, start, 70);
+    summary.summary_id = summary_id(&source.provider, &source.source_id, "reversed-daily");
+    summary.source.source_kind = SourceKind::Manual;
+    summary.metadata.summary_format = "manual_daily".to_string();
+    summary.period_start = Some(start);
+    summary.period_end = Some(start - chrono::Duration::hours(14));
+    store.upsert_summary(&summary).expect("summary");
+
+    assert!(!crate::sync_payload::is_http_rollup_passthrough_summary(
+        &summary
+    ));
+    let counts = store
+        .pending_http_sync_summary_counts_with_projects(
+            "https://api.example.com/api/sync/batches",
+            "device",
+            false,
+        )
+        .expect("pending counts");
+    assert_eq!(counts.passthrough_summaries, 0);
+}

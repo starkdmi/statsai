@@ -28,11 +28,6 @@ pub(crate) fn summary_period_bounds(summary: &UsageSummary) -> (DateTime<Utc>, D
     }
 }
 
-fn summary_spans_single_day(summary: &UsageSummary) -> bool {
-    let (start, end) = summary_period_bounds(summary);
-    start.date_naive() == end.date_naive()
-}
-
 fn summary_fits_single_daily_report_day(summary: &UsageSummary) -> bool {
     let (start, end) = summary_period_bounds(summary);
     if start.date_naive() == end.date_naive() {
@@ -47,36 +42,6 @@ fn is_exact_daily_passthrough_summary(summary: &UsageSummary) -> bool {
         summary.metadata.summary_format.as_str(),
         "external_daily" | "manual_daily" | "custom_daily" | "ccusage_daily"
     )
-}
-
-fn is_exact_period_passthrough_summary(summary: &UsageSummary) -> bool {
-    matches!(
-        summary.metadata.summary_format.as_str(),
-        "manual_period_summary" | "custom_period_summary"
-    )
-}
-
-/// The copy of [`crate::sync_payload::is_http_rollup_passthrough_summary`]
-/// that the cache report and [`Store::pending_http_sync_summary_counts`] use.
-/// The batch and `sync --verify` use that one. This copy differs in one case:
-/// it swaps bounds that run backwards. So a daily report whose end precedes
-/// its start on an earlier date, by at most 25 hours, counts here but is not
-/// sent.
-pub(crate) fn is_http_rollup_passthrough_summary(summary: &UsageSummary) -> bool {
-    if summary.metadata.summary_format == "daily_rollup.v1" {
-        return false;
-    }
-    if summary.metadata.summary_format == "claude_stats_cache" {
-        return false;
-    }
-    if summary.source.source_kind == SourceKind::LocalSummary {
-        return false;
-    }
-    if summary.source.source_kind == SourceKind::LocalAdapter {
-        return true;
-    }
-    (is_exact_daily_passthrough_summary(summary) && summary_fits_single_daily_report_day(summary))
-        || (is_exact_period_passthrough_summary(summary) && !summary_spans_single_day(summary))
 }
 
 pub(crate) fn collect_pending_summary_days<'a>(

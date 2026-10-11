@@ -27,9 +27,9 @@ mod verified;
 
 pub(crate) use accounts::deserialize_subscription_payload;
 pub(crate) use rollups::{
-    collect_pending_summary_days, event_with_valid_project, is_http_rollup_passthrough_summary,
-    summary_period_bounds, summary_sync_payload_hash, sync_rollup_bucket_key,
-    sync_rollup_project_key, task_span_session_hashes, SyncRollupBucketKey,
+    collect_pending_summary_days, event_with_valid_project, summary_period_bounds,
+    summary_sync_payload_hash, sync_rollup_bucket_key, sync_rollup_project_key,
+    task_span_session_hashes, SyncRollupBucketKey,
 };
 pub(crate) use sql::{
     begin_immediate_transaction_with_retry, commit_transaction, enable_sqlite_defensive,
@@ -61,7 +61,7 @@ use statsai_core::{
     BillingPeriod, CacheHealthV1, CodeChangeMetric, Confidence, CostAccumulator, CostInfo,
     DailyRollup, EventId, EventSource, IdentitySource, LatencySource, MetricStats, ModelInfo,
     PrivacyInfo, PrivacyMode, ProviderAccount, ProviderAccountId, SemanticFingerprintInput,
-    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceKind, SourceLocation,
+    SourceAccountAssignment, SourceAccountAssignmentId, SourceId, SourceLocation,
     SourceVerificationMode, Subscription, SubscriptionId, SubscriptionStatus, SummaryId,
     SummaryMetadata, SummaryMetricTotals, SummaryMetrics, SummaryModelMetrics, SummaryModelUsage,
     SyncAuthoritativeSnapshot, SyncBatch, TaskVerificationCursor, TaskVerificationId, UsageCounts,
@@ -116,7 +116,9 @@ pub use quota::{
     WEEKLY_RESET_PERIOD_SECONDS,
 };
 pub use sync_payload::summary_for_sync_target;
-pub(crate) use sync_payload::{is_daily_rollup_summary, summary_for_sync};
+pub(crate) use sync_payload::{
+    is_daily_rollup_summary, is_http_rollup_passthrough_summary, summary_for_sync,
+};
 pub use tasks::{
     derive_task_work_items, NamedTaskBenchmark, TaskBenchmarkMetrics, TaskBenchmarkReport,
     TaskDeletionImpact, TaskRebuildReport, TaskRebuildTimings, TaskStats,
