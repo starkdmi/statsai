@@ -473,6 +473,18 @@ pub(crate) fn scan_with_adapters(
                 }
                 let insert_started_at = Instant::now();
                 store.restore_project_identities(&mut scan.events, &replaced_identities)?;
+                store.restore_summary_project_identities(
+                    &mut scan.summaries,
+                    &scan.events,
+                    &replaced_identities,
+                )?;
+                if command.include_tasks {
+                    store.restore_task_span_project_identities(
+                        &mut scan.task_spans,
+                        &scan.events,
+                        &replaced_identities,
+                    )?;
+                }
                 let insert_result = store.insert_events_with_resolution(&scan.events)?;
                 store.upsert_session_names(&scan.session_names)?;
                 inserted_count += insert_result.inserted;

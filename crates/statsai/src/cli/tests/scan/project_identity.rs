@@ -57,6 +57,16 @@ fn write_session(path: &Path, workspace: &Path, turns: usize) {
         workspace.display()
     )
     .expect("turn context");
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-06-01T08:00:02Z","type":"event_msg","payload":{{"type":"task_started","started_at":"2026-06-01T08:00:02Z"}}}}"#
+    )
+    .expect("task started");
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-06-01T08:00:03Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Fix the importer"}}]}}}}"#
+    )
+    .expect("user message");
     for turn in 0..turns {
         let total = 120 * (turn + 1);
         writeln!(
@@ -87,7 +97,7 @@ fn scan_codex(store: &Store, replace: bool) {
     scan_with_adapters(
         ScanCommand {
             provider: None,
-            include_tasks: false,
+            include_tasks: true,
             preview: false,
             no_cache: false,
             replace,
@@ -99,6 +109,16 @@ fn scan_codex(store: &Store, replace: bool) {
         vec![Box::new(ConfiguredCodexAdapter::new())],
     )
     .expect("scan");
+}
+
+/// Every stored task span's project bucket.
+fn stored_task_buckets(store: &Store) -> Vec<String> {
+    store
+        .task_spans()
+        .expect("task spans")
+        .into_iter()
+        .map(|span| span.project_bucket)
+        .collect()
 }
 
 /// `(project_id, repo_remote_hash)` of every stored event.
@@ -158,6 +178,9 @@ fn reimporting_usage_from_a_deleted_checkout_keeps_its_repository_project() {
     let before = stored_identities(&store);
     assert_eq!(before.len(), 1);
     assert!(before[0].1.is_some(), "the first scan reads the remote");
+    let buckets = stored_task_buckets(&store);
+    assert_eq!(buckets.len(), 1);
+    assert!(buckets[0].starts_with("repo:") && !buckets[0].starts_with("repo:none"));
 
     std::fs::remove_dir_all(&fixture.workspace).expect("delete checkout");
 
@@ -167,10 +190,16 @@ fn reimporting_usage_from_a_deleted_checkout_keeps_its_repository_project() {
     let after_prune = stored_identities(&store);
     assert_eq!(after_prune.len(), 2);
     assert!(after_prune.iter().all(|identity| identity == &before[0]));
+    assert_eq!(stored_task_buckets(&store), buckets);
 
     // A full re-import deletes the source's rows before writing them again.
     scan_codex(&store, true);
     assert_eq!(stored_identities(&store), after_prune);
+    assert_eq!(stored_task_buckets(&store), buckets);
+    let work_items = store.work_items().expect("work items");
+    assert!(work_items
+        .iter()
+        .all(|work_item| work_item.project_bucket == buckets[0]));
 }
 
 #[test]
