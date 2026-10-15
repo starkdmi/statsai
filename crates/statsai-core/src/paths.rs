@@ -21,6 +21,42 @@ pub fn canonical_display(path: &Path) -> String {
         .to_string()
 }
 
+/// Hash of a checkout location that stays the same after the folder is deleted.
+///
+/// [`path_hash`] canonicalizes a path only while it exists, so a folder reached
+/// through a symlink (`/tmp` and `/var` on macOS, a code folder linked from
+/// another volume) hashes as its resolved path while it exists, and as the
+/// symlinked spelling once it is gone. This resolves the deepest ancestor that
+/// still exists and appends the missing components, so a deleted folder keeps
+/// the hash it had. For a path that exists the result equals [`path_hash`].
+#[must_use]
+pub fn location_path_hash(path: &Path) -> String {
+    hash_text(&canonical_location(path).to_string_lossy())
+}
+
+fn canonical_location(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let expanded = expand_home(path);
+    let mut missing = Vec::new();
+    let mut current = expanded.as_path();
+    while let Some(parent) = current.parent() {
+        match current.components().next_back() {
+            Some(std::path::Component::Normal(name)) => missing.push(name),
+            _ => return expanded,
+        }
+        if let Ok(canonical) = parent.canonicalize() {
+            return missing
+                .iter()
+                .rev()
+                .fold(canonical, |path, name| path.join(name));
+        }
+        current = parent;
+    }
+    expanded
+}
+
 /// Display-friendly path normalization.
 /// Expands `~` for home but does NOT perform filesystem canonicalization
 /// (to avoid symlink/mount identity changes for labels).

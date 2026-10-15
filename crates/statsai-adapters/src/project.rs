@@ -1,4 +1,6 @@
-use statsai_core::{display_path, hash_text, normalize_git_remote, path_hash, ProjectInfo};
+use statsai_core::{
+    display_path, hash_text, location_path_hash, normalize_git_remote, ProjectInfo,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -88,7 +90,7 @@ pub(crate) fn resolve_project_context(
         .as_deref()
         .and_then(project_label_from_path)
         .or_else(|| repo_label.clone());
-    let path_hash_value = project_path.as_deref().map(path_hash);
+    let path_hash_value = project_path.as_deref().map(location_path_hash);
     let path_label = project_path.as_deref().map(display_path);
 
     ProjectContext {
@@ -111,7 +113,7 @@ pub(crate) fn project_context_from_path_fallback(root: &Path, path: &Path) -> Op
     let project_path = root.join(&project_key);
     ProjectContext {
         project_label: Some(project_key),
-        path_hash: Some(path_hash(&project_path)),
+        path_hash: Some(location_path_hash(&project_path)),
         path_label: Some(display_path(&project_path)),
         ..ProjectContext::default()
     }
