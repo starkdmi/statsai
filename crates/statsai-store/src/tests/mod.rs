@@ -5,6 +5,7 @@ mod cache;
 mod dedupe;
 mod events;
 mod open;
+mod project_identity;
 mod rollups;
 mod scan_state;
 mod sources;

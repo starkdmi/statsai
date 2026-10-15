@@ -11,6 +11,7 @@ mod events;
 mod migrations;
 mod pricing;
 mod privacy;
+mod project_identity;
 mod quota;
 mod read_only;
 mod rollups;
@@ -83,6 +84,7 @@ pub use pricing::{
     apply_current_estimated_pricing, RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY,
     APPLIED_PRICING_RULESET_VERSION_KEY,
 };
+pub use project_identity::LocationIdentities;
 pub use read_only::{ReadOnlyOpenError, ReadStore};
 pub use rollups::{SessionFilter, SessionSort, SessionStats};
 pub use scan_lock::{
@@ -300,6 +302,9 @@ pub struct EventInsertBatchResult {
 pub struct EventDeletionImpact {
     pub deleted: u64,
     pub deleted_event_ids: Vec<EventId>,
+    /// Repository identities the deleted rows held, by location, so the rows
+    /// written in their place can keep them when the working folder is gone.
+    pub replaced_identities: LocationIdentities,
 }
 
 pub struct ScanFileReplacement<'a> {

@@ -19,7 +19,8 @@ use statsai_core::{
 };
 use statsai_store::{
     derive_task_work_items, reconcile_verified_source_state, verified_source_observation_hash,
-    ActivityPersistMode, ActivityScanCursor, ScanFileStateEntry, Store, TaskRebuildReport,
+    ActivityPersistMode, ActivityScanCursor, LocationIdentities, ScanFileStateEntry, Store,
+    TaskRebuildReport,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
@@ -87,6 +88,9 @@ pub(crate) fn scan_with_adapters(
     let mut rebuild_work_items_duration_ms = 0u64;
     let mut rebuild_work_item_report = TaskRebuildReport::default();
 
+    if !command.preview {
+        store.repair_project_identities()?;
+    }
     let configured_sources = store.list_sources()?;
 
     for adapter in adapters {
@@ -409,12 +413,14 @@ pub(crate) fn scan_with_adapters(
                 };
                 let mut deleted_task_spans = Vec::new();
                 let mut deleted_event_ids = Vec::new();
+                let mut replaced_identities = LocationIdentities::default();
                 if replace_source_records {
                     let delete_started_at = Instant::now();
                     let deleted_events =
                         store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
                     removed_event_count += deleted_events.deleted;
                     deleted_event_ids.extend(deleted_events.deleted_event_ids);
+                    replaced_identities.extend(deleted_events.replaced_identities);
                     removed_summary_count += store
                         .delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
                     if replace_all_source_quota_records {
@@ -444,6 +450,7 @@ pub(crate) fn scan_with_adapters(
                     )?;
                     removed_event_count += deleted_events.deleted;
                     deleted_event_ids.extend(deleted_events.deleted_event_ids);
+                    replaced_identities.extend(deleted_events.replaced_identities);
                     removed_summary_count += store.delete_summaries_for_source_file_hashes(
                         &source.source_id,
                         &reconciled_file_hashes,
@@ -465,6 +472,7 @@ pub(crate) fn scan_with_adapters(
                     delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
                 }
                 let insert_started_at = Instant::now();
+                store.restore_project_identities(&mut scan.events, &replaced_identities)?;
                 let insert_result = store.insert_events_with_resolution(&scan.events)?;
                 store.upsert_session_names(&scan.session_names)?;
                 inserted_count += insert_result.inserted;

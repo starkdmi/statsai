@@ -654,6 +654,9 @@ impl Store {
                     impact.deleted_event_ids.push(row?);
                 }
                 drop(statement);
+                impact
+                    .replaced_identities
+                    .extend(self.repo_identities_for_source(source_id)?);
 
                 impact.deleted += self.conn.execute(
                     "DELETE FROM usage_events WHERE source_id = ?1",
@@ -701,6 +704,7 @@ impl Store {
                 for payload in payloads {
                     let event: UsageEvent = serde_json::from_str(&payload)?;
                     dirty.observe(&event);
+                    impact.replaced_identities.observe(&event);
                     impact.deleted_event_ids.push(event.event_id);
                 }
 
