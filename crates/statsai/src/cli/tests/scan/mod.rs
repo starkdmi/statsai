@@ -3,6 +3,7 @@ pub(crate) use super::*;
 
 mod files;
 mod preview;
+mod project_identity;
 
 #[derive(Clone)]
 struct AttributionBlockedTestAdapter {

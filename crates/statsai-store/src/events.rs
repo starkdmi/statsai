@@ -1,5 +1,6 @@
 use super::*;
 use crate::dedupe::*;
+use crate::project_identity::EVENT_PROJECT_SQL;
 
 #[derive(Debug, Default)]
 pub(crate) struct EventWriteDirty {
@@ -642,16 +643,29 @@ impl Store {
                 }
             }
             for source_id in source_ids {
-                // `usage_events_source_idx` covers this, so naming the ids costs an
-                // index range read rather than a pass over the payloads.
-                let mut statement = self
-                    .conn
-                    .prepare("SELECT event_id FROM usage_events WHERE source_id = ?1")?;
+                // `usage_events_source_idx` finds the rows. Besides each id, the
+                // pass reads the row's project, so rows written in their place
+                // can keep its repository (see `project_identity`).
+                let mut statement = self.conn.prepare(&format!(
+                    "SELECT event_id, {EVENT_PROJECT_SQL}, started_at
+                     FROM usage_events WHERE source_id = ?1"
+                ))?;
                 let rows = statement.query_map(params![&source_id.0], |row| {
-                    row.get::<_, String>(0).map(EventId)
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?;
                 for row in rows {
-                    impact.deleted_event_ids.push(row?);
+                    let (event_id, project_json, started_at) = row?;
+                    Self::observe_replaced_row(
+                        &mut impact.replaced_identities,
+                        &event_id,
+                        project_json.as_deref(),
+                        &started_at,
+                    );
+                    impact.deleted_event_ids.push(EventId(event_id));
                 }
                 drop(statement);
 
@@ -701,6 +715,7 @@ impl Store {
                 for payload in payloads {
                     let event: UsageEvent = serde_json::from_str(&payload)?;
                     dirty.observe(&event);
+                    impact.replaced_identities.observe(&event);
                     impact.deleted_event_ids.push(event.event_id);
                 }
 

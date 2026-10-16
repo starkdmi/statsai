@@ -245,6 +245,7 @@ impl Store {
         replacement: ScanFileReplacement<'_>,
     ) -> Result<ScanFileReplacementResult> {
         self.with_immediate_transaction(|| {
+            self.repair_project_identities()?;
             let deleted_events = self.delete_events_for_source_file_hashes(
                 replacement.source_id,
                 replacement.reconciled_file_hashes,
@@ -253,8 +254,16 @@ impl Store {
                 replacement.source_id,
                 replacement.reconciled_file_hashes,
             )?;
-            let inserted_events = self.insert_events(replacement.events)?;
-            let written_summaries = self.upsert_summaries(replacement.summaries)?;
+            let mut events = replacement.events.to_vec();
+            self.restore_project_identities(&mut events, &deleted_events.replaced_identities)?;
+            let mut summaries = replacement.summaries.to_vec();
+            self.restore_summary_project_identities(
+                &mut summaries,
+                &events,
+                &deleted_events.replaced_identities,
+            )?;
+            let inserted_events = self.insert_events(&events)?;
+            let written_summaries = self.upsert_summaries(&summaries)?;
             self.upsert_session_names(replacement.session_names)?;
             // A quota observation can point at an event this just deleted, and the
             // daemon -- the only caller -- never touches quota rows itself, so nothing
