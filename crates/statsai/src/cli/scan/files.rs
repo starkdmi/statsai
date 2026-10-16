@@ -27,15 +27,19 @@ pub(crate) fn scan_candidate_compatible_signatures(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScanFileReconciliation {
+    /// The files to read: changed or new ones, and the files a gone file moved
+    /// to, which then hold its records.
     pub(crate) pending_entries: Vec<ScanFileStateEntry>,
     pub(crate) compatible_entries_to_upgrade: Vec<ScanFileStateEntry>,
-    /// Tracked files that moved to a path read this scan
-    /// ([`moved_scan_file_entries`]): their records are replaced like a changed
-    /// file's, and their cache entries go. A tracked file that is simply gone
-    /// keeps both its records and its cache entry: a provider deleting or
-    /// compressing a log does not delete its history from the store, and the
-    /// entry lets a later scan still recognise the file if it moved.
+    /// Tracked files that moved to a current path ([`gone_scan_files`]): their
+    /// records are replaced like a changed file's, and their cache entries go. A
+    /// tracked file that is simply gone keeps both its records and its cache
+    /// entry: a provider deleting or compressing a log does not delete its history
+    /// from the store, and the entry lets a later scan still recognise the file if
+    /// it moved.
     pub(crate) moved_entries: Vec<ScanFileStateEntry>,
+    /// Gone files nothing can be matched to: only their cache entries go.
+    pub(crate) forgotten_entries: Vec<ScanFileStateEntry>,
     /// Whether any tracked file is gone, moved or not.
     pub(crate) has_gone_entries: bool,
 }
@@ -59,7 +63,7 @@ pub(crate) fn select_scan_file_reconciliation(
         require_tasks_collected,
     )?;
     let tracked_entries = store.scan_file_entries(source_id)?;
-    let moved_entries = moved_scan_file_entries(&tracked_entries, file_cache_entries);
+    let gone = gone_scan_files(&tracked_entries, file_cache_entries);
     let current_cache_keys = file_cache_entries
         .iter()
         .map(|entry| entry.cache_key.as_str())
@@ -67,10 +71,22 @@ pub(crate) fn select_scan_file_reconciliation(
     let has_gone_entries = tracked_entries
         .iter()
         .any(|entry| !current_cache_keys.contains(entry.cache_key.as_str()));
+    // A file moved to a path already tracked, unchanged there, is read again so
+    // it holds the records its old path loses.
+    let mut pending_entries = selection.pending_entries;
+    for moved in &gone.moved {
+        if !pending_entries
+            .iter()
+            .any(|entry| entry.cache_key == moved.to.cache_key)
+        {
+            pending_entries.push(moved.to.clone());
+        }
+    }
     Ok(ScanFileReconciliation {
-        pending_entries: selection.pending_entries,
+        pending_entries,
         compatible_entries_to_upgrade: selection.compatible_entries_to_upgrade,
-        moved_entries,
+        moved_entries: gone.moved_from(),
+        forgotten_entries: gone.forgotten,
         has_gone_entries,
     })
 }

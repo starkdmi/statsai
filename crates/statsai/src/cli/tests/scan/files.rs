@@ -699,6 +699,83 @@ fn a_full_reread_replaces_task_spans_without_a_file_hash() {
 }
 
 #[test]
+fn no_cache_with_no_files_keeps_rows_without_a_file_hash() {
+    // The source's folder is unmounted, renamed or empty, while something else
+    // about it changed, so the source is still processed.
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-no-files-legacy"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 5, 4, 10, 0, 0)
+        .single()
+        .expect("started_at");
+    store
+        .insert_events(&[test_event(
+            "codex",
+            &source,
+            started_at,
+            None,
+            TokenParts::total(75),
+        )])
+        .expect("seed hashless event");
+    let verified_state = statsai_core::VerifiedSourceState {
+        provider_user_id: Some("acct-verified".to_string()),
+        email: None,
+        account_label: None,
+        plan_name: None,
+        authenticated_at: None,
+        verified_at: None,
+        subscription: None,
+    };
+    let adapter = TestAdapter {
+        provider: "codex",
+        discovered: vec![source.clone()],
+        candidates: Vec::new(),
+        scan_result: statsai_adapters::AdapterScan::default(),
+        probe_result: Some(verified_state),
+        scan_calls: None,
+    };
+    scan_with_adapters(
+        ScanCommand {
+            provider: None,
+            include_tasks: false,
+            preview: false,
+            no_cache: true,
+            replace: false,
+            verbose: false,
+            explain: false,
+        },
+        &store,
+        "device-test",
+        vec![Box::new(adapter)],
+    )
+    .expect("scan");
+
+    // Nothing was read to replace it, so the row stays.
+    assert_eq!(
+        store
+            .events_for_source(&source.source_id)
+            .expect("events")
+            .len(),
+        1
+    );
+    assert_ne!(
+        store
+            .source(&source.source_id)
+            .expect("source")
+            .and_then(|stored| stored.verified_state_hash),
+        None,
+        "the scan did process the source"
+    );
+}
+
+#[test]
 fn partial_scan_with_legacy_rows_falls_back_to_full_source_reconcile() {
     let store = Store::in_memory().expect("store");
     let source = SourceLocation::local_adapter(
@@ -919,8 +996,9 @@ fn full_rereads_retire_hashless_rows_and_keep_gone_files_rows() {
         ];
         expected.sort();
         assert_eq!(summary_ids, expected, "no_cache={no_cache}");
-        // The gone file's cache entry stays, so a later move is still recognised.
-        assert!(store
+        // Its name carries no session, so no later file can be recognised as it:
+        // the cache entry goes, while its rows stay.
+        assert!(!store
             .scan_file_entries(&source.source_id)
             .expect("cache")
             .iter()

@@ -22,7 +22,17 @@ impl Store {
         &self,
         records: &[QuotaObservationRecordV1],
     ) -> Result<u64> {
+        Ok(self.upsert_quota_observations_counting(records)?.written)
+    }
+
+    /// [`Store::upsert_quota_observations_inner`], also counting the records whose
+    /// stored row or windows it changed.
+    fn upsert_quota_observations_counting(
+        &self,
+        records: &[QuotaObservationRecordV1],
+    ) -> Result<QuotaWriteCount> {
         let mut written = 0u64;
+        let mut changed = 0u64;
         let mut assignments_by_source = HashMap::new();
         for record in records {
             let source_id = &record.observation.source_id;
@@ -163,6 +173,7 @@ impl Store {
                     },
                 );
             if windows_changed {
+                changed = changed.saturating_add(1);
                 self.conn.execute(
                     "DELETE FROM quota_window_observations WHERE observation_id = ?1",
                     [&record.observation.observation_id],
@@ -190,7 +201,7 @@ impl Store {
             }
             written = written.saturating_add(1);
         }
-        Ok(written)
+        Ok(QuotaWriteCount { written, changed })
     }
 
     pub(crate) fn replace_quota_observations_for_source_files_inner(
@@ -198,7 +209,7 @@ impl Store {
         source_id: &SourceId,
         source_file_path_hashes: &[String],
         records: &[QuotaObservationRecordV1],
-    ) -> Result<u64> {
+    ) -> Result<QuotaWriteCount> {
         let source_file_path_hashes = source_file_path_hashes
             .iter()
             .map(String::as_str)
@@ -214,6 +225,7 @@ impl Store {
             .collect::<HashSet<_>>();
 
         let mut orphaned_payload_hashes = BTreeSet::new();
+        let mut deleted = 0u64;
         for source_file_path_hash in source_file_path_hashes {
             let mut statement = self.conn.prepare(
                 "SELECT observation_id, payload_hash FROM quota_observations
@@ -241,18 +253,19 @@ impl Store {
                     "DELETE FROM quota_window_observations WHERE observation_id = ?1",
                     [&observation_id],
                 )?;
-                self.conn.execute(
+                deleted = deleted.saturating_add(self.conn.execute(
                     "DELETE FROM quota_observations WHERE observation_id = ?1",
                     [&observation_id],
-                )?;
+                )? as u64);
             }
         }
 
-        let written = self.upsert_quota_observations_inner(records)?;
+        let mut count = self.upsert_quota_observations_counting(records)?;
+        count.changed = count.changed.saturating_add(deleted);
         // After the upsert, so a payload the incoming records reuse is seen as still
         // referenced rather than deleted and immediately rewritten.
         self.delete_unreferenced_quota_payloads_for_hashes(&orphaned_payload_hashes)?;
-        Ok(written)
+        Ok(count)
     }
 
     pub fn replace_quota_observations_for_source_files(
@@ -262,11 +275,13 @@ impl Store {
         records: &[QuotaObservationRecordV1],
     ) -> Result<u64> {
         self.with_immediate_transaction(|| {
-            self.replace_quota_observations_for_source_files_inner(
-                source_id,
-                source_file_path_hashes,
-                records,
-            )
+            Ok(self
+                .replace_quota_observations_for_source_files_inner(
+                    source_id,
+                    source_file_path_hashes,
+                    records,
+                )?
+                .written)
         })
     }
 
@@ -550,4 +565,12 @@ impl Store {
             false,
         )
     }
+}
+
+/// What a quota write did: the records it was given, and the rows it changed --
+/// written with different contents, or deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct QuotaWriteCount {
+    pub(crate) written: u64,
+    pub(crate) changed: u64,
 }

@@ -742,8 +742,12 @@ impl Store {
         self.with_immediate_transaction(|| {
             let mut impact = EventDeletionImpact::default();
             let mut dirty = EventWriteDirty::default();
-            let condition =
-                format!("source_id = ?1 AND COALESCE({EVENT_SOURCE_FILE_HASH_SQL}, '') = ''");
+            // Spelled with the bare expression `usage_events_source_file_idx` is
+            // built on, so both arms read an index range instead of every payload.
+            let condition = format!(
+                "source_id = ?1 AND ({EVENT_SOURCE_FILE_HASH_SQL} IS NULL \
+                 OR {EVENT_SOURCE_FILE_HASH_SQL} = '')"
+            );
             let rows: Vec<(String, String)> = {
                 let mut stmt = self.conn.prepare(&format!(
                     "SELECT event_id, payload FROM usage_events WHERE {condition}"

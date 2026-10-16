@@ -17,7 +17,6 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 const JSONL_EXTENSION: &str = "jsonl";
 const ZSTD_EXTENSION: &str = "zst";
@@ -30,26 +29,11 @@ const ZSTD_EXTENSION: &str = "zst";
 /// listed under its canonical `.jsonl` path: that is the cache key the plain file
 /// had, which a path that does not exist could not otherwise be canonicalized to.
 pub(crate) fn collect_jsonl_files_with_compressed(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut plain = Vec::new();
-    let mut compressed = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        match path.extension().and_then(|ext| ext.to_str()) {
-            Some(JSONL_EXTENSION) => plain.push(path.to_path_buf()),
-            Some(ZSTD_EXTENSION) if uncompressed_name(path).is_some() => {
-                compressed.push(path.to_path_buf());
-            }
-            _ => {}
-        }
-    }
+    let (plain, compressed): (Vec<_>, Vec<_>) = crate::collect_files(root, |path| {
+        is_plain_jsonl(path) || uncompressed_name(path).is_some()
+    })?
+    .into_iter()
+    .partition(|path| is_plain_jsonl(path));
 
     let listed = plain
         .iter()
@@ -71,6 +55,10 @@ pub(crate) fn collect_jsonl_files_with_compressed(root: &Path) -> Result<Vec<Pat
     }
     files.sort_by_cached_key(|path| path.to_string_lossy().into_owned());
     Ok(files)
+}
+
+fn is_plain_jsonl(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some(JSONL_EXTENSION)
 }
 
 /// `X.jsonl` for a file named `X.jsonl.zst`.
@@ -176,10 +164,17 @@ impl<R: BufRead> Read for ZstdFrames<R> {
                     length,
                     ..
                 })) => {
-                    io::copy(
+                    let skipped = io::copy(
                         &mut (&mut self.source).take(u64::from(length)),
                         &mut io::sink(),
                     )?;
+                    // A stream that ends inside the frame is cut short, not complete.
+                    if skipped != u64::from(length) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "zstd skippable frame is truncated",
+                        ));
+                    }
                 }
                 Err(error) => return Err(io::Error::other(error)),
             }
@@ -300,6 +295,17 @@ mod tests {
         let mut wrong_content = CHECKSUMMED_FRAME;
         wrong_content[13] = b'2';
         assert!(read_frame(&wrong_content).is_err());
+    }
+
+    #[test]
+    fn a_truncated_skippable_frame_fails_to_read() {
+        let mut bytes = compressed("{\"first\":1}\n");
+        // Declares eight bytes and holds three: the copy was cut short.
+        bytes.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(b"pad");
+        let error = read_frame(&bytes).expect_err("truncated frame");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

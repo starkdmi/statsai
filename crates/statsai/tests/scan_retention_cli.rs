@@ -156,6 +156,21 @@ fn scans_keep_usage_of_compressed_moved_and_deleted_rollouts() {
     scan(&[]);
     assert_eq!(counts(&store, &codex_home), (2, 2), "after deleting again");
 
+    // Copied, scanned, then the original deleted, as a move across volumes is:
+    // the copy, tracked already, still takes the original's rows over rather
+    // than keeping both copies' quota rows.
+    let copy_a = sessions.join(format!("{name_a}.zst"));
+    std::fs::copy(&archived_a, &copy_a).expect("copy");
+    scan(&[]);
+    assert_eq!(counts(&store, &codex_home).0, 2, "while both copies exist");
+    std::fs::remove_file(&copy_a).expect("delete the copy");
+    scan(&[]);
+    assert_eq!(
+        counts(&store, &codex_home),
+        (2, 2),
+        "after the copy is gone"
+    );
+
     // A full reread replaces what it reads, and keeps the rest.
     scan(&["--no-cache"]);
     assert_eq!(counts(&store, &codex_home), (2, 2), "after --no-cache");

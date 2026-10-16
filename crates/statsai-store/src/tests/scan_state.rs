@@ -70,6 +70,7 @@ fn scan_file_replacement_rolls_back_deletions_when_cache_update_fails() {
             pending_entries: &[replacement],
             compatible_entries_to_upgrade: &[],
             removed_cache_keys: &[],
+            forgotten_cache_keys: &[],
         })
         .expect_err("replacement should fail");
 
@@ -340,6 +341,7 @@ fn scan_file_replacement_clears_links_to_events_it_retired() {
             }],
             compatible_entries_to_upgrade: &[],
             removed_cache_keys: &[],
+            forgotten_cache_keys: &[],
         })
         .expect("replace scan files");
 
@@ -426,10 +428,13 @@ fn legacy_provenance_check_survives_a_payload_it_cannot_read() {
 }
 
 #[test]
-fn moved_scan_files_are_matched_by_a_session_name_on_a_new_path() {
+fn gone_scan_files_match_moves_by_session_name() {
     let entry = |key: &str| ScanFileStateEntry {
         cache_key: key.to_string(),
         cache_signature: "sig".to_string(),
+    };
+    let moved_from = |tracked: &[ScanFileStateEntry], current: &[ScanFileStateEntry]| {
+        gone_scan_files(tracked, current).moved_from()
     };
     let rollout = "rollout-2026-05-28T10-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
     let session = "4c1f5a8e-2b7d-4e0a-9c3f-1d2e3f4a5b6c.jsonl";
@@ -437,21 +442,27 @@ fn moved_scan_files_are_matched_by_a_session_name_on_a_new_path() {
     // Archived: gone from `sessions/`, the one file of its name now elsewhere.
     let tracked = [entry(&format!("/codex/sessions/2026/05/28/{rollout}"))];
     let current = [entry(&format!("/codex/archived_sessions/{rollout}"))];
-    assert_eq!(
-        moved_scan_file_entries(&tracked, &current),
-        tracked.to_vec()
-    );
+    let gone = gone_scan_files(&tracked, &current);
+    assert_eq!(gone.moved_from(), tracked.to_vec());
+    assert_eq!(gone.moved[0].to, current[0]);
 
     // Claude Code names a transcript for its session the same way.
     let tracked = [entry(&format!("/claude/projects/-old/{session}"))];
     let current = [entry(&format!("/claude/projects/-new/{session}"))];
-    assert_eq!(
-        moved_scan_file_entries(&tracked, &current),
-        tracked.to_vec()
-    );
+    assert_eq!(moved_from(&tracked, &current), tracked.to_vec());
+
+    // Copied first and deleted later: the copy was tracked already, and it is
+    // still where the file moved to.
+    let tracked = [
+        entry(&format!("/codex/sessions/{rollout}")),
+        entry(&format!("/codex/archived_sessions/{rollout}")),
+    ];
+    let current = [entry(&format!("/codex/archived_sessions/{rollout}"))];
+    assert_eq!(moved_from(&tracked, &current), vec![tracked[0].clone()]);
 
     // Grok names every session's file `summary.json`: one session deleted while
-    // another exists is not a move.
+    // another exists is not a move. Nothing can ever match such a name, so the
+    // gone file's entry is forgotten instead of kept.
     let tracked = [
         entry("/grok/sessions/one/summary.json"),
         entry("/grok/sessions/two/summary.json"),
@@ -460,24 +471,20 @@ fn moved_scan_files_are_matched_by_a_session_name_on_a_new_path() {
         entry("/grok/sessions/two/summary.json"),
         entry("/grok/sessions/three/summary.json"),
     ];
-    assert!(moved_scan_file_entries(&tracked, &current).is_empty());
+    let gone = gone_scan_files(&tracked, &current);
+    assert!(gone.moved.is_empty());
+    assert_eq!(gone.forgotten, vec![tracked[0].clone()]);
 
-    // A name two current files share says nothing about which one it moved to.
+    // A name two current files share says nothing about which one it moved to;
+    // the gone file is kept, not forgotten.
     let tracked = [entry(&format!("/codex/sessions/{rollout}"))];
     let current = [
         entry(&format!("/codex/archived_sessions/{rollout}")),
         entry(&format!("/codex/archived_sessions/copy/{rollout}")),
     ];
-    assert!(moved_scan_file_entries(&tracked, &current).is_empty());
-
-    // A file already tracked at its other path was read there before; only a
-    // path new to the store is where a file moved to.
-    let tracked = [
-        entry(&format!("/codex/sessions/{rollout}")),
-        entry(&format!("/codex/archived_sessions/{rollout}")),
-    ];
-    let current = [entry(&format!("/codex/archived_sessions/{rollout}"))];
-    assert!(moved_scan_file_entries(&tracked, &current).is_empty());
+    let gone = gone_scan_files(&tracked, &current);
+    assert!(gone.moved.is_empty());
+    assert!(gone.forgotten.is_empty());
 }
 
 #[test]
@@ -519,6 +526,7 @@ fn scan_file_replacement_retires_the_task_spans_of_moved_files() {
             pending_entries: &[],
             compatible_entries_to_upgrade: &[],
             removed_cache_keys: std::slice::from_ref(&moved_key),
+            forgotten_cache_keys: &[],
         })
         .expect("replace scan files");
 

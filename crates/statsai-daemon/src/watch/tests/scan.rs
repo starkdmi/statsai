@@ -799,16 +799,14 @@ fn rescan_changed_sources_keeps_records_of_deleted_files() {
     .expect("rescan deleted file");
 
     assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
-    // A provider deleting its log does not delete the usage it recorded, and
-    // the file's cache entry stays so a later move is still recognised.
+    // A provider deleting its log does not delete the usage it recorded. The
+    // file's name carries no session, so no later file can be recognised as it,
+    // and its cache entry goes.
     assert_eq!(store.event_count().expect("event count"), 1);
-    assert_eq!(
-        store
-            .scan_file_entries(&source.source_id)
-            .expect("scan entries")
-            .len(),
-        1
-    );
+    assert!(store
+        .scan_file_entries(&source.source_id)
+        .expect("scan entries")
+        .is_empty());
 }
 
 #[test]

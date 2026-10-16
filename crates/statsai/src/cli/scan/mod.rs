@@ -18,7 +18,7 @@ use statsai_core::{
     ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
-    derive_task_work_items, moved_scan_file_entries, reconcile_verified_source_state,
+    derive_task_work_items, gone_scan_files, reconcile_verified_source_state,
     verified_source_observation_hash, ActivityPersistMode, ActivityScanCursor, LocationIdentities,
     ScanFileStateEntry, Store, TaskRebuildReport,
 };
@@ -155,10 +155,13 @@ pub(crate) fn scan_with_adapters(
             let pending_file_entries = file_reconciliation.pending_entries;
             let compatible_entries_to_upgrade = file_reconciliation.compatible_entries_to_upgrade;
             let moved_file_entries = file_reconciliation.moved_entries;
+            let forgotten_file_entries = file_reconciliation.forgotten_entries;
+            let reads_files = !pending_file_entries.is_empty() || !moved_file_entries.is_empty();
             // A gone file touches nothing, as its records stay, except under
-            // `--replace`, which rebuilds the source from the files there are.
-            let touched_files = !pending_file_entries.is_empty()
-                || !moved_file_entries.is_empty()
+            // `--replace`, which rebuilds the source from the files there are, and
+            // for the cache entries of the gone files nothing can be matched to.
+            let touched_files = reads_files
+                || !forgotten_file_entries.is_empty()
                 || (command.replace && file_reconciliation.has_gone_entries);
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let scan_all_current_files = !file_cache_entries.is_empty()
@@ -172,8 +175,10 @@ pub(crate) fn scan_with_adapters(
             // records file by file cannot reach them. A scan that reads files while
             // the source holds any rereads every file and retires them on their own;
             // `--replace` deletes them with the rest of the source.
+            // With no file to read, nothing would replace them, so they stay.
             let has_hashless_records = !command.replace
-                && (command.no_cache || touched_files)
+                && !file_cache_entries.is_empty()
+                && (command.no_cache || reads_files)
                 && store.source_records_missing_scan_file_hashes(&source.source_id)?;
             let needs_legacy_full_reconcile =
                 has_hashless_records && !command.no_cache && !scan_all_current_files;
@@ -499,7 +504,8 @@ pub(crate) fn scan_with_adapters(
                     // Spans without a file hash name no file to replace them by,
                     // so a full reread that collects tasks retires them and reads
                     // them again.
-                    if command.include_tasks && reread_every_file {
+                    if command.include_tasks && reread_every_file && !file_cache_entries.is_empty()
+                    {
                         deleted_by_scan.push(
                             store.delete_task_spans_without_source_file_hash(&source.source_id)?,
                         );
@@ -547,8 +553,13 @@ pub(crate) fn scan_with_adapters(
                     )?;
                     // Every file was reread, so a row with no file hash, stored before
                     // hashes were recorded, is one no file can replace. A row of a file
-                    // that is gone keeps its hash, and stays.
-                    store.delete_quota_observations_without_source_file_hash(&source.source_id)?;
+                    // that is gone keeps its hash, and stays. With no file read, there
+                    // is nothing to replace it.
+                    if !file_cache_entries.is_empty() {
+                        store.delete_quota_observations_without_source_file_hash(
+                            &source.source_id,
+                        )?;
+                    }
                 } else {
                     store.upsert_quota_observations(&scan.quota_observations)?;
                 }
@@ -659,8 +670,11 @@ pub(crate) fn scan_with_adapters(
                 )?;
                 store
                     .upgrade_scan_file_entries(&source.source_id, &compatible_entries_to_upgrade)?;
-                let moved_cache_keys = scan_file_cache_keys(&moved_file_entries);
-                store.delete_scan_file_entries(&source.source_id, &moved_cache_keys)?;
+                let retired_cache_keys = scan_file_cache_keys(&moved_file_entries)
+                    .into_iter()
+                    .chain(scan_file_cache_keys(&forgotten_file_entries))
+                    .collect::<Vec<_>>();
+                store.delete_scan_file_entries(&source.source_id, &retired_cache_keys)?;
                 if account_evidence_enabled {
                     store.upsert_account_evidence_checkpoints(&account_evidence.checkpoints)?;
                 }

@@ -572,6 +572,7 @@ fn the_daemon_rescan_keeps_a_deleted_checkouts_repository() {
             pending_entries: &[],
             compatible_entries_to_upgrade: &[],
             removed_cache_keys: &[],
+            forgotten_cache_keys: &[],
         })
         .expect("replace scan files");
 

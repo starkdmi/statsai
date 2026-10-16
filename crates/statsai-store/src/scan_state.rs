@@ -286,7 +286,7 @@ impl Store {
                     record
                 })
                 .collect::<Vec<_>>();
-            self.replace_quota_observations_for_source_files(
+            let quota_write = self.replace_quota_observations_for_source_files_inner(
                 replacement.source_id,
                 replacement.reconciled_file_hashes,
                 &quota_observations,
@@ -295,7 +295,10 @@ impl Store {
             // just deleted. Run after the insert: a record that survives the rescan
             // keeps its id, and the check treats it as still present.
             self.clear_quota_usage_links_for_events(&deleted_events.deleted_event_ids)?;
-            if !replacement.reconciled_file_hashes.is_empty() {
+            // The plan rows are derived from every quota row of the source, so
+            // they are rebuilt only when a quota row changed: an append to an
+            // active rollout without a new rate-limit sample costs nothing here.
+            if quota_write.changed > 0 {
                 self.rebuild_quota_plan_observations_for_source(replacement.source_id)?;
             }
             let activity = self.persist_activity_scan_inner(
@@ -331,6 +334,7 @@ impl Store {
                 &deleted_spans.deleted_spans,
             )?;
             self.delete_scan_file_entries(replacement.source_id, replacement.removed_cache_keys)?;
+            self.delete_scan_file_entries(replacement.source_id, replacement.forgotten_cache_keys)?;
             Ok(ScanFileReplacementResult {
                 inserted_events,
                 written_summaries,

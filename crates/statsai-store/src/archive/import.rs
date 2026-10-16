@@ -91,13 +91,15 @@ impl Store {
     }
 
     /// Retires the imported files that moved to one of `entries`
-    /// ([`crate::moved_scan_file_entries`]): their import state, artifact
-    /// dependencies, code trace edits and quota observations go, and their import
-    /// at the new path records them again, under ids that include that path.
+    /// ([`crate::gone_scan_files`]): their import state, artifact dependencies,
+    /// code trace edits and quota observations go, and the import at the new path
+    /// holds them, under ids that include that path. A file moved to a path
+    /// already imported is imported there already.
     ///
     /// A file that is simply gone keeps all of it, as a scan keeps a gone file's
     /// usage, and keeps its import state, so a later collect still recognises the
-    /// move if the file reappears elsewhere. Returns how many files were retired.
+    /// move if the file reappears elsewhere. One whose name no file can ever be
+    /// matched by loses only its import state. Returns how many files were retired.
     pub fn reconcile_archive_import_entries(
         &self,
         source_id: &SourceId,
@@ -116,7 +118,18 @@ impl Store {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
-            let moved = crate::moved_scan_file_entries(&tracked, entries);
+            let gone = crate::gone_scan_files(&tracked, entries);
+            for entry in &gone.forgotten {
+                self.conn.execute(
+                    "DELETE FROM archive_artifact_dependencies WHERE source_id = ?1 AND cache_key = ?2",
+                    params![&source_id.0, &entry.cache_key],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM archive_import_state WHERE source_id = ?1 AND cache_key = ?2",
+                    params![&source_id.0, &entry.cache_key],
+                )?;
+            }
+            let moved = gone.moved_from();
             for entry in &moved {
                 let cache_key = &entry.cache_key;
                 self.conn.execute(

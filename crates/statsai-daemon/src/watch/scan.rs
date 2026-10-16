@@ -13,7 +13,7 @@ use statsai_core::{
     UsageSummary, ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
-    find_existing_provider_account, moved_scan_file_entries, reconcile_verified_source_state,
+    find_existing_provider_account, gone_scan_files, reconcile_verified_source_state,
     try_acquire_scan_lock, upsert_provider_account, verified_source_observation_hash,
     ActivityPersistMode, ActivityScanCursor, ScanFileReplacement, ScanFileStateEntry, Store,
     UpsertProviderAccountInput,
@@ -334,10 +334,16 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                 }
             };
             // A file that is gone keeps its records and its cache entry. One that
-            // moved to a path read now has its records replaced by the ones read
-            // there, and its entry goes.
-            let moved_file_entries =
-                moved_scan_file_entries(&tracked_file_entries, &file_cache_entries);
+            // moved to a current path has its records replaced by the ones read
+            // there, and its entry goes; so does the entry of one nothing can be
+            // matched to.
+            let gone_files = gone_scan_files(&tracked_file_entries, &file_cache_entries);
+            let moved_file_entries = gone_files.moved_from();
+            let forgotten_cache_keys = gone_files
+                .forgotten
+                .iter()
+                .map(|entry| entry.cache_key.clone())
+                .collect::<Vec<_>>();
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let probed_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
@@ -400,6 +406,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
             };
             if pending_file_entries.is_empty()
                 && moved_file_entries.is_empty()
+                && forgotten_cache_keys.is_empty()
                 && !has_cache_entry_upgrades
                 && !verified_state_changed
                 && !has_account_evidence
@@ -536,6 +543,12 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                         &compatible_entries_to_upgrade,
                                     )
                                     .context("upgrade scan cache")?;
+                                store
+                                    .delete_scan_file_entries(
+                                        &source.source_id,
+                                        &forgotten_cache_keys,
+                                    )
+                                    .context("forget gone files")?;
                                 return Ok(None);
                             }
                             apply_source_account_resolution(
@@ -581,6 +594,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                     pending_entries: &pending_file_entries,
                                     compatible_entries_to_upgrade: &compatible_entries_to_upgrade,
                                     removed_cache_keys: &removed_cache_keys,
+                                    forgotten_cache_keys: &forgotten_cache_keys,
                                 })
                                 .context("atomically reconcile scan files")?;
                             Ok(Some(replacement))
