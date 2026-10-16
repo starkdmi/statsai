@@ -687,7 +687,7 @@ fn manual_only_watcher_rescan_does_not_collect_account_evidence() {
 }
 
 #[test]
-fn rescan_changed_sources_removes_records_for_deleted_files() {
+fn rescan_changed_sources_keeps_records_of_deleted_files() {
     let store = Store::in_memory().expect("store");
     let root = tempfile::tempdir().expect("source root");
     let deleted_file = root.path().join("deleted.jsonl");
@@ -799,7 +799,10 @@ fn rescan_changed_sources_removes_records_for_deleted_files() {
     .expect("rescan deleted file");
 
     assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
-    assert_eq!(store.event_count().expect("event count"), 0);
+    // A provider deleting its log does not delete the usage it recorded. The
+    // file's name carries no session, so no later file can be recognised as it,
+    // and its cache entry goes.
+    assert_eq!(store.event_count().expect("event count"), 1);
     assert!(store
         .scan_file_entries(&source.source_id)
         .expect("scan entries")
@@ -911,7 +914,7 @@ fn rescan_changed_sources_preserves_event_from_unchanged_duplicate_file() {
         })
     };
     let active_event: UsageEvent =
-        serde_json::from_value(event_json(active_file_hash)).expect("active event");
+        serde_json::from_value(event_json(active_file_hash.clone())).expect("active event");
     let archived_event: UsageEvent =
         serde_json::from_value(event_json(archived_file_hash.clone())).expect("archived event");
     assert!(store.insert_event(&active_event).expect("insert event"));
@@ -936,7 +939,9 @@ fn rescan_changed_sources_preserves_event_from_unchanged_duplicate_file() {
     )
     .expect("rescan duplicate file");
 
-    assert_eq!(*scan_calls.lock().expect("scan calls"), 1);
+    // The deleted file's event stays as it was, so nothing needs rereading:
+    // the unchanged copy takes the event over the next time it changes.
+    assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
     let events = store.events().expect("events");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_id.0, "event-duplicate-file");
@@ -945,6 +950,88 @@ fn rescan_changed_sources_preserves_event_from_unchanged_duplicate_file() {
             .parse_evidence
             .as_ref()
             .and_then(|evidence| evidence.source_file_path_hash.as_deref()),
-        Some(archived_file_hash.as_str())
+        Some(active_file_hash.as_str())
+    );
+}
+
+#[test]
+fn a_watched_rollout_moving_takes_its_quota_rows_along() {
+    let store = Store::in_memory().expect("store");
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let day = codex_home.path().join("sessions/2026/08/20");
+    std::fs::create_dir_all(&day).expect("sessions");
+    let name = "rollout-2026-08-20T12-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
+    let active = day.join(name);
+    std::fs::write(
+        &active,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": "2026-08-20T12:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                        "total_token_usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+                    },
+                    "rate_limits": {
+                        "primary": {"used_percent": 25, "window_minutes": 10080, "resets_at": 1787832000}
+                    }
+                }
+            })
+        ),
+    )
+    .expect("rollout");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        codex_home.path(),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let adapters: Vec<Box<dyn ProviderAdapter>> = vec![Box::new(statsai_adapters::CodexAdapter)];
+    let quota_file_hashes = |store: &Store| {
+        store
+            .quota_observations(&statsai_store::QuotaQuery::default(), false)
+            .expect("quota rows")
+            .into_iter()
+            .map(|record| record.observation.source_file_path_hash)
+            .collect::<Vec<_>>()
+    };
+
+    rescan_changed_sources_with_adapters(
+        &store,
+        "device-test",
+        std::slice::from_ref(&active),
+        &adapters,
+    )
+    .expect("scan the rollout");
+    assert_eq!(store.event_count().expect("events"), 1);
+    assert_eq!(
+        quota_file_hashes(&store).len(),
+        1,
+        "the watcher stores quota rows"
+    );
+
+    // Codex archives the thread.
+    let archived_dir = codex_home.path().join("archived_sessions");
+    std::fs::create_dir_all(&archived_dir).expect("archived sessions");
+    let archived = archived_dir.join(name);
+    std::fs::rename(&active, &archived).expect("archive");
+    rescan_changed_sources_with_adapters(
+        &store,
+        "device-test",
+        &[active, archived.clone()],
+        &adapters,
+    )
+    .expect("scan the move");
+
+    assert_eq!(store.event_count().expect("events"), 1);
+    assert_eq!(
+        quota_file_hashes(&store),
+        vec![hash_text(&statsai_core::canonical_display(&archived))],
+        "the quota row moved with its file instead of staying under the old path"
     );
 }

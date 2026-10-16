@@ -40,6 +40,7 @@ mod archive;
 mod cache;
 mod claude;
 mod codex;
+mod compressed;
 mod cursor;
 mod event;
 mod grok;
@@ -86,6 +87,7 @@ pub(crate) use codex::{
     codex_project_context_from_value, codex_quota_observation, codex_token_count_usage,
     codex_usage_roots, session_raw_from_value,
 };
+pub use compressed::readable_jsonl_path;
 pub(crate) use grok::grok_sessions_root;
 pub use grok::GrokBuildAdapter;
 pub(crate) use opencode::opencode_message_usage_counts;
@@ -463,6 +465,14 @@ pub(crate) fn session_event_rollups(events: &[UsageEvent]) -> HashMap<String, Se
 }
 
 pub(crate) fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>> {
+    collect_files(root, |path| {
+        path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+    })
+}
+
+/// The files under `root` that `keep` accepts, without following links, sorted by
+/// path.
+pub(crate) fn collect_files(root: &Path, keep: impl Fn(&Path) -> bool) -> Result<Vec<PathBuf>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -470,9 +480,7 @@ pub(crate) fn collect_jsonl_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
-        if entry.file_type().is_file()
-            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-        {
+        if entry.file_type().is_file() && keep(entry.path()) {
             files.push(entry.path().to_path_buf());
         }
     }

@@ -15,7 +15,7 @@ pub(crate) struct ScanCommand {
     pub(crate) no_cache: bool,
     #[arg(
         long,
-        help = "Replace existing events for scanned sources before inserting"
+        help = "Delete all stored records of scanned sources first, even those of deleted files"
     )]
     pub(crate) replace: bool,
     #[arg(long, help = "Show detailed per-source diagnostics")]

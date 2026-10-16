@@ -18,9 +18,9 @@ use statsai_core::{
     ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
-    derive_task_work_items, reconcile_verified_source_state, verified_source_observation_hash,
-    ActivityPersistMode, ActivityScanCursor, LocationIdentities, ScanFileStateEntry, Store,
-    TaskRebuildReport,
+    derive_task_work_items, gone_scan_files, reconcile_verified_source_state,
+    verified_source_observation_hash, ActivityPersistMode, ActivityScanCursor, LocationIdentities,
+    ScanFileStateEntry, Store, TaskRebuildReport,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
@@ -154,9 +154,15 @@ pub(crate) fn scan_with_adapters(
             )?;
             let pending_file_entries = file_reconciliation.pending_entries;
             let compatible_entries_to_upgrade = file_reconciliation.compatible_entries_to_upgrade;
-            let removed_file_entries = file_reconciliation.removed_entries;
-            let touched_files =
-                !pending_file_entries.is_empty() || !removed_file_entries.is_empty();
+            let moved_file_entries = file_reconciliation.moved_entries;
+            let forgotten_file_entries = file_reconciliation.forgotten_entries;
+            let reads_files = !pending_file_entries.is_empty() || !moved_file_entries.is_empty();
+            // A gone file touches nothing, as its records stay, except under
+            // `--replace`, which rebuilds the source from the files there are, and
+            // for the cache entries of the gone files nothing can be matched to.
+            let touched_files = reads_files
+                || !forgotten_file_entries.is_empty()
+                || (command.replace && file_reconciliation.has_gone_entries);
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let scan_all_current_files = !file_cache_entries.is_empty()
                 && pending_file_entries.len() == file_cache_entries.len();
@@ -165,23 +171,31 @@ pub(crate) fn scan_with_adapters(
             // read. Timing them together attributed the query's cost to the filesystem.
             candidate_scan_duration_ms += candidate_scan_started_at.elapsed().as_millis() as u64;
             let legacy_reconcile_started_at = Instant::now();
-            let needs_legacy_full_reconcile = !command.replace
-                && !command.no_cache
-                && touched_files
-                && !scan_all_current_files
+            // Rows stored before file hashes were recorded name no file, so replacing
+            // records file by file cannot reach them. A scan that reads files while
+            // the source holds any rereads every file and retires them on their own;
+            // `--replace` deletes them with the rest of the source.
+            // With no file to read, nothing would replace them, so they stay.
+            let has_hashless_records = !command.replace
+                && !file_cache_entries.is_empty()
+                && (command.no_cache || reads_files)
                 && store.source_records_missing_scan_file_hashes(&source.source_id)?;
+            let needs_legacy_full_reconcile =
+                has_hashless_records && !command.no_cache && !scan_all_current_files;
             legacy_check_duration_ms += legacy_reconcile_started_at.elapsed().as_millis() as u64;
-            let replace_source_records = should_replace_source_records_for_scan(
+            let reread_every_file = should_reread_every_file(
                 command.replace,
                 command.no_cache,
                 file_cache_entries.len(),
                 pending_file_entries.len(),
                 needs_legacy_full_reconcile,
             );
-            let replace_all_source_quota_records = should_replace_all_source_quota_records(
-                command.replace,
-                needs_legacy_full_reconcile,
-            );
+            // The files whose records this scan replaces, before the moved ones.
+            let reconciled_file_entries = if reread_every_file {
+                &file_cache_entries
+            } else {
+                &pending_file_entries
+            };
             let stored_activity_cursor = store.activity_scan_cursor(&source.source_id)?;
             let parser_revision_mismatch = stored_activity_cursor
                 .as_ref()
@@ -195,7 +209,7 @@ pub(crate) fn scan_with_adapters(
             } else {
                 command.replace || command.no_cache || parser_revision_mismatch
             };
-            let should_run_adapter_scan = if replace_source_records || activity_full_reconcile {
+            let should_run_adapter_scan = if reread_every_file || activity_full_reconcile {
                 !file_cache_entries.is_empty()
             } else {
                 !pending_file_entries.is_empty()
@@ -204,7 +218,7 @@ pub(crate) fn scan_with_adapters(
                 device_id: device_id.to_string(),
                 collect_tasks: command.include_tasks,
                 selected_cache_keys: (should_run_adapter_scan
-                    && !replace_source_records
+                    && !reread_every_file
                     && !command.no_cache
                     && !activity_full_reconcile)
                     .then(|| {
@@ -343,10 +357,10 @@ pub(crate) fn scan_with_adapters(
                         store,
                         SourceTaskChangeSet {
                             source_id: &source.source_id,
-                            replace_source_records,
-                            touched_files,
-                            pending_file_entries: &pending_file_entries,
-                            removed_file_entries: &removed_file_entries,
+                            replace_source_records: command.replace,
+                            touched_files: reread_every_file || touched_files,
+                            pending_file_entries: reconciled_file_entries,
+                            moved_file_entries: &moved_file_entries,
                             task_spans: &scan.task_spans,
                         },
                     )?;
@@ -414,7 +428,7 @@ pub(crate) fn scan_with_adapters(
                 let mut deleted_task_spans = Vec::new();
                 let mut deleted_event_ids = Vec::new();
                 let mut replaced_identities = LocationIdentities::default();
-                if replace_source_records {
+                if command.replace {
                     let delete_started_at = Instant::now();
                     let deleted_events =
                         store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
@@ -423,11 +437,9 @@ pub(crate) fn scan_with_adapters(
                     replaced_identities.extend(deleted_events.replaced_identities);
                     removed_summary_count += store
                         .delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
-                    if replace_all_source_quota_records {
-                        store.delete_quota_observations_for_sources(std::slice::from_ref(
-                            &source.source_id,
-                        ))?;
-                    }
+                    store.delete_quota_observations_for_sources(std::slice::from_ref(
+                        &source.source_id,
+                    ))?;
                     if command.include_tasks {
                         let deleted = store.delete_task_spans_for_sources(std::slice::from_ref(
                             &source.source_id,
@@ -438,11 +450,11 @@ pub(crate) fn scan_with_adapters(
                         deleted_task_spans.extend(deleted.deleted_spans);
                     }
                     delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
-                } else if touched_files {
+                } else if reread_every_file || touched_files {
                     let delete_started_at = Instant::now();
                     let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
-                        &pending_file_entries,
-                        &removed_file_entries,
+                        reconciled_file_entries,
+                        &moved_file_entries,
                     );
                     let deleted_events = store.delete_events_for_source_file_hashes(
                         &source.source_id,
@@ -455,15 +467,50 @@ pub(crate) fn scan_with_adapters(
                         &source.source_id,
                         &reconciled_file_hashes,
                     )?;
-                    store.delete_quota_observations_for_source_file_hashes(
-                        &source.source_id,
-                        &reconciled_file_hashes,
-                    )?;
-                    if command.include_tasks {
-                        let deleted = store.delete_task_spans_for_source_file_hashes(
+                    if has_hashless_records {
+                        let deleted_events =
+                            store.delete_events_without_source_file_hash(&source.source_id)?;
+                        removed_event_count += deleted_events.deleted;
+                        deleted_event_ids.extend(deleted_events.deleted_event_ids);
+                        replaced_identities.extend(deleted_events.replaced_identities);
+                        removed_summary_count +=
+                            store.delete_summaries_without_source_file_hash(&source.source_id)?;
+                    }
+                    // A full reread replaces quota rows after the insert instead,
+                    // so the rows it reads again unchanged are not rewritten.
+                    if !reread_every_file {
+                        store.delete_quota_observations_for_source_file_hashes(
                             &source.source_id,
                             &reconciled_file_hashes,
                         )?;
+                    }
+                    // A moved file's spans go even when this scan collects none: its
+                    // cache entry goes below, and with it the only record that its
+                    // spans belong to the file now at the new path. That file is
+                    // recorded without tasks, so the next scan that collects them
+                    // reads it again.
+                    let task_span_file_hashes = if command.include_tasks {
+                        reconciled_file_hashes
+                    } else {
+                        scan_file_hashes_for_reconciliation(&[], &moved_file_entries)
+                    };
+                    let mut deleted_by_scan = Vec::new();
+                    if !task_span_file_hashes.is_empty() {
+                        deleted_by_scan.push(store.delete_task_spans_for_source_file_hashes(
+                            &source.source_id,
+                            &task_span_file_hashes,
+                        )?);
+                    }
+                    // Spans without a file hash name no file to replace them by,
+                    // so a full reread that collects tasks retires them and reads
+                    // them again.
+                    if command.include_tasks && reread_every_file && !file_cache_entries.is_empty()
+                    {
+                        deleted_by_scan.push(
+                            store.delete_task_spans_without_source_file_hash(&source.source_id)?,
+                        );
+                    }
+                    for deleted in deleted_by_scan {
                         removed_task_span_count += deleted.deleted;
                         affected_project_buckets
                             .extend(deleted.affected_project_buckets.iter().cloned());
@@ -494,24 +541,25 @@ pub(crate) fn scan_with_adapters(
                     &insert_result.canonical_event_ids,
                 );
                 let quota_reconcile_started_at = Instant::now();
-                if replace_source_records && !replace_all_source_quota_records {
+                if reread_every_file && !command.replace {
                     let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
                         &file_cache_entries,
-                        &removed_file_entries,
+                        &moved_file_entries,
                     );
                     store.replace_quota_observations_for_source_files(
                         &source.source_id,
                         &reconciled_file_hashes,
                         &scan.quota_observations,
                     )?;
-                    // Every file was rescanned, so anything still carrying a hash outside that set
-                    // belongs to a file that is gone, or predates file hashes entirely. Nothing
-                    // later in this scan revisits it, so it is retired here rather than surviving
-                    // as a row no source file explains.
-                    store.delete_quota_observations_for_source_outside_file_hashes(
-                        &source.source_id,
-                        &reconciled_file_hashes,
-                    )?;
+                    // Every file was reread, so a row with no file hash, stored before
+                    // hashes were recorded, is one no file can replace. A row of a file
+                    // that is gone keeps its hash, and stays. With no file read, there
+                    // is nothing to replace it.
+                    if !file_cache_entries.is_empty() {
+                        store.delete_quota_observations_without_source_file_hash(
+                            &source.source_id,
+                        )?;
+                    }
                 } else {
                     store.upsert_quota_observations(&scan.quota_observations)?;
                 }
@@ -519,19 +567,21 @@ pub(crate) fn scan_with_adapters(
                     quota_reconcile_started_at.elapsed().as_millis() as u64;
 
                 let activity_write_started_at = Instant::now();
+                let activity_every_file = reread_every_file || activity_full_reconcile;
                 let activity_mode = ActivityPersistMode::for_scan(
                     adapter.provider(),
-                    replace_source_records || activity_full_reconcile,
+                    command.replace,
+                    activity_every_file,
                 );
                 let reconciled_activity_hashes =
                     if matches!(activity_mode, ActivityPersistMode::ReplaceFiles) {
                         scan_file_hashes_for_reconciliation(
-                            if replace_source_records {
+                            if activity_every_file {
                                 &file_cache_entries
                             } else {
                                 &pending_file_entries
                             },
-                            &removed_file_entries,
+                            &moved_file_entries,
                         )
                     } else {
                         Vec::new()
@@ -597,11 +647,18 @@ pub(crate) fn scan_with_adapters(
                     );
                     rebuild_span_ids
                         .extend(scan.task_spans.iter().map(|span| span.span_id.0.clone()));
-                    rebuild_project_buckets.extend(affected_project_buckets);
                 }
+                rebuild_project_buckets.extend(affected_project_buckets);
 
                 let cache_write_started_at = Instant::now();
-                let cache_entries_to_record = if replace_source_records || command.no_cache {
+                // `--replace` deleted the records of files that are gone too, so their
+                // cache entries go with them: one that comes back is read again.
+                if command.replace {
+                    store.delete_scan_file_entries_for_sources(std::slice::from_ref(
+                        &source.source_id,
+                    ))?;
+                }
+                let cache_entries_to_record = if reread_every_file {
                     &file_cache_entries
                 } else {
                     &pending_file_entries
@@ -613,15 +670,17 @@ pub(crate) fn scan_with_adapters(
                 )?;
                 store
                     .upgrade_scan_file_entries(&source.source_id, &compatible_entries_to_upgrade)?;
-                let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
-                store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
+                let retired_cache_keys = scan_file_cache_keys(&moved_file_entries)
+                    .into_iter()
+                    .chain(scan_file_cache_keys(&forgotten_file_entries))
+                    .collect::<Vec<_>>();
+                store.delete_scan_file_entries(&source.source_id, &retired_cache_keys)?;
                 if account_evidence_enabled {
                     store.upsert_account_evidence_checkpoints(&account_evidence.checkpoints)?;
                 }
                 cache_write_duration_ms += cache_write_started_at.elapsed().as_millis() as u64;
 
-                if command.include_tasks
-                    && !rebuild_project_buckets.is_empty()
+                if !rebuild_project_buckets.is_empty()
                     && (!rebuild_span_ids.is_empty() || !deleted_task_spans.is_empty())
                 {
                     let rebuild_started_at = Instant::now();

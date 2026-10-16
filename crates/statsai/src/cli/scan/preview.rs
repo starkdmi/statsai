@@ -50,10 +50,13 @@ pub(crate) struct PreviewTaskRebuild {
 
 pub(crate) struct SourceTaskChangeSet<'a> {
     pub(crate) source_id: &'a SourceId,
+    /// `--replace`: every span of the source goes.
     pub(crate) replace_source_records: bool,
     pub(crate) touched_files: bool,
+    /// The files whose spans are replaced: the files read.
     pub(crate) pending_file_entries: &'a [ScanFileStateEntry],
-    pub(crate) removed_file_entries: &'a [ScanFileStateEntry],
+    /// The files that moved to one of them. Spans of files that are gone stay.
+    pub(crate) moved_file_entries: &'a [ScanFileStateEntry],
     pub(crate) task_spans: &'a [TaskSpan],
 }
 
@@ -100,7 +103,7 @@ impl PreviewTaskRebuild {
         } else if changes.touched_files {
             let reconciled_hashes = scan_file_hashes_for_reconciliation(
                 changes.pending_file_entries,
-                changes.removed_file_entries,
+                changes.moved_file_entries,
             )
             .into_iter()
             .collect::<HashSet<_>>();

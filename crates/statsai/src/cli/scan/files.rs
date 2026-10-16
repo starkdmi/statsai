@@ -27,9 +27,21 @@ pub(crate) fn scan_candidate_compatible_signatures(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScanFileReconciliation {
+    /// The files to read: changed or new ones, and the files a gone file moved
+    /// to, which then hold its records.
     pub(crate) pending_entries: Vec<ScanFileStateEntry>,
     pub(crate) compatible_entries_to_upgrade: Vec<ScanFileStateEntry>,
-    pub(crate) removed_entries: Vec<ScanFileStateEntry>,
+    /// Tracked files that moved to a current path ([`gone_scan_files`]): their
+    /// records are replaced like a changed file's, and their cache entries go. A
+    /// tracked file that is simply gone keeps both its records and its cache
+    /// entry: a provider deleting or compressing a log does not delete its history
+    /// from the store, and the entry lets a later scan still recognise the file if
+    /// it moved.
+    pub(crate) moved_entries: Vec<ScanFileStateEntry>,
+    /// Gone files nothing can be matched to: only their cache entries go.
+    pub(crate) forgotten_entries: Vec<ScanFileStateEntry>,
+    /// Whether any tracked file is gone, moved or not.
+    pub(crate) has_gone_entries: bool,
 }
 
 pub(crate) fn select_scan_file_reconciliation(
@@ -51,18 +63,31 @@ pub(crate) fn select_scan_file_reconciliation(
         require_tasks_collected,
     )?;
     let tracked_entries = store.scan_file_entries(source_id)?;
-    let current_cache_keys: BTreeSet<_> = file_cache_entries
+    let gone = gone_scan_files(&tracked_entries, file_cache_entries);
+    let current_cache_keys = file_cache_entries
         .iter()
         .map(|entry| entry.cache_key.as_str())
-        .collect();
-    let removed_entries = tracked_entries
-        .into_iter()
-        .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
-        .collect();
+        .collect::<HashSet<_>>();
+    let has_gone_entries = tracked_entries
+        .iter()
+        .any(|entry| !current_cache_keys.contains(entry.cache_key.as_str()));
+    // A file moved to a path already tracked, unchanged there, is read again so
+    // it holds the records its old path loses.
+    let mut pending_entries = selection.pending_entries;
+    for moved in &gone.moved {
+        if !pending_entries
+            .iter()
+            .any(|entry| entry.cache_key == moved.to.cache_key)
+        {
+            pending_entries.push(moved.to.clone());
+        }
+    }
     Ok(ScanFileReconciliation {
-        pending_entries: selection.pending_entries,
+        pending_entries,
         compatible_entries_to_upgrade: selection.compatible_entries_to_upgrade,
-        removed_entries,
+        moved_entries: gone.moved_from(),
+        forgotten_entries: gone.forgotten,
+        has_gone_entries,
     })
 }
 
@@ -113,7 +138,12 @@ pub(crate) fn select_scan_file_entries(
     )
 }
 
-pub(crate) fn should_replace_source_records_for_scan(
+/// Whether this scan rereads every current file of the source and replaces their records.
+///
+/// Only `--replace` deletes the whole source first. Every other full reread -- `--no-cache`, a
+/// cache invalidation that leaves every file pending, or a source holding rows from before file
+/// hashes -- replaces records file by file, so the records of files that are gone survive it.
+pub(crate) fn should_reread_every_file(
     explicit_replace: bool,
     no_cache: bool,
     candidate_count: usize,
@@ -126,29 +156,15 @@ pub(crate) fn should_replace_source_records_for_scan(
         || (candidate_count > 0 && pending_count == candidate_count)
 }
 
-/// Whether this scan must delete every quota row the source owns before reinserting.
-///
-/// `--no-cache` used to be here. It reparses every file, so file-level reconciliation already
-/// covers everything it rewrites, and the only rows the file path could miss are those no current
-/// file accounts for -- which `delete_quota_observations_for_source_outside_file_hashes` retires
-/// directly. Deleting the whole source to reach them walked every observation, every window, and
-/// the payload table, and on a multi-gigabyte store that ran for tens of minutes. `--replace` keeps
-/// the blanket delete: it is documented as a destructive rebuild, and a caller asking for one is
-/// asking for exactly that.
-pub(crate) fn should_replace_all_source_quota_records(
-    explicit_replace: bool,
-    legacy_full_reconcile: bool,
-) -> bool {
-    explicit_replace || legacy_full_reconcile
-}
-
+/// The file hashes whose records a scan replaces: the files it read, and the
+/// files that moved to one of them.
 pub(crate) fn scan_file_hashes_for_reconciliation(
-    pending_entries: &[ScanFileStateEntry],
-    removed_entries: &[ScanFileStateEntry],
+    read_entries: &[ScanFileStateEntry],
+    moved_entries: &[ScanFileStateEntry],
 ) -> Vec<String> {
-    pending_entries
+    read_entries
         .iter()
-        .chain(removed_entries.iter())
+        .chain(moved_entries.iter())
         .map(|entry| hash_text(&entry.cache_key))
         .collect::<BTreeSet<_>>()
         .into_iter()

@@ -72,6 +72,24 @@ impl Store {
         })
     }
 
+    /// Deletes the source's summaries that carry no source file hash, as
+    /// [`Store::delete_events_without_source_file_hash`] does for events.
+    pub fn delete_summaries_without_source_file_hash(&self, source_id: &SourceId) -> Result<u64> {
+        self.with_immediate_transaction(|| {
+            Ok(self.conn.execute(
+                r#"
+                DELETE FROM usage_summaries
+                WHERE source_id = ?1
+                  AND COALESCE(
+                        CASE WHEN json_valid(payload)
+                          THEN json_extract(payload, '$.parse_evidence.source_file_path_hash')
+                        END, '') = ''
+                "#,
+                params![&source_id.0],
+            )? as u64)
+        })
+    }
+
     pub fn summaries(&self) -> Result<Vec<UsageSummary>> {
         let mut stmt = self
             .conn

@@ -83,7 +83,7 @@ fn source_quota_reads_do_not_deserialize_unrelated_rows() {
 }
 
 #[test]
-fn orphan_purge_retires_only_rows_no_rescanned_file_explains() {
+fn hashless_purge_retires_only_rows_without_a_file_hash() {
     let store = Store::in_memory().expect("store");
     let observed_at = DateTime::from_timestamp(1_787_227_200, 0).expect("observed at");
     let source_id = SourceId("quota-orphan-source".to_string());
@@ -100,39 +100,42 @@ fn orphan_purge_retires_only_rows_no_rescanned_file_explains() {
             25.0,
         )
     };
-    let kept = record(source_id.clone(), "kept");
-    let orphaned = record(source_id.clone(), "orphaned");
-    let untouched = record(other_source_id.clone(), "other");
+    let without_hash = |source: SourceId, id: &str| {
+        let mut record = record(source, id);
+        record.observation.source_file_path_hash = String::new();
+        record
+    };
+    let current = record(source_id.clone(), "current");
+    // A row of a file that is gone: the store keeps it.
+    let gone = record(source_id.clone(), "gone");
+    let legacy = without_hash(source_id.clone(), "legacy");
+    let other_legacy = without_hash(other_source_id.clone(), "other");
     store
-        .upsert_quota_observations(&[kept, orphaned, untouched])
+        .upsert_quota_observations(&[current, gone, legacy, other_legacy])
         .expect("seed quota rows");
 
-    // What a full rescan sees: only `kept`'s file still exists.
     let deleted = store
-        .delete_quota_observations_for_source_outside_file_hashes(
-            &source_id,
-            &["file-kept".to_string()],
-        )
-        .expect("purge orphaned quota rows");
+        .delete_quota_observations_without_source_file_hash(&source_id)
+        .expect("purge hashless quota rows");
 
-    assert_eq!(deleted, 1, "only the row without a current file is retired");
-    let remaining = store
+    assert_eq!(deleted, 1, "only the row without a file hash is retired");
+    let mut remaining = store
         .quota_observations_for_source(&source_id)
         .expect("read source quota rows")
         .into_iter()
         .map(|record| record.observation.observation_id)
         .collect::<Vec<_>>();
-    assert_eq!(remaining, vec!["kept".to_string()]);
-    let orphaned_windows: i64 = store
+    remaining.sort();
+    assert_eq!(remaining, vec!["current".to_string(), "gone".to_string()]);
+    let legacy_windows: i64 = store
         .conn
         .query_row(
-            "SELECT count(*) FROM quota_window_observations WHERE observation_id = 'orphaned'",
+            "SELECT count(*) FROM quota_window_observations WHERE observation_id = 'legacy'",
             [],
             |row| row.get(0),
         )
-        .expect("count orphaned windows");
-    assert_eq!(orphaned_windows, 0, "windows follow their observation");
-    // A hash absent from one source's rescan says nothing about another source.
+        .expect("count legacy windows");
+    assert_eq!(legacy_windows, 0, "windows follow their observation");
     assert_eq!(
         store
             .quota_observations_for_source(&other_source_id)

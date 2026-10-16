@@ -281,6 +281,120 @@ pub struct ScanFileStateEntry {
     pub cache_signature: String,
 }
 
+/// What became of the `tracked` files that are no longer among the `current` ones.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GoneScanFiles {
+    /// Each gone file that moved, with the current file it moved to.
+    pub moved: Vec<MovedScanFile>,
+    /// Gone files no later file can be recognised as, because their names carry
+    /// no session: their cache entries can go, while their records stay.
+    pub forgotten: Vec<ScanFileStateEntry>,
+}
+
+/// A gone file and the current file it moved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedScanFile {
+    pub from: ScanFileStateEntry,
+    pub to: ScanFileStateEntry,
+}
+
+impl GoneScanFiles {
+    /// The moved files' old entries.
+    #[must_use]
+    pub fn moved_from(&self) -> Vec<ScanFileStateEntry> {
+        self.moved.iter().map(|moved| moved.from.clone()).collect()
+    }
+
+    /// The cache entries that go: the moved files' old ones and the forgotten ones.
+    #[must_use]
+    pub fn retired_cache_keys(&self) -> Vec<String> {
+        self.moved
+            .iter()
+            .map(|moved| moved.from.cache_key.clone())
+            .chain(self.forgotten.iter().map(|entry| entry.cache_key.clone()))
+            .collect()
+    }
+}
+
+/// Sorts the `tracked` files missing from `current` into moved and forgotten
+/// ones; the rest are simply gone.
+///
+/// A scan keeps the records of a file that is gone -- provider tools delete and
+/// compress their logs, and the store is what keeps the history -- and keeps its
+/// cache entry, so a move is still recognised when the file reappears scans later.
+/// Only a moved file's records are replaced, by those read from its new path:
+/// records whose ids include the file's path, such as quota observations, would
+/// otherwise be stored under both. A file moved to a path already tracked, as when
+/// it was copied and the original deleted later, counts too; its new path is read
+/// again so it holds the records.
+///
+/// Files are matched only by a name that carries their session's UUID
+/// ([`session_file_name`]), and only when exactly one gone file and one current
+/// file have that name, so files sharing a generic name, like each Grok session's
+/// `summary.json`, are never taken for one another. Gone files without such a name
+/// can never be matched, so they are forgotten rather than kept for it.
+#[must_use]
+pub fn gone_scan_files(
+    tracked: &[ScanFileStateEntry],
+    current: &[ScanFileStateEntry],
+) -> GoneScanFiles {
+    let current_keys = current
+        .iter()
+        .map(|entry| entry.cache_key.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut current_names = HashMap::<&str, Vec<&ScanFileStateEntry>>::new();
+    for entry in current {
+        if let Some(name) = session_file_name(&entry.cache_key) {
+            current_names.entry(name).or_default().push(entry);
+        }
+    }
+    let removed = tracked
+        .iter()
+        .filter(|entry| !current_keys.contains(entry.cache_key.as_str()))
+        .collect::<Vec<_>>();
+    let mut removed_names = HashMap::<&str, usize>::new();
+    for entry in &removed {
+        if let Some(name) = session_file_name(&entry.cache_key) {
+            *removed_names.entry(name).or_default() += 1;
+        }
+    }
+    let mut gone = GoneScanFiles::default();
+    for entry in removed {
+        let Some(name) = session_file_name(&entry.cache_key) else {
+            gone.forgotten.push(entry.clone());
+            continue;
+        };
+        if removed_names.get(name) != Some(&1) {
+            continue;
+        }
+        if let Some([to]) = current_names.get(name).map(Vec::as_slice) {
+            gone.moved.push(MovedScanFile {
+                from: entry.clone(),
+                to: (*to).clone(),
+            });
+        }
+    }
+    gone
+}
+
+/// The file name of `cache_key` when it carries a UUID, as a session's own log
+/// is named: Codex's `rollout-{time}-{uuid}.jsonl`, Claude Code's `{uuid}.jsonl`.
+fn session_file_name(cache_key: &str) -> Option<&str> {
+    let name = std::path::Path::new(cache_key).file_name()?.to_str()?;
+    name.as_bytes()
+        .windows(36)
+        .any(|window| {
+            window.iter().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+        })
+        .then_some(name)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScanFileStateSelection {
     pub pending_entries: Vec<ScanFileStateEntry>,
@@ -317,10 +431,16 @@ pub struct ScanFileReplacement<'a> {
     pub activity_coverage: &'a [ActivityCoverageV1],
     pub activity_persist_mode: ActivityPersistMode,
     pub activity_scan_cursor: Option<ActivityScanCursor>,
+    /// The quota observations read from the reconciled files, which replace the
+    /// ones stored for them.
+    pub quota_observations: &'a [statsai_core::QuotaObservationRecordV1],
     pub device_id: &'a str,
     pub pending_entries: &'a [ScanFileStateEntry],
     pub compatible_entries_to_upgrade: &'a [ScanFileStateEntry],
+    /// The moved files' old entries: their task spans go with them.
     pub removed_cache_keys: &'a [String],
+    /// Entries of gone files that nothing can be matched to: only the entries go.
+    pub forgotten_cache_keys: &'a [String],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

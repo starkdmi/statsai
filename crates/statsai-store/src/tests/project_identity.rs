@@ -567,10 +567,12 @@ fn the_daemon_rescan_keeps_a_deleted_checkouts_repository() {
             activity_coverage: &[],
             activity_persist_mode: ActivityPersistMode::ReplaceFiles,
             activity_scan_cursor: None,
+            quota_observations: &[],
             device_id: "device",
             pending_entries: &[],
             compatible_entries_to_upgrade: &[],
             removed_cache_keys: &[],
+            forgotten_cache_keys: &[],
         })
         .expect("replace scan files");
 

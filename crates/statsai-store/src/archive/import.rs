@@ -90,29 +90,48 @@ impl Store {
         )?)
     }
 
+    /// Retires the imported files that moved to one of `entries`
+    /// ([`crate::gone_scan_files`]): their import state, artifact dependencies,
+    /// code trace edits and quota observations go, and the import at the new path
+    /// holds them, under ids that include that path. A file moved to a path
+    /// already imported is imported there already.
+    ///
+    /// A file that is simply gone keeps all of it, as a scan keeps a gone file's
+    /// usage, and keeps its import state, so a later collect still recognises the
+    /// move if the file reappears elsewhere. One whose name no file can ever be
+    /// matched by loses only its import state. Returns how many files were retired.
     pub fn reconcile_archive_import_entries(
         &self,
         source_id: &SourceId,
         entries: &[ScanFileStateEntry],
     ) -> Result<u64> {
-        let current_cache_keys = entries
-            .iter()
-            .map(|entry| entry.cache_key.as_str())
-            .collect::<HashSet<_>>();
         self.with_immediate_transaction(|| {
             let mut statement = self.conn.prepare(
-                "SELECT cache_key FROM archive_import_state WHERE source_id = ?1",
+                "SELECT cache_key, cache_signature FROM archive_import_state WHERE source_id = ?1",
             )?;
-            let stored_cache_keys = statement
-                .query_map([&source_id.0], |row| row.get::<_, String>(0))?
+            let tracked = statement
+                .query_map([&source_id.0], |row| {
+                    Ok(ScanFileStateEntry {
+                        cache_key: row.get(0)?,
+                        cache_signature: row.get(1)?,
+                    })
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
-            let removed_cache_keys = stored_cache_keys
-                .into_iter()
-                .filter(|cache_key| !current_cache_keys.contains(cache_key.as_str()))
-                .collect::<Vec<_>>();
-            for cache_key in &removed_cache_keys {
-                self.delete_archive_trace_entry_inner(source_id, cache_key)?;
+            let gone = crate::gone_scan_files(&tracked, entries);
+            for entry in &gone.forgotten {
+                self.conn.execute(
+                    "DELETE FROM archive_artifact_dependencies WHERE source_id = ?1 AND cache_key = ?2",
+                    params![&source_id.0, &entry.cache_key],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM archive_import_state WHERE source_id = ?1 AND cache_key = ?2",
+                    params![&source_id.0, &entry.cache_key],
+                )?;
+            }
+            let moved = gone.moved_from();
+            for entry in &moved {
+                let cache_key = &entry.cache_key;
                 self.conn.execute(
                     "DELETE FROM archive_artifact_dependencies WHERE source_id = ?1 AND cache_key = ?2",
                     params![&source_id.0, cache_key],
@@ -121,6 +140,7 @@ impl Store {
                     "DELETE FROM archive_import_state WHERE source_id = ?1 AND cache_key = ?2",
                     params![&source_id.0, cache_key],
                 )?;
+                self.delete_archive_trace_entry_inner(source_id, cache_key)?;
                 self.conn.execute(
                     "DELETE FROM quota_window_observations WHERE observation_id IN (SELECT observation_id FROM quota_observations WHERE source_id = ?1 AND source_file_path_hash = ?2)",
                     params![&source_id.0, hash_text(cache_key)],
@@ -130,11 +150,13 @@ impl Store {
                     params![&source_id.0, hash_text(cache_key)],
                 )?;
             }
-            self.conn.execute(
-                "DELETE FROM quota_payloads WHERE payload_hash NOT IN (SELECT payload_hash FROM quota_observations)",
-                [],
-            )?;
-            Ok(removed_cache_keys.len() as u64)
+            if !moved.is_empty() {
+                self.conn.execute(
+                    "DELETE FROM quota_payloads WHERE payload_hash NOT IN (SELECT payload_hash FROM quota_observations)",
+                    [],
+                )?;
+            }
+            Ok(moved.len() as u64)
         })
     }
 

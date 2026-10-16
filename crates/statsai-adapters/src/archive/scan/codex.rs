@@ -11,7 +11,9 @@ pub(crate) fn collect_codex(
     let paths = selected_jsonl_paths(selected_cache_keys, || {
         codex_usage_roots(&source_path)
             .into_iter()
-            .flat_map(|path| collect_jsonl_files(&path).unwrap_or_default())
+            .flat_map(|path| {
+                crate::compressed::collect_jsonl_files_with_compressed(&path).unwrap_or_default()
+            })
             .collect()
     });
     let mut scan = ArchiveScan::measured();
@@ -38,9 +40,9 @@ pub(crate) fn collect_codex_quota_observations(
     source: &SourceLocation,
     path: &Path,
 ) -> Result<Vec<QuotaObservationRecordV1>> {
-    let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
+    let mut reader = crate::compressed::open_jsonl(path)?;
+    let fallback_timestamp = file_modified_timestamp(&crate::compressed::readable_jsonl_path(path))
+        .unwrap_or_else(Utc::now);
     // Keyed like the usage parser: a line's own session id, else the file's
     // latest `session_meta` id.
     let mut previous_totals = HashMap::new();
@@ -113,8 +115,7 @@ pub(crate) fn collect_codex_file(
     let mut pending_mutations = HashMap::new();
     let source_record_path = canonical_display(path);
 
-    let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = crate::compressed::open_jsonl(path)?;
     let mut line_bytes = Vec::new();
     let mut line_number = 0usize;
     loop {
@@ -366,9 +367,8 @@ pub(crate) fn codex_archive_header(
     path: &Path,
     fallback_id: String,
 ) -> Result<(String, Option<String>, Option<ProjectInfo>)> {
-    let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
     let mut project_cache = ProjectContextCache::new();
-    let mut reader = BufReader::new(file);
+    let mut reader = crate::compressed::open_jsonl(path)?;
     let mut line_bytes = Vec::new();
     loop {
         let status = read_bounded_jsonl_line(&mut reader, &mut line_bytes, MAX_JSONL_RECORD_BYTES)?;

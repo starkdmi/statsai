@@ -22,7 +22,17 @@ impl Store {
         &self,
         records: &[QuotaObservationRecordV1],
     ) -> Result<u64> {
+        Ok(self.upsert_quota_observations_counting(records)?.written)
+    }
+
+    /// [`Store::upsert_quota_observations_inner`], also counting the records whose
+    /// stored row or windows it changed.
+    fn upsert_quota_observations_counting(
+        &self,
+        records: &[QuotaObservationRecordV1],
+    ) -> Result<QuotaWriteCount> {
         let mut written = 0u64;
+        let mut changed = 0u64;
         let mut assignments_by_source = HashMap::new();
         for record in records {
             let source_id = &record.observation.source_id;
@@ -163,6 +173,7 @@ impl Store {
                     },
                 );
             if windows_changed {
+                changed = changed.saturating_add(1);
                 self.conn.execute(
                     "DELETE FROM quota_window_observations WHERE observation_id = ?1",
                     [&record.observation.observation_id],
@@ -190,7 +201,7 @@ impl Store {
             }
             written = written.saturating_add(1);
         }
-        Ok(written)
+        Ok(QuotaWriteCount { written, changed })
     }
 
     pub(crate) fn replace_quota_observations_for_source_files_inner(
@@ -198,7 +209,7 @@ impl Store {
         source_id: &SourceId,
         source_file_path_hashes: &[String],
         records: &[QuotaObservationRecordV1],
-    ) -> Result<u64> {
+    ) -> Result<QuotaWriteCount> {
         let source_file_path_hashes = source_file_path_hashes
             .iter()
             .map(String::as_str)
@@ -214,6 +225,7 @@ impl Store {
             .collect::<HashSet<_>>();
 
         let mut orphaned_payload_hashes = BTreeSet::new();
+        let mut deleted = 0u64;
         for source_file_path_hash in source_file_path_hashes {
             let mut statement = self.conn.prepare(
                 "SELECT observation_id, payload_hash FROM quota_observations
@@ -241,18 +253,19 @@ impl Store {
                     "DELETE FROM quota_window_observations WHERE observation_id = ?1",
                     [&observation_id],
                 )?;
-                self.conn.execute(
+                deleted = deleted.saturating_add(self.conn.execute(
                     "DELETE FROM quota_observations WHERE observation_id = ?1",
                     [&observation_id],
-                )?;
+                )? as u64);
             }
         }
 
-        let written = self.upsert_quota_observations_inner(records)?;
+        let mut count = self.upsert_quota_observations_counting(records)?;
+        count.changed = count.changed.saturating_add(deleted);
         // After the upsert, so a payload the incoming records reuse is seen as still
         // referenced rather than deleted and immediately rewritten.
         self.delete_unreferenced_quota_payloads_for_hashes(&orphaned_payload_hashes)?;
-        Ok(written)
+        Ok(count)
     }
 
     pub fn replace_quota_observations_for_source_files(
@@ -262,11 +275,13 @@ impl Store {
         records: &[QuotaObservationRecordV1],
     ) -> Result<u64> {
         self.with_immediate_transaction(|| {
-            self.replace_quota_observations_for_source_files_inner(
-                source_id,
-                source_file_path_hashes,
-                records,
-            )
+            Ok(self
+                .replace_quota_observations_for_source_files_inner(
+                    source_id,
+                    source_file_path_hashes,
+                    records,
+                )?
+                .written)
         })
     }
 
@@ -428,42 +443,27 @@ impl Store {
         })
     }
 
-    /// Deletes this source's quota rows that no file in `source_file_path_hashes` accounts for.
+    /// Deletes this source's quota rows that carry no source file hash: rows stored
+    /// before file hashes were recorded.
     ///
-    /// A full rescan replaces every file it can see, but `replace_quota_observations_for_source_files`
-    /// only reconciles the hashes handed to it, so rows written for a file that has since disappeared
-    /// -- and legacy rows stored before file hashes were recorded -- outlive the scan that should have
-    /// retired them. Deleting the whole source instead would retire them, and that is what `--no-cache`
-    /// used to do: on a store with six figures of observations it walked every row, every window, and
-    /// the payload table, which is the stall this replaces. The unmatched set is normally empty, and the
-    /// source index covers the lookup, so the common case reads an index range and writes nothing.
-    pub fn delete_quota_observations_for_source_outside_file_hashes(
+    /// A scan that rereads every current file replaces their rows by file hash, which
+    /// cannot reach these. Rows of files that are gone keep their hash and stay: the
+    /// store keeps what a provider deleted from disk. The source index covers the
+    /// lookup, and the set is normally empty, so the common case writes nothing.
+    pub fn delete_quota_observations_without_source_file_hash(
         &self,
         source_id: &SourceId,
-        source_file_path_hashes: &[String],
     ) -> Result<u64> {
         self.with_immediate_transaction(|| {
-            let retained = source_file_path_hashes
-                .iter()
-                .map(String::as_str)
-                .collect::<HashSet<_>>();
             let mut statement = self.conn.prepare(
-                "SELECT observation_id, source_file_path_hash, payload_hash FROM quota_observations
-                 WHERE source_id = ?1",
+                "SELECT observation_id, payload_hash FROM quota_observations
+                 WHERE source_id = ?1 AND COALESCE(source_file_path_hash, '') = ''",
             )?;
             let orphaned = statement
                 .query_map([&source_id.0], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .filter(|(_, file_hash, _)| !retained.contains(file_hash.as_str()))
-                .map(|(observation_id, _, payload_hash)| (observation_id, payload_hash))
-                .collect::<Vec<_>>();
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
             if orphaned.is_empty() {
                 return Ok(0);
@@ -565,4 +565,12 @@ impl Store {
             false,
         )
     }
+}
+
+/// What a quota write did: the records it was given, and the rows it changed --
+/// written with different contents, or deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct QuotaWriteCount {
+    pub(crate) written: u64,
+    pub(crate) changed: u64,
 }

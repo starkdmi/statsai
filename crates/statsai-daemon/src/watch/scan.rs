@@ -13,9 +13,10 @@ use statsai_core::{
     UsageSummary, ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
-    find_existing_provider_account, reconcile_verified_source_state, try_acquire_scan_lock,
-    upsert_provider_account, verified_source_observation_hash, ActivityPersistMode,
-    ActivityScanCursor, ScanFileReplacement, ScanFileStateEntry, Store, UpsertProviderAccountInput,
+    find_existing_provider_account, gone_scan_files, reconcile_verified_source_state,
+    try_acquire_scan_lock, upsert_provider_account, verified_source_observation_hash,
+    ActivityPersistMode, ActivityScanCursor, ScanFileReplacement, ScanFileStateEntry, Store,
+    UpsertProviderAccountInput,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -332,13 +333,16 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                     continue;
                 }
             };
-            let current_cache_keys = file_cache_entries
+            // A file that is gone keeps its records and its cache entry. One that
+            // moved to a current path has its records replaced by the ones read
+            // there, and its entry goes; so does the entry of one nothing can be
+            // matched to.
+            let gone_files = gone_scan_files(&tracked_file_entries, &file_cache_entries);
+            let moved_file_entries = gone_files.moved_from();
+            let forgotten_cache_keys = gone_files
+                .forgotten
                 .iter()
-                .map(|entry| entry.cache_key.as_str())
-                .collect::<HashSet<_>>();
-            let removed_file_entries = tracked_file_entries
-                .into_iter()
-                .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
+                .map(|entry| entry.cache_key.clone())
                 .collect::<Vec<_>>();
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let probed_verified_source_state =
@@ -401,7 +405,8 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                     .is_some_and(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION)
             };
             if pending_file_entries.is_empty()
-                && removed_file_entries.is_empty()
+                && moved_file_entries.is_empty()
+                && forgotten_cache_keys.is_empty()
                 && !has_cache_entry_upgrades
                 && !verified_state_changed
                 && !has_account_evidence
@@ -409,8 +414,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
             {
                 continue;
             }
-            let rescan_file_entries = if activity_full_reconcile || !removed_file_entries.is_empty()
-            {
+            let rescan_file_entries = if activity_full_reconcile || !moved_file_entries.is_empty() {
                 &file_cache_entries
             } else {
                 &pending_file_entries
@@ -483,12 +487,12 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                         };
                     let reconciled_file_hashes = rescan_file_entries
                         .iter()
-                        .chain(removed_file_entries.iter())
+                        .chain(moved_file_entries.iter())
                         .map(|entry| hash_text(&entry.cache_key))
                         .collect::<HashSet<_>>()
                         .into_iter()
                         .collect::<Vec<_>>();
-                    let removed_cache_keys = removed_file_entries
+                    let removed_cache_keys = moved_file_entries
                         .iter()
                         .map(|entry| entry.cache_key.clone())
                         .collect::<Vec<_>>();
@@ -532,13 +536,19 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                     &account_evidence.checkpoints,
                                 )?;
                             }
-                            if pending_file_entries.is_empty() && removed_file_entries.is_empty() {
+                            if pending_file_entries.is_empty() && moved_file_entries.is_empty() {
                                 store
                                     .upgrade_scan_file_entries(
                                         &source.source_id,
                                         &compatible_entries_to_upgrade,
                                     )
                                     .context("upgrade scan cache")?;
+                                store
+                                    .delete_scan_file_entries(
+                                        &source.source_id,
+                                        &forgotten_cache_keys,
+                                    )
+                                    .context("forget gone files")?;
                                 return Ok(None);
                             }
                             apply_source_account_resolution(
@@ -565,6 +575,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                     activity_coverage: &scan.activity_coverage,
                                     activity_persist_mode: ActivityPersistMode::for_scan(
                                         &source.provider,
+                                        false,
                                         activity_full_reconcile,
                                     ),
                                     activity_scan_cursor: Some(ActivityScanCursor {
@@ -578,10 +589,12 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                             }),
                                         parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
                                     }),
+                                    quota_observations: &scan.quota_observations,
                                     device_id,
                                     pending_entries: &pending_file_entries,
                                     compatible_entries_to_upgrade: &compatible_entries_to_upgrade,
                                     removed_cache_keys: &removed_cache_keys,
+                                    forgotten_cache_keys: &forgotten_cache_keys,
                                 })
                                 .context("atomically reconcile scan files")?;
                             Ok(Some(replacement))

@@ -65,10 +65,12 @@ fn scan_file_replacement_rolls_back_deletions_when_cache_update_fails() {
             activity_coverage: &[],
             activity_persist_mode: ActivityPersistMode::ReplaceFiles,
             activity_scan_cursor: None,
+            quota_observations: &[],
             device_id: "device",
             pending_entries: &[replacement],
             compatible_entries_to_upgrade: &[],
             removed_cache_keys: &[],
+            forgotten_cache_keys: &[],
         })
         .expect_err("replacement should fail");
 
@@ -248,10 +250,9 @@ fn scan_file_state_accepts_compatible_signatures() {
 
 #[test]
 fn scan_file_replacement_clears_links_to_events_it_retired() {
-    // The daemon is the only caller here and it never touches quota rows, so a
-    // quota observation left pointing at an event this retires would keep a link
-    // to a row that no longer exists. A record that survives the rescan keeps its
-    // id, and must keep its link.
+    // A quota observation of a file the rescan does not reread can point at an
+    // event this retires, and would keep a link to a row that no longer exists.
+    // A record that survives the rescan keeps its id, and must keep its link.
     let store = Store::in_memory().expect("store");
     let source = statsai_core::SourceLocation::local_adapter(
         "codex",
@@ -264,6 +265,7 @@ fn scan_file_replacement_clears_links_to_events_it_retired() {
     let now = Utc::now();
     let cache_key = "/tmp/codex-link-repair/session.jsonl".to_string();
     let file_hash = hash_text(&cache_key);
+    let other_file_hash = hash_text("/tmp/codex-link-repair/other.jsonl");
 
     let evidence = |record_id: &str, line: u64| {
         Some(statsai_core::ParseEvidence {
@@ -312,7 +314,7 @@ fn scan_file_replacement_clears_links_to_events_it_retired() {
                     observation_id,
                     &source.source_id.0,
                     now.to_rfc3339(),
-                    &file_hash,
+                    &other_file_hash,
                     &event.event_id.0,
                 ],
             )
@@ -331,6 +333,7 @@ fn scan_file_replacement_clears_links_to_events_it_retired() {
             activity_coverage: &[],
             activity_persist_mode: ActivityPersistMode::ReplaceFiles,
             activity_scan_cursor: None,
+            quota_observations: &[],
             device_id: "device",
             pending_entries: &[ScanFileStateEntry {
                 cache_key,
@@ -338,6 +341,7 @@ fn scan_file_replacement_clears_links_to_events_it_retired() {
             }],
             compatible_entries_to_upgrade: &[],
             removed_cache_keys: &[],
+            forgotten_cache_keys: &[],
         })
         .expect("replace scan files");
 
@@ -421,4 +425,112 @@ fn legacy_provenance_check_survives_a_payload_it_cannot_read() {
             .expect("an unreadable payload must not fail the check"),
         "a payload that cannot be read counts as missing provenance"
     );
+}
+
+#[test]
+fn gone_scan_files_match_moves_by_session_name() {
+    let entry = |key: &str| ScanFileStateEntry {
+        cache_key: key.to_string(),
+        cache_signature: "sig".to_string(),
+    };
+    let moved_from = |tracked: &[ScanFileStateEntry], current: &[ScanFileStateEntry]| {
+        gone_scan_files(tracked, current).moved_from()
+    };
+    let rollout = "rollout-2026-05-28T10-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
+    let session = "4c1f5a8e-2b7d-4e0a-9c3f-1d2e3f4a5b6c.jsonl";
+
+    // Archived: gone from `sessions/`, the one file of its name now elsewhere.
+    let tracked = [entry(&format!("/codex/sessions/2026/05/28/{rollout}"))];
+    let current = [entry(&format!("/codex/archived_sessions/{rollout}"))];
+    let gone = gone_scan_files(&tracked, &current);
+    assert_eq!(gone.moved_from(), tracked.to_vec());
+    assert_eq!(gone.moved[0].to, current[0]);
+
+    // Claude Code names a transcript for its session the same way.
+    let tracked = [entry(&format!("/claude/projects/-old/{session}"))];
+    let current = [entry(&format!("/claude/projects/-new/{session}"))];
+    assert_eq!(moved_from(&tracked, &current), tracked.to_vec());
+
+    // Copied first and deleted later: the copy was tracked already, and it is
+    // still where the file moved to.
+    let tracked = [
+        entry(&format!("/codex/sessions/{rollout}")),
+        entry(&format!("/codex/archived_sessions/{rollout}")),
+    ];
+    let current = [entry(&format!("/codex/archived_sessions/{rollout}"))];
+    assert_eq!(moved_from(&tracked, &current), vec![tracked[0].clone()]);
+
+    // Grok names every session's file `summary.json`: one session deleted while
+    // another exists is not a move. Nothing can ever match such a name, so the
+    // gone file's entry is forgotten instead of kept.
+    let tracked = [
+        entry("/grok/sessions/one/summary.json"),
+        entry("/grok/sessions/two/summary.json"),
+    ];
+    let current = [
+        entry("/grok/sessions/two/summary.json"),
+        entry("/grok/sessions/three/summary.json"),
+    ];
+    let gone = gone_scan_files(&tracked, &current);
+    assert!(gone.moved.is_empty());
+    assert_eq!(gone.forgotten, vec![tracked[0].clone()]);
+
+    // A name two current files share says nothing about which one it moved to;
+    // the gone file is kept, not forgotten.
+    let tracked = [entry(&format!("/codex/sessions/{rollout}"))];
+    let current = [
+        entry(&format!("/codex/archived_sessions/{rollout}")),
+        entry(&format!("/codex/archived_sessions/copy/{rollout}")),
+    ];
+    let gone = gone_scan_files(&tracked, &current);
+    assert!(gone.moved.is_empty());
+    assert!(gone.forgotten.is_empty());
+}
+
+#[test]
+fn scan_file_replacement_retires_the_task_spans_of_moved_files() {
+    let store = Store::in_memory().expect("store");
+    let source = statsai_core::SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-watched-move"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let moved_key = "/tmp/codex-watched-move/sessions/rollout.jsonl".to_string();
+    let kept_key = "/tmp/codex-watched-move/sessions/other.jsonl".to_string();
+    let now = Utc::now();
+    let mut moved = task_span(&source, "moved-session", "Archive old rollouts", now);
+    moved.source_file_path_hash = Some(hash_text(&moved_key));
+    let mut kept = task_span(&source, "kept-session", "Keep this one", now);
+    kept.source_file_path_hash = Some(hash_text(&kept_key));
+    store
+        .upsert_task_spans(&[moved, kept.clone()])
+        .expect("seed spans");
+
+    // The watcher passes the moved files' old entries as the removed ones.
+    store
+        .replace_scan_file_records(ScanFileReplacement {
+            source_id: &source.source_id,
+            reconciled_file_hashes: &[hash_text(&moved_key)],
+            events: &[],
+            summaries: &[],
+            session_names: &[],
+            activity_invocations: &[],
+            activity_coverage: &[],
+            activity_persist_mode: ActivityPersistMode::ReplaceFiles,
+            activity_scan_cursor: None,
+            quota_observations: &[],
+            device_id: "device",
+            pending_entries: &[],
+            compatible_entries_to_upgrade: &[],
+            removed_cache_keys: std::slice::from_ref(&moved_key),
+            forgotten_cache_keys: &[],
+        })
+        .expect("replace scan files");
+
+    let spans = store.task_spans().expect("task spans");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].span_id, kept.span_id);
 }

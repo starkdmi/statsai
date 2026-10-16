@@ -153,7 +153,7 @@ fn preview_task_rebuild_counts_only_affected_work_items() {
                 replace_source_records: false,
                 touched_files: true,
                 pending_file_entries: &pending_entries,
-                removed_file_entries: &[],
+                moved_file_entries: &[],
                 task_spans: &[updated_span_a],
             },
         )
@@ -259,7 +259,7 @@ fn preview_task_rebuild_counts_shared_bucket_rebuilds_per_source_step() {
                 replace_source_records: false,
                 touched_files: true,
                 pending_file_entries: &pending_a,
-                removed_file_entries: &[],
+                moved_file_entries: &[],
                 task_spans: &[updated_span_a],
             },
         )
@@ -272,7 +272,7 @@ fn preview_task_rebuild_counts_shared_bucket_rebuilds_per_source_step() {
                 replace_source_records: false,
                 touched_files: true,
                 pending_file_entries: &pending_b,
-                removed_file_entries: &[],
+                moved_file_entries: &[],
                 task_spans: &[updated_span_b],
             },
         )

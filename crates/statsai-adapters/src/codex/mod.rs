@@ -315,7 +315,7 @@ pub(crate) fn codex_jsonl_candidates(
     )];
     let mut candidates = Vec::new();
     for usage_root in roots {
-        for candidate_path in collect_jsonl_files(&usage_root)? {
+        for candidate_path in crate::compressed::collect_jsonl_files_with_compressed(&usage_root)? {
             candidates.push(scan_candidate_with_compatible_dependencies(
                 candidate_path,
                 None,
@@ -332,6 +332,16 @@ pub(crate) fn codex_usage_root_for_file(root: &Path, path: &Path) -> PathBuf {
         let usage_root = root.join(child);
         if path.starts_with(&usage_root) {
             return usage_root;
+        }
+    }
+    // A compressed rollout is listed under its canonical path, which a usage
+    // folder reached through a symlink -- the root or the folder itself -- is
+    // not a prefix of, so each folder is resolved as a whole.
+    for child in ["sessions", "archived_sessions"] {
+        if let Ok(usage_root) = root.join(child).canonicalize() {
+            if path.starts_with(&usage_root) {
+                return usage_root;
+            }
         }
     }
     root.to_path_buf()

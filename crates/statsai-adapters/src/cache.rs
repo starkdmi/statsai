@@ -57,7 +57,9 @@ pub(crate) fn scan_candidate_with_compatible_dependencies(
     cache_namespaces: &ScanCacheNamespaces,
 ) -> ScanCandidateFile {
     let cache_key = canonical_display(&path);
-    let file_signature = file_metadata_signature(&path);
+    // A compressed `.jsonl` is signed by the file that holds its lines, so
+    // compressing it reads as a change to the same file.
+    let file_signature = file_metadata_signature(&crate::compressed::readable_jsonl_path(&path));
     let cache_signature = build_scan_cache_signature(
         &cache_namespaces.current,
         &file_signature,

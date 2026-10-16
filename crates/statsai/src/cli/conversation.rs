@@ -206,10 +206,8 @@ fn collect_archive_sources(
             let entries = scan_file_state_entries(&candidates);
             // An empty candidate list from an unreachable root — an unmounted
             // volume, a renamed home directory, a `--source` pointing somewhere
-            // absent — is not evidence that the archive was emptied.
-            // Reconciling it would delete every imported conversation, trace
-            // edit, and artifact dependency for the source and retire the
-            // derived metrics remotely, so it is reported instead of erased.
+            // absent — is not evidence that the archive was emptied, so the
+            // source is reported and skipped.
             if entries.is_empty() && !adapter.archive_root_available(&source) {
                 let imported = store.archive_import_entry_count(&source.source_id)?;
                 if imported > 0 {
@@ -301,7 +299,9 @@ pub(crate) fn collect_archive_source_entries(
         .map(|entry| {
             candidates_by_key
                 .get(entry.cache_key.as_str())
-                .and_then(|candidate| std::fs::metadata(&candidate.path).ok())
+                .and_then(|candidate| {
+                    std::fs::metadata(statsai_adapters::readable_jsonl_path(&candidate.path)).ok()
+                })
                 .map_or(0, |metadata| metadata.len())
         })
         .collect::<Vec<_>>();

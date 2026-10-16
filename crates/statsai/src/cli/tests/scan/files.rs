@@ -171,74 +171,39 @@ fn no_cache_scan_reselects_unchanged_files() {
 }
 
 #[test]
-fn full_source_rescan_replaces_existing_source_records() {
-    assert!(should_replace_source_records_for_scan(
-        true, false, 0, 0, false
-    ));
-    assert!(should_replace_source_records_for_scan(
-        false, true, 0, 0, false
-    ));
-    assert!(should_replace_source_records_for_scan(
-        false, false, 2, 2, false
-    ));
-    assert!(should_replace_source_records_for_scan(
-        false, false, 0, 0, true
-    ));
-    assert!(!should_replace_source_records_for_scan(
-        false, false, 2, 1, false
-    ));
-    assert!(!should_replace_source_records_for_scan(
-        false, false, 0, 0, false
-    ));
+fn full_rescans_reread_every_file() {
+    assert!(should_reread_every_file(true, false, 0, 0, false));
+    assert!(should_reread_every_file(false, true, 0, 0, false));
+    assert!(should_reread_every_file(false, false, 2, 2, false));
+    assert!(should_reread_every_file(false, false, 0, 0, true));
+    assert!(!should_reread_every_file(false, false, 2, 1, false));
+    assert!(!should_reread_every_file(false, false, 0, 0, false));
 }
 
 #[test]
-fn cache_invalidation_reconciles_quota_records_by_file() {
-    assert!(!should_replace_all_source_quota_records(false, false));
-    assert!(should_replace_all_source_quota_records(true, false));
-    assert!(should_replace_all_source_quota_records(false, true));
-}
-
-#[test]
-fn no_cache_rescan_reconciles_quota_records_instead_of_deleting_the_source() {
-    // `--no-cache` rereads every file, so the file-level path already rewrites everything it
-    // produces. Deleting the source first walked every observation and window on a store with
-    // six figures of rows, which is the stall a documented flag must not have.
-    assert!(!should_replace_all_source_quota_records(false, false));
-    // The full reread still replaces the source's records, so the reconciliation branch --
-    // the one that also retires rows outside the rescanned file set -- is the branch it takes.
-    assert!(should_replace_source_records_for_scan(
-        false, true, 0, 0, false
-    ));
-    // An explicit destructive rebuild keeps the blanket delete.
-    assert!(should_replace_all_source_quota_records(true, false));
-}
-
-#[test]
-fn scan_file_reconciliation_tracks_removed_candidates() {
+fn scan_file_reconciliation_tells_a_moved_file_from_a_gone_one() {
     let store = Store::in_memory().expect("store");
-    let source_id = statsai_core::SourceId("src-removed-cache".to_string());
-    let tracked = vec![
-        ScanFileStateEntry {
-            cache_key: "/tmp/a.jsonl".to_string(),
-            cache_signature: "sig-a-1".to_string(),
-        },
-        ScanFileStateEntry {
-            cache_key: "/tmp/b.jsonl".to_string(),
-            cache_signature: "sig-b-1".to_string(),
-        },
-    ];
+    let source_id = statsai_core::SourceId("src-moved-cache".to_string());
+    let entry = |key: &str| ScanFileStateEntry {
+        cache_key: key.to_string(),
+        cache_signature: format!("sig-{key}"),
+    };
+    let archived_name = "rollout-2026-05-28T10-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
+    let deleted_name = "rollout-2026-05-28T11-00-00-019e733b-6b32-7fb2-b570-e8f68052bb37.jsonl";
     store
-        .record_scan_file_entries(&source_id, &tracked)
+        .record_scan_file_entries(
+            &source_id,
+            &[
+                entry(&format!("/codex/sessions/2026/05/28/{archived_name}")),
+                entry(&format!("/codex/sessions/2026/05/28/{deleted_name}")),
+            ],
+        )
         .expect("record tracked cache state");
 
     let reconciliation = select_scan_file_reconciliation(
         &store,
         &source_id,
-        &[ScanFileStateEntry {
-            cache_key: "/tmp/b.jsonl".to_string(),
-            cache_signature: "sig-b-1".to_string(),
-        }],
+        &[entry(&format!("/codex/archived_sessions/{archived_name}"))],
         &HashMap::new(),
         false,
         false,
@@ -246,13 +211,11 @@ fn scan_file_reconciliation_tracks_removed_candidates() {
     )
     .expect("reconciliation");
 
-    assert!(reconciliation.pending_entries.is_empty());
     assert_eq!(
-        reconciliation.removed_entries,
-        vec![ScanFileStateEntry {
-            cache_key: "/tmp/a.jsonl".to_string(),
-            cache_signature: "sig-a-1".to_string(),
-        }]
+        reconciliation.moved_entries,
+        vec![entry(&format!(
+            "/codex/sessions/2026/05/28/{archived_name}"
+        ))]
     );
 }
 
@@ -584,6 +547,235 @@ fn partial_scan_removes_stale_task_spans_and_rebuilds_work_items() {
 }
 
 #[test]
+fn a_move_retires_task_spans_even_when_tasks_are_not_collected() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-task-move"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let name = "rollout-2026-06-12T11-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
+    let old_path = format!("/tmp/codex-task-move/sessions/2026/06/12/{name}");
+    let new_path = format!("/tmp/codex-task-move/archived_sessions/{name}");
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 6, 12, 11, 0, 0)
+        .single()
+        .expect("started_at");
+    let scan = |include_tasks: bool, path: &str, with_span: bool| {
+        let event = test_scan_event(&source, path, started_at, "event", 100);
+        let span = test_task_span(
+            &source,
+            path,
+            started_at,
+            "span",
+            "Archive the old rollouts",
+            &event,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(path, "sig-1")],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event],
+                task_spans: if with_span { vec![span] } else { Vec::new() },
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+    };
+
+    scan(true, &old_path, true);
+    assert_eq!(store.task_spans().expect("task spans").len(), 1);
+    assert_eq!(store.work_items().expect("work items").len(), 1);
+
+    // Moved while tasks are not collected: its span goes with its old path.
+    scan(false, &new_path, false);
+    assert!(store.task_spans().expect("task spans").is_empty());
+    assert!(store.work_items().expect("work items").is_empty());
+
+    // The file at the new path was recorded without tasks, so the next scan
+    // that collects them reads it again.
+    scan(true, &new_path, true);
+    let spans = store.task_spans().expect("task spans");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].source_file_path_hash.as_deref(),
+        Some(hash_text(&new_path).as_str())
+    );
+    assert_eq!(store.work_items().expect("work items").len(), 1);
+}
+
+#[test]
+fn a_full_reread_replaces_task_spans_without_a_file_hash() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "claude_code",
+        "test",
+        "0",
+        Path::new("/tmp/claude-hashless-spans"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let index = "/tmp/claude-hashless-spans/sessions-index.json";
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 6, 12, 11, 0, 0)
+        .single()
+        .expect("started_at");
+    // An index entry with no transcript path: its span has no file hash, and
+    // its id follows the entry's `modified` time.
+    let scan = |span_id: &str, no_cache: bool| {
+        let event = test_scan_event(&source, index, started_at, "event", 100);
+        let mut span = test_task_span(
+            &source,
+            index,
+            started_at,
+            "span",
+            "Index the sessions",
+            &event,
+        );
+        span.span_id = statsai_core::TaskSpanId(span_id.to_string());
+        span.source_file_path_hash = None;
+        let adapter = TestAdapter {
+            provider: "claude_code",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(index, "sig-1")],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event],
+                task_spans: vec![span],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: true,
+                preview: false,
+                no_cache,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+    };
+
+    scan("span-modified-1", false);
+    // The entry's `modified` time changed; `--no-cache` rereads it.
+    scan("span-modified-2", true);
+
+    let spans = store.task_spans().expect("task spans");
+    assert_eq!(
+        spans
+            .iter()
+            .map(|span| span.span_id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["span-modified-2"]
+    );
+    assert_eq!(store.work_items().expect("work items").len(), 1);
+}
+
+#[test]
+fn no_cache_with_no_files_keeps_rows_without_a_file_hash() {
+    // The source's folder is unmounted, renamed or empty, while something else
+    // about it changed, so the source is still processed.
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-no-files-legacy"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 5, 4, 10, 0, 0)
+        .single()
+        .expect("started_at");
+    store
+        .insert_events(&[test_event(
+            "codex",
+            &source,
+            started_at,
+            None,
+            TokenParts::total(75),
+        )])
+        .expect("seed hashless event");
+    let verified_state = statsai_core::VerifiedSourceState {
+        provider_user_id: Some("acct-verified".to_string()),
+        email: None,
+        account_label: None,
+        plan_name: None,
+        authenticated_at: None,
+        verified_at: None,
+        subscription: None,
+    };
+    let adapter = TestAdapter {
+        provider: "codex",
+        discovered: vec![source.clone()],
+        candidates: Vec::new(),
+        scan_result: statsai_adapters::AdapterScan::default(),
+        probe_result: Some(verified_state),
+        scan_calls: None,
+    };
+    scan_with_adapters(
+        ScanCommand {
+            provider: None,
+            include_tasks: false,
+            preview: false,
+            no_cache: true,
+            replace: false,
+            verbose: false,
+            explain: false,
+        },
+        &store,
+        "device-test",
+        vec![Box::new(adapter)],
+    )
+    .expect("scan");
+
+    // Nothing was read to replace it, so the row stays.
+    assert_eq!(
+        store
+            .events_for_source(&source.source_id)
+            .expect("events")
+            .len(),
+        1
+    );
+    assert_ne!(
+        store
+            .source(&source.source_id)
+            .expect("source")
+            .and_then(|stored| stored.verified_state_hash),
+        None,
+        "the scan did process the source"
+    );
+}
+
+#[test]
 fn partial_scan_with_legacy_rows_falls_back_to_full_source_reconcile() {
     let store = Store::in_memory().expect("store");
     let source = SourceLocation::local_adapter(
@@ -693,6 +885,125 @@ fn partial_scan_with_legacy_rows_falls_back_to_full_source_reconcile() {
         summaries[0].summary_id,
         summary_id("codex", &source.source_id, "summary-b")
     );
+}
+
+#[test]
+fn full_rereads_retire_hashless_rows_and_keep_gone_files_rows() {
+    // `--no-cache`, and a scan that finds every current file changed.
+    for (no_cache, b_signature) in [(true, "sig-b-1"), (false, "sig-b-2")] {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-full-reread-legacy"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let file_gone = "/tmp/codex-full-reread-legacy/gone.jsonl";
+        let file_b = "/tmp/codex-full-reread-legacy/b.jsonl";
+        store
+            .record_scan_file_entries(
+                &source.source_id,
+                &[
+                    ScanFileStateEntry {
+                        cache_key: file_gone.to_string(),
+                        cache_signature: "sig-gone-1".to_string(),
+                    },
+                    ScanFileStateEntry {
+                        cache_key: file_b.to_string(),
+                        cache_signature: "sig-b-1".to_string(),
+                    },
+                ],
+            )
+            .expect("record initial cache");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 4, 10, 0, 0)
+            .single()
+            .expect("started_at");
+        let gone_at = started_at - chrono::Duration::days(1);
+        let mut legacy_summary = test_summary("codex", &source, started_at, 75, None);
+        legacy_summary.summary_id = summary_id("codex", &source.source_id, "legacy-summary");
+        store
+            .insert_events(&[
+                test_event("codex", &source, started_at, None, TokenParts::total(75)),
+                test_scan_event(&source, file_gone, gone_at, "event-gone", 40),
+            ])
+            .expect("seed events");
+        store
+            .upsert_summaries(&[
+                legacy_summary,
+                test_scan_summary(&source, file_gone, gone_at, "summary-gone", 40),
+            ])
+            .expect("seed summaries");
+
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(file_b, b_signature)],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![test_scan_event(&source, file_b, started_at, "event-b", 125)],
+                summaries: vec![test_scan_summary(
+                    &source,
+                    file_b,
+                    started_at,
+                    "summary-b",
+                    125,
+                )],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("full reread");
+
+        let mut record_ids = store
+            .events_for_source(&source.source_id)
+            .expect("events")
+            .into_iter()
+            .filter_map(|event| event.parse_evidence.and_then(|e| e.source_record_id))
+            .collect::<Vec<_>>();
+        record_ids.sort();
+        assert_eq!(
+            record_ids,
+            vec!["event-b".to_string(), "event-gone".to_string()],
+            "no_cache={no_cache}: the hashless row goes, the gone file's row stays"
+        );
+        let mut summary_ids = store
+            .summaries_for_source(&source.source_id)
+            .expect("summaries")
+            .into_iter()
+            .map(|summary| summary.summary_id.0)
+            .collect::<Vec<_>>();
+        summary_ids.sort();
+        let mut expected = vec![
+            summary_id("codex", &source.source_id, "summary-b").0,
+            summary_id("codex", &source.source_id, "summary-gone").0,
+        ];
+        expected.sort();
+        assert_eq!(summary_ids, expected, "no_cache={no_cache}");
+        // Its name carries no session, so no later file can be recognised as it:
+        // the cache entry goes, while its rows stay.
+        assert!(!store
+            .scan_file_entries(&source.source_id)
+            .expect("cache")
+            .iter()
+            .any(|entry| entry.cache_key == file_gone));
+    }
 }
 
 fn test_scan_summary(

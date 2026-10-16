@@ -22,14 +22,18 @@ pub enum ActivityPersistMode {
 }
 
 impl ActivityPersistMode {
+    /// How a scan writes activity. `replace_source` (`--replace`) drops every
+    /// invocation of the source. A scan that rereads `every_file` replaces those
+    /// files' invocations and keeps the ones of files that are gone. Otherwise the
+    /// files it read are replaced, except OpenCode's, which its cursor upserts.
     #[must_use]
-    pub fn for_scan(provider: &str, full_source_replace: bool) -> Self {
-        if full_source_replace {
+    pub fn for_scan(provider: &str, replace_source: bool, every_file: bool) -> Self {
+        if replace_source {
             Self::ReplaceSource
-        } else if provider == "opencode" {
-            Self::Upsert
-        } else {
+        } else if every_file || provider != "opencode" {
             Self::ReplaceFiles
+        } else {
+            Self::Upsert
         }
     }
 }
@@ -1098,22 +1102,26 @@ mod tests {
     }
 
     #[test]
-    fn persist_mode_for_scan_uses_replace_files_unless_full_or_opencode() {
+    fn persist_mode_for_scan_replaces_the_source_only_when_asked() {
+        for provider in ["codex", "opencode"] {
+            assert_eq!(
+                ActivityPersistMode::for_scan(provider, true, true),
+                ActivityPersistMode::ReplaceSource
+            );
+            // A full reread replaces the files it read: a file that is gone
+            // keeps its invocations.
+            assert_eq!(
+                ActivityPersistMode::for_scan(provider, false, true),
+                ActivityPersistMode::ReplaceFiles
+            );
+        }
         assert_eq!(
-            ActivityPersistMode::for_scan("codex", false),
+            ActivityPersistMode::for_scan("codex", false, false),
             ActivityPersistMode::ReplaceFiles
         );
         assert_eq!(
-            ActivityPersistMode::for_scan("codex", true),
-            ActivityPersistMode::ReplaceSource
-        );
-        assert_eq!(
-            ActivityPersistMode::for_scan("opencode", false),
+            ActivityPersistMode::for_scan("opencode", false, false),
             ActivityPersistMode::Upsert
-        );
-        assert_eq!(
-            ActivityPersistMode::for_scan("opencode", true),
-            ActivityPersistMode::ReplaceSource
         );
     }
 
