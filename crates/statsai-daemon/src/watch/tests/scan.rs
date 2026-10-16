@@ -799,13 +799,16 @@ fn rescan_changed_sources_keeps_records_of_deleted_files() {
     .expect("rescan deleted file");
 
     assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
-    // A provider deleting its log does not delete the usage it recorded; only
-    // the file's cache entry goes.
+    // A provider deleting its log does not delete the usage it recorded, and
+    // the file's cache entry stays so a later move is still recognised.
     assert_eq!(store.event_count().expect("event count"), 1);
-    assert!(store
-        .scan_file_entries(&source.source_id)
-        .expect("scan entries")
-        .is_empty());
+    assert_eq!(
+        store
+            .scan_file_entries(&source.source_id)
+            .expect("scan entries")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -913,7 +916,7 @@ fn rescan_changed_sources_preserves_event_from_unchanged_duplicate_file() {
         })
     };
     let active_event: UsageEvent =
-        serde_json::from_value(event_json(active_file_hash)).expect("active event");
+        serde_json::from_value(event_json(active_file_hash.clone())).expect("active event");
     let archived_event: UsageEvent =
         serde_json::from_value(event_json(archived_file_hash.clone())).expect("archived event");
     assert!(store.insert_event(&active_event).expect("insert event"));
@@ -938,7 +941,9 @@ fn rescan_changed_sources_preserves_event_from_unchanged_duplicate_file() {
     )
     .expect("rescan duplicate file");
 
-    assert_eq!(*scan_calls.lock().expect("scan calls"), 1);
+    // The deleted file's event stays as it was, so nothing needs rereading:
+    // the unchanged copy takes the event over the next time it changes.
+    assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
     let events = store.events().expect("events");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_id.0, "event-duplicate-file");
@@ -947,6 +952,6 @@ fn rescan_changed_sources_preserves_event_from_unchanged_duplicate_file() {
             .parse_evidence
             .as_ref()
             .and_then(|evidence| evidence.source_file_path_hash.as_deref()),
-        Some(archived_file_hash.as_str())
+        Some(active_file_hash.as_str())
     );
 }

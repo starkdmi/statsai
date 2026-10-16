@@ -281,33 +281,79 @@ pub struct ScanFileStateEntry {
     pub cache_signature: String,
 }
 
-/// The `removed` files a scan still reads under another path: those whose file
-/// name a `current` file of the same source has, as when Codex moves a rollout
-/// from `sessions/` to `archived_sessions/`.
+/// The `tracked` files that moved: each gone from its tracked path, with the one
+/// `current` file named for the same session at a path not tracked before, as
+/// when Codex moves a rollout from `sessions/` to `archived_sessions/`.
 ///
 /// A scan keeps the records of a file that is gone -- provider tools delete and
-/// compress their logs, and the store is what keeps the history -- so only a moved
-/// file's records are replaced, by those read from its new path. Records whose ids
-/// include the file's path, such as quota observations, would otherwise be stored
-/// under both.
+/// compress their logs, and the store is what keeps the history -- and keeps its
+/// cache entry, so the move is still recognised when the file reappears scans
+/// later. Only a moved file's records are replaced, by those read from its new
+/// path: records whose ids include the file's path, such as quota observations,
+/// would otherwise be stored under both. Files are matched only by a name that
+/// carries their session's UUID ([`session_file_name`]), and only when no other
+/// file on either side has that name, so files sharing a generic name, like each
+/// Grok session's `summary.json`, are never taken for one another.
 #[must_use]
 pub fn moved_scan_file_entries(
-    removed: &[ScanFileStateEntry],
+    tracked: &[ScanFileStateEntry],
     current: &[ScanFileStateEntry],
 ) -> Vec<ScanFileStateEntry> {
-    let current_names = current
+    let tracked_keys = tracked
         .iter()
-        .filter_map(|entry| std::path::Path::new(&entry.cache_key).file_name())
+        .map(|entry| entry.cache_key.as_str())
         .collect::<std::collections::HashSet<_>>();
-    removed
+    let current_keys = current
         .iter()
+        .map(|entry| entry.cache_key.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    // Per session file name: how many current files have it, and whether one of
+    // them is at a path not tracked before.
+    let mut current_names = HashMap::<&str, (usize, bool)>::new();
+    for entry in current {
+        if let Some(name) = session_file_name(&entry.cache_key) {
+            let seen = current_names.entry(name).or_default();
+            seen.0 += 1;
+            seen.1 |= !tracked_keys.contains(entry.cache_key.as_str());
+        }
+    }
+    let removed = tracked
+        .iter()
+        .filter(|entry| !current_keys.contains(entry.cache_key.as_str()))
+        .collect::<Vec<_>>();
+    let mut removed_names = HashMap::<&str, usize>::new();
+    for entry in &removed {
+        if let Some(name) = session_file_name(&entry.cache_key) {
+            *removed_names.entry(name).or_default() += 1;
+        }
+    }
+    removed
+        .into_iter()
         .filter(|entry| {
-            std::path::Path::new(&entry.cache_key)
-                .file_name()
-                .is_some_and(|name| current_names.contains(name))
+            session_file_name(&entry.cache_key).is_some_and(|name| {
+                removed_names.get(name) == Some(&1) && current_names.get(name) == Some(&(1, true))
+            })
         })
         .cloned()
         .collect()
+}
+
+/// The file name of `cache_key` when it carries a UUID, as a session's own log
+/// is named: Codex's `rollout-{time}-{uuid}.jsonl`, Claude Code's `{uuid}.jsonl`.
+fn session_file_name(cache_key: &str) -> Option<&str> {
+    let name = std::path::Path::new(cache_key).file_name()?.to_str()?;
+    name.as_bytes()
+        .windows(36)
+        .any(|window| {
+            window.iter().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+        })
+        .then_some(name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

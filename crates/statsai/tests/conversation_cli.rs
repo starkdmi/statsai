@@ -185,7 +185,9 @@ fn conversation_collect_keeps_code_traces_of_compressed_moved_and_deleted_archiv
     let codex_home = dir.path().join("codex");
     let sessions = codex_home.join("sessions");
     std::fs::create_dir_all(&sessions).expect("sessions");
-    let fixture_path = sessions.join("thread.jsonl");
+    // Named as Codex names a rollout: for its session's UUID.
+    let rollout = "rollout-2026-08-01T10-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
+    let fixture_path = sessions.join(rollout);
     let mut fixture = File::create(&fixture_path).expect("fixture");
     for value in [
         serde_json::json!({
@@ -251,7 +253,7 @@ fn conversation_collect_keeps_code_traces_of_compressed_moved_and_deleted_archiv
 
     // Codex compresses an older rollout in place: the same file, so the same
     // trace edit.
-    let compressed_path = sessions.join("thread.jsonl.zst");
+    let compressed_path = sessions.join(format!("{rollout}.zst"));
     let plain = std::fs::read(&fixture_path).expect("read fixture");
     std::fs::write(
         &compressed_path,
@@ -270,16 +272,30 @@ fn conversation_collect_keeps_code_traces_of_compressed_moved_and_deleted_archiv
     // and not kept twice.
     let archived = codex_home.join("archived_sessions");
     std::fs::create_dir_all(&archived).expect("archived sessions");
-    let archived_path = archived.join("thread.jsonl.zst");
+    let archived_path = archived.join(format!("{rollout}.zst"));
     std::fs::rename(&compressed_path, &archived_path).expect("archive fixture");
     let recollected = collect();
     assert!(recollected.contains("trace_edits=1"), "{recollected}");
     assert_eq!(trace_count("archived"), 1);
 
     // Deleting the log does not delete what it recorded.
+    let held = std::fs::read(&archived_path).expect("hold archive fixture");
     std::fs::remove_file(&archived_path).expect("delete archive fixture");
     collect();
     assert_eq!(trace_count("deleted"), 1);
+
+    // A log that reappears elsewhere collects later is still a move.
+    let restored = codex_home.join("sessions/restored");
+    std::fs::create_dir_all(&restored).expect("restored folder");
+    let restored_path = restored.join(format!("{rollout}.zst"));
+    std::fs::write(&restored_path, held).expect("restore fixture");
+    let recollected = collect();
+    assert!(recollected.contains("trace_edits=1"), "{recollected}");
+    assert_eq!(trace_count("restored"), 1);
+
+    std::fs::remove_file(&restored_path).expect("delete restored fixture");
+    collect();
+    assert_eq!(trace_count("deleted again"), 1);
     assert_eq!(
         Store::open(&store_path)
             .expect("reopen collected store")

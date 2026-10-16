@@ -181,50 +181,6 @@ fn full_rescans_reread_every_file() {
 }
 
 #[test]
-fn scan_file_reconciliation_tracks_removed_candidates() {
-    let store = Store::in_memory().expect("store");
-    let source_id = statsai_core::SourceId("src-removed-cache".to_string());
-    let tracked = vec![
-        ScanFileStateEntry {
-            cache_key: "/tmp/a.jsonl".to_string(),
-            cache_signature: "sig-a-1".to_string(),
-        },
-        ScanFileStateEntry {
-            cache_key: "/tmp/b.jsonl".to_string(),
-            cache_signature: "sig-b-1".to_string(),
-        },
-    ];
-    store
-        .record_scan_file_entries(&source_id, &tracked)
-        .expect("record tracked cache state");
-
-    let reconciliation = select_scan_file_reconciliation(
-        &store,
-        &source_id,
-        &[ScanFileStateEntry {
-            cache_key: "/tmp/b.jsonl".to_string(),
-            cache_signature: "sig-b-1".to_string(),
-        }],
-        &HashMap::new(),
-        false,
-        false,
-        false,
-    )
-    .expect("reconciliation");
-
-    assert!(reconciliation.pending_entries.is_empty());
-    assert_eq!(
-        reconciliation.removed_entries,
-        vec![ScanFileStateEntry {
-            cache_key: "/tmp/a.jsonl".to_string(),
-            cache_signature: "sig-a-1".to_string(),
-        }]
-    );
-    // Nothing else is named `a.jsonl`, so it is gone rather than moved.
-    assert!(reconciliation.moved_entries.is_empty());
-}
-
-#[test]
 fn scan_file_reconciliation_tells_a_moved_file_from_a_gone_one() {
     let store = Store::in_memory().expect("store");
     let source_id = statsai_core::SourceId("src-moved-cache".to_string());
@@ -232,21 +188,22 @@ fn scan_file_reconciliation_tells_a_moved_file_from_a_gone_one() {
         cache_key: key.to_string(),
         cache_signature: format!("sig-{key}"),
     };
+    let archived_name = "rollout-2026-05-28T10-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
+    let deleted_name = "rollout-2026-05-28T11-00-00-019e733b-6b32-7fb2-b570-e8f68052bb37.jsonl";
     store
         .record_scan_file_entries(
             &source_id,
             &[
-                entry("/codex/sessions/2026/05/rollout-a.jsonl"),
-                entry("/codex/sessions/2026/05/rollout-b.jsonl"),
+                entry(&format!("/codex/sessions/2026/05/28/{archived_name}")),
+                entry(&format!("/codex/sessions/2026/05/28/{deleted_name}")),
             ],
         )
         .expect("record tracked cache state");
 
-    // `rollout-a` was archived; `rollout-b` was deleted.
     let reconciliation = select_scan_file_reconciliation(
         &store,
         &source_id,
-        &[entry("/codex/archived_sessions/rollout-a.jsonl")],
+        &[entry(&format!("/codex/archived_sessions/{archived_name}"))],
         &HashMap::new(),
         false,
         false,
@@ -254,10 +211,11 @@ fn scan_file_reconciliation_tells_a_moved_file_from_a_gone_one() {
     )
     .expect("reconciliation");
 
-    assert_eq!(reconciliation.removed_entries.len(), 2);
     assert_eq!(
         reconciliation.moved_entries,
-        vec![entry("/codex/sessions/2026/05/rollout-a.jsonl")]
+        vec![entry(&format!(
+            "/codex/sessions/2026/05/28/{archived_name}"
+        ))]
     );
 }
 
@@ -698,6 +656,124 @@ fn partial_scan_with_legacy_rows_falls_back_to_full_source_reconcile() {
         summaries[0].summary_id,
         summary_id("codex", &source.source_id, "summary-b")
     );
+}
+
+#[test]
+fn full_rereads_retire_hashless_rows_and_keep_gone_files_rows() {
+    // `--no-cache`, and a scan that finds every current file changed.
+    for (no_cache, b_signature) in [(true, "sig-b-1"), (false, "sig-b-2")] {
+        let store = Store::in_memory().expect("store");
+        let source = SourceLocation::local_adapter(
+            "codex",
+            "test",
+            "0",
+            Path::new("/tmp/codex-full-reread-legacy"),
+            LocationOrigin::Configured,
+        );
+        store.upsert_source(&source).expect("source");
+        let file_gone = "/tmp/codex-full-reread-legacy/gone.jsonl";
+        let file_b = "/tmp/codex-full-reread-legacy/b.jsonl";
+        store
+            .record_scan_file_entries(
+                &source.source_id,
+                &[
+                    ScanFileStateEntry {
+                        cache_key: file_gone.to_string(),
+                        cache_signature: "sig-gone-1".to_string(),
+                    },
+                    ScanFileStateEntry {
+                        cache_key: file_b.to_string(),
+                        cache_signature: "sig-b-1".to_string(),
+                    },
+                ],
+            )
+            .expect("record initial cache");
+        let started_at = Utc
+            .with_ymd_and_hms(2026, 5, 4, 10, 0, 0)
+            .single()
+            .expect("started_at");
+        let gone_at = started_at - chrono::Duration::days(1);
+        let mut legacy_summary = test_summary("codex", &source, started_at, 75, None);
+        legacy_summary.summary_id = summary_id("codex", &source.source_id, "legacy-summary");
+        store
+            .insert_events(&[
+                test_event("codex", &source, started_at, None, TokenParts::total(75)),
+                test_scan_event(&source, file_gone, gone_at, "event-gone", 40),
+            ])
+            .expect("seed events");
+        store
+            .upsert_summaries(&[
+                legacy_summary,
+                test_scan_summary(&source, file_gone, gone_at, "summary-gone", 40),
+            ])
+            .expect("seed summaries");
+
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(file_b, b_signature)],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![test_scan_event(&source, file_b, started_at, "event-b", 125)],
+                summaries: vec![test_scan_summary(
+                    &source,
+                    file_b,
+                    started_at,
+                    "summary-b",
+                    125,
+                )],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: false,
+                preview: false,
+                no_cache,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("full reread");
+
+        let mut record_ids = store
+            .events_for_source(&source.source_id)
+            .expect("events")
+            .into_iter()
+            .filter_map(|event| event.parse_evidence.and_then(|e| e.source_record_id))
+            .collect::<Vec<_>>();
+        record_ids.sort();
+        assert_eq!(
+            record_ids,
+            vec!["event-b".to_string(), "event-gone".to_string()],
+            "no_cache={no_cache}: the hashless row goes, the gone file's row stays"
+        );
+        let mut summary_ids = store
+            .summaries_for_source(&source.source_id)
+            .expect("summaries")
+            .into_iter()
+            .map(|summary| summary.summary_id.0)
+            .collect::<Vec<_>>();
+        summary_ids.sort();
+        let mut expected = vec![
+            summary_id("codex", &source.source_id, "summary-b").0,
+            summary_id("codex", &source.source_id, "summary-gone").0,
+        ];
+        expected.sort();
+        assert_eq!(summary_ids, expected, "no_cache={no_cache}");
+        // The gone file's cache entry stays, so a later move is still recognised.
+        assert!(store
+            .scan_file_entries(&source.source_id)
+            .expect("cache")
+            .iter()
+            .any(|entry| entry.cache_key == file_gone));
+    }
 }
 
 fn test_scan_summary(

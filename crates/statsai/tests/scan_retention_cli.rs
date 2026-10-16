@@ -109,8 +109,11 @@ fn scans_keep_usage_of_compressed_moved_and_deleted_rollouts() {
     let codex_home = directory.path().join("codex");
     let sessions = codex_home.join("sessions/2026/08/20");
     std::fs::create_dir_all(&sessions).expect("sessions");
-    let rollout_a = sessions.join("rollout-a.jsonl");
-    let rollout_b = sessions.join("rollout-b.jsonl");
+    // Named as Codex names rollouts: for their sessions' UUIDs.
+    let name_a = "rollout-2026-08-20T12-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
+    let name_b = "rollout-2026-08-20T13-00-00-019e733b-6b32-7fb2-b570-e8f68052bb37.jsonl";
+    let rollout_a = sessions.join(name_a);
+    let rollout_b = sessions.join(name_b);
     write_rollout(&rollout_a, "2026-08-20T12:00:00Z", 10);
     write_rollout(&rollout_b, "2026-08-20T13:00:00Z", 20);
     let store = directory.path().join("statsai.sqlite3");
@@ -133,14 +136,25 @@ fn scans_keep_usage_of_compressed_moved_and_deleted_rollouts() {
     // path rather than kept under both.
     let archived = codex_home.join("archived_sessions");
     std::fs::create_dir_all(&archived).expect("archived sessions");
-    std::fs::rename(&compressed_a, archived.join("rollout-a.jsonl.zst")).expect("archive");
+    let archived_a = archived.join(format!("{name_a}.zst"));
+    std::fs::rename(&compressed_a, &archived_a).expect("archive");
     scan(&[]);
     assert_eq!(counts(&store, &codex_home), (2, 2), "after archiving");
 
     // Deleted: its usage stays.
+    let held_b = std::fs::read(&rollout_b).expect("hold rollout");
     std::fs::remove_file(&rollout_b).expect("delete rollout");
     scan(&[]);
     assert_eq!(counts(&store, &codex_home), (2, 2), "after deletion");
+
+    // Back scans later, under another path: still a move, not a second copy.
+    let restored_b = archived.join(name_b);
+    std::fs::write(&restored_b, held_b).expect("restore rollout");
+    scan(&[]);
+    assert_eq!(counts(&store, &codex_home), (2, 2), "after restoring");
+    std::fs::remove_file(&restored_b).expect("delete restored rollout");
+    scan(&[]);
+    assert_eq!(counts(&store, &codex_home), (2, 2), "after deleting again");
 
     // A full reread replaces what it reads, and keeps the rest.
     scan(&["--no-cache"]);

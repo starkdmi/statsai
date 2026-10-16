@@ -29,13 +29,12 @@ pub(crate) fn scan_candidate_compatible_signatures(
 pub(crate) struct ScanFileReconciliation {
     pub(crate) pending_entries: Vec<ScanFileStateEntry>,
     pub(crate) compatible_entries_to_upgrade: Vec<ScanFileStateEntry>,
-    /// Tracked files no longer among the candidates. Their cache entries go, and
-    /// their records stay: a provider deleting or compressing a log does not
-    /// delete its history from the store.
-    pub(crate) removed_entries: Vec<ScanFileStateEntry>,
-    /// The removed files read under another path this scan
+    /// Tracked files that moved to a path read this scan
     /// ([`moved_scan_file_entries`]): their records are replaced like a changed
-    /// file's.
+    /// file's, and their cache entries go. A tracked file that is simply gone
+    /// keeps both its records and its cache entry: a provider deleting or
+    /// compressing a log does not delete its history from the store, and the
+    /// entry lets a later scan still recognise the file if it moved.
     pub(crate) moved_entries: Vec<ScanFileStateEntry>,
 }
 
@@ -58,19 +57,10 @@ pub(crate) fn select_scan_file_reconciliation(
         require_tasks_collected,
     )?;
     let tracked_entries = store.scan_file_entries(source_id)?;
-    let current_cache_keys: BTreeSet<_> = file_cache_entries
-        .iter()
-        .map(|entry| entry.cache_key.as_str())
-        .collect();
-    let removed_entries = tracked_entries
-        .into_iter()
-        .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
-        .collect::<Vec<_>>();
-    let moved_entries = moved_scan_file_entries(&removed_entries, file_cache_entries);
+    let moved_entries = moved_scan_file_entries(&tracked_entries, file_cache_entries);
     Ok(ScanFileReconciliation {
         pending_entries: selection.pending_entries,
         compatible_entries_to_upgrade: selection.compatible_entries_to_upgrade,
-        removed_entries,
         moved_entries,
     })
 }

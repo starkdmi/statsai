@@ -154,10 +154,8 @@ pub(crate) fn scan_with_adapters(
             )?;
             let pending_file_entries = file_reconciliation.pending_entries;
             let compatible_entries_to_upgrade = file_reconciliation.compatible_entries_to_upgrade;
-            let removed_file_entries = file_reconciliation.removed_entries;
             let moved_file_entries = file_reconciliation.moved_entries;
-            let touched_files =
-                !pending_file_entries.is_empty() || !removed_file_entries.is_empty();
+            let touched_files = !pending_file_entries.is_empty() || !moved_file_entries.is_empty();
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let scan_all_current_files = !file_cache_entries.is_empty()
                 && pending_file_entries.len() == file_cache_entries.len();
@@ -166,13 +164,15 @@ pub(crate) fn scan_with_adapters(
             // read. Timing them together attributed the query's cost to the filesystem.
             candidate_scan_duration_ms += candidate_scan_started_at.elapsed().as_millis() as u64;
             let legacy_reconcile_started_at = Instant::now();
-            // A file that is gone keeps its records, so only files read or moved
-            // call for the fuller reconcile.
-            let needs_legacy_full_reconcile = !command.replace
-                && !command.no_cache
-                && (!pending_file_entries.is_empty() || !moved_file_entries.is_empty())
-                && !scan_all_current_files
+            // Rows stored before file hashes were recorded name no file, so replacing
+            // records file by file cannot reach them. A scan that reads files while
+            // the source holds any rereads every file and retires them on their own;
+            // `--replace` deletes them with the rest of the source.
+            let has_hashless_records = !command.replace
+                && (command.no_cache || touched_files)
                 && store.source_records_missing_scan_file_hashes(&source.source_id)?;
+            let needs_legacy_full_reconcile =
+                has_hashless_records && !command.no_cache && !scan_all_current_files;
             legacy_check_duration_ms += legacy_reconcile_started_at.elapsed().as_millis() as u64;
             let reread_every_file = should_reread_every_file(
                 command.replace,
@@ -458,7 +458,7 @@ pub(crate) fn scan_with_adapters(
                         &source.source_id,
                         &reconciled_file_hashes,
                     )?;
-                    if needs_legacy_full_reconcile {
+                    if has_hashless_records {
                         let deleted_events =
                             store.delete_events_without_source_file_hash(&source.source_id)?;
                         removed_event_count += deleted_events.deleted;
@@ -627,8 +627,8 @@ pub(crate) fn scan_with_adapters(
                 )?;
                 store
                     .upgrade_scan_file_entries(&source.source_id, &compatible_entries_to_upgrade)?;
-                let removed_cache_keys = scan_file_cache_keys(&removed_file_entries);
-                store.delete_scan_file_entries(&source.source_id, &removed_cache_keys)?;
+                let moved_cache_keys = scan_file_cache_keys(&moved_file_entries);
+                store.delete_scan_file_entries(&source.source_id, &moved_cache_keys)?;
                 if account_evidence_enabled {
                     store.upsert_account_evidence_checkpoints(&account_evidence.checkpoints)?;
                 }

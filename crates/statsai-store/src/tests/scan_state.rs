@@ -422,3 +422,58 @@ fn legacy_provenance_check_survives_a_payload_it_cannot_read() {
         "a payload that cannot be read counts as missing provenance"
     );
 }
+
+#[test]
+fn moved_scan_files_are_matched_by_a_session_name_on_a_new_path() {
+    let entry = |key: &str| ScanFileStateEntry {
+        cache_key: key.to_string(),
+        cache_signature: "sig".to_string(),
+    };
+    let rollout = "rollout-2026-05-28T10-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
+    let session = "4c1f5a8e-2b7d-4e0a-9c3f-1d2e3f4a5b6c.jsonl";
+
+    // Archived: gone from `sessions/`, the one file of its name now elsewhere.
+    let tracked = [entry(&format!("/codex/sessions/2026/05/28/{rollout}"))];
+    let current = [entry(&format!("/codex/archived_sessions/{rollout}"))];
+    assert_eq!(
+        moved_scan_file_entries(&tracked, &current),
+        tracked.to_vec()
+    );
+
+    // Claude Code names a transcript for its session the same way.
+    let tracked = [entry(&format!("/claude/projects/-old/{session}"))];
+    let current = [entry(&format!("/claude/projects/-new/{session}"))];
+    assert_eq!(
+        moved_scan_file_entries(&tracked, &current),
+        tracked.to_vec()
+    );
+
+    // Grok names every session's file `summary.json`: one session deleted while
+    // another exists is not a move.
+    let tracked = [
+        entry("/grok/sessions/one/summary.json"),
+        entry("/grok/sessions/two/summary.json"),
+    ];
+    let current = [
+        entry("/grok/sessions/two/summary.json"),
+        entry("/grok/sessions/three/summary.json"),
+    ];
+    assert!(moved_scan_file_entries(&tracked, &current).is_empty());
+
+    // A name two current files share says nothing about which one it moved to.
+    let tracked = [entry(&format!("/codex/sessions/{rollout}"))];
+    let current = [
+        entry(&format!("/codex/archived_sessions/{rollout}")),
+        entry(&format!("/codex/archived_sessions/copy/{rollout}")),
+    ];
+    assert!(moved_scan_file_entries(&tracked, &current).is_empty());
+
+    // A file already tracked at its other path was read there before; only a
+    // path new to the store is where a file moved to.
+    let tracked = [
+        entry(&format!("/codex/sessions/{rollout}")),
+        entry(&format!("/codex/archived_sessions/{rollout}")),
+    ];
+    let current = [entry(&format!("/codex/archived_sessions/{rollout}"))];
+    assert!(moved_scan_file_entries(&tracked, &current).is_empty());
+}

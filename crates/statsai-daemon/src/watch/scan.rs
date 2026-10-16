@@ -333,19 +333,11 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                     continue;
                 }
             };
-            let current_cache_keys = file_cache_entries
-                .iter()
-                .map(|entry| entry.cache_key.as_str())
-                .collect::<HashSet<_>>();
-            // A file that is gone keeps its records: only its cache entry goes.
-            // One that moved to another current path has its records replaced
-            // by the ones read there.
-            let removed_file_entries = tracked_file_entries
-                .into_iter()
-                .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
-                .collect::<Vec<_>>();
+            // A file that is gone keeps its records and its cache entry. One that
+            // moved to a path read now has its records replaced by the ones read
+            // there, and its entry goes.
             let moved_file_entries =
-                moved_scan_file_entries(&removed_file_entries, &file_cache_entries);
+                moved_scan_file_entries(&tracked_file_entries, &file_cache_entries);
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let probed_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
@@ -407,7 +399,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                     .is_some_and(|cursor| cursor.parser_revision != ACTIVITY_PARSER_REVISION)
             };
             if pending_file_entries.is_empty()
-                && removed_file_entries.is_empty()
+                && moved_file_entries.is_empty()
                 && !has_cache_entry_upgrades
                 && !verified_state_changed
                 && !has_account_evidence
@@ -493,7 +485,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                         .collect::<HashSet<_>>()
                         .into_iter()
                         .collect::<Vec<_>>();
-                    let removed_cache_keys = removed_file_entries
+                    let removed_cache_keys = moved_file_entries
                         .iter()
                         .map(|entry| entry.cache_key.clone())
                         .collect::<Vec<_>>();
@@ -537,7 +529,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                     &account_evidence.checkpoints,
                                 )?;
                             }
-                            if pending_file_entries.is_empty() && removed_file_entries.is_empty() {
+                            if pending_file_entries.is_empty() && moved_file_entries.is_empty() {
                                 store
                                     .upgrade_scan_file_entries(
                                         &source.source_id,

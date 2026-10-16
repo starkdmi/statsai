@@ -206,10 +206,8 @@ fn collect_archive_sources(
             let entries = scan_file_state_entries(&candidates);
             // An empty candidate list from an unreachable root — an unmounted
             // volume, a renamed home directory, a `--source` pointing somewhere
-            // absent — is not evidence that the archive was emptied.
-            // Reconciling it would forget every imported file of the source,
-            // and the next collect would import them all again, so it is
-            // reported instead.
+            // absent — is not evidence that the archive was emptied, so the
+            // source is reported and skipped.
             if entries.is_empty() && !adapter.archive_root_available(&source) {
                 let imported = store.archive_import_entry_count(&source.source_id)?;
                 if imported > 0 {
