@@ -36,6 +36,8 @@ pub(crate) struct ScanFileReconciliation {
     /// compressing a log does not delete its history from the store, and the
     /// entry lets a later scan still recognise the file if it moved.
     pub(crate) moved_entries: Vec<ScanFileStateEntry>,
+    /// Whether any tracked file is gone, moved or not.
+    pub(crate) has_gone_entries: bool,
 }
 
 pub(crate) fn select_scan_file_reconciliation(
@@ -58,10 +60,18 @@ pub(crate) fn select_scan_file_reconciliation(
     )?;
     let tracked_entries = store.scan_file_entries(source_id)?;
     let moved_entries = moved_scan_file_entries(&tracked_entries, file_cache_entries);
+    let current_cache_keys = file_cache_entries
+        .iter()
+        .map(|entry| entry.cache_key.as_str())
+        .collect::<HashSet<_>>();
+    let has_gone_entries = tracked_entries
+        .iter()
+        .any(|entry| !current_cache_keys.contains(entry.cache_key.as_str()));
     Ok(ScanFileReconciliation {
         pending_entries: selection.pending_entries,
         compatible_entries_to_upgrade: selection.compatible_entries_to_upgrade,
         moved_entries,
+        has_gone_entries,
     })
 }
 

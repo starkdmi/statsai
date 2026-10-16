@@ -262,14 +262,42 @@ impl Store {
                 &events,
                 &deleted_events.replaced_identities,
             )?;
-            let inserted_events = self.insert_events(&events)?;
+            let insert_result = self.insert_events_with_resolution(&events)?;
+            let inserted_events = insert_result.inserted;
             let written_summaries = self.upsert_summaries(&summaries)?;
             self.upsert_session_names(replacement.session_names)?;
-            // A quota observation can point at an event this just deleted, and the
-            // daemon -- the only caller -- never touches quota rows itself, so nothing
-            // else repairs the link. Run after the insert: a record that survives the
-            // rescan keeps its id, and the check treats it as still present.
+            // The reconciled files' quota rows are replaced like their events, so a
+            // moved file's rows move with it rather than staying under its old path
+            // beside the ones read at the new one. Links follow the events they
+            // name to the ids those were stored under.
+            let quota_observations = replacement
+                .quota_observations
+                .iter()
+                .cloned()
+                .map(|mut record| {
+                    if let Some(canonical) = record
+                        .observation
+                        .usage_event_id
+                        .as_ref()
+                        .and_then(|event_id| insert_result.canonical_event_ids.get(event_id))
+                    {
+                        record.observation.usage_event_id = Some(canonical.clone());
+                    }
+                    record
+                })
+                .collect::<Vec<_>>();
+            self.replace_quota_observations_for_source_files(
+                replacement.source_id,
+                replacement.reconciled_file_hashes,
+                &quota_observations,
+            )?;
+            // A quota observation of a file not reread can point at an event this
+            // just deleted. Run after the insert: a record that survives the rescan
+            // keeps its id, and the check treats it as still present.
             self.clear_quota_usage_links_for_events(&deleted_events.deleted_event_ids)?;
+            if !replacement.reconciled_file_hashes.is_empty() {
+                self.rebuild_quota_plan_observations_for_source(replacement.source_id)?;
+            }
             let activity = self.persist_activity_scan_inner(
                 replacement.device_id,
                 replacement.source_id,
@@ -283,6 +311,24 @@ impl Store {
             self.upgrade_scan_file_entries(
                 replacement.source_id,
                 replacement.compatible_entries_to_upgrade,
+            )?;
+            // The removed entries are moved files. The watcher collects no task
+            // spans, so their spans would outlive the entries that tie them to the
+            // file now at the new path; they go with them, and that file, recorded
+            // without tasks, is read again by the next scan that collects them.
+            let moved_file_hashes = replacement
+                .removed_cache_keys
+                .iter()
+                .map(|cache_key| hash_text(cache_key))
+                .collect::<Vec<_>>();
+            let deleted_spans = self.delete_task_spans_for_source_file_hashes(
+                replacement.source_id,
+                &moved_file_hashes,
+            )?;
+            self.rebuild_task_work_items_for_changes_report(
+                &deleted_spans.affected_project_buckets,
+                &BTreeSet::new(),
+                &deleted_spans.deleted_spans,
             )?;
             self.delete_scan_file_entries(replacement.source_id, replacement.removed_cache_keys)?;
             Ok(ScanFileReplacementResult {

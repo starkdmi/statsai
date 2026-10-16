@@ -148,3 +148,48 @@ pub(super) fn test_store_summary(
         imported_at: now,
     }
 }
+
+pub(crate) fn task_span(
+    source: &statsai_core::SourceLocation,
+    raw_session_id: &str,
+    title: &str,
+    started_at: chrono::DateTime<Utc>,
+) -> statsai_core::TaskSpan {
+    statsai_core::TaskSpan {
+        schema_version: statsai_core::TASK_SPAN_SCHEMA_VERSION.to_string(),
+        span_id: statsai_core::TaskSpanId(format!("span-{raw_session_id}-{title}")),
+        provider: source.provider.clone(),
+        source_id: source.source_id.clone(),
+        span_kind: "test".to_string(),
+        source_record_id: None,
+        source_file_path_hash: None,
+        summary_id: None,
+        session_id: Some(raw_session_id.to_string()),
+        thread_id: None,
+        title: title.to_string(),
+        normalized_title: statsai_core::normalize_task_title(title),
+        title_source: Some("test".to_string()),
+        summary_preview: None,
+        todo_excerpt: None,
+        issue_keys: Vec::new(),
+        branch_family: None,
+        project_bucket: "bucket".to_string(),
+        project: None,
+        git: None,
+        usage: UsageCounts::default(),
+        estimated_cost_usd: None,
+        estimated_cost_micro_usd: None,
+        event_count: 0,
+        has_usage_evidence: false,
+        total_messages: 0,
+        user_messages: 0,
+        assistant_messages: 0,
+        developer_messages: 0,
+        linked_event_ids: Vec::new(),
+        confidence: Confidence::Medium,
+        is_meta: statsai_core::task_title_is_generic(Some(title)),
+        started_at,
+        ended_at: Some(started_at),
+        duration_seconds: Some(0),
+    }
+}

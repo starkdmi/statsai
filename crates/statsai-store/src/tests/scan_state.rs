@@ -65,6 +65,7 @@ fn scan_file_replacement_rolls_back_deletions_when_cache_update_fails() {
             activity_coverage: &[],
             activity_persist_mode: ActivityPersistMode::ReplaceFiles,
             activity_scan_cursor: None,
+            quota_observations: &[],
             device_id: "device",
             pending_entries: &[replacement],
             compatible_entries_to_upgrade: &[],
@@ -248,10 +249,9 @@ fn scan_file_state_accepts_compatible_signatures() {
 
 #[test]
 fn scan_file_replacement_clears_links_to_events_it_retired() {
-    // The daemon is the only caller here and it never touches quota rows, so a
-    // quota observation left pointing at an event this retires would keep a link
-    // to a row that no longer exists. A record that survives the rescan keeps its
-    // id, and must keep its link.
+    // A quota observation of a file the rescan does not reread can point at an
+    // event this retires, and would keep a link to a row that no longer exists.
+    // A record that survives the rescan keeps its id, and must keep its link.
     let store = Store::in_memory().expect("store");
     let source = statsai_core::SourceLocation::local_adapter(
         "codex",
@@ -264,6 +264,7 @@ fn scan_file_replacement_clears_links_to_events_it_retired() {
     let now = Utc::now();
     let cache_key = "/tmp/codex-link-repair/session.jsonl".to_string();
     let file_hash = hash_text(&cache_key);
+    let other_file_hash = hash_text("/tmp/codex-link-repair/other.jsonl");
 
     let evidence = |record_id: &str, line: u64| {
         Some(statsai_core::ParseEvidence {
@@ -312,7 +313,7 @@ fn scan_file_replacement_clears_links_to_events_it_retired() {
                     observation_id,
                     &source.source_id.0,
                     now.to_rfc3339(),
-                    &file_hash,
+                    &other_file_hash,
                     &event.event_id.0,
                 ],
             )
@@ -331,6 +332,7 @@ fn scan_file_replacement_clears_links_to_events_it_retired() {
             activity_coverage: &[],
             activity_persist_mode: ActivityPersistMode::ReplaceFiles,
             activity_scan_cursor: None,
+            quota_observations: &[],
             device_id: "device",
             pending_entries: &[ScanFileStateEntry {
                 cache_key,
@@ -476,4 +478,51 @@ fn moved_scan_files_are_matched_by_a_session_name_on_a_new_path() {
     ];
     let current = [entry(&format!("/codex/archived_sessions/{rollout}"))];
     assert!(moved_scan_file_entries(&tracked, &current).is_empty());
+}
+
+#[test]
+fn scan_file_replacement_retires_the_task_spans_of_moved_files() {
+    let store = Store::in_memory().expect("store");
+    let source = statsai_core::SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-watched-move"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let moved_key = "/tmp/codex-watched-move/sessions/rollout.jsonl".to_string();
+    let kept_key = "/tmp/codex-watched-move/sessions/other.jsonl".to_string();
+    let now = Utc::now();
+    let mut moved = task_span(&source, "moved-session", "Archive old rollouts", now);
+    moved.source_file_path_hash = Some(hash_text(&moved_key));
+    let mut kept = task_span(&source, "kept-session", "Keep this one", now);
+    kept.source_file_path_hash = Some(hash_text(&kept_key));
+    store
+        .upsert_task_spans(&[moved, kept.clone()])
+        .expect("seed spans");
+
+    // The watcher passes the moved files' old entries as the removed ones.
+    store
+        .replace_scan_file_records(ScanFileReplacement {
+            source_id: &source.source_id,
+            reconciled_file_hashes: &[hash_text(&moved_key)],
+            events: &[],
+            summaries: &[],
+            session_names: &[],
+            activity_invocations: &[],
+            activity_coverage: &[],
+            activity_persist_mode: ActivityPersistMode::ReplaceFiles,
+            activity_scan_cursor: None,
+            quota_observations: &[],
+            device_id: "device",
+            pending_entries: &[],
+            compatible_entries_to_upgrade: &[],
+            removed_cache_keys: std::slice::from_ref(&moved_key),
+        })
+        .expect("replace scan files");
+
+    let spans = store.task_spans().expect("task spans");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].span_id, kept.span_id);
 }

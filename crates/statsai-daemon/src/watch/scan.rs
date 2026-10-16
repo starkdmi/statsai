@@ -576,6 +576,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                             }),
                                         parser_revision: ACTIVITY_PARSER_REVISION.to_string(),
                                     }),
+                                    quota_observations: &scan.quota_observations,
                                     device_id,
                                     pending_entries: &pending_file_entries,
                                     compatible_entries_to_upgrade: &compatible_entries_to_upgrade,

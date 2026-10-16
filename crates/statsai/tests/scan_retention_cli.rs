@@ -172,4 +172,14 @@ fn scans_keep_usage_of_compressed_moved_and_deleted_rollouts() {
     // `--replace` is the one destructive rebuild.
     scan(&["--replace"]);
     assert_eq!(counts(&store, &codex_home), (1, 1), "after --replace");
+
+    // It forgets files that are gone along with their records, so one moved
+    // away during it and back unchanged is read again.
+    let away = directory.path().join(format!("{name_a}.zst"));
+    std::fs::rename(&archived_a, &away).expect("move away");
+    scan(&["--replace"]);
+    assert_eq!(counts(&store, &codex_home), (0, 0), "--replace while away");
+    std::fs::rename(&away, &archived_a).expect("move back");
+    scan(&[]);
+    assert_eq!(counts(&store, &codex_home), (1, 1), "back after --replace");
 }

@@ -547,6 +547,84 @@ fn partial_scan_removes_stale_task_spans_and_rebuilds_work_items() {
 }
 
 #[test]
+fn a_move_retires_task_spans_even_when_tasks_are_not_collected() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-task-move"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let name = "rollout-2026-06-12T11-00-00-019e733b-6b32-7fb2-b570-e8f68052bb36.jsonl";
+    let old_path = format!("/tmp/codex-task-move/sessions/2026/06/12/{name}");
+    let new_path = format!("/tmp/codex-task-move/archived_sessions/{name}");
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 6, 12, 11, 0, 0)
+        .single()
+        .expect("started_at");
+    let scan = |include_tasks: bool, path: &str, with_span: bool| {
+        let event = test_scan_event(&source, path, started_at, "event", 100);
+        let span = test_task_span(
+            &source,
+            path,
+            started_at,
+            "span",
+            "Archive the old rollouts",
+            &event,
+        );
+        let adapter = TestAdapter {
+            provider: "codex",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(path, "sig-1")],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event],
+                task_spans: if with_span { vec![span] } else { Vec::new() },
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks,
+                preview: false,
+                no_cache: false,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+    };
+
+    scan(true, &old_path, true);
+    assert_eq!(store.task_spans().expect("task spans").len(), 1);
+    assert_eq!(store.work_items().expect("work items").len(), 1);
+
+    // Moved while tasks are not collected: its span goes with its old path.
+    scan(false, &new_path, false);
+    assert!(store.task_spans().expect("task spans").is_empty());
+    assert!(store.work_items().expect("work items").is_empty());
+
+    // The file at the new path was recorded without tasks, so the next scan
+    // that collects them reads it again.
+    scan(true, &new_path, true);
+    let spans = store.task_spans().expect("task spans");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].source_file_path_hash.as_deref(),
+        Some(hash_text(&new_path).as_str())
+    );
+    assert_eq!(store.work_items().expect("work items").len(), 1);
+}
+
+#[test]
 fn partial_scan_with_legacy_rows_falls_back_to_full_source_reconcile() {
     let store = Store::in_memory().expect("store");
     let source = SourceLocation::local_adapter(

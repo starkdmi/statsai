@@ -392,6 +392,9 @@ pub struct ScanFileReplacement<'a> {
     pub activity_coverage: &'a [ActivityCoverageV1],
     pub activity_persist_mode: ActivityPersistMode,
     pub activity_scan_cursor: Option<ActivityScanCursor>,
+    /// The quota observations read from the reconciled files, which replace the
+    /// ones stored for them.
+    pub quota_observations: &'a [statsai_core::QuotaObservationRecordV1],
     pub device_id: &'a str,
     pub pending_entries: &'a [ScanFileStateEntry],
     pub compatible_entries_to_upgrade: &'a [ScanFileStateEntry],

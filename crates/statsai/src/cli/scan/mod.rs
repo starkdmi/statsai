@@ -155,7 +155,11 @@ pub(crate) fn scan_with_adapters(
             let pending_file_entries = file_reconciliation.pending_entries;
             let compatible_entries_to_upgrade = file_reconciliation.compatible_entries_to_upgrade;
             let moved_file_entries = file_reconciliation.moved_entries;
-            let touched_files = !pending_file_entries.is_empty() || !moved_file_entries.is_empty();
+            // A gone file touches nothing, as its records stay, except under
+            // `--replace`, which rebuilds the source from the files there are.
+            let touched_files = !pending_file_entries.is_empty()
+                || !moved_file_entries.is_empty()
+                || (command.replace && file_reconciliation.has_gone_entries);
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let scan_all_current_files = !file_cache_entries.is_empty()
                 && pending_file_entries.len() == file_cache_entries.len();
@@ -475,10 +479,20 @@ pub(crate) fn scan_with_adapters(
                             &reconciled_file_hashes,
                         )?;
                     }
-                    if command.include_tasks {
+                    // A moved file's spans go even when this scan collects none: its
+                    // cache entry goes below, and with it the only record that its
+                    // spans belong to the file now at the new path. That file is
+                    // recorded without tasks, so the next scan that collects them
+                    // reads it again.
+                    let task_span_file_hashes = if command.include_tasks {
+                        reconciled_file_hashes
+                    } else {
+                        scan_file_hashes_for_reconciliation(&[], &moved_file_entries)
+                    };
+                    if !task_span_file_hashes.is_empty() {
                         let deleted = store.delete_task_spans_for_source_file_hashes(
                             &source.source_id,
-                            &reconciled_file_hashes,
+                            &task_span_file_hashes,
                         )?;
                         removed_task_span_count += deleted.deleted;
                         affected_project_buckets
@@ -611,10 +625,17 @@ pub(crate) fn scan_with_adapters(
                     );
                     rebuild_span_ids
                         .extend(scan.task_spans.iter().map(|span| span.span_id.0.clone()));
-                    rebuild_project_buckets.extend(affected_project_buckets);
                 }
+                rebuild_project_buckets.extend(affected_project_buckets);
 
                 let cache_write_started_at = Instant::now();
+                // `--replace` deleted the records of files that are gone too, so their
+                // cache entries go with them: one that comes back is read again.
+                if command.replace {
+                    store.delete_scan_file_entries_for_sources(std::slice::from_ref(
+                        &source.source_id,
+                    ))?;
+                }
                 let cache_entries_to_record = if reread_every_file {
                     &file_cache_entries
                 } else {
@@ -634,8 +655,7 @@ pub(crate) fn scan_with_adapters(
                 }
                 cache_write_duration_ms += cache_write_started_at.elapsed().as_millis() as u64;
 
-                if command.include_tasks
-                    && !rebuild_project_buckets.is_empty()
+                if !rebuild_project_buckets.is_empty()
                     && (!rebuild_span_ids.is_empty() || !deleted_task_spans.is_empty())
                 {
                     let rebuild_started_at = Instant::now();

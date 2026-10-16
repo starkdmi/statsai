@@ -154,6 +154,17 @@ impl<R: BufRead> Read for ZstdFrames<R> {
                 if read > 0 {
                     return Ok(read);
                 }
+                // The frame is read out, so the checksum of what it held is
+                // complete. `ruzstd` computes it but leaves the comparison to
+                // the caller; a frame written without one has nothing to check.
+                if let Some(stored) = self.decoder.get_checksum_from_data() {
+                    if self.decoder.get_calculated_checksum() != Some(stored) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "zstd frame checksum does not match its content",
+                        ));
+                    }
+                }
                 self.in_frame = false;
             }
             if self.source.fill_buf()?.is_empty() {
@@ -257,6 +268,38 @@ mod tests {
             read_all(&root.path().join("rollout.jsonl")),
             "{\"first\":1}\n{\"second\":2}\n"
         );
+    }
+
+    /// `{"x":1}\n` as `zstd --check` writes it: one frame with a content checksum
+    /// in its last four bytes.
+    const CHECKSUMMED_FRAME: [u8; 21] = [
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x41, 0x00, 0x00, 0x7b, 0x22, 0x78, 0x22, 0x3a, 0x31,
+        0x7d, 0x0a, 0x22, 0x03, 0xde, 0x93,
+    ];
+
+    fn read_frame(bytes: &[u8]) -> io::Result<String> {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("rollout.jsonl.zst"), bytes).expect("write");
+        let mut text = String::new();
+        open_jsonl(&root.path().join("rollout.jsonl"))
+            .expect("open")
+            .read_to_string(&mut text)?;
+        Ok(text)
+    }
+
+    #[test]
+    fn a_frame_checksum_is_verified() {
+        assert_eq!(read_frame(&CHECKSUMMED_FRAME).expect("read"), "{\"x\":1}\n");
+
+        let mut wrong_checksum = CHECKSUMMED_FRAME;
+        wrong_checksum[20] ^= 0xff;
+        let error = read_frame(&wrong_checksum).expect_err("checksum mismatch");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        // A changed byte of content, which the checksum no longer matches.
+        let mut wrong_content = CHECKSUMMED_FRAME;
+        wrong_content[13] = b'2';
+        assert!(read_frame(&wrong_content).is_err());
     }
 
     #[test]
