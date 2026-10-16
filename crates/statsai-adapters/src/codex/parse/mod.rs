@@ -19,9 +19,9 @@ pub(crate) fn parse_codex_file(
     path: &Path,
 ) -> Result<()> {
     let collect_tasks = ctx.options.should_collect_tasks();
-    let file = File::open(path).with_context(|| format!("read {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let fallback_timestamp = file_modified_timestamp(path).unwrap_or_else(Utc::now);
+    let mut reader = crate::compressed::open_jsonl(path)?;
+    let fallback_timestamp = file_modified_timestamp(&crate::compressed::readable_jsonl_path(path))
+        .unwrap_or_else(Utc::now);
     let file_fallback_project = project_context_from_path_fallback(root, path);
     // Both are per session: one file can interleave several sessions.
     let mut previous_totals: HashMap<String, Option<CodexCumulativeTotal>> = HashMap::new();

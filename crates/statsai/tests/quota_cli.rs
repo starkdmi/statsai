@@ -321,7 +321,7 @@ fn scan_preview_reports_quota_only_sources_and_totals() {
 }
 
 #[test]
-fn conversation_archive_backfills_and_reconciles_quota_observations() {
+fn conversation_archive_backfills_reconciles_and_keeps_quota_observations() {
     let directory = tempdir().expect("temp dir");
     let codex_home = directory.path().join("codex");
     let sessions = codex_home.join("sessions");
@@ -428,5 +428,7 @@ fn conversation_archive_backfills_and_reconciles_quota_observations() {
         &["quota", "status", "--json"],
     )))
     .expect("reconciled status JSON");
-    assert_eq!(status["total_observations"], 0);
+    // A changed file's dropped line goes, but a deleted file keeps what it
+    // recorded.
+    assert_eq!(status["total_observations"], 1);
 }

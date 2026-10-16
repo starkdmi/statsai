@@ -281,6 +281,35 @@ pub struct ScanFileStateEntry {
     pub cache_signature: String,
 }
 
+/// The `removed` files a scan still reads under another path: those whose file
+/// name a `current` file of the same source has, as when Codex moves a rollout
+/// from `sessions/` to `archived_sessions/`.
+///
+/// A scan keeps the records of a file that is gone -- provider tools delete and
+/// compress their logs, and the store is what keeps the history -- so only a moved
+/// file's records are replaced, by those read from its new path. Records whose ids
+/// include the file's path, such as quota observations, would otherwise be stored
+/// under both.
+#[must_use]
+pub fn moved_scan_file_entries(
+    removed: &[ScanFileStateEntry],
+    current: &[ScanFileStateEntry],
+) -> Vec<ScanFileStateEntry> {
+    let current_names = current
+        .iter()
+        .filter_map(|entry| std::path::Path::new(&entry.cache_key).file_name())
+        .collect::<std::collections::HashSet<_>>();
+    removed
+        .iter()
+        .filter(|entry| {
+            std::path::Path::new(&entry.cache_key)
+                .file_name()
+                .is_some_and(|name| current_names.contains(name))
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScanFileStateSelection {
     pub pending_entries: Vec<ScanFileStateEntry>,

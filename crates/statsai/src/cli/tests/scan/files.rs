@@ -171,47 +171,13 @@ fn no_cache_scan_reselects_unchanged_files() {
 }
 
 #[test]
-fn full_source_rescan_replaces_existing_source_records() {
-    assert!(should_replace_source_records_for_scan(
-        true, false, 0, 0, false
-    ));
-    assert!(should_replace_source_records_for_scan(
-        false, true, 0, 0, false
-    ));
-    assert!(should_replace_source_records_for_scan(
-        false, false, 2, 2, false
-    ));
-    assert!(should_replace_source_records_for_scan(
-        false, false, 0, 0, true
-    ));
-    assert!(!should_replace_source_records_for_scan(
-        false, false, 2, 1, false
-    ));
-    assert!(!should_replace_source_records_for_scan(
-        false, false, 0, 0, false
-    ));
-}
-
-#[test]
-fn cache_invalidation_reconciles_quota_records_by_file() {
-    assert!(!should_replace_all_source_quota_records(false, false));
-    assert!(should_replace_all_source_quota_records(true, false));
-    assert!(should_replace_all_source_quota_records(false, true));
-}
-
-#[test]
-fn no_cache_rescan_reconciles_quota_records_instead_of_deleting_the_source() {
-    // `--no-cache` rereads every file, so the file-level path already rewrites everything it
-    // produces. Deleting the source first walked every observation and window on a store with
-    // six figures of rows, which is the stall a documented flag must not have.
-    assert!(!should_replace_all_source_quota_records(false, false));
-    // The full reread still replaces the source's records, so the reconciliation branch --
-    // the one that also retires rows outside the rescanned file set -- is the branch it takes.
-    assert!(should_replace_source_records_for_scan(
-        false, true, 0, 0, false
-    ));
-    // An explicit destructive rebuild keeps the blanket delete.
-    assert!(should_replace_all_source_quota_records(true, false));
+fn full_rescans_reread_every_file() {
+    assert!(should_reread_every_file(true, false, 0, 0, false));
+    assert!(should_reread_every_file(false, true, 0, 0, false));
+    assert!(should_reread_every_file(false, false, 2, 2, false));
+    assert!(should_reread_every_file(false, false, 0, 0, true));
+    assert!(!should_reread_every_file(false, false, 2, 1, false));
+    assert!(!should_reread_every_file(false, false, 0, 0, false));
 }
 
 #[test]
@@ -253,6 +219,45 @@ fn scan_file_reconciliation_tracks_removed_candidates() {
             cache_key: "/tmp/a.jsonl".to_string(),
             cache_signature: "sig-a-1".to_string(),
         }]
+    );
+    // Nothing else is named `a.jsonl`, so it is gone rather than moved.
+    assert!(reconciliation.moved_entries.is_empty());
+}
+
+#[test]
+fn scan_file_reconciliation_tells_a_moved_file_from_a_gone_one() {
+    let store = Store::in_memory().expect("store");
+    let source_id = statsai_core::SourceId("src-moved-cache".to_string());
+    let entry = |key: &str| ScanFileStateEntry {
+        cache_key: key.to_string(),
+        cache_signature: format!("sig-{key}"),
+    };
+    store
+        .record_scan_file_entries(
+            &source_id,
+            &[
+                entry("/codex/sessions/2026/05/rollout-a.jsonl"),
+                entry("/codex/sessions/2026/05/rollout-b.jsonl"),
+            ],
+        )
+        .expect("record tracked cache state");
+
+    // `rollout-a` was archived; `rollout-b` was deleted.
+    let reconciliation = select_scan_file_reconciliation(
+        &store,
+        &source_id,
+        &[entry("/codex/archived_sessions/rollout-a.jsonl")],
+        &HashMap::new(),
+        false,
+        false,
+        false,
+    )
+    .expect("reconciliation");
+
+    assert_eq!(reconciliation.removed_entries.len(), 2);
+    assert_eq!(
+        reconciliation.moved_entries,
+        vec![entry("/codex/sessions/2026/05/rollout-a.jsonl")]
     );
 }
 

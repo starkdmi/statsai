@@ -687,7 +687,7 @@ fn manual_only_watcher_rescan_does_not_collect_account_evidence() {
 }
 
 #[test]
-fn rescan_changed_sources_removes_records_for_deleted_files() {
+fn rescan_changed_sources_keeps_records_of_deleted_files() {
     let store = Store::in_memory().expect("store");
     let root = tempfile::tempdir().expect("source root");
     let deleted_file = root.path().join("deleted.jsonl");
@@ -799,7 +799,9 @@ fn rescan_changed_sources_removes_records_for_deleted_files() {
     .expect("rescan deleted file");
 
     assert_eq!(*scan_calls.lock().expect("scan calls"), 0);
-    assert_eq!(store.event_count().expect("event count"), 0);
+    // A provider deleting its log does not delete the usage it recorded; only
+    // the file's cache entry goes.
+    assert_eq!(store.event_count().expect("event count"), 1);
     assert!(store
         .scan_file_entries(&source.source_id)
         .expect("scan entries")

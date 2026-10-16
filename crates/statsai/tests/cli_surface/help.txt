@@ -45,7 +45,7 @@ Options:
       --include-tasks          Collect local task spans and rebuild work items
       --preview                Preview without persisting to the store
       --no-cache               Ignore the scan file cache and reparse all candidate files
-      --replace                Replace existing events for scanned sources before inserting
+      --replace                Delete all stored records of scanned sources first, even those of deleted files
       --verbose                Show detailed per-source diagnostics
       --explain                Show parse evidence for each event
   -h, --help                   Print help

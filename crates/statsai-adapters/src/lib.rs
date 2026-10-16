@@ -40,6 +40,7 @@ mod archive;
 mod cache;
 mod claude;
 mod codex;
+mod compressed;
 mod cursor;
 mod event;
 mod grok;
@@ -86,6 +87,7 @@ pub(crate) use codex::{
     codex_project_context_from_value, codex_quota_observation, codex_token_count_usage,
     codex_usage_roots, session_raw_from_value,
 };
+pub use compressed::readable_jsonl_path;
 pub(crate) use grok::grok_sessions_root;
 pub use grok::GrokBuildAdapter;
 pub(crate) use opencode::opencode_message_usage_counts;

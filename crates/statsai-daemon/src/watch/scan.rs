@@ -13,9 +13,10 @@ use statsai_core::{
     UsageSummary, ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
-    find_existing_provider_account, reconcile_verified_source_state, try_acquire_scan_lock,
-    upsert_provider_account, verified_source_observation_hash, ActivityPersistMode,
-    ActivityScanCursor, ScanFileReplacement, ScanFileStateEntry, Store, UpsertProviderAccountInput,
+    find_existing_provider_account, moved_scan_file_entries, reconcile_verified_source_state,
+    try_acquire_scan_lock, upsert_provider_account, verified_source_observation_hash,
+    ActivityPersistMode, ActivityScanCursor, ScanFileReplacement, ScanFileStateEntry, Store,
+    UpsertProviderAccountInput,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -336,10 +337,15 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                 .iter()
                 .map(|entry| entry.cache_key.as_str())
                 .collect::<HashSet<_>>();
+            // A file that is gone keeps its records: only its cache entry goes.
+            // One that moved to another current path has its records replaced
+            // by the ones read there.
             let removed_file_entries = tracked_file_entries
                 .into_iter()
                 .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
                 .collect::<Vec<_>>();
+            let moved_file_entries =
+                moved_scan_file_entries(&removed_file_entries, &file_cache_entries);
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
             let probed_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
@@ -409,8 +415,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
             {
                 continue;
             }
-            let rescan_file_entries = if activity_full_reconcile || !removed_file_entries.is_empty()
-            {
+            let rescan_file_entries = if activity_full_reconcile || !moved_file_entries.is_empty() {
                 &file_cache_entries
             } else {
                 &pending_file_entries
@@ -483,7 +488,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                         };
                     let reconciled_file_hashes = rescan_file_entries
                         .iter()
-                        .chain(removed_file_entries.iter())
+                        .chain(moved_file_entries.iter())
                         .map(|entry| hash_text(&entry.cache_key))
                         .collect::<HashSet<_>>()
                         .into_iter()
@@ -565,6 +570,7 @@ fn rescan_changed_sources_with_adapters_and_commit_store_and_dependencies(
                                     activity_coverage: &scan.activity_coverage,
                                     activity_persist_mode: ActivityPersistMode::for_scan(
                                         &source.provider,
+                                        false,
                                         activity_full_reconcile,
                                     ),
                                     activity_scan_cursor: Some(ActivityScanCursor {

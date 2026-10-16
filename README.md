@@ -432,6 +432,13 @@ statsai report cache --from 2026-05-01 --details
 Normal scans use a per-source file signature cache. `--no-cache` forces a
 one-off reread; `--replace` performs a destructive source rebuild.
 
+The store keeps usage after its log is gone: when a tool deletes, moves or
+compresses a session file, a scan keeps what it recorded from that file, and
+replaces it only with what it reads from the file's new place. Codex rollouts it
+compresses in place (`rollout-….jsonl.zst`) are read as the same files. Only
+`--replace`, and `source remove --delete-data`, delete the usage of files that
+no longer exist.
+
 `statsai scan`, `statsai sync` (other than `--status`, `--verify`, and
 `--reset-remote --dry-run`), and each pass of `statsai daemon --watch` take
 turns through `scan.lock` beside the database (`~/.statsai/scan.lock` by

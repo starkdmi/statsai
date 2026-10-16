@@ -180,7 +180,7 @@ fn conversation_collect_reports_partial_coverage_for_unmeasurable_mutations() {
 }
 
 #[test]
-fn conversation_collect_prunes_code_traces_when_archive_file_is_deleted() {
+fn conversation_collect_keeps_code_traces_of_compressed_moved_and_deleted_archive_files() {
     let dir = tempdir().expect("temp dir");
     let codex_home = dir.path().join("codex");
     let sessions = codex_home.join("sessions");
@@ -234,27 +234,60 @@ fn conversation_collect_prunes_code_traces_when_archive_file_is_deleted() {
     );
     drop(store);
 
-    std::fs::remove_file(&fixture_path).expect("delete archive fixture");
-    let recollected = stdout(run_statsai(
-        &store_path,
-        &codex_home,
-        &["conversation", "collect", "--provider", "codex"],
-    ));
+    let trace_count = |step: &str| {
+        Store::open(&store_path)
+            .expect("reopen collected store")
+            .list_trace_edits()
+            .unwrap_or_else(|error| panic!("{step}: {error}"))
+            .len()
+    };
+    let collect = || {
+        stdout(run_statsai(
+            &store_path,
+            &codex_home,
+            &["conversation", "collect", "--provider", "codex"],
+        ))
+    };
 
-    assert!(recollected.contains("trace_edits=0"), "{recollected}");
-    assert!(
-        recollected.contains("trace_coverage=Unavailable"),
-        "{recollected}"
+    // Codex compresses an older rollout in place: the same file, so the same
+    // trace edit.
+    let compressed_path = sessions.join("thread.jsonl.zst");
+    let plain = std::fs::read(&fixture_path).expect("read fixture");
+    std::fs::write(
+        &compressed_path,
+        ruzstd::encoding::compress_to_vec(
+            plain.as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ),
+    )
+    .expect("write compressed fixture");
+    std::fs::remove_file(&fixture_path).expect("remove plain fixture");
+    let recollected = collect();
+    assert!(recollected.contains("trace_edits=1"), "{recollected}");
+    assert_eq!(trace_count("compressed"), 1);
+
+    // Archiving the thread moves it: its edit is recorded under the new path
+    // and not kept twice.
+    let archived = codex_home.join("archived_sessions");
+    std::fs::create_dir_all(&archived).expect("archived sessions");
+    let archived_path = archived.join("thread.jsonl.zst");
+    std::fs::rename(&compressed_path, &archived_path).expect("archive fixture");
+    let recollected = collect();
+    assert!(recollected.contains("trace_edits=1"), "{recollected}");
+    assert_eq!(trace_count("archived"), 1);
+
+    // Deleting the log does not delete what it recorded.
+    std::fs::remove_file(&archived_path).expect("delete archive fixture");
+    collect();
+    assert_eq!(trace_count("deleted"), 1);
+    assert_eq!(
+        Store::open(&store_path)
+            .expect("reopen collected store")
+            .list_code_change_metrics(false)
+            .expect("kept metrics")
+            .len(),
+        1
     );
-    let store = Store::open(&store_path).expect("reopen collected store");
-    assert!(store
-        .list_trace_edits()
-        .expect("reconciled traces")
-        .is_empty());
-    assert!(store
-        .list_code_change_metrics(false)
-        .expect("reconciled metrics")
-        .is_empty());
 }
 
 #[test]

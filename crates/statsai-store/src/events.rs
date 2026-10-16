@@ -730,6 +730,46 @@ impl Store {
         })
     }
 
+    /// Deletes the source's events that carry no source file hash: rows stored
+    /// before file hashes were recorded. No file can be matched to them, so a scan
+    /// that rereads every current file of the source replaces them this way,
+    /// rather than by deleting the whole source and with it the records of files
+    /// that are gone.
+    pub fn delete_events_without_source_file_hash(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<EventDeletionImpact> {
+        self.with_immediate_transaction(|| {
+            let mut impact = EventDeletionImpact::default();
+            let mut dirty = EventWriteDirty::default();
+            let condition =
+                format!("source_id = ?1 AND COALESCE({EVENT_SOURCE_FILE_HASH_SQL}, '') = ''");
+            let rows: Vec<(String, String)> = {
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT event_id, payload FROM usage_events WHERE {condition}"
+                ))?;
+                let rows =
+                    stmt.query_map(params![&source_id.0], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            for (event_id, payload) in rows {
+                // A payload that is not an event has no rollup to refresh, and
+                // is deleted all the same.
+                if let Ok(event) = serde_json::from_str::<UsageEvent>(&payload) {
+                    dirty.observe(&event);
+                    impact.replaced_identities.observe(&event);
+                }
+                impact.deleted_event_ids.push(EventId(event_id));
+            }
+            impact.deleted += self.conn.execute(
+                &format!("DELETE FROM usage_events WHERE {condition}"),
+                params![&source_id.0],
+            )? as u64;
+            self.refresh_event_rollups(&dirty)?;
+            Ok(impact)
+        })
+    }
+
     pub(crate) fn event_by_id(&self, event_id: &str) -> Result<Option<UsageEvent>> {
         self.conn
             .query_row(

@@ -428,42 +428,27 @@ impl Store {
         })
     }
 
-    /// Deletes this source's quota rows that no file in `source_file_path_hashes` accounts for.
+    /// Deletes this source's quota rows that carry no source file hash: rows stored
+    /// before file hashes were recorded.
     ///
-    /// A full rescan replaces every file it can see, but `replace_quota_observations_for_source_files`
-    /// only reconciles the hashes handed to it, so rows written for a file that has since disappeared
-    /// -- and legacy rows stored before file hashes were recorded -- outlive the scan that should have
-    /// retired them. Deleting the whole source instead would retire them, and that is what `--no-cache`
-    /// used to do: on a store with six figures of observations it walked every row, every window, and
-    /// the payload table, which is the stall this replaces. The unmatched set is normally empty, and the
-    /// source index covers the lookup, so the common case reads an index range and writes nothing.
-    pub fn delete_quota_observations_for_source_outside_file_hashes(
+    /// A scan that rereads every current file replaces their rows by file hash, which
+    /// cannot reach these. Rows of files that are gone keep their hash and stay: the
+    /// store keeps what a provider deleted from disk. The source index covers the
+    /// lookup, and the set is normally empty, so the common case writes nothing.
+    pub fn delete_quota_observations_without_source_file_hash(
         &self,
         source_id: &SourceId,
-        source_file_path_hashes: &[String],
     ) -> Result<u64> {
         self.with_immediate_transaction(|| {
-            let retained = source_file_path_hashes
-                .iter()
-                .map(String::as_str)
-                .collect::<HashSet<_>>();
             let mut statement = self.conn.prepare(
-                "SELECT observation_id, source_file_path_hash, payload_hash FROM quota_observations
-                 WHERE source_id = ?1",
+                "SELECT observation_id, payload_hash FROM quota_observations
+                 WHERE source_id = ?1 AND COALESCE(source_file_path_hash, '') = ''",
             )?;
             let orphaned = statement
                 .query_map([&source_id.0], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .filter(|(_, file_hash, _)| !retained.contains(file_hash.as_str()))
-                .map(|(observation_id, _, payload_hash)| (observation_id, payload_hash))
-                .collect::<Vec<_>>();
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
             if orphaned.is_empty() {
                 return Ok(0);

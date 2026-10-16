@@ -29,7 +29,14 @@ pub(crate) fn scan_candidate_compatible_signatures(
 pub(crate) struct ScanFileReconciliation {
     pub(crate) pending_entries: Vec<ScanFileStateEntry>,
     pub(crate) compatible_entries_to_upgrade: Vec<ScanFileStateEntry>,
+    /// Tracked files no longer among the candidates. Their cache entries go, and
+    /// their records stay: a provider deleting or compressing a log does not
+    /// delete its history from the store.
     pub(crate) removed_entries: Vec<ScanFileStateEntry>,
+    /// The removed files read under another path this scan
+    /// ([`moved_scan_file_entries`]): their records are replaced like a changed
+    /// file's.
+    pub(crate) moved_entries: Vec<ScanFileStateEntry>,
 }
 
 pub(crate) fn select_scan_file_reconciliation(
@@ -58,11 +65,13 @@ pub(crate) fn select_scan_file_reconciliation(
     let removed_entries = tracked_entries
         .into_iter()
         .filter(|entry| !current_cache_keys.contains(entry.cache_key.as_str()))
-        .collect();
+        .collect::<Vec<_>>();
+    let moved_entries = moved_scan_file_entries(&removed_entries, file_cache_entries);
     Ok(ScanFileReconciliation {
         pending_entries: selection.pending_entries,
         compatible_entries_to_upgrade: selection.compatible_entries_to_upgrade,
         removed_entries,
+        moved_entries,
     })
 }
 
@@ -113,7 +122,12 @@ pub(crate) fn select_scan_file_entries(
     )
 }
 
-pub(crate) fn should_replace_source_records_for_scan(
+/// Whether this scan rereads every current file of the source and replaces their records.
+///
+/// Only `--replace` deletes the whole source first. Every other full reread -- `--no-cache`, a
+/// cache invalidation that leaves every file pending, or a source holding rows from before file
+/// hashes -- replaces records file by file, so the records of files that are gone survive it.
+pub(crate) fn should_reread_every_file(
     explicit_replace: bool,
     no_cache: bool,
     candidate_count: usize,
@@ -126,29 +140,15 @@ pub(crate) fn should_replace_source_records_for_scan(
         || (candidate_count > 0 && pending_count == candidate_count)
 }
 
-/// Whether this scan must delete every quota row the source owns before reinserting.
-///
-/// `--no-cache` used to be here. It reparses every file, so file-level reconciliation already
-/// covers everything it rewrites, and the only rows the file path could miss are those no current
-/// file accounts for -- which `delete_quota_observations_for_source_outside_file_hashes` retires
-/// directly. Deleting the whole source to reach them walked every observation, every window, and
-/// the payload table, and on a multi-gigabyte store that ran for tens of minutes. `--replace` keeps
-/// the blanket delete: it is documented as a destructive rebuild, and a caller asking for one is
-/// asking for exactly that.
-pub(crate) fn should_replace_all_source_quota_records(
-    explicit_replace: bool,
-    legacy_full_reconcile: bool,
-) -> bool {
-    explicit_replace || legacy_full_reconcile
-}
-
+/// The file hashes whose records a scan replaces: the files it read, and the
+/// files that moved to one of them.
 pub(crate) fn scan_file_hashes_for_reconciliation(
-    pending_entries: &[ScanFileStateEntry],
-    removed_entries: &[ScanFileStateEntry],
+    read_entries: &[ScanFileStateEntry],
+    moved_entries: &[ScanFileStateEntry],
 ) -> Vec<String> {
-    pending_entries
+    read_entries
         .iter()
-        .chain(removed_entries.iter())
+        .chain(moved_entries.iter())
         .map(|entry| hash_text(&entry.cache_key))
         .collect::<BTreeSet<_>>()
         .into_iter()

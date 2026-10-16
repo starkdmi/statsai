@@ -18,9 +18,9 @@ use statsai_core::{
     ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
-    derive_task_work_items, reconcile_verified_source_state, verified_source_observation_hash,
-    ActivityPersistMode, ActivityScanCursor, LocationIdentities, ScanFileStateEntry, Store,
-    TaskRebuildReport,
+    derive_task_work_items, moved_scan_file_entries, reconcile_verified_source_state,
+    verified_source_observation_hash, ActivityPersistMode, ActivityScanCursor, LocationIdentities,
+    ScanFileStateEntry, Store, TaskRebuildReport,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
@@ -155,6 +155,7 @@ pub(crate) fn scan_with_adapters(
             let pending_file_entries = file_reconciliation.pending_entries;
             let compatible_entries_to_upgrade = file_reconciliation.compatible_entries_to_upgrade;
             let removed_file_entries = file_reconciliation.removed_entries;
+            let moved_file_entries = file_reconciliation.moved_entries;
             let touched_files =
                 !pending_file_entries.is_empty() || !removed_file_entries.is_empty();
             let has_cache_entry_upgrades = !compatible_entries_to_upgrade.is_empty();
@@ -165,23 +166,27 @@ pub(crate) fn scan_with_adapters(
             // read. Timing them together attributed the query's cost to the filesystem.
             candidate_scan_duration_ms += candidate_scan_started_at.elapsed().as_millis() as u64;
             let legacy_reconcile_started_at = Instant::now();
+            // A file that is gone keeps its records, so only files read or moved
+            // call for the fuller reconcile.
             let needs_legacy_full_reconcile = !command.replace
                 && !command.no_cache
-                && touched_files
+                && (!pending_file_entries.is_empty() || !moved_file_entries.is_empty())
                 && !scan_all_current_files
                 && store.source_records_missing_scan_file_hashes(&source.source_id)?;
             legacy_check_duration_ms += legacy_reconcile_started_at.elapsed().as_millis() as u64;
-            let replace_source_records = should_replace_source_records_for_scan(
+            let reread_every_file = should_reread_every_file(
                 command.replace,
                 command.no_cache,
                 file_cache_entries.len(),
                 pending_file_entries.len(),
                 needs_legacy_full_reconcile,
             );
-            let replace_all_source_quota_records = should_replace_all_source_quota_records(
-                command.replace,
-                needs_legacy_full_reconcile,
-            );
+            // The files whose records this scan replaces, before the moved ones.
+            let reconciled_file_entries = if reread_every_file {
+                &file_cache_entries
+            } else {
+                &pending_file_entries
+            };
             let stored_activity_cursor = store.activity_scan_cursor(&source.source_id)?;
             let parser_revision_mismatch = stored_activity_cursor
                 .as_ref()
@@ -195,7 +200,7 @@ pub(crate) fn scan_with_adapters(
             } else {
                 command.replace || command.no_cache || parser_revision_mismatch
             };
-            let should_run_adapter_scan = if replace_source_records || activity_full_reconcile {
+            let should_run_adapter_scan = if reread_every_file || activity_full_reconcile {
                 !file_cache_entries.is_empty()
             } else {
                 !pending_file_entries.is_empty()
@@ -204,7 +209,7 @@ pub(crate) fn scan_with_adapters(
                 device_id: device_id.to_string(),
                 collect_tasks: command.include_tasks,
                 selected_cache_keys: (should_run_adapter_scan
-                    && !replace_source_records
+                    && !reread_every_file
                     && !command.no_cache
                     && !activity_full_reconcile)
                     .then(|| {
@@ -343,10 +348,10 @@ pub(crate) fn scan_with_adapters(
                         store,
                         SourceTaskChangeSet {
                             source_id: &source.source_id,
-                            replace_source_records,
-                            touched_files,
-                            pending_file_entries: &pending_file_entries,
-                            removed_file_entries: &removed_file_entries,
+                            replace_source_records: command.replace,
+                            touched_files: reread_every_file || touched_files,
+                            pending_file_entries: reconciled_file_entries,
+                            moved_file_entries: &moved_file_entries,
                             task_spans: &scan.task_spans,
                         },
                     )?;
@@ -414,7 +419,7 @@ pub(crate) fn scan_with_adapters(
                 let mut deleted_task_spans = Vec::new();
                 let mut deleted_event_ids = Vec::new();
                 let mut replaced_identities = LocationIdentities::default();
-                if replace_source_records {
+                if command.replace {
                     let delete_started_at = Instant::now();
                     let deleted_events =
                         store.delete_events_for_sources(std::slice::from_ref(&source.source_id))?;
@@ -423,11 +428,9 @@ pub(crate) fn scan_with_adapters(
                     replaced_identities.extend(deleted_events.replaced_identities);
                     removed_summary_count += store
                         .delete_summaries_for_sources(std::slice::from_ref(&source.source_id))?;
-                    if replace_all_source_quota_records {
-                        store.delete_quota_observations_for_sources(std::slice::from_ref(
-                            &source.source_id,
-                        ))?;
-                    }
+                    store.delete_quota_observations_for_sources(std::slice::from_ref(
+                        &source.source_id,
+                    ))?;
                     if command.include_tasks {
                         let deleted = store.delete_task_spans_for_sources(std::slice::from_ref(
                             &source.source_id,
@@ -438,11 +441,11 @@ pub(crate) fn scan_with_adapters(
                         deleted_task_spans.extend(deleted.deleted_spans);
                     }
                     delete_duration_ms += delete_started_at.elapsed().as_millis() as u64;
-                } else if touched_files {
+                } else if reread_every_file || touched_files {
                     let delete_started_at = Instant::now();
                     let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
-                        &pending_file_entries,
-                        &removed_file_entries,
+                        reconciled_file_entries,
+                        &moved_file_entries,
                     );
                     let deleted_events = store.delete_events_for_source_file_hashes(
                         &source.source_id,
@@ -455,10 +458,23 @@ pub(crate) fn scan_with_adapters(
                         &source.source_id,
                         &reconciled_file_hashes,
                     )?;
-                    store.delete_quota_observations_for_source_file_hashes(
-                        &source.source_id,
-                        &reconciled_file_hashes,
-                    )?;
+                    if needs_legacy_full_reconcile {
+                        let deleted_events =
+                            store.delete_events_without_source_file_hash(&source.source_id)?;
+                        removed_event_count += deleted_events.deleted;
+                        deleted_event_ids.extend(deleted_events.deleted_event_ids);
+                        replaced_identities.extend(deleted_events.replaced_identities);
+                        removed_summary_count +=
+                            store.delete_summaries_without_source_file_hash(&source.source_id)?;
+                    }
+                    // A full reread replaces quota rows after the insert instead,
+                    // so the rows it reads again unchanged are not rewritten.
+                    if !reread_every_file {
+                        store.delete_quota_observations_for_source_file_hashes(
+                            &source.source_id,
+                            &reconciled_file_hashes,
+                        )?;
+                    }
                     if command.include_tasks {
                         let deleted = store.delete_task_spans_for_source_file_hashes(
                             &source.source_id,
@@ -494,24 +510,20 @@ pub(crate) fn scan_with_adapters(
                     &insert_result.canonical_event_ids,
                 );
                 let quota_reconcile_started_at = Instant::now();
-                if replace_source_records && !replace_all_source_quota_records {
+                if reread_every_file && !command.replace {
                     let reconciled_file_hashes = scan_file_hashes_for_reconciliation(
                         &file_cache_entries,
-                        &removed_file_entries,
+                        &moved_file_entries,
                     );
                     store.replace_quota_observations_for_source_files(
                         &source.source_id,
                         &reconciled_file_hashes,
                         &scan.quota_observations,
                     )?;
-                    // Every file was rescanned, so anything still carrying a hash outside that set
-                    // belongs to a file that is gone, or predates file hashes entirely. Nothing
-                    // later in this scan revisits it, so it is retired here rather than surviving
-                    // as a row no source file explains.
-                    store.delete_quota_observations_for_source_outside_file_hashes(
-                        &source.source_id,
-                        &reconciled_file_hashes,
-                    )?;
+                    // Every file was reread, so a row with no file hash, stored before
+                    // hashes were recorded, is one no file can replace. A row of a file
+                    // that is gone keeps its hash, and stays.
+                    store.delete_quota_observations_without_source_file_hash(&source.source_id)?;
                 } else {
                     store.upsert_quota_observations(&scan.quota_observations)?;
                 }
@@ -519,19 +531,21 @@ pub(crate) fn scan_with_adapters(
                     quota_reconcile_started_at.elapsed().as_millis() as u64;
 
                 let activity_write_started_at = Instant::now();
+                let activity_every_file = reread_every_file || activity_full_reconcile;
                 let activity_mode = ActivityPersistMode::for_scan(
                     adapter.provider(),
-                    replace_source_records || activity_full_reconcile,
+                    command.replace,
+                    activity_every_file,
                 );
                 let reconciled_activity_hashes =
                     if matches!(activity_mode, ActivityPersistMode::ReplaceFiles) {
                         scan_file_hashes_for_reconciliation(
-                            if replace_source_records {
+                            if activity_every_file {
                                 &file_cache_entries
                             } else {
                                 &pending_file_entries
                             },
-                            &removed_file_entries,
+                            &moved_file_entries,
                         )
                     } else {
                         Vec::new()
@@ -601,7 +615,7 @@ pub(crate) fn scan_with_adapters(
                 }
 
                 let cache_write_started_at = Instant::now();
-                let cache_entries_to_record = if replace_source_records || command.no_cache {
+                let cache_entries_to_record = if reread_every_file {
                     &file_cache_entries
                 } else {
                     &pending_file_entries
