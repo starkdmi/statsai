@@ -625,6 +625,80 @@ fn a_move_retires_task_spans_even_when_tasks_are_not_collected() {
 }
 
 #[test]
+fn a_full_reread_replaces_task_spans_without_a_file_hash() {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "claude_code",
+        "test",
+        "0",
+        Path::new("/tmp/claude-hashless-spans"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let index = "/tmp/claude-hashless-spans/sessions-index.json";
+    let started_at = Utc
+        .with_ymd_and_hms(2026, 6, 12, 11, 0, 0)
+        .single()
+        .expect("started_at");
+    // An index entry with no transcript path: its span has no file hash, and
+    // its id follows the entry's `modified` time.
+    let scan = |span_id: &str, no_cache: bool| {
+        let event = test_scan_event(&source, index, started_at, "event", 100);
+        let mut span = test_task_span(
+            &source,
+            index,
+            started_at,
+            "span",
+            "Index the sessions",
+            &event,
+        );
+        span.span_id = statsai_core::TaskSpanId(span_id.to_string());
+        span.source_file_path_hash = None;
+        let adapter = TestAdapter {
+            provider: "claude_code",
+            discovered: vec![source.clone()],
+            candidates: vec![test_scan_candidate(index, "sig-1")],
+            scan_result: statsai_adapters::AdapterScan {
+                events: vec![event],
+                task_spans: vec![span],
+                ..statsai_adapters::AdapterScan::default()
+            },
+            probe_result: None,
+            scan_calls: None,
+        };
+        scan_with_adapters(
+            ScanCommand {
+                provider: None,
+                include_tasks: true,
+                preview: false,
+                no_cache,
+                replace: false,
+                verbose: false,
+                explain: false,
+            },
+            &store,
+            "device-test",
+            vec![Box::new(adapter)],
+        )
+        .expect("scan");
+    };
+
+    scan("span-modified-1", false);
+    // The entry's `modified` time changed; `--no-cache` rereads it.
+    scan("span-modified-2", true);
+
+    let spans = store.task_spans().expect("task spans");
+    assert_eq!(
+        spans
+            .iter()
+            .map(|span| span.span_id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["span-modified-2"]
+    );
+    assert_eq!(store.work_items().expect("work items").len(), 1);
+}
+
+#[test]
 fn partial_scan_with_legacy_rows_falls_back_to_full_source_reconcile() {
     let store = Store::in_memory().expect("store");
     let source = SourceLocation::local_adapter(

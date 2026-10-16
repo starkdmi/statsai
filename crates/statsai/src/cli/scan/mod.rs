@@ -489,11 +489,22 @@ pub(crate) fn scan_with_adapters(
                     } else {
                         scan_file_hashes_for_reconciliation(&[], &moved_file_entries)
                     };
+                    let mut deleted_by_scan = Vec::new();
                     if !task_span_file_hashes.is_empty() {
-                        let deleted = store.delete_task_spans_for_source_file_hashes(
+                        deleted_by_scan.push(store.delete_task_spans_for_source_file_hashes(
                             &source.source_id,
                             &task_span_file_hashes,
-                        )?;
+                        )?);
+                    }
+                    // Spans without a file hash name no file to replace them by,
+                    // so a full reread that collects tasks retires them and reads
+                    // them again.
+                    if command.include_tasks && reread_every_file {
+                        deleted_by_scan.push(
+                            store.delete_task_spans_without_source_file_hash(&source.source_id)?,
+                        );
+                    }
+                    for deleted in deleted_by_scan {
                         removed_task_span_count += deleted.deleted;
                         affected_project_buckets
                             .extend(deleted.affected_project_buckets.iter().cloned());

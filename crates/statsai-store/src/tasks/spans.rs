@@ -35,6 +35,44 @@ impl Store {
         })
     }
 
+    /// Deletes the source's task spans that carry no source file hash, such as
+    /// those of Claude Code index entries without a transcript path. No file can
+    /// be matched to them, so a scan that rereads every file replaces them this
+    /// way, as it does events without a hash.
+    pub fn delete_task_spans_without_source_file_hash(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<TaskDeletionImpact> {
+        self.with_immediate_transaction(|| {
+            let mut statement = self.conn.prepare(
+                r#"
+                SELECT span_id, project_bucket, started_at
+                FROM task_spans
+                WHERE source_id = ?1 AND COALESCE(source_file_path_hash, '') = ''
+                ORDER BY started_at, span_id
+                "#,
+            )?;
+            let rows = statement.query_map(params![&source_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut targets = Vec::new();
+            for row in rows {
+                let (span_id, project_bucket, started_at) = row?;
+                targets.push(DeletedTaskSpanRef {
+                    span_id: TaskSpanId(span_id),
+                    project_bucket,
+                    started_at: parse_rfc3339_utc(&started_at)?,
+                });
+            }
+            drop(statement);
+            self.delete_task_span_targets_in_tx(&targets)
+        })
+    }
+
     pub fn task_spans(&self) -> Result<Vec<TaskSpan>> {
         self.task_spans_by_sql(
             "SELECT payload FROM task_spans ORDER BY project_bucket, started_at, span_id",
