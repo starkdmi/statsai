@@ -334,11 +334,11 @@ pub(crate) fn codex_usage_root_for_file(root: &Path, path: &Path) -> PathBuf {
             return usage_root;
         }
     }
-    // A compressed rollout is listed under its canonical path, which a root
-    // reached through a symlink is not a prefix of.
-    if let Ok(canonical_root) = root.canonicalize() {
-        for child in ["sessions", "archived_sessions"] {
-            let usage_root = canonical_root.join(child);
+    // A compressed rollout is listed under its canonical path, which a usage
+    // folder reached through a symlink -- the root or the folder itself -- is
+    // not a prefix of, so each folder is resolved as a whole.
+    for child in ["sessions", "archived_sessions"] {
+        if let Ok(usage_root) = root.join(child).canonicalize() {
             if path.starts_with(&usage_root) {
                 return usage_root;
             }
