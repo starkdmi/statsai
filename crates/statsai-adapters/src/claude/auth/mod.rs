@@ -238,6 +238,10 @@ pub(crate) enum ClaudeAttribution {
 /// Identity inference and plan collection both go through this, so a gateway,
 /// API key, or cloud-provider switch can never suppress one but not the other.
 /// An unreadable or malformed settings file is ambiguous, not clear, and blocks.
+/// The one exception is a project's settings file that fails to open with
+/// `EPERM`, as every file in a folder macOS privacy settings protect does: it
+/// is left out of that project's settings instead, so a protected folder can't
+/// suppress attribution for the whole source.
 pub(crate) fn claude_durable_settings_attribution(
     root: &Path,
     settings_root: &Path,

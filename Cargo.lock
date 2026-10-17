@@ -2851,7 +2851,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "statsai"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2882,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-adapters"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -2895,6 +2895,7 @@ dependencies = [
  "serde_json",
  "statsai-core",
  "statsai-pricing",
+ "statsai-store",
  "tempfile",
  "url",
  "walkdir",
@@ -2902,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-core"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "base64",
  "chrono",
@@ -2920,7 +2921,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-daemon"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "ascii",
@@ -2942,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-dev"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2960,7 +2961,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-menubar"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "block2",
  "libc",
@@ -2979,7 +2980,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-pricing"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "statsai-core",
@@ -2987,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-privacy"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "nix 0.30.1",
@@ -3004,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-sdk"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3018,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-store"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -3039,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "statsai-sync"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "chrono",

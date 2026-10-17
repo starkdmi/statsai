@@ -30,3 +30,6 @@ walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Path only, so publishing drops it: tests check what the store does with an
+# observation, and the published crate must not depend on the store.
+statsai-store = { path = "../statsai-store" }

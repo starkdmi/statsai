@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Once;
 
 #[cfg(test)]
 pub(crate) fn claude_settings_have_auth_override(root: &Path) -> Option<bool> {
@@ -80,12 +81,16 @@ pub(crate) fn claude_source_settings_auth_override(
     for project_path in &project_paths {
         let mut effective_state = base_state.clone();
         for project_settings_root in claude_project_settings_roots(project_path) {
-            let project_settings = claude_settings_paths(&project_settings_root);
-            claude_apply_auth_override_settings_files(
-                &mut effective_state,
-                &project_settings,
-                false,
-            )?;
+            for path in claude_settings_paths(&project_settings_root) {
+                match claude_apply_auth_override_settings_file(&mut effective_state, &path, false) {
+                    Ok(()) => {}
+                    // Left out, not unknown; see claude_durable_settings_attribution.
+                    Err(ClaudeSettingsFileError::Denied(error)) => {
+                        note_denied_project_settings(&path, &error);
+                    }
+                    Err(ClaudeSettingsFileError::Unknown) => return None,
+                }
+            }
         }
         if effective_state.has_auth_override() {
             block = Some(merge_claude_auth_blocks(
@@ -237,26 +242,102 @@ pub(crate) fn claude_auth_override_state_from_files(
     Some(state)
 }
 
+/// Applies each settings file in `paths`, in order. Any file that exists but
+/// can't be read or parsed makes the result unknown.
 pub(crate) fn claude_apply_auth_override_settings_files(
     state: &mut ClaudeAuthOverrideState,
     paths: &[PathBuf],
     include_policy_helper: bool,
 ) -> Option<()> {
     for path in paths {
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return None,
-        };
-        let evidence_at = file
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .map(DateTime::<Utc>::from);
-        let settings: Value = serde_json::from_reader(BufReader::new(file)).ok()?;
-        state.apply(&settings, include_policy_helper, evidence_at);
+        claude_apply_auth_override_settings_file(state, path, include_policy_helper).ok()?;
     }
     Some(())
+}
+
+/// Why a settings file that may exist could not be applied.
+#[derive(Debug)]
+pub(crate) enum ClaudeSettingsFileError {
+    /// Opening it failed with `EPERM`, which macOS returns for any file in a
+    /// folder its privacy settings protect: nothing can be said about what it
+    /// holds, or even whether it exists.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Denied(std::io::Error),
+    /// Any other failure, `EACCES` from file modes and malformed JSON included.
+    Unknown,
+}
+
+/// Applies one settings file. A file that does not exist is skipped.
+pub(crate) fn claude_apply_auth_override_settings_file(
+    state: &mut ClaudeAuthOverrideState,
+    path: &Path,
+    include_policy_helper: bool,
+) -> Result<(), ClaudeSettingsFileError> {
+    let file = match open_claude_settings_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if claude_settings_open_blocked_by_privacy_setting(&error) => {
+            return Err(ClaudeSettingsFileError::Denied(error));
+        }
+        Err(_) => return Err(ClaudeSettingsFileError::Unknown),
+    };
+    let evidence_at = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(DateTime::<Utc>::from);
+    let settings: Value = serde_json::from_reader(BufReader::new(file))
+        .map_err(|_| ClaudeSettingsFileError::Unknown)?;
+    state.apply(&settings, include_policy_helper, evidence_at);
+    Ok(())
+}
+
+/// Rust reports both `EPERM` and `EACCES` as `PermissionDenied`, but only
+/// `EPERM` is a privacy setting: `EACCES` comes from file modes, such as another
+/// user's settings file, and says the file is there.
+#[cfg(unix)]
+fn claude_settings_open_blocked_by_privacy_setting(error: &std::io::Error) -> bool {
+    const EPERM: i32 = 1;
+    error.raw_os_error() == Some(EPERM)
+}
+
+/// Other systems have no error only a privacy setting returns: Windows gives
+/// `ERROR_ACCESS_DENIED` for file permissions, a directory path, and a file
+/// being replaced alike.
+#[cfg(not(unix))]
+fn claude_settings_open_blocked_by_privacy_setting(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn open_claude_settings_file(path: &Path) -> std::io::Result<File> {
+    #[cfg(all(test, unix))]
+    if let Some(error) = test_support::injected_open_error(path) {
+        return Err(error);
+    }
+    File::open(path)
+}
+
+static NOTED_DENIED_PROJECT_SETTINGS: Once = Once::new();
+
+/// Reports the first project settings file a privacy setting kept the scan
+/// from reading, once per process: a protected folder denies every path in
+/// it, so each project there would otherwise warn on every scan and daemon pass.
+fn note_denied_project_settings(path: &Path, error: &std::io::Error) {
+    NOTED_DENIED_PROJECT_SETTINGS.call_once(|| {
+        eprintln!(
+            "warning: can't read Claude Code project settings {} ({error}), and \
+             other project folders may be affected too; account attribution \
+             leaves such files out, so if one selects another credential that \
+             project's sessions get the source's account. Let StatsAI read the \
+             folder, or use manual_only verification.",
+            path.display()
+        );
+    });
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn claude_denied_project_settings_noted() -> bool {
+    NOTED_DENIED_PROJECT_SETTINGS.is_completed()
 }
 
 #[cfg(test)]
@@ -326,4 +407,58 @@ pub(crate) fn claude_base_url_is_non_default(value: &Value) -> bool {
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
+}
+
+/// Lets tests make opening chosen settings files fail. Tests run as root in
+/// some environments, where file modes cannot produce a permission error.
+#[cfg(all(test, unix))]
+pub(crate) mod test_support {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    /// What macOS returns for a folder its privacy settings protect.
+    pub(crate) const EPERM: i32 = 1;
+    /// What file modes return.
+    pub(crate) const EACCES: i32 = 13;
+
+    thread_local! {
+        static DENIED: RefCell<Vec<(PathBuf, i32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Opening `path` on this thread fails until the guard is dropped.
+    #[must_use = "the denial lasts only while the guard is held"]
+    pub(crate) struct DenySettingsRead(PathBuf);
+
+    impl DenySettingsRead {
+        /// Fails with `EPERM`, as if a privacy setting protected the folder.
+        pub(crate) fn new(path: &Path) -> Self {
+            Self::with_errno(path, EPERM)
+        }
+
+        pub(crate) fn with_errno(path: &Path, errno: i32) -> Self {
+            DENIED.with(|denied| denied.borrow_mut().push((path.to_path_buf(), errno)));
+            Self(path.to_path_buf())
+        }
+    }
+
+    impl Drop for DenySettingsRead {
+        fn drop(&mut self) {
+            DENIED.with(|denied| {
+                let mut denied = denied.borrow_mut();
+                if let Some(index) = denied.iter().position(|(path, _)| *path == self.0) {
+                    denied.remove(index);
+                }
+            });
+        }
+    }
+
+    pub(super) fn injected_open_error(path: &Path) -> Option<std::io::Error> {
+        DENIED.with(|denied| {
+            denied
+                .borrow()
+                .iter()
+                .find(|(denied, _)| denied == path)
+                .map(|(_, errno)| std::io::Error::from_raw_os_error(*errno))
+        })
+    }
 }
