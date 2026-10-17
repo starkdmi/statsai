@@ -5,7 +5,8 @@ name: Claude review status
 # status writes are refused, so this workflow is the only writer of that
 # context.
 #
-# - A new summary comment from `hexnyl` that starts with
+# - A new summary comment from an owner account (`hexnyl` or `starkdmi`)
+#   that starts with
 #   `<!-- claude-review round=N sha=<head> verdict=pass|fail -->` sets success
 #   or failure on the PR head, but only when the marker's SHA is the current
 #   head. Edited comments are ignored, so a verdict cannot be changed after
@@ -50,7 +51,8 @@ jobs:
     if: >-
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
-      github.event.comment.user.login == 'hexnyl' &&
+      (github.event.comment.user.login == 'hexnyl' ||
+        github.event.comment.user.login == 'starkdmi') &&
       startsWith(github.event.comment.body, '<!-- claude-review')
     runs-on: ubuntu-latest
     concurrency:
