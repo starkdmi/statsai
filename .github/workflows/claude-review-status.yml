@@ -8,10 +8,10 @@ name: Claude review status
 # - A new summary comment from a maintainer account (`hexnyl` or `starkdmi`)
 #   that starts with
 #   `<!-- claude-review round=N sha=<head> verdict=pass|fail -->` sets success
-#   or failure on the PR head, but only when the marker's SHA is the current
-#   head. Edited comments are ignored, so a verdict cannot be changed after
-#   the fact. No verdict in the marker counts as failure; that is what the
-#   round-cap comment looks like.
+#   or failure on the PR head, but only when the marker's SHA is the full
+#   40-character SHA of the current head. Edited comments are ignored, so a
+#   verdict cannot be changed after the fact. No verdict in the marker counts
+#   as failure; that is what the round-cap comment looks like.
 # - Every push to a PR resets the status to pending, so a stale pass cannot
 #   carry over to commits the routine has not seen. This runs on
 #   `pull_request_target`, i.e. from the base branch's copy of this file, so a
@@ -74,8 +74,10 @@ jobs:
               [...marker[1].matchAll(/(\w+)=([^\s]+)/g)].map(m => [m[1], m[2].toLowerCase()])
             );
 
-            if (!/^[0-9a-f]{7,40}$/.test(attrs.sha || '')) {
-              core.notice(`Marker SHA "${attrs.sha ?? ''}" is not a hex SHA; leaving status as is.`);
+            // A full SHA, compared for equality: a short prefix could match a
+            // different commit pushed after the review.
+            if (!/^[0-9a-f]{40}$/.test(attrs.sha || '')) {
+              core.notice(`Marker SHA "${attrs.sha ?? ''}" is not a full 40-character SHA; leaving status as is.`);
               return;
             }
 
@@ -84,7 +86,7 @@ jobs:
               repo: context.repo.repo,
               pull_number: context.payload.issue.number,
             });
-            if (!pr.head.sha.startsWith(attrs.sha)) {
+            if (pr.head.sha !== attrs.sha) {
               core.notice(`Summary is for ${attrs.sha}, PR head is ${pr.head.sha}; a newer push already reset the status.`);
               return;
             }
