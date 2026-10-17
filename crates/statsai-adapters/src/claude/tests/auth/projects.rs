@@ -661,3 +661,255 @@ fn project_path_memo_does_not_remember_a_read_it_could_not_complete() {
         "the next probe reads for itself rather than inheriting the failure"
     );
 }
+
+/// A Claude config root with a cached OAuth profile and one session index per
+/// workspace, each workspace holding a harmless `.claude/settings.local.json`.
+/// Returns the root and each workspace's settings file.
+fn claude_root_with_project_settings(dir: &Path, workspaces: &[&str]) -> (PathBuf, Vec<PathBuf>) {
+    let root = dir.join("claude-config");
+    std::fs::create_dir_all(&root).expect("config root");
+    std::fs::write(
+        root.join(".claude.json"),
+        serde_json::json!({
+            "oauthAccount": {
+                "accountUuid": "cached-account",
+                "emailAddress": "cached@example.com",
+                "profileFetchedAt": 1_786_104_000_000_i64,
+                "organizationType": "claude_max",
+                "organizationRateLimitTier": "default_claude_max_5x"
+            }
+        })
+        .to_string(),
+    )
+    .expect("claude profile");
+    let mut settings_paths = Vec::new();
+    for name in workspaces {
+        let project_store = root.join("projects").join(name);
+        let workspace = dir.join(name);
+        let settings_path = workspace.join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::create_dir_all(workspace.join(".claude")).expect("project settings directory");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            serde_json::json!({
+                "version": 1,
+                "originalPath": workspace,
+                "entries": []
+            })
+            .to_string(),
+        )
+        .expect("session index");
+        std::fs::write(&settings_path, r#"{"permissions":{"allow":[]}}"#)
+            .expect("project settings");
+        settings_paths.push(settings_path);
+    }
+    (root, settings_paths)
+}
+
+#[test]
+fn claude_unreadable_project_settings_do_not_block_the_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) =
+        claude_root_with_project_settings(dir.path(), &["denied-workspace", "readable-workspace"]);
+    let _deny = test_support::DenySettingsRead::new(&settings_paths[0]);
+
+    let observation =
+        claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+    let VerifiedSourceObservation::Inferred {
+        identity: state, ..
+    } = observation
+    else {
+        panic!("a project settings file the scan may not open must not block the source: {observation:?}");
+    };
+    assert_eq!(state.provider_user_id.as_deref(), Some("cached-account"));
+    assert!(claude_denied_project_settings_noted(&settings_paths[0]));
+    assert!(!claude_denied_project_settings_noted(&settings_paths[1]));
+    // Plan evidence goes through the same settings check.
+    let source = SourceLocation::local_adapter(
+        crate::CLAUDE_CODE_PROVIDER,
+        "claude-code-local-jsonl",
+        "0",
+        &root,
+        LocationOrigin::Configured,
+    );
+    let evidence = collect_claude_account_evidence_with_probe_context(
+        &source,
+        &root,
+        &LocationOrigin::Configured,
+        None,
+    );
+    assert_eq!(evidence.plan_observations.len(), 1);
+    assert_eq!(evidence.plan_observations[0].plan_name, "Max 5x");
+}
+
+#[test]
+fn claude_readable_override_still_blocks_beside_unreadable_project_settings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) = claude_root_with_project_settings(dir.path(), &["workspace"]);
+    let shared_settings = settings_paths[0].with_file_name("settings.json");
+    std::fs::write(
+        &shared_settings,
+        serde_json::json!({
+            "env": {"ANTHROPIC_API_KEY": "project-api-key"}
+        })
+        .to_string(),
+    )
+    .expect("project settings");
+    let _deny = test_support::DenySettingsRead::new(&settings_paths[0]);
+
+    let observation =
+        claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+    assert_eq!(
+        observation,
+        VerifiedSourceObservation::AttributionBlocked {
+            blocked_since: file_modified_at(&shared_settings),
+        }
+    );
+}
+
+#[test]
+fn claude_unreadable_user_settings_still_block_the_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, _) = claude_root_with_project_settings(dir.path(), &["workspace"]);
+    let user_settings = root.join("settings.json");
+    std::fs::write(&user_settings, r#"{"theme":"dark"}"#).expect("user settings");
+    let _deny = test_support::DenySettingsRead::new(&user_settings);
+
+    let observation =
+        claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+    assert_eq!(
+        observation,
+        VerifiedSourceObservation::AttributionBlocked {
+            blocked_since: None
+        }
+    );
+}
+
+fn api_key_settings() -> String {
+    serde_json::json!({
+        "env": {"ANTHROPIC_API_KEY": "project-api-key"}
+    })
+    .to_string()
+}
+
+#[test]
+fn claude_override_after_unreadable_settings_in_the_same_project_still_blocks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) = claude_root_with_project_settings(dir.path(), &["workspace"]);
+    let local_settings = &settings_paths[0];
+    let shared_settings = local_settings.with_file_name("settings.json");
+    std::fs::write(&shared_settings, r#"{"permissions":{"allow":[]}}"#).expect("project settings");
+    std::fs::write(local_settings, api_key_settings()).expect("project settings");
+    // settings.json is applied first, so the override comes after the denial.
+    let _deny = test_support::DenySettingsRead::new(&shared_settings);
+
+    let observation =
+        claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+    assert_eq!(
+        observation,
+        VerifiedSourceObservation::AttributionBlocked {
+            blocked_since: file_modified_at(local_settings),
+        }
+    );
+}
+
+#[test]
+fn claude_nested_project_override_still_blocks_beside_unreadable_repository_settings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) = claude_root_with_project_settings(dir.path(), &["workspace"]);
+    let repository = dir.path().join("workspace");
+    let nested_project = repository.join("crates").join("app");
+    let nested_settings = nested_project.join(".claude").join("settings.json");
+    std::fs::create_dir_all(repository.join(".git")).expect("git directory");
+    std::fs::create_dir_all(nested_settings.parent().expect("parent"))
+        .expect("nested settings directory");
+    std::fs::write(&nested_settings, api_key_settings()).expect("nested settings");
+    std::fs::write(
+        root.join("projects")
+            .join("workspace")
+            .join("sessions-index.json"),
+        serde_json::json!({
+            "version": 1,
+            "originalPath": nested_project,
+            "entries": []
+        })
+        .to_string(),
+    )
+    .expect("session index");
+    // The repository root's settings are applied before the nested project's.
+    let _deny = test_support::DenySettingsRead::new(&settings_paths[0]);
+
+    let observation =
+        claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+    assert_eq!(
+        observation,
+        VerifiedSourceObservation::AttributionBlocked {
+            blocked_since: file_modified_at(&nested_settings),
+        }
+    );
+}
+
+#[test]
+fn claude_other_projects_override_still_blocks_beside_unreadable_project_settings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) =
+        claude_root_with_project_settings(dir.path(), &["denied-workspace", "override-workspace"]);
+    std::fs::write(&settings_paths[1], api_key_settings()).expect("project settings");
+    let _deny = test_support::DenySettingsRead::new(&settings_paths[0]);
+
+    // Projects are checked in hash-map order, which changes from probe to
+    // probe, so repeat until the denied project has very likely come first.
+    for _ in 0..16 {
+        let observation =
+            claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+        assert_eq!(
+            observation,
+            VerifiedSourceObservation::AttributionBlocked {
+                blocked_since: file_modified_at(&settings_paths[1]),
+            }
+        );
+    }
+}
+
+#[test]
+fn claude_unreadable_project_settings_keep_the_sources_verified_assignment() {
+    use statsai_store::{reconcile_verified_source_state, verified_source_observation_hash, Store};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) =
+        claude_root_with_project_settings(dir.path(), &["denied-workspace", "readable-workspace"]);
+    let store = Store::in_memory().expect("store");
+    let mut source = SourceLocation::local_adapter(
+        crate::CLAUDE_CODE_PROVIDER,
+        "claude-code-local-jsonl",
+        "0",
+        &root,
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    let reconcile = |source: &mut SourceLocation| {
+        let observation =
+            claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+        let hash = verified_source_observation_hash(&observation).expect("observation hash");
+        reconcile_verified_source_state(&store, source, &observation, hash).expect("reconcile");
+        store
+            .list_source_account_assignments_for_source(&source.source_id)
+            .expect("assignments")
+    };
+
+    let assignments = reconcile(&mut source);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].ended_at, None);
+
+    // The system stops letting scans into one project's folder.
+    let _deny = test_support::DenySettingsRead::new(&settings_paths[0]);
+    let after_denial = reconcile(&mut source);
+
+    assert_eq!(after_denial, assignments);
+}

@@ -2895,6 +2895,7 @@ dependencies = [
  "serde_json",
  "statsai-core",
  "statsai-pricing",
+ "statsai-store",
  "tempfile",
  "url",
  "walkdir",
