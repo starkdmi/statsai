@@ -5,7 +5,7 @@ name: Claude review status
 # status writes are refused, so this workflow is the only writer of that
 # context.
 #
-# - A new summary comment from an owner account (`hexnyl` or `starkdmi`)
+# - A new summary comment from a maintainer account (`hexnyl` or `starkdmi`)
 #   that starts with
 #   `<!-- claude-review round=N sha=<head> verdict=pass|fail -->` sets success
 #   or failure on the PR head, but only when the marker's SHA is the current
