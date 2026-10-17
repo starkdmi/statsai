@@ -79,11 +79,11 @@ jobs:
               return;
             }
 
-            const verdict = (body.match(/\*\*Verdict\*\*:?\s*`?(pass|fail)`?/i) || [])[1];
+            const verdict = (body.match(/\*\*Verdict:?\*\*:?\s*`?(pass|fail)`?/i) || [])[1];
             const state = verdict && verdict.toLowerCase() === 'pass' ? 'success' : 'failure';
             const round = attrs.round ? `round ${attrs.round}: ` : '';
-            const firstLine = (body.split('\n').find(l => /\*\*Verdict\*\*/.test(l)) || '')
-              .replace(/\*\*Verdict\*\*:?\s*/i, '').replace(/[`*]/g, '').trim();
+            const firstLine = (body.split('\n').find(l => /\*\*Verdict:?\*\*/.test(l)) || '')
+              .replace(/\*\*Verdict:?\*\*:?\s*/i, '').replace(/[`*]/g, '').trim();
             const description = (round + (firstLine || (verdict ? verdict : 'no verdict in summary; needs a human'))).slice(0, 140);
 
             await github.rest.repos.createCommitStatus({
