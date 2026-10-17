@@ -1,12 +1,35 @@
 # Agent instructions
 
-Rust workspace for the StatsAI CLI, daemon, menubar app, SDK and sync crates.
-The toolchain is pinned in `rust-toolchain.toml`; CI runs
-`./scripts/rust-ci.sh fmt`, `clippy` and `test` on macOS and Linux.
+Rust workspace, 11 crates under `crates/`. The toolchain is pinned in
+`rust-toolchain.toml`; CI runs `./scripts/rust-ci.sh fmt`, `clippy` and `test`
+on macOS and Linux.
 
-Run `./scripts/rust-ci.sh full` before pushing. `scripts/install-git-hooks.sh`
-installs pre-commit and pre-push hooks that do this for you; set
-`STATSAI_SKIP_LOCAL_CI=1` only when you have just run the suite yourself.
+## Verification
+
+- Per crate: `cargo fmt -p <crate>`, `cargo clippy -p <crate> --all-targets -- -D warnings`,
+  `cargo test -p <crate>`.
+- Workspace, before any push: `./scripts/rust-ci.sh full`.
+- `statsai-daemon` has a `watch` feature. `rust-ci.sh` covers it; in the
+  per-crate loop also run clippy and test for `statsai-daemon` with
+  `--features watch`.
+- Never `cargo fmt --all`: it touches files other agents are editing. Use
+  `-p <crate>`.
+- `scripts/install-git-hooks.sh` installs pre-commit and pre-push hooks that run
+  workspace fmt, clippy and the test suite. During parallel refactors, set
+  `STATSAI_SKIP_LOCAL_CI=1` on subagent commits and let the parent run full CI
+  at wave ends; otherwise leave the hooks on.
+
+## This repository is public
+
+Everything that reaches `origin` is permanent and world-readable, pull request
+branches included. Before every push, read the diff and the commit messages for
+anything that identifies a person or a machine: names, emails, usernames in
+paths (`/Users/<name>/...`), hostnames, tokens, API keys, private project or
+customer names, local fixture data. Replace it or do not push. When in doubt,
+commit locally and leave the push to the repository owner.
+
+Commit messages carry no AI attribution trailers (no `Co-authored-by:` or
+session lines for an agent).
 
 ## Main branch
 
@@ -27,7 +50,9 @@ Pull requests are reviewed by agents with distinct jobs. Keep them distinct:
   `[should-fix]` or `[nit]`, plus one summary comment that starts with a hidden
   `<!-- claude-review round=N … -->` marker. It removes the `claude:re-review`
   label when a round starts, so the label can be added again later. It never
-  pushes.
+  pushes. The `claude/review` commit status is set from that summary by
+  `.github/workflows/claude-review-status.yml`, and reset to pending on every
+  new push.
 - **The agent addressing review** (Claude auto-fix, or whoever is asked to) is
   the only agent that pushes to the pull request branch.
 
