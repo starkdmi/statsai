@@ -62,6 +62,10 @@ fn format_task_list_item_appends_review_reasons_when_present() {
     work_item.review_reasons.clear();
     let clean_line = format_task_list_item(&work_item);
     assert!(!clean_line.contains("review="));
+
+    work_item.title = "Fix \u{1b}]0;pwned\u{7}login".to_string();
+    let escaped_line = format_task_list_item(&work_item);
+    assert!(escaped_line.ends_with("title=Fix \\u{1b}]0;pwned\\u{7}login"));
 }
 
 #[test]
@@ -127,4 +131,47 @@ fn subscription_json_value_preserves_major_unit_price() {
 
     assert_eq!(value["price"], json!(20.0));
     assert_eq!(value["price_cents"], json!(2000));
+}
+
+#[test]
+fn terminal_safe_leaves_ordinary_text_untouched() {
+    let text = "line one\n\tindented — ünïcödé ✓";
+
+    assert!(matches!(terminal_safe(text), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(terminal_safe(text), text);
+}
+
+#[test]
+fn terminal_safe_keeps_crlf_line_endings() {
+    let text = "a\r\nb";
+
+    assert!(matches!(terminal_safe(text), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(terminal_safe(text), text);
+    assert_eq!(terminal_safe("x\r\r\ny\r"), "x\\u{d}\r\ny\\u{d}");
+}
+
+#[test]
+fn terminal_safe_escapes_control_characters() {
+    assert_eq!(
+        terminal_safe("a\u{1b}]52;c;cHdu\u{7}b\u{1b}[2Jc"),
+        "a\\u{1b}]52;c;cHdu\\u{7}b\\u{1b}[2Jc"
+    );
+    assert_eq!(terminal_safe("x\ry"), "x\\u{d}y");
+    assert_eq!(terminal_safe("\u{0}\u{7f}"), "\\u{0}\\u{7f}");
+    assert_eq!(terminal_safe("\u{9b}31m\u{85}"), "\\u{9b}31m\\u{85}");
+}
+
+#[test]
+fn terminal_safe_escapes_bidi_controls() {
+    assert_eq!(
+        terminal_safe("ok \u{202e}txt.exe\u{202c}"),
+        "ok \\u{202e}txt.exe\\u{202c}"
+    );
+    assert_eq!(
+        terminal_safe("\u{2066}a\u{2069}\u{202a}"),
+        "\\u{2066}a\\u{2069}\\u{202a}"
+    );
+    // Joiners shape emoji and scripts, so they are not escaped.
+    let text = "👩\u{200d}💻 مرحبا";
+    assert!(matches!(terminal_safe(text), std::borrow::Cow::Borrowed(_)));
 }

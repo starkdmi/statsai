@@ -57,7 +57,9 @@ pub fn background_service_state() -> Result<BackgroundServiceState> {
     let domain = gui_domain()?;
     let launch_agent_loaded = launch_agent_loaded_in(&domain);
     let daemon_reachable = daemon_reachable_at(DAEMON_LOOPBACK_ADDRESS);
-    let daemon_version = daemon_health(DAEMON_LOOPBACK_ADDRESS).and_then(|health| health.version);
+    let daemon_version = daemon_health(DAEMON_LOOPBACK_ADDRESS)
+        .and_then(|health| health.version)
+        .filter(|version| is_version_shaped(version));
     let stale = daemon_is_stale(
         launch_agent_loaded,
         daemon_reachable,
@@ -301,6 +303,18 @@ struct DaemonHealth {
     version: Option<String>,
 }
 
+// Whatever listens on the loopback port answers /health, so its version is
+// untrusted: keep it only when it looks like a version, never terminal escapes.
+// Built everywhere so its tests run on every CI platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_version_shaped(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
+}
+
 #[cfg(target_os = "macos")]
 fn daemon_health(api: &str) -> Option<DaemonHealth> {
     let response = ureq::get(&format!("http://{api}/health"))
@@ -316,10 +330,11 @@ fn daemon_health(api: &str) -> Option<DaemonHealth> {
     .ok()
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn loaded_legacy_daemon_without_version_is_stale() {
         assert!(daemon_is_stale(true, true, None));
@@ -329,5 +344,17 @@ mod tests {
             Some(env!("CARGO_PKG_VERSION"))
         ));
         assert!(!daemon_is_stale(true, false, None));
+    }
+
+    #[test]
+    fn daemon_version_must_be_version_shaped() {
+        assert!(is_version_shaped(env!("CARGO_PKG_VERSION")));
+        assert!(is_version_shaped("1.2.3-beta.1+build.5"));
+        assert!(!is_version_shaped(""));
+        assert!(!is_version_shaped("1.0\u{1b}]0;title\u{7}"));
+        assert!(!is_version_shaped("\u{1b}[2J"));
+        assert!(!is_version_shaped("1.0 extra"));
+        assert!(!is_version_shaped("1.0_beta"));
+        assert!(!is_version_shaped(&"1".repeat(65)));
     }
 }

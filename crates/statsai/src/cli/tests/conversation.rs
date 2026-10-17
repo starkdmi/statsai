@@ -274,3 +274,18 @@ fn archive_group_parsing_stops_before_holding_too_much_content() {
         scans.len()
     );
 }
+
+#[test]
+fn search_preview_is_escaped_before_it_is_truncated() {
+    let hit = "\u{1b}".repeat(500);
+
+    let preview = compact_archive_preview(&hit, 220);
+
+    assert_eq!(preview.chars().count(), 223);
+    assert!(preview.ends_with("..."));
+    assert!(!preview.contains('\u{1b}'));
+    assert_eq!(
+        compact_archive_preview("a\u{1b}[2J\r\nb", 220),
+        "a\\u{1b}[2J b"
+    );
+}

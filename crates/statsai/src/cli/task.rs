@@ -9,7 +9,7 @@ use statsai_store::Store;
 use std::collections::{BTreeSet, HashSet};
 
 use super::args::{TaskCommand, TaskSubcommand, TaskVerifySubcommand};
-use super::format::format_u64;
+use super::format::{format_u64, terminal_safe};
 
 pub(crate) fn task(command: TaskCommand, store: &Store) -> Result<()> {
     match command.command {
@@ -71,21 +71,21 @@ pub(crate) fn task(command: TaskCommand, store: &Store) -> Result<()> {
                     for verification in &output.verifications {
                         println!(
                             "  verification={} updated_at={}",
-                            format_task_verification(verification),
+                            terminal_safe(&format_task_verification(verification)),
                             verification.updated_at.to_rfc3339()
                         );
                     }
                     for span in output.spans {
                         println!(
                             "  span={} provider={} start={} end={} tokens={} title={}",
-                            span.span_id.0,
-                            span.provider,
+                            terminal_safe(&span.span_id.0),
+                            terminal_safe(&span.provider),
                             span.started_at.to_rfc3339(),
                             span.ended_at
                                 .map(|value| value.to_rfc3339())
                                 .unwrap_or_else(|| "open".to_string()),
                             format_u64(span.usage.computed_total()),
-                            span.title
+                            terminal_safe(&span.title)
                         );
                         let repo_label = span
                             .project
@@ -101,18 +101,18 @@ pub(crate) fn task(command: TaskCommand, store: &Store) -> Result<()> {
                         let thread_id = span.thread_id.as_deref().unwrap_or("-");
                         println!(
                             "    repo={} branch={} session={} thread={} issues={}",
-                            repo_label,
-                            branch_label,
-                            session_id,
-                            thread_id,
+                            terminal_safe(repo_label),
+                            terminal_safe(branch_label),
+                            terminal_safe(session_id),
+                            terminal_safe(thread_id),
                             if span.issue_keys.is_empty() {
                                 "-".to_string()
                             } else {
-                                span.issue_keys.join(",")
+                                terminal_safe(&span.issue_keys.join(",")).into_owned()
                             }
                         );
                         if let Some(summary_preview) = span.summary_preview.as_deref() {
-                            println!("    summary_preview={summary_preview}");
+                            println!("    summary_preview={}", terminal_safe(summary_preview));
                         }
                     }
                 }
@@ -536,18 +536,18 @@ pub(crate) fn parse_task_verdict(value: &str) -> Result<TaskVerdict> {
 pub(crate) fn print_work_item(work_item: &WorkItem) {
     println!(
         "{} status={:?} confidence={:?} spans={} events={} tokens={} providers={} title={}",
-        work_item.work_item_id.0,
+        terminal_safe(&work_item.work_item_id.0),
         work_item.status,
         work_item.confidence,
         work_item.span_count,
         work_item.event_count,
         format_u64(work_item.total_tokens),
-        work_item.providers.join(","),
-        work_item.title
+        terminal_safe(&work_item.providers.join(",")),
+        terminal_safe(&work_item.title)
     );
     println!(
         "  project_bucket={} started_at={} ended_at={} no_git={} cross_provider={}",
-        work_item.project_bucket,
+        terminal_safe(&work_item.project_bucket),
         work_item.started_at.to_rfc3339(),
         work_item.ended_at.to_rfc3339(),
         work_item.no_git,
@@ -567,13 +567,13 @@ pub(crate) fn print_work_item(work_item: &WorkItem) {
 pub(crate) fn format_task_list_item(work_item: &WorkItem) -> String {
     let mut line = format!(
         "{} status={:?} confidence={:?} spans={} tokens={} providers={} title={}",
-        work_item.work_item_id.0,
+        terminal_safe(&work_item.work_item_id.0),
         work_item.status,
         work_item.confidence,
         work_item.span_count,
         format_u64(work_item.total_tokens),
-        work_item.providers.join(","),
-        work_item.title
+        terminal_safe(&work_item.providers.join(",")),
+        terminal_safe(&work_item.title)
     );
     if !work_item.review_reasons.is_empty() {
         line.push_str(" review=");

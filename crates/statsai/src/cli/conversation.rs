@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use super::args::{ConversationCommand, ConversationSubcommand};
-use super::format::format_u64;
+use super::format::{format_u64, terminal_safe};
 use super::scan::{scan_file_state_entries, scan_sources_for_adapter};
 use super::source::{canonical_provider_name, preview_path_label};
 
@@ -41,11 +41,11 @@ pub(crate) fn conversation(
                 for conversation in conversations {
                     println!(
                         "{:<29} {:<13} {:>8} {:>10}  {}{}",
-                        conversation.conversation_id,
-                        conversation.provider,
+                        terminal_safe(&conversation.conversation_id),
+                        terminal_safe(&conversation.provider),
                         format_u64(conversation.item_count),
                         format_u64(conversation.content_bytes),
-                        conversation.title.as_deref().unwrap_or("(untitled)"),
+                        terminal_safe(conversation.title.as_deref().unwrap_or("(untitled)")),
                         if conversation.missing_content_count > 0 {
                             " [partial]"
                         } else {
@@ -81,9 +81,9 @@ pub(crate) fn conversation(
                     let preview = compact_archive_preview(&hit.text, 220);
                     println!(
                         "{}  {}  {}\n  {}",
-                        hit.conversation_id,
-                        hit.role.as_deref().unwrap_or("unknown"),
-                        hit.title.as_deref().unwrap_or("(untitled)"),
+                        terminal_safe(&hit.conversation_id),
+                        terminal_safe(hit.role.as_deref().unwrap_or("unknown")),
+                        terminal_safe(hit.title.as_deref().unwrap_or("(untitled)")),
                         preview
                     );
                 }
@@ -548,15 +548,17 @@ pub(crate) fn canonical_conversation_provider_filter(
 fn print_archive_conversation(conversation: &ArchiveConversation) {
     println!(
         "{} ({})",
-        conversation
-            .title
-            .as_deref()
-            .unwrap_or("Untitled conversation"),
-        conversation.conversation_id
+        terminal_safe(
+            conversation
+                .title
+                .as_deref()
+                .unwrap_or("Untitled conversation")
+        ),
+        terminal_safe(&conversation.conversation_id)
     );
     println!(
         "provider={} items={} completeness={:?} missing={}",
-        conversation.provider,
+        terminal_safe(&conversation.provider),
         conversation.items.len(),
         conversation.completeness,
         conversation.missing_content_count
@@ -573,24 +575,30 @@ fn print_archive_conversation(conversation: &ArchiveConversation) {
                 .unwrap_or_default(),
             item.tool_name
                 .as_deref()
-                .map(|name| format!(" {name}"))
+                .map(|name| format!(" {}", terminal_safe(name)))
                 .unwrap_or_default()
         );
         for part in &item.parts {
             if let Some(text) = part.text.as_deref() {
-                println!("{text}");
+                println!("{}", terminal_safe(text));
             } else if part.data_base64.is_some() {
                 println!(
                     "[{} {} {} bytes sha256={}]",
                     part.kind.as_str(),
-                    part.mime_type
-                        .as_deref()
-                        .unwrap_or("application/octet-stream"),
+                    terminal_safe(
+                        part.mime_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream")
+                    ),
                     part.original_bytes,
                     part.content_hash
                 );
             } else if let Some(uri) = part.external_uri.as_deref() {
-                println!("[missing {} artifact: {uri}]", part.kind.as_str());
+                println!(
+                    "[missing {} artifact: {}]",
+                    part.kind.as_str(),
+                    terminal_safe(uri)
+                );
             }
         }
     }
@@ -641,8 +649,11 @@ fn print_archive_markdown(conversation: &ArchiveConversation) {
     }
 }
 
-fn compact_archive_preview(value: &str, max_chars: usize) -> String {
+// Escapes before it truncates, so the preview stays within `max_chars` however
+// many control characters the hit holds.
+pub(crate) fn compact_archive_preview(value: &str, max_chars: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = terminal_safe(&compact).into_owned();
     if compact.chars().count() <= max_chars {
         return compact;
     }
