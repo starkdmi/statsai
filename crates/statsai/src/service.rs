@@ -305,7 +305,8 @@ struct DaemonHealth {
 
 // Whatever listens on the loopback port answers /health, so its version is
 // untrusted: keep it only when it looks like a version, never terminal escapes.
-#[cfg(target_os = "macos")]
+// Built everywhere so its tests run on every CI platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn is_version_shaped(version: &str) -> bool {
     !version.is_empty()
         && version.len() <= 64
@@ -329,10 +330,11 @@ fn daemon_health(api: &str) -> Option<DaemonHealth> {
     .ok()
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn loaded_legacy_daemon_without_version_is_stale() {
         assert!(daemon_is_stale(true, true, None));
@@ -352,6 +354,7 @@ mod tests {
         assert!(!is_version_shaped("1.0\u{1b}]0;title\u{7}"));
         assert!(!is_version_shaped("\u{1b}[2J"));
         assert!(!is_version_shaped("1.0 extra"));
+        assert!(!is_version_shaped("1.0_beta"));
         assert!(!is_version_shaped(&"1".repeat(65)));
     }
 }

@@ -84,7 +84,7 @@ pub(crate) fn conversation(
                         terminal_safe(&hit.conversation_id),
                         terminal_safe(hit.role.as_deref().unwrap_or("unknown")),
                         terminal_safe(hit.title.as_deref().unwrap_or("(untitled)")),
-                        terminal_safe(&preview)
+                        preview
                     );
                 }
             }
@@ -649,8 +649,11 @@ fn print_archive_markdown(conversation: &ArchiveConversation) {
     }
 }
 
-fn compact_archive_preview(value: &str, max_chars: usize) -> String {
+// Escapes before it truncates, so the preview stays within `max_chars` however
+// many control characters the hit holds.
+pub(crate) fn compact_archive_preview(value: &str, max_chars: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = terminal_safe(&compact).into_owned();
     if compact.chars().count() <= max_chars {
         return compact;
     }

@@ -122,7 +122,12 @@ pub(crate) fn truncate_label(value: &str, width: usize) -> String {
 /// from a file would otherwise be acted on by the terminal rather than shown.
 /// Line breaks, tabs and the `\r` of a `\r\n` pair are kept byte-for-byte so
 /// text still reads as text; a lone `\r` is escaped because it can overwrite
-/// the line before it. `--json` keeps the raw bytes.
+/// the line before it, and bidi overrides and isolates are escaped because
+/// they reorder the text around them.
+///
+/// This is for display only: an escaped character prints as `\u{1b}`, which
+/// looks the same as text that literally contains `\u{1b}`. `--json` keeps the
+/// exact bytes.
 pub(crate) fn terminal_safe(value: &str) -> Cow<'_, str> {
     let mut chars = value.char_indices().peekable();
     let first = loop {
@@ -150,8 +155,12 @@ pub(crate) fn terminal_safe(value: &str) -> Cow<'_, str> {
 }
 
 /// C0 controls, DEL and C1 controls, other than a line break, a tab, or a
-/// `\r` immediately followed by a line break.
+/// `\r` immediately followed by a line break; and the bidi embedding,
+/// override and isolate controls.
 fn is_terminal_control(ch: char, next: Option<char>) -> bool {
+    if matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+        return true;
+    }
     ch.is_control() && ch != '\n' && ch != '\t' && !(ch == '\r' && next == Some('\n'))
 }
 
