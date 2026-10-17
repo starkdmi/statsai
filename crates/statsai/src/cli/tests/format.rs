@@ -128,3 +128,31 @@ fn subscription_json_value_preserves_major_unit_price() {
     assert_eq!(value["price"], json!(20.0));
     assert_eq!(value["price_cents"], json!(2000));
 }
+
+#[test]
+fn terminal_safe_leaves_ordinary_text_untouched() {
+    let text = "line one\n\tindented — ünïcödé ✓";
+
+    assert!(matches!(terminal_safe(text), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(terminal_safe(text), text);
+}
+
+#[test]
+fn terminal_safe_keeps_crlf_line_endings() {
+    let text = "a\r\nb";
+
+    assert!(matches!(terminal_safe(text), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(terminal_safe(text), text);
+    assert_eq!(terminal_safe("x\r\r\ny\r"), "x\\u{d}\r\ny\\u{d}");
+}
+
+#[test]
+fn terminal_safe_escapes_control_characters() {
+    assert_eq!(
+        terminal_safe("a\u{1b}]52;c;cHdu\u{7}b\u{1b}[2Jc"),
+        "a\\u{1b}]52;c;cHdu\\u{7}b\\u{1b}[2Jc"
+    );
+    assert_eq!(terminal_safe("x\ry"), "x\\u{d}y");
+    assert_eq!(terminal_safe("\u{0}\u{7f}"), "\\u{0}\\u{7f}");
+    assert_eq!(terminal_safe("\u{9b}31m\u{85}"), "\\u{9b}31m\\u{85}");
+}

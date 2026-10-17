@@ -3,6 +3,7 @@ use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use statsai_core::{home_dir, Subscription, SubscriptionStatus};
+use std::borrow::Cow;
 
 pub(crate) fn format_cursor(date: Option<String>, id: Option<&str>) -> String {
     match (date, id) {
@@ -113,6 +114,45 @@ pub(crate) fn truncate_label(value: &str, width: usize) -> String {
         .take(width.saturating_sub(1))
         .collect::<String>()
         + "…"
+}
+
+/// Escapes control characters in stored text before it is printed for a person.
+///
+/// Archived transcripts carry tool output verbatim, so an escape sequence read
+/// from a file would otherwise be acted on by the terminal rather than shown.
+/// Line breaks, tabs and the `\r` of a `\r\n` pair are kept byte-for-byte so
+/// text still reads as text; a lone `\r` is escaped because it can overwrite
+/// the line before it. `--json` keeps the raw bytes.
+pub(crate) fn terminal_safe(value: &str) -> Cow<'_, str> {
+    let mut chars = value.char_indices().peekable();
+    let first = loop {
+        match chars.next() {
+            None => return Cow::Borrowed(value),
+            Some((index, ch)) => {
+                let next = chars.peek().map(|&(_, next)| next);
+                if is_terminal_control(ch, next) {
+                    break index;
+                }
+            }
+        }
+    };
+    let mut out = String::with_capacity(value.len() + 8);
+    out.push_str(&value[..first]);
+    let mut chars = value[first..].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if is_terminal_control(ch, chars.peek().copied()) {
+            out.extend(ch.escape_unicode());
+        } else {
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// C0 controls, DEL and C1 controls, other than a line break, a tab, or a
+/// `\r` immediately followed by a line break.
+fn is_terminal_control(ch: char, next: Option<char>) -> bool {
+    ch.is_control() && ch != '\n' && ch != '\t' && !(ch == '\r' && next == Some('\n'))
 }
 
 pub(crate) fn subscription_status_label(status: &SubscriptionStatus) -> &'static str {
