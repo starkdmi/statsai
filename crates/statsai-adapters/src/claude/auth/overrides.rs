@@ -1,6 +1,5 @@
 use super::*;
-use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::Once;
 
 #[cfg(test)]
 pub(crate) fn claude_settings_have_auth_override(root: &Path) -> Option<bool> {
@@ -259,10 +258,12 @@ pub(crate) fn claude_apply_auth_override_settings_files(
 /// Why a settings file that may exist could not be applied.
 #[derive(Debug)]
 pub(crate) enum ClaudeSettingsFileError {
-    /// The system refused to open it (`EACCES`, or `EPERM` from a privacy
-    /// setting): nothing can be said about what it holds.
+    /// Opening it failed with `EPERM`, which macOS returns for any file in a
+    /// folder its privacy settings protect: nothing can be said about what it
+    /// holds, or even whether it exists.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Denied(std::io::Error),
-    /// Any other failure, malformed JSON included.
+    /// Any other failure, `EACCES` from file modes and malformed JSON included.
     Unknown,
 }
 
@@ -275,8 +276,7 @@ pub(crate) fn claude_apply_auth_override_settings_file(
     let file = match open_claude_settings_file(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        // Rust reports both EACCES and EPERM as PermissionDenied.
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+        Err(error) if claude_settings_open_blocked_by_privacy_setting(&error) => {
             return Err(ClaudeSettingsFileError::Denied(error));
         }
         Err(_) => return Err(ClaudeSettingsFileError::Unknown),
@@ -292,40 +292,52 @@ pub(crate) fn claude_apply_auth_override_settings_file(
     Ok(())
 }
 
+/// Rust reports both `EPERM` and `EACCES` as `PermissionDenied`, but only
+/// `EPERM` is a privacy setting: `EACCES` comes from file modes, such as another
+/// user's settings file, and says the file is there.
+#[cfg(unix)]
+fn claude_settings_open_blocked_by_privacy_setting(error: &std::io::Error) -> bool {
+    const EPERM: i32 = 1;
+    error.raw_os_error() == Some(EPERM)
+}
+
+/// Other systems have no error only a privacy setting returns: Windows gives
+/// `ERROR_ACCESS_DENIED` for file permissions, a directory path, and a file
+/// being replaced alike.
+#[cfg(not(unix))]
+fn claude_settings_open_blocked_by_privacy_setting(_error: &std::io::Error) -> bool {
+    false
+}
+
 fn open_claude_settings_file(path: &Path) -> std::io::Result<File> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if let Some(error) = test_support::injected_open_error(path) {
         return Err(error);
     }
     File::open(path)
 }
 
-/// Project settings files already reported by [`note_denied_project_settings`].
-static NOTED_DENIED_PROJECT_SETTINGS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+static NOTED_DENIED_PROJECT_SETTINGS: Once = Once::new();
 
-/// Reports a project settings file the scan was not allowed to read, once per
-/// path and process: every scan and every daemon pass probes it again.
+/// Reports the first project settings file a privacy setting kept the scan
+/// from reading, once per process: a protected folder denies every path in
+/// it, so each project there would otherwise warn on every scan and daemon pass.
 fn note_denied_project_settings(path: &Path, error: &std::io::Error) {
-    let first = NOTED_DENIED_PROJECT_SETTINGS
-        .lock()
-        .map(|mut noted| noted.insert(path.to_path_buf()))
-        .unwrap_or(false);
-    if first {
+    NOTED_DENIED_PROJECT_SETTINGS.call_once(|| {
         eprintln!(
-            "warning: can't read Claude Code project settings {} ({error}); \
-             account attribution leaves this file out, so if it selects another \
-             credential that project's sessions get the source's account. \
-             Let StatsAI read the folder, or use manual_only verification.",
+            "warning: can't read Claude Code project settings {} ({error}), and \
+             other project folders may be affected too; account attribution \
+             leaves such files out, so if one selects another credential that \
+             project's sessions get the source's account. Let StatsAI read the \
+             folder, or use manual_only verification.",
             path.display()
         );
-    }
+    });
 }
 
-#[cfg(test)]
-pub(crate) fn claude_denied_project_settings_noted(path: &Path) -> bool {
-    NOTED_DENIED_PROJECT_SETTINGS
-        .lock()
-        .is_ok_and(|noted| noted.contains(path))
+#[cfg(all(test, unix))]
+pub(crate) fn claude_denied_project_settings_noted() -> bool {
+    NOTED_DENIED_PROJECT_SETTINGS.is_completed()
 }
 
 #[cfg(test)]
@@ -399,23 +411,32 @@ pub(crate) fn claude_base_url_is_non_default(value: &Value) -> bool {
 
 /// Lets tests make opening chosen settings files fail. Tests run as root in
 /// some environments, where file modes cannot produce a permission error.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod test_support {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
 
+    /// What macOS returns for a folder its privacy settings protect.
+    pub(crate) const EPERM: i32 = 1;
+    /// What file modes return.
+    pub(crate) const EACCES: i32 = 13;
+
     thread_local! {
-        static DENIED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static DENIED: RefCell<Vec<(PathBuf, i32)>> = const { RefCell::new(Vec::new()) };
     }
 
-    /// Opening `path` on this thread fails with `PermissionDenied` until the
-    /// guard is dropped.
+    /// Opening `path` on this thread fails until the guard is dropped.
     #[must_use = "the denial lasts only while the guard is held"]
     pub(crate) struct DenySettingsRead(PathBuf);
 
     impl DenySettingsRead {
+        /// Fails with `EPERM`, as if a privacy setting protected the folder.
         pub(crate) fn new(path: &Path) -> Self {
-            DENIED.with(|denied| denied.borrow_mut().push(path.to_path_buf()));
+            Self::with_errno(path, EPERM)
+        }
+
+        pub(crate) fn with_errno(path: &Path, errno: i32) -> Self {
+            DENIED.with(|denied| denied.borrow_mut().push((path.to_path_buf(), errno)));
             Self(path.to_path_buf())
         }
     }
@@ -424,7 +445,7 @@ pub(crate) mod test_support {
         fn drop(&mut self) {
             DENIED.with(|denied| {
                 let mut denied = denied.borrow_mut();
-                if let Some(index) = denied.iter().position(|path| *path == self.0) {
+                if let Some(index) = denied.iter().position(|(path, _)| *path == self.0) {
                     denied.remove(index);
                 }
             });
@@ -436,20 +457,8 @@ pub(crate) mod test_support {
             denied
                 .borrow()
                 .iter()
-                .any(|denied| denied == path)
-                .then(permission_error)
+                .find(|(denied, _)| denied == path)
+                .map(|(_, errno)| std::io::Error::from_raw_os_error(*errno))
         })
-    }
-
-    /// The error macOS returns for a folder its privacy settings protect.
-    #[cfg(unix)]
-    pub(crate) fn permission_error() -> std::io::Error {
-        const EPERM: i32 = 1;
-        std::io::Error::from_raw_os_error(EPERM)
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn permission_error() -> std::io::Error {
-        std::io::ErrorKind::PermissionDenied.into()
     }
 }

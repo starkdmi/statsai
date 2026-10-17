@@ -665,6 +665,7 @@ fn project_path_memo_does_not_remember_a_read_it_could_not_complete() {
 /// A Claude config root with a cached OAuth profile and one session index per
 /// workspace, each workspace holding a harmless `.claude/settings.local.json`.
 /// Returns the root and each workspace's settings file.
+#[cfg(unix)]
 fn claude_root_with_project_settings(dir: &Path, workspaces: &[&str]) -> (PathBuf, Vec<PathBuf>) {
     let root = dir.join("claude-config");
     std::fs::create_dir_all(&root).expect("config root");
@@ -706,6 +707,7 @@ fn claude_root_with_project_settings(dir: &Path, workspaces: &[&str]) -> (PathBu
     (root, settings_paths)
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_unreadable_project_settings_do_not_block_the_source() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -723,8 +725,7 @@ fn claude_unreadable_project_settings_do_not_block_the_source() {
         panic!("a project settings file the scan may not open must not block the source: {observation:?}");
     };
     assert_eq!(state.provider_user_id.as_deref(), Some("cached-account"));
-    assert!(claude_denied_project_settings_noted(&settings_paths[0]));
-    assert!(!claude_denied_project_settings_noted(&settings_paths[1]));
+    assert!(claude_denied_project_settings_noted());
     // Plan evidence goes through the same settings check.
     let source = SourceLocation::local_adapter(
         crate::CLAUDE_CODE_PROVIDER,
@@ -743,6 +744,28 @@ fn claude_unreadable_project_settings_do_not_block_the_source() {
     assert_eq!(evidence.plan_observations[0].plan_name, "Max 5x");
 }
 
+#[cfg(unix)]
+#[test]
+fn claude_project_settings_denied_by_file_modes_still_block_the_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) =
+        claude_root_with_project_settings(dir.path(), &["denied-workspace", "readable-workspace"]);
+    // EACCES says the file is there, perhaps another user's with a credential.
+    let _deny =
+        test_support::DenySettingsRead::with_errno(&settings_paths[0], test_support::EACCES);
+
+    let observation =
+        claude_auth_snapshot_with_probe_context(&root, &LocationOrigin::Configured, None);
+
+    assert_eq!(
+        observation,
+        VerifiedSourceObservation::AttributionBlocked {
+            blocked_since: None
+        }
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn claude_readable_override_still_blocks_beside_unreadable_project_settings() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -769,6 +792,7 @@ fn claude_readable_override_still_blocks_beside_unreadable_project_settings() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_unreadable_user_settings_still_block_the_source() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -788,6 +812,7 @@ fn claude_unreadable_user_settings_still_block_the_source() {
     );
 }
 
+#[cfg(unix)]
 fn api_key_settings() -> String {
     serde_json::json!({
         "env": {"ANTHROPIC_API_KEY": "project-api-key"}
@@ -795,6 +820,7 @@ fn api_key_settings() -> String {
     .to_string()
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_override_after_unreadable_settings_in_the_same_project_still_blocks() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -817,6 +843,7 @@ fn claude_override_after_unreadable_settings_in_the_same_project_still_blocks() 
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_nested_project_override_still_blocks_beside_unreadable_repository_settings() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -854,6 +881,7 @@ fn claude_nested_project_override_still_blocks_beside_unreadable_repository_sett
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_other_projects_override_still_blocks_beside_unreadable_project_settings() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -877,6 +905,7 @@ fn claude_other_projects_override_still_blocks_beside_unreadable_project_setting
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_unreadable_project_settings_keep_the_sources_verified_assignment() {
     use statsai_store::{reconcile_verified_source_state, verified_source_observation_hash, Store};

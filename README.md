@@ -302,15 +302,14 @@ credential provenance. Durable API-key, token, cloud-provider, gateway, and
 credential-helper settings in managed, user, and project scopes suppress the
 inference. Missing session indexes are recovered from bounded transcript
 metadata when possible; otherwise attribution fails closed. A project settings
-file the system won't let StatsAI open, such as one in a folder that macOS
-privacy settings protect, is left out with a warning instead of suppressing the
-inference for the whole source. That project's sessions are then attributed
-like the rest of the source even if the file selects another credential, and a
-scan that can read the file may disagree with one that can't; let StatsAI read
-the folder, or use `manual_only`. One-shot environment overrides cannot be
-reconstructed by file-only collection, so `auto` is a best-effort source-wide
-policy. Use `manual_only` plus explicit source connections for mixed-credential
-history.
+file in a folder that macOS privacy settings protect, which fails to open with
+`EPERM`, is left out with a warning instead of suppressing the inference for the
+whole source. That project's sessions are then attributed like the rest of the
+source even if the file selects another credential, and a scan that can read the
+file may disagree with one that can't; let StatsAI read the folder, or use
+`manual_only`. One-shot environment overrides cannot be reconstructed by
+file-only collection, so `auto` is a best-effort source-wide policy. Use
+`manual_only` plus explicit source connections for mixed-credential history.
 
 The same cached profile also reports the Claude subscription plan — Pro, Max,
 Team, or Enterprise, with Max 5x and Max 20x named when the cached rate-limit
