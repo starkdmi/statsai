@@ -5,7 +5,6 @@ use crate::SourceId;
 use chrono::{DateTime, Utc};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 pub(super) fn context<'a>(source: &'a SourceId) -> TraceEditContext<'a> {
     TraceEditContext {
@@ -25,12 +24,7 @@ pub(super) fn context<'a>(source: &'a SourceId) -> TraceEditContext<'a> {
 }
 
 pub(super) fn run_test_git(path: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(path)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(args)
-        .status()
-        .unwrap();
+    let status = test_git_command(path).args(args).status().unwrap();
     assert!(status.success());
 }
 
@@ -45,9 +39,7 @@ pub(super) fn commit_test_file(
     fs::write(path.join(relative_path), contents).unwrap();
     run_test_git(path, &["add", relative_path]);
     let timestamp = committed_at.to_rfc3339();
-    let status = Command::new("git")
-        .current_dir(path)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
+    let status = test_git_command(path)
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", email)
         .env("GIT_AUTHOR_DATE", &timestamp)

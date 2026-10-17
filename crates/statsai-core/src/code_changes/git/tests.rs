@@ -5,12 +5,7 @@ use std::fs;
 use tempfile::TempDir;
 
 fn test_git_stdout(path: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .current_dir(path)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(args)
-        .output()
-        .unwrap();
+    let output = test_git_command(path).args(args).output().unwrap();
     assert!(output.status.success());
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
@@ -340,6 +335,100 @@ fn git_scan_handles_linked_worktrees_branches_and_merges() {
         1,
         "a merged branch's additions are counted once"
     );
+}
+
+/// Everything about a hook's checkout that fixture commands used to rewrite.
+#[derive(Debug, PartialEq)]
+struct HookCheckoutState {
+    config: String,
+    refs: String,
+    worktrees: String,
+    main_head: String,
+    worktree_head: String,
+    worktree_index: String,
+}
+
+fn hook_checkout_state(main: &Path, worktree: &Path) -> HookCheckoutState {
+    HookCheckoutState {
+        config: fs::read_to_string(main.join(".git/config")).unwrap(),
+        refs: test_git_stdout(main, &["for-each-ref", "--format=%(refname) %(objectname)"]),
+        worktrees: test_git_stdout(main, &["worktree", "list", "--porcelain"]),
+        main_head: test_git_stdout(main, &["symbolic-ref", "HEAD"]),
+        worktree_head: test_git_stdout(worktree, &["symbolic-ref", "HEAD"]),
+        worktree_index: test_git_stdout(worktree, &["ls-files", "--stage"]),
+    }
+}
+
+#[test]
+fn fixture_and_scan_commands_leave_an_inherited_hook_checkout_alone() {
+    // Git runs a hook in a linked worktree with GIT_DIR naming that worktree
+    // (and GIT_INDEX_FILE for pre-commit), and the test suite the hook starts
+    // inherits both. This checkout stands in for the one running the hook,
+    // with no identity of its own configured.
+    let temp = TempDir::new().unwrap();
+    let main = temp.path().join("checkout");
+    let worktree = temp.path().join("checkout-worktree");
+    fs::create_dir_all(&main).unwrap();
+    run_test_git(&main, &["init", "-q"]);
+    commit_test_file(
+        &main,
+        "lib.rs",
+        "lib\n",
+        "initial",
+        "owner@example.com",
+        Utc::now(),
+    );
+    let worktree_text = worktree.to_string_lossy().into_owned();
+    run_test_git(
+        &main,
+        &["worktree", "add", "-q", "-b", "work", &worktree_text],
+    );
+    let hook_git_dir = test_git_stdout(&worktree, &["rev-parse", "--absolute-git-dir"]);
+    let before = hook_checkout_state(&main, &worktree);
+
+    // These two tests between them run every fixture helper and the scanner,
+    // and the second is the sequence that once set core.bare, a Test identity,
+    // a commit, and a feature branch on the hook's checkout.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "code_changes::git::tests::git_scan_only_counts_recent_local_branch_commits_from_configured_identity",
+            "code_changes::git::tests::git_scan_handles_linked_worktrees_branches_and_merges",
+        ])
+        .env("GIT_DIR", &hook_git_dir)
+        .env("GIT_INDEX_FILE", Path::new(&hook_git_dir).join("index"))
+        .env("GIT_PREFIX", "")
+        .output()
+        .unwrap();
+
+    assert_eq!(hook_checkout_state(&main, &worktree), before);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 2 passed;"),
+        "fixture tests under an inherited hook checkout:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn git_commands_drop_every_variable_that_names_a_repository() {
+    let removed = |command: &Command| {
+        command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    let repository_vars = GIT_REPOSITORY_ENV_VARS
+        .map(String::from)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    // The scanner honours a user's ceiling directories; fixtures drop them.
+    assert_eq!(removed(&git_command(Path::new("."), &[])), repository_vars);
+    let mut fixture_vars = repository_vars;
+    fixture_vars.insert("GIT_CEILING_DIRECTORIES".to_string());
+    assert_eq!(removed(&test_git_command(Path::new("."))), fixture_vars);
 }
 
 #[test]
