@@ -48,12 +48,13 @@ When you are addressing review on a pull request:
 3. Never make a finding go away by deleting, skipping or loosening a test, or
    by narrowing the spec. If a finding is wrong, reply with the evidence and
    leave the code as it is.
-4. Reply in each thread with `Fixed in <sha>` or the reason you did not change
-   it.
+4. Order of operations: commit, push, then reply in each thread with
+   `Fixed in <sha>` or the reason you did not change it, then label (step 5).
 5. After pushing, add the `claude:re-review` label. That is what starts the
    next review round; do not ask for a re-review any other way. If the label
    is already present, the previous round has not started yet; do not add it
-   again.
+   again. If you pushed nothing because every finding is disputed, add
+   `claude:needs-human` instead and leave the decision to the owner.
 
    ```sh
    # <pr> is the pull request number
