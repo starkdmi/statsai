@@ -5,31 +5,32 @@ name: Claude review status
 # status writes are refused, so this workflow is the only writer of that
 # context.
 #
-# - A summary comment from `hexnyl` that starts with `<!-- claude-review ... -->`
-#   sets success (Verdict: pass) or failure (Verdict: fail, or no verdict,
-#   which is how the round-cap comment looks) on the SHA named in the marker.
-# - Every new push to a PR resets the status to pending, so a stale pass
-#   cannot carry over to commits the routine has not seen.
+# - A new summary comment from `hexnyl` that starts with
+#   `<!-- claude-review round=N sha=<head> verdict=pass|fail -->` sets success
+#   or failure on the PR head, but only when the marker's SHA is the current
+#   head. Edited comments are ignored, so a verdict cannot be changed after
+#   the fact. No verdict in the marker counts as failure; that is what the
+#   round-cap comment looks like.
+# - Every push to a PR resets the status to pending, so a stale pass cannot
+#   carry over to commits the routine has not seen. This runs on
+#   `pull_request_target`, i.e. from the base branch's copy of this file, so a
+#   PR cannot rewrite it; it checks nothing out and runs no PR code.
 
 on:
   issue_comment:
-    types: [created, edited]
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review]
 
 permissions:
   contents: read
   pull-requests: read
   statuses: write
 
-concurrency:
-  group: claude-review-status-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: false
-
 jobs:
   pending:
     name: Reset on push
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v7
@@ -52,47 +53,52 @@ jobs:
       github.event.comment.user.login == 'hexnyl' &&
       startsWith(github.event.comment.body, '<!-- claude-review')
     runs-on: ubuntu-latest
+    concurrency:
+      group: claude-review-verdict-${{ github.event.issue.number }}
+      cancel-in-progress: false
     steps:
       - uses: actions/github-script@v7
         with:
           script: |
             const body = context.payload.comment.body;
-            const marker = body.match(/<!--\s*claude-review\b([^>]*)-->/);
+            // Only the leading marker is trusted; nothing in the comment body
+            // below it (which may quote other text) affects the verdict.
+            const marker = body.match(/^<!--\s*claude-review\b([^>]*)-->/);
+            if (!marker) {
+              core.notice('Comment does not start with a claude-review marker; ignoring.');
+              return;
+            }
             const attrs = Object.fromEntries(
-              [...(marker ? marker[1] : '').matchAll(/(\w+)=([^\s]+)/g)].map(m => [m[1], m[2]])
+              [...marker[1].matchAll(/(\w+)=([^\s]+)/g)].map(m => [m[1], m[2].toLowerCase()])
             );
+
+            if (!/^[0-9a-f]{7,40}$/.test(attrs.sha || '')) {
+              core.notice(`Marker SHA "${attrs.sha ?? ''}" is not a hex SHA; leaving status as is.`);
+              return;
+            }
 
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.payload.issue.number,
             });
-
-            // Only trust a SHA that is actually the PR head; otherwise the
-            // comment is about an older commit and a new push already reset
-            // the status to pending.
-            const sha = attrs.sha && attrs.sha.length >= 7 && pr.head.sha.startsWith(attrs.sha.replace(/[^0-9a-f]/gi, ''))
-              ? pr.head.sha
-              : null;
-            if (!sha) {
-              core.notice(`Summary is for ${attrs.sha || 'an unknown SHA'}, PR head is ${pr.head.sha}; leaving status as is.`);
+            if (!pr.head.sha.startsWith(attrs.sha)) {
+              core.notice(`Summary is for ${attrs.sha}, PR head is ${pr.head.sha}; a newer push already reset the status.`);
               return;
             }
 
-            const verdict = (body.match(/\*\*Verdict:?\*\*:?\s*`?(pass|fail)`?/i) || [])[1];
-            const state = verdict && verdict.toLowerCase() === 'pass' ? 'success' : 'failure';
+            const verdict = attrs.verdict === 'pass' ? 'pass' : 'fail';
+            const state = verdict === 'pass' ? 'success' : 'failure';
             const round = attrs.round ? `round ${attrs.round}: ` : '';
-            const firstLine = (body.split('\n').find(l => /\*\*Verdict:?\*\*/.test(l)) || '')
-              .replace(/\*\*Verdict:?\*\*:?\s*/i, '').replace(/[`*]/g, '').trim();
-            const description = (round + (firstLine || (verdict ? verdict : 'no verdict in summary; needs a human'))).slice(0, 140);
+            const description = (round + (attrs.verdict ? verdict : 'no verdict in marker; needs a human')).slice(0, 140);
 
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              sha,
+              sha: pr.head.sha,
               state,
               context: 'claude/review',
               description,
               target_url: context.payload.comment.html_url,
             });
-            core.info(`claude/review=${state} on ${sha}: ${description}`);
+            core.info(`claude/review=${state} on ${pr.head.sha}: ${description}`);
