@@ -434,18 +434,16 @@ fn source_remove_delete_data_retires_committed_metrics_without_any_traces() {
         &["config", "user.email", "test@example.com"],
         &["config", "user.name", "Test"],
     ] {
-        let status = std::process::Command::new("git")
+        let status = statsai_core::test_git_command(repository.path())
             .args(args)
-            .current_dir(repository.path())
             .status()
             .expect("run git");
         assert!(status.success());
     }
     std::fs::write(repository.path().join("main.rs"), "fn main() {}\n").expect("write source");
     for args in [&["add", "main.rs"][..], &["commit", "-qm", "initial"]] {
-        let status = std::process::Command::new("git")
+        let status = statsai_core::test_git_command(repository.path())
             .args(args)
-            .current_dir(repository.path())
             .status()
             .expect("run git");
         assert!(status.success());

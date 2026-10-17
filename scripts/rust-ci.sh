@@ -14,6 +14,13 @@ EOF
   exit 64
 }
 
+# Git hooks export the hook's repository (GIT_DIR, GIT_INDEX_FILE, ...). Tests
+# build fixture repositories with plain git commands, which would otherwise
+# initialize, configure, and commit to the checkout running the hook. The hooks
+# need these for their own git calls, so they are dropped here instead.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_NAMESPACE GIT_CEILING_DIRECTORIES
+
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 cd "$repo_root"
 

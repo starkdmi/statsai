@@ -19,7 +19,8 @@ thread_local! {
 /// Inspect commits already present in a local Git object database.
 ///
 /// The implementation invokes only local, read-only Git commands and disables
-/// prompts, optional locks, external diff drivers, and text conversion.
+/// prompts, optional locks, external diff drivers, and text conversion. It finds
+/// the repository from `path` alone, never from one named by the environment.
 pub fn scan_local_git_repository(
     path: &Path,
     project_id: Option<&str>,
@@ -341,11 +342,57 @@ fn run_git_allow_missing(path: &Path, args: &[&str]) -> Result<String, GitScanEr
     output_text(args, output, true)
 }
 
+/// Variables through which Git takes its repository, work tree, index, or
+/// object store from the environment instead of finding them from its working
+/// directory.
+///
+/// Git exports `GIT_DIR`, `GIT_INDEX_FILE`, and `GIT_PREFIX` to its hooks, so a
+/// command started from anything a hook runs would otherwise act on the hook's
+/// repository rather than on the one in its working directory.
+pub const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_NAMESPACE",
+];
+
+/// Makes `command` find its repository from its working directory alone.
+///
+/// `GIT_CEILING_DIRECTORIES` is kept. It only stops discovery from climbing and
+/// never points it at another repository, and it is how a user keeps a folder
+/// under a home-directory repository from being taken for part of it.
+pub fn clear_git_repository_env(command: &mut Command) -> &mut Command {
+    for name in GIT_REPOSITORY_ENV_VARS {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// Starts a Git command for a test fixture repository at `path`.
+///
+/// The workspace's tests run under its own Git hooks, and a fixture command
+/// that inherited the hook's repository would initialize, configure, and commit
+/// to that checkout instead of the temporary one. System configuration and
+/// ceiling directories are dropped too, so fixtures behave alike everywhere.
+#[doc(hidden)]
+pub fn test_git_command(path: &Path) -> Command {
+    let mut command = Command::new("git");
+    clear_git_repository_env(&mut command)
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(path);
+    command
+}
+
 fn git_command(path: &Path, args: &[&str]) -> Command {
     #[cfg(test)]
     TEST_GIT_COMMAND_COUNT.set(TEST_GIT_COMMAND_COUNT.get().saturating_add(1));
     let mut command = Command::new("git");
-    command
+    clear_git_repository_env(&mut command)
         .current_dir(path)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")

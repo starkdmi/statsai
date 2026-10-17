@@ -3,7 +3,7 @@ pub(super) use statsai_core::{
     CodeCategory, CodeLineCounts, SyncBatch, CODE_CHANGE_METRIC_SCHEMA_VERSION,
     SYNC_BATCH_SCHEMA_VERSION,
 };
-pub(super) use std::{fs, path::Path, process::Command};
+pub(super) use std::{fs, path::Path};
 pub(super) use tempfile::TempDir;
 
 /// Repoints the recorded project path at `path`, as a moved worktree would.
@@ -106,9 +106,7 @@ pub(super) fn insert_optional_project_evidence(
 }
 
 pub(super) fn run_test_git(path: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(path)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
+    let status = statsai_core::test_git_command(path)
         .args(args)
         .status()
         .expect("run git");
