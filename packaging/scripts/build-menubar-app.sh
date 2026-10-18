@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DIST_DIR="${ROOT}/target/distrib"
 UNIVERSAL_ARCHIVE="${DIST_DIR}/statsai-universal-apple-darwin.tar.xz"
-OUT_ZIP="${DIST_DIR}/StatsAI.app.zip"
+OUT_ZIP="${DIST_DIR}/StatsAIMenuBar.app.zip"
 ARM_TARGET="aarch64-apple-darwin"
 X64_TARGET="x86_64-apple-darwin"
 
@@ -25,14 +25,14 @@ has_target() {
 BUILD_UNIVERSAL=false
 if has_target "${ARM_TARGET}" && has_target "${X64_TARGET}"; then
   BUILD_UNIVERSAL=true
-  echo "building universal StatsAI.app (menubar + embedded statsai CLI)..."
+  echo "building universal StatsAIMenuBar.app (menubar + embedded statsai CLI)..."
 else
   if ! has_target "${ARM_TARGET}"; then
     echo "missing required Rust target: ${ARM_TARGET}" >&2
     echo "install it with: rustup target add ${ARM_TARGET}" >&2
     exit 1
   fi
-  echo "building arm64-only StatsAI.app (${X64_TARGET} not installed)..."
+  echo "building arm64-only StatsAIMenuBar.app (${X64_TARGET} not installed)..."
   echo "for a universal release zip, run: rustup target add ${X64_TARGET}"
 fi
 
@@ -44,11 +44,17 @@ fi
 # Generate bundle metadata (Info.plist, icon, LSUIElement) from the arm64 build.
 cargo bundle --release -p statsai-menubar --target "${ARM_TARGET}"
 
-APP_DIR="${ROOT}/target/${ARM_TARGET}/release/bundle/osx/StatsAI.app"
+APP_DIR="${ROOT}/target/${ARM_TARGET}/release/bundle/osx/StatsAIMenuBar.app"
 if [[ ! -d "${APP_DIR}" ]]; then
   echo "expected app bundle at ${APP_DIR}" >&2
   exit 1
 fi
+
+# Upgrading from the bundle's old name moves its login item through System
+# Events, and macOS asks the user first only when the app says why.
+plutil -replace NSAppleEventsUsageDescription -string \
+  "StatsAI Menu Bar moves its login item when it replaces an older copy of itself." \
+  "${APP_DIR}/Contents/Info.plist"
 
 MENUBAR_ARM="${ROOT}/target/${ARM_TARGET}/release/statsai-menubar"
 MENUBAR_UNI="${APP_DIR}/Contents/MacOS/statsai-menubar"

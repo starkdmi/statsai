@@ -1,5 +1,6 @@
 mod app;
 mod capture;
+mod legacy;
 mod menu;
 
 pub use app::run;
@@ -83,7 +84,7 @@ impl InstanceLock {
         let locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 };
         if !locked {
             return Err(
-                "StatsAI menu bar is already running. Quit the existing instance first."
+                "StatsAI Menu Bar is already running. Quit the existing instance first."
                     .to_string(),
             );
         }

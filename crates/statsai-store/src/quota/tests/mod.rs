@@ -1,5 +1,6 @@
 pub(crate) use super::*;
 
+mod contributions;
 mod cycles;
 mod observations;
 mod reconstruct;

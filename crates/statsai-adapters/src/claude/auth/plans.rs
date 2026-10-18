@@ -89,13 +89,17 @@ pub(crate) fn collect_claude_account_evidence(
     root: &Path,
     location_origin: &LocationOrigin,
 ) -> AccountEvidenceScan {
-    let managed_settings_root = claude_managed_settings_root();
-    let mut scan = collect_claude_account_evidence_with_probe_context(
-        source,
-        root,
-        location_origin,
-        managed_settings_root.as_deref(),
-    );
+    let mut scan = if claude_project_settings_deferred(root) {
+        AccountEvidenceScan::default()
+    } else {
+        let managed_settings_root = claude_managed_settings_root();
+        collect_claude_account_evidence_with_probe_context(
+            source,
+            root,
+            location_origin,
+            managed_settings_root.as_deref(),
+        )
+    };
     if let Some(desktop_sessions_root) = claude_desktop_sessions_root_for(root) {
         collect_claude_desktop_session_evidence(source, &desktop_sessions_root, &mut scan);
     }

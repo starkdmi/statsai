@@ -1,5 +1,6 @@
 use super::*;
-use std::sync::Once;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::{Mutex, Once};
 
 #[cfg(test)]
 pub(crate) fn claude_settings_have_auth_override(root: &Path) -> Option<bool> {
@@ -77,16 +78,39 @@ pub(crate) fn claude_source_settings_auth_override(
     if project_paths.is_empty() {
         return Some(base_state.probe());
     }
+    let home = home_dir();
+    // A privacy setting covers a whole protected folder, so once one project's
+    // settings there are denied, every other project's are too: they are left
+    // out without asking again, for the rest of this probe.
+    let mut denied_folders = HashSet::new();
     let mut block = None;
     for project_path in &project_paths {
         let mut effective_state = base_state.clone();
         for project_settings_root in claude_project_settings_roots(project_path) {
+            let protected_folder =
+                privacy_protected_folder(&project_settings_root, home.as_deref());
+            if protected_folder
+                .as_ref()
+                .is_some_and(|folder| denied_folders.contains(folder))
+            {
+                continue;
+            }
             for path in claude_settings_paths(&project_settings_root) {
                 match claude_apply_auth_override_settings_file(&mut effective_state, &path, false) {
                     Ok(()) => {}
                     // Left out, not unknown; see claude_durable_settings_attribution.
                     Err(ClaudeSettingsFileError::Denied(error)) => {
-                        note_denied_project_settings(&path, &error);
+                        let folder = protected_folder.clone().unwrap_or_else(|| {
+                            project_settings_root
+                                .parent()
+                                .unwrap_or(&project_settings_root)
+                                .to_path_buf()
+                        });
+                        note_denied_project_settings(&path, &folder, &error);
+                        if let Some(protected_folder) = &protected_folder {
+                            denied_folders.insert(protected_folder.clone());
+                            break;
+                        }
                     }
                     Err(ClaudeSettingsFileError::Unknown) => return None,
                 }
@@ -317,12 +341,51 @@ fn open_claude_settings_file(path: &Path) -> std::io::Result<File> {
     File::open(path)
 }
 
+/// The folder macOS privacy settings protect as a whole that `path` is in:
+/// the home directory's Desktop, Documents and Downloads, iCloud Drive, or a
+/// volume under `/Volumes`. A denial anywhere in one denies all of it.
+pub(crate) fn privacy_protected_folder(path: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let home = home.filter(|home| home.parent().is_some());
+    if let Some((home, relative)) =
+        home.and_then(|home| Some((home, path.strip_prefix(home).ok()?)))
+    {
+        let mut components = relative.components().map(|component| component.as_os_str());
+        return match components.next()?.to_str()? {
+            folder @ ("Desktop" | "Documents" | "Downloads") => Some(home.join(folder)),
+            "Library" if components.next()? == "Mobile Documents" => {
+                Some(home.join("Library").join("Mobile Documents"))
+            }
+            _ => None,
+        };
+    }
+    let mut components = path.strip_prefix("/Volumes").ok()?.components();
+    Some(Path::new("/Volumes").join(components.next()?.as_os_str()))
+}
+
 static NOTED_DENIED_PROJECT_SETTINGS: Once = Once::new();
 
-/// Reports the first project settings file a privacy setting kept the scan
-/// from reading, once per process: a protected folder denies every path in
-/// it, so each project there would otherwise warn on every scan and daemon pass.
-fn note_denied_project_settings(path: &Path, error: &std::io::Error) {
+static DENIED_PROJECT_SETTINGS_FOLDERS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// The folders in which this process was denied a Claude Code project's
+/// settings file: a protected folder (see [`privacy_protected_folder`]) when
+/// the file is in one, else the project's folder. Account attribution leaves
+/// the settings there out, so a tool that runs scans can tell the user which
+/// folders to let StatsAI read.
+pub fn claude_denied_project_settings_folders() -> Vec<PathBuf> {
+    DENIED_PROJECT_SETTINGS_FOLDERS
+        .lock()
+        .map(|folders| folders.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Records the folder, and reports the first project settings file a privacy
+/// setting kept the scan from reading, once per process: a protected folder
+/// denies every path in it, so each project there would otherwise warn on
+/// every scan and daemon pass.
+fn note_denied_project_settings(path: &Path, folder: &Path, error: &std::io::Error) {
+    if let Ok(mut folders) = DENIED_PROJECT_SETTINGS_FOLDERS.lock() {
+        folders.insert(folder.to_path_buf());
+    }
     NOTED_DENIED_PROJECT_SETTINGS.call_once(|| {
         eprintln!(
             "warning: can't read Claude Code project settings {} ({error}), and \
@@ -423,6 +486,12 @@ pub(crate) mod test_support {
 
     thread_local! {
         static DENIED: RefCell<Vec<(PathBuf, i32)>> = const { RefCell::new(Vec::new()) };
+        static OPENED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Every settings file this thread tried to open since the last call.
+    pub(crate) fn take_opened_settings() -> Vec<PathBuf> {
+        OPENED.with(|opened| std::mem::take(&mut *opened.borrow_mut()))
     }
 
     /// Opening `path` on this thread fails until the guard is dropped.
@@ -453,6 +522,7 @@ pub(crate) mod test_support {
     }
 
     pub(super) fn injected_open_error(path: &Path) -> Option<std::io::Error> {
+        OPENED.with(|opened| opened.borrow_mut().push(path.to_path_buf()));
         DENIED.with(|denied| {
             denied
                 .borrow()

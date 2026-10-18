@@ -1,7 +1,11 @@
 use super::{ClaudeSessionProjectMetadata, ClaudeTaskEntry};
-use crate::{file_modified_timestamp, resolve_project_context, timestamp_from_scalar};
+use crate::{
+    file_modified_timestamp, resolve_project_context_cached, timestamp_from_scalar,
+    ProjectContextCache,
+};
 use chrono::Utc;
 use serde_json::Value;
+use statsai_core::ProjectInfo;
 use statsai_core::{
     canonical_display, expand_home_path, summarize_task_text, task_title_from_prompt,
     task_title_is_generic,
@@ -145,20 +149,15 @@ pub(crate) fn load_claude_task_entries(projects_root: &Path) -> Vec<ClaudeTaskEn
             } else {
                 "summary"
             };
-            let project = item
+            let project_path = item
                 .get("projectPath")
                 .and_then(Value::as_str)
                 .map(expand_home_path)
-                .or_else(|| original_path.clone())
-                .and_then(|project_path| {
-                    resolve_project_context(
-                        Some(project_path),
-                        None,
-                        item.get("gitBranch")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                    )
-                });
+                .or_else(|| original_path.clone());
+            let git_branch = item
+                .get("gitBranch")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
             let started_at = item
                 .get("created")
                 .and_then(timestamp_from_scalar)
@@ -179,7 +178,8 @@ pub(crate) fn load_claude_task_entries(projects_root: &Path) -> Vec<ClaudeTaskEn
                 title,
                 title_source,
                 summary_preview,
-                project,
+                project_path,
+                git_branch,
                 started_at,
                 ended_at,
                 source_path: item
@@ -191,4 +191,15 @@ pub(crate) fn load_claude_task_entries(projects_root: &Path) -> Vec<ClaudeTaskEn
     }
 
     entries_out
+}
+
+impl ClaudeTaskEntry {
+    /// The project the index names for this session, resolved only when a
+    /// span needs it: reading a checkout's git metadata for every indexed
+    /// session, including the ones no span is emitted for, touched every
+    /// project folder on every scan with tasks.
+    pub(crate) fn resolve_project(&self, cache: &mut ProjectContextCache) -> Option<ProjectInfo> {
+        let project_path = self.project_path.clone()?;
+        resolve_project_context_cached(Some(project_path), None, self.git_branch.clone(), cache)
+    }
 }

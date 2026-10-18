@@ -1,5 +1,5 @@
 use super::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 thread_local! {
     /// Active only while a [`ClaudeProjectPathMemo`] is held on this thread.
@@ -47,6 +47,62 @@ impl Drop for ClaudeProjectPathMemo {
         let previous = self.previous.take();
         PROJECT_PATHS.with(|memo| *memo.borrow_mut() = previous);
     }
+}
+
+thread_local! {
+    /// Set only while a [`ClaudeProjectSettingsDeferral`] is held on this thread.
+    static PROJECT_SETTINGS_DEFERRED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Defers what depends on Claude Code project folders for as long as it is held.
+///
+/// Whether a source's cached account can be trusted depends on the settings of
+/// every project it has ever run in. Answering means walking each project's
+/// folders for its repository root and opening its `.claude` settings, which on
+/// macOS asks the privacy settings about every protected folder a project is
+/// in. A scan that has no file to read for a source has no usage to attribute
+/// either, so it holds this while it handles that source: for a source with
+/// projects, the verified-state probe answers `Unavailable`, which keeps the
+/// stored state, and account evidence leaves out the cached plan, whose
+/// collection checks the same settings. Desktop session records are still
+/// read, and a source with no project is answered as usual. The next scan that reads
+/// the source's files probes as before, before it attributes anything, so a
+/// settings change made in between is seen before any usage it governs.
+///
+/// Nesting is safe: the guard restores whatever it replaced.
+#[must_use = "the deferral is only active while the guard is held"]
+pub struct ClaudeProjectSettingsDeferral {
+    previous: bool,
+}
+
+impl ClaudeProjectSettingsDeferral {
+    pub fn begin() -> Self {
+        let previous = PROJECT_SETTINGS_DEFERRED.with(|deferred| deferred.replace(true));
+        Self { previous }
+    }
+
+    /// Whether a deferral is held on this thread, for callers that check
+    /// which of their steps run under it.
+    pub fn is_held() -> bool {
+        PROJECT_SETTINGS_DEFERRED.with(Cell::get)
+    }
+}
+
+impl Drop for ClaudeProjectSettingsDeferral {
+    fn drop(&mut self) {
+        PROJECT_SETTINGS_DEFERRED.with(|deferred| deferred.set(self.previous));
+    }
+}
+
+/// Whether a [`ClaudeProjectSettingsDeferral`] is held and the source at
+/// `root` has projects whose folders answering would touch. A source with no
+/// project (or none yet) is answered as usual, since that reads nothing in a
+/// project folder; one whose projects can't be listed is deferred too, rather
+/// than blocked on an answer a later scan will give.
+pub(crate) fn claude_project_settings_deferred(root: &Path) -> bool {
+    PROJECT_SETTINGS_DEFERRED.with(Cell::get)
+        && claude_project_paths_from_session_indexes(&root.join("projects"))
+            .is_none_or(|project_paths| !project_paths.is_empty())
 }
 
 pub(crate) fn claude_project_paths_from_session_indexes(
@@ -276,9 +332,8 @@ pub(crate) fn insert_claude_project_path(
 }
 
 pub(crate) fn claude_project_settings_roots(project_path: &Path) -> Vec<PathBuf> {
-    let Some(repository_root) = project_path
-        .ancestors()
-        .find(|ancestor| ancestor.join(".git").exists())
+    let Some(repository_root) =
+        git_discovery_ancestors(project_path).find(|ancestor| ancestor.join(".git").exists())
     else {
         return vec![project_path.join(".claude")];
     };

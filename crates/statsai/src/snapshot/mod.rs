@@ -599,7 +599,7 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
             menu_stat_2,
             menu_stat_3: "Dashboard · not connected".to_string(),
             primary_action: PrimaryAction::Link,
-            tooltip: "StatsAI".to_string(),
+            tooltip: "StatsAI Menu Bar".to_string(),
             menu_layout: "unlinked".to_string(),
         };
     }
@@ -611,7 +611,7 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
             menu_stat_2,
             menu_stat_3: dashboard_line_synced(last_sync_at, has_synced, false),
             primary_action: PrimaryAction::UploadNow,
-            tooltip: "StatsAI — upload needs attention".to_string(),
+            tooltip: "StatsAI Menu Bar — upload needs attention".to_string(),
             menu_layout: "upload_issue".to_string(),
         };
     }
@@ -630,7 +630,7 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
             menu_stat_2,
             menu_stat_3: dashboard_line_synced(last_sync_at, has_synced, false),
             primary_action: PrimaryAction::UploadNow,
-            tooltip: "StatsAI — ready to upload".to_string(),
+            tooltip: "StatsAI Menu Bar — ready to upload".to_string(),
             menu_layout: "pending_upload".to_string(),
         };
     }
@@ -642,7 +642,7 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
             menu_stat_2: "Today · no requests yet".to_string(),
             menu_stat_3: dashboard_line_synced(last_sync_at, has_synced, false),
             primary_action: PrimaryAction::None,
-            tooltip: "StatsAI".to_string(),
+            tooltip: "StatsAI Menu Bar".to_string(),
             menu_layout: "no_data".to_string(),
         };
     }
@@ -653,7 +653,7 @@ fn build_ui(input: SnapshotUiInput) -> UiCopy {
         menu_stat_2,
         menu_stat_3: dashboard_line_synced(last_sync_at, has_synced, false),
         primary_action: PrimaryAction::None,
-        tooltip: "StatsAI — up to date".to_string(),
+        tooltip: "StatsAI Menu Bar — up to date".to_string(),
         menu_layout: "ready".to_string(),
     }
 }

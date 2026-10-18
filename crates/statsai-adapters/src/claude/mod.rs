@@ -2,11 +2,14 @@ mod auth;
 mod parse;
 mod tasks;
 
-pub use auth::ClaudeProjectPathMemo;
 pub(crate) use auth::*;
+pub use auth::{
+    claude_denied_project_settings_folders, ClaudeProjectPathMemo, ClaudeProjectSettingsDeferral,
+};
 pub(crate) use parse::*;
 pub(crate) use tasks::*;
 
+use crate::ProjectContextCache;
 use crate::{
     collect_jsonl_files, file_metadata_signature, scan_cache_namespaces, scan_candidate,
     session_event_rollups, source_root_path, split_paths, AccountEvidenceScan, AdapterScan,
@@ -18,7 +21,7 @@ use chrono::{DateTime, Utc};
 use statsai_core::{
     branch_family, canonical_display, extract_issue_keys, hash_text, home_dir,
     normalize_task_title, project_bucket_key, task_span_id, task_title_is_generic,
-    AccountEvidenceCheckpointV1, Confidence, LocationOrigin, ProjectInfo, SourceLocation, TaskSpan,
+    AccountEvidenceCheckpointV1, Confidence, LocationOrigin, SourceLocation, TaskSpan,
     VerifiedSourceObservation, TASK_SPAN_SCHEMA_VERSION,
 };
 use std::collections::HashSet;
@@ -30,8 +33,6 @@ use crate::cache::SCAN_CACHE_SIGNATURE_VERSION;
 use crate::file_modified_at;
 #[cfg(test)]
 use crate::tests::{options, options_without_tasks, write_git_fixture};
-#[cfg(test)]
-use crate::ProjectContextCache;
 #[cfg(test)]
 use chrono::TimeZone;
 #[cfg(test)]
@@ -110,6 +111,9 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             return Ok(VerifiedSourceObservation::Unavailable);
         };
         let root = normalize_claude_config_root(&root);
+        if claude_project_settings_deferred(&root) {
+            return Ok(VerifiedSourceObservation::Unavailable);
+        }
         Ok(claude_auth_snapshot(&root, &source.location_origin))
     }
 
@@ -119,6 +123,14 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         };
         let root = normalize_claude_config_root(&root);
         claude_auth_dependency_paths(&root, &source.location_origin)
+    }
+
+    fn account_verification_dependency_paths(&self, source: &SourceLocation) -> Vec<PathBuf> {
+        let Some(root) = source_root_path(source) else {
+            return Vec::new();
+        };
+        let root = normalize_claude_config_root(&root);
+        claude_account_dependency_paths(&root, &source.location_origin)
     }
 
     fn verification_dependency_paths_changed(
@@ -243,6 +255,7 @@ pub(crate) fn scan_claude_source(
     }
     if options.should_collect_tasks() {
         let event_rollups = session_event_rollups(&scan.events);
+        let mut project_cache = ProjectContextCache::new();
         for entry in load_claude_task_entries(&projects) {
             let event_rollup = event_rollups.get(&hash_text(&entry.session_id));
             if !should_emit_claude_task_entry(
@@ -256,7 +269,7 @@ pub(crate) fn scan_claude_source(
             let project = event_rollup
                 .and_then(SessionEventRollup::consistent_project)
                 .cloned()
-                .or_else(|| entry.project.clone());
+                .or_else(|| entry.resolve_project(&mut project_cache));
             let title = entry
                 .title
                 .clone()
@@ -493,7 +506,8 @@ pub(crate) struct ClaudeTaskEntry {
     pub(crate) title: Option<String>,
     pub(crate) title_source: &'static str,
     pub(crate) summary_preview: Option<String>,
-    pub(crate) project: Option<ProjectInfo>,
+    pub(crate) project_path: Option<PathBuf>,
+    pub(crate) git_branch: Option<String>,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) ended_at: DateTime<Utc>,
     pub(crate) source_path: Option<PathBuf>,

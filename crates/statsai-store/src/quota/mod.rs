@@ -6,13 +6,14 @@ use serde::Serialize;
 use statsai_core::{
     hash_text, periods_overlap, EventId, ProviderAccountId, QuotaChangePointV1,
     QuotaCycleContributionV1, QuotaDailyEnvelopeV1, QuotaObservationRecordV1, QuotaObservationV1,
-    QuotaProjectionStatusV1, QuotaTransitionKind, QuotaUsageLinkKind, QuotaUsageSliceV1,
-    QuotaUsageTotalsV1, QuotaWindowObservationV1, QuotaWindowSyncProjectionV1, QuotaWindowV1,
-    SourceAccountAssignment, SourceId, QUOTA_CYCLE_CONTRIBUTION_SCHEMA_VERSION,
+    QuotaProjectionStatusV1, QuotaStatusV1, QuotaTransitionKind, QuotaUsageLinkKind,
+    QuotaUsageSliceV1, QuotaUsageTotalsV1, QuotaWindowObservationV1, QuotaWindowSyncProjectionV1,
+    QuotaWindowV1, SourceAccountAssignment, SourceId, QUOTA_CYCLE_CONTRIBUTION_SCHEMA_VERSION,
     QUOTA_WEEKLY_WINDOW_MINUTES, QUOTA_WINDOW_SCHEMA_VERSION,
     QUOTA_WINDOW_SYNC_PROJECTION_SCHEMA_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 mod cycles;
 mod observations;

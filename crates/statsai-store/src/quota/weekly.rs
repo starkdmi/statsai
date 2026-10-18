@@ -358,9 +358,12 @@ impl Store {
             return Ok(());
         }
         let day_list = days.into_iter().collect::<Vec<_>>();
-        for event in
-            self.claude_code_events_on_utc_days(provider_account_id, source_id, &day_list)?
-        {
+        for event in self.account_events_on_utc_days(
+            MANUAL_WEEKLY_PROVIDER,
+            provider_account_id,
+            source_id,
+            &day_list,
+        )? {
             let estimated_cost = event.cost.estimated_micro_usd();
             for slices in slices_by_end.values_mut() {
                 for slice in slices.iter_mut() {
@@ -376,39 +379,46 @@ impl Store {
         Ok(())
     }
 
-    fn claude_code_events_on_utc_days(
+    /// One provider account's events that started on any of `days` (UTC), oldest
+    /// first, optionally from one source.
+    ///
+    /// Boundary slices are the only use: each lies within one UTC day, so the
+    /// events a cycle's slices can take are those of its two boundary days.
+    pub(crate) fn account_events_on_utc_days(
         &self,
+        provider: &str,
         provider_account_id: &ProviderAccountId,
         source_id: Option<&SourceId>,
         days: &[NaiveDate],
-    ) -> Result<Vec<statsai_core::UsageEvent>> {
-        if days.is_empty() {
-            return Ok(Vec::new());
-        }
+    ) -> Result<Vec<BoundaryEvent>> {
+        let mut events = Vec::new();
         // One indexed range per UTC day. Bundled SQLite drops `started_at` from
         // the provider/account index when those ranges are combined with OR, and
-        // then each batch scans the account's whole history.
-        let sql = boundary_day_events_sql(days.len(), source_id.is_some());
-        let mut statement = self.conn.prepare(&sql)?;
-        let mut bindings: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        for day in days {
-            let start = day.and_hms_opt(0, 0, 0).expect("utc midnight").and_utc();
-            let end = start + Duration::days(1);
-            bindings.push(Box::new(provider_account_id.0.clone()));
-            if let Some(source_id) = source_id {
-                bindings.push(Box::new(source_id.0.clone()));
+        // then each batch scans the account's whole history. Batches stay well
+        // under SQLite's limit on the terms of one compound SELECT.
+        for batch in days.chunks(BOUNDARY_DAYS_PER_QUERY) {
+            let sql = boundary_day_events_sql(batch.len(), source_id.is_some());
+            let mut statement = self.conn.prepare_cached(&sql)?;
+            let mut bindings: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            for day in batch {
+                let start = day.and_hms_opt(0, 0, 0).expect("utc midnight").and_utc();
+                let end = start + Duration::days(1);
+                bindings.push(Box::new(provider.to_string()));
+                bindings.push(Box::new(provider_account_id.0.clone()));
+                if let Some(source_id) = source_id {
+                    bindings.push(Box::new(source_id.0.clone()));
+                }
+                bindings.push(Box::new(start.to_rfc3339()));
+                bindings.push(Box::new(end.to_rfc3339()));
             }
-            bindings.push(Box::new(start.to_rfc3339()));
-            bindings.push(Box::new(end.to_rfc3339()));
-        }
-        let params = bindings
-            .iter()
-            .map(|value| value.as_ref() as &dyn rusqlite::types::ToSql)
-            .collect::<Vec<_>>();
-        let rows = statement.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(serde_json::from_str(&row?)?);
+            let params = bindings
+                .iter()
+                .map(|value| value.as_ref() as &dyn rusqlite::types::ToSql)
+                .collect::<Vec<_>>();
+            let rows = statement.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                events.push(serde_json::from_str(&row?)?);
+            }
         }
         Ok(events)
     }
@@ -435,29 +445,31 @@ fn usage_day_cell(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
     row.get(0)
 }
 
+/// UTC days one boundary-day query covers. Each day is one arm of a compound
+/// SELECT, and SQLite refuses more than 500 by default.
+pub(crate) const BOUNDARY_DAYS_PER_QUERY: usize = 100;
+
 /// `UNION ALL` of one provider/account/start-time range per UTC day.
 ///
 /// Each arm keeps `started_at` inside the index constraint. An `OR` of the same
 /// ranges does not, on the SQLite build this crate bundles.
 pub(crate) fn boundary_day_events_sql(day_count: usize, with_source: bool) -> String {
+    let per_day = if with_source { 5 } else { 4 };
     let mut arms = Vec::with_capacity(day_count);
     for index in 0..day_count {
-        let base = if with_source {
-            index * 4 + 1
-        } else {
-            index * 3 + 1
-        };
+        let provider_param = index * per_day + 1;
+        let account_param = provider_param + 1;
         let source_clause = if with_source {
-            format!("AND source_id = ?{} ", base + 1)
+            format!("AND source_id = ?{} ", account_param + 1)
         } else {
             String::new()
         };
-        let start_param = if with_source { base + 2 } else { base + 1 };
+        let start_param = provider_param + per_day - 2;
         let end_param = start_param + 1;
         arms.push(format!(
             "SELECT payload, started_at, event_id FROM usage_events \
-             WHERE provider = 'claude_code' \
-               AND provider_account_id = ?{base} \
+             WHERE provider = ?{provider_param} \
+               AND provider_account_id = ?{account_param} \
                {source_clause}AND started_at >= ?{start_param} \
                AND started_at < ?{end_param}"
         ));
@@ -514,4 +526,23 @@ fn manual_contribution_id(device_id: &str, account_id: &str, end_epoch: i64) -> 
         "quota_cycle_contribution.v1:{device_id}:claude_code:{account_id}:default:10080:manual:{end_epoch}"
     ));
     format!("quota_cycle_{}", &digest[..32])
+}
+
+/// The fields of a stored usage event that a boundary slice reads.
+///
+/// Boundary days carry thousands of events, and the rest of each payload -- source,
+/// session, model, project, git -- is most of its size. Deserializing into the
+/// same `UsageCounts` and `CostInfo` keeps the arithmetic identical.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct BoundaryEvent {
+    pub(crate) provider: String,
+    pub(crate) provider_account_id: Option<ProviderAccountId>,
+    pub(crate) session: BoundaryEventSession,
+    pub(crate) usage: statsai_core::UsageCounts,
+    pub(crate) cost: statsai_core::CostInfo,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct BoundaryEventSession {
+    pub(crate) started_at: DateTime<Utc>,
 }
