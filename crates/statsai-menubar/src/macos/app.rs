@@ -1,4 +1,5 @@
 use super::capture::{fetch_snapshot, run_statsai_capture, run_statsai_capture_dynamic};
+use super::legacy::migrate_legacy_bundles;
 use super::menu::{
     alert, choose_source_folder, choose_source_provider, dashboard_url, flush_pending_menu_shell,
     help_url, loading_snapshot, menu_shell_key, open_url, rebuild_menu_for_activity,
@@ -13,6 +14,9 @@ use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 pub fn run() -> Result<(), String> {
+    // A copy under the old bundle name may hold the instance lock, and the
+    // LaunchAgent install below must see it gone.
+    let legacy_migration = migrate_legacy_bundles();
     let _instance_lock = InstanceLock::acquire()?;
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
@@ -32,7 +36,9 @@ pub fn run() -> Result<(), String> {
         let _ = refresh_proxy.send_event(UserEvent::Refresh);
     });
 
-    if should_auto_install_background_tracking(cfg!(debug_assertions)) {
+    if should_auto_install_background_tracking(cfg!(debug_assertions))
+        || legacy_migration.launch_agent_needs_reinstall
+    {
         ensure_background_tracking();
     }
 
@@ -71,7 +77,7 @@ pub fn run() -> Result<(), String> {
             Event::NewEvents(tao::event::StartCause::Init) if tray_icon.is_none() => {
                 match TrayIconBuilder::new()
                     .with_menu(Box::new(tray_menu.clone()))
-                    .with_tooltip("StatsAI")
+                    .with_tooltip("StatsAI Menu Bar")
                     .with_icon(tray_icon_image())
                     .build()
                 {
@@ -86,7 +92,7 @@ pub fn run() -> Result<(), String> {
                         let _ = init_refresh_proxy.send_event(UserEvent::Refresh);
                     }
                     Err(err) => {
-                        eprintln!("StatsAI could not create the menu bar icon: {err}");
+                        eprintln!("StatsAI Menu Bar could not create its icon: {err}");
                         std::process::exit(1);
                     }
                 }

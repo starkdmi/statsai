@@ -2973,6 +2973,7 @@ dependencies = [
  "serde",
  "serde_json",
  "statsai",
+ "statsai-core",
  "statsai-store",
  "tao",
  "tray-icon",

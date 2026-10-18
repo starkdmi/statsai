@@ -1,8 +1,10 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+mod legacy_bundle;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("StatsAI menu bar app is only supported on macOS.");
+    eprintln!("StatsAI Menu Bar is only supported on macOS.");
     std::process::exit(1);
 }
 

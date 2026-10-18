@@ -86,7 +86,7 @@ impl MenuUi {
                 open_dashboard: MenuItem::new("Open Dashboard", true, None),
                 add_source: MenuItem::new("Add Source", true, None),
                 help: MenuItem::new("Help", true, None),
-                quit: MenuItem::new("Quit StatsAI", true, None),
+                quit: MenuItem::new("Quit StatsAI Menu Bar", true, None),
             },
             #[cfg(debug_assertions)]
             dev_info: status_item(" "),
@@ -362,7 +362,7 @@ pub(super) fn loading_snapshot() -> AppSnapshot {
         last_scan_summary: Some("Last scan · waiting to start".to_string()),
         help_url: help_url(),
         setup_url: dashboard_url(),
-        tooltip: "StatsAI".to_string(),
+        tooltip: "StatsAI Menu Bar".to_string(),
     }
 }
 
@@ -400,7 +400,7 @@ pub(super) fn unavailable_snapshot(reason: &str) -> AppSnapshot {
         last_scan_summary: Some("Last scan unavailable".to_string()),
         help_url: help_url(),
         setup_url: dashboard_url(),
-        tooltip: "StatsAI — status unavailable".to_string(),
+        tooltip: "StatsAI Menu Bar — status unavailable".to_string(),
     }
 }
 
@@ -562,7 +562,7 @@ mod tests {
             last_scan_summary: Some("Last scan found no requests yet".to_string()),
             help_url: "https://statsai.dev/help/setup".to_string(),
             setup_url: "https://statsai.dev/dashboard/".to_string(),
-            tooltip: "StatsAI".to_string(),
+            tooltip: "StatsAI Menu Bar".to_string(),
             menu_layout: "unlinked".to_string(),
             status_error: false,
         }
@@ -631,6 +631,15 @@ mod tests {
         ready.sessions_week = 10;
         ready.background_tracking.running = true;
         assert!(!should_run_startup_scan(&ready));
+    }
+
+    #[test]
+    fn placeholder_snapshots_name_the_menu_bar_app() {
+        assert_eq!(loading_snapshot().tooltip, "StatsAI Menu Bar");
+        assert_eq!(
+            unavailable_snapshot("offline").tooltip,
+            "StatsAI Menu Bar — status unavailable"
+        );
     }
 
     #[test]

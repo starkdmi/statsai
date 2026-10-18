@@ -168,7 +168,7 @@ fn resolve_statsai_binary() -> Result<PathBuf, String> {
         }
     }
 
-    Err("StatsAI could not find its background service.".to_string())
+    Err("StatsAI Menu Bar could not find its background service.".to_string())
 }
 
 fn validate_cli_path(path: &Path) -> Result<PathBuf, String> {
@@ -176,7 +176,7 @@ fn validate_cli_path(path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    if file_name == "statsai-menubar" || file_name == "StatsAI" {
+    if matches!(file_name, "statsai-menubar" | "StatsAIMenuBar" | "StatsAI") {
         return Err(format!(
             "{} is the menu bar app, not the CLI.",
             path.display()
@@ -240,5 +240,19 @@ fn same_executable(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_bar_executables_are_not_mistaken_for_the_cli() {
+        let macos_dir = Path::new("/Applications/StatsAIMenuBar.app/Contents/MacOS");
+        for name in ["statsai-menubar", "StatsAIMenuBar", "StatsAI"] {
+            let err = validate_cli_path(&macos_dir.join(name)).unwrap_err();
+            assert!(err.ends_with("is the menu bar app, not the CLI."), "{err}");
+        }
     }
 }

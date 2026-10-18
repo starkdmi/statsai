@@ -234,7 +234,7 @@ jobs:
           merge-multiple: true
       - name: Build universal macOS CLI archive
         run: ./packaging/scripts/build-universal-macos.sh
-      - name: Build StatsAI.app bundle
+      - name: Build StatsAIMenuBar.app bundle
         run: ./packaging/scripts/build-menubar-app.sh
       - name: Upload macOS extras
         uses: actions/upload-artifact@v7
@@ -243,8 +243,8 @@ jobs:
           path: |
             target/distrib/statsai-universal-apple-darwin.tar.xz
             target/distrib/statsai-universal-apple-darwin.tar.xz.sha256
-            target/distrib/StatsAI.app.zip
-            target/distrib/StatsAI.app.zip.sha256
+            target/distrib/StatsAIMenuBar.app.zip
+            target/distrib/StatsAIMenuBar.app.zip.sha256
 
   # Determines if we should publish/announce
   host:

@@ -95,7 +95,10 @@ cargo install statsai
 cargo binstall statsai
 ```
 
-GitHub Releases include a universal macOS CLI archive and `StatsAI.app`.
+GitHub Releases include a universal macOS CLI archive and the menu bar app,
+`StatsAIMenuBar.app`. Releases up to 0.7.2 named it `StatsAI.app`; on its first
+launch the renamed app moves that copy to the Trash and points its login item at
+itself.
 
 ### 2. Preview your local usage
 
