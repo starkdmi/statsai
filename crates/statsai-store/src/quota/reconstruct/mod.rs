@@ -13,7 +13,8 @@ pub(crate) struct WindowScope {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WindowPoint {
-    pub(crate) observation: QuotaObservationV1,
+    /// Shared by every window the observation reported, rather than copied into each.
+    pub(crate) observation: Rc<QuotaObservationV1>,
     pub(crate) window: QuotaWindowObservationV1,
 }
 
@@ -141,10 +142,10 @@ pub(crate) fn observation_postdates_reset(
 }
 
 pub(crate) fn daily_envelopes_from_points(points: &[WindowPoint]) -> Vec<QuotaDailyEnvelopeV1> {
-    let mut grouped = BTreeMap::<String, Vec<&WindowPoint>>::new();
+    let mut grouped = BTreeMap::<chrono::NaiveDate, Vec<&WindowPoint>>::new();
     for point in points {
         grouped
-            .entry(point.observation.observed_at.date_naive().to_string())
+            .entry(point.observation.observed_at.date_naive())
             .or_default()
             .push(point);
     }
@@ -155,7 +156,7 @@ pub(crate) fn daily_envelopes_from_points(points: &[WindowPoint]) -> Vec<QuotaDa
             let first = day_points.first().expect("non-empty utc day");
             let last = day_points.last().expect("non-empty utc day");
             QuotaDailyEnvelopeV1 {
-                day,
+                day: day.to_string(),
                 first_observed_at: first.observation.observed_at,
                 first_used_percent: first.window.used_percent,
                 last_observed_at: last.observation.observed_at,
@@ -288,6 +289,16 @@ pub(crate) fn quota_cluster_matches_time_query(
 pub(crate) fn collapse_semantic_duplicates(
     records: Vec<QuotaObservationRecordV1>,
 ) -> Vec<QuotaObservationRecordV1> {
+    collapse_semantic_duplicates_by(records, observation_quality)
+}
+
+/// [`collapse_semantic_duplicates`], ranking copies by `quality` instead of
+/// [`observation_quality`]. For readers that load fewer windows than an
+/// observation has and keep its full window count elsewhere.
+pub(crate) fn collapse_semantic_duplicates_by<Q: Ord>(
+    records: Vec<QuotaObservationRecordV1>,
+    quality: impl Fn(&QuotaObservationRecordV1) -> Q,
+) -> Vec<QuotaObservationRecordV1> {
     let mut semantic_groups = HashMap::<String, Vec<QuotaObservationRecordV1>>::new();
     for record in records {
         semantic_groups
@@ -307,9 +318,7 @@ pub(crate) fn collapse_semantic_duplicates(
             for record in group {
                 let source_id = record.observation.source_id.clone();
                 match source_scoped.get_mut(&source_id) {
-                    Some(existing)
-                        if observation_quality(&record) > observation_quality(existing) =>
-                    {
+                    Some(existing) if quality(&record) > quality(existing) => {
                         *existing = record;
                     }
                     Some(_) => {}
@@ -322,7 +331,7 @@ pub(crate) fn collapse_semantic_duplicates(
             continue;
         }
         if attributed_accounts.len() == 1 {
-            if let Some(best) = group.into_iter().max_by_key(observation_quality) {
+            if let Some(best) = group.into_iter().max_by_key(|record| quality(record)) {
                 collapsed.push(best);
             }
             continue;
@@ -336,7 +345,7 @@ pub(crate) fn collapse_semantic_duplicates(
                 continue;
             }
             match account_scoped.get_mut(&account_id) {
-                Some(existing) if observation_quality(&record) > observation_quality(existing) => {
+                Some(existing) if quality(&record) > quality(existing) => {
                     *existing = record;
                 }
                 Some(_) => {}
@@ -348,13 +357,23 @@ pub(crate) fn collapse_semantic_duplicates(
         collapsed.extend(account_scoped.into_values());
     }
 
-    collapsed.sort_by_key(|record| {
-        (
-            record.observation.observed_at,
-            record.observation.observation_id.clone(),
-        )
-    });
+    collapsed.sort_by(compare_observation_records);
     collapsed
+}
+
+/// Orders records by when they were observed, then by id, without copying either.
+pub(crate) fn compare_observation_records(
+    left: &QuotaObservationRecordV1,
+    right: &QuotaObservationRecordV1,
+) -> std::cmp::Ordering {
+    left.observation
+        .observed_at
+        .cmp(&right.observation.observed_at)
+        .then_with(|| {
+            left.observation
+                .observation_id
+                .cmp(&right.observation.observation_id)
+        })
 }
 
 pub(crate) fn observation_quality(record: &QuotaObservationRecordV1) -> (bool, bool, usize) {

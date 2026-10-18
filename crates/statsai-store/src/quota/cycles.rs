@@ -92,12 +92,11 @@ pub(crate) fn effective_cycle_bounds(windows: Vec<&QuotaWindowV1>) -> HashMap<St
     }
     let mut bounds = HashMap::new();
     for mut scope_windows in grouped.into_values() {
-        scope_windows.sort_by_key(|window| {
-            (
-                window.inferred_start,
-                window.representative_reset,
-                window.window_id.clone(),
-            )
+        scope_windows.sort_by(|left, right| {
+            left.inferred_start
+                .cmp(&right.inferred_start)
+                .then_with(|| left.representative_reset.cmp(&right.representative_reset))
+                .then_with(|| left.window_id.cmp(&right.window_id))
         });
         for window in &scope_windows {
             bounds.insert(

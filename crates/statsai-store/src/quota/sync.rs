@@ -1,4 +1,5 @@
 use super::*;
+use chrono::NaiveDate;
 
 impl Store {
     pub fn quota_sync_projections(
@@ -58,7 +59,7 @@ impl Store {
         query: &QuotaQuery,
         device_id: &str,
     ) -> Result<Vec<QuotaCycleContributionV1>> {
-        let reconstructed = self.reconstruct_quota_windows(query)?;
+        let reconstructed = self.reconstruct_attributed_weekly_quota_windows(query)?;
         let mut contributions = Vec::new();
         let mut pending = Vec::new();
         for item in reconstructed {
@@ -97,26 +98,6 @@ impl Store {
         );
         let mut slices_by_window = HashMap::<String, Vec<QuotaUsageSliceV1>>::new();
         if !pending.is_empty() {
-            let first_start = pending
-                .iter()
-                .map(|item| {
-                    effective_bounds
-                        .get(&item.reconstructed.window.window_id)
-                        .map(|bounds| bounds.start)
-                        .unwrap_or(item.reconstructed.window.inferred_start)
-                })
-                .min()
-                .expect("pending contributions are non-empty");
-            let last_end = pending
-                .iter()
-                .map(|item| {
-                    effective_bounds
-                        .get(&item.reconstructed.window.window_id)
-                        .map(|bounds| bounds.end)
-                        .unwrap_or(item.reconstructed.window.representative_reset)
-                })
-                .max()
-                .expect("pending contributions are non-empty");
             let mut slice_builders = pending
                 .iter()
                 .map(|item| {
@@ -143,7 +124,32 @@ impl Store {
                 })
                 .collect::<Vec<_>>();
 
-            for event in self.events_in_period(Some(first_start), last_end)? {
+            // Each slice lies within one UTC day, the day it starts on, so the
+            // events that can land in one are those of each cycle's two boundary
+            // days, for its own provider and account. Reading those days alone,
+            // rather than every event of every provider between the first cycle's
+            // start and the last one's end, keeps this proportional to the cycles.
+            let mut boundary_days =
+                BTreeMap::<(&str, &ProviderAccountId), BTreeSet<NaiveDate>>::new();
+            for (_, builders) in &slice_builders {
+                boundary_days
+                    .entry((builders.provider.as_str(), &builders.account_id))
+                    .or_default()
+                    .extend(
+                        builders
+                            .slices
+                            .iter()
+                            .map(|slice| slice.period_start.date_naive()),
+                    );
+            }
+            let mut boundary_events = Vec::new();
+            for ((provider, account_id), days) in boundary_days {
+                let days = days.into_iter().collect::<Vec<_>>();
+                boundary_events
+                    .extend(self.account_events_on_utc_days(provider, account_id, None, &days)?);
+            }
+
+            for event in boundary_events {
                 let Some(account_id) = event.provider_account_id.as_ref() else {
                     continue;
                 };

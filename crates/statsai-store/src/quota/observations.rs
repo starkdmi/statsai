@@ -377,17 +377,258 @@ impl Store {
             record.windows.push(window);
         }
         let mut records = observations.into_values().collect::<Vec<_>>();
-        records.sort_by_key(|record| {
-            (
-                record.observation.observed_at,
-                record.observation.observation_id.clone(),
-            )
-        });
+        records.sort_by(compare_observation_records);
         Ok(if collapse_duplicates {
             collapse_semantic_duplicates(records)
         } else {
             records
         })
+    }
+
+    /// The collapsed, attributed observations weekly cycle contributions are built
+    /// from, each with its weekly windows only.
+    ///
+    /// The result is what `quota_observations(query, true)` returns, less the
+    /// observations with no provider account and every window shorter than a week,
+    /// and with the fields contributions never read -- status, usage sample, line
+    /// number, source, raw rate limits -- left empty. Neither omission can change a
+    /// contribution: reconstruction scopes never mix window lengths, a contribution
+    /// needs an account, and an unattributed copy never outranks an attributed one
+    /// when duplicates collapse.
+    ///
+    /// What it saves is the reading. [`Store::quota_observations`] scans the
+    /// observation table, whose rows are mostly their JSON, and parses each
+    /// observation's JSON, its raw rate-limit payload and every window's JSON.
+    /// This reads the observations from two covering indexes,
+    /// `quota_observations_scope_idx` and `quota_observations_semantic_idx`, and the
+    /// windows in one sequential scan of their columns, with no JSON at all.
+    ///
+    /// Duplicates still collapse by the same ranking: windows of every length are
+    /// counted, and linked usage is read from `quota_observations_usage_event_idx`.
+    pub(crate) fn attributed_weekly_quota_observations(
+        &self,
+        query: &QuotaQuery,
+    ) -> Result<Vec<QuotaObservationRecordV1>> {
+        if query.source_id.is_some() {
+            // Only the CLI scopes contributions to a source, and the source index
+            // already narrows the full reader to that source's rows.
+            let mut records = self.quota_observations(query, true)?;
+            records.retain_mut(|record| {
+                record
+                    .windows
+                    .retain(|window| window.window_minutes == QUOTA_WEEKLY_WINDOW_MINUTES);
+                record.observation.provider_account_id.is_some() && !record.windows.is_empty()
+            });
+            return Ok(records);
+        }
+
+        let mut sql = String::from(
+            "SELECT rowid, observation_id, provider, provider_account_id, observed_at
+             FROM quota_observations
+             WHERE provider_account_id IS NOT NULL",
+        );
+        let mut bindings = Vec::<&str>::new();
+        if let Some(provider) = query.provider.as_deref() {
+            bindings.push(provider);
+            sql.push_str(&format!(" AND provider = ?{}", bindings.len()));
+        }
+        if let Some(account_id) = query.provider_account_id.as_ref() {
+            bindings.push(&account_id.0);
+            sql.push_str(&format!(" AND provider_account_id = ?{}", bindings.len()));
+        }
+        let mut ids = Vec::new();
+        let mut scoped = Vec::new();
+        let mut statement = self.conn.prepare(&sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(bindings))?;
+        while let Some(row) = rows.next()? {
+            ids.push(row.get::<_, String>(1)?);
+            scoped.push(ScopedObservation {
+                rowid: row.get(0)?,
+                provider: row.get(2)?,
+                provider_account_id: ProviderAccountId(row.get(3)?),
+                observed_at: crate::parse_rfc3339_for_row(row.get_ref(4)?.as_str()?, 4)?,
+            });
+        }
+        drop(rows);
+        drop(statement);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let position = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+
+        // Every window is counted, as the collapse ranking counts them; only the
+        // weekly ones are kept. A sequential scan reads fewer pages than looking
+        // each weekly row up from `quota_window_observations_reconstruct_idx`.
+        let mut windows = vec![Vec::<QuotaWindowObservationV1>::new(); ids.len()];
+        let mut window_counts = vec![0usize; ids.len()];
+        let window_sql = if query.limit_id.is_some() {
+            "SELECT window_observation_id, observation_id, provider_slot, limit_id,
+                    window_minutes, used_percent, resets_at
+             FROM quota_window_observations
+             WHERE limit_id = ?1"
+        } else {
+            "SELECT window_observation_id, observation_id, provider_slot, limit_id,
+                    window_minutes, used_percent, resets_at
+             FROM quota_window_observations"
+        };
+        let mut statement = self.conn.prepare(window_sql)?;
+        let mut rows = match query.limit_id.as_deref() {
+            Some(limit_id) => statement.query(params![limit_id])?,
+            None => statement.query([])?,
+        };
+        while let Some(row) = rows.next()? {
+            let Some(&index) = position.get(row.get_ref(1)?.as_str()?) else {
+                continue;
+            };
+            window_counts[index] += 1;
+            if row.get::<_, i64>(4)? != QUOTA_WEEKLY_WINDOW_MINUTES as i64 {
+                continue;
+            }
+            let resets_at_epoch_seconds = row.get::<_, i64>(6)?;
+            let resets_at = DateTime::from_timestamp(resets_at_epoch_seconds, 0).ok_or(
+                rusqlite::Error::IntegralValueOutOfRange(6, resets_at_epoch_seconds),
+            )?;
+            windows[index].push(QuotaWindowObservationV1 {
+                schema_version: String::new(),
+                window_observation_id: row.get(0)?,
+                observation_id: ids[index].clone(),
+                provider_slot: row.get(2)?,
+                limit_id: row.get(3)?,
+                window_minutes: QUOTA_WEEKLY_WINDOW_MINUTES,
+                used_percent: used_percent_as_parsed(row.get(5)?),
+                resets_at,
+                resets_at_epoch_seconds,
+            });
+        }
+        drop(rows);
+        drop(statement);
+
+        let superseded =
+            self.superseded_semantic_duplicates(&ids, &scoped, &position, |index| {
+                window_counts[index]
+            })?;
+
+        let mut kept = (0..ids.len())
+            .filter(|&index| !superseded.contains(&index) && !windows[index].is_empty())
+            .collect::<Vec<_>>();
+        kept.sort_by(|&left, &right| {
+            scoped[left]
+                .observed_at
+                .cmp(&scoped[right].observed_at)
+                .then_with(|| ids[left].cmp(&ids[right]))
+        });
+        let mut ids = ids.into_iter().map(Some).collect::<Vec<_>>();
+        let mut scoped = scoped.into_iter().map(Some).collect::<Vec<_>>();
+        Ok(kept
+            .into_iter()
+            .map(|index| {
+                let observation_id = ids[index].take().expect("each observation is kept once");
+                let scoped = scoped[index].take().expect("each observation is kept once");
+                let mut windows = std::mem::take(&mut windows[index]);
+                // The order `quota_observations` loads them in.
+                windows.sort_by(|left, right| {
+                    left.resets_at_epoch_seconds
+                        .cmp(&right.resets_at_epoch_seconds)
+                        .then_with(|| left.window_observation_id.cmp(&right.window_observation_id))
+                });
+                QuotaObservationRecordV1 {
+                    observation: scoped.into_observation(observation_id),
+                    windows,
+                    raw_rate_limits: serde_json::Value::Null,
+                }
+            })
+            .collect())
+    }
+
+    /// The positions, among `ids`, of observations that a semantic duplicate
+    /// outranks, decided exactly as [`collapse_semantic_duplicates`] decides it.
+    ///
+    /// `quota_observations_semantic_idx` lists fingerprints in order, so copies
+    /// sit next to each other and only they are ranked.
+    fn superseded_semantic_duplicates(
+        &self,
+        ids: &[String],
+        scoped: &[ScopedObservation],
+        position: &HashMap<&str, usize>,
+        window_count: impl Fn(usize) -> usize,
+    ) -> Result<HashSet<usize>> {
+        let mut duplicates = Vec::<(usize, String)>::new();
+        let mut run = Vec::<usize>::new();
+        let mut run_fingerprint = String::new();
+        let mut statement = self.conn.prepare(
+            "SELECT semantic_fingerprint, observation_id FROM quota_observations
+             ORDER BY semantic_fingerprint",
+        )?;
+        let mut rows = statement.query([])?;
+        loop {
+            let row = rows.next()?;
+            let fingerprint = match row {
+                Some(row) => Some(row.get_ref(0)?.as_str()?),
+                None => None,
+            };
+            if fingerprint != Some(run_fingerprint.as_str()) {
+                if run.len() > 1 {
+                    duplicates.extend(run.iter().map(|&index| (index, run_fingerprint.clone())));
+                }
+                run.clear();
+                run_fingerprint.clear();
+                run_fingerprint.push_str(fingerprint.unwrap_or_default());
+            }
+            let Some(row) = row else { break };
+            if let Some(&index) = position.get(row.get_ref(1)?.as_str()?) {
+                run.push(index);
+            }
+        }
+        drop(rows);
+        drop(statement);
+        if duplicates.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut linked = HashSet::new();
+        let mut statement = self
+            .conn
+            .prepare("SELECT rowid FROM quota_observations WHERE usage_event_id IS NOT NULL")?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        for rowid in rows {
+            linked.insert(rowid?);
+        }
+
+        let mut records = duplicates
+            .into_iter()
+            .map(|(index, fingerprint)| {
+                let mut observation = scoped[index].clone().into_observation(ids[index].clone());
+                observation.semantic_fingerprint = fingerprint;
+                observation.usage_event_id = linked
+                    .contains(&scoped[index].rowid)
+                    .then(|| EventId(String::new()));
+                QuotaObservationRecordV1 {
+                    observation,
+                    windows: Vec::new(),
+                    raw_rate_limits: serde_json::Value::Null,
+                }
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(compare_observation_records);
+        let candidates = records
+            .iter()
+            .map(|record| position[record.observation.observation_id.as_str()])
+            .collect::<HashSet<_>>();
+        let kept = collapse_semantic_duplicates_by(records, |record| {
+            (
+                record.observation.provider_account_id.is_some(),
+                record.observation.usage_event_id.is_some(),
+                window_count(position[record.observation.observation_id.as_str()]),
+            )
+        })
+        .into_iter()
+        .map(|record| position[record.observation.observation_id.as_str()])
+        .collect::<HashSet<_>>();
+        Ok(candidates.difference(&kept).copied().collect())
     }
 
     pub fn delete_quota_observations_for_sources(&self, source_ids: &[SourceId]) -> Result<u64> {
@@ -573,4 +814,54 @@ impl Store {
 pub(crate) struct QuotaWriteCount {
     pub(crate) written: u64,
     pub(crate) changed: u64,
+}
+
+/// An attributed observation as `quota_observations_scope_idx` covers it.
+#[derive(Clone)]
+struct ScopedObservation {
+    rowid: i64,
+    provider: String,
+    provider_account_id: ProviderAccountId,
+    observed_at: DateTime<Utc>,
+}
+
+impl ScopedObservation {
+    /// The observation with every field the index does not cover left empty.
+    fn into_observation(self, observation_id: String) -> QuotaObservationV1 {
+        QuotaObservationV1 {
+            schema_version: String::new(),
+            observation_id,
+            semantic_fingerprint: String::new(),
+            provider: self.provider,
+            source_id: SourceId(String::new()),
+            provider_account_id: Some(self.provider_account_id),
+            observed_at: self.observed_at,
+            source_file_path_hash: String::new(),
+            source_record_id: String::new(),
+            source_line_number: 0,
+            payload_hash: String::new(),
+            usage_sample: None,
+            usage_event_id: None,
+            usage_link_kind: QuotaUsageLinkKind::None,
+            status: QuotaStatusV1::default(),
+        }
+    }
+}
+
+/// A window's `used_percent` as [`Store::quota_observations`] reads it back from
+/// the window's JSON.
+///
+/// The column holds the value as observed. The JSON holds the shortest decimal
+/// that round-trips, but serde_json's default parser can land one unit in the last
+/// place away from it for a long fraction, and every result built so far, synced
+/// ones included, carries the parsed value. Whole percentages, all Codex reports,
+/// are exact either way and skip the detour.
+fn used_percent_as_parsed(value: f64) -> f64 {
+    if value.fract() == 0.0 {
+        return value;
+    }
+    serde_json::to_string(&value)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(value)
 }
