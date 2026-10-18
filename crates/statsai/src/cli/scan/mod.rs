@@ -8,14 +8,15 @@ use super::source::{
 };
 use anyhow::{Context, Result};
 use statsai_adapters::{
-    adapter_for_provider, default_adapters, retain_accounts_referenced_by_account_evidence,
-    AccountEvidenceScan, ProviderAdapter, ScanCandidateFile, ScanDiagnostics, ScanOptions,
-    VerifiedSourceObservation, OPENCODE_PROVIDER,
+    adapter_for_provider, claude_denied_project_settings_folders, default_adapters,
+    retain_accounts_referenced_by_account_evidence, AccountEvidenceScan,
+    ClaudeProjectSettingsDeferral, ProviderAdapter, ScanCandidateFile, ScanDiagnostics,
+    ScanOptions, VerifiedSourceObservation, CLAUDE_CODE_PROVIDER, OPENCODE_PROVIDER,
 };
 use statsai_core::{
-    hash_text, EventId, QuotaObservationRecordV1, SourceId, SourceKind, SourceLocation,
-    SourceVerificationMode, TaskSpan, TaskVerification, UsageEvent, UsageTotals,
-    ACTIVITY_PARSER_REVISION,
+    collapse_home_path_label, hash_text, home_dir, EventId, QuotaObservationRecordV1, SourceId,
+    SourceKind, SourceLocation, SourceVerificationMode, TaskSpan, TaskVerification, UsageEvent,
+    UsageTotals, ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
     derive_task_work_items, gone_scan_files, reconcile_verified_source_state,
@@ -106,38 +107,6 @@ pub(crate) fn scan_with_adapters(
                 source.path_label = path_label_from_hashless_source(&source);
             }
             let verification_mode = source_verification_mode(&source);
-            let account_evidence_enabled =
-                matches!(verification_mode, SourceVerificationMode::Auto);
-            let mut account_evidence = AccountEvidenceScan::default();
-            let account_evidence_started_at = Instant::now();
-            if account_evidence_enabled {
-                let account_evidence_checkpoints =
-                    store.account_evidence_checkpoints(&source.source_id)?;
-                account_evidence =
-                    adapter.collect_account_evidence(&source, &account_evidence_checkpoints)?;
-                let known_account_aliases = canonicalize_known_account_evidence(
-                    store,
-                    adapter.provider(),
-                    &mut account_evidence,
-                )?;
-                store.retain_unseen_account_evidence(
-                    &source.source_id,
-                    &mut account_evidence.identity_observations,
-                    &mut account_evidence.plan_observations,
-                    &mut account_evidence.conversation_bindings,
-                )?;
-                retain_accounts_referenced_by_account_evidence(
-                    adapter.provider(),
-                    &known_account_aliases,
-                    &mut account_evidence,
-                );
-            }
-            account_evidence_duration_ms +=
-                account_evidence_started_at.elapsed().as_millis() as u64;
-            let account_evidence_count = account_evidence.identity_observations.len()
-                + account_evidence.plan_observations.len()
-                + account_evidence.conversation_bindings.len();
-            let account_evidence_checkpoint_count = account_evidence.checkpoints.len();
             let candidate_scan_started_at = Instant::now();
             let cache_candidates = adapter.scan_candidates(&source)?;
             let compatible_scan_signatures =
@@ -236,6 +205,43 @@ pub(crate) fn scan_with_adapters(
                 },
                 activity_full_reconcile,
             };
+            // A source with no file to read has no usage to attribute, so nothing
+            // that depends on its project folders is asked about until a scan that
+            // reads it. See ClaudeProjectSettingsDeferral.
+            let source_idle = !should_run_adapter_scan && !touched_files && !command.no_cache;
+            let _project_settings_deferral = source_idle.then(ClaudeProjectSettingsDeferral::begin);
+            let account_evidence_enabled =
+                matches!(verification_mode, SourceVerificationMode::Auto);
+            let mut account_evidence = AccountEvidenceScan::default();
+            let account_evidence_started_at = Instant::now();
+            if account_evidence_enabled {
+                let account_evidence_checkpoints =
+                    store.account_evidence_checkpoints(&source.source_id)?;
+                account_evidence =
+                    adapter.collect_account_evidence(&source, &account_evidence_checkpoints)?;
+                let known_account_aliases = canonicalize_known_account_evidence(
+                    store,
+                    adapter.provider(),
+                    &mut account_evidence,
+                )?;
+                store.retain_unseen_account_evidence(
+                    &source.source_id,
+                    &mut account_evidence.identity_observations,
+                    &mut account_evidence.plan_observations,
+                    &mut account_evidence.conversation_bindings,
+                )?;
+                retain_accounts_referenced_by_account_evidence(
+                    adapter.provider(),
+                    &known_account_aliases,
+                    &mut account_evidence,
+                );
+            }
+            account_evidence_duration_ms +=
+                account_evidence_started_at.elapsed().as_millis() as u64;
+            let account_evidence_count = account_evidence.identity_observations.len()
+                + account_evidence.plan_observations.len()
+                + account_evidence.conversation_bindings.len();
+            let account_evidence_checkpoint_count = account_evidence.checkpoints.len();
             let probed_verified_source_state =
                 if matches!(verification_mode, SourceVerificationMode::Disabled) {
                     VerifiedSourceObservation::Unavailable
@@ -821,5 +827,27 @@ pub(crate) fn scan_with_adapters(
         }
         print_scan_diagnostics_total(&total_diagnostics);
     }
+    print_denied_project_settings_folders();
     Ok(())
+}
+
+/// One `scan warning:` line per folder whose Claude Code project settings a
+/// privacy setting kept this scan from reading, after the summary, for tools
+/// that run scans to show: `scan warning: project_settings_denied
+/// provider=claude_code folder="~/Documents"`. The folder is a JSON string,
+/// with the home directory as `~`. The scan still counts usage there; account
+/// attribution leaves those settings out.
+fn print_denied_project_settings_folders() {
+    let home = home_dir();
+    for folder in claude_denied_project_settings_folders() {
+        let label = folder.to_string_lossy();
+        let label = match home.as_deref() {
+            Some(home) => collapse_home_path_label(&label, home),
+            None => label.into_owned(),
+        };
+        println!(
+            "scan warning: project_settings_denied provider={CLAUDE_CODE_PROVIDER} folder={}",
+            serde_json::Value::String(label)
+        );
+    }
 }

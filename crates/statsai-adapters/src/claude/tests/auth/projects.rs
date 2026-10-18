@@ -942,3 +942,233 @@ fn claude_unreadable_project_settings_keep_the_sources_verified_assignment() {
 
     assert_eq!(after_denial, assignments);
 }
+
+#[test]
+fn privacy_protected_folders_are_the_ones_a_denial_covers_whole() {
+    let home = Path::new("/Users/someone");
+    for (path, folder) in [
+        (
+            "/Users/someone/Documents/app/.claude",
+            Some("/Users/someone/Documents"),
+        ),
+        (
+            "/Users/someone/Downloads/app/.claude",
+            Some("/Users/someone/Downloads"),
+        ),
+        ("/Users/someone/Desktop/app", Some("/Users/someone/Desktop")),
+        (
+            "/Users/someone/Library/Mobile Documents/com~apple~CloudDocs/app",
+            Some("/Users/someone/Library/Mobile Documents"),
+        ),
+        ("/Volumes/External/app/.claude", Some("/Volumes/External")),
+        ("/Users/someone/work/app/.claude", None),
+        ("/Users/someone/Library/Caches/app", None),
+        ("/Users/someone/Documents", Some("/Users/someone/Documents")),
+        ("/Users/someone2/Documents/app", None),
+        ("/opt/work/app", None),
+    ] {
+        assert_eq!(
+            privacy_protected_folder(Path::new(path), Some(home)),
+            folder.map(PathBuf::from),
+            "{path}"
+        );
+    }
+}
+
+/// A Claude config root whose session indexes name `projects`, which need not
+/// exist: opening their settings is what the tests watch.
+#[cfg(unix)]
+fn claude_root_naming_projects(dir: &Path, projects: &[PathBuf]) -> PathBuf {
+    let root = dir.join("claude-config");
+    for (index, project) in projects.iter().enumerate() {
+        let project_store = root.join("projects").join(format!("project-{index}"));
+        std::fs::create_dir_all(&project_store).expect("project store");
+        std::fs::write(
+            project_store.join("sessions-index.json"),
+            serde_json::json!({"version": 1, "originalPath": project, "entries": []}).to_string(),
+        )
+        .expect("session index");
+    }
+    root
+}
+
+#[cfg(unix)]
+#[test]
+fn a_denied_protected_folder_is_asked_about_once_per_probe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Not under the home directory, so the volume is the protected folder and
+    // the repository search stops at its root.
+    let volume = PathBuf::from("/Volumes/statsai-test-denied-volume");
+    let projects = ["first", "second", "third"].map(|name| volume.join(name));
+    let root = claude_root_naming_projects(dir.path(), &projects);
+    let _denials = projects
+        .iter()
+        .flat_map(|project| claude_settings_paths(&project.join(".claude")))
+        .map(|path| test_support::DenySettingsRead::new(&path))
+        .collect::<Vec<_>>();
+    test_support::take_opened_settings();
+
+    let probe = claude_source_settings_auth_override(&root, &root);
+
+    assert_eq!(probe, Some(ClaudeAuthOverrideProbe::Clear));
+    let opened_on_volume = test_support::take_opened_settings()
+        .into_iter()
+        .filter(|path| path.starts_with(&volume))
+        .count();
+    assert_eq!(
+        opened_on_volume, 1,
+        "the first denial stands for the whole volume"
+    );
+    assert!(claude_denied_project_settings_folders().contains(&volume));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_denied_project_outside_protected_folders_does_not_excuse_the_others() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) =
+        claude_root_with_project_settings(dir.path(), &["denied-workspace", "other-workspace"]);
+    let _deny = test_support::DenySettingsRead::new(&settings_paths[0]);
+    // The other project's settings exist and are another user's: only a
+    // protected folder's denial may stand for its neighbours.
+    let _other =
+        test_support::DenySettingsRead::with_errno(&settings_paths[1], test_support::EACCES);
+
+    assert_eq!(claude_source_settings_auth_override(&root, &root), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_denied_project_outside_protected_folders_is_reported_by_its_folder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) =
+        claude_root_with_project_settings(dir.path(), &["denied-workspace", "other-workspace"]);
+    let _deny = test_support::DenySettingsRead::new(&settings_paths[0]);
+    test_support::take_opened_settings();
+
+    assert_eq!(
+        claude_source_settings_auth_override(&root, &root),
+        Some(ClaudeAuthOverrideProbe::Clear)
+    );
+    assert!(test_support::take_opened_settings().contains(&settings_paths[1]));
+    assert!(claude_denied_project_settings_folders().contains(&dir.path().join("denied-workspace")));
+}
+
+#[cfg(unix)]
+#[test]
+fn deferred_project_settings_are_neither_opened_nor_answered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) =
+        claude_root_with_project_settings(dir.path(), &["first-workspace", "second-workspace"]);
+    let source = SourceLocation::local_adapter(
+        crate::CLAUDE_CODE_PROVIDER,
+        "claude-code-local-jsonl",
+        "0",
+        &root,
+        LocationOrigin::Configured,
+    );
+    let adapter = ClaudeCodeAdapter;
+    test_support::take_opened_settings();
+
+    {
+        let _deferral = ClaudeProjectSettingsDeferral::begin();
+        assert!(matches!(
+            adapter
+                .probe_verified_source_state(&source)
+                .expect("deferred probe"),
+            VerifiedSourceObservation::Unavailable
+        ));
+        let evidence = adapter
+            .collect_account_evidence(&source, &[])
+            .expect("deferred evidence");
+        assert!(evidence.plan_observations.is_empty());
+        let opened = test_support::take_opened_settings();
+        assert!(
+            settings_paths.iter().all(|path| !opened.contains(path)),
+            "{opened:?}"
+        );
+    }
+
+    // The next pass that is not deferred answers as before.
+    assert!(matches!(
+        adapter.probe_verified_source_state(&source).expect("probe"),
+        VerifiedSourceObservation::Inferred { .. }
+    ));
+    let evidence = adapter
+        .collect_account_evidence(&source, &[])
+        .expect("evidence");
+    assert_eq!(evidence.plan_observations.len(), 1);
+    assert!(test_support::take_opened_settings().contains(&settings_paths[0]));
+}
+
+#[cfg(unix)]
+#[test]
+fn account_dependencies_leave_out_every_project_folder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, settings_paths) =
+        claude_root_with_project_settings(dir.path(), &["first-workspace", "second-workspace"]);
+    let source = SourceLocation::local_adapter(
+        crate::CLAUDE_CODE_PROVIDER,
+        "claude-code-local-jsonl",
+        "0",
+        &root,
+        LocationOrigin::Configured,
+    );
+    let adapter = ClaudeCodeAdapter;
+
+    let all = adapter.verification_dependency_paths(&source);
+    let account = adapter.account_verification_dependency_paths(&source);
+
+    let project_settings_roots = settings_paths
+        .iter()
+        .map(|path| path.parent().expect("settings root").to_path_buf())
+        .collect::<Vec<_>>();
+    assert!(project_settings_roots.iter().all(|root| all.contains(root)));
+    assert!(account
+        .iter()
+        .all(|path| !path.starts_with(dir.path().join("first-workspace"))
+            && !path.starts_with(dir.path().join("second-workspace"))));
+    assert!(account.iter().all(|path| all.contains(path)));
+    assert!(account.contains(&root.join(".claude.json")));
+}
+
+#[test]
+fn a_source_with_no_project_is_answered_while_deferred() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("claude-config");
+    std::fs::create_dir_all(root.join("projects")).expect("projects root");
+    std::fs::write(
+        root.join(".claude.json"),
+        serde_json::json!({
+            "oauthAccount": {
+                "accountUuid": "cached-account",
+                "emailAddress": "cached@example.com",
+                "profileFetchedAt": 1_786_104_000_000_i64,
+                "organizationType": "claude_max",
+                "organizationRateLimitTier": "default_claude_max_5x"
+            }
+        })
+        .to_string(),
+    )
+    .expect("claude profile");
+    let source = SourceLocation::local_adapter(
+        crate::CLAUDE_CODE_PROVIDER,
+        "claude-code-local-jsonl",
+        "0",
+        &root,
+        LocationOrigin::Configured,
+    );
+    let adapter = ClaudeCodeAdapter;
+
+    // Answering reads no project folder, so nothing is deferred: a source's
+    // account and plan are recorded before it has any session.
+    let _deferral = ClaudeProjectSettingsDeferral::begin();
+    assert!(matches!(
+        adapter.probe_verified_source_state(&source).expect("probe"),
+        VerifiedSourceObservation::Inferred { .. }
+    ));
+    let evidence = adapter
+        .collect_account_evidence(&source, &[])
+        .expect("evidence");
+    assert_eq!(evidence.plan_observations.len(), 1);
+}

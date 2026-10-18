@@ -58,7 +58,7 @@ impl VerificationDependencyCache {
             return cached.paths.clone();
         }
 
-        let paths = adapter.verification_dependency_paths(source);
+        let paths = adapter.account_verification_dependency_paths(source);
         self.entries.insert(
             source.source_id.clone(),
             CachedVerificationDependencies {

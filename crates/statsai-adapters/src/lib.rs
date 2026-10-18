@@ -73,15 +73,18 @@ pub(crate) use model::{
     ModelReasoningState,
 };
 pub(crate) use project::{
-    project_context_from_path_fallback, resolve_project_context, resolve_project_context_cached,
-    ProjectContextCache,
+    git_discovery_ancestors, project_context_from_path_fallback, resolve_project_context,
+    resolve_project_context_cached, ProjectContextCache,
 };
 pub(crate) use sqlite::{
     open_sqlite_readonly, sqlite_column_exists, sqlite_nonzero_u64, sqlite_table_exists,
 };
 
 pub(crate) use claude::claude_usage_counts_from_value;
-pub use claude::{ClaudeCodeAdapter, ClaudeProjectPathMemo};
+pub use claude::{
+    claude_denied_project_settings_folders, ClaudeCodeAdapter, ClaudeProjectPathMemo,
+    ClaudeProjectSettingsDeferral,
+};
 pub use codex::CodexAdapter;
 pub(crate) use codex::{
     codex_project_context_from_value, codex_quota_observation, codex_token_count_usage,
@@ -307,6 +310,17 @@ pub trait ProviderAdapter: Send + Sync {
     }
     fn verification_dependency_paths(&self, _source: &SourceLocation) -> Vec<PathBuf> {
         Vec::new()
+    }
+    /// The part of [`verification_dependency_paths`](Self::verification_dependency_paths)
+    /// that belongs to the source itself, such as its credentials and its user
+    /// settings, without anything in the folders of the projects it was used
+    /// in. Listing those touches every project folder, which on macOS asks the
+    /// privacy settings about each protected folder one is in; a watcher that
+    /// should not do that before anything changed uses this list, and sees a
+    /// change to a project's settings at the next scan that reads the source.
+    /// The default is the full list, for adapters with no project dependencies.
+    fn account_verification_dependency_paths(&self, source: &SourceLocation) -> Vec<PathBuf> {
+        self.verification_dependency_paths(source)
     }
     fn verification_dependency_paths_changed(
         &self,

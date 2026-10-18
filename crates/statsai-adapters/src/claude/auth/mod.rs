@@ -1,6 +1,6 @@
 use crate::{
-    collect_jsonl_files, file_modified_at, parse_timestamp_value, read_bounded_jsonl_line,
-    BoundedLineRead, MAX_JSONL_RECORD_BYTES,
+    collect_jsonl_files, file_modified_at, git_discovery_ancestors, parse_timestamp_value,
+    read_bounded_jsonl_line, BoundedLineRead, MAX_JSONL_RECORD_BYTES,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
@@ -21,10 +21,11 @@ mod plans;
 mod projects;
 
 pub(crate) use desktop::*;
+pub use overrides::claude_denied_project_settings_folders;
 pub(crate) use overrides::*;
 pub(crate) use plans::*;
-pub use projects::ClaudeProjectPathMemo;
 pub(crate) use projects::*;
+pub use projects::{ClaudeProjectPathMemo, ClaudeProjectSettingsDeferral};
 
 pub(crate) const CLAUDE_SETTINGS_AUTH_OVERRIDE_KEYS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
@@ -94,6 +95,30 @@ pub(crate) fn claude_auth_dependency_paths(
     root: &Path,
     location_origin: &LocationOrigin,
 ) -> Vec<PathBuf> {
+    let mut paths = claude_account_dependency_paths(root, location_origin);
+    if let Some(project_paths) = claude_project_paths_from_session_indexes(&root.join("projects")) {
+        for project_path in project_paths {
+            for project_settings_root in claude_project_settings_roots(&project_path) {
+                if project_settings_root.is_dir() {
+                    paths.push(project_settings_root);
+                } else {
+                    paths.extend(claude_settings_paths(&project_settings_root));
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The dependencies that are the source's own: its profile, user and managed
+/// settings, and desktop session records. Unlike the projects' settings, none
+/// of them is in a project folder, so listing them reads nothing there.
+pub(crate) fn claude_account_dependency_paths(
+    root: &Path,
+    location_origin: &LocationOrigin,
+) -> Vec<PathBuf> {
     let default_root = home_dir().map(|home| home.join(".claude"));
     let settings_root = claude_settings_root(root, location_origin, default_root.as_deref());
     let mut paths = claude_profile_dependency_paths(root, location_origin, default_root.as_deref());
@@ -106,17 +131,6 @@ pub(crate) fn claude_auth_dependency_paths(
     // of their own.
     if let Some(desktop_sessions_root) = claude_desktop_sessions_root_for(root) {
         paths.push(desktop_sessions_root);
-    }
-    if let Some(project_paths) = claude_project_paths_from_session_indexes(&root.join("projects")) {
-        for project_path in project_paths {
-            for project_settings_root in claude_project_settings_roots(&project_path) {
-                if project_settings_root.is_dir() {
-                    paths.push(project_settings_root);
-                } else {
-                    paths.extend(claude_settings_paths(&project_settings_root));
-                }
-            }
-        }
     }
     paths.sort();
     paths.dedup();

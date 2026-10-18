@@ -307,7 +307,14 @@ file in a folder that macOS privacy settings protect, which fails to open with
 whole source. That project's sessions are then attributed like the rest of the
 source even if the file selects another credential, and a scan that can read the
 file may disagree with one that can't; let StatsAI read the folder, or use
-`manual_only`. One-shot environment overrides cannot be reconstructed by
+`manual_only`. After the first such file, the scan skips the rest of that
+protected folder, and `scan` prints a `scan warning: project_settings_denied`
+line naming the folder after its summary. Project settings are read only by a
+scan that has files of the source to read: a scan with nothing new keeps the
+source's last verified state, and a settings change is seen by the next scan
+with activity, before it attributes that activity. The search for a project's
+repository root stops at the home directory, or at a volume's root under
+`/Volumes`. One-shot environment overrides cannot be reconstructed by
 file-only collection, so `auto` is a best-effort source-wide policy. Use
 `manual_only` plus explicit source connections for mixed-credential history.
 

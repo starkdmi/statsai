@@ -1,5 +1,5 @@
 use statsai_core::{
-    display_path, hash_text, location_path_hash, normalize_git_remote, ProjectInfo,
+    display_path, hash_text, home_dir, location_path_hash, normalize_git_remote, ProjectInfo,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -149,19 +149,38 @@ pub(crate) fn read_git_repository_metadata(path: &Path) -> Option<GitRepositoryM
 }
 
 pub(crate) fn find_git_repo_root(path: &Path) -> Option<PathBuf> {
-    let mut current = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent()?.to_path_buf()
-    };
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
+    let start = if path.is_dir() { path } else { path.parent()? };
+    git_discovery_ancestors(start)
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// `path` and its ancestors, as far as a repository holding `path` can start.
+///
+/// A path inside the home directory stops at the home directory, and one on a
+/// volume under `/Volumes` at the volume's root; any other path goes up to the
+/// filesystem root. Above those lie only the folders every project shares
+/// (`/Users`, `/`), and on macOS asking for a `.git` there is one more file
+/// access per project for no repository anyone keeps.
+pub(crate) fn git_discovery_ancestors(path: &Path) -> impl Iterator<Item = &Path> {
+    let ceiling = git_discovery_ceiling(path, home_dir().as_deref());
+    let mut reached_ceiling = false;
+    path.ancestors().take_while(move |ancestor| {
+        if reached_ceiling {
+            return false;
         }
-        if !current.pop() {
-            return None;
-        }
+        reached_ceiling = ceiling.as_deref() == Some(*ancestor);
+        true
+    })
+}
+
+pub(crate) fn git_discovery_ceiling(path: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(home) = home.filter(|home| home.parent().is_some() && path.starts_with(home)) {
+        return Some(home.to_path_buf());
     }
+    let mut components = path.strip_prefix("/Volumes").ok()?.components();
+    let volume = components.next()?;
+    Some(Path::new("/Volumes").join(volume.as_os_str()))
 }
 
 pub(crate) fn git_dir_for_repo_root(repo_root: &Path) -> Option<PathBuf> {
@@ -274,4 +293,62 @@ fn project_context_requires_path_or_repo_identity() {
     .into_project_info();
 
     assert_eq!(project, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_discovery_stops_at_the_home_directory_or_a_volume_root() {
+        let home = Path::new("/Users/someone");
+        assert_eq!(
+            git_discovery_ceiling(Path::new("/Users/someone/Documents/app"), Some(home)),
+            Some(home.to_path_buf())
+        );
+        assert_eq!(
+            git_discovery_ceiling(home, Some(home)),
+            Some(home.to_path_buf())
+        );
+        // Whole components: a sibling whose name starts the same is not home.
+        assert_eq!(
+            git_discovery_ceiling(Path::new("/Users/someone2/app"), Some(home)),
+            None
+        );
+        assert_eq!(
+            git_discovery_ceiling(Path::new("/Volumes/External/work/app"), Some(home)),
+            Some(PathBuf::from("/Volumes/External"))
+        );
+        assert_eq!(
+            git_discovery_ceiling(Path::new("/opt/work/app"), Some(home)),
+            None
+        );
+        // A home at the filesystem root would stop nothing short of it anyway.
+        assert_eq!(
+            git_discovery_ceiling(Path::new("/srv/app"), Some(Path::new("/"))),
+            None
+        );
+    }
+
+    #[test]
+    fn git_discovery_includes_the_ceiling_and_nothing_above_it() {
+        let ancestors = git_discovery_ancestors(Path::new("/Volumes/External/work/app"))
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ancestors,
+            [
+                "/Volumes/External/work/app",
+                "/Volumes/External/work",
+                "/Volumes/External",
+            ]
+            .map(PathBuf::from)
+        );
+        assert_eq!(
+            git_discovery_ancestors(Path::new("/opt/work"))
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>(),
+            ["/opt/work", "/opt", "/"].map(PathBuf::from)
+        );
+    }
 }
