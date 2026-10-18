@@ -1,6 +1,7 @@
 pub(super) use super::support::*;
 pub(crate) use super::*;
 
+mod denied_folder_warning;
 mod files;
 mod preview;
 mod project_identity;

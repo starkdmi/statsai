@@ -24,6 +24,7 @@ use statsai_store::{
     ScanFileStateEntry, Store, TaskRebuildReport,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
 use std::time::Instant;
 
 mod files;
@@ -840,14 +841,19 @@ pub(crate) fn scan_with_adapters(
 fn print_denied_project_settings_folders() {
     let home = home_dir();
     for folder in claude_denied_project_settings_folders() {
-        let label = folder.to_string_lossy();
-        let label = match home.as_deref() {
-            Some(home) => collapse_home_path_label(&label, home),
-            None => label.into_owned(),
-        };
-        println!(
-            "scan warning: project_settings_denied provider={CLAUDE_CODE_PROVIDER} folder={}",
-            serde_json::Value::String(label)
-        );
+        println!("{}", denied_folder_warning_line(&folder, home.as_deref()));
     }
+}
+
+/// The `scan warning:` line for one denied folder, without a newline.
+pub(crate) fn denied_folder_warning_line(folder: &Path, home: Option<&Path>) -> String {
+    let label = folder.to_string_lossy();
+    let label = match home {
+        Some(home) => collapse_home_path_label(&label, home),
+        None => label.into_owned(),
+    };
+    format!(
+        "scan warning: project_settings_denied provider={CLAUDE_CODE_PROVIDER} folder={}",
+        serde_json::Value::String(label)
+    )
 }
