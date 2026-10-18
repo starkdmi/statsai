@@ -4,6 +4,7 @@ pub(crate) use super::*;
 mod files;
 mod preview;
 mod project_identity;
+mod project_settings_deferral;
 
 #[derive(Clone)]
 struct AttributionBlockedTestAdapter {

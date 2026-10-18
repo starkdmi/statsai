@@ -80,6 +80,12 @@ impl ClaudeProjectSettingsDeferral {
         let previous = PROJECT_SETTINGS_DEFERRED.with(|deferred| deferred.replace(true));
         Self { previous }
     }
+
+    /// Whether a deferral is held on this thread, for callers that check
+    /// which of their steps run under it.
+    pub fn is_held() -> bool {
+        PROJECT_SETTINGS_DEFERRED.with(Cell::get)
+    }
 }
 
 impl Drop for ClaudeProjectSettingsDeferral {
