@@ -6,6 +6,7 @@ use super::menu::{
     should_run_startup_scan, sync_menu_shell, unavailable_snapshot, MenuShellContext, MenuUi,
 };
 use super::{install_menu_tracking_observers, Activity, InstanceLock, UserEvent, REFRESH_INTERVAL};
+use crate::legacy_bundle::unretired_bundles_alert;
 use statsai::snapshot::AppSnapshot;
 use std::cell::{Cell, RefCell};
 use tao::event::Event;
@@ -17,6 +18,11 @@ pub fn run() -> Result<(), String> {
     // A copy under the old bundle name may hold the instance lock, and the
     // LaunchAgent install below must see it gone.
     let legacy_migration = migrate_legacy_bundles();
+    // Before the lock: an old copy left running holds it, and this launch
+    // would otherwise only report "already running".
+    if let Some((title, message)) = unretired_bundles_alert(&legacy_migration.unretired) {
+        alert(&title, &message);
+    }
     let _instance_lock = InstanceLock::acquire()?;
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();

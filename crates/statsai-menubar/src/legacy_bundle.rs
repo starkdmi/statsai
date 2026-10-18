@@ -163,6 +163,32 @@ pub(crate) fn launch_agent_points_into(plist: &str, bundle: &Path) -> bool {
     plist.contains(&prefix)
 }
 
+/// The alert title and message for old copies left in place because their
+/// login item could not be moved, or `None` when every old copy was retired.
+/// Such a copy is still running and starts at every login, holding the lock
+/// this app needs, so the user has to remove it by hand.
+pub(crate) fn unretired_bundles_alert(bundles: &[PathBuf]) -> Option<(String, String)> {
+    let paths = bundles
+        .iter()
+        .map(|bundle| bundle.display().to_string())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return None;
+    }
+    let message = format!(
+        "StatsAI Menu Bar could not move the login item of the older copy at {}, so that copy \
+         is still installed and opens at login instead of this one. To finish the update, \
+         remove StatsAI from System Settings > General > Login Items, quit it, move {} to the \
+         Trash, then open StatsAI Menu Bar again.",
+        paths.join(" and "),
+        if paths.len() == 1 { "it" } else { "them" },
+    );
+    Some((
+        "StatsAI Menu Bar could not replace the old StatsAI.app".to_string(),
+        message,
+    ))
+}
+
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -383,5 +409,32 @@ mod tests {
             "<string>/Users/a&amp;b/Applications/StatsAI.app/Contents/MacOS/statsai</string>",
             Path::new("/Users/a&b/Applications/StatsAI.app")
         ));
+    }
+
+    #[test]
+    fn unretired_copies_get_an_alert_that_says_how_to_finish() {
+        assert_eq!(unretired_bundles_alert(&[]), None);
+
+        let (title, message) =
+            unretired_bundles_alert(&[PathBuf::from("/Applications/StatsAI.app")])
+                .expect("alert for one copy");
+        assert_eq!(
+            title,
+            "StatsAI Menu Bar could not replace the old StatsAI.app"
+        );
+        assert!(message.contains("older copy at /Applications/StatsAI.app,"));
+        assert!(message.contains("System Settings > General > Login Items"));
+        assert!(message.contains("move it to the Trash"));
+        assert!(message.contains("open StatsAI Menu Bar again"));
+
+        let (_, message) = unretired_bundles_alert(&[
+            PathBuf::from("/Applications/StatsAI.app"),
+            PathBuf::from("/Users/me/Applications/StatsAI.app"),
+        ])
+        .expect("alert for two copies");
+        assert!(
+            message.contains("/Applications/StatsAI.app and /Users/me/Applications/StatsAI.app")
+        );
+        assert!(message.contains("move them to the Trash"));
     }
 }

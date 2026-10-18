@@ -19,12 +19,16 @@ pub(super) struct LegacyMigration {
     /// The LaunchAgent still runs the CLI from a bundle that is now in the
     /// Trash, so it has to be reinstalled from this bundle.
     pub(super) launch_agent_needs_reinstall: bool,
+    /// Old copies left in place, still running if they were, because their
+    /// login item could not be moved. The user has to remove them by hand.
+    pub(super) unretired: Vec<PathBuf>,
 }
 
 /// Retires copies of the menu bar app installed under its old bundle name:
-/// quits a running one, moves its login item to this bundle and moves it to
+/// moves its login item to this bundle, quits a running one and moves it to
 /// the Trash. Only a bundle whose identifier is the menu bar app's is touched,
-/// and only once its login item, if any, points here.
+/// and only once its login item, if any, points here; until then it is left
+/// as it is, running or not, and listed in `unretired`.
 /// Every failure is logged and never stops the launch.
 pub(super) fn migrate_legacy_bundles() -> LegacyMigration {
     let mut migration = LegacyMigration::default();
@@ -52,18 +56,21 @@ pub(super) fn migrate_legacy_bundles() -> LegacyMigration {
             }
         }
 
-        quit_running_copies(&legacy);
-        // Before the move: a login item follows its bundle into the Trash, and
-        // would open the old copy from there at every login. When it can't be
-        // moved, the old copy stays where it is.
+        // Before anything else: a login item follows its bundle into the Trash,
+        // and would open the old copy from there at every login. When it can't
+        // be moved (the Automation prompt was declined, or System Events
+        // failed), the old copy is left exactly as it was, so the user is not
+        // left with neither app running, and the launch tells them what to do.
         if let Err(message) = move_login_items(&legacy, &current) {
             eprintln!(
                 "statsai menubar: could not move the login item for {}, so it stays in \
-                 place; quit it and move it out of Applications: {message}",
+                 place: {message}",
                 legacy.display()
             );
+            migration.unretired.push(legacy);
             continue;
         }
+        quit_running_copies(&legacy);
         match move_to_trash(&legacy) {
             Ok(()) => {
                 if launch_agent_runs_from(&legacy) {
