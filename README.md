@@ -16,6 +16,7 @@
 <p align="center">
   <a href="https://statsai.dev">Website</a> ·
   <a href="https://statsai.dev/docs/">Documentation</a> ·
+  <a href="https://statsai.dev/download/">Mac app</a> ·
   <a href="https://github.com/starkdmi/statsai/releases">Releases</a>
 </p>
 
@@ -99,6 +100,14 @@ GitHub Releases include a universal macOS CLI archive and the menu bar app,
 `StatsAIMenuBar.app`. Releases up to 0.7.2 named it `StatsAI.app`; on its first
 launch the renamed app moves that copy to the Trash and points its login item at
 itself.
+
+Prefer an app? [StatsAI for Mac](https://statsai.dev/download/) shows the usage
+on your Mac in the dashboard, offline and with no account, and bundles this CLI.
+Download it from the site, or install it with Homebrew:
+
+```sh
+brew install --cask starkdmi/tap/statsai-desktop
+```
 
 ### 2. Preview your local usage
 
