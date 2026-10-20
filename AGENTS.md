@@ -42,8 +42,9 @@ pull request unprompted.
 
 Pull requests are reviewed by agents with distinct jobs. Keep them distinct:
 
-- **Cursor Bugbot** reviews every push at line level; Cursor's security agent
-  runs alongside it. Both post as `cursor[bot]`.
+- **The Grok line reviewer** (a Cursor Automation on Grok 4.7) reviews every
+  push at line level. Its comments end with a hidden `<!-- cursor-review -->`
+  marker. Cursor's security agent runs alongside it. Both post as `cursor[bot]`.
 - **The Claude review routine** runs once per round: when a pull request is
   opened or marked ready for review, and whenever the `claude:re-review` label
   is added. It posts as one of the maintainer accounts (`starkdmi` or
@@ -56,6 +57,15 @@ Pull requests are reviewed by agents with distinct jobs. Keep them distinct:
   only, current head only), and reset to pending on every new push.
 - **The agent addressing review** (Claude auto-fix, or whoever is asked to) is
   the only agent that pushes to the pull request branch.
+- **Automation PRs** come from `cursor/<job>-*` branches (pricing, ci, deps,
+  cleanup, tests) and go through the same loop. `cursor/cleanup-*` PRs may
+  delete tests, but only with a per-test justification table in the body;
+  reviewers verify every row.
+- **Dependabot PRs** are never pushed to. When one fails CI, the dependency
+  fixer opens a replacement PR that starts "Supersedes #<n>"; review and merge
+  that one instead.
+- **Draft `cursor/repro-*` PRs** hold a failing test for a Linear `bug` issue.
+  To fix the bug, push the fix to that branch and mark the PR ready for review.
 
 Name the Linear issue (`STA-<n>`) in the pull request title or branch. The
 reviewer checks the change against that issue's "Done when" list; without an
