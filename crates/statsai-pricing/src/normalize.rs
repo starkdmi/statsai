@@ -39,6 +39,10 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("claude-fable-5") {
         return Some("claude-fable-5");
     }
+    // Must precede the `claude-mythos-5` test, which would otherwise swallow 5.1.
+    if lower.contains("claude-mythos-5-1") || lower.contains("claude-mythos-5.1") {
+        return Some("claude-mythos-5-1");
+    }
     if lower.contains("claude-mythos-5") {
         return Some("claude-mythos-5");
     }
@@ -99,6 +103,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("gpt-6-astra") {
         return Some("gpt-6-astra");
     }
+    if lower.contains("gpt-6.1-terra") {
+        return Some("gpt-6.1-terra");
+    }
     if lower.contains("gpt-6.1-sol") {
         return Some("gpt-6.1-sol");
     }
@@ -122,6 +129,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     }
     if lower.contains("gpt-5.4-mini") {
         return Some("gpt-5.4-mini");
+    }
+    if lower.contains("gpt-5.4-nano") {
+        return Some("gpt-5.4-nano");
     }
     if lower.contains("gpt-5.4") {
         return Some("gpt-5.4");
@@ -245,6 +255,7 @@ pub fn normalize_model_name(name: &str) -> String {
     match lower.as_str() {
         "claude-fable-5-1" | "claude-fable-5.1" => "claude-fable-5-1".to_string(),
         "claude-fable-5" => "claude-fable-5".to_string(),
+        "claude-mythos-5-1" | "claude-mythos-5.1" => "claude-mythos-5-1".to_string(),
         "claude-mythos-5" => "claude-mythos-5".to_string(),
         "claude-opus-5-5" | "claude-opus-5-5-thinking" | "claude-opus-5.5" => {
             "claude-opus-5-5".to_string()
@@ -288,8 +299,10 @@ pub fn normalize_model_name(name: &str) -> String {
         "codex-auto-review" => "codex-auto-review".to_string(),
         "gpt-5.4" => "gpt-5.4".to_string(),
         "gpt-5.4-mini" => "gpt-5.4-mini".to_string(),
+        "gpt-5.4-nano" => "gpt-5.4-nano".to_string(),
         "gpt-6-astra" | "gpt-6-astra-codex" => "gpt-6-astra".to_string(),
         "gpt-6.1-sol" => "gpt-6.1-sol".to_string(),
+        "gpt-6.1-terra" => "gpt-6.1-terra".to_string(),
         "gpt-6-sol" => "gpt-6-sol".to_string(),
         "gpt-6-luna" => "gpt-6-luna".to_string(),
         "gpt-5.6-sol" => "gpt-5.6-sol".to_string(),

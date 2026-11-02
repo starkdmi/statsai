@@ -59,7 +59,13 @@ pub(crate) fn pricing_for_effective_speed(
     let fast = match model_name {
         "claude-opus-5-5" => pricing_with_cache_creation(8.0, 10.0, 0.4, 40.0),
         "claude-opus-5" | "claude-opus-4-8" => pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0),
-        "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna" => pricing_with_cache_creation(
+        // Fast mode is twice the standard rates in effect that day, including
+        // cache writes and cached input. Models that also have a >272k tier
+        // publish that same multiple on the long-context rates.
+        // https://developers.openai.com/api/docs/pricing
+        "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6-astra"
+        | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5" | "gpt-5.1" | "gpt-5.2"
+        | "gpt-5.3-codex" | "gpt-5.4-mini" => pricing_with_cache_creation(
             standard.input_per_million * 2.0,
             standard.cache_creation_per_million * 2.0,
             standard.cached_input_per_million * 2.0,
@@ -71,6 +77,8 @@ pub(crate) fn pricing_for_effective_speed(
             pricing_with_cache_creation(30.0, 37.5, 3.0, 150.0)
         }
         // Grok 4.6/4.7 Fast is 2x the standard short-context token rates.
+        // Grok 4.7 Fast above 200k is 1.5x these rates, not another 2x.
+        // https://docs.x.ai/developers/pricing
         "grok-4.6" | "grok-4.7" => pricing(4.0, 1.0, 12.0),
         // Grok 4.5 fast doubles input and cached input but triples output.
         // Applied as multipliers against the standard rates above rather than as
@@ -153,6 +161,9 @@ pub(crate) fn pricing_for_model_on(
     match normalized.as_str() {
         // Fable 5.1 matches Fable 5 except for cache reads, which dropped to $0.25/M.
         "claude-fable-5-1" => Some(pricing_with_cache_creation(10.0, 12.5, 0.25, 50.0)),
+        // Mythos 5.1 matches Mythos 5 except cache reads at $0.25/M.
+        // https://platform.claude.com/docs/en/about-claude/pricing
+        "claude-mythos-5-1" => Some(pricing_with_cache_creation(10.0, 12.5, 0.25, 50.0)),
         "claude-fable-5" | "claude-mythos-5" => {
             Some(pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0))
         }
@@ -183,6 +194,11 @@ pub(crate) fn pricing_for_model_on(
         // Same input, cache-write and output rates as GPT-6 Sol; cached input
         // is 5% of input rather than 10%.
         "gpt-6.1-sol" => Some(pricing_with_cache_creation(2.0, 2.5, 0.1, 10.0)),
+        // Launch price, 2026-10-26. Cache writes are the 30-minute rate.
+        // Prompts over 272k use the shared long-context multiplier; fast is 2x.
+        // https://developers.openai.com/api/docs/models/gpt-6.1-terra
+        // https://developers.openai.com/api/docs/pricing
+        "gpt-6.1-terra" => Some(pricing_with_cache_creation(1.0, 1.25, 0.05, 5.0)),
         "gpt-6-sol" => Some(pricing_with_cache_creation(2.0, 2.5, 0.2, 10.0)),
         "gpt-6-luna" => Some(pricing_with_cache_creation(0.1, 0.125, 0.01, 0.5)),
         // GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount.
@@ -192,6 +208,9 @@ pub(crate) fn pricing_for_model_on(
         "gpt-5.5" => Some(pricing(5.0, 0.5, 30.0)),
         "gpt-5.4" => Some(pricing(2.5, 0.25, 15.0)),
         "gpt-5.4-mini" => Some(pricing(0.75, 0.075, 4.5)),
+        // No long-context tier. Cache writes are billed as input.
+        // https://developers.openai.com/api/docs/pricing
+        "gpt-5.4-nano" => Some(pricing(0.2, 0.02, 1.25)),
         "gpt-5.3-codex" | "gpt-5.2" | "gpt-5.2-chat-latest" | "gpt-5.2-codex" => {
             Some(pricing(1.75, 0.175, 14.0))
         }

@@ -203,12 +203,16 @@ fn pricing_multipliers(
 
     let is_openai_long_context_model = matches!(
         model_name,
+        // GPT-5.5 uses the same >272k tier: 2x input and cached input, 1.5x output.
+        // https://developers.openai.com/api/docs/models/gpt-5.5
         "gpt-5.4"
+            | "gpt-5.5"
             | "gpt-5.6-sol"
             | "gpt-5.6-terra"
             | "gpt-5.6-luna"
             | "gpt-6-astra"
             | "gpt-6.1-sol"
+            | "gpt-6.1-terra"
             | "gpt-6-sol"
             | "gpt-6-luna"
     );
@@ -228,11 +232,24 @@ fn pricing_multipliers(
         && prompt_tokens > OPENAI_LONG_CONTEXT_THRESHOLD
     {
         (20_000, 15_000)
-    } else if is_xai_long_context_model
-        && usage.requests == Some(1)
-        && prompt_tokens >= XAI_LONG_CONTEXT_THRESHOLD
-    {
-        (20_000, 20_000)
+    } else if is_xai_long_context_model && usage.requests == Some(1) {
+        // Grok 4.7 Fast long context is 1.5x the fast rate once the prompt
+        // exceeds 200k ($6 / $1.50 / $18), not a second 2x on the fast rate.
+        // At exactly 200k the fast card stays on the short-context rate.
+        // Cursor keeps its own >256k tier above. Standard Grok 4.7 still
+        // doubles at >=200k.
+        // https://docs.x.ai/developers/pricing
+        if model_name == "grok-4.7" && uses_fast_mode_pricing {
+            if prompt_tokens > XAI_LONG_CONTEXT_THRESHOLD {
+                (15_000, 15_000)
+            } else {
+                (MULTIPLIER_SCALE, MULTIPLIER_SCALE)
+            }
+        } else if prompt_tokens >= XAI_LONG_CONTEXT_THRESHOLD {
+            (20_000, 20_000)
+        } else {
+            (MULTIPLIER_SCALE, MULTIPLIER_SCALE)
+        }
     } else {
         (MULTIPLIER_SCALE, MULTIPLIER_SCALE)
     }
