@@ -36,6 +36,39 @@ fn normalizes_mythos_5_1_ahead_of_mythos_5() {
 }
 
 #[test]
+fn normalizes_fable_5_2_and_mythos_5_2_ahead_of_earlier_fable_and_mythos() {
+    assert_eq!(normalize_model_name("claude-fable-5-2"), "claude-fable-5-2");
+    assert_eq!(normalize_model_name("claude-fable-5.2"), "claude-fable-5-2");
+    assert_eq!(
+        normalize_model_name("claude-fable-5-2-thinking-max"),
+        "claude-fable-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("anthropic/claude-fable-5-2"),
+        "claude-fable-5-2"
+    );
+    assert_eq!(normalize_model_name("claude-fable-5-1"), "claude-fable-5-1");
+    assert_eq!(normalize_model_name("claude-fable-5"), "claude-fable-5");
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-2"),
+        "claude-mythos-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5.2"),
+        "claude-mythos-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("openrouter/claude-mythos-5-2-thinking"),
+        "claude-mythos-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-1"),
+        "claude-mythos-5-1"
+    );
+    assert_eq!(normalize_model_name("claude-mythos-5"), "claude-mythos-5");
+}
+
+#[test]
 fn normalizes_fable_5_1_ahead_of_fable_5() {
     assert_eq!(normalize_model_name("claude-fable-5-1"), "claude-fable-5-1");
     assert_eq!(normalize_model_name("claude-fable-5.1"), "claude-fable-5-1");

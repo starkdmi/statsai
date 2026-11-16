@@ -14,10 +14,10 @@
 /// Increment this constant on every semantic pricing-rule change so persisted
 /// stores can reprice automatically. The descriptive catalog string is not an
 /// ordering key.
-pub const PRICING_RULESET_VERSION: u64 = 6;
+pub const PRICING_RULESET_VERSION: u64 = 7;
 
 /// Descriptive identifier for the compiled price list. Not an ordering key.
-pub const PRICING_CATALOG_VERSION: &str = "official:2026-11-02";
+pub const PRICING_CATALOG_VERSION: &str = "official:2026-11-16";
 
 mod catalog;
 mod cost;

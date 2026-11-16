@@ -57,6 +57,12 @@ pub(crate) fn pricing_for_effective_speed(
     }
 
     let fast = match model_name {
+        // Fast input and output are 2x. Prompt-cache multipliers apply on top
+        // of that fast input rate: 1.25x 5-minute writes and 0.025x cache reads.
+        // https://platform.claude.com/docs/en/about-claude/pricing
+        "claude-fable-5-2" | "claude-mythos-5-2" => {
+            pricing_with_cache_creation(16.0, 20.0, 0.4, 80.0)
+        }
         "claude-opus-5-5" => pricing_with_cache_creation(8.0, 10.0, 0.4, 40.0),
         "claude-opus-5" | "claude-opus-4-8" => pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0),
         // Fast mode is twice the standard rates in effect that day, including
@@ -159,6 +165,14 @@ pub(crate) fn pricing_for_model_on(
         return pricing_for_model_on(mapped, usage_date);
     }
     match normalized.as_str() {
+        // Launch price, 2026-11-09. Mythos 5.2 uses the same rates. Cache reads
+        // are 0.025x input. The 1M window has no long-context surcharge.
+        // https://platform.claude.com/docs/en/about-claude/pricing
+        // https://platform.claude.com/docs/en/models/fable-5-2/overview
+        // https://www.anthropic.com/claude-fable-and-mythos-5-2
+        "claude-fable-5-2" | "claude-mythos-5-2" => {
+            Some(pricing_with_cache_creation(8.0, 10.0, 0.2, 40.0))
+        }
         // Fable 5.1 matches Fable 5 except for cache reads, which dropped to $0.25/M.
         "claude-fable-5-1" => Some(pricing_with_cache_creation(10.0, 12.5, 0.25, 50.0)),
         // Mythos 5.1 matches Mythos 5 except cache reads at $0.25/M.

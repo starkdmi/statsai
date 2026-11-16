@@ -367,6 +367,97 @@ fn mythos_5_1_prices_cache_reads_below_mythos_5() {
 }
 
 #[test]
+fn fable_5_2_and_mythos_5_2_use_the_november_9_launch_price() {
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let one_hour = UsageCounts {
+        cache_creation_tokens: Some(1_000_000),
+        cache_creation_1h_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let long_context = UsageCounts {
+        input_tokens: Some(300_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let model = |name: &str, speed: Option<&str>| statsai_core::ModelInfo {
+        name: Some(name.to_string()),
+        normalized_name: Some(normalize_model_name(name)),
+        provider_model_id: Some(name.to_string()),
+        speed: speed.map(str::to_string),
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+
+    let fable_5_2 = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-2", None)),
+        &usage,
+    );
+    let mythos_5_2 = estimate_cost(
+        "claude_code",
+        Some(&model("anthropic/claude-mythos-5.2", None)),
+        &usage,
+    );
+    let fable_5 = estimate_cost("claude_code", Some(&model("claude-fable-5", None)), &usage);
+    let fast = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-2-fast", None)),
+        &usage,
+    );
+    let fast_speed = estimate_cost(
+        "cursor",
+        Some(&model("claude-mythos-5-2", Some("fast"))),
+        &usage,
+    );
+    let hour = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-2", None)),
+        &one_hour,
+    );
+    let long = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-2", None)),
+        &long_context,
+    );
+
+    // 8 input + 10 5-minute cache write + 0.20 cache read + 40 output.
+    assert_eq!(
+        fable_5_2.estimated_api_equivalent_micro_usd,
+        Some(58_200_000)
+    );
+    assert_eq!(
+        mythos_5_2.estimated_api_equivalent_micro_usd,
+        Some(58_200_000)
+    );
+    assert_ne!(
+        fable_5_2.estimated_api_equivalent_micro_usd,
+        fable_5.estimated_api_equivalent_micro_usd
+    );
+    // Fast is 2x input and output, with cache multipliers on the fast input rate:
+    // 16 + 20 + 0.40 + 80.
+    assert_eq!(fast.estimated_api_equivalent_micro_usd, Some(116_400_000));
+    assert_eq!(
+        fast_speed.estimated_api_equivalent_micro_usd,
+        Some(116_400_000)
+    );
+    assert_eq!(
+        fast.pricing_source.as_deref(),
+        Some("claude_code_api_pricing:claude-fable-5-2:fast")
+    );
+    // 1-hour cache writes stay 2x the input rate in effect.
+    assert_eq!(hour.estimated_api_equivalent_micro_usd, Some(16_000_000));
+    // 300k input at $8/M plus 1M output at $40/M. No long-context surcharge.
+    assert_eq!(long.estimated_api_equivalent_micro_usd, Some(42_400_000));
+}
+
+#[test]
 fn gpt_5_4_nano_uses_its_own_rates() {
     let nano = test_model("openai/gpt-5.4-nano");
     let gpt_5_4 = test_model("gpt-5.4");
