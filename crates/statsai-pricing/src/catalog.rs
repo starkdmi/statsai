@@ -57,6 +57,9 @@ pub(crate) fn pricing_for_effective_speed(
     }
 
     let fast = match model_name {
+        // 2x the standard input and output rates, with the caching multipliers
+        // (1.25x write, 0.025x read) applied on top of the fast input rate.
+        "claude-fable-5-2" => pricing_with_cache_creation(16.0, 20.0, 0.4, 80.0),
         "claude-opus-5-5" => pricing_with_cache_creation(8.0, 10.0, 0.4, 40.0),
         "claude-opus-5" | "claude-opus-4-8" => pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0),
         "gpt-6.1-sol" | "gpt-6-sol" | "gpt-6-luna" => pricing_with_cache_creation(
@@ -151,6 +154,9 @@ pub(crate) fn pricing_for_model_on(
         return pricing_for_model_on(mapped, usage_date);
     }
     match normalized.as_str() {
+        // Fable 5.2 is cheaper across the board: $8 input, $40 output, and cache
+        // reads at 0.025x input. Cache writes stay at the 1.25x multiplier.
+        "claude-fable-5-2" => Some(pricing_with_cache_creation(8.0, 10.0, 0.2, 40.0)),
         // Fable 5.1 matches Fable 5 except for cache reads, which dropped to $0.25/M.
         "claude-fable-5-1" => Some(pricing_with_cache_creation(10.0, 12.5, 0.25, 50.0)),
         "claude-fable-5" | "claude-mythos-5" => {

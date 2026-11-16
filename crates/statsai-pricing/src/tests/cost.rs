@@ -194,6 +194,46 @@ fn claude_fast_mode_prices_all_token_categories_at_premium_rates() {
 }
 
 #[test]
+fn claude_fast_mode_prices_fable_5_2_at_twice_standard_with_caching_on_top() {
+    let standard_model = statsai_core::ModelInfo {
+        name: Some("claude-fable-5-2".to_string()),
+        normalized_name: Some("claude-fable-5-2".to_string()),
+        provider_model_id: Some("claude-fable-5-2".to_string()),
+        speed: Some("standard".to_string()),
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+    let fast_model = statsai_core::ModelInfo {
+        speed: Some("fast".to_string()),
+        ..standard_model.clone()
+    };
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(2_000_000),
+        cache_creation_5m_tokens: Some(1_000_000),
+        cache_creation_1h_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+
+    let standard = estimate_cost("claude_code", Some(&standard_model), &usage);
+    let fast = estimate_cost("claude_code", Some(&fast_model), &usage);
+
+    // 8.00 input + 10.00 5m write + 16.00 1h write + 0.20 read + 40.00 output.
+    assert_eq!(
+        standard.estimated_api_equivalent_micro_usd,
+        Some(74_200_000)
+    );
+    // 16.00 + 20.00 + 32.00 + 0.40 + 80.00.
+    assert_eq!(fast.estimated_api_equivalent_micro_usd, Some(148_400_000));
+    assert_eq!(
+        fast.pricing_source.as_deref(),
+        Some("claude_code_api_pricing:claude-fable-5-2:fast")
+    );
+}
+
+#[test]
 fn historical_claude_fast_mode_uses_the_six_times_opus_rate() {
     let standard_model = statsai_core::ModelInfo {
         name: Some("claude-opus-4-7".to_string()),
@@ -336,6 +376,38 @@ fn gpt_5_6_sol_uses_the_promotional_rate_from_its_start_date() {
     // 4.00 + 5.00 + 0.40 + 20.00 from 2026-08-21.
     assert_eq!(on("2026-08-21T00:00:00Z"), 29_400_000);
     assert_eq!(on("2026-09-05T12:00:00Z"), 29_400_000);
+}
+
+#[test]
+fn fable_5_2_prices_cache_reads_below_fable_5_1() {
+    let usage = UsageCounts {
+        cache_read_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let model = |name: &str| statsai_core::ModelInfo {
+        name: Some(name.to_string()),
+        normalized_name: Some(normalize_model_name(name)),
+        provider_model_id: Some(name.to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+
+    let fable_5_2 = estimate_cost("claude_code", Some(&model("claude-fable-5-2")), &usage);
+    let suffixed = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-2-thinking-max")),
+        &usage,
+    );
+    let fable_5_1 = estimate_cost("claude_code", Some(&model("claude-fable-5-1")), &usage);
+
+    assert_eq!(fable_5_2.estimated_api_equivalent_micro_usd, Some(200_000));
+    assert_eq!(suffixed.estimated_api_equivalent_micro_usd, Some(200_000));
+    assert_eq!(fable_5_1.estimated_api_equivalent_micro_usd, Some(250_000));
+    assert_eq!(
+        fable_5_2.pricing_source.as_deref(),
+        Some("claude_code_api_pricing:claude-fable-5-2")
+    );
 }
 
 #[test]

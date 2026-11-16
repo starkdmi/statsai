@@ -32,7 +32,10 @@ fn normalize_reversed_claude_model_name(lower: &str) -> Option<&'static str> {
 }
 
 fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
-    // Must precede the `claude-fable-5` test, which would otherwise swallow every 5.1 name.
+    // Must precede the `claude-fable-5` test, which would otherwise swallow every 5.1 and 5.2 name.
+    if lower.contains("claude-fable-5-2") || lower.contains("claude-fable-5.2") {
+        return Some("claude-fable-5-2");
+    }
     if lower.contains("claude-fable-5-1") || lower.contains("claude-fable-5.1") {
         return Some("claude-fable-5-1");
     }
@@ -243,6 +246,7 @@ pub fn normalize_model_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
 
     match lower.as_str() {
+        "claude-fable-5-2" | "claude-fable-5.2" => "claude-fable-5-2".to_string(),
         "claude-fable-5-1" | "claude-fable-5.1" => "claude-fable-5-1".to_string(),
         "claude-fable-5" => "claude-fable-5".to_string(),
         "claude-mythos-5" => "claude-mythos-5".to_string(),

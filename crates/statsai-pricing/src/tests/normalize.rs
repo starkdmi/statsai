@@ -30,6 +30,25 @@ fn normalizes_fable_5_1_ahead_of_fable_5() {
 }
 
 #[test]
+fn normalizes_fable_5_2_ahead_of_fable_5() {
+    assert_eq!(normalize_model_name("claude-fable-5-2"), "claude-fable-5-2");
+    assert_eq!(normalize_model_name("claude-fable-5.2"), "claude-fable-5-2");
+    assert_eq!(
+        normalize_model_name("anthropic/claude-fable-5-2"),
+        "claude-fable-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("claude-fable-5-2-thinking-max"),
+        "claude-fable-5-2"
+    );
+    // The neighbouring versions keep their own names.
+    assert_eq!(normalize_model_name("claude-fable-5-1"), "claude-fable-5-1");
+    assert_eq!(normalize_model_name("claude-fable-5"), "claude-fable-5");
+    // `fable` is a model pick in Claude Code settings, not a versioned id.
+    assert_eq!(normalize_model_name("fable"), "fable");
+}
+
+#[test]
 fn normalizes_reversed_cursor_claude_names() {
     assert_eq!(
         normalize_model_name("claude-4.5-sonnet"),
@@ -265,6 +284,26 @@ fn refreshing_normalization_recovers_a_stale_cached_name() {
     // Only the derived field moves; the observation is untouched.
     assert_eq!(refreshed.name, stale.name);
     assert_eq!(refreshed.provider_model_id, stale.provider_model_id);
+}
+
+#[test]
+fn refreshing_normalization_moves_a_fable_5_2_row_off_fable_5() {
+    // What a scan produced before Fable 5.2 had its own catalog entry.
+    let stale = statsai_core::ModelInfo {
+        name: Some("claude-fable-5-2".to_string()),
+        normalized_name: Some("claude-fable-5".to_string()),
+        provider_model_id: Some("claude-fable-5-2".to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+
+    let refreshed = model_with_refreshed_normalization(&stale);
+
+    assert_eq!(
+        refreshed.normalized_name.as_deref(),
+        Some("claude-fable-5-2")
+    );
 }
 
 #[test]
