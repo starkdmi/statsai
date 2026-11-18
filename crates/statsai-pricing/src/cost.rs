@@ -227,7 +227,14 @@ fn pricing_multipliers(
             | "grok-4.20-0309-reasoning"
             | "grok-4.20-0309-non-reasoning"
     );
+    // GPT-5.4 and GPT-5.5 fast mode excludes long context: the card leaves
+    // its >272k cells blank. A fast request stays on the fast rates rather
+    // than stacking the standard long-context multiplier on them.
+    // https://developers.openai.com/api/docs/pricing
+    let fast_without_long_context_tier =
+        uses_fast_mode_pricing && matches!(model_name, "gpt-5.4" | "gpt-5.5");
     if is_openai_long_context_model
+        && !fast_without_long_context_tier
         && usage.requests == Some(1)
         && prompt_tokens > OPENAI_LONG_CONTEXT_THRESHOLD
     {

@@ -77,6 +77,15 @@ pub(crate) fn pricing_for_effective_speed(
             standard.cached_input_per_million * 2.0,
             standard.output_per_million * 2.0,
         ),
+        // Published fast rates that are not a flat 2x. GPT-5.5 is 2.5x and
+        // GPT-5 mini is 1.8x. GPT-5.4 is 2x but, like GPT-5.5, publishes no
+        // fast long-context rate, so `pricing_multipliers` keeps a fast request
+        // over 272k on these rates. Cache writes bill as input.
+        // https://developers.openai.com/api/docs/pricing
+        // https://openai.com/api-fast-mode/
+        "gpt-5.5" => pricing(12.5, 1.25, 75.0),
+        "gpt-5.4" => pricing(5.0, 0.5, 30.0),
+        "gpt-5-mini" => pricing(0.45, 0.045, 3.6),
         // Historical fast-mode rates. Effective `usage.speed` is authoritative:
         // unsupported requests either failed or reported `standard` after fallback.
         "claude-opus-4-6" | "claude-opus-4-7" => {

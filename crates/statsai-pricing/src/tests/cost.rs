@@ -508,21 +508,88 @@ fn published_openai_fast_mode_is_twice_the_standard_rate_that_day() {
     assert_eq!(promo_fast, promo_standard.saturating_mul(2));
     assert_ne!(before_fast, promo_fast);
 
+    // Terra and Luna follow their 2026-07-30 price cut, as Sol follows its promo.
+    // Terra: 2 x (2.50 + 3.125 + 0.25 + 15), then 2 x (2 + 2.50 + 0.20 + 12).
+    // Luna: 2 x (1 + 1.25 + 0.10 + 6), then 2 x (0.20 + 0.25 + 0.02 + 1.20).
+    for (name, before_expected, after_expected) in [
+        ("gpt-5.6-terra", 41_750_000, 33_400_000),
+        ("gpt-5.6-luna", 16_700_000, 3_340_000),
+    ] {
+        let (before_standard, before_fast) = fast_of(name, "2026-07-29T23:59:59Z");
+        let (after_standard, after_fast) = fast_of(name, "2026-07-30T00:00:00Z");
+        assert_eq!(before_fast, before_standard.saturating_mul(2), "{name}");
+        assert_eq!(after_fast, after_standard.saturating_mul(2), "{name}");
+        assert_eq!(before_fast, before_expected, "{name}");
+        assert_eq!(after_fast, after_expected, "{name}");
+    }
+
     for name in [
         "gpt-6-astra",
         "gpt-6.1-terra",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5",
         "gpt-5.1",
         "gpt-5.2",
         "gpt-5.3-codex",
         "gpt-5.4-mini",
     ] {
-        let (standard, fast) = fast_of(name, "2026-10-26T00:00:00Z");
+        let (standard, fast) = fast_of(name, "2026-11-18T00:00:00Z");
         assert_eq!(fast, standard.saturating_mul(2), "{name}");
     }
+}
 
-    let (mini_standard, mini_fast) = fast_of("gpt-5-mini", "2026-10-26T00:00:00Z");
-    assert_eq!(mini_fast, mini_standard);
+#[test]
+fn published_openai_fast_rates_that_are_not_a_flat_2x() {
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let long_context = UsageCounts {
+        input_tokens: Some(100_000),
+        cache_read_tokens: Some(200_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let fast = |name: &str| statsai_core::ModelInfo {
+        speed: Some("fast".to_string()),
+        ..test_model(name)
+    };
+    let cost = |model: &statsai_core::ModelInfo, usage: &UsageCounts| {
+        estimate_cost("codex", Some(model), usage).estimated_api_equivalent_micro_usd
+    };
+
+    // GPT-5 mini is 1.8x: 0.45 input + 0.45 cache write + 0.045 cached input
+    // + 3.60 output.
+    assert_eq!(cost(&fast("gpt-5-mini"), &usage), Some(4_545_000));
+    assert_eq!(cost(&test_model("gpt-5-mini"), &usage), Some(2_525_000));
+    // GPT-5.4 is 2x: 5 + 5 + 0.50 + 30.
+    assert_eq!(cost(&fast("gpt-5.4"), &usage), Some(40_500_000));
+    // GPT-5.5 is 2.5x: 12.50 + 12.50 + 1.25 + 75.
+    assert_eq!(cost(&fast("gpt-5.5"), &usage), Some(101_250_000));
+    assert_eq!(
+        estimate_cost("codex", Some(&fast("gpt-5.5")), &usage)
+            .pricing_source
+            .as_deref(),
+        Some("codex_api_pricing:gpt-5.5:fast")
+    );
+
+    // Neither publishes a fast rate above 272k, so a fast long request stays on
+    // the fast rates instead of stacking the standard long-context multiplier.
+    // 100k * $12.50 + 200k * $1.25 + 1M * $75.
+    assert_eq!(cost(&fast("gpt-5.5"), &long_context), Some(76_500_000));
+    // 100k * $5 + 200k * $0.50 + 1M * $30.
+    assert_eq!(cost(&fast("gpt-5.4"), &long_context), Some(30_600_000));
+    // Standard requests keep the long-context tier: 100k * $10 + 200k * $1
+    // + 1M * $45.
+    assert_eq!(
+        cost(&test_model("gpt-5.5"), &long_context),
+        Some(46_200_000)
+    );
 }
 
 #[test]
