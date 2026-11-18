@@ -192,6 +192,36 @@ fn normalizes_gpt_5_6_family_and_proxy_wrapped_ids() {
 }
 
 #[test]
+fn dated_fable_5_and_mythos_5_ids_are_not_taken_for_5_2() {
+    // Snapshot dates start with 2, so these contain "claude-fable-5-2" and
+    // "claude-mythos-5-2" without being 5.2.
+    assert_eq!(
+        normalize_model_name("claude-fable-5-20260610"),
+        "claude-fable-5"
+    );
+    assert_eq!(
+        normalize_model_name("anthropic/claude-fable-5-20260610"),
+        "claude-fable-5"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-20260610"),
+        "claude-mythos-5"
+    );
+    assert_eq!(
+        normalize_model_name("claude-fable-5-2-20260915"),
+        "claude-fable-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-2-20260915"),
+        "claude-mythos-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("openrouter/claude-fable-5.2-thinking"),
+        "claude-fable-5-2"
+    );
+}
+
+#[test]
 fn normalizes_gpt_5_4_nano_ahead_of_gpt_5_4() {
     assert_eq!(normalize_model_name("gpt-5.4-nano"), "gpt-5.4-nano");
     assert_eq!(

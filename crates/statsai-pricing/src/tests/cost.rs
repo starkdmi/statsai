@@ -406,6 +406,11 @@ fn fable_5_2_and_mythos_5_2_use_the_november_9_launch_price() {
         &usage,
     );
     let fable_5 = estimate_cost("claude_code", Some(&model("claude-fable-5", None)), &usage);
+    let dated_fable_5 = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-20260610", None)),
+        &usage,
+    );
     let fast = estimate_cost(
         "claude_code",
         Some(&model("claude-fable-5-2-fast", None)),
@@ -439,6 +444,12 @@ fn fable_5_2_and_mythos_5_2_use_the_november_9_launch_price() {
     assert_ne!(
         fable_5_2.estimated_api_equivalent_micro_usd,
         fable_5.estimated_api_equivalent_micro_usd
+    );
+    // A dated Fable 5 snapshot contains "claude-fable-5-2" but is still Fable 5:
+    // 10 + 12.50 + 1 + 50.
+    assert_eq!(
+        dated_fable_5.estimated_api_equivalent_micro_usd,
+        Some(73_500_000)
     );
     // Fast is 2x input and output, with cache multipliers on the fast input rate:
     // 16 + 20 + 0.40 + 80.

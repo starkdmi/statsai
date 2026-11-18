@@ -31,9 +31,24 @@ fn normalize_reversed_claude_model_name(lower: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether `lower` contains `version` not followed by another digit.
+///
+/// Anthropic snapshot ids end in an eight-digit date, and every date so far
+/// starts with `2`. A plain `contains("claude-fable-5-2")` therefore also
+/// matches the Fable 5 snapshot `claude-fable-5-20260610`.
+fn contains_version(lower: &str, version: &str) -> bool {
+    lower.match_indices(version).any(|(start, _)| {
+        !lower[start + version.len()..]
+            .bytes()
+            .next()
+            .is_some_and(|next| next.is_ascii_digit())
+    })
+}
+
 fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     // 5.2 must precede 5.1 and 5: "claude-fable-5-2" contains "claude-fable-5".
-    if lower.contains("claude-fable-5-2") || lower.contains("claude-fable-5.2") {
+    // It must also not take a dated Fable 5 id such as claude-fable-5-20260610.
+    if contains_version(lower, "claude-fable-5-2") || contains_version(lower, "claude-fable-5.2") {
         return Some("claude-fable-5-2");
     }
     // Must precede the `claude-fable-5` test, which would otherwise swallow every 5.1 name.
@@ -43,8 +58,10 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("claude-fable-5") {
         return Some("claude-fable-5");
     }
-    // 5.2 must precede 5.1 and 5, same reason as Fable.
-    if lower.contains("claude-mythos-5-2") || lower.contains("claude-mythos-5.2") {
+    // 5.2 must precede 5.1 and 5, and must not take a dated Mythos 5 id, the
+    // same as Fable.
+    if contains_version(lower, "claude-mythos-5-2") || contains_version(lower, "claude-mythos-5.2")
+    {
         return Some("claude-mythos-5-2");
     }
     // Must precede the `claude-mythos-5` test, which would otherwise swallow 5.1.
