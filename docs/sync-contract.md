@@ -126,9 +126,9 @@ collector. `SourceLocation.path_label`, `ProviderAccount.plan_name` and
 `Subscription.notes` stay permitted keys, because the collector still
 serializes each one as `null`, but the backend discards whatever value they
 carry and stores `null`. A collector bug, an older or third-party collector, or
-a hand-built request therefore cannot store a local path, an account plan or
-subscription notes. `Subscription.plan_name` is a different field: it is part
-of subscription identity and is kept.
+a hand-built request therefore cannot store a local path, a plan name on the
+account record, or subscription notes. `Subscription.plan_name` is a different
+field: it is part of subscription identity and is kept.
 
 Account-plan sync sends only the canonical account reference, provider, raw and
 display plan names, observation time, explicit provider bounds, evidence kind,
