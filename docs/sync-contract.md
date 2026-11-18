@@ -121,6 +121,15 @@ The current production sync path strips record-level local evidence before sendi
 - `Subscription.notes`
 - code source text, diffs, file paths, tool arguments, and commit messages
 
+The backend enforces the three metadata entries instead of trusting the
+collector. `SourceLocation.path_label`, `ProviderAccount.plan_name` and
+`Subscription.notes` stay permitted keys, because the collector still
+serializes each one as `null`, but the backend discards whatever value they
+carry and stores `null`. A collector bug, an older or third-party collector, or
+a hand-built request therefore cannot store a local path, an account plan or
+subscription notes. `Subscription.plan_name` is a different field: it is part
+of subscription identity and is kept.
+
 Account-plan sync sends only the canonical account reference, provider, raw and
 display plan names, observation time, explicit provider bounds, evidence kind,
 confidence, and aggregate coverage/conflict counts. Email, provider user ID,
@@ -423,8 +432,12 @@ schema-version bump.
 against a closed set of permitted keys, and an unrecognized key refuses the
 whole batch with `400 invalid_sync_batch`. This is deliberate: an unexpected
 key may carry a path, address, or message that this contract excludes, and the
-refusal guarantees none of it is stored. The consequence is a hard release
-order:
+refusal guarantees none of it is stored. The metadata collections are no
+exception: the permitted keys of `sources`, `accounts`,
+`source_account_assignments` and `subscriptions` are exactly the fields of
+`SourceLocation`, `ProviderAccount`, `SourceAccountAssignment` and
+`Subscription`, so adding a field to one of those types is a record-field change
+like any other. The consequence is a hard release order:
 
 > **Deploy the backend before releasing a collector that adds a record field.**
 > Until it is deployed, upgraded collectors cannot sync anything — not just the
