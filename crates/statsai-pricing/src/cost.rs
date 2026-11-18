@@ -10,6 +10,7 @@ use crate::PRICING_CATALOG_VERSION;
 const MICRO_USD_PER_USD: i128 = 1_000_000;
 const TOKENS_PER_MILLION: i128 = 1_000_000;
 const MULTIPLIER_SCALE: i128 = 10_000;
+const OPENAI_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
 #[must_use]
 pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCounts) -> CostInfo {
@@ -44,6 +45,7 @@ pub fn estimate_cost_at(
             .any(|name| name.trim().to_ascii_lowercase().ends_with("-fast"))
             .then_some("fast")
     });
+    let effective_speed = effective_speed.filter(|_| fast_mode_covers(&model_name, usage));
     let (pricing, uses_fast_mode_pricing) =
         pricing_for_effective_speed(&model_name, effective_speed, standard_pricing);
 
@@ -158,22 +160,41 @@ fn cache_creation_cost_numerator(
     ))
 }
 
+fn prompt_tokens(usage: &UsageCounts) -> u64 {
+    usage
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(usage.cache_creation_tokens.unwrap_or(0))
+        .saturating_add(usage.cache_read_tokens.unwrap_or(0))
+}
+
+/// Whether fast mode can serve this request at all.
+///
+/// GPT-5.5, GPT-5.4 and GPT-5.4 mini fast mode excludes long context: the fast
+/// card leaves their >272k cells blank, and only GPT-5.6 runs long prompts in
+/// fast mode. OpenAI serves a request fast mode does not cover at the standard
+/// tier and bills it at standard rates, so one request over 272k is priced as
+/// standard, with any standard long-context tier. An aggregate whose request
+/// count is not 1 cannot be split by size and keeps the fast rate.
+/// https://openai.com/api-fast-mode/
+/// https://developers.openai.com/api/docs/guides/fast-mode
+fn fast_mode_covers(model_name: &str, usage: &UsageCounts) -> bool {
+    !(matches!(model_name, "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini")
+        && usage.requests == Some(1)
+        && prompt_tokens(usage) > OPENAI_LONG_CONTEXT_THRESHOLD)
+}
+
 fn pricing_multipliers(
     provider: &str,
     model_name: &str,
     usage: &UsageCounts,
     uses_fast_mode_pricing: bool,
 ) -> (i128, i128) {
-    const OPENAI_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
     const XAI_LONG_CONTEXT_THRESHOLD: u64 = 200_000;
     const CURSOR_GROK_4_7_LONG_CONTEXT_THRESHOLD: u64 = 256_000;
     const CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD: u64 = 100_000;
 
-    let prompt_tokens = usage
-        .input_tokens
-        .unwrap_or(0)
-        .saturating_add(usage.cache_creation_tokens.unwrap_or(0))
-        .saturating_add(usage.cache_read_tokens.unwrap_or(0));
+    let prompt_tokens = prompt_tokens(usage);
 
     if model_name == "grok-4.7" && provider.eq_ignore_ascii_case("cursor") {
         if usage.requests == Some(1) && prompt_tokens > CURSOR_GROK_4_7_LONG_CONTEXT_THRESHOLD {
@@ -229,14 +250,7 @@ fn pricing_multipliers(
             | "grok-4.20-0309-reasoning"
             | "grok-4.20-0309-non-reasoning"
     );
-    // GPT-5.4 and GPT-5.5 fast mode excludes long context: the card leaves
-    // its >272k cells blank. A fast request stays on the fast rates rather
-    // than stacking the standard long-context multiplier on them.
-    // https://developers.openai.com/api/docs/pricing
-    let fast_without_long_context_tier =
-        uses_fast_mode_pricing && matches!(model_name, "gpt-5.4" | "gpt-5.5");
     if is_openai_long_context_model
-        && !fast_without_long_context_tier
         && usage.requests == Some(1)
         && prompt_tokens > OPENAI_LONG_CONTEXT_THRESHOLD
     {

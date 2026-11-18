@@ -561,13 +561,6 @@ fn published_openai_fast_rates_that_are_not_a_flat_2x() {
         output_tokens: Some(1_000_000),
         ..UsageCounts::default()
     };
-    let long_context = UsageCounts {
-        input_tokens: Some(100_000),
-        cache_read_tokens: Some(200_000),
-        output_tokens: Some(1_000_000),
-        requests: Some(1),
-        ..UsageCounts::default()
-    };
     let fast = |name: &str| statsai_core::ModelInfo {
         speed: Some("fast".to_string()),
         ..test_model(name)
@@ -590,19 +583,86 @@ fn published_openai_fast_rates_that_are_not_a_flat_2x() {
             .as_deref(),
         Some("codex_api_pricing:gpt-5.5:fast")
     );
+}
 
-    // Neither publishes a fast rate above 272k, so a fast long request stays on
-    // the fast rates instead of stacking the standard long-context multiplier.
-    // 100k * $12.50 + 200k * $1.25 + 1M * $75.
-    assert_eq!(cost(&fast("gpt-5.5"), &long_context), Some(76_500_000));
-    // 100k * $5 + 200k * $0.50 + 1M * $30.
-    assert_eq!(cost(&fast("gpt-5.4"), &long_context), Some(30_600_000));
-    // Standard requests keep the long-context tier: 100k * $10 + 200k * $1
-    // + 1M * $45.
+#[test]
+fn fast_mode_without_long_context_bills_a_long_request_at_standard() {
+    let long_context = UsageCounts {
+        input_tokens: Some(100_000),
+        cache_read_tokens: Some(200_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let boundary = UsageCounts {
+        input_tokens: Some(272_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let aggregate = UsageCounts {
+        requests: Some(2),
+        ..long_context.clone()
+    };
+    let fast = |name: &str| statsai_core::ModelInfo {
+        speed: Some("fast".to_string()),
+        ..test_model(name)
+    };
+    let estimate = |model: &statsai_core::ModelInfo, usage: &UsageCounts| {
+        estimate_cost("codex", Some(model), usage)
+    };
+
+    // GPT-5.5, GPT-5.4 and GPT-5.4 mini fast mode excludes long context, so a
+    // fast request over 272k runs and bills at standard, long-context tier
+    // included. GPT-5.5: 100k * $10 + 200k * $1 + 1M * $45.
+    let gpt_5_5 = estimate(&fast("gpt-5.5"), &long_context);
+    assert_eq!(gpt_5_5.estimated_api_equivalent_micro_usd, Some(46_200_000));
     assert_eq!(
-        cost(&test_model("gpt-5.5"), &long_context),
-        Some(46_200_000)
+        gpt_5_5.estimated_api_equivalent_micro_usd,
+        estimate(&test_model("gpt-5.5"), &long_context).estimated_api_equivalent_micro_usd
     );
+    assert_eq!(
+        gpt_5_5.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-5.5")
+    );
+    // GPT-5.4: 100k * $5 + 200k * $0.50 + 1M * $22.50.
+    assert_eq!(
+        estimate(&fast("gpt-5.4"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(23_100_000)
+    );
+    // GPT-5.4 mini has no long-context tier: 100k * $0.75 + 200k * $0.075
+    // + 1M * $4.50.
+    assert_eq!(
+        estimate(&fast("gpt-5.4-mini"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(4_590_000)
+    );
+
+    // At exactly 272k the request is still short context and stays fast:
+    // 272k * $12.50 + 1M * $75.
+    let at_boundary = estimate(&fast("gpt-5.5"), &boundary);
+    assert_eq!(
+        at_boundary.estimated_api_equivalent_micro_usd,
+        Some(78_400_000)
+    );
+    assert_eq!(
+        at_boundary.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-5.5:fast")
+    );
+    // An aggregate cannot be split by request size and keeps the fast rate:
+    // 100k * $12.50 + 200k * $1.25 + 1M * $75.
+    assert_eq!(
+        estimate(&fast("gpt-5.5"), &aggregate).estimated_api_equivalent_micro_usd,
+        Some(76_500_000)
+    );
+    // GPT-5.6 does run long prompts in fast mode: 2x the long-context rate.
+    // Luna from 2026-07-30: 2 x (100k * $0.40 + 200k * $0.04 + 1M * $1.80).
+    let luna = estimate_cost_at(
+        "codex",
+        Some(&fast("gpt-5.6-luna")),
+        &long_context,
+        &parse_utc("2026-11-18T00:00:00Z"),
+    );
+    assert_eq!(luna.estimated_api_equivalent_micro_usd, Some(3_696_000));
 }
 
 #[test]

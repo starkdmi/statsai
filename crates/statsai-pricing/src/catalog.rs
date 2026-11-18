@@ -80,9 +80,9 @@ pub(crate) fn pricing_for_effective_speed(
             )
         }
         // Published fast rates that are not a flat 2x. GPT-5.5 is 2.5x and
-        // GPT-5 mini is 1.8x. GPT-5.4 is 2x but, like GPT-5.5, publishes no
-        // fast long-context rate, so `pricing_multipliers` keeps a fast request
-        // over 272k on these rates. Cache writes bill as input.
+        // GPT-5 mini is 1.8x. GPT-5.4 is 2x but, like GPT-5.5, has no fast
+        // long-context rate: `estimate_cost_at` prices a fast request over 272k
+        // as standard (see `fast_mode_covers`). Cache writes bill as input.
         // https://developers.openai.com/api/docs/pricing
         // https://openai.com/api-fast-mode/
         "gpt-5.5" => pricing(12.5, 1.25, 75.0),
