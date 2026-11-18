@@ -17,7 +17,7 @@
 pub const PRICING_RULESET_VERSION: u64 = 7;
 
 /// Descriptive identifier for the compiled price list. Not an ordering key.
-pub const PRICING_CATALOG_VERSION: &str = "official:2026-11-16";
+pub const PRICING_CATALOG_VERSION: &str = "official:2026-11-18";
 
 mod catalog;
 mod cost;

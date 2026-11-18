@@ -69,14 +69,16 @@ pub(crate) fn pricing_for_effective_speed(
         // cache writes and cached input. Models that also have a >272k tier
         // publish that same multiple on the long-context rates.
         // https://developers.openai.com/api/docs/pricing
-        "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6-astra"
-        | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5" | "gpt-5.1" | "gpt-5.2"
-        | "gpt-5.3-codex" | "gpt-5.4-mini" => pricing_with_cache_creation(
-            standard.input_per_million * 2.0,
-            standard.cache_creation_per_million * 2.0,
-            standard.cached_input_per_million * 2.0,
-            standard.output_per_million * 2.0,
-        ),
+        "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-sol"
+        | "gpt-6-luna" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+        | "gpt-5" | "gpt-5.1" | "gpt-5.2" | "gpt-5.3-codex" | "gpt-5.4-mini" => {
+            pricing_with_cache_creation(
+                standard.input_per_million * 2.0,
+                standard.cache_creation_per_million * 2.0,
+                standard.cached_input_per_million * 2.0,
+                standard.output_per_million * 2.0,
+            )
+        }
         // Published fast rates that are not a flat 2x. GPT-5.5 is 2.5x and
         // GPT-5 mini is 1.8x. GPT-5.4 is 2x but, like GPT-5.5, publishes no
         // fast long-context rate, so `pricing_multipliers` keeps a fast request
@@ -210,6 +212,13 @@ pub(crate) fn pricing_for_model_on(
         // is one known request.
         "claude-haiku-5-5" => Some(pricing_with_cache_creation(0.1, 0.125, 0.01, 0.5)),
         "claude-haiku-4-5" => Some(pricing_with_cache_creation(1.0, 1.25, 0.1, 5.0)),
+        // Launch price, 2026-11-17. Cache writes are the 30-minute rate. Prompts
+        // over 272k use the shared long-context multiplier; fast is 2x.
+        // https://developers.openai.com/api/docs/pricing
+        // https://developers.openai.com/api/docs/models/gpt-6.2-astra
+        // https://developers.openai.com/api/docs/models/gpt-6.2-sol
+        "gpt-6.2-astra" => Some(pricing_with_cache_creation(8.0, 10.0, 0.4, 40.0)),
+        "gpt-6.2-sol" => Some(pricing_with_cache_creation(2.0, 2.5, 0.1, 10.0)),
         // The default rate, covering the 272k context window Codex runs by
         // default. A larger prompt reprices the whole request at 20/25/2/75,
         // applied by `pricing_multipliers` where a record is one known request.

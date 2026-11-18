@@ -222,6 +222,23 @@ fn dated_fable_5_and_mythos_5_ids_are_not_taken_for_5_2() {
 }
 
 #[test]
+fn normalizes_gpt_6_2_astra_and_sol_without_folding_into_earlier_versions() {
+    assert_eq!(normalize_model_name("gpt-6.2-astra"), "gpt-6.2-astra");
+    assert_eq!(
+        normalize_model_name("openai/gpt-6.2-astra-2026-11-17"),
+        "gpt-6.2-astra"
+    );
+    assert_eq!(normalize_model_name("gpt-6.2-sol"), "gpt-6.2-sol");
+    assert_eq!(
+        normalize_model_name("openai/gpt-6.2-sol-2026-11-17"),
+        "gpt-6.2-sol"
+    );
+    assert_eq!(normalize_model_name("gpt-6-astra"), "gpt-6-astra");
+    assert_eq!(normalize_model_name("gpt-6.1-sol"), "gpt-6.1-sol");
+    assert_eq!(normalize_model_name("gpt-6-sol"), "gpt-6-sol");
+}
+
+#[test]
 fn normalizes_gpt_5_4_nano_ahead_of_gpt_5_4() {
     assert_eq!(normalize_model_name("gpt-5.4-nano"), "gpt-5.4-nano");
     assert_eq!(

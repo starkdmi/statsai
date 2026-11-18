@@ -535,6 +535,8 @@ fn published_openai_fast_mode_is_twice_the_standard_rate_that_day() {
     }
 
     for name in [
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
         "gpt-6-astra",
         "gpt-6.1-terra",
         "gpt-5.6-terra",
@@ -600,6 +602,99 @@ fn published_openai_fast_rates_that_are_not_a_flat_2x() {
     assert_eq!(
         cost(&test_model("gpt-5.5"), &long_context),
         Some(46_200_000)
+    );
+}
+
+#[test]
+fn gpt_6_2_astra_and_sol_use_the_november_17_launch_price() {
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let boundary = UsageCounts {
+        input_tokens: Some(272_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let long_context = UsageCounts {
+        input_tokens: Some(100_000),
+        cache_read_tokens: Some(200_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let fast = |name: &str| statsai_core::ModelInfo {
+        speed: Some("fast".to_string()),
+        ..test_model(name)
+    };
+    let estimate = |model: &statsai_core::ModelInfo, usage: &UsageCounts| {
+        estimate_cost("codex", Some(model), usage)
+    };
+
+    let astra = estimate(&test_model("gpt-6.2-astra"), &usage);
+    let dated_astra = estimate(&test_model("openai/gpt-6.2-astra-2026-11-17"), &usage);
+    let sol = estimate(&test_model("gpt-6.2-sol"), &usage);
+    let gpt_6_astra = estimate(&test_model("gpt-6-astra"), &usage);
+
+    // 8 input + 10 30-minute cache write + 0.40 cached input + 40 output.
+    assert_eq!(astra.estimated_api_equivalent_micro_usd, Some(58_400_000));
+    assert_eq!(
+        dated_astra.estimated_api_equivalent_micro_usd,
+        Some(58_400_000)
+    );
+    assert_eq!(
+        astra.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-6.2-astra")
+    );
+    assert_ne!(
+        astra.estimated_api_equivalent_micro_usd,
+        gpt_6_astra.estimated_api_equivalent_micro_usd
+    );
+    // 2 + 2.50 + 0.10 + 10. The same rates as GPT-6.1 Sol, under its own name.
+    assert_eq!(sol.estimated_api_equivalent_micro_usd, Some(14_600_000));
+    assert_eq!(
+        sol.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-6.2-sol")
+    );
+
+    // 272k is still short context: 272k * $8 + 1M * $40.
+    assert_eq!(
+        estimate(&test_model("gpt-6.2-astra"), &boundary).estimated_api_equivalent_micro_usd,
+        Some(42_176_000)
+    );
+    // Above 272k: 2x input and cached input, 1.5x output, for the whole request.
+    // Astra: 100k * $16 + 200k * $0.80 + 1M * $60.
+    assert_eq!(
+        estimate(&test_model("gpt-6.2-astra"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(61_760_000)
+    );
+    // Sol: 100k * $4 + 200k * $0.20 + 1M * $15.
+    assert_eq!(
+        estimate(&test_model("gpt-6.2-sol"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(15_440_000)
+    );
+
+    // Fast is 2x the rate for the same context length.
+    let fast_astra = estimate(&fast("gpt-6.2-astra"), &usage);
+    assert_eq!(
+        fast_astra.estimated_api_equivalent_micro_usd,
+        Some(116_800_000)
+    );
+    assert_eq!(
+        fast_astra.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-6.2-astra:fast")
+    );
+    assert_eq!(
+        estimate(&fast("gpt-6.2-sol"), &usage).estimated_api_equivalent_micro_usd,
+        Some(29_200_000)
+    );
+    assert_eq!(
+        estimate(&fast("gpt-6.2-astra"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(123_520_000)
     );
 }
 
