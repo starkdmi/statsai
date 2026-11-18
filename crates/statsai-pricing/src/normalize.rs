@@ -31,13 +31,42 @@ fn normalize_reversed_claude_model_name(lower: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether `lower` contains `version` not followed by another digit.
+///
+/// Anthropic snapshot ids end in an eight-digit date, and every date so far
+/// starts with `2`. A plain `contains("claude-fable-5-2")` therefore also
+/// matches the Fable 5 snapshot `claude-fable-5-20260610`.
+fn contains_version(lower: &str, version: &str) -> bool {
+    lower.match_indices(version).any(|(start, _)| {
+        !lower[start + version.len()..]
+            .bytes()
+            .next()
+            .is_some_and(|next| next.is_ascii_digit())
+    })
+}
+
 fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
+    // 5.2 must precede 5.1 and 5: "claude-fable-5-2" contains "claude-fable-5".
+    // It must also not take a dated Fable 5 id such as claude-fable-5-20260610.
+    if contains_version(lower, "claude-fable-5-2") || contains_version(lower, "claude-fable-5.2") {
+        return Some("claude-fable-5-2");
+    }
     // Must precede the `claude-fable-5` test, which would otherwise swallow every 5.1 name.
     if lower.contains("claude-fable-5-1") || lower.contains("claude-fable-5.1") {
         return Some("claude-fable-5-1");
     }
     if lower.contains("claude-fable-5") {
         return Some("claude-fable-5");
+    }
+    // 5.2 must precede 5.1 and 5, and must not take a dated Mythos 5 id, the
+    // same as Fable.
+    if contains_version(lower, "claude-mythos-5-2") || contains_version(lower, "claude-mythos-5.2")
+    {
+        return Some("claude-mythos-5-2");
+    }
+    // Must precede the `claude-mythos-5` test, which would otherwise swallow 5.1.
+    if lower.contains("claude-mythos-5-1") || lower.contains("claude-mythos-5.1") {
+        return Some("claude-mythos-5-1");
     }
     if lower.contains("claude-mythos-5") {
         return Some("claude-mythos-5");
@@ -96,8 +125,17 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     if lower.contains("claude-haiku-3-5") || lower.contains("claude-haiku-3.5") {
         return Some("claude-haiku-3-5");
     }
+    if lower.contains("gpt-6.2-astra") {
+        return Some("gpt-6.2-astra");
+    }
+    if lower.contains("gpt-6.2-sol") {
+        return Some("gpt-6.2-sol");
+    }
     if lower.contains("gpt-6-astra") {
         return Some("gpt-6-astra");
+    }
+    if lower.contains("gpt-6.1-terra") {
+        return Some("gpt-6.1-terra");
     }
     if lower.contains("gpt-6.1-sol") {
         return Some("gpt-6.1-sol");
@@ -122,6 +160,9 @@ fn normalize_proxy_wrapped_model_name(lower: &str) -> Option<&'static str> {
     }
     if lower.contains("gpt-5.4-mini") {
         return Some("gpt-5.4-mini");
+    }
+    if lower.contains("gpt-5.4-nano") {
+        return Some("gpt-5.4-nano");
     }
     if lower.contains("gpt-5.4") {
         return Some("gpt-5.4");
@@ -243,8 +284,11 @@ pub fn normalize_model_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
 
     match lower.as_str() {
+        "claude-fable-5-2" | "claude-fable-5.2" => "claude-fable-5-2".to_string(),
         "claude-fable-5-1" | "claude-fable-5.1" => "claude-fable-5-1".to_string(),
         "claude-fable-5" => "claude-fable-5".to_string(),
+        "claude-mythos-5-2" | "claude-mythos-5.2" => "claude-mythos-5-2".to_string(),
+        "claude-mythos-5-1" | "claude-mythos-5.1" => "claude-mythos-5-1".to_string(),
         "claude-mythos-5" => "claude-mythos-5".to_string(),
         "claude-opus-5-5" | "claude-opus-5-5-thinking" | "claude-opus-5.5" => {
             "claude-opus-5-5".to_string()
@@ -288,8 +332,12 @@ pub fn normalize_model_name(name: &str) -> String {
         "codex-auto-review" => "codex-auto-review".to_string(),
         "gpt-5.4" => "gpt-5.4".to_string(),
         "gpt-5.4-mini" => "gpt-5.4-mini".to_string(),
+        "gpt-5.4-nano" => "gpt-5.4-nano".to_string(),
+        "gpt-6.2-astra" => "gpt-6.2-astra".to_string(),
+        "gpt-6.2-sol" => "gpt-6.2-sol".to_string(),
         "gpt-6-astra" | "gpt-6-astra-codex" => "gpt-6-astra".to_string(),
         "gpt-6.1-sol" => "gpt-6.1-sol".to_string(),
+        "gpt-6.1-terra" => "gpt-6.1-terra".to_string(),
         "gpt-6-sol" => "gpt-6-sol".to_string(),
         "gpt-6-luna" => "gpt-6-luna".to_string(),
         "gpt-5.6-sol" => "gpt-5.6-sol".to_string(),

@@ -339,6 +339,465 @@ fn gpt_5_6_sol_uses_the_promotional_rate_from_its_start_date() {
 }
 
 #[test]
+fn mythos_5_1_prices_cache_reads_below_mythos_5() {
+    let usage = UsageCounts {
+        cache_read_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let model = |name: &str| statsai_core::ModelInfo {
+        name: Some(name.to_string()),
+        normalized_name: Some(normalize_model_name(name)),
+        provider_model_id: Some(name.to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+
+    let mythos_5 = estimate_cost("claude_code", Some(&model("claude-mythos-5")), &usage);
+    let mythos_5_1 = estimate_cost("claude_code", Some(&model("claude-mythos-5-1")), &usage);
+    let wrapped = estimate_cost(
+        "claude_code",
+        Some(&model("anthropic/claude-mythos-5.1")),
+        &usage,
+    );
+
+    assert_eq!(mythos_5.estimated_api_equivalent_micro_usd, Some(1_000_000));
+    assert_eq!(mythos_5_1.estimated_api_equivalent_micro_usd, Some(250_000));
+    assert_eq!(wrapped.estimated_api_equivalent_micro_usd, Some(250_000));
+}
+
+#[test]
+fn fable_5_2_and_mythos_5_2_use_the_november_9_launch_price() {
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let one_hour = UsageCounts {
+        cache_creation_tokens: Some(1_000_000),
+        cache_creation_1h_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let long_context = UsageCounts {
+        input_tokens: Some(300_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let model = |name: &str, speed: Option<&str>| statsai_core::ModelInfo {
+        name: Some(name.to_string()),
+        normalized_name: Some(normalize_model_name(name)),
+        provider_model_id: Some(name.to_string()),
+        speed: speed.map(str::to_string),
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    };
+
+    let fable_5_2 = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-2", None)),
+        &usage,
+    );
+    let mythos_5_2 = estimate_cost(
+        "claude_code",
+        Some(&model("anthropic/claude-mythos-5.2", None)),
+        &usage,
+    );
+    let fable_5 = estimate_cost("claude_code", Some(&model("claude-fable-5", None)), &usage);
+    let dated_fable_5 = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-20260610", None)),
+        &usage,
+    );
+    let fast = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-2-fast", None)),
+        &usage,
+    );
+    let fast_speed = estimate_cost(
+        "cursor",
+        Some(&model("claude-mythos-5-2", Some("fast"))),
+        &usage,
+    );
+    let hour = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-2", None)),
+        &one_hour,
+    );
+    let long = estimate_cost(
+        "claude_code",
+        Some(&model("claude-fable-5-2", None)),
+        &long_context,
+    );
+
+    // 8 input + 10 5-minute cache write + 0.20 cache read + 40 output.
+    assert_eq!(
+        fable_5_2.estimated_api_equivalent_micro_usd,
+        Some(58_200_000)
+    );
+    assert_eq!(
+        mythos_5_2.estimated_api_equivalent_micro_usd,
+        Some(58_200_000)
+    );
+    assert_ne!(
+        fable_5_2.estimated_api_equivalent_micro_usd,
+        fable_5.estimated_api_equivalent_micro_usd
+    );
+    // A dated Fable 5 snapshot contains "claude-fable-5-2" but is still Fable 5:
+    // 10 + 12.50 + 1 + 50.
+    assert_eq!(
+        dated_fable_5.estimated_api_equivalent_micro_usd,
+        Some(73_500_000)
+    );
+    // Fast is 2x input and output, with cache multipliers on the fast input rate:
+    // 16 + 20 + 0.40 + 80.
+    assert_eq!(fast.estimated_api_equivalent_micro_usd, Some(116_400_000));
+    assert_eq!(
+        fast_speed.estimated_api_equivalent_micro_usd,
+        Some(116_400_000)
+    );
+    assert_eq!(
+        fast.pricing_source.as_deref(),
+        Some("claude_code_api_pricing:claude-fable-5-2:fast")
+    );
+    // 1-hour cache writes stay 2x the input rate in effect.
+    assert_eq!(hour.estimated_api_equivalent_micro_usd, Some(16_000_000));
+    // 300k input at $8/M plus 1M output at $40/M. No long-context surcharge.
+    assert_eq!(long.estimated_api_equivalent_micro_usd, Some(42_400_000));
+}
+
+#[test]
+fn gpt_5_4_nano_uses_its_own_rates() {
+    let nano = test_model("openai/gpt-5.4-nano");
+    let gpt_5_4 = test_model("gpt-5.4");
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+
+    let cost = estimate_cost("codex", Some(&nano), &usage);
+    // 0.20 input + 0.20 cache write + 0.02 cached input + 1.25 output.
+    assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(1_670_000));
+    assert_ne!(
+        cost.estimated_api_equivalent_micro_usd,
+        estimate_cost("codex", Some(&gpt_5_4), &usage).estimated_api_equivalent_micro_usd
+    );
+}
+
+#[test]
+fn published_openai_fast_mode_is_twice_the_standard_rate_that_day() {
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let fast_of = |name: &str, timestamp: &str| {
+        let at = parse_utc(timestamp);
+        let model = statsai_core::ModelInfo {
+            speed: Some("fast".to_string()),
+            ..test_model(name)
+        };
+        let standard = estimate_cost_at("codex", Some(&test_model(name)), &usage, &at)
+            .estimated_api_equivalent_micro_usd
+            .expect("standard");
+        let fast = estimate_cost_at("codex", Some(&model), &usage, &at)
+            .estimated_api_equivalent_micro_usd
+            .expect("fast");
+        (standard, fast)
+    };
+
+    let (before_standard, before_fast) = fast_of("gpt-5.6-sol", "2026-08-20T23:59:59Z");
+    let (promo_standard, promo_fast) = fast_of("gpt-5.6-sol", "2026-08-21T00:00:00Z");
+    assert_eq!(before_fast, before_standard.saturating_mul(2));
+    assert_eq!(promo_fast, promo_standard.saturating_mul(2));
+    assert_ne!(before_fast, promo_fast);
+
+    // Terra and Luna follow their 2026-07-30 price cut, as Sol follows its promo.
+    // Terra: 2 x (2.50 + 3.125 + 0.25 + 15), then 2 x (2 + 2.50 + 0.20 + 12).
+    // Luna: 2 x (1 + 1.25 + 0.10 + 6), then 2 x (0.20 + 0.25 + 0.02 + 1.20).
+    for (name, before_expected, after_expected) in [
+        ("gpt-5.6-terra", 41_750_000, 33_400_000),
+        ("gpt-5.6-luna", 16_700_000, 3_340_000),
+    ] {
+        let (before_standard, before_fast) = fast_of(name, "2026-07-29T23:59:59Z");
+        let (after_standard, after_fast) = fast_of(name, "2026-07-30T00:00:00Z");
+        assert_eq!(before_fast, before_standard.saturating_mul(2), "{name}");
+        assert_eq!(after_fast, after_standard.saturating_mul(2), "{name}");
+        assert_eq!(before_fast, before_expected, "{name}");
+        assert_eq!(after_fast, after_expected, "{name}");
+    }
+
+    for name in [
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
+        "gpt-6-astra",
+        "gpt-6.1-terra",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5",
+        "gpt-5.1",
+        "gpt-5.2",
+        "gpt-5.3-codex",
+        "gpt-5.4-mini",
+    ] {
+        let (standard, fast) = fast_of(name, "2026-11-18T00:00:00Z");
+        assert_eq!(fast, standard.saturating_mul(2), "{name}");
+    }
+}
+
+#[test]
+fn published_openai_fast_rates_that_are_not_a_flat_2x() {
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let fast = |name: &str| statsai_core::ModelInfo {
+        speed: Some("fast".to_string()),
+        ..test_model(name)
+    };
+    let cost = |model: &statsai_core::ModelInfo, usage: &UsageCounts| {
+        estimate_cost("codex", Some(model), usage).estimated_api_equivalent_micro_usd
+    };
+
+    // GPT-5 mini is 1.8x: 0.45 input + 0.45 cache write + 0.045 cached input
+    // + 3.60 output.
+    assert_eq!(cost(&fast("gpt-5-mini"), &usage), Some(4_545_000));
+    assert_eq!(cost(&test_model("gpt-5-mini"), &usage), Some(2_525_000));
+    // GPT-5.4 is 2x: 5 + 5 + 0.50 + 30.
+    assert_eq!(cost(&fast("gpt-5.4"), &usage), Some(40_500_000));
+    // GPT-5.5 is 2.5x: 12.50 + 12.50 + 1.25 + 75.
+    assert_eq!(cost(&fast("gpt-5.5"), &usage), Some(101_250_000));
+    assert_eq!(
+        estimate_cost("codex", Some(&fast("gpt-5.5")), &usage)
+            .pricing_source
+            .as_deref(),
+        Some("codex_api_pricing:gpt-5.5:fast")
+    );
+}
+
+#[test]
+fn fast_mode_without_long_context_bills_a_long_request_at_standard() {
+    let long_context = UsageCounts {
+        input_tokens: Some(100_000),
+        cache_read_tokens: Some(200_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let boundary = UsageCounts {
+        input_tokens: Some(272_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let aggregate = UsageCounts {
+        requests: Some(2),
+        ..long_context.clone()
+    };
+    let fast = |name: &str| statsai_core::ModelInfo {
+        speed: Some("fast".to_string()),
+        ..test_model(name)
+    };
+    let estimate = |model: &statsai_core::ModelInfo, usage: &UsageCounts| {
+        estimate_cost("codex", Some(model), usage)
+    };
+
+    // GPT-5.5, GPT-5.4 and GPT-5.4 mini fast mode excludes long context, so a
+    // fast request over 272k runs and bills at standard, long-context tier
+    // included. GPT-5.5: 100k * $10 + 200k * $1 + 1M * $45.
+    let gpt_5_5 = estimate(&fast("gpt-5.5"), &long_context);
+    assert_eq!(gpt_5_5.estimated_api_equivalent_micro_usd, Some(46_200_000));
+    assert_eq!(
+        gpt_5_5.estimated_api_equivalent_micro_usd,
+        estimate(&test_model("gpt-5.5"), &long_context).estimated_api_equivalent_micro_usd
+    );
+    assert_eq!(
+        gpt_5_5.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-5.5")
+    );
+    // GPT-5.4: 100k * $5 + 200k * $0.50 + 1M * $22.50.
+    assert_eq!(
+        estimate(&fast("gpt-5.4"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(23_100_000)
+    );
+    // GPT-5.4 mini has no long-context tier: 100k * $0.75 + 200k * $0.075
+    // + 1M * $4.50.
+    assert_eq!(
+        estimate(&fast("gpt-5.4-mini"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(4_590_000)
+    );
+
+    // At exactly 272k the request is still short context and stays fast:
+    // 272k * $12.50 + 1M * $75.
+    let at_boundary = estimate(&fast("gpt-5.5"), &boundary);
+    assert_eq!(
+        at_boundary.estimated_api_equivalent_micro_usd,
+        Some(78_400_000)
+    );
+    assert_eq!(
+        at_boundary.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-5.5:fast")
+    );
+    // An aggregate cannot be split by request size and keeps the fast rate:
+    // 100k * $12.50 + 200k * $1.25 + 1M * $75.
+    assert_eq!(
+        estimate(&fast("gpt-5.5"), &aggregate).estimated_api_equivalent_micro_usd,
+        Some(76_500_000)
+    );
+    // GPT-5.6 does run long prompts in fast mode: 2x the long-context rate.
+    // Luna from 2026-07-30: 2 x (100k * $0.40 + 200k * $0.04 + 1M * $1.80).
+    let luna = estimate_cost_at(
+        "codex",
+        Some(&fast("gpt-5.6-luna")),
+        &long_context,
+        &parse_utc("2026-11-18T00:00:00Z"),
+    );
+    assert_eq!(luna.estimated_api_equivalent_micro_usd, Some(3_696_000));
+}
+
+#[test]
+fn gpt_6_2_astra_and_sol_use_the_november_17_launch_price() {
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    let boundary = UsageCounts {
+        input_tokens: Some(272_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let long_context = UsageCounts {
+        input_tokens: Some(100_000),
+        cache_read_tokens: Some(200_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let fast = |name: &str| statsai_core::ModelInfo {
+        speed: Some("fast".to_string()),
+        ..test_model(name)
+    };
+    let estimate = |model: &statsai_core::ModelInfo, usage: &UsageCounts| {
+        estimate_cost("codex", Some(model), usage)
+    };
+
+    let astra = estimate(&test_model("gpt-6.2-astra"), &usage);
+    let dated_astra = estimate(&test_model("openai/gpt-6.2-astra-2026-11-17"), &usage);
+    let sol = estimate(&test_model("gpt-6.2-sol"), &usage);
+    let gpt_6_astra = estimate(&test_model("gpt-6-astra"), &usage);
+
+    // 8 input + 10 30-minute cache write + 0.40 cached input + 40 output.
+    assert_eq!(astra.estimated_api_equivalent_micro_usd, Some(58_400_000));
+    assert_eq!(
+        dated_astra.estimated_api_equivalent_micro_usd,
+        Some(58_400_000)
+    );
+    assert_eq!(
+        astra.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-6.2-astra")
+    );
+    assert_ne!(
+        astra.estimated_api_equivalent_micro_usd,
+        gpt_6_astra.estimated_api_equivalent_micro_usd
+    );
+    // 2 + 2.50 + 0.10 + 10. The same rates as GPT-6.1 Sol, under its own name.
+    assert_eq!(sol.estimated_api_equivalent_micro_usd, Some(14_600_000));
+    assert_eq!(
+        sol.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-6.2-sol")
+    );
+
+    // 272k is still short context: 272k * $8 + 1M * $40.
+    assert_eq!(
+        estimate(&test_model("gpt-6.2-astra"), &boundary).estimated_api_equivalent_micro_usd,
+        Some(42_176_000)
+    );
+    // Above 272k: 2x input and cached input, 1.5x output, for the whole request.
+    // Astra: 100k * $16 + 200k * $0.80 + 1M * $60.
+    assert_eq!(
+        estimate(&test_model("gpt-6.2-astra"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(61_760_000)
+    );
+    // Sol: 100k * $4 + 200k * $0.20 + 1M * $15.
+    assert_eq!(
+        estimate(&test_model("gpt-6.2-sol"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(15_440_000)
+    );
+
+    // Fast is 2x the rate for the same context length.
+    let fast_astra = estimate(&fast("gpt-6.2-astra"), &usage);
+    assert_eq!(
+        fast_astra.estimated_api_equivalent_micro_usd,
+        Some(116_800_000)
+    );
+    assert_eq!(
+        fast_astra.pricing_source.as_deref(),
+        Some("codex_api_pricing:gpt-6.2-astra:fast")
+    );
+    assert_eq!(
+        estimate(&fast("gpt-6.2-sol"), &usage).estimated_api_equivalent_micro_usd,
+        Some(29_200_000)
+    );
+    assert_eq!(
+        estimate(&fast("gpt-6.2-astra"), &long_context).estimated_api_equivalent_micro_usd,
+        Some(123_520_000)
+    );
+}
+
+#[test]
+fn gpt_5_5_long_context_matches_the_272k_tier() {
+    let model = test_model("gpt-5.5");
+    let boundary_usage = UsageCounts {
+        input_tokens: Some(272_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let long_usage = UsageCounts {
+        input_tokens: Some(100_000),
+        cache_read_tokens: Some(200_000),
+        output_tokens: Some(1_000_000),
+        requests: Some(1),
+        ..UsageCounts::default()
+    };
+    let aggregate_usage = UsageCounts {
+        requests: Some(2),
+        ..long_usage.clone()
+    };
+
+    let boundary = estimate_cost("codex", Some(&model), &boundary_usage);
+    let long = estimate_cost("codex", Some(&model), &long_usage);
+    let aggregate = estimate_cost("codex", Some(&model), &aggregate_usage);
+
+    // 272k input at $5/M plus 1M output at $30/M.
+    assert_eq!(
+        boundary.estimated_api_equivalent_micro_usd,
+        Some(31_360_000)
+    );
+    // Long context: 2x input and cached input, 1.5x output.
+    // 100k * $10 + 200k * $1 + 1M * $45.
+    assert_eq!(long.estimated_api_equivalent_micro_usd, Some(46_200_000));
+    assert_eq!(
+        aggregate.estimated_api_equivalent_micro_usd,
+        Some(30_600_000)
+    );
+}
+
+#[test]
 fn fable_5_1_prices_cache_reads_below_fable_5() {
     let usage = UsageCounts {
         cache_read_tokens: Some(1_000_000),
@@ -1019,6 +1478,9 @@ fn gpt_6_sol_6_1_sol_and_luna_reprice_entire_request_above_272k() {
     let at = parse_utc("2026-09-22T12:00:00Z");
     for (name, short_cost, long_cost, fast_long_cost) in [
         ("gpt-6.1-sol", 557_200, 1_064_600, 2_129_200),
+        // 100k*$1 + 100k*$1.25 + 72k*$0.05 + 10k*$5 = $0.2786.
+        // Over 272k: 2x input and cache, 1.5x output. Fast long is 2x that.
+        ("gpt-6.1-terra", 278_600, 532_300, 1_064_600),
         ("gpt-6-sol", 564_400, 1_079_200, 2_158_400),
         ("gpt-6-luna", 28_220, 53_960, 107_920),
     ] {
@@ -1536,16 +1998,25 @@ fn grok_4_7_build_long_context_starts_at_200k_prompt_tokens() {
         ..UsageCounts::default()
     };
 
+    let above = UsageCounts {
+        input_tokens: Some(120_001),
+        ..usage.clone()
+    };
+
     let standard_cost = estimate_cost("grok_build", Some(&standard), &usage);
-    let fast_cost = estimate_cost("grok_build", Some(&fast), &usage);
+    let fast_at = estimate_cost("grok_build", Some(&fast), &usage);
+    let fast_above = estimate_cost("grok_build", Some(&fast), &above);
 
     assert_eq!(
         standard_cost.estimated_api_equivalent_micro_usd,
         Some(680_000)
     );
+    // Exactly 200k stays on the short-context fast card ($4 / $1 / $12).
+    assert_eq!(fast_at.estimated_api_equivalent_micro_usd, Some(680_000));
+    // 120_001 input at $6, 80k cached input at $1.50, 10k output at $18.
     assert_eq!(
-        fast_cost.estimated_api_equivalent_micro_usd,
-        Some(1_360_000)
+        fast_above.estimated_api_equivalent_micro_usd,
+        Some(1_020_006)
     );
 }
 

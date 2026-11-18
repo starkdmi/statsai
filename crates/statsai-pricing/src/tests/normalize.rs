@@ -16,6 +16,59 @@ fn normalizes_claude_thinking_variant() {
 }
 
 #[test]
+fn normalizes_mythos_5_1_ahead_of_mythos_5() {
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-1"),
+        "claude-mythos-5-1"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5.1"),
+        "claude-mythos-5-1"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-1-thinking-max"),
+        "claude-mythos-5-1"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-thinking-high"),
+        "claude-mythos-5"
+    );
+}
+
+#[test]
+fn normalizes_fable_5_2_and_mythos_5_2_ahead_of_earlier_fable_and_mythos() {
+    assert_eq!(normalize_model_name("claude-fable-5-2"), "claude-fable-5-2");
+    assert_eq!(normalize_model_name("claude-fable-5.2"), "claude-fable-5-2");
+    assert_eq!(
+        normalize_model_name("claude-fable-5-2-thinking-max"),
+        "claude-fable-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("anthropic/claude-fable-5-2"),
+        "claude-fable-5-2"
+    );
+    assert_eq!(normalize_model_name("claude-fable-5-1"), "claude-fable-5-1");
+    assert_eq!(normalize_model_name("claude-fable-5"), "claude-fable-5");
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-2"),
+        "claude-mythos-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5.2"),
+        "claude-mythos-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("openrouter/claude-mythos-5-2-thinking"),
+        "claude-mythos-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-1"),
+        "claude-mythos-5-1"
+    );
+    assert_eq!(normalize_model_name("claude-mythos-5"), "claude-mythos-5");
+}
+
+#[test]
 fn normalizes_fable_5_1_ahead_of_fable_5() {
     assert_eq!(normalize_model_name("claude-fable-5-1"), "claude-fable-5-1");
     assert_eq!(normalize_model_name("claude-fable-5.1"), "claude-fable-5-1");
@@ -95,6 +148,17 @@ fn normalizes_gpt_6_1_sol_without_collapsing_into_gpt_6_sol() {
 }
 
 #[test]
+fn normalizes_gpt_6_1_terra_without_collapsing_into_another_terra_or_sol() {
+    assert_eq!(normalize_model_name("gpt-6.1-terra"), "gpt-6.1-terra");
+    assert_eq!(
+        normalize_model_name("openai/gpt-6.1-terra-2026-10-26"),
+        "gpt-6.1-terra"
+    );
+    assert_eq!(normalize_model_name("gpt-5.6-terra"), "gpt-5.6-terra");
+    assert_eq!(normalize_model_name("gpt-6.1-sol"), "gpt-6.1-sol");
+}
+
+#[test]
 fn normalizes_new_opus_and_gpt_6_models_without_collapsing_opus_5_5() {
     assert_eq!(normalize_model_name("claude-opus-5-5"), "claude-opus-5-5");
     assert_eq!(normalize_model_name("claude-opus-5.5"), "claude-opus-5-5");
@@ -125,6 +189,64 @@ fn normalizes_gpt_5_6_family_and_proxy_wrapped_ids() {
         normalize_model_name("relay/openai-gpt-5.6-terra"),
         "gpt-5.6-terra"
     );
+}
+
+#[test]
+fn dated_fable_5_and_mythos_5_ids_are_not_taken_for_5_2() {
+    // Snapshot dates start with 2, so these contain "claude-fable-5-2" and
+    // "claude-mythos-5-2" without being 5.2.
+    assert_eq!(
+        normalize_model_name("claude-fable-5-20260610"),
+        "claude-fable-5"
+    );
+    assert_eq!(
+        normalize_model_name("anthropic/claude-fable-5-20260610"),
+        "claude-fable-5"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-20260610"),
+        "claude-mythos-5"
+    );
+    assert_eq!(
+        normalize_model_name("claude-fable-5-2-20260915"),
+        "claude-fable-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("claude-mythos-5-2-20260915"),
+        "claude-mythos-5-2"
+    );
+    assert_eq!(
+        normalize_model_name("openrouter/claude-fable-5.2-thinking"),
+        "claude-fable-5-2"
+    );
+}
+
+#[test]
+fn normalizes_gpt_6_2_astra_and_sol_without_folding_into_earlier_versions() {
+    assert_eq!(normalize_model_name("gpt-6.2-astra"), "gpt-6.2-astra");
+    assert_eq!(
+        normalize_model_name("openai/gpt-6.2-astra-2026-11-17"),
+        "gpt-6.2-astra"
+    );
+    assert_eq!(normalize_model_name("gpt-6.2-sol"), "gpt-6.2-sol");
+    assert_eq!(
+        normalize_model_name("openai/gpt-6.2-sol-2026-11-17"),
+        "gpt-6.2-sol"
+    );
+    assert_eq!(normalize_model_name("gpt-6-astra"), "gpt-6-astra");
+    assert_eq!(normalize_model_name("gpt-6.1-sol"), "gpt-6.1-sol");
+    assert_eq!(normalize_model_name("gpt-6-sol"), "gpt-6-sol");
+}
+
+#[test]
+fn normalizes_gpt_5_4_nano_ahead_of_gpt_5_4() {
+    assert_eq!(normalize_model_name("gpt-5.4-nano"), "gpt-5.4-nano");
+    assert_eq!(
+        normalize_model_name("openai/gpt-5.4-nano-2026-03-17"),
+        "gpt-5.4-nano"
+    );
+    assert_eq!(normalize_model_name("gpt-5.4"), "gpt-5.4");
+    assert_eq!(normalize_model_name("gpt-5.4-mini"), "gpt-5.4-mini");
 }
 
 #[test]

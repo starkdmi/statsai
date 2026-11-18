@@ -979,6 +979,72 @@ fn a_stored_event_with_a_stale_normalized_name_is_renormalized_and_repriced() {
     );
 }
 
+#[test]
+fn a_store_on_ruleset_5_moves_stored_5_2_rows_off_the_5_0_rates() {
+    let (store, source) = store_with_source("/tmp/pricing-5-2-normalization");
+    let started_at = parse_utc("2026-11-10T12:00:00Z");
+    let cache_reads = || UsageCounts {
+        cache_read_tokens: Some(1_000_000),
+        total_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    // Scanned and priced before 5.2 had its own entry: normalized to the 5.0
+    // name and billed at its $1.00/M cache-read rate.
+    let folded = |event_id: &str, observed: &str, folded_into: &str| {
+        let mut event = test_event(
+            &source,
+            started_at,
+            event_id,
+            observed,
+            cache_reads(),
+            CostInfo {
+                estimated_api_equivalent_usd: Some(100),
+                estimated_api_equivalent_micro_usd: Some(1_000_000),
+                pricing_source: Some(format!("claude_code_api_pricing:{folded_into}")),
+                pricing_version: Some("official:2026-10-08".to_string()),
+                confidence: Confidence::Medium,
+                ..missing_cost()
+            },
+        );
+        event.model = Some(ModelInfo {
+            normalized_name: Some(folded_into.to_string()),
+            ..event.model.clone().expect("model")
+        });
+        event
+    };
+    let fable = folded("stale-fable-5-2", "claude-fable-5-2", "claude-fable-5");
+    let mythos = folded(
+        "stale-mythos-5-2",
+        "claude-mythos-5-2-thinking",
+        "claude-mythos-5",
+    );
+    store.insert_event(&fable).expect("insert fable");
+    store.insert_event(&mythos).expect("insert mythos");
+    // Ruleset 5 is the last one released without the 5.2 entries. A store that
+    // applied it must still reprice, so this fails if the version is not bumped
+    // past it: the store would report `already_current` and keep these rows.
+    store
+        .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "5")
+        .expect("mark ruleset 5");
+
+    let report = store.ensure_current_pricing().expect("reprice");
+
+    assert!(!report.already_current);
+    for (event, normalized) in [(&fable, "claude-fable-5-2"), (&mythos, "claude-mythos-5-2")] {
+        let stored = stored_event(&store, &event.event_id.0);
+        assert_eq!(
+            stored.model.expect("model").normalized_name.as_deref(),
+            Some(normalized)
+        );
+        // 5.2 reads cache at $0.20/M, not the 5.0 rate of $1.00/M.
+        assert_eq!(
+            stored.cost.estimated_api_equivalent_micro_usd,
+            Some(200_000),
+            "{normalized}"
+        );
+    }
+}
+
 /// A cost an adapter derived by summing per-request samples, which prices each
 /// request against its own context-size tier. Only the session total is stored,
 /// and its request count is not 1, so the generic estimator cannot reproduce it.
