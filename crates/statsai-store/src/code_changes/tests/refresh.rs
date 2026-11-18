@@ -407,11 +407,15 @@ fn replacing_identical_metrics_is_idempotent_and_does_not_redirty_them() {
 #[test]
 fn local_refresh_preserves_metrics_ingested_from_another_device() {
     let store = Store::in_memory().expect("open store");
+    // Inside the Git observation window, which a refresh rebuilds. A fixed
+    // date ages out of that window, and the refresh then carries the stale
+    // local metric forward instead of dropping it.
+    let day = Utc::now().date_naive();
     let remote_metric = CodeChangeMetric {
         schema_version: CODE_CHANGE_METRIC_SCHEMA_VERSION.to_string(),
         metric_id: "remote-metric".to_string(),
         device_id: "remote-device".to_string(),
-        day: NaiveDate::from_ymd_opt(2026, 8, 1).expect("date"),
+        day,
         project_id: None,
         repository_hash: Some("remote-repository".to_string()),
         commit_hash: Some("remote-commit".to_string()),
