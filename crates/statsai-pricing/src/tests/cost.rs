@@ -1573,7 +1573,7 @@ fn codex_auto_review_reuses_gpt_5_4_rates_before_july_30() {
     assert_eq!(review_cost.confidence, Confidence::Medium);
     assert_eq!(
         review_cost.pricing_version.as_deref(),
-        Some(PRICING_CATALOG_VERSION)
+        Some(embedded_pricing().catalog())
     );
 }
 
@@ -1750,7 +1750,7 @@ fn overlay_preserves_provider_reported_provenance() {
     );
     assert_eq!(
         overlaid.pricing_version.as_deref(),
-        Some(PRICING_CATALOG_VERSION)
+        Some(embedded_pricing().catalog())
     );
     assert_eq!(overlaid.confidence, Confidence::High);
 }
@@ -1830,7 +1830,7 @@ fn grok_4_6_uses_official_short_context_rates_without_rewriting_identity() {
     );
     assert_eq!(
         grok_4_6_cost.pricing_version.as_deref(),
-        Some(PRICING_CATALOG_VERSION)
+        Some(embedded_pricing().catalog())
     );
 }
 

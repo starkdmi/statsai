@@ -5,6 +5,7 @@ mod cli;
 mod data;
 mod github;
 mod launcher;
+mod pricing;
 mod state;
 
 use anyhow::{bail, Context, Result};
@@ -552,6 +553,8 @@ fn upgrade_prod(paths: &Paths, state: &State, assume_yes: bool) -> Result<()> {
         current,
         installed.manifest.store_schema_version,
         installed.manifest.pricing_ruleset_version,
+        installed.manifest.pricing_format,
+        pricing::refresh_disabled_by_env(),
     )?;
     let data::ProdUpgradePlan::Upgrade {
         from,
@@ -560,10 +563,10 @@ fn upgrade_prod(paths: &Paths, state: &State, assume_yes: bool) -> Result<()> {
     } = plan
     else {
         println!(
-            "{} is already at store schema {} and pricing ruleset {}; nothing to migrate.",
+            "{} is already at store schema {} and pricing version {}; nothing to migrate.",
             paths.display(&paths.prod_store),
             current.schema,
-            pricing_label(current.pricing)
+            pricing_label(current.applied_pricing())
         );
         return Ok(());
     };
@@ -575,10 +578,14 @@ fn upgrade_prod(paths: &Paths, state: &State, assume_yes: bool) -> Result<()> {
         short_sha(&selected.sha)
     );
     println!("  store schema:     {} -> {schema}", from.schema);
-    println!(
-        "  pricing ruleset:  {} -> {pricing}",
-        pricing_label(from.pricing)
-    );
+    if from.applied_pricing() == Some(pricing) {
+        println!("  pricing version:  {pricing} (unchanged)");
+    } else {
+        println!(
+            "  pricing version:  {} -> {pricing}",
+            pricing_label(from.applied_pricing())
+        );
+    }
     println!(
         "  backup:           an APFS clone under {}",
         paths.display(&paths.prod_backups_dir)
@@ -614,19 +621,19 @@ fn upgrade_prod(paths: &Paths, state: &State, assume_yes: bool) -> Result<()> {
     // it restarts the daemon or resumes syncing, and "exited zero" is not the same
     // claim as "production is at the version this asked for".
     let after = data::read_prod_versions(paths)?;
-    if after.schema != schema || after.pricing != Some(pricing) {
+    if after.schema != schema || after.applied_pricing() != Some(pricing) {
         bail!(
-            "`statsai store migrate` reported success, but {} is at store schema {} and pricing ruleset {} rather than the schema {schema} and ruleset {pricing} the selected build supports. The database from before the migration is at {}; `statsai-dev data restore-prod` puts it back",
+            "`statsai store migrate` reported success, but {} is at store schema {} and pricing version {} rather than the schema {schema} and pricing version {pricing} the upgrade expected. The database from before the migration is at {}; `statsai-dev data restore-prod` puts it back",
             paths.display(&paths.prod_store),
             after.schema,
-            pricing_label(after.pricing),
+            pricing_label(after.applied_pricing()),
             paths.display(&backup.path)
         );
     }
     println!(
-        "Production is now at store schema {} and pricing ruleset {}.",
+        "Production is now at store schema {} and pricing version {}.",
         after.schema,
-        pricing_label(after.pricing)
+        pricing_label(after.applied_pricing())
     );
     println!(
         "Keep {} until the upgrade has proven itself; `statsai-dev data restore-prod` puts it back.",
@@ -662,9 +669,9 @@ fn restore_prod(paths: &Paths, backup: Option<PathBuf>, assume_yes: bool) -> Res
         current.schema, restoring.schema
     );
     println!(
-        "  pricing ruleset:  {} -> {}",
-        pricing_label(current.pricing),
-        pricing_label(restoring.pricing)
+        "  pricing version:  {} -> {}",
+        pricing_label(current.applied_pricing()),
+        pricing_label(restoring.applied_pricing())
     );
     if !assume_yes {
         confirm("restore")?;
@@ -995,7 +1002,7 @@ mod tests {
     fn installed_build(paths: &Paths, sha: &str) -> InstalledBuild {
         InstalledBuild {
             manifest: BuildManifest {
-                schema: 2,
+                schema: 3,
                 repository: github::REPOSITORY.to_string(),
                 sha: sha.to_string(),
                 target: TARGET.to_string(),
@@ -1003,7 +1010,8 @@ mod tests {
                 workflow_run_id: 104,
                 workflow_attempt: 1,
                 store_schema_version: 17,
-                pricing_ruleset_version: 1,
+                pricing_ruleset_version: 7,
+                pricing_format: Some(1),
             },
             binary_sha256: "b".repeat(64),
             binary_path: paths.builds_dir.join(sha).join("statsai"),

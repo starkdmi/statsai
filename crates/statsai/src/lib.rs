@@ -304,7 +304,7 @@ mod tests {
             PrivacyMode, SessionInfo, SourceKind, SourceLocation, UsageCounts, UsageEvent,
             USAGE_EVENT_SCHEMA_VERSION,
         };
-        use statsai_store::PRICING_RULESET_VERSION;
+        use statsai_store::embedded_pricing;
         use std::path::Path;
 
         let directory = tempfile::tempdir().expect("tempdir");
@@ -404,7 +404,7 @@ mod tests {
         let store = open_operational_store(&path).expect("operational open");
         assert_eq!(
             store.applied_pricing_ruleset_version().expect("applied"),
-            Some(PRICING_RULESET_VERSION)
+            Some(embedded_pricing().version())
         );
         let stored = store.events().expect("events");
         assert_eq!(stored.len(), 1);

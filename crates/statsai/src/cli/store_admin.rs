@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use statsai_store::{
-    database_applied_pricing_ruleset_version, database_schema_version, CURRENT_SCHEMA_VERSION,
-    PRICING_RULESET_VERSION,
+    database_applied_pricing_ruleset_version, database_schema_version, embedded_pricing,
+    CURRENT_SCHEMA_VERSION,
 };
 use std::fmt::Display;
 use std::path::Path;
@@ -26,7 +26,7 @@ pub(crate) fn store_admin(command: StoreAdminCommand, source: &Path) -> Result<(
             Ok(())
         }
         StoreAdminSubcommand::SupportedPricingRulesetVersion => {
-            println!("{PRICING_RULESET_VERSION}");
+            println!("{}", embedded_pricing().version());
             Ok(())
         }
         StoreAdminSubcommand::Migrate => migrate(source),
@@ -84,7 +84,7 @@ mod tests {
         );
         assert_eq!(
             database_applied_pricing_ruleset_version(&path).expect("read pricing ruleset"),
-            Some(PRICING_RULESET_VERSION)
+            Some(embedded_pricing().version())
         );
     }
 

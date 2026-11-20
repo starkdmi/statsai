@@ -58,9 +58,12 @@ fn codex_auto_review_reports_aggregate_periods_that_cross_its_equivalent_change(
 }
 #[test]
 fn ruleset_version_is_numeric_and_catalog_is_descriptive() {
-    const { assert!(PRICING_RULESET_VERSION >= 1) };
-    assert!(PRICING_CATALOG_VERSION.contains(':'));
-    assert_ne!(PRICING_RULESET_VERSION.to_string(), PRICING_CATALOG_VERSION);
+    assert!(embedded_pricing().version() >= 1);
+    assert!(embedded_pricing().catalog().contains(':'));
+    assert_ne!(
+        embedded_pricing().version().to_string(),
+        embedded_pricing().catalog()
+    );
 }
 
 #[test]

@@ -2984,6 +2984,8 @@ name = "statsai-pricing"
 version = "0.7.3"
 dependencies = [
  "chrono",
+ "serde",
+ "serde_json",
  "statsai-core",
 ]
 

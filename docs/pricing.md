@@ -1,0 +1,333 @@
+# Pricing file
+
+StatsAI estimates the API-equivalent cost of usage from published per-token
+prices. Those prices live in one JSON file,
+[`crates/statsai-pricing/pricing.json`](../crates/statsai-pricing/pricing.json),
+not in Rust code. Every binary embeds the file it was built with. Clients also
+fetch the copy on `main` once a day and keep it in their SQLite store, so a
+price change reaches users without a release.
+
+This page is for whoever edits prices, and for users who want to know where
+their cost estimates come from.
+
+## Why prices are a data file
+
+Prices change more often than StatsAI ships. Promotions start and end, and
+price cuts land between releases. When prices were Rust constants, every change
+waited for a release, and users saw corrected costs only after they upgraded.
+
+Now a price change is a pull request that edits `pricing.json`. Once it merges
+to `main`, clients pick it up within a day and reprice their stored estimates.
+
+## Where the file lives
+
+- In the repository: `crates/statsai-pricing/pricing.json`. It sits inside the
+  crate so the crate can embed it with `include_str!` and the published crate
+  ships it.
+- Clients fetch it from
+  `https://raw.githubusercontent.com/starkdmi/statsai/main/crates/statsai-pricing/pricing.json`.
+  `STATSAI_PRICING_URL` replaces that URL, for testing.
+
+## Format 1
+
+A short example, trimmed from the real file:
+
+```json
+{
+  "format": 1,
+  "version": 7,
+  "catalog": "official:2026-11-18",
+  "models": {
+    "gpt-5.6-sol": {
+      "note": "https://developers.openai.com/api/docs/pricing",
+      "prices": [
+        { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 30 },
+        { "from": "2026-08-21", "input": 4, "cache_write": 5, "cache_read": 0.4, "output": 20, "note": "promotion" }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-5.6-luna": {
+      "prices": [
+        { "from": null, "input": 1, "cache_write": 1.25, "cache_read": 0.1, "output": 6 },
+        { "from": "2026-07-30", "input": 0.2, "cache_write": 0.25, "cache_read": 0.02, "output": 1.2, "note": "price cut" }
+      ]
+    },
+    "gpt-5.4": {
+      "prices": [
+        { "from": null, "input": 2.5, "cache_write": 2.5, "cache_read": 0.25, "output": 15 }
+      ]
+    }
+  },
+  "equivalents": {
+    "codex-auto-review": [
+      { "from": null, "model": "gpt-5.4" },
+      { "from": "2026-07-30", "model": "gpt-5.6-luna" }
+    ]
+  },
+  "names": {
+    "claude-opus-5-5": ["claude-opus-5-5-thinking", "claude-opus-5.5"]
+  },
+  "patterns": [
+    { "contains": ["claude-fable-5-2", "claude-fable-5.2"], "model": "claude-fable-5-2", "whole_version": true }
+  ],
+  "reversed": {
+    "claude-5.5-opus": "claude-opus-5-5"
+  }
+}
+```
+
+### Top-level fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `format` | integer | Structure version of the file. See [`format` and `version`](#format-and-version). |
+| `version` | integer, at least 1 | Goes up on every change to the file. |
+| `catalog` | string | Written into each estimate's `pricing_version`. Non-empty, at most 100 characters, contains `:`, for example `official:2026-11-18`. |
+| `models` | object | Prices, keyed by lowercase catalog model name. |
+| `equivalents` | object | Names priced as another model, by date. |
+| `names` | object | Exact spellings that normalize to a canonical name. |
+| `patterns` | array | Ordered substring rules for names with no exact match. |
+| `reversed` | object | Names Cursor writes with the family after the version. |
+
+Unknown fields are rejected anywhere in the file. `note` is allowed on a model,
+a price period, an equivalent period and a pattern. Code ignores it; use it for
+sources and explanations.
+
+### `models`
+
+Each key is a lowercase catalog name, such as `claude-opus-5-5` or `gpt-5.5`.
+Two models with the same rates are still two entries.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `prices` | yes | List of price periods, oldest first. |
+| `source` | no | Pricing-source prefix: `cursor_model_pricing` or `xai_api_pricing`. Lowercase letters, digits and `_`. Absent means `{provider}_api_pricing`. Estimates record `{source}:{observed name}`. |
+| `long_context` | no | A higher tier for long prompts. |
+| `fast` | no | Fast-mode pricing. |
+| `note` | no | Free text. |
+
+A **price period** has `from` and four rates, in USD per million tokens:
+
+| Field | Meaning |
+|---|---|
+| `from` | `null` in the first period, which applies since forever. A `YYYY-MM-DD` UTC date in every later period. Dates strictly increase. |
+| `input` | Uncached input. |
+| `cache_write` | Cache writes. Where a provider bills cache writes as input, this equals `input`. |
+| `cache_read` | Cache reads (cached input). |
+| `output` | Output, including reasoning. |
+| `note` | Optional free text. |
+
+An event is priced with the last period whose `from` is on or before the
+event's UTC date.
+
+**`long_context`** is `{ "above": N, "input": x, "output": y }` or
+`{ "at_least": N, "input": x, "output": y }`, with exactly one of `above`
+(prompt tokens greater than N) and `at_least` (prompt tokens N or more). Prompt
+tokens are input plus cache writes plus cache reads. The tier applies only when
+a record is one known request, because an aggregate cannot be split by prompt
+size. `input` multiplies the input, cache-write and cache-read rates; `output`
+multiplies the output rate.
+
+**`fast`** has exactly one of:
+
+- `multiplier`: fast rates are the standard rates of the period in effect that
+  day, all four times this number.
+- `prices`: fast rates as their own list of periods, with the same rules as
+  `prices`.
+
+It may also have:
+
+- `max_prompt: N`: fast mode does not serve one known request whose prompt is
+  over N tokens, so that request is priced at standard rates.
+- `long_context`: replaces the model's `long_context` while fast rates apply.
+  Without it, the model's `long_context` applies on top of the fast rates.
+
+### `equivalents`
+
+Maps an observed name to periods of `{ "from", "model" }`, with the same date
+rules as prices. Events in a period are priced as that `model`: its rates, fast
+mode, long-context tier and source. The observed name stays on the event; only
+the price comes from the target. Every target must be a key in `models`, and a
+name cannot be in both `models` and `equivalents`.
+
+### `names`
+
+The exact-match table of the name normalizer. Each key is a canonical name; its
+value lists other spellings of it. A lowercased name equal to a key maps to
+itself, and a name equal to a listed spelling maps to its key. A spelling
+appears once in the whole table and is never also a key. A key does not need a
+`models` entry.
+
+### `patterns`
+
+Ordered substring rules for names with no exact match, such as dated snapshot
+ids and names a proxy wraps. The first rule with any matching `contains`
+string wins, so order matters: `claude-fable-5-2` must come before
+`claude-fable-5`. With `whole_version: true`, the match must not be followed by
+an ASCII digit, so `claude-fable-5-2` does not match the Fable 5 snapshot
+`claude-fable-5-20260610`. The default is a plain substring match.
+
+### `reversed`
+
+Cursor writes some Claude names with the version before the family, for example
+`claude-4.5-sonnet-thinking`. The code reads `claude-<version>-<family>` from
+the start of the name, drops the rest, and looks that key up here. Keys start
+with `claude-`.
+
+A name is normalized in this order: an exact match in `names`, then the first
+matching rule in `patterns`, then `reversed`. A name that none of them matches
+stays as observed, lowercased.
+
+### Limits
+
+- Names (in every section): non-empty, at most 128 bytes, lowercase ASCII, no
+  whitespace.
+- Rates: finite, from 0 to 1000 USD per million tokens.
+- Multipliers (`fast.multiplier`, `long_context.input` and `output`): finite,
+  greater than 0 and at most 20.
+- Token thresholds (`above`, `at_least`, `max_prompt`): from 1 to 100,000,000.
+- The whole file: at most 1 MiB.
+
+## `format` and `version`
+
+`version` goes up on every change to the file, and never goes down. Clients
+compare versions to decide whether a file is newer than the one they have.
+
+`format` changes only when the structure changes: a new field, or a rule older
+code cannot follow. A binary reads every format up to the one it was built for.
+A new format therefore needs a release, and clients on older releases stop
+taking new files from `main` until they upgrade. Raise `format` only together
+with the code that reads it.
+
+A binary refuses a store whose stored file has a format it cannot read, and
+asks you to upgrade. It never refuses a store because its file has a newer
+`version`; it uses that file.
+
+## Editing the file
+
+- **Change a price by adding a period.** Never edit or delete a period that
+  has started. Usage priced under it must keep its rate. A period dated in the
+  future can still be corrected until its day arrives. A new period can start
+  in the past, for a change found late; clients reprice the usage it covers.
+- **`from` is a UTC day.** The new rate applies to events on that UTC date and
+  later.
+- **The first period has `from: null`.**
+- **To end a promotion, add a period with the regular rate**, dated the day the
+  promotion ends. Do not delete the promotional period.
+- **Raise `version` on every change**, even to a note or to whitespace. Never
+  lower or reuse it: a client ignores a file whose version is not higher than
+  its own, so the change would not reach anyone. If another pull request raised
+  `version` first, update your branch and raise it again.
+- **Set `catalog` to the date of the change**, for example
+  `official:2026-11-24`.
+- **Add a model** by adding a `models` entry, plus whatever `names`,
+  `patterns` or `reversed` entries the normalizer needs to reach it from the
+  spellings tools report. Use `equivalents` for a name that should be priced
+  as another model.
+- **Never remove a model or an `equivalents` entry.** Stored events still
+  name it.
+- **Put sources in `note`**, with the provider's pricing URL.
+
+`long_context`, `fast.multiplier`, `fast.max_prompt`, `fast.long_context` and
+`source` have no dates. Changing one changes the price of all past usage, so
+change them only to fix a mistake.
+
+The check described below enforces most of these rules.
+
+## What CI checks
+
+- The `statsai-pricing` tests parse the file with the same validation every
+  client runs: structure, unknown fields, limits, period order and name rules.
+- The **Pricing file** job runs
+  [`scripts/check-pricing-file.sh`](../scripts/check-pricing-file.sh) on every
+  pull request. It compares the file with the base branch and fails when:
+  - the file changed and `version` did not go up;
+  - `format` went down;
+  - a `models` or `equivalents` entry was removed;
+  - a period whose `from` is `null` or on or before today's UTC date was
+    changed or removed. This covers `prices`, `fast.prices` and `equivalents`.
+
+Run the same check locally before you push:
+
+```sh
+scripts/check-pricing-file.sh origin/main
+```
+
+## How clients refresh
+
+- `statsai scan`, `statsai sync` and the watch daemon start a refresh on a
+  background thread when one is due. The command never waits for it; a scan
+  never waits on the network. The daemon checks hourly whether one is due.
+- A refresh is due at most once a day per store: when the last check is at
+  least 24 hours old and no attempt started in the last 10 minutes.
+- The request sends the stored ETag, so an unchanged file costs a `304` and no
+  body. It times out after 10 seconds and reads at most 1 MiB. A failed attempt
+  counts as the day's check; `statsai pricing refresh` tries again at once.
+- A fetched file is adopted only when it parses and passes validation (so no
+  rate is negative or out of bounds), its `format` is one the binary reads, and
+  its `version` is higher than any copy the process already has.
+- An adopted file is stored in the SQLite store under the `pricing.file`
+  metadata key.
+- Every command uses the newest copy it can read: the file embedded in the
+  binary or the stored copy, whichever has the higher `version`. When a binary
+  reprices the store with an embedded file newer than the stored copy, it also
+  stores its embedded file, so older binaries sharing the store use it.
+- The next command that uses price-derived data reprices stored estimates with
+  the newer version. Changed rollups are marked dirty, so the next incremental
+  `statsai sync --sink http` uploads the corrected costs. Neither `--full`,
+  `--rebuild-rollups` nor a raw rescan is needed. Provider-reported costs are
+  never replaced.
+- Repricing never goes backward. When the store was last repriced with a higher
+  version than the copy a binary uses, that binary leaves the stored estimates
+  as they are.
+
+## Turning the refresh off
+
+Either of these turns it off:
+
+- `statsai pricing auto-refresh off`, a setting kept in the store.
+  `statsai pricing auto-refresh on` turns it back on.
+- `STATSAI_PRICING_REFRESH=off` in the environment. `0`, `false` and `no` work
+  too, in any case.
+
+With the refresh off, StatsAI never fetches the file and ignores the stored
+copy. It prices with the file embedded in the binary.
+
+Tests and `cargo run` started inside this repository run with the refresh off:
+[`.cargo/config.toml`](../.cargo/config.toml) sets
+`STATSAI_PRICING_REFRESH=off`. A value set in your shell, such as `on`, takes
+precedence. The desktop golden captures in statsai-ui also run with it off, so
+their costs come from the embedded file.
+
+## Commands
+
+```sh
+statsai pricing status              # the pricing file in use and the refresh state
+statsai pricing refresh             # fetch now, ignoring the daily schedule
+statsai pricing auto-refresh off    # or on
+```
+
+`statsai pricing refresh` refuses when the refresh is off. When it adopts a
+file, it reprices the store immediately.
+
+`statsai store supported-pricing-format` prints the newest format the binary
+reads. `statsai store supported-pricing-ruleset-version` prints the `version`
+of the embedded file.
+
+## What stays in Rust
+
+Some pricing rules are mechanics, not data. Changing them needs a code change
+and a release:
+
+- How tiers and multipliers combine, the one-known-request rule for
+  long-context tiers, and integer micro-USD arithmetic.
+- Cursor-hosted Grok 4.7: its own tier above 256k prompt tokens (2x, or 1.5x
+  on fast rates), priced under `cursor_model_pricing`, and never xAI's 200k
+  tier.
+- 1-hour cache writes for `claude-*` models, billed at 2x the input rate.
+- Name handling around the tables: the `-fast` suffix, the `anthropic/` and
+  `openai/` prefixes, and the parser behind `reversed`.
+
+When a price change needs one of these to change, or needs a field format 1
+does not have, it ships with a release.

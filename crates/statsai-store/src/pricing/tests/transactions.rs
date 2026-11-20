@@ -118,7 +118,7 @@ fn concurrent_callers_do_not_publish_partial_or_duplicate_repricing() {
     let store = Store::open(&path).expect("reopen");
     assert_eq!(
         store.applied_pricing_ruleset_version().expect("applied"),
-        Some(PRICING_RULESET_VERSION)
+        Some(embedded_pricing().version())
     );
     let events = store.events().expect("events");
     assert_eq!(events.len(), 1);

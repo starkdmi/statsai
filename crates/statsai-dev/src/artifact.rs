@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 pub(crate) const TARGET: &str = "aarch64-apple-darwin";
-const MANIFEST_SCHEMA: u32 = 2;
+/// The manifest schema the dev-build workflow writes today.
+const MANIFEST_SCHEMA: u32 = 3;
+/// Builds that predate pricing files: no `pricing_format`.
+const LEGACY_MANIFEST_SCHEMA: u32 = 2;
 const MAX_BINARY_BYTES: u64 = 192 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 
@@ -24,7 +27,13 @@ pub(crate) struct BuildManifest {
     pub(crate) workflow_run_id: u64,
     pub(crate) workflow_attempt: u64,
     pub(crate) store_schema_version: i64,
+    /// The version of the pricing file the build embeds. Schema 2 builds predate
+    /// pricing files, and this is the compiled ruleset version they price with.
     pub(crate) pricing_ruleset_version: u64,
+    /// The newest pricing file format the build reads. Required from schema 3;
+    /// absent from schema 2, whose builds read no pricing files at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pricing_format: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -244,13 +253,19 @@ fn parse_manifest(bytes: &[u8], context: &str) -> Result<BuildManifest> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).with_context(|| context.to_string())?;
     match value.get("schema").and_then(serde_json::Value::as_u64) {
-        Some(schema) if schema == u64::from(MANIFEST_SCHEMA) => {}
-        Some(schema) => {
-            bail!("unsupported build manifest schema {schema} (expected {MANIFEST_SCHEMA})")
-        }
-        None => bail!("build manifest is missing schema (expected {MANIFEST_SCHEMA})"),
+        Some(schema) if supported_schema(schema) => {}
+        Some(schema) => bail!(
+            "unsupported build manifest schema {schema} (expected {LEGACY_MANIFEST_SCHEMA} or {MANIFEST_SCHEMA})"
+        ),
+        None => bail!(
+            "build manifest is missing schema (expected {LEGACY_MANIFEST_SCHEMA} or {MANIFEST_SCHEMA})"
+        ),
     }
     serde_json::from_value(value).with_context(|| context.to_string())
+}
+
+fn supported_schema(schema: u64) -> bool {
+    schema == u64::from(MANIFEST_SCHEMA) || schema == u64::from(LEGACY_MANIFEST_SCHEMA)
 }
 
 fn validate_manifest(
@@ -258,11 +273,23 @@ fn validate_manifest(
     expected_sha: &str,
     run: Option<&WorkflowRun>,
 ) -> Result<()> {
-    if manifest.schema != MANIFEST_SCHEMA {
+    if !supported_schema(u64::from(manifest.schema)) {
         bail!(
-            "unsupported build manifest schema {} (expected {MANIFEST_SCHEMA})",
+            "unsupported build manifest schema {} (expected {LEGACY_MANIFEST_SCHEMA} or {MANIFEST_SCHEMA})",
             manifest.schema
         );
+    }
+    match (manifest.schema, manifest.pricing_format) {
+        (LEGACY_MANIFEST_SCHEMA, Some(_)) => bail!(
+            "build manifest schema {LEGACY_MANIFEST_SCHEMA} must not record pricing_format; builds that read pricing files write schema {MANIFEST_SCHEMA}"
+        ),
+        (LEGACY_MANIFEST_SCHEMA, None) => {}
+        (_, None) => bail!(
+            "build manifest schema {} is missing pricing_format",
+            manifest.schema
+        ),
+        (_, Some(0)) => bail!("build manifest contains invalid pricing format 0"),
+        (_, Some(_)) => {}
     }
     if manifest.repository != REPOSITORY {
         bail!(
@@ -426,8 +453,47 @@ mod tests {
             workflow_run_id: 104,
             workflow_attempt: 1,
             store_schema_version: 17,
-            pricing_ruleset_version: 1,
+            pricing_ruleset_version: 7,
+            pricing_format: Some(1),
         }
+    }
+
+    fn legacy_manifest(sha: &str) -> BuildManifest {
+        BuildManifest {
+            schema: LEGACY_MANIFEST_SCHEMA,
+            pricing_ruleset_version: 6,
+            pricing_format: None,
+            ..manifest(sha)
+        }
+    }
+
+    fn verify_raw_manifest(manifest: serde_json::Value) -> Result<VerifiedArtifact> {
+        let sha = "a".repeat(40);
+        let binary = fake_binary();
+        let checksum = sha256_bytes(&binary);
+        verify_download(
+            &archive_raw_manifest(
+                &serde_json::to_vec(&manifest).expect("serialize manifest"),
+                &binary,
+                &checksum,
+            ),
+            &sha,
+            &run(&sha),
+        )
+    }
+
+    fn raw_manifest(schema: u64) -> serde_json::Value {
+        serde_json::json!({
+            "schema": schema,
+            "repository": REPOSITORY,
+            "sha": "a".repeat(40),
+            "target": TARGET,
+            "source": { "kind": "main" },
+            "workflow_run_id": 104,
+            "workflow_attempt": 1,
+            "store_schema_version": 17,
+            "pricing_ruleset_version": 7
+        })
     }
 
     fn archive_raw_manifest(manifest: &[u8], binary: &[u8], checksum: &str) -> Vec<u8> {
@@ -496,7 +562,8 @@ mod tests {
 
         assert_eq!(verified.manifest.sha, sha);
         assert_eq!(verified.manifest.schema, MANIFEST_SCHEMA);
-        assert_eq!(verified.manifest.pricing_ruleset_version, 1);
+        assert_eq!(verified.manifest.pricing_ruleset_version, 7);
+        assert_eq!(verified.manifest.pricing_format, Some(1));
         assert_eq!(verified.binary_sha256, checksum);
     }
 
@@ -529,8 +596,63 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported build manifest schema 1 (expected 2)"),
+                .contains("unsupported build manifest schema 1 (expected 2 or 3)"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_future_manifest_schema_is_rejected() {
+        let mut future = raw_manifest(4);
+        future["pricing_format"] = serde_json::json!(1);
+        let error = verify_raw_manifest(future).expect_err("schema 4 must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported build manifest schema 4 (expected 2 or 3)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn schema_3_manifest_requires_a_pricing_format() {
+        let error = verify_raw_manifest(raw_manifest(3))
+            .expect_err("schema 3 without pricing_format must fail");
+        assert!(
+            format!("{error:#}").contains("missing pricing_format"),
+            "{error:#}"
+        );
+
+        let mut zero = raw_manifest(3);
+        zero["pricing_format"] = serde_json::json!(0);
+        let error = verify_raw_manifest(zero).expect_err("pricing format 0 must fail");
+        assert!(
+            format!("{error:#}").contains("invalid pricing format 0"),
+            "{error:#}"
+        );
+
+        let mut complete = raw_manifest(3);
+        complete["pricing_format"] = serde_json::json!(2);
+        let verified = verify_raw_manifest(complete).expect("complete schema 3");
+        assert_eq!(verified.manifest.pricing_format, Some(2));
+        assert_eq!(verified.manifest.pricing_ruleset_version, 7);
+    }
+
+    #[test]
+    fn schema_2_manifest_is_a_legacy_build_without_a_pricing_format() {
+        let verified = verify_raw_manifest(raw_manifest(2)).expect("legacy schema 2");
+        assert_eq!(verified.manifest.schema, LEGACY_MANIFEST_SCHEMA);
+        assert_eq!(verified.manifest.pricing_format, None);
+        assert_eq!(verified.manifest.pricing_ruleset_version, 7);
+
+        // Only builds that read pricing files record a format, and they write schema 3.
+        let mut contradictory = raw_manifest(2);
+        contradictory["pricing_format"] = serde_json::json!(1);
+        let error =
+            verify_raw_manifest(contradictory).expect_err("schema 2 with pricing_format must fail");
+        assert!(
+            format!("{error:#}").contains("must not record pricing_format"),
+            "{error:#}"
         );
     }
 
@@ -585,18 +707,30 @@ mod tests {
         let first_sha = "a".repeat(40);
         let second_sha = "b".repeat(40);
         let binary = fake_binary();
-        for sha in [&first_sha, &second_sha] {
+        // A build cached before schema 3 must keep loading as the legacy build it is.
+        for manifest in [legacy_manifest(&first_sha), manifest(&second_sha)] {
             let artifact = VerifiedArtifact {
-                manifest: manifest(sha),
+                manifest,
                 binary: binary.clone(),
                 binary_sha256: sha256_bytes(&binary),
             };
             install(&paths, &artifact).expect("install cached build");
         }
 
-        assert!(load_cached(&paths, &first_sha)
-            .expect("verify cached build")
-            .is_some());
+        assert_eq!(
+            load_cached(&paths, &first_sha)
+                .expect("verify cached build")
+                .expect("cached legacy build")
+                .manifest,
+            legacy_manifest(&first_sha)
+        );
+        assert_eq!(
+            load_cached(&paths, &second_sha)
+                .expect("verify cached build")
+                .expect("cached current build")
+                .manifest,
+            manifest(&second_sha)
+        );
         assert_eq!(prune(&paths, &[&second_sha]).expect("prune cache"), 1);
         assert!(load_cached(&paths, &first_sha)
             .expect("inspect pruned build")

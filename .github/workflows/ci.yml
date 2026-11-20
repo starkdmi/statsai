@@ -43,6 +43,20 @@ jobs:
       - run: ./scripts/rust-ci.sh clippy
       - run: ./scripts/rust-ci.sh test
 
+  pricing-file:
+    name: Pricing file
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: scripts/check-pricing-file.sh "origin/$BASE_REF"
+        env:
+          BASE_REF: ${{ github.base_ref }}
+
   dependency-review:
     name: Dependency Review
     if: github.event_name == 'pull_request'

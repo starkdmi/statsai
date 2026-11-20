@@ -6,9 +6,9 @@ use rusqlite::params;
 use serde::de::DeserializeOwned;
 use statsai_core::{CostAccumulator, CostInfo, ModelInfo, UsageEvent, UsageSummary};
 use statsai_pricing::{
-    estimate_cost_at, estimate_priced_from_source_records, model_with_refreshed_normalization,
-    overlay_estimated_cost, pricing_changes_between, unknown_cost, PRICING_CATALOG_VERSION,
-    PRICING_RULESET_VERSION,
+    embedded_pricing, estimate_cost_at, estimate_priced_from_source_records,
+    model_with_refreshed_normalization, overlay_estimated_cost, pricing_changes_between,
+    unknown_cost,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -49,15 +49,20 @@ impl RepricingReport {
 
 impl fmt::Display for RepricingReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pricing = embedded_pricing();
         if self.already_current {
             return write!(
                 formatter,
-                "pricing already at ruleset {PRICING_RULESET_VERSION} ({PRICING_CATALOG_VERSION})"
+                "pricing already at ruleset {} ({})",
+                pricing.version(),
+                pricing.catalog()
             );
         }
         write!(
             formatter,
-            "repriced store to ruleset {PRICING_RULESET_VERSION} ({PRICING_CATALOG_VERSION}): examined_events={} changed_events={} skipped_unreadable_events={} changed_summaries={} refreshed_rollups={}",
+            "repriced store to ruleset {} ({}): examined_events={} changed_events={} skipped_unreadable_events={} changed_summaries={} refreshed_rollups={}",
+            pricing.version(),
+            pricing.catalog(),
             self.examined_events,
             self.changed_events,
             self.skipped_unreadable_events,
@@ -85,7 +90,8 @@ impl Store {
     /// owns the decision so development launchers compiled against a different
     /// catalog cannot reprice a store they did not select.
     pub fn ensure_current_pricing(&self) -> Result<RepricingReport> {
-        self.ensure_pricing_ruleset(PRICING_RULESET_VERSION, PRICING_CATALOG_VERSION)
+        let pricing = embedded_pricing();
+        self.ensure_pricing_ruleset(pricing.version(), pricing.catalog())
     }
 
     /// Returns the last successfully applied pricing ruleset, if recorded.

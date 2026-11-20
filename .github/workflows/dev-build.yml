@@ -70,6 +70,7 @@ jobs:
           cp "target/$BUILD_TARGET/release/statsai" "$artifact_dir/statsai"
           store_schema_version=$("$artifact_dir/statsai" store supported-schema-version)
           pricing_ruleset_version=$("$artifact_dir/statsai" store supported-pricing-ruleset-version)
+          pricing_format=$("$artifact_dir/statsai" store supported-pricing-format)
 
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             source_json=$(jq -n --argjson number "$PR_NUMBER" '{kind: "pull_request", number: $number}')
@@ -86,8 +87,9 @@ jobs:
             --argjson workflow_attempt "$WORKFLOW_ATTEMPT" \
             --argjson store_schema_version "$store_schema_version" \
             --argjson pricing_ruleset_version "$pricing_ruleset_version" \
+            --argjson pricing_format "$pricing_format" \
             '{
-              schema: 2,
+              schema: 3,
               repository: $repository,
               sha: $sha,
               target: $target,
@@ -95,7 +97,8 @@ jobs:
               workflow_run_id: $workflow_run_id,
               workflow_attempt: $workflow_attempt,
               store_schema_version: $store_schema_version,
-              pricing_ruleset_version: $pricing_ruleset_version
+              pricing_ruleset_version: $pricing_ruleset_version,
+              pricing_format: $pricing_format
             }' > "$artifact_dir/build.json"
 
           (cd "$artifact_dir" && shasum -a 256 statsai > SHA256SUMS)
@@ -103,6 +106,7 @@ jobs:
           test "$(jq -r .sha "$artifact_dir/build.json")" = "$BUILD_SHA"
           test "$(jq -r .store_schema_version "$artifact_dir/build.json")" = "$store_schema_version"
           test "$(jq -r .pricing_ruleset_version "$artifact_dir/build.json")" = "$pricing_ruleset_version"
+          test "$(jq -r .pricing_format "$artifact_dir/build.json")" = "$pricing_format"
           (cd "$artifact_dir" && shasum -a 256 -c SHA256SUMS)
           echo "sha=$BUILD_SHA" >> "$GITHUB_OUTPUT"
           echo "path=$artifact_dir" >> "$GITHUB_OUTPUT"

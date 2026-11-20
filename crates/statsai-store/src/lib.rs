@@ -92,10 +92,14 @@ pub use scan_lock::{
     SCAN_LOCK_FILE_NAME,
 };
 pub use snapshot::{
-    clone_database_to, database_applied_pricing_ruleset_version, database_schema_version,
-    DatabaseClone,
+    clone_database_to, database_applied_pricing_ruleset_version, database_pricing_state,
+    database_schema_version, DatabaseClone, DatabasePricingState, StoredPricingFileHeader,
+    PRICING_REFRESH_SETTING_KEY, STORED_PRICING_FILE_KEY,
 };
-pub use statsai_pricing::{PRICING_CATALOG_VERSION, PRICING_RULESET_VERSION};
+pub use statsai_pricing::{
+    active_pricing, embedded_pricing, install_pricing, PricingFileError, PricingFileHeader,
+    PricingTable, PRICING_FORMAT,
+};
 use std::time::Duration;
 
 #[cfg(test)]

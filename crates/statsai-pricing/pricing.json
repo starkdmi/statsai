@@ -1,0 +1,590 @@
+{
+  "format": 1,
+  "version": 7,
+  "catalog": "official:2026-11-18",
+  "models": {
+    "claude-fable-5-2": {
+      "note": "Launch price, 2026-11-09. Mythos 5.2 uses the same rates. Cache reads are 0.025x input. The 1M window has no long-context surcharge. Fast input and output are 2x; prompt-cache multipliers apply on top of that fast input rate: 1.25x 5-minute writes and 0.025x cache reads. https://platform.claude.com/docs/en/about-claude/pricing https://platform.claude.com/docs/en/models/fable-5-2/overview https://www.anthropic.com/claude-fable-and-mythos-5-2",
+      "prices": [
+        { "from": null, "input": 8, "cache_write": 10, "cache_read": 0.2, "output": 40 }
+      ],
+      "fast": {
+        "prices": [
+          { "from": null, "input": 16, "cache_write": 20, "cache_read": 0.4, "output": 80 }
+        ]
+      }
+    },
+    "claude-mythos-5-2": {
+      "note": "Same rates as Fable 5.2, launched 2026-11-09. https://platform.claude.com/docs/en/about-claude/pricing https://www.anthropic.com/claude-fable-and-mythos-5-2",
+      "prices": [
+        { "from": null, "input": 8, "cache_write": 10, "cache_read": 0.2, "output": 40 }
+      ],
+      "fast": {
+        "prices": [
+          { "from": null, "input": 16, "cache_write": 20, "cache_read": 0.4, "output": 80 }
+        ]
+      }
+    },
+    "claude-fable-5-1": {
+      "note": "Fable 5.1 matches Fable 5 except for cache reads, which dropped to $0.25/M.",
+      "prices": [
+        { "from": null, "input": 10, "cache_write": 12.5, "cache_read": 0.25, "output": 50 }
+      ]
+    },
+    "claude-mythos-5-1": {
+      "note": "Mythos 5.1 matches Mythos 5 except cache reads at $0.25/M. https://platform.claude.com/docs/en/about-claude/pricing",
+      "prices": [
+        { "from": null, "input": 10, "cache_write": 12.5, "cache_read": 0.25, "output": 50 }
+      ]
+    },
+    "claude-fable-5": {
+      "prices": [
+        { "from": null, "input": 10, "cache_write": 12.5, "cache_read": 1, "output": 50 }
+      ]
+    },
+    "claude-mythos-5": {
+      "prices": [
+        { "from": null, "input": 10, "cache_write": 12.5, "cache_read": 1, "output": 50 }
+      ]
+    },
+    "claude-opus-5-5": {
+      "note": "No long-context surcharge. Fast input and output are 2x, with the prompt-cache multipliers on top of the fast input rate. https://platform.claude.com/docs/en/about-claude/pricing",
+      "prices": [
+        { "from": null, "input": 4, "cache_write": 5, "cache_read": 0.2, "output": 20 }
+      ],
+      "fast": {
+        "prices": [
+          { "from": null, "input": 8, "cache_write": 10, "cache_read": 0.4, "output": 40 }
+        ]
+      }
+    },
+    "claude-opus-5": {
+      "prices": [
+        { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 25 }
+      ],
+      "fast": {
+        "prices": [
+          { "from": null, "input": 10, "cache_write": 12.5, "cache_read": 1, "output": 50 }
+        ]
+      }
+    },
+    "claude-sonnet-5-5": {
+      "prices": [
+        { "from": null, "input": 2, "cache_write": 2.5, "cache_read": 0.2, "output": 10 },
+        { "from": "2026-10-07", "input": 2, "cache_write": 2.5, "cache_read": 0.1, "output": 10, "note": "Sonnet 5.5 cache reads dropped from $0.20/M to $0.10/M; its other rates held." }
+      ]
+    },
+    "claude-sonnet-5": {
+      "note": "The $2/$10 launch price became standard; the rise to $3/$15 scheduled for 2026-09-01 was cancelled.",
+      "prices": [
+        { "from": null, "input": 2, "cache_write": 2.5, "cache_read": 0.2, "output": 10 }
+      ]
+    },
+    "claude-opus-4": {
+      "prices": [
+        { "from": null, "input": 15, "cache_write": 18.75, "cache_read": 1.5, "output": 75 }
+      ]
+    },
+    "claude-opus-4-1": {
+      "prices": [
+        { "from": null, "input": 15, "cache_write": 18.75, "cache_read": 1.5, "output": 75 }
+      ]
+    },
+    "claude-opus-4-5": {
+      "prices": [
+        { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 25 }
+      ]
+    },
+    "claude-opus-4-6": {
+      "note": "Fast rates are historical fast-mode rates. Effective usage.speed is authoritative: unsupported requests either failed or reported standard after fallback.",
+      "prices": [
+        { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 25 }
+      ],
+      "fast": {
+        "prices": [
+          { "from": null, "input": 30, "cache_write": 37.5, "cache_read": 3, "output": 150 }
+        ]
+      }
+    },
+    "claude-opus-4-7": {
+      "note": "Fast rates are historical fast-mode rates. Effective usage.speed is authoritative: unsupported requests either failed or reported standard after fallback.",
+      "prices": [
+        { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 25 }
+      ],
+      "fast": {
+        "prices": [
+          { "from": null, "input": 30, "cache_write": 37.5, "cache_read": 3, "output": 150 }
+        ]
+      }
+    },
+    "claude-opus-4-8": {
+      "prices": [
+        { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 25 }
+      ],
+      "fast": {
+        "prices": [
+          { "from": null, "input": 10, "cache_write": 12.5, "cache_read": 1, "output": 50 }
+        ]
+      }
+    },
+    "claude-sonnet-4": {
+      "prices": [
+        { "from": null, "input": 3, "cache_write": 3.75, "cache_read": 0.3, "output": 15 }
+      ]
+    },
+    "claude-sonnet-4-5": {
+      "prices": [
+        { "from": null, "input": 3, "cache_write": 3.75, "cache_read": 0.3, "output": 15 }
+      ]
+    },
+    "claude-sonnet-4-6": {
+      "prices": [
+        { "from": null, "input": 3, "cache_write": 3.75, "cache_read": 0.3, "output": 15 }
+      ]
+    },
+    "claude-haiku-5-5": {
+      "note": "The rate for prompts up to 100k tokens. A larger prompt reprices the whole request at 5x, every rate including cache writes and reads, where a record is one known request.",
+      "prices": [
+        { "from": null, "input": 0.1, "cache_write": 0.125, "cache_read": 0.01, "output": 0.5 }
+      ],
+      "long_context": { "above": 100000, "input": 5, "output": 5 }
+    },
+    "claude-haiku-4-5": {
+      "prices": [
+        { "from": null, "input": 1, "cache_write": 1.25, "cache_read": 0.1, "output": 5 }
+      ]
+    },
+    "gpt-6.2-astra": {
+      "note": "Launch price, 2026-11-17. Cache writes are the 30-minute rate. Prompts over 272k use the shared long-context multiplier; fast is 2x. https://developers.openai.com/api/docs/pricing https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+      "prices": [
+        { "from": null, "input": 8, "cache_write": 10, "cache_read": 0.4, "output": 40 }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-6.2-sol": {
+      "note": "Launch price, 2026-11-17. Cache writes are the 30-minute rate. Prompts over 272k use the shared long-context multiplier; fast is 2x. https://developers.openai.com/api/docs/pricing https://developers.openai.com/api/docs/models/gpt-6.2-sol",
+      "prices": [
+        { "from": null, "input": 2, "cache_write": 2.5, "cache_read": 0.1, "output": 10 }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-6-astra": {
+      "note": "The default rate, covering the 272k context window Codex runs by default. A larger prompt reprices the whole request at 20/25/2/75 where a record is one known request.",
+      "prices": [
+        { "from": null, "input": 10, "cache_write": 12.5, "cache_read": 1, "output": 50 }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-6.1-sol": {
+      "note": "Same input, cache-write and output rates as GPT-6 Sol; cached input is 5% of input rather than 10%.",
+      "prices": [
+        { "from": null, "input": 2, "cache_write": 2.5, "cache_read": 0.1, "output": 10 }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-6.1-terra": {
+      "note": "Launch price, 2026-10-26. Cache writes are the 30-minute rate. Prompts over 272k use the shared long-context multiplier; fast is 2x. https://developers.openai.com/api/docs/models/gpt-6.1-terra https://developers.openai.com/api/docs/pricing",
+      "prices": [
+        { "from": null, "input": 1, "cache_write": 1.25, "cache_read": 0.05, "output": 5 }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-6-sol": {
+      "prices": [
+        { "from": null, "input": 2, "cache_write": 2.5, "cache_read": 0.2, "output": 10 }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-6-luna": {
+      "prices": [
+        { "from": null, "input": 0.1, "cache_write": 0.125, "cache_read": 0.01, "output": 0.5 }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-5.6-sol": {
+      "note": "GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount. Fast mode is twice the standard rates in effect that day, including cache writes and cached input. https://developers.openai.com/api/docs/pricing",
+      "prices": [
+        { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 30 },
+        { "from": "2026-08-21", "input": 4, "cache_write": 5, "cache_read": 0.4, "output": 20, "note": "Promotional, announced to hold at least through 2026-11-21. When it lapses, add a period rather than editing this one: usage priced under the promotion must keep its rate." }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-5.6-terra": {
+      "note": "GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount. Fast mode is twice the standard rates in effect that day. https://developers.openai.com/api/docs/pricing",
+      "prices": [
+        { "from": null, "input": 2.5, "cache_write": 3.125, "cache_read": 0.25, "output": 15 },
+        { "from": "2026-07-30", "input": 2, "cache_write": 2.5, "cache_read": 0.2, "output": 12, "note": "GPT-5.6 Luna and Terra price cut." }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-5.6-luna": {
+      "note": "GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount. Fast mode is twice the standard rates in effect that day. https://developers.openai.com/api/docs/pricing",
+      "prices": [
+        { "from": null, "input": 1, "cache_write": 1.25, "cache_read": 0.1, "output": 6 },
+        { "from": "2026-07-30", "input": 0.2, "cache_write": 0.25, "cache_read": 0.02, "output": 1.2, "note": "GPT-5.6 Luna and Terra price cut." }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-5.5": {
+      "note": "Uses the same >272k tier as the other OpenAI models: 2x input and cached input, 1.5x output (https://developers.openai.com/api/docs/models/gpt-5.5). Fast is 2.5x and has no long-context rate: the fast card leaves the >272k cells blank, so one request over 272k is served and billed at standard. Cache writes bill as input. https://developers.openai.com/api/docs/pricing https://openai.com/api-fast-mode/ https://developers.openai.com/api/docs/guides/fast-mode",
+      "prices": [
+        { "from": null, "input": 5, "cache_write": 5, "cache_read": 0.5, "output": 30 }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": {
+        "prices": [
+          { "from": null, "input": 12.5, "cache_write": 12.5, "cache_read": 1.25, "output": 75 }
+        ],
+        "max_prompt": 272000
+      }
+    },
+    "gpt-5.4": {
+      "note": "Fast is 2x but, like GPT-5.5, has no fast long-context rate: one fast request over 272k is billed at standard. Cache writes bill as input. https://developers.openai.com/api/docs/pricing https://openai.com/api-fast-mode/",
+      "prices": [
+        { "from": null, "input": 2.5, "cache_write": 2.5, "cache_read": 0.25, "output": 15 }
+      ],
+      "long_context": { "above": 272000, "input": 2, "output": 1.5 },
+      "fast": {
+        "prices": [
+          { "from": null, "input": 5, "cache_write": 5, "cache_read": 0.5, "output": 30 }
+        ],
+        "max_prompt": 272000
+      }
+    },
+    "gpt-5.4-mini": {
+      "note": "Fast mode excludes long context: one fast request over 272k is billed at standard. https://openai.com/api-fast-mode/",
+      "prices": [
+        { "from": null, "input": 0.75, "cache_write": 0.75, "cache_read": 0.075, "output": 4.5 }
+      ],
+      "fast": { "multiplier": 2, "max_prompt": 272000 }
+    },
+    "gpt-5.4-nano": {
+      "note": "No long-context tier. Cache writes are billed as input. https://developers.openai.com/api/docs/pricing",
+      "prices": [
+        { "from": null, "input": 0.2, "cache_write": 0.2, "cache_read": 0.02, "output": 1.25 }
+      ]
+    },
+    "gpt-5.3-codex": {
+      "prices": [
+        { "from": null, "input": 1.75, "cache_write": 1.75, "cache_read": 0.175, "output": 14 }
+      ],
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-5.2": {
+      "prices": [
+        { "from": null, "input": 1.75, "cache_write": 1.75, "cache_read": 0.175, "output": 14 }
+      ],
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-5.2-chat-latest": {
+      "prices": [
+        { "from": null, "input": 1.75, "cache_write": 1.75, "cache_read": 0.175, "output": 14 }
+      ]
+    },
+    "gpt-5.2-codex": {
+      "prices": [
+        { "from": null, "input": 1.75, "cache_write": 1.75, "cache_read": 0.175, "output": 14 }
+      ]
+    },
+    "gpt-5-codex": {
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.125, "output": 10 }
+      ]
+    },
+    "gpt-5.1-codex": {
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.125, "output": 10 }
+      ]
+    },
+    "gpt-5.1-codex-max": {
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.125, "output": 10 }
+      ]
+    },
+    "gpt-5": {
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.125, "output": 10 }
+      ],
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-5.1": {
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.125, "output": 10 }
+      ],
+      "fast": { "multiplier": 2 }
+    },
+    "gpt-5-chat-latest": {
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.125, "output": 10 }
+      ]
+    },
+    "gpt-5.1-chat-latest": {
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.125, "output": 10 }
+      ]
+    },
+    "gpt-5-mini": {
+      "note": "Fast is 1.8x. Cache writes bill as input. https://developers.openai.com/api/docs/pricing https://openai.com/api-fast-mode/",
+      "prices": [
+        { "from": null, "input": 0.25, "cache_write": 0.25, "cache_read": 0.025, "output": 2 }
+      ],
+      "fast": {
+        "prices": [
+          { "from": null, "input": 0.45, "cache_write": 0.45, "cache_read": 0.045, "output": 3.6 }
+        ]
+      }
+    },
+    "gpt-5.1-codex-mini": {
+      "prices": [
+        { "from": null, "input": 0.25, "cache_write": 0.25, "cache_read": 0.025, "output": 2 }
+      ]
+    },
+    "gpt-5-nano": {
+      "prices": [
+        { "from": null, "input": 0.05, "cache_write": 0.05, "cache_read": 0.005, "output": 0.4 }
+      ]
+    },
+    "composer-2.5": {
+      "source": "cursor_model_pricing",
+      "prices": [
+        { "from": null, "input": 0.5, "cache_write": 0.5, "cache_read": 0.2, "output": 2.5 }
+      ]
+    },
+    "composer-2.5-fast": {
+      "source": "cursor_model_pricing",
+      "prices": [
+        { "from": null, "input": 3, "cache_write": 3, "cache_read": 0.5, "output": 15 }
+      ]
+    },
+    "grok-build-0.1": {
+      "source": "xai_api_pricing",
+      "prices": [
+        { "from": null, "input": 1, "cache_write": 1, "cache_read": 0.2, "output": 2 }
+      ],
+      "long_context": { "at_least": 200000, "input": 2, "output": 2 }
+    },
+    "grok-4.3": {
+      "source": "xai_api_pricing",
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.2, "output": 2.5 }
+      ],
+      "long_context": { "at_least": 200000, "input": 2, "output": 2 }
+    },
+    "grok-4.20-multi-agent-0309": {
+      "source": "xai_api_pricing",
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.2, "output": 2.5 }
+      ],
+      "long_context": { "at_least": 200000, "input": 2, "output": 2 }
+    },
+    "grok-4.20-0309-reasoning": {
+      "source": "xai_api_pricing",
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.2, "output": 2.5 }
+      ],
+      "long_context": { "at_least": 200000, "input": 2, "output": 2 }
+    },
+    "grok-4.20-0309-non-reasoning": {
+      "source": "xai_api_pricing",
+      "prices": [
+        { "from": null, "input": 1.25, "cache_write": 1.25, "cache_read": 0.2, "output": 2.5 }
+      ],
+      "long_context": { "at_least": 200000, "input": 2, "output": 2 }
+    },
+    "grok-4.5": {
+      "note": "Grok 4.5 fast doubles input and cached input but triples output. The fast rates are those multiples of the standard rates rather than 4.6's absolutes: xAI documents 4.5 cached input at $0.30/M, not 4.6's $0.50/M (https://docs.x.ai/developers/models/grok-4.5), so 2x lands at $0.60/M.",
+      "source": "xai_api_pricing",
+      "prices": [
+        { "from": null, "input": 2, "cache_write": 2, "cache_read": 0.3, "output": 6 }
+      ],
+      "long_context": { "at_least": 200000, "input": 2, "output": 2 },
+      "fast": {
+        "prices": [
+          { "from": null, "input": 4, "cache_write": 4, "cache_read": 0.6, "output": 18 }
+        ]
+      }
+    },
+    "grok-4.6": {
+      "note": "Official Grok 4.6/4.7 short-context rates are $2/M input, $0.50/M cached input, and $6/M output. Fast is 2x the standard short-context token rates. https://docs.x.ai/developers/pricing",
+      "source": "xai_api_pricing",
+      "prices": [
+        { "from": null, "input": 2, "cache_write": 2, "cache_read": 0.5, "output": 6 }
+      ],
+      "long_context": { "at_least": 200000, "input": 2, "output": 2 },
+      "fast": {
+        "prices": [
+          { "from": null, "input": 4, "cache_write": 4, "cache_read": 1, "output": 12 }
+        ]
+      }
+    },
+    "grok-4.7": {
+      "note": "Official Grok 4.6/4.7 short-context rates are $2/M input, $0.50/M cached input, and $6/M output. Fast is 2x the standard short-context rates. Standard Grok 4.7 doubles at >=200k. Grok 4.7 Fast long context is 1.5x the fast rate once the prompt exceeds 200k ($6 / $1.50 / $18), not a second 2x; at exactly 200k the fast card stays on the short-context rate. Usage through Cursor follows Cursor's own >256k tier, which stays in code. https://docs.x.ai/developers/pricing",
+      "source": "xai_api_pricing",
+      "prices": [
+        { "from": null, "input": 2, "cache_write": 2, "cache_read": 0.5, "output": 6 }
+      ],
+      "long_context": { "at_least": 200000, "input": 2, "output": 2 },
+      "fast": {
+        "prices": [
+          { "from": null, "input": 4, "cache_write": 4, "cache_read": 1, "output": 12 }
+        ],
+        "long_context": { "above": 200000, "input": 1.5, "output": 1.5 }
+      }
+    }
+  },
+  "equivalents": {
+    "codex-auto-review": [
+      { "from": null, "model": "gpt-5.4", "note": "Priced with GPT-5.4 rates. The observed name is kept; this mapping is pricing-only." },
+      { "from": "2026-07-30", "model": "gpt-5.6-luna", "note": "Priced with GPT-5.6 Luna rates from the Luna and Terra price cut." }
+    ]
+  },
+  "names": {
+    "claude-fable-5-2": ["claude-fable-5.2"],
+    "claude-fable-5-1": ["claude-fable-5.1"],
+    "claude-fable-5": [],
+    "claude-mythos-5-2": ["claude-mythos-5.2"],
+    "claude-mythos-5-1": ["claude-mythos-5.1"],
+    "claude-mythos-5": [],
+    "claude-opus-5-5": ["claude-opus-5-5-thinking", "claude-opus-5.5"],
+    "claude-opus-5": ["claude-opus-5-thinking"],
+    "claude-sonnet-5-5": ["claude-sonnet-5-5-thinking", "claude-sonnet-5.5"],
+    "claude-sonnet-5": ["claude-sonnet-5-thinking"],
+    "claude-sonnet-3-5": ["claude-3-5-sonnet-20241022"],
+    "claude-sonnet-3-7": ["claude-3-7-sonnet"],
+    "claude-opus-4": [],
+    "claude-opus-4-1": ["claude-opus-4.1"],
+    "claude-opus-4-5": ["claude-opus-4-5-thinking", "claude-opus-4.5"],
+    "claude-opus-4-6": ["claude-opus-4-6-thinking", "claude-opus-4.6"],
+    "claude-opus-4-7": ["claude-opus-4-7-thinking", "claude-opus-4.7"],
+    "claude-opus-4-8": ["claude-opus-4-8-thinking", "claude-opus-4.8"],
+    "claude-sonnet-4": [],
+    "claude-sonnet-4-5": ["claude-sonnet-4.5"],
+    "claude-sonnet-4-6": ["claude-sonnet-4-6-thinking", "claude-sonnet-4.6"],
+    "claude-haiku-5-5": ["claude-haiku-5.5"],
+    "claude-haiku-4-5": ["claude-haiku-4.5"],
+    "claude-haiku-3-5": ["claude-haiku-3.5"],
+    "gpt-5": ["gpt-5-chat-latest"],
+    "gpt-5.1": ["gpt-5.1-chat-latest"],
+    "gpt-5-codex": ["gpt-5.1-codex"],
+    "gpt-5.1-codex-max": [],
+    "gpt-5-mini": ["gpt-5.1-codex-mini"],
+    "gpt-5.2": ["gpt-5.2-chat-latest", "gpt-5.2-codex"],
+    "gpt-5.3-codex": [],
+    "codex-auto-review": [],
+    "gpt-5.4": [],
+    "gpt-5.4-mini": [],
+    "gpt-5.4-nano": [],
+    "gpt-6.2-astra": [],
+    "gpt-6.2-sol": [],
+    "gpt-6-astra": ["gpt-6-astra-codex"],
+    "gpt-6.1-sol": [],
+    "gpt-6.1-terra": [],
+    "gpt-6-sol": [],
+    "gpt-6-luna": [],
+    "gpt-5.6-sol": [],
+    "gpt-5.6-terra": [],
+    "gpt-5.6-luna": [],
+    "gpt-5.5": [],
+    "gpt-5-nano": [],
+    "composer-2.5": ["grok-composer-2.5"],
+    "composer-2.5-fast": ["grok-composer-2.5-fast"],
+    "grok-build-0.1": ["grok-build"],
+    "grok-4.7": ["grok-4.7-build-fast"],
+    "grok-4.6": ["grok-4.6-build", "grok-4.6-latest"],
+    "grok-4.5": ["grok-4.5-latest", "grok-build-latest"],
+    "grok-4.3": ["grok-4.3-latest"],
+    "grok-4.20-multi-agent-0309": [],
+    "grok-4.20-0309-reasoning": [],
+    "grok-4.20-0309-non-reasoning": []
+  },
+  "patterns": [
+    { "contains": ["claude-fable-5-2", "claude-fable-5.2"], "model": "claude-fable-5-2", "whole_version": true, "note": "5.2 must precede 5.1 and 5: claude-fable-5-2 contains claude-fable-5. It must also not take a dated Fable 5 id such as claude-fable-5-20260610: Anthropic snapshot ids end in an eight-digit date, so the match must not be followed by a digit." },
+    { "contains": ["claude-fable-5-1", "claude-fable-5.1"], "model": "claude-fable-5-1", "note": "Must precede the claude-fable-5 rule, which would otherwise swallow every 5.1 name." },
+    { "contains": ["claude-fable-5"], "model": "claude-fable-5" },
+    { "contains": ["claude-mythos-5-2", "claude-mythos-5.2"], "model": "claude-mythos-5-2", "whole_version": true, "note": "5.2 must precede 5.1 and 5, and must not take a dated Mythos 5 id, the same as Fable." },
+    { "contains": ["claude-mythos-5-1", "claude-mythos-5.1"], "model": "claude-mythos-5-1", "note": "Must precede the claude-mythos-5 rule, which would otherwise swallow 5.1." },
+    { "contains": ["claude-mythos-5"], "model": "claude-mythos-5" },
+    { "contains": ["claude-opus-5-5", "claude-opus-5.5"], "model": "claude-opus-5-5" },
+    { "contains": ["claude-opus-5"], "model": "claude-opus-5" },
+    { "contains": ["claude-sonnet-5-5", "claude-sonnet-5.5"], "model": "claude-sonnet-5-5" },
+    { "contains": ["claude-sonnet-5"], "model": "claude-sonnet-5" },
+    { "contains": ["claude-opus-4-8", "claude-opus-4.8"], "model": "claude-opus-4-8" },
+    { "contains": ["claude-opus-4-7", "claude-opus-4.7"], "model": "claude-opus-4-7" },
+    { "contains": ["claude-opus-4-6", "claude-opus-4.6"], "model": "claude-opus-4-6" },
+    { "contains": ["claude-opus-4-5", "claude-opus-4.5"], "model": "claude-opus-4-5" },
+    { "contains": ["claude-opus-4-1", "claude-opus-4.1"], "model": "claude-opus-4-1" },
+    { "contains": ["claude-sonnet-4-6", "claude-sonnet-4.6"], "model": "claude-sonnet-4-6" },
+    { "contains": ["claude-sonnet-4-5", "claude-sonnet-4.5"], "model": "claude-sonnet-4-5" },
+    { "contains": ["claude-haiku-5-5", "claude-haiku-5.5"], "model": "claude-haiku-5-5" },
+    { "contains": ["claude-haiku-4-5", "claude-haiku-4.5"], "model": "claude-haiku-4-5" },
+    { "contains": ["claude-sonnet-4"], "model": "claude-sonnet-4" },
+    { "contains": ["claude-opus-4"], "model": "claude-opus-4" },
+    { "contains": ["claude-sonnet-3-7", "claude-3-7-sonnet"], "model": "claude-sonnet-3-7" },
+    { "contains": ["claude-sonnet-3-5", "claude-3-5-sonnet-20241022"], "model": "claude-sonnet-3-5" },
+    { "contains": ["claude-haiku-3-5", "claude-haiku-3.5"], "model": "claude-haiku-3-5" },
+    { "contains": ["gpt-6.2-astra"], "model": "gpt-6.2-astra" },
+    { "contains": ["gpt-6.2-sol"], "model": "gpt-6.2-sol" },
+    { "contains": ["gpt-6-astra"], "model": "gpt-6-astra" },
+    { "contains": ["gpt-6.1-terra"], "model": "gpt-6.1-terra" },
+    { "contains": ["gpt-6.1-sol"], "model": "gpt-6.1-sol" },
+    { "contains": ["gpt-6-sol"], "model": "gpt-6-sol" },
+    { "contains": ["gpt-6-luna"], "model": "gpt-6-luna" },
+    { "contains": ["gpt-5.6-sol"], "model": "gpt-5.6-sol" },
+    { "contains": ["gpt-5.6-terra"], "model": "gpt-5.6-terra" },
+    { "contains": ["gpt-5.6-luna"], "model": "gpt-5.6-luna" },
+    { "contains": ["gpt-5.5"], "model": "gpt-5.5" },
+    { "contains": ["gpt-5.4-mini"], "model": "gpt-5.4-mini" },
+    { "contains": ["gpt-5.4-nano"], "model": "gpt-5.4-nano" },
+    { "contains": ["gpt-5.4"], "model": "gpt-5.4" },
+    { "contains": ["codex-auto-review"], "model": "codex-auto-review" },
+    { "contains": ["gpt-5.1-codex-mini"], "model": "gpt-5-mini" },
+    { "contains": ["gpt-5.1-codex-max"], "model": "gpt-5.1-codex-max" },
+    { "contains": ["gpt-5.3-codex"], "model": "gpt-5.3-codex" },
+    { "contains": ["gpt-5.2-codex", "gpt-5.2-chat-latest", "gpt-5.2"], "model": "gpt-5.2" },
+    { "contains": ["gpt-5.1-codex"], "model": "gpt-5-codex" },
+    { "contains": ["gpt-5.1-chat-latest", "gpt-5.1"], "model": "gpt-5.1" },
+    { "contains": ["gpt-5-mini"], "model": "gpt-5-mini" },
+    { "contains": ["gpt-5-nano"], "model": "gpt-5-nano" },
+    { "contains": ["gpt-5-chat-latest", "gpt-5"], "model": "gpt-5" },
+    { "contains": ["grok-composer-2.5-fast", "composer-2.5-fast"], "model": "composer-2.5-fast" },
+    { "contains": ["grok-composer-2.5", "composer-2.5"], "model": "composer-2.5" },
+    { "contains": ["grok-4.7"], "model": "grok-4.7" },
+    { "contains": ["grok-4.6"], "model": "grok-4.6" },
+    { "contains": ["grok-4.5-latest", "grok-4.5", "grok-build-latest"], "model": "grok-4.5" },
+    { "contains": ["grok-build-0.1", "grok-build"], "model": "grok-build-0.1" },
+    { "contains": ["grok-4.3-latest", "grok-4.3"], "model": "grok-4.3" },
+    { "contains": ["grok-4.20-multi-agent-0309"], "model": "grok-4.20-multi-agent-0309" },
+    { "contains": ["grok-4.20-0309-reasoning"], "model": "grok-4.20-0309-reasoning" },
+    { "contains": ["grok-4.20-0309-non-reasoning"], "model": "grok-4.20-0309-non-reasoning" }
+  ],
+  "reversed": {
+    "claude-5.5-opus": "claude-opus-5-5",
+    "claude-5-opus": "claude-opus-5",
+    "claude-4.8-opus": "claude-opus-4-8",
+    "claude-4.7-opus": "claude-opus-4-7",
+    "claude-4.6-opus": "claude-opus-4-6",
+    "claude-4.5-opus": "claude-opus-4-5",
+    "claude-4.1-opus": "claude-opus-4-1",
+    "claude-4-opus": "claude-opus-4",
+    "claude-5.5-sonnet": "claude-sonnet-5-5",
+    "claude-5-sonnet": "claude-sonnet-5",
+    "claude-4.6-sonnet": "claude-sonnet-4-6",
+    "claude-4.5-sonnet": "claude-sonnet-4-5",
+    "claude-4-sonnet": "claude-sonnet-4",
+    "claude-3.7-sonnet": "claude-sonnet-3-7",
+    "claude-3.5-sonnet": "claude-sonnet-3-5",
+    "claude-5.5-haiku": "claude-haiku-5-5",
+    "claude-4.5-haiku": "claude-haiku-4-5",
+    "claude-3.5-haiku": "claude-haiku-3-5"
+  }
+}

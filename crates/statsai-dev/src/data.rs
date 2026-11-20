@@ -1,9 +1,10 @@
+use crate::pricing::build_pricing_target;
 use crate::state::{save, Paths, State};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use statsai_store::{
-    clone_database_to, database_applied_pricing_ruleset_version, database_schema_version,
-    DatabaseClone, Store,
+    clone_database_to, database_pricing_state, database_schema_version, DatabaseClone,
+    DatabasePricingState, Store,
 };
 use std::fs;
 use std::io::ErrorKind;
@@ -37,7 +38,14 @@ pub(crate) struct RefreshOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProdVersions {
     pub(crate) schema: i64,
-    pub(crate) pricing: Option<u64>,
+    pub(crate) pricing: DatabasePricingState,
+}
+
+impl ProdVersions {
+    /// The pricing version the store's estimates were last repriced with.
+    pub(crate) fn applied_pricing(&self) -> Option<u64> {
+        self.pricing.applied_version
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +54,9 @@ pub(crate) enum ProdUpgradePlan {
     Upgrade {
         from: ProdVersions,
         schema: i64,
+        /// The applied pricing version production must be at afterwards: the newer
+        /// of what it had and what the build prices with, because repricing never
+        /// goes backward.
         pricing: u64,
     },
 }
@@ -403,22 +414,33 @@ pub(crate) fn read_prod_versions_at(database: &Path) -> Result<ProdVersions> {
     let Some(schema) = database_schema_version(database)? else {
         bail!("StatsAI database does not exist at {}", database.display());
     };
-    Ok(ProdVersions {
-        schema,
-        pricing: database_applied_pricing_ruleset_version(database)?,
-    })
+    let pricing = database_pricing_state(database)?.with_context(|| {
+        format!(
+            "StatsAI database disappeared at {} while reading its pricing",
+            database.display()
+        )
+    })?;
+    Ok(ProdVersions { schema, pricing })
 }
 
 /// Decides what a build may do to production data.
 ///
-/// Migrations and pricing rulesets only go forward, so a build behind production
-/// has nothing to offer it and must not try. A build level with production has
-/// nothing to do. Everything else is an upgrade, including stamping a ruleset
-/// onto a database that has never recorded one.
+/// Migrations only go forward, so a build behind production's schema has nothing
+/// to offer it and must not try. Repricing only goes forward too, but a build that
+/// reads pricing files is not refused for being behind production's pricing: it
+/// leaves newer prices as they are. Only a stored pricing file in a format the
+/// build cannot read refuses it. A legacy build, one that predates pricing files,
+/// refuses a newer applied version as it always has.
+///
+/// Pricing needs an upgrade when production has never recorded an applied version
+/// or is behind the version the build would price it with. A build level with
+/// production on both counts has nothing to do. Everything else is an upgrade.
 pub(crate) fn plan_prod_upgrade(
     current: ProdVersions,
     build_schema: i64,
     build_pricing: u64,
+    build_pricing_format: Option<u32>,
+    refresh_disabled_by_env: bool,
 ) -> Result<ProdUpgradePlan> {
     if current.schema > build_schema {
         bail!(
@@ -427,20 +449,27 @@ pub(crate) fn plan_prod_upgrade(
             current.schema
         );
     }
-    if let Some(pricing) = current.pricing {
-        if pricing > build_pricing {
-            bail!(
-                "production has pricing ruleset {pricing} applied, ahead of the selected build's {build_pricing}; select a build that carries at least ruleset {pricing}"
-            );
-        }
+    let target = build_pricing_target(
+        build_pricing,
+        build_pricing_format,
+        &current.pricing,
+        refresh_disabled_by_env,
+    )?;
+    let applied = current.applied_pricing();
+    let legacy_build = build_pricing_format.is_none();
+    if let Some(applied) = applied.filter(|applied| legacy_build && *applied > target) {
+        bail!(
+            "production has pricing version {applied} applied, ahead of the selected build's {target}, and that build predates pricing files; select a build that carries at least pricing version {applied}"
+        );
     }
-    if current.schema == build_schema && current.pricing == Some(build_pricing) {
+    let pricing_current = applied.is_some_and(|applied| applied >= target);
+    if current.schema == build_schema && pricing_current {
         return Ok(ProdUpgradePlan::AlreadyCurrent);
     }
     Ok(ProdUpgradePlan::Upgrade {
         from: current,
         schema: build_schema,
-        pricing: build_pricing,
+        pricing: applied.map_or(target, |applied| applied.max(target)),
     })
 }
 
@@ -674,45 +703,167 @@ mod tests {
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
     }
 
+    /// A build that reads pricing files.
+    const READS_FORMAT_1: Option<u32> = Some(1);
+    /// A build that predates pricing files.
+    const LEGACY: Option<u32> = None;
+
     fn production_at(schema: i64, pricing: Option<u64>) -> ProdVersions {
-        ProdVersions { schema, pricing }
+        ProdVersions {
+            schema,
+            pricing: DatabasePricingState {
+                applied_version: pricing,
+                stored_file: None,
+                stored_file_unreadable: false,
+                refresh_setting_on: true,
+            },
+        }
+    }
+
+    /// Production with a stored pricing file of `format` at `version`.
+    fn production_storing(
+        schema: i64,
+        applied: Option<u64>,
+        format: u64,
+        version: u64,
+    ) -> ProdVersions {
+        let mut production = production_at(schema, applied);
+        production.pricing.stored_file =
+            Some(statsai_store::StoredPricingFileHeader { format, version });
+        production
+    }
+
+    fn upgrade(from: ProdVersions, schema: i64, pricing: u64) -> ProdUpgradePlan {
+        ProdUpgradePlan::Upgrade {
+            from,
+            schema,
+            pricing,
+        }
     }
 
     #[test]
     fn an_upgrade_is_planned_only_forward() {
-        assert_eq!(
-            plan_prod_upgrade(production_at(22, Some(1)), 23, 1).expect("schema upgrade"),
-            ProdUpgradePlan::Upgrade {
-                from: production_at(22, Some(1)),
-                schema: 23,
-                pricing: 1,
-            }
+        for format in [READS_FORMAT_1, LEGACY] {
+            assert_eq!(
+                plan_prod_upgrade(production_at(22, Some(7)), 23, 7, format, false)
+                    .expect("schema upgrade"),
+                upgrade(production_at(22, Some(7)), 23, 7)
+            );
+            // A database that has never recorded a pricing version is upgraded rather
+            // than refused: stamping it is exactly what the missing metadata needs.
+            assert_eq!(
+                plan_prod_upgrade(production_at(23, None), 23, 7, format, false)
+                    .expect("pricing upgrade"),
+                upgrade(production_at(23, None), 23, 7)
+            );
+            assert_eq!(
+                plan_prod_upgrade(production_at(23, Some(7)), 23, 8, format, false)
+                    .expect("pricing upgrade"),
+                upgrade(production_at(23, Some(7)), 23, 8)
+            );
+            assert_eq!(
+                plan_prod_upgrade(production_at(23, Some(7)), 23, 7, format, false)
+                    .expect("nothing to do"),
+                ProdUpgradePlan::AlreadyCurrent
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_behind_production_may_not_touch_it() {
+        for format in [READS_FORMAT_1, LEGACY] {
+            let older_schema = plan_prod_upgrade(production_at(23, Some(7)), 22, 7, format, false)
+                .expect_err("a build behind production must refuse");
+            assert!(older_schema.to_string().contains("only go forward"));
+        }
+
+        let older_pricing = plan_prod_upgrade(production_at(23, Some(8)), 23, 7, LEGACY, false)
+            .expect_err("a legacy build behind production's pricing must refuse");
+        assert!(
+            older_pricing.to_string().contains("pricing version 8"),
+            "{older_pricing}"
         );
-        // A database that has never recorded a ruleset is upgraded rather than
-        // refused: stamping it is exactly what the missing metadata needs.
+        assert!(
+            older_pricing.to_string().contains("predates pricing files"),
+            "{older_pricing}"
+        );
+    }
+
+    #[test]
+    fn a_build_behind_production_pricing_leaves_it_as_it_is() {
+        // Repricing never goes backward, so production keeps version 8.
         assert_eq!(
-            plan_prod_upgrade(production_at(23, None), 23, 1).expect("pricing upgrade"),
-            ProdUpgradePlan::Upgrade {
-                from: production_at(23, None),
-                schema: 23,
-                pricing: 1,
-            }
+            plan_prod_upgrade(production_at(23, Some(8)), 23, 7, READS_FORMAT_1, false)
+                .expect("nothing to do"),
+            ProdUpgradePlan::AlreadyCurrent
         );
         assert_eq!(
-            plan_prod_upgrade(production_at(23, Some(1)), 23, 1).expect("nothing to do"),
+            plan_prod_upgrade(production_at(22, Some(8)), 23, 7, READS_FORMAT_1, false)
+                .expect("schema upgrade only"),
+            upgrade(production_at(22, Some(8)), 23, 8)
+        );
+    }
+
+    #[test]
+    fn a_stored_pricing_file_raises_the_target_while_the_refresh_is_on() {
+        // A refresh adopted version 9, and nothing has repriced production yet.
+        let adopted = production_storing(23, Some(7), 1, 9);
+        assert_eq!(
+            plan_prod_upgrade(adopted, 23, 7, READS_FORMAT_1, false).expect("pricing upgrade"),
+            upgrade(adopted, 23, 9)
+        );
+        // A legacy build ignores the stored copy.
+        assert_eq!(
+            plan_prod_upgrade(adopted, 23, 7, LEGACY, false).expect("nothing to do"),
+            ProdUpgradePlan::AlreadyCurrent
+        );
+        // So does a build with the refresh off, by variable or by setting.
+        assert_eq!(
+            plan_prod_upgrade(adopted, 23, 7, READS_FORMAT_1, true).expect("nothing to do"),
+            ProdUpgradePlan::AlreadyCurrent
+        );
+        let mut setting_off = adopted;
+        setting_off.pricing.refresh_setting_on = false;
+        assert_eq!(
+            plan_prod_upgrade(setting_off, 23, 7, READS_FORMAT_1, false).expect("nothing to do"),
+            ProdUpgradePlan::AlreadyCurrent
+        );
+
+        // Production already repriced to its stored copy: a build embedding an older
+        // version has nothing to add.
+        assert_eq!(
+            plan_prod_upgrade(
+                production_storing(23, Some(9), 1, 9),
+                23,
+                7,
+                READS_FORMAT_1,
+                false
+            )
+            .expect("nothing to do"),
             ProdUpgradePlan::AlreadyCurrent
         );
     }
 
     #[test]
-    fn a_build_behind_production_may_not_touch_it() {
-        let older_schema = plan_prod_upgrade(production_at(23, Some(1)), 22, 1)
-            .expect_err("a build behind production must refuse");
-        assert!(older_schema.to_string().contains("only go forward"));
-
-        let older_pricing = plan_prod_upgrade(production_at(23, Some(2)), 23, 1)
-            .expect_err("an older ruleset must refuse");
-        assert!(older_pricing.to_string().contains("pricing ruleset 2"));
+    fn a_stored_pricing_format_the_build_cannot_read_refuses_the_upgrade() {
+        let unreadable = production_storing(22, Some(9), 2, 9);
+        for refresh_disabled_by_env in [false, true] {
+            let error =
+                plan_prod_upgrade(unreadable, 23, 9, READS_FORMAT_1, refresh_disabled_by_env)
+                    .expect_err("an unknown format must refuse");
+            assert!(
+                error.to_string().contains("pricing file format 2"),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("select a newer build"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            plan_prod_upgrade(unreadable, 23, 9, Some(2), false).expect("reads format 2"),
+            upgrade(unreadable, 23, 9)
+        );
     }
 
     // `clone_database_to` is APFS-only, so the backup path cannot run elsewhere.

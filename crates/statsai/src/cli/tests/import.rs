@@ -566,7 +566,7 @@ fn import_overlays_estimated_cost_when_store_ruleset_is_already_current() {
     );
     assert_eq!(
         incoming.record.summary.cost.pricing_version.as_deref(),
-        Some(statsai_store::PRICING_CATALOG_VERSION)
+        Some(statsai_store::embedded_pricing().catalog())
     );
     assert!(incoming
         .record
@@ -594,7 +594,7 @@ fn import_overlays_estimated_cost_when_store_ruleset_is_already_current() {
     assert_eq!(stored[0].cost.estimated_api_equivalent_usd, expected_usd);
     assert_eq!(
         stored[0].cost.pricing_version.as_deref(),
-        Some(statsai_store::PRICING_CATALOG_VERSION)
+        Some(statsai_store::embedded_pricing().catalog())
     );
     let still_current = store.ensure_current_pricing().expect("still current");
     assert!(still_current.already_current);

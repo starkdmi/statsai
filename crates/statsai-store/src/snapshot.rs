@@ -89,26 +89,124 @@ pub fn database_applied_pricing_ruleset_version(path: impl AsRef<Path>) -> Resul
     }
 
     let connection = open_read_only(path)?;
-    let has_metadata_table = connection
+    if !has_local_metadata(&connection, path)? {
+        return Ok(None);
+    }
+    let value = read_metadata_value(
+        &connection,
+        path,
+        super::APPLIED_PRICING_RULESET_VERSION_KEY,
+    )?;
+    parse_applied_pricing_ruleset_value(value.as_deref())
+}
+
+/// `local_metadata` key holding the text of the newest pricing file the store
+/// has adopted.
+pub const STORED_PRICING_FILE_KEY: &str = "pricing.file";
+
+/// `local_metadata` key holding the pricing refresh setting, `"on"` or `"off"`.
+/// Absent means on.
+pub const PRICING_REFRESH_SETTING_KEY: &str = "pricing.refresh";
+
+/// The `format` and `version` of the pricing file stored in a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredPricingFileHeader {
+    /// The file's structure version.
+    pub format: u64,
+    /// The file's price version.
+    pub version: u64,
+}
+
+/// Everything about a database's pricing that decides which pricing version a
+/// given binary would price it with, read without opening it as a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabasePricingState {
+    /// The pricing version the store's estimates were last repriced with.
+    pub applied_version: Option<u64>,
+    /// The header of the stored pricing file, when one is stored and readable.
+    pub stored_file: Option<StoredPricingFileHeader>,
+    /// A pricing file is stored, but its `format` and `version` could not be
+    /// read. Binaries ignore such a copy.
+    pub stored_file_unreadable: bool,
+    /// The store's pricing refresh setting. Only the value `"off"` turns it off.
+    pub refresh_setting_on: bool,
+}
+
+/// Reads the applied pricing version, the stored pricing file's header and the
+/// refresh setting without creating, migrating, or repricing the database.
+///
+/// `Ok(None)` means the path does not exist. A database without a
+/// `local_metadata` table has no applied version, no stored file and the
+/// refresh on. Only the stored file's integer `format` and `version` are read;
+/// a stored file without them is reported as unreadable rather than failing.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be opened as a readable
+/// SQLite database, or when the applied version is not a valid unsigned integer.
+pub fn database_pricing_state(path: impl AsRef<Path>) -> Result<Option<DatabasePricingState>> {
+    let path = path.as_ref();
+    if !path
+        .try_exists()
+        .with_context(|| format!("check whether database {} exists", path.display()))?
+    {
+        return Ok(None);
+    }
+
+    let connection = open_read_only(path)?;
+    if !has_local_metadata(&connection, path)? {
+        return Ok(Some(DatabasePricingState {
+            applied_version: None,
+            stored_file: None,
+            stored_file_unreadable: false,
+            refresh_setting_on: true,
+        }));
+    }
+    let applied = read_metadata_value(
+        &connection,
+        path,
+        super::APPLIED_PRICING_RULESET_VERSION_KEY,
+    )?;
+    let stored_file = read_metadata_value(&connection, path, STORED_PRICING_FILE_KEY)?
+        .map(|text| parse_stored_pricing_file_header(&text));
+    let refresh = read_metadata_value(&connection, path, PRICING_REFRESH_SETTING_KEY)?;
+    Ok(Some(DatabasePricingState {
+        applied_version: parse_applied_pricing_ruleset_value(applied.as_deref())?,
+        stored_file: stored_file.flatten(),
+        stored_file_unreadable: stored_file.is_some_and(|header| header.is_none()),
+        refresh_setting_on: refresh.as_deref() != Some("off"),
+    }))
+}
+
+/// Reads the integer `format` and `version` of a stored pricing file, ignoring
+/// everything else in it. A file that is not a JSON object with both has none.
+fn parse_stored_pricing_file_header(text: &str) -> Option<StoredPricingFileHeader> {
+    let file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text).ok()?;
+    Some(StoredPricingFileHeader {
+        format: file.get("format")?.as_u64()?,
+        version: file.get("version")?.as_u64()?,
+    })
+}
+
+fn has_local_metadata(connection: &Connection, path: &Path) -> Result<bool> {
+    connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'local_metadata')",
             [],
             |row| row.get::<_, bool>(0),
         )
-        .with_context(|| format!("inspect local metadata at {}", path.display()))?;
-    if !has_metadata_table {
-        return Ok(None);
-    }
+        .with_context(|| format!("inspect local metadata at {}", path.display()))
+}
 
-    let value: Option<String> = connection
+fn read_metadata_value(connection: &Connection, path: &Path, key: &str) -> Result<Option<String>> {
+    connection
         .query_row(
             "SELECT value FROM local_metadata WHERE key = ?1",
-            [super::APPLIED_PRICING_RULESET_VERSION_KEY],
+            [key],
             |row| row.get(0),
         )
         .optional()
-        .with_context(|| format!("read applied pricing ruleset version at {}", path.display()))?;
-    parse_applied_pricing_ruleset_value(value.as_deref())
+        .with_context(|| format!("read {key} at {}", path.display()))
 }
 
 pub(crate) fn parse_applied_pricing_ruleset_value(value: Option<&str>) -> Result<Option<u64>> {
@@ -541,6 +639,166 @@ mod tests {
 
         assert_eq!(
             database_schema_version(&path).expect("read legacy schema"),
+            Some(0)
+        );
+    }
+
+    fn store_with_metadata(path: &Path, values: &[(&str, &str)]) {
+        let store = crate::Store::open(path).expect("create store");
+        for (key, value) in values {
+            store
+                .set_metadata_value(key, value)
+                .expect("write metadata value");
+        }
+    }
+
+    #[test]
+    fn missing_database_has_no_pricing_state() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        assert_eq!(
+            database_pricing_state(directory.path().join("missing.sqlite"))
+                .expect("inspect missing database"),
+            None
+        );
+    }
+
+    #[test]
+    fn database_without_metadata_has_default_pricing_state() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("legacy.sqlite");
+        let connection = Connection::open(&path).expect("create legacy database");
+        connection
+            .execute("CREATE TABLE legacy (id INTEGER PRIMARY KEY)", [])
+            .expect("create legacy table");
+        drop(connection);
+
+        assert_eq!(
+            database_pricing_state(&path).expect("read legacy pricing"),
+            Some(DatabasePricingState {
+                applied_version: None,
+                stored_file: None,
+                stored_file_unreadable: false,
+                refresh_setting_on: true,
+            })
+        );
+    }
+
+    #[test]
+    fn pricing_state_reads_applied_version_stored_header_and_setting() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("statsai.sqlite");
+        store_with_metadata(
+            &path,
+            &[
+                (crate::APPLIED_PRICING_RULESET_VERSION_KEY, "8"),
+                (
+                    STORED_PRICING_FILE_KEY,
+                    r#"{"format": 2, "version": 9, "catalog": "official:2027-01-01", "models": {}}"#,
+                ),
+                (PRICING_REFRESH_SETTING_KEY, "off"),
+            ],
+        );
+
+        assert_eq!(
+            database_pricing_state(&path).expect("read pricing state"),
+            Some(DatabasePricingState {
+                applied_version: Some(8),
+                stored_file: Some(StoredPricingFileHeader {
+                    format: 2,
+                    version: 9,
+                }),
+                stored_file_unreadable: false,
+                refresh_setting_on: false,
+            })
+        );
+    }
+
+    #[test]
+    fn pricing_refresh_is_on_unless_the_setting_is_off() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (label, setting) in [
+            ("absent", None),
+            ("on", Some("on")),
+            ("other", Some("OFF ")),
+        ] {
+            let path = directory.path().join(format!("{label}.sqlite"));
+            let values: Vec<_> = setting
+                .map(|value| (PRICING_REFRESH_SETTING_KEY, value))
+                .into_iter()
+                .collect();
+            store_with_metadata(&path, &values);
+
+            let state = database_pricing_state(&path)
+                .expect("read pricing state")
+                .expect("database exists");
+            assert!(state.refresh_setting_on, "{label}");
+            assert_eq!(state.applied_version, None, "{label}");
+            assert_eq!(state.stored_file, None, "{label}");
+            assert!(!state.stored_file_unreadable, "{label}");
+        }
+    }
+
+    #[test]
+    fn an_unparsable_stored_pricing_file_is_reported_not_fatal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (label, text) in [
+            ("not json", "not json"),
+            ("empty", ""),
+            ("missing version", r#"{"format": 1}"#),
+            ("string format", r#"{"format": "1", "version": 7}"#),
+            ("negative version", r#"{"format": 1, "version": -7}"#),
+            ("not an object", "[1, 7]"),
+        ] {
+            let path = directory
+                .path()
+                .join(format!("{}.sqlite", label.replace(' ', "-")));
+            store_with_metadata(
+                &path,
+                &[
+                    (crate::APPLIED_PRICING_RULESET_VERSION_KEY, "7"),
+                    (STORED_PRICING_FILE_KEY, text),
+                ],
+            );
+
+            let state = database_pricing_state(&path)
+                .unwrap_or_else(|error| panic!("{label}: {error:#}"))
+                .expect("database exists");
+            assert_eq!(state.applied_version, Some(7), "{label}");
+            assert_eq!(state.stored_file, None, "{label}");
+            assert!(state.stored_file_unreadable, "{label}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_applied_pricing_version_is_an_error() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("statsai.sqlite");
+        store_with_metadata(
+            &path,
+            &[(crate::APPLIED_PRICING_RULESET_VERSION_KEY, "seven")],
+        );
+
+        let error = database_pricing_state(&path).expect_err("invalid applied version");
+        assert!(
+            format!("{error:#}").contains("pricing.applied_ruleset_version"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn reading_pricing_state_does_not_create_or_migrate_the_database() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("empty.sqlite");
+        std::fs::write(&path, b"").expect("create empty file");
+
+        assert_eq!(
+            database_pricing_state(&path)
+                .expect("read empty database")
+                .map(|state| state.applied_version),
+            Some(None)
+        );
+        assert_eq!(
+            database_schema_version(&path).expect("still unmigrated"),
             Some(0)
         );
     }
