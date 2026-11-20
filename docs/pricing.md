@@ -26,7 +26,10 @@ to `main`, clients pick it up within a day and reprice their stored estimates.
   ships it.
 - Clients fetch it from
   `https://raw.githubusercontent.com/starkdmi/statsai/main/crates/statsai-pricing/pricing.json`.
-  `STATSAI_PRICING_URL` replaces that URL, for testing.
+  `STATSAI_PRICING_URL` replaces that URL, for testing. A file adopted from
+  it stays in the store for good, because versions never go down, so point
+  such a test at a scratch store with `--store`. `statsai-dev env prod`
+  removes the variable.
 
 ## Format 1
 
@@ -202,16 +205,43 @@ with the code that reads it.
 
 A binary refuses a store whose stored file has a format it cannot read, and
 asks you to upgrade, whether or not the refresh is on. Commands that use
-price-derived data stop with that message, and the watch daemon skips its scan
-passes until the store holds a file it can read. It never refuses a store
-because its file has a newer `version`; it uses that file.
+price-derived data stop with that message. So does `statsai daemon --watch`
+started on such a store: it exits, and a LaunchAgent keeps restarting it into
+the same message. A watch daemon already running when such a file is stored
+keeps running, says why once, and skips its scan passes. In practice only
+upgrading StatsAI clears this, since a newer file from `main` is in the new
+format too. A running watch daemon restarts when its executable is replaced,
+and scans every watched source again when it starts.
+
+A binary never refuses a store because its stored file or its estimates have a
+newer `version`. While the refresh is on it uses a newer stored file; either
+way it leaves estimates priced with a newer version as they are.
+
+### Releases before pricing files
+
+Releases before pricing files compare the store's
+`pricing.applied_ruleset_version` with the ruleset version compiled into them
+(7 in the last of them), and refuse a store priced with a higher one:
+`database pricing ruleset version 8 is newer than this StatsAI binary supports (7)`.
+Once any newer binary with the refresh on adopts a file from `main`, which
+needs nothing from you, every older release that shares the store stops there:
+an older CLI on your `PATH`, the CLI bundled with an older StatsAI for Mac, and
+an older watch daemon the next time it starts. An older daemon that is already
+running checks prices only when it starts, so it keeps writing estimates at its
+own prices that nothing reprices until the next version. Upgrade every binary
+that shares the store (the CLI, the watch daemon or its LaunchAgent, and the
+desktop app) and restart the daemon, or turn the refresh off in the newer
+binary until they are all upgraded.
 
 ## Editing the file
 
 - **Change a price by adding a period.** Never edit or delete a period that
   has started. Usage priced under it must keep its rate. A period dated in the
   future can still be corrected until its day arrives. A new period can start
-  in the past, for a change found late; clients reprice the usage it covers.
+  in the past, for a change found late; clients reprice the usage it covers,
+  with the exceptions under [How clients refresh](#how-clients-refresh). An
+  aggregate summary whose period spans the new period's `from` date then has
+  an unknown cost, because its tokens cannot be split between the two rates.
 - **`from` is a UTC day.** The new rate applies to events on that UTC date and
   later.
 - **The first period has `from: null`.**
@@ -220,7 +250,9 @@ because its file has a newer `version`; it uses that file.
 - **Raise `version` on every change**, even to a note or to whitespace. Never
   lower or reuse it: a client ignores a file whose version is not higher than
   its own, so the change would not reach anyone. If another pull request raised
-  `version` first, update your branch and raise it again.
+  `version` first, update your branch and raise it again. Two open pull
+  requests that raise it to the same number can each pass CI; whichever merges
+  second must be updated and raise it again (see below).
 - **Set `catalog` to the date of the change**, for example
   `official:2026-11-24`.
 - **Add a model** by adding a `models` entry, plus whatever `names`,
@@ -242,13 +274,26 @@ The check described below enforces most of these rules.
 - The `statsai-pricing` tests parse the file with the same validation every
   client runs: structure, unknown fields, limits, period order and name rules.
 - The **Pricing file** job runs
-  [`scripts/check-pricing-file.sh`](../scripts/check-pricing-file.sh) on every
-  pull request. It compares the file with the base branch and fails when:
+  [`scripts/check-pricing-file.sh`](../scripts/check-pricing-file.sh). On a
+  pull request it compares the file in the merge commit GitHub built with that
+  commit's first parent, the base tip the pull request merges onto, so a
+  re-run after `main` moved still checks only the pull request's own change.
+  On every push to `main` it compares the new tip with the one the push
+  replaced. It fails when:
   - the file changed and `version` did not go up;
   - `format` went down;
   - a `models` or `equivalents` entry was removed;
   - a period whose `from` is `null` or on or before today's UTC date was
     changed or removed. This covers `prices`, `fast.prices` and `equivalents`.
+
+`main` does not require pull requests to be up to date before they merge. Two
+pull requests that both raise `version` from 7 to 8 each pass against the base
+they saw, and when they set the same `catalog` they can merge without a
+conflict. `main` then holds a second, different file at version 8, which
+clients that already took the first one never adopt. The push check fails
+`main` as soon as that happens. Fix it at once with a pull request that raises
+`version` again; before you merge a pricing pull request, update it if another
+one merged since its checks ran.
 
 Run the same check locally before you push:
 
@@ -278,8 +323,9 @@ scripts/check-pricing-file.sh origin/main
     or was not newer.
 - The request is a `GET` with `User-Agent: statsai/<version>` and, when an
   `ETag` is stored, `If-None-Match`, so an unchanged file costs a `304` and no
-  body. It times out after 10 seconds overall, connecting and reading
-  included, and reads at most 1 MiB. Any status other than `200` and `304` is a
+  body. Once the host name resolves, it times out after 10 seconds overall,
+  connecting and reading included; the name lookup itself is bounded only by
+  the system resolver. It reads at most 1 MiB. Any status other than `200` and `304` is a
   failure. Only `https` URLs are fetched; `STATSAI_PRICING_URL` may also be a
   plain `http` URL to `127.0.0.1` or `localhost`, for testing. A failed attempt
   counts as the day's check; `statsai pricing refresh` tries again at once.
@@ -291,19 +337,29 @@ scripts/check-pricing-file.sh origin/main
   than the stored copy replaces it. A stored copy that is invalid in a format
   the binary reads is ignored with a warning, and the next file stored
   replaces it.
-- Every command uses the newest copy it can read: the file embedded in the
-  binary or the stored copy, whichever has the higher `version`. When a binary
-  reprices the store with an embedded file newer than the stored copy, it also
-  stores its embedded file, so older binaries sharing the store use it.
+- While the refresh is on, every command uses the newest copy it can read:
+  the file embedded in the binary or the stored copy, whichever has the higher
+  `version`. When a binary reprices the store with an embedded file newer than
+  the stored copy, it also stores its embedded file, so other binaries sharing
+  the store use it.
 - The next command that uses price-derived data reprices stored estimates with
   the newer version, and so does the watch daemon before its next scan pass.
   Changed rollups are marked dirty, so the next incremental
-  `statsai sync --sink http` uploads the corrected costs. Neither `--full`,
-  `--rebuild-rollups` nor a raw rescan is needed. Provider-reported costs are
-  never replaced.
+  `statsai sync --sink http` uploads the corrected costs. Neither `--full` nor
+  `--rebuild-rollups` is needed. Provider-reported costs are never replaced.
+- Estimates that adapters such as Grok Build and OpenCode sum from per-request
+  records are the exception. Repricing keeps them, since the stored aggregate
+  cannot reproduce them, so they keep the older rates until their sources are
+  scanned again; `statsai scan --no-cache` re-reads them all.
 - Repricing never goes backward. When the store was last repriced with a higher
   version than the copy a binary uses, that binary leaves the stored estimates
   as they are.
+- The store records one applied version for all its estimates. Another process
+  can reprice the store while a scan, sync, import or watch pass is writing
+  estimates priced with the older version. So when such a command or pass
+  finishes and finds the store priced with a newer version than it priced with,
+  it reprices the whole store again with that version, which the store holds a
+  copy of, and logs the repricing report.
 - Commands that open the store without repricing it, such as
   `statsai quota` and `statsai status`, use the newest copy they can read for
   any estimate they make.
@@ -323,14 +379,23 @@ Either of these turns it off:
 - `STATSAI_PRICING_REFRESH=off` in the environment. `0`, `false` and `no` work
   too, in any case.
 
-With the refresh off, StatsAI never fetches the file and ignores the stored
-copy. It prices with the file embedded in the binary.
+With the refresh off, StatsAI never fetches the file and prices with the file
+embedded in the binary. The one exception is a store whose estimates were
+already repriced with a newer stored copy: StatsAI keeps pricing with that copy,
+so the store never mixes two versions and no price goes back. A store priced
+with a newer version it holds no copy of keeps its estimates, and new ones use
+the embedded file.
+
+This also holds for a watch daemon that is running when the setting changes:
+it checks the setting before every pass, and its prices stay the store's.
 
 Tests and `cargo run` started inside this repository run with the refresh off:
 [`.cargo/config.toml`](../.cargo/config.toml) sets
 `STATSAI_PRICING_REFRESH=off`. A value set in your shell, such as `on`, takes
-precedence. The desktop golden captures in statsai-ui also run with it off, so
-their costs come from the embedded file.
+precedence, except in tests that start the `statsai` binary: they set
+`STATSAI_PRICING_REFRESH=off` on it themselves, so a test never fetches. The
+desktop golden captures in statsai-ui also run with it off, so their costs come
+from the embedded file.
 
 ## Commands
 

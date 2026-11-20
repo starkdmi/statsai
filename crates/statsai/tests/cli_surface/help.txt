@@ -1183,7 +1183,7 @@ Commands:
   supported-schema-version           Print the store schema version supported by this binary
   supported-pricing-ruleset-version  Print the version of the pricing file built into this binary
   supported-pricing-format           Print the newest pricing file format this binary reads
-  migrate                            Migrate the store to this binary's schema and apply its pricing ruleset
+  migrate                            Migrate the store to this binary's schema and reprice it with the newest pricing file it can use
   help                               Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1230,7 +1230,7 @@ Options:
       --device-id <DEVICE_ID>  Device identifier for multi-device sync
   -h, --help                   Print help
 ===== statsai store migrate --help =====
-Migrate the store to this binary's schema and apply its pricing ruleset
+Migrate the store to this binary's schema and reprice it with the newest pricing file it can use
 
 Usage: statsai store migrate [OPTIONS]
 

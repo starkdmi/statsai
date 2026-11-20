@@ -149,6 +149,40 @@ fn status_uses_a_newer_stored_file_only_while_the_refresh_is_on() {
         off.prices_with,
         PricesWith::File { version, source: "embedded", .. } if version == embedded_version()
     ));
+
+    // Once the store is priced with the stored file, a process with the
+    // refresh off keeps pricing with it.
+    store
+        .set_metadata_value(
+            statsai_store::APPLIED_PRICING_RULESET_VERSION_KEY,
+            &(embedded_version() + 1).to_string(),
+        )
+        .expect("applied");
+    let off = status_of(&store, true);
+    assert!(matches!(
+        off.prices_with,
+        PricesWith::File { version, source: "stored", .. } if version == embedded_version() + 1
+    ));
+    assert!(off
+        .lines()
+        .iter()
+        .any(|line| line.starts_with("commands price with: version ")
+            && line.ends_with(", the stored file")));
+}
+
+#[test]
+fn auto_refresh_off_says_a_store_priced_with_a_stored_file_keeps_it() {
+    let store = Store::in_memory().expect("store");
+    let lines = set_auto_refresh(&store, false, false).expect("auto-refresh off");
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].starts_with("Pricing auto-refresh is off for this store: StatsAI does not fetch the pricing file and prices with the file built into the binary."),
+        "{lines:?}"
+    );
+    assert!(
+        lines[0].ends_with("A store already priced with a newer stored file keeps that file, so its prices never go back."),
+        "{lines:?}"
+    );
 }
 
 #[test]

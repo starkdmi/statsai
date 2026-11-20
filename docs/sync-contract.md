@@ -277,9 +277,13 @@ and refreshes the affected `sync_rollups` in place. Changed rollups are marked
 dirty so a later incremental HTTP sync publishes the corrected values without
 `--rebuild-rollups` or `--full`. Provider-reported cost fields are never
 replaced by estimates. Repricing never goes backward: a store already repriced
-with a newer `version` is used as it is, not refused. A store whose stored
-pricing file has a `format` the binary cannot read is refused with a message to
-upgrade. See [Pricing file](pricing.md).
+with a newer `version` is used as it is, not refused. A scan, sync, import or
+watch pass that finishes after another process repriced the store reprices it
+again, so the rollups it wrote are corrected and marked dirty too. Estimates
+that adapters sum from per-request records are kept as they are and refreshed
+only by a rescan of their sources. A store whose stored pricing file has a
+`format` the binary cannot read is refused with a message to upgrade. See
+[Pricing file](pricing.md).
 
 User-defined aliases are still retained in `ProviderAccount.account_label` for
 display, but they are no longer the primary account key.

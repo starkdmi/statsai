@@ -37,11 +37,12 @@ pub(crate) fn store_admin(command: StoreAdminCommand, source: &Path) -> Result<(
     }
 }
 
-/// Brings a store up to this binary's schema and pricing ruleset, and reports
-/// what changed.
+/// Brings a store up to this binary's schema and reprices it with the newest
+/// pricing file this process can use (the embedded file, or the store's newer
+/// copy while the refresh is on), and reports what changed.
 ///
 /// Opening a store is what migrates it, and price-derived commands additionally
-/// apply the compiled ruleset on the way to doing something else. This command
+/// reprice it on the way to doing something else. This command
 /// exists so that upgrade can be asked for on its own -- a launcher that must
 /// decide whether an old database is safe to open needs a way to say "only
 /// migrate", not "scan, and migrate as a side effect".
@@ -55,7 +56,7 @@ fn migrate(source: &Path) -> Result<()> {
     let schema_after = database_schema_version(source)?;
     let pricing_after = database_applied_pricing_ruleset_version(source)?;
     println!(
-        "Migrated {} (schema {} -> {}, pricing ruleset {} -> {})",
+        "Migrated {} (schema {} -> {}, pricing version {} -> {})",
         source.display(),
         version_label(schema_before),
         version_label(schema_after),

@@ -510,6 +510,28 @@ impl PricingFileServer {
 }
 
 /// The embedded pricing file at `version`, with `edit` applied.
+/// The first day after every period `model` has in the embedded pricing file,
+/// and no earlier than `at_least`. A period a test adds there keeps the
+/// model's periods in order whatever periods later edits to pricing.json give
+/// it, and the embedded file prices every later day with its last period.
+pub(super) fn day_after_last_embedded_period(
+    model: &str,
+    at_least: chrono::NaiveDate,
+) -> chrono::NaiveDate {
+    let file: Value = serde_json::from_str(statsai_store::embedded_pricing().source_text())
+        .expect("embedded pricing json");
+    file["models"][model]["prices"]
+        .as_array()
+        .expect("periods")
+        .iter()
+        .filter_map(|period| period["from"].as_str())
+        .map(|from| {
+            chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d").expect("period date")
+                + chrono::Duration::days(1)
+        })
+        .fold(at_least, chrono::NaiveDate::max)
+}
+
 pub(super) fn pricing_file_at(version: u64, edit: impl FnOnce(&mut Value)) -> String {
     let mut file: Value = serde_json::from_str(statsai_store::embedded_pricing().source_text())
         .expect("embedded pricing json");

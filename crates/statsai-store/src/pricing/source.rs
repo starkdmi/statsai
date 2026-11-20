@@ -5,7 +5,10 @@
 //! It is only ever replaced by a file that parses, has a format this binary
 //! reads, and has a higher `version` than the copy already there. While the
 //! refresh is on, a process prices with the newer of the file embedded in its
-//! binary and that stored copy; while it is off, with the embedded file only.
+//! binary and that stored copy. While it is off, it prices with the embedded
+//! file, unless the store's estimates were already priced with a newer version
+//! and the stored copy is that version: then it keeps pricing with that copy,
+//! so a store never mixes two versions and nothing moves backward.
 
 use crate::{Store, PRICING_REFRESH_SETTING_KEY, STORED_PRICING_FILE_KEY};
 use anyhow::Result;
@@ -258,9 +261,11 @@ impl Store {
             .map_or(embedded, |stored| stored.max(embedded)))
     }
 
-    /// Writes `table`'s text as the store's pricing file when it is newer than
-    /// the stored copy, or when nothing usable is stored, so other binaries
-    /// sharing the store price with it too.
+    /// Writes `table`'s text as the store's pricing file so other binaries
+    /// sharing the store price with it too: when no copy is stored, when the
+    /// stored copy is unreadable, or when the stored copy has a lower version.
+    /// A stored copy at the same or a higher version is kept, including one in
+    /// a format this binary cannot read, whose prices a newer binary uses.
     pub(crate) fn store_pricing_file_if_newer(&self, table: &PricingTable) -> Result<bool> {
         if self
             .stored_pricing()?
@@ -279,9 +284,15 @@ impl Store {
         self.current_pricing_table_with(self.pricing_refresh_state()?)
     }
 
-    /// The pricing table this process prices the store with: while `refresh`
-    /// is on, the newer of the embedded file and a usable stored copy; while it
-    /// is off, the embedded file.
+    /// The pricing table this process prices the store with.
+    ///
+    /// While `refresh` is on: the newer of the embedded file and a usable
+    /// stored copy. While it is off: the embedded file, except when the store's
+    /// estimates are already priced with a newer version than the embedded
+    /// file's and the usable stored copy is exactly that version. Then that
+    /// copy, so the process neither writes older prices into the store nor
+    /// leaves it priced with two versions. A store priced with a newer version
+    /// that it holds no copy of is used as it is, with the embedded file.
     ///
     /// # Errors
     ///
@@ -326,12 +337,34 @@ impl Store {
                 warn_unreadable_stored_pricing(&reason);
                 ResolvedPricing::Table(embedded)
             }
-            StoredPricing::Usable(stored)
-                if refresh.is_on() && stored.version() > embedded.version() =>
-            {
-                ResolvedPricing::Table(stored)
+            StoredPricing::Usable(stored) if stored.version() > embedded.version() => {
+                if refresh.is_on()
+                    || self.applied_pricing_ruleset_version()? == Some(stored.version())
+                {
+                    ResolvedPricing::Table(stored)
+                } else {
+                    ResolvedPricing::Table(embedded)
+                }
             }
             StoredPricing::Usable(_) | StoredPricing::None => ResolvedPricing::Table(embedded),
         })
+    }
+
+    /// The table for pricing `version`, when this process has one: the
+    /// store's usable copy at exactly that version, which is the file the
+    /// process that applied it stored, or else the embedded file or the
+    /// process's active table at that version.
+    pub(crate) fn pricing_table_at_version(
+        &self,
+        version: u64,
+    ) -> Result<Option<Arc<PricingTable>>> {
+        if let StoredPricing::Usable(stored) = self.stored_pricing()? {
+            if stored.version() == version {
+                return Ok(Some(stored));
+            }
+        }
+        Ok([embedded_pricing(), active_pricing()]
+            .into_iter()
+            .find(|known| known.version() == version))
     }
 }

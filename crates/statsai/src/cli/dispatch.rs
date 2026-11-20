@@ -57,13 +57,17 @@ pub(crate) fn run() -> Result<()> {
                 store.use_current_pricing()?;
                 store
             };
+            // The version this command prices what it writes with, captured
+            // before anything is written or a background refresh starts.
+            let priced_with = statsai_store::active_pricing().version();
+            let settles_pricing = command_settles_pricing(&command);
             if command_starts_pricing_refresh(&command) {
                 // Never joined: the command does not wait for the network.
                 drop(statsai::pricing_refresh::spawn_background_refresh(
                     &store_path,
                 ));
             }
-            match command {
+            let result = match command {
                 Command::Scan(command) => scan(command, &store, &device_id),
                 Command::Report(command) => report(command, &store),
                 Command::Sessions(command) => sessions(command, &store),
@@ -80,7 +84,9 @@ pub(crate) fn run() -> Result<()> {
                     statsai::privacy_cli::run(command, &store, &store_path)
                 }
                 Command::Sync(command) => sync(command, &store, &device_id),
-                Command::Daemon(command) => daemon(command, store, &device_id, &store_path),
+                Command::Daemon(command) => {
+                    return daemon(command, store, &device_id, &store_path);
+                }
                 Command::Status => status(&store),
                 Command::Schema(_)
                 | Command::Store(_)
@@ -91,7 +97,16 @@ pub(crate) fn run() -> Result<()> {
                 | Command::Snapshot(_) => {
                     unreachable!("handled before store open")
                 }
+            };
+            if settles_pricing {
+                // Also after a failure: the command may have written some
+                // estimates before it stopped.
+                let settled = statsai::settle_pricing(&store, priced_with);
+                result?;
+                settled?;
+                return Ok(());
             }
+            result
         }
     }
 }
@@ -107,6 +122,16 @@ pub(crate) fn command_reprices_persisted_usage(command: &Command) -> bool {
             | Command::Task(_)
             | Command::Sync(_)
             | Command::Daemon(_)
+    )
+}
+
+/// Whether a command writes priced estimates, and so settles the store's
+/// pricing when it finishes ([`statsai::settle_pricing`]): `scan`, `sync` and
+/// `import`. The watch daemon settles after each pass instead.
+pub(crate) fn command_settles_pricing(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Scan(_) | Command::Sync(_) | Command::Import(_)
     )
 }
 

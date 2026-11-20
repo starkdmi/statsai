@@ -11,6 +11,8 @@ use tempfile::tempdir;
 
 fn run_statsai(store: &Path, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_statsai"))
+        // Never fetch pricing, whatever the developer's shell exports.
+        .env("STATSAI_PRICING_REFRESH", "off")
         .arg("--store")
         .arg(store)
         .args(args)

@@ -830,18 +830,21 @@ mod tests {
         );
 
         // Production already repriced to its stored copy: a build embedding an older
-        // version has nothing to add.
-        assert_eq!(
-            plan_prod_upgrade(
-                production_storing(23, Some(9), 1, 9),
-                23,
-                7,
-                READS_FORMAT_1,
-                false
-            )
-            .expect("nothing to do"),
-            ProdUpgradePlan::AlreadyCurrent
-        );
+        // version has nothing to add, and with the refresh off it keeps pricing
+        // with that copy.
+        for refresh_disabled_by_env in [false, true] {
+            assert_eq!(
+                plan_prod_upgrade(
+                    production_storing(23, Some(9), 1, 9),
+                    23,
+                    7,
+                    READS_FORMAT_1,
+                    refresh_disabled_by_env
+                )
+                .expect("nothing to do"),
+                ProdUpgradePlan::AlreadyCurrent
+            );
+        }
     }
 
     #[test]

@@ -337,7 +337,7 @@ pub(crate) fn set_auto_refresh(
     let mut lines = vec![if on {
         "Pricing auto-refresh is on for this store: StatsAI fetches the pricing file from GitHub at most once a day and prices with the newest copy it can read.".to_string()
     } else {
-        "Pricing auto-refresh is off for this store: StatsAI does not fetch the pricing file and prices with the file built into the binary.".to_string()
+        "Pricing auto-refresh is off for this store: StatsAI does not fetch the pricing file and prices with the file built into the binary. A store already priced with a newer stored file keeps that file, so its prices never go back.".to_string()
     }];
     if disabled_by_env && on {
         lines.push(format!(

@@ -30,7 +30,8 @@ pub use statsai_store::{
 
 /// Opens a store for a command that reads or publishes price-derived data and
 /// first reprices it with the newest pricing file this process can use: the
-/// embedded file, or the store's newer copy while the pricing refresh is on.
+/// embedded file, or the store's newer copy while the pricing refresh is on (or
+/// while it is off, when the store is already priced with that copy).
 ///
 /// A store priced with a newer version is used as it is. A store whose stored
 /// pricing file has a format this binary cannot read is refused.
@@ -39,6 +40,19 @@ pub fn open_operational_store(path: &Path) -> Result<Store> {
     let report = store.ensure_current_pricing()?;
     log_repricing_report(&report);
     Ok(store)
+}
+
+/// Settles the store's pricing after a command that wrote priced estimates
+/// with the table at version `priced_with` ([`Store::settle_pricing`]), and
+/// prints the repricing it did, if any.
+pub fn settle_pricing(store: &Store, priced_with: u64) -> Result<()> {
+    if let Some(report) = store
+        .settle_pricing(priced_with)
+        .map_err(|error| error.context("reprice what this command wrote"))?
+    {
+        log_repricing_report(&report);
+    }
+    Ok(())
 }
 
 /// Prints a report that repriced the store. A store that was already current,

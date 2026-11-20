@@ -881,10 +881,16 @@ fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
         LocationOrigin::Configured,
     );
     store.upsert_source(&source).expect("source");
-    let started_at = Utc
-        .with_ymd_and_hms(2026, 7, 29, 12, 0, 0)
-        .single()
-        .expect("started_at");
+    // The newer file below starts a GPT-5.4 period after every period the
+    // embedded file has; the event falls four weeks into it.
+    let raise_from = day_after_last_embedded_period(
+        "gpt-5.4",
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 1).expect("date"),
+    );
+    let started_at = (raise_from + Duration::days(28))
+        .and_hms_opt(12, 0, 0)
+        .expect("started_at")
+        .and_utc();
     let mut event = test_event(
         "codex",
         &source,
@@ -946,7 +952,7 @@ fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
         build_sync_batch(&command, &store, "device", &target).expect("repeat batch");
     assert!(repeat_batch.summaries.is_empty());
 
-    // `main` publishes a newer file: from 2026-07-01, GPT-5.4 costs 3 USD
+    // `main` publishes a newer file: from `raise_from`, GPT-5.4 costs 3 USD
     // input and 18 USD output per million tokens.
     let newer = pricing_file_at(embedded_version + 1, |file| {
         file["catalog"] = json!("test:gpt-5.4-raise");
@@ -954,7 +960,7 @@ fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
             .as_array_mut()
             .expect("gpt-5.4 periods")
             .push(json!({
-                "from": "2026-07-01",
+                "from": raise_from.format("%Y-%m-%d").to_string(),
                 "input": 3,
                 "cache_write": 3,
                 "cache_read": 0.3,

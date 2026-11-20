@@ -602,19 +602,32 @@ binary embeds. `scan`, `sync`, and the watch daemon also check the copy on
 and save a newer copy in the local store. Every command prices with the newest
 copy it can read, embedded or stored. See [Pricing file](docs/pricing.md) for the
 format, the editing rules, and how to turn the refresh off
-(`statsai pricing auto-refresh off` or `STATSAI_PRICING_REFRESH=off`).
+(`statsai pricing auto-refresh off` or `STATSAI_PRICING_REFRESH=off`). With the
+refresh off, StatsAI prices with the embedded file, except that a store already
+priced with a newer stored copy keeps that copy.
 
 Pricing updates are version-driven and automatic. The selected `statsai` binary
 reprices persisted normalized events when the pricing file it uses has a newer
 `version` than the store's last applied one, before scan, report, sync,
 snapshot, task, export, import, or daemon use price-derived data. Diagnostic
 commands such as `status`, `doctor`, `quota`, `conversation`, and `account` do
-not trigger that pass. A raw provider rescan (`--no-cache`) is not required.
-Ordinary incremental `statsai sync --sink http` then uploads the corrected dirty
-rollups; `--rebuild-rollups` and `--full` are unnecessary just because prices
-changed. Repricing never goes backward: a store already repriced with a newer
-`version` is used as it is. A store whose stored pricing file has a `format`
-the binary cannot read is refused with a message to upgrade StatsAI.
+not trigger that pass. A raw provider rescan (`--no-cache`) is not required,
+except for estimates that adapters such as Grok Build and OpenCode sum from
+per-request records, which only a rescan refreshes. Ordinary incremental
+`statsai sync --sink http` then uploads the corrected dirty rollups;
+`--rebuild-rollups` and `--full` are unnecessary just because prices changed.
+When another process reprices the store while a scan, sync, import or watch
+pass is writing, that command reprices the store again when it finishes, so
+nothing it wrote keeps the older prices. Repricing never goes backward: a store
+already repriced with a newer `version` is used as it is. A store whose stored
+pricing file has a `format` the binary cannot read is refused with a message to
+upgrade StatsAI.
+
+Releases from before pricing files refuse a store priced past their compiled
+ruleset version (7 in the last of them), and that happens as soon as a newer
+binary adopts a file from `main`. Upgrade every binary that shares the store
+(the CLI, the watch daemon, and StatsAI for Mac) and restart the daemon; see
+[Releases before pricing files](docs/pricing.md#releases-before-pricing-files).
 
 ## Develop locally
 

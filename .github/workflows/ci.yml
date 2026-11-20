@@ -45,7 +45,6 @@ jobs:
 
   pricing-file:
     name: Pricing file
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -53,9 +52,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - run: scripts/check-pricing-file.sh "origin/$BASE_REF"
+      # A pull request run checks out the merge commit GitHub built for the
+      # event. Its first parent is the base tip it was merged onto, so this
+      # checks only the pull request's own change, even on a re-run after
+      # main moved.
+      - name: Check the pull request's change
+        if: github.event_name == 'pull_request'
+        run: scripts/check-pricing-file.sh HEAD^1
+      # Two pull requests can each pass against the base they saw and still
+      # merge into a main whose file changed without a higher version. Checking
+      # each push to main against the tip it replaced fails main loudly then.
+      - name: Check the change pushed to main
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        run: scripts/check-pricing-file.sh "$BEFORE"
         env:
-          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
 
   dependency-review:
     name: Dependency Review

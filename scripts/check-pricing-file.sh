@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # Checks a change to crates/statsai-pricing/pricing.json against the editing
-# rules in docs/pricing.md. CI runs it on every pull request.
+# rules in docs/pricing.md. CI runs it on every pull request, against the base
+# tip the pull request is merged onto, and on every push to main, against the
+# tip the push replaced.
 
 pricing_path=crates/statsai-pricing/pricing.json
 

@@ -23,6 +23,9 @@ pub const APPLIED_PRICING_CATALOG_VERSION_KEY: &str = "pricing.applied_catalog_v
 const EVENT_PAGE_SIZE: usize = 256;
 const SUMMARY_PAGE_SIZE: usize = 128;
 const TASK_SPAN_PAGE_SIZE: usize = 128;
+/// How many times [`Store::settle_pricing`] reads the applied version again
+/// when another process moves it while it waits for the write lock.
+const SETTLE_ATTEMPTS: usize = 3;
 
 /// What one application of a pricing table to a store did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -155,9 +158,11 @@ impl Store {
     /// Events, summaries, sync rollups (changed ones are marked dirty for the
     /// next incremental sync), session rollups and task spans are repriced in
     /// one transaction that also records the table's version and catalog.
-    /// When the table is newer than the store's pricing file, or the store has
-    /// no usable one, its text becomes the store's pricing file, so other
-    /// binaries sharing the store price with it too.
+    /// The table's text becomes the store's pricing file when no copy is
+    /// stored, when the stored copy is unreadable, or when the stored copy
+    /// (usable or in a format this binary cannot read) has a lower version, so
+    /// other binaries sharing the store price with it too. A stored copy at the
+    /// same or a higher version is kept.
     ///
     /// A store already at the table's version is left alone. So is a store
     /// priced with a higher version: repricing never goes backward, and the
@@ -173,25 +178,88 @@ impl Store {
             if let Some(report) = self.settled_pricing_report(table)? {
                 return Ok(report);
             }
-
-            let mut report = RepricingReport::for_table(table);
-            let mut dirty_keys = BTreeSet::new();
-            let mut session_ids = BTreeSet::new();
-
-            self.reprice_events_in_tx(table, &mut report, &mut dirty_keys, &mut session_ids)?;
-            self.reprice_summaries_in_tx(table, &mut report)?;
-            report.refreshed_rollups = self.refresh_sync_rollups_for_keys_counted(&dirty_keys)?;
-            self.refresh_session_rollups_for_keys(&session_ids)?;
-            self.reprice_task_spans_in_tx(&mut report)?;
-
-            self.set_metadata_value(
-                APPLIED_PRICING_RULESET_VERSION_KEY,
-                &table.version().to_string(),
-            )?;
-            self.set_metadata_value(APPLIED_PRICING_CATALOG_VERSION_KEY, table.catalog())?;
-            self.store_pricing_file_if_newer(table)?;
-            Ok(report)
+            self.reprice_store_in_tx(table)
         })
+    }
+
+    /// Reprices every estimate in the store with `table` and records its
+    /// version and catalog, whatever version the store was priced with. Runs
+    /// inside the caller's transaction.
+    fn reprice_store_in_tx(&self, table: &PricingTable) -> Result<RepricingReport> {
+        let mut report = RepricingReport::for_table(table);
+        let mut dirty_keys = BTreeSet::new();
+        let mut session_ids = BTreeSet::new();
+
+        self.reprice_events_in_tx(table, &mut report, &mut dirty_keys, &mut session_ids)?;
+        self.reprice_summaries_in_tx(table, &mut report)?;
+        report.refreshed_rollups = self.refresh_sync_rollups_for_keys_counted(&dirty_keys)?;
+        self.refresh_session_rollups_for_keys(&session_ids)?;
+        self.reprice_task_spans_in_tx(&mut report)?;
+
+        self.set_metadata_value(
+            APPLIED_PRICING_RULESET_VERSION_KEY,
+            &table.version().to_string(),
+        )?;
+        self.set_metadata_value(APPLIED_PRICING_CATALOG_VERSION_KEY, table.catalog())?;
+        self.store_pricing_file_if_newer(table)?;
+        Ok(report)
+    }
+
+    /// Repairs estimates a command wrote while another process repriced the
+    /// store. Call it when a command that writes priced data (a scan, a sync,
+    /// an import, a watch pass) finishes, with `priced_with`, the version of
+    /// the process's active table when the command started pricing.
+    ///
+    /// The applied version is one stamp for the whole store. When another
+    /// process moved it past `priced_with` while this command ran, whatever
+    /// this command wrote afterwards carries older prices that no later
+    /// command would reprice, because the store already reads as current. So
+    /// when the store's applied version is now higher than `priced_with`, this
+    /// reprices the whole store again with the table for the applied version,
+    /// even though the store is already stamped with it, and makes that table
+    /// the process's active table. Otherwise, or when this process has no
+    /// table at the applied version, it does nothing and returns `None`.
+    ///
+    /// It holds the store's write lock only for the repricing itself.
+    pub fn settle_pricing(&self, priced_with: u64) -> Result<Option<RepricingReport>> {
+        let Some((table, report)) = self.settle_pricing_in_store(priced_with)? else {
+            return Ok(None);
+        };
+        install_pricing(table);
+        Ok(Some(report))
+    }
+
+    /// [`Store::settle_pricing`] without changing the process's active table:
+    /// returns the table it repriced with, beside the report. For callers
+    /// that must not change what the process prices with, such as tests that
+    /// share one process-wide table.
+    pub fn settle_pricing_in_store(
+        &self,
+        priced_with: u64,
+    ) -> Result<Option<(Arc<PricingTable>, RepricingReport)>> {
+        // Another process can move the applied version again between reading
+        // it and taking the write lock; try again with the newer one.
+        for _ in 0..SETTLE_ATTEMPTS {
+            let Some(applied) = self.applied_pricing_ruleset_version()? else {
+                return Ok(None);
+            };
+            if applied <= priced_with {
+                return Ok(None);
+            }
+            let Some(table) = self.pricing_table_at_version(applied)? else {
+                return Ok(None);
+            };
+            let report = self.with_immediate_transaction(|| {
+                if self.applied_pricing_ruleset_version()? != Some(applied) {
+                    return Ok(None);
+                }
+                self.reprice_store_in_tx(&table).map(Some)
+            })?;
+            if let Some(report) = report {
+                return Ok(Some((table, report)));
+            }
+        }
+        Ok(None)
     }
 
     /// The report for a store that `table` would not change: one already at

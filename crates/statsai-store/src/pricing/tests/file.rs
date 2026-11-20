@@ -32,10 +32,37 @@ fn embedded_version() -> u64 {
     embedded_pricing().version()
 }
 
-/// GPT-5.5's input rate goes from 5 to 6 USD per million tokens.
+/// GPT-5.5's input rate goes up by 1 USD per million tokens in every period,
+/// so whichever period prices an event, its estimate changes.
 fn raise_gpt_5_5_input(file: &mut Value) {
     file["catalog"] = json!(NEWER_CATALOG);
-    file["models"]["gpt-5.5"]["prices"][0]["input"] = json!(6.0);
+    for period in file["models"]["gpt-5.5"]["prices"]
+        .as_array_mut()
+        .expect("gpt-5.5 periods")
+    {
+        let input = period["input"].as_f64().expect("input rate");
+        period["input"] = json!(input + 1.0);
+    }
+}
+
+/// The first day after every period `model` has in `file`, and no earlier
+/// than `at_least`. A period a test adds there keeps the model's periods in
+/// order whatever periods later edits to pricing.json give it.
+fn day_after_last_period(
+    file: &Value,
+    model: &str,
+    at_least: chrono::NaiveDate,
+) -> chrono::NaiveDate {
+    file["models"][model]["prices"]
+        .as_array()
+        .expect("periods")
+        .iter()
+        .filter_map(|period| period["from"].as_str())
+        .map(|from| {
+            chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d").expect("period date")
+                + chrono::Duration::days(1)
+        })
+        .fold(at_least, chrono::NaiveDate::max)
 }
 
 /// The embedded file one version up, with GPT-5.5's input rate raised.
@@ -147,17 +174,270 @@ fn a_newer_stored_file_reprices_changed_events_and_marks_their_rollups_dirty() {
         dirty[0].cost.estimated_api_equivalent_micro_usd,
         expected.estimated_api_equivalent_micro_usd
     );
-    assert_eq!(stored_pricing_text(&store), Some(text));
+    assert_eq!(stored_pricing_text(&store), Some(text.clone()));
 
-    // With the refresh off, this process prices with its embedded file, and
-    // it does not take the store back to it.
+    // With the refresh off, the store is already priced with the stored copy,
+    // so this process keeps pricing with it rather than mixing in the
+    // embedded file's older prices.
     let off = store
         .current_pricing_table_with(PricingRefreshState::OffBySetting)
         .expect("refresh off");
-    assert_eq!(off.version(), embedded.version());
-    let report = store.apply_pricing_table(&off).expect("store ahead");
-    assert_eq!(report.store_ahead, Some(newer_version));
+    assert_eq!(off.version(), newer_version);
+    assert_eq!(off.source_text(), text);
+    let report = store.apply_pricing_table(&off).expect("already current");
+    assert!(report.already_current);
     assert_eq!(stored_event(&store, &event.event_id.0).cost, expected);
+}
+
+#[test]
+fn with_the_refresh_off_a_store_priced_with_its_stored_copy_keeps_that_copy() {
+    let (store, source) = store_with_source("/tmp/pricing-file-off-store-ahead");
+    let first = gpt_5_5_event(&source, "2026-09-01T12:00:00Z");
+    store.insert_event(&first).expect("insert");
+    let text = newer_pricing_text();
+    let newer_version = embedded_version() + 1;
+    store.offer_pricing_file(&text).expect("offer");
+    let newer = store
+        .current_pricing_table_with(PricingRefreshState::On)
+        .expect("stored copy");
+    store.apply_pricing_table(&newer).expect("reprice");
+    let repriced = stored_event(&store, &first.event_id.0).cost;
+    assert_eq!(repriced, gpt_5_5_cost(&newer, &first));
+
+    for off in [
+        PricingRefreshState::OffBySetting,
+        PricingRefreshState::OffByEnvironment,
+    ] {
+        let table = store.current_pricing_table_with(off).expect("refresh off");
+        assert_eq!(table.version(), newer_version, "{off:?}");
+        assert_eq!(table.source_text(), text, "{off:?}");
+        let report = store.apply_pricing_table(&table).expect("apply");
+        assert!(report.already_current, "{off:?}");
+        assert_eq!(report.store_ahead, None, "{off:?}");
+
+        // What a scan writes with that table matches the store, including a
+        // rescanned event: nothing moves back to the embedded prices.
+        let second = gpt_5_5_event(&source, "2026-09-02T12:00:00Z");
+        let mut written = second.clone();
+        written.cost = gpt_5_5_cost(&table, &second);
+        store.insert_event(&written).expect("insert");
+        assert_eq!(
+            stored_event(&store, &second.event_id.0).cost,
+            gpt_5_5_cost(&newer, &second)
+        );
+        assert_eq!(stored_event(&store, &first.event_id.0).cost, repriced);
+    }
+}
+
+#[test]
+fn with_the_refresh_off_a_store_ahead_without_its_copy_prices_with_the_embedded_file() {
+    let embedded = embedded_version();
+    // The store is priced with embedded + 1. It holds no copy, or a copy of
+    // another version (a refresh stored embedded + 2 that nothing applied yet).
+    let two_up = pricing_text_at(embedded + 2, raise_gpt_5_5_input);
+    for stored in [None, Some(two_up.as_str())] {
+        let (store, source) = store_with_source("/tmp/pricing-file-off-no-copy");
+        let mut event = gpt_5_5_event(&source, "2026-09-01T12:00:00Z");
+        event.cost = gpt_5_5_cost(&embedded_pricing(), &event);
+        store.insert_event(&event).expect("insert");
+        if let Some(stored) = stored {
+            store
+                .set_metadata_value(STORED_PRICING_FILE_KEY, stored)
+                .expect("store a copy");
+        }
+        store
+            .set_metadata_value(
+                APPLIED_PRICING_RULESET_VERSION_KEY,
+                &(embedded + 1).to_string(),
+            )
+            .expect("store ahead");
+        let payload_before =
+            serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize");
+
+        for off in [
+            PricingRefreshState::OffBySetting,
+            PricingRefreshState::OffByEnvironment,
+        ] {
+            let table = store.current_pricing_table_with(off).expect("refresh off");
+            assert_eq!(table.version(), embedded, "{off:?} {stored:?}");
+            // Installs the embedded table, which is already the active one.
+            let report = store
+                .ensure_current_pricing_with(off)
+                .expect("a store ahead is not refused");
+            assert_eq!(report.version, embedded);
+            assert_eq!(report.store_ahead, Some(embedded + 1));
+            assert!(!report.did_work());
+        }
+
+        assert_eq!(
+            serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize"),
+            payload_before
+        );
+        assert_eq!(
+            store.applied_pricing_ruleset_version().expect("applied"),
+            Some(embedded + 1)
+        );
+        assert_eq!(stored_pricing_text(&store).as_deref(), stored);
+    }
+}
+
+#[test]
+fn with_the_refresh_off_a_store_not_ahead_prices_with_the_embedded_file_only() {
+    let embedded = embedded_version();
+    let text = newer_pricing_text();
+    // Never priced, and priced with the embedded version: a newer stored copy
+    // is ignored either way.
+    for applied in [None, Some(embedded)] {
+        let (store, _source) = store_with_source("/tmp/pricing-file-off-not-ahead");
+        store.offer_pricing_file(&text).expect("offer");
+        if let Some(applied) = applied {
+            store
+                .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, &applied.to_string())
+                .expect("applied");
+        }
+        for off in [
+            PricingRefreshState::OffBySetting,
+            PricingRefreshState::OffByEnvironment,
+        ] {
+            assert_eq!(
+                store
+                    .current_pricing_table_with(off)
+                    .expect("refresh off")
+                    .version(),
+                embedded,
+                "{off:?} {applied:?}"
+            );
+        }
+        assert_eq!(
+            store
+                .current_pricing_table_with(PricingRefreshState::On)
+                .expect("refresh on")
+                .version(),
+            embedded + 1
+        );
+    }
+}
+
+#[test]
+fn settling_reprices_what_a_command_wrote_after_another_process_repriced_the_store() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("statsai.sqlite");
+    let store = Store::open(&path).expect("open");
+    let source = test_source("/tmp/pricing-file-settle");
+    store.upsert_source(&source).expect("source");
+    let embedded = embedded_pricing();
+    store.apply_pricing_table(&embedded).expect("embedded");
+    // This command prices what it writes with the embedded file.
+    let priced_with = embedded.version();
+    let priced_by_this_command = |started_at: &str| {
+        let mut event = gpt_5_5_event(&source, started_at);
+        event.cost = gpt_5_5_cost(&embedded, &event);
+        event
+    };
+    let first = priced_by_this_command("2026-09-01T12:00:00Z");
+    store.insert_event(&first).expect("first");
+
+    // Another process stores a newer file with a changed rate and reprices
+    // the store with it, through its own connection.
+    let other = Store::open(&path).expect("second connection");
+    let text = newer_pricing_text();
+    assert_eq!(
+        other.offer_pricing_file(&text).expect("offer"),
+        PricingOffer::Stored {
+            version: priced_with + 1
+        }
+    );
+    let newer = other
+        .current_pricing_table_with(PricingRefreshState::On)
+        .expect("stored copy");
+    assert_eq!(newer.version(), priced_with + 1);
+    assert_eq!(
+        other
+            .apply_pricing_table(&newer)
+            .expect("reprice")
+            .changed_events,
+        1
+    );
+
+    // This command goes on writing with the embedded file: a new event, and
+    // the first event parsed again.
+    let second = priced_by_this_command("2026-09-02T12:00:00Z");
+    store.insert_event(&second).expect("second");
+    store.insert_event(&first).expect("first again");
+    assert_ne!(
+        stored_event(&store, &second.event_id.0).cost,
+        gpt_5_5_cost(&newer, &second)
+    );
+    // The store already reads as priced with the newer version, so applying
+    // it again changes nothing.
+    assert!(
+        other
+            .apply_pricing_table(&newer)
+            .expect("already current")
+            .already_current
+    );
+
+    // Settling with the version this command priced with reprices it all.
+    let (table, report) = store
+        .settle_pricing_in_store(priced_with)
+        .expect("settle")
+        .expect("the store moved past this command's version");
+    assert_eq!(table.version(), priced_with + 1);
+    assert_eq!(table.source_text(), text);
+    assert_eq!(report.version, priced_with + 1);
+    assert!(!report.already_current);
+    assert!(report.changed_events >= 1, "{report:?}");
+    for event in [&first, &second] {
+        let cost = stored_event(&store, &event.event_id.0).cost;
+        assert_eq!(cost, gpt_5_5_cost(&newer, event));
+        assert_eq!(cost.pricing_version.as_deref(), Some(NEWER_CATALOG));
+    }
+    assert_eq!(
+        store.applied_pricing_ruleset_version().expect("applied"),
+        Some(priced_with + 1)
+    );
+
+    // A command that priced with the applied version has nothing to settle.
+    assert!(store
+        .settle_pricing_in_store(priced_with + 1)
+        .expect("settle")
+        .is_none());
+}
+
+#[test]
+fn settling_does_nothing_when_the_store_did_not_move_or_its_table_is_unknown() {
+    let (store, source) = store_with_source("/tmp/pricing-file-settle-nothing");
+    let embedded = embedded_version();
+    let mut event = gpt_5_5_event(&source, "2026-09-01T12:00:00Z");
+    event.cost = gpt_5_5_cost(&embedded_pricing(), &event);
+    store.insert_event(&event).expect("insert");
+
+    // Never priced.
+    assert!(store.settle_pricing(embedded).expect("settle").is_none());
+    // Priced with the version the command priced with, or an older one.
+    store
+        .apply_pricing_table(&embedded_pricing())
+        .expect("embedded");
+    assert!(store.settle_pricing(embedded).expect("settle").is_none());
+    assert!(store
+        .settle_pricing(embedded + 1)
+        .expect("settle")
+        .is_none());
+    // Priced with a newer version this process has no table for.
+    store
+        .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "99")
+        .expect("store ahead");
+    let payload_before =
+        serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize");
+    assert!(store.settle_pricing(embedded).expect("settle").is_none());
+    assert_eq!(
+        serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize"),
+        payload_before
+    );
+    assert_eq!(
+        store.applied_pricing_ruleset_version().expect("applied"),
+        Some(99)
+    );
 }
 
 #[test]
@@ -533,8 +813,20 @@ fn the_environment_wins_over_the_setting_and_the_setting_round_trips() {
 #[test]
 fn a_summary_spanning_a_boundary_only_the_newer_file_has_becomes_unknown() {
     let (store, source) = store_with_source("/tmp/pricing-file-new-boundary");
-    let start = parse_utc("2026-09-01T00:00:00Z");
-    let end = parse_utc("2026-09-03T00:00:00Z");
+    let embedded_file: Value = serde_json::from_str(embedded_pricing_text()).expect("json");
+    let boundary = day_after_last_period(
+        &embedded_file,
+        "gpt-5.5",
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 2).expect("date"),
+    );
+    let start = (boundary - chrono::Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .expect("start")
+        .and_utc();
+    let end = (boundary + chrono::Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .expect("end")
+        .and_utc();
     store
         .upsert_summary(&test_summary(
             &source,
@@ -549,7 +841,7 @@ fn a_summary_spanning_a_boundary_only_the_newer_file_has_becomes_unknown() {
             .as_array_mut()
             .expect("periods")
             .push(json!({
-                "from": "2026-09-02",
+                "from": boundary.format("%Y-%m-%d").to_string(),
                 "input": 6,
                 "cache_write": 6,
                 "cache_read": 0.6,

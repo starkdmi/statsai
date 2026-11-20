@@ -24,8 +24,11 @@ pub(crate) fn refresh_on(store: &DatabasePricingState, refresh_disabled_by_env: 
 /// `build_format` is `None` for a legacy build, one that predates pricing files:
 /// it prices with its embedded version only and ignores any stored copy. A build
 /// that reads pricing files uses the newer of its embedded version and the
-/// store's readable stored copy while the refresh is on, and its embedded version
-/// alone while the refresh is off.
+/// store's readable stored copy while the refresh is on. While the refresh is
+/// off it uses its embedded version, except when the store's estimates are
+/// already priced with a version newer than the build's and the stored copy is
+/// that same version: then it keeps pricing with the stored copy, as StatsAI
+/// does, so it never prices new events with older prices than the store's.
 ///
 /// # Errors
 ///
@@ -50,6 +53,8 @@ pub(crate) fn build_pricing_target(
     }
     if refresh_on(store, refresh_disabled_by_env) {
         Ok(build_version.max(stored.version))
+    } else if store.applied_version == Some(stored.version) && stored.version > build_version {
+        Ok(stored.version)
     } else {
         Ok(build_version)
     }
@@ -116,16 +121,60 @@ mod tests {
     }
 
     #[test]
-    fn with_the_refresh_off_a_build_ignores_the_stored_copy() {
+    fn with_the_refresh_off_a_build_ignores_a_stored_copy_the_store_is_not_priced_with() {
+        // Stored, but production is priced with the build's version or none.
+        for applied in [None, Some(7)] {
+            let mut setting_off = store(applied, Some((1, 9)));
+            setting_off.refresh_setting_on = false;
+            assert_eq!(
+                build_pricing_target(7, Some(1), &setting_off, false).expect("setting off"),
+                7
+            );
+            assert_eq!(
+                build_pricing_target(7, Some(1), &store(applied, Some((1, 9))), true)
+                    .expect("variable off"),
+                7
+            );
+        }
+        // Production is priced with version 9, but the stored copy is another
+        // version, or none is stored.
+        for stored in [Some((1, 10)), Some((1, 8)), None] {
+            assert_eq!(
+                build_pricing_target(7, Some(1), &store(Some(9), stored), true)
+                    .expect("variable off"),
+                7,
+                "{stored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_the_refresh_off_a_build_keeps_the_stored_copy_the_store_is_priced_with() {
         let mut setting_off = store(Some(9), Some((1, 9)));
         setting_off.refresh_setting_on = false;
         assert_eq!(
             build_pricing_target(7, Some(1), &setting_off, false).expect("setting off"),
-            7
+            9
         );
         assert_eq!(
             build_pricing_target(7, Some(1), &store(Some(9), Some((1, 9))), true)
                 .expect("variable off"),
+            9
+        );
+        // A build at or past that version prices with its own.
+        assert_eq!(
+            build_pricing_target(9, Some(1), &store(Some(9), Some((1, 9))), true)
+                .expect("variable off"),
+            9
+        );
+        assert_eq!(
+            build_pricing_target(10, Some(1), &store(Some(9), Some((1, 9))), true)
+                .expect("variable off"),
+            10
+        );
+        // A legacy build never reads it.
+        assert_eq!(
+            build_pricing_target(7, None, &store(Some(9), Some((1, 9))), true).expect("legacy"),
             7
         );
     }

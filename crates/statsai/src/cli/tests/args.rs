@@ -174,6 +174,29 @@ fn scan_and_every_sync_start_a_background_pricing_refresh() {
 }
 
 #[test]
+fn commands_that_write_priced_estimates_settle_pricing_when_they_finish() {
+    let settles = |args: &[&str]| {
+        let cli = Cli::try_parse_from(args).expect("parse");
+        command_settles_pricing(&cli.command)
+    };
+    assert!(settles(&["statsai", "scan"]));
+    assert!(settles(&["statsai", "sync"]));
+    assert!(settles(&["statsai", "sync", "--sink", "http"]));
+    assert!(settles(&[
+        "statsai",
+        "import",
+        "cursor",
+        "--path",
+        "usage.csv"
+    ]));
+    assert!(!settles(&["statsai", "report", "monthly"]));
+    assert!(!settles(&["statsai", "export", "--json"]));
+    assert!(!settles(&["statsai", "status"]));
+    // The watch daemon settles after each pass instead.
+    assert!(!settles(&["statsai", "daemon", "--watch"]));
+}
+
+#[test]
 fn price_derived_commands_reprice_and_diagnostic_commands_do_not() {
     let reprice = |args: &[&str]| {
         let cli = Cli::try_parse_from(args).expect("parse");

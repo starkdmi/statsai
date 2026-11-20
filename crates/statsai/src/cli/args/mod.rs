@@ -284,7 +284,9 @@ pub(crate) enum StoreAdminSubcommand {
     SupportedPricingRulesetVersion,
     #[command(about = "Print the newest pricing file format this binary reads")]
     SupportedPricingFormat,
-    #[command(about = "Migrate the store to this binary's schema and apply its pricing ruleset")]
+    #[command(
+        about = "Migrate the store to this binary's schema and reprice it with the newest pricing file it can use"
+    )]
     Migrate,
 }
 

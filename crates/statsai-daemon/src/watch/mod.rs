@@ -206,35 +206,33 @@ fn run_watch_loop<W: Watcher>(
                     worker_scan_lock.as_deref(),
                     |notice| match background_store.as_ref() {
                         Ok(store) => {
-                            if !bring_pricing_up_to_date(store, &mut unsupported_pricing)? {
-                                return Ok(());
-                            }
-                            rescan_changed_sources(
-                                store,
-                                &worker_shared_store,
-                                &worker_device_id,
-                                notice.paths(),
-                                notice.rescan_all(),
-                                &dependency_snapshot,
-                            )
+                            scan_with_current_pricing(store, &mut unsupported_pricing, || {
+                                rescan_changed_sources(
+                                    store,
+                                    &worker_shared_store,
+                                    &worker_device_id,
+                                    notice.paths(),
+                                    notice.rescan_all(),
+                                    &dependency_snapshot,
+                                )
+                            })
                         }
                         Err(error) => {
                             eprintln!(
                                 "daemon: dedicated scan connection unavailable ({error:#}); using shared store"
                             );
                             let store = super::lock_store(&worker_shared_store);
-                            if !bring_pricing_up_to_date(&store, &mut unsupported_pricing)? {
-                                return Ok(());
-                            }
-                            let adapters: Vec<Box<dyn ProviderAdapter>> = default_adapters();
-                            rescan_changed_sources_with_adapters_and_dependencies(
-                                &store,
-                                &worker_device_id,
-                                notice.paths(),
-                                notice.rescan_all(),
-                                &adapters,
-                                &dependency_snapshot,
-                            )
+                            scan_with_current_pricing(&store, &mut unsupported_pricing, || {
+                                let adapters: Vec<Box<dyn ProviderAdapter>> = default_adapters();
+                                rescan_changed_sources_with_adapters_and_dependencies(
+                                    &store,
+                                    &worker_device_id,
+                                    notice.paths(),
+                                    notice.rescan_all(),
+                                    &adapters,
+                                    &dependency_snapshot,
+                                )
+                            })
                         }
                     },
                 );

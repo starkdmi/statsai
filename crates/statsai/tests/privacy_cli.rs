@@ -16,6 +16,8 @@ use statsai_store::{FilteredConversationRecord, Store};
 
 fn run_statsai(store: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_statsai"))
+        // Never fetch pricing, whatever the developer's shell exports.
+        .env("STATSAI_PRICING_REFRESH", "off")
         .arg("--store")
         .arg(store)
         .args(args)

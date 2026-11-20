@@ -8,6 +8,8 @@ use std::time::Duration;
 
 fn run_statsai(home: &Path, store: &Path, args: &[&str]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_statsai"))
+        // Never fetch pricing, whatever the developer's shell exports.
+        .env("STATSAI_PRICING_REFRESH", "off")
         .arg("--store")
         .arg(store)
         .args(args)

@@ -36,6 +36,48 @@ fn append_period(value: &mut Value, model: &str, period: Value) {
         .push(period);
 }
 
+/// Adds `period` to `model`'s periods in date order, for a period that must
+/// fall inside a window that has already passed.
+fn insert_period(value: &mut Value, model: &str, period: Value) {
+    let from = period["from"].as_str().expect("dated period").to_string();
+    let periods = value["models"][model]["prices"]
+        .as_array_mut()
+        .expect("prices");
+    let index = periods
+        .iter()
+        .position(|existing| {
+            existing["from"]
+                .as_str()
+                .is_some_and(|existing| existing > from.as_str())
+        })
+        .unwrap_or(periods.len());
+    periods.insert(index, period);
+}
+
+/// The first day after every period `model` has in `value`, and no earlier
+/// than `at_least`. A period a test appends there keeps the model's periods
+/// in order whatever periods later edits to pricing.json give it.
+fn day_after_last_period(value: &Value, model: &str, at_least: NaiveDate) -> NaiveDate {
+    value["models"][model]["prices"]
+        .as_array()
+        .expect("prices")
+        .iter()
+        .filter_map(|period| period["from"].as_str())
+        .map(|from| {
+            NaiveDate::parse_from_str(from, "%Y-%m-%d").expect("period date")
+                + chrono::Duration::days(1)
+        })
+        .fold(at_least, NaiveDate::max)
+}
+
+fn day(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
+fn midnight(date: NaiveDate) -> chrono::DateTime<Utc> {
+    date.and_hms_opt(0, 0, 0).expect("midnight").and_utc()
+}
+
 #[test]
 fn an_event_is_priced_with_the_last_period_starting_on_or_before_its_day() {
     let table = embedded_pricing();
@@ -77,15 +119,17 @@ fn an_event_is_priced_with_the_last_period_starting_on_or_before_its_day() {
 #[test]
 fn a_middle_period_covers_the_days_up_to_the_next_start() {
     let mut value = embedded_json();
+    let middle = day_after_last_period(&value, "claude-opus-5", date(2027, 2, 1));
+    let last = middle + chrono::Duration::days(28);
     append_period(
         &mut value,
         "claude-opus-5",
-        json!({ "from": "2027-02-01", "input": 4, "cache_write": 5, "cache_read": 0.4, "output": 20 }),
+        json!({ "from": day(middle), "input": 4, "cache_write": 5, "cache_read": 0.4, "output": 20 }),
     );
     append_period(
         &mut value,
         "claude-opus-5",
-        json!({ "from": "2027-03-01", "input": 3, "cache_write": 3.75, "cache_read": 0.3, "output": 15 }),
+        json!({ "from": day(last), "input": 3, "cache_write": 3.75, "cache_read": 0.3, "output": 15 }),
     );
     let table = parse_value(&value);
     let input_on = |day: NaiveDate| {
@@ -95,10 +139,10 @@ fn a_middle_period_covers_the_days_up_to_the_next_start() {
             .input_per_million
     };
 
-    assert!((input_on(date(2027, 1, 31)) - 5.0).abs() < f64::EPSILON);
-    assert!((input_on(date(2027, 2, 1)) - 4.0).abs() < f64::EPSILON);
-    assert!((input_on(date(2027, 2, 28)) - 4.0).abs() < f64::EPSILON);
-    assert!((input_on(date(2027, 3, 1)) - 3.0).abs() < f64::EPSILON);
+    assert!((input_on(middle - chrono::Duration::days(1)) - 5.0).abs() < f64::EPSILON);
+    assert!((input_on(middle) - 4.0).abs() < f64::EPSILON);
+    assert!((input_on(last - chrono::Duration::days(1)) - 4.0).abs() < f64::EPSILON);
+    assert!((input_on(last) - 3.0).abs() < f64::EPSILON);
     assert!((input_on(NaiveDate::MAX) - 3.0).abs() < f64::EPSILON);
     assert!((input_on(NaiveDate::MIN) - 5.0).abs() < f64::EPSILON);
 }
@@ -107,12 +151,14 @@ fn a_middle_period_covers_the_days_up_to_the_next_start() {
 fn an_appended_price_period_reprices_later_events_without_touching_the_global() {
     let mut value = embedded_json();
     value["version"] = json!(embedded_pricing().version() + 1);
+    let boundary = day_after_last_period(&value, "claude-opus-5", date(2027, 1, 1));
     append_period(
         &mut value,
         "claude-opus-5",
-        json!({ "from": "2027-01-01", "input": 1, "cache_write": 1.25, "cache_read": 0.1, "output": 5 }),
+        json!({ "from": day(boundary), "input": 1, "cache_write": 1.25, "cache_read": 0.1, "output": 5 }),
     );
     let table = parse_value(&value);
+    let day_before = boundary - chrono::Duration::days(1);
 
     let model = statsai_core::ModelInfo {
         name: Some("claude-opus-5".to_string()),
@@ -126,8 +172,8 @@ fn an_appended_price_period_reprices_later_events_without_touching_the_global() 
         input_tokens: Some(1_000_000),
         ..UsageCounts::default()
     };
-    let before = Utc.with_ymd_and_hms(2026, 12, 31, 23, 59, 59).unwrap();
-    let after = Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap();
+    let after = midnight(boundary);
+    let before = after - chrono::Duration::seconds(1);
 
     let old_rate = table.estimate_cost_at("claude_code", Some(&model), &usage, &before);
     let new_rate = table.estimate_cost_at("claude_code", Some(&model), &usage, &after);
@@ -135,24 +181,24 @@ fn an_appended_price_period_reprices_later_events_without_touching_the_global() 
     assert_eq!(new_rate.estimated_api_equivalent_micro_usd, Some(1_000_000));
     assert_eq!(new_rate.pricing_version.as_deref(), Some(table.catalog()));
 
-    assert!(table.pricing_changes_between("claude-opus-5", date(2026, 12, 31), date(2027, 1, 1)));
+    assert!(table.pricing_changes_between("claude-opus-5", day_before, boundary));
     assert!(table.pricing_changes_between(
         "anthropic/claude-opus-5-thinking",
-        date(2027, 1, 1),
-        date(2026, 12, 31)
+        boundary,
+        day_before
     ));
-    assert!(!table.pricing_changes_between("claude-opus-5", date(2027, 1, 1), date(2027, 6, 1)));
+    assert!(!table.pricing_changes_between(
+        "claude-opus-5",
+        boundary,
+        boundary + chrono::Duration::days(151)
+    ));
 
     // Neither the embedded nor the process-global table saw the new period.
-    assert!(!embedded_pricing().pricing_changes_between(
-        "claude-opus-5",
-        date(2026, 12, 31),
-        date(2027, 1, 1)
-    ));
+    assert!(!embedded_pricing().pricing_changes_between("claude-opus-5", day_before, boundary));
     assert!(!pricing_changes_between(
         "claude-opus-5",
-        date(2026, 12, 31),
-        date(2027, 1, 1)
+        day_before,
+        boundary
     ));
     assert_eq!(
         estimate_cost_at("claude_code", Some(&model), &usage, &after)
@@ -213,42 +259,42 @@ fn equivalent_boundaries_include_target_changes_only_inside_their_window() {
     ));
 
     let mut value = embedded_json();
-    // Inside codex-auto-review's GPT-5.4 window: a boundary for it too.
-    append_period(
+    // Inside codex-auto-review's GPT-5.4 window, which closed on 2026-07-30:
+    // a boundary for it too.
+    insert_period(
         &mut value,
         "gpt-5.4",
         json!({ "from": "2026-05-01", "input": 2, "cache_write": 2, "cache_read": 0.2, "output": 12 }),
     );
-    // After the window closes on 2026-07-30: GPT-5.4 changes, codex-auto-review does not.
+    // After the window closes: GPT-5.4 changes, codex-auto-review does not.
+    let gpt_5_4_change = day_after_last_period(&value, "gpt-5.4", date(2026, 9, 1));
     append_period(
         &mut value,
         "gpt-5.4",
-        json!({ "from": "2026-09-01", "input": 1, "cache_write": 1, "cache_read": 0.1, "output": 6 }),
+        json!({ "from": day(gpt_5_4_change), "input": 1, "cache_write": 1, "cache_read": 0.1, "output": 6 }),
     );
     // Inside the GPT-5.6 Luna window, which has no end.
+    let luna_change = day_after_last_period(&value, "gpt-5.6-luna", date(2027, 1, 1));
     append_period(
         &mut value,
         "gpt-5.6-luna",
-        json!({ "from": "2027-01-01", "input": 0.1, "cache_write": 0.125, "cache_read": 0.01, "output": 0.6 }),
+        json!({ "from": day(luna_change), "input": 0.1, "cache_write": 0.125, "cache_read": 0.01, "output": 0.6 }),
     );
     let table = parse_value(&value);
+    let one_day = chrono::Duration::days(1);
 
     assert!(table.pricing_changes_between(
         "codex-auto-review",
         date(2026, 4, 30),
         date(2026, 5, 1)
     ));
-    assert!(table.pricing_changes_between("gpt-5.4", date(2026, 8, 31), date(2026, 9, 1)));
+    assert!(table.pricing_changes_between("gpt-5.4", gpt_5_4_change - one_day, gpt_5_4_change));
     assert!(!table.pricing_changes_between(
         "codex-auto-review",
-        date(2026, 8, 31),
-        date(2026, 9, 1)
+        gpt_5_4_change - one_day,
+        gpt_5_4_change
     ));
-    assert!(table.pricing_changes_between(
-        "codex-auto-review",
-        date(2026, 12, 31),
-        date(2027, 1, 1)
-    ));
+    assert!(table.pricing_changes_between("codex-auto-review", luna_change - one_day, luna_change));
     assert!(table.pricing_changes_between(
         "codex-auto-review",
         date(2026, 7, 29),

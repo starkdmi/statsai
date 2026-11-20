@@ -47,7 +47,9 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a started attempt keeps other processes from starting one.
 pub const ATTEMPT_LEASE: Duration = Duration::from_secs(10 * 60);
 
-/// The overall time limit of one request: connecting, sending and reading.
+/// The overall time limit of one request once the host name resolves:
+/// connecting, sending and reading. The name lookup itself is bounded only by
+/// the system resolver.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The largest pricing file a client reads, the same limit validation applies.
@@ -79,7 +81,8 @@ pub enum FetchOutcome {
 /// Fetches the pricing file at `url`.
 ///
 /// Sends `If-None-Match` when `etag` is given. `timeout` bounds the whole
-/// request, connecting and reading included. The body is read up to
+/// request after the host name resolves, connecting and reading included; the
+/// name lookup is bounded only by the system resolver. The body is read up to
 /// [`MAX_PRICING_FILE_BYTES`].
 ///
 /// # Errors

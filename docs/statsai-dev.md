@@ -153,7 +153,9 @@ statsai-dev env prod
 
 The profiles set the existing `STATSAI_API_URL` and `STATSAI_WEB_URL` variables
 for the launched process, and select the store (see
-[Forward StatsAI commands](#forward-statsai-commands)):
+[Forward StatsAI commands](#forward-statsai-commands)). Under `prod` they also
+remove `STATSAI_PRICING_URL`, a testing override, so a forwarded build can only
+fetch the pricing file from `main`:
 
 | Profile | API | Web | Store |
 |---|---|---|---|
@@ -245,9 +247,12 @@ with, its *pricing target*:
 - A build that predates pricing files: its own version.
 - Any other build while the refresh is on: the newer of its embedded version and
   the stored file's version.
-- Any other build while the refresh is off: its embedded version. The refresh is
-  off when production's setting is `off`, or when `STATSAI_PRICING_REFRESH` is
-  `0`, `off`, `false` or `no` in `statsai-dev`'s environment. Forwarded builds
+- Any other build while the refresh is off: its embedded version, unless
+  production's estimates are already priced with a newer version and the stored
+  file is that version; then that version, because the build keeps pricing with
+  the stored file rather than mix in older prices. The refresh is off when
+  production's setting is `off`, or when `STATSAI_PRICING_REFRESH` is `0`,
+  `off`, `false` or `no` in `statsai-dev`'s environment. Forwarded builds
   inherit that variable, so they see the same value.
 
 A newer pricing version never makes a build that reads pricing files refuse a
@@ -257,14 +262,14 @@ store. Only a stored file in a format the build cannot read does: `env prod` and
 
 So production that a refresh has moved past a build's embedded prices still works
 with that build under `env prod`, once production has been repriced to the stored
-file, as long as the refresh is on. A build that predates pricing files, or one
-running with the refresh off, is refused there.
+file, whether the refresh is on or off. A build that predates pricing files is
+refused there.
 
 A forwarded build with the refresh on can itself adopt a newer pricing file from
 `main` into production, as a released binary would. Until production is repriced
 to that file, `env prod` refuses builds with the refresh on, because they would
 do the repricing. Set `STATSAI_PRICING_REFRESH=off` to keep a forwarded build
-from fetching or using stored files.
+from fetching, and from using a stored file production is not yet priced with.
 
 ## Upgrade production to a merged build
 

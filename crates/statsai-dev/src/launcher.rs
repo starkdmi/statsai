@@ -1,5 +1,5 @@
 use crate::artifact::{load_cached, InstalledBuild};
-use crate::pricing::{build_pricing_target, refresh_disabled_by_env, refresh_on};
+use crate::pricing::{build_pricing_target, refresh_disabled_by_env};
 use crate::state::{Environment, Paths, SelectedBuild, State};
 use anyhow::{bail, Context, Result};
 use statsai_store::{database_pricing_state, database_schema_version, DatabasePricingState};
@@ -203,32 +203,21 @@ fn ensure_production_pricing_compatible(
         ),
         Ordering::Less => bail!(
             "refusing the prod environment: the selected build would price new events with pricing version {target}, older than the pricing version {applied} production's estimates were priced with; {}. {USE_THE_CLONE}",
-            older_target_remedy(production, build_format, refresh_disabled_by_env)
+            older_target_remedy(build_format)
         ),
     }
 }
 
 /// What would let a build that is behind production's pricing run against it.
-fn older_target_remedy(
-    production: &DatabasePricingState,
-    build_format: Option<u32>,
-    refresh_disabled_by_env: bool,
-) -> String {
+///
+/// A build that reads pricing files keeps pricing with a stored copy at
+/// production's applied version whether or not the refresh is on, so only a
+/// newer build helps.
+fn older_target_remedy(build_format: Option<u32>) -> &'static str {
     if build_format.is_none() {
-        return "the selected build predates pricing files and prices only with its own, so select a newer build".to_string();
+        return "the selected build predates pricing files and prices only with its own, so select a newer build";
     }
-    match production.stored_file {
-        Some(stored)
-            if stored.version >= production.applied_version.unwrap_or(0)
-                && !refresh_on(production, refresh_disabled_by_env) =>
-        {
-            format!(
-                "production stores pricing version {}, which the build ignores because the pricing refresh is off (STATSAI_PRICING_REFRESH or production's `pricing.refresh` setting)",
-                stored.version
-            )
-        }
-        _ => "select a build whose pricing is at least that version".to_string(),
-    }
+    "select a build whose pricing is at least that version"
 }
 
 fn apply_environment(command: &mut Command, environment: Environment) {
@@ -240,9 +229,15 @@ fn apply_environment(command: &mut Command, environment: Environment) {
         Environment::Prod => {
             command.env_remove("STATSAI_API_URL");
             command.env_remove("STATSAI_WEB_URL");
+            // A testing override: a file adopted from it would stay in
+            // production's store for good, since versions never go down.
+            command.env_remove(PRICING_URL_ENV);
         }
     }
 }
+
+/// The variable that points the pricing refresh at another URL, for testing.
+const PRICING_URL_ENV: &str = "STATSAI_PRICING_URL";
 
 fn validate_forward_arguments(arguments: &[OsString]) -> Result<()> {
     if arguments.is_empty() {
@@ -362,6 +357,48 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    /// The variables `apply_environment` sets (`Some`) or removes (`None`).
+    fn environment_changes(environment: Environment) -> Vec<(String, Option<String>)> {
+        let mut command = Command::new("statsai");
+        apply_environment(&mut command, environment);
+        let mut changes = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        changes.sort();
+        changes
+    }
+
+    #[test]
+    fn the_prod_environment_removes_url_overrides_including_the_pricing_url() {
+        assert_eq!(
+            environment_changes(Environment::Prod),
+            vec![
+                ("STATSAI_API_URL".to_string(), None),
+                ("STATSAI_PRICING_URL".to_string(), None),
+                ("STATSAI_WEB_URL".to_string(), None),
+            ]
+        );
+        for environment in [Environment::Local, Environment::Dev] {
+            let changes = environment_changes(environment);
+            assert!(
+                changes.iter().all(|(key, _)| key != "STATSAI_PRICING_URL"),
+                "{changes:?}"
+            );
+            assert!(
+                changes
+                    .iter()
+                    .any(|(key, value)| key == "STATSAI_API_URL" && value.is_some()),
+                "{changes:?}"
+            );
+        }
     }
 
     fn in_prod_environment(state: State) -> State {
@@ -615,20 +652,44 @@ mod tests {
         assert!(legacy.contains("pricing version 9"), "{legacy}");
         assert!(legacy.contains("predates pricing files"), "{legacy}");
 
-        let variable_off = refusal(&refreshed, 7, READS_FORMAT_1, true);
-        assert!(variable_off.contains("refresh is off"), "{variable_off}");
-        assert!(variable_off.contains("pricing version 9"), "{variable_off}");
-
-        let setting_off = refusal(
-            &DatabasePricingState {
-                refresh_setting_on: false,
-                ..refreshed
-            },
-            7,
-            READS_FORMAT_1,
-            false,
+        // With the refresh off, the build keeps pricing with the stored copy
+        // production is priced with, as StatsAI does.
+        assert_eq!(
+            ensure_production_pricing_compatible(&refreshed, 7, READS_FORMAT_1, true)
+                .expect("variable off"),
+            9
         );
-        assert!(setting_off.contains("refresh is off"), "{setting_off}");
+        assert_eq!(
+            ensure_production_pricing_compatible(
+                &DatabasePricingState {
+                    refresh_setting_on: false,
+                    ..refreshed
+                },
+                7,
+                READS_FORMAT_1,
+                false,
+            )
+            .expect("setting off"),
+            9
+        );
+
+        // Production holds no copy of the version it is priced with: only a
+        // newer build helps, whatever the refresh.
+        for stored in [None, Some((1, 8))] {
+            for refresh_disabled_by_env in [false, true] {
+                let older = refusal(
+                    &production(Some(9), stored),
+                    7,
+                    READS_FORMAT_1,
+                    refresh_disabled_by_env,
+                );
+                assert!(older.contains("would price new events"), "{older}");
+                assert!(
+                    older.contains("select a build whose pricing is at least that version"),
+                    "{older}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -641,13 +702,15 @@ mod tests {
             assert!(error.contains("would reprice production"), "{error}");
             assert!(error.contains("pricing version 9"), "{error}");
         }
-        // With the refresh off the build ignores the stored copy, so only its own
-        // version counts.
+        // With the refresh off the build ignores a stored copy production is not
+        // priced with, so only its own version counts.
         assert_eq!(
             ensure_production_pricing_compatible(&adopted, 9, READS_FORMAT_1, true)
                 .expect("the stored copy is ignored"),
             9
         );
+        let older = refusal(&adopted, 7, READS_FORMAT_1, true);
+        assert!(older.contains("would price new events"), "{older}");
     }
 
     #[test]
