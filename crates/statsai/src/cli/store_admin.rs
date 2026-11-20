@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use statsai_store::{
     database_applied_pricing_ruleset_version, database_schema_version, embedded_pricing,
-    CURRENT_SCHEMA_VERSION,
+    CURRENT_SCHEMA_VERSION, PRICING_FORMAT,
 };
 use std::fmt::Display;
 use std::path::Path;
@@ -27,6 +27,10 @@ pub(crate) fn store_admin(command: StoreAdminCommand, source: &Path) -> Result<(
         }
         StoreAdminSubcommand::SupportedPricingRulesetVersion => {
             println!("{}", embedded_pricing().version());
+            Ok(())
+        }
+        StoreAdminSubcommand::SupportedPricingFormat => {
+            println!("{PRICING_FORMAT}");
             Ok(())
         }
         StoreAdminSubcommand::Migrate => migrate(source),

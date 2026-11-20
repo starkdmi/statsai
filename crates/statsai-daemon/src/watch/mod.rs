@@ -185,6 +185,7 @@ fn run_watch_loop<W: Watcher>(
         .spawn(move || {
             let mut retry_delay = WATCH_SCAN_INITIAL_RETRY_DELAY;
             let mut reported_scan_lock_wait = false;
+            let mut unsupported_pricing = None;
             while scan_signal_rx.recv().is_ok() {
                 let notice = worker_pending_scan_paths
                     .lock()
@@ -204,19 +205,27 @@ fn run_watch_loop<W: Watcher>(
                     retry_delay,
                     worker_scan_lock.as_deref(),
                     |notice| match background_store.as_ref() {
-                        Ok(store) => rescan_changed_sources(
-                            store,
-                            &worker_shared_store,
-                            &worker_device_id,
-                            notice.paths(),
-                            notice.rescan_all(),
-                            &dependency_snapshot,
-                        ),
+                        Ok(store) => {
+                            if !bring_pricing_up_to_date(store, &mut unsupported_pricing)? {
+                                return Ok(());
+                            }
+                            rescan_changed_sources(
+                                store,
+                                &worker_shared_store,
+                                &worker_device_id,
+                                notice.paths(),
+                                notice.rescan_all(),
+                                &dependency_snapshot,
+                            )
+                        }
                         Err(error) => {
                             eprintln!(
                                 "daemon: dedicated scan connection unavailable ({error:#}); using shared store"
                             );
                             let store = super::lock_store(&worker_shared_store);
+                            if !bring_pricing_up_to_date(&store, &mut unsupported_pricing)? {
+                                return Ok(());
+                            }
                             let adapters: Vec<Box<dyn ProviderAdapter>> = default_adapters();
                             rescan_changed_sources_with_adapters_and_dependencies(
                                 &store,

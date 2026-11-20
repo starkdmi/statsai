@@ -19,6 +19,7 @@ pub(crate) fn run() -> Result<()> {
     match cli.command {
         Command::Schema(command) => schema(command),
         Command::Store(command) => store_admin(command, &store_path),
+        Command::Pricing(command) => pricing(command, &store_path),
         Command::Doctor => doctor(&store_path),
         Command::Auth(command) => auth(command),
         Command::Service(command) => service(command),
@@ -50,8 +51,18 @@ pub(crate) fn run() -> Result<()> {
             let store = if command_reprices_persisted_usage(&command) {
                 statsai::open_operational_store(&store_path)?
             } else {
-                Store::open(&store_path)?
+                let store = Store::open(&store_path)?;
+                // Costs these commands read are priced with the newest
+                // pricing file this process can use, without repricing.
+                store.use_current_pricing()?;
+                store
             };
+            if command_starts_pricing_refresh(&command) {
+                // Never joined: the command does not wait for the network.
+                drop(statsai::pricing_refresh::spawn_background_refresh(
+                    &store_path,
+                ));
+            }
             match command {
                 Command::Scan(command) => scan(command, &store, &device_id),
                 Command::Report(command) => report(command, &store),
@@ -73,6 +84,7 @@ pub(crate) fn run() -> Result<()> {
                 Command::Status => status(&store),
                 Command::Schema(_)
                 | Command::Store(_)
+                | Command::Pricing(_)
                 | Command::Doctor
                 | Command::Auth(_)
                 | Command::Service(_)
@@ -96,6 +108,12 @@ pub(crate) fn command_reprices_persisted_usage(command: &Command) -> bool {
             | Command::Sync(_)
             | Command::Daemon(_)
     )
+}
+
+/// Whether a command starts a background pricing refresh once its store is
+/// open: `scan` and every `sync`. The watch daemon runs its own refresher.
+pub(crate) fn command_starts_pricing_refresh(command: &Command) -> bool {
+    matches!(command, Command::Scan(_) | Command::Sync(_))
 }
 
 /// Whether a command scans into the store and so must hold the scan lock.

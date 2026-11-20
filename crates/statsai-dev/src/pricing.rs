@@ -7,27 +7,16 @@
 //! a format the build cannot read does.
 
 use anyhow::{bail, Result};
-use statsai_store::DatabasePricingState;
+use statsai_store::{DatabasePricingState, PricingRefreshState};
 
-/// The environment variable that turns the pricing refresh off. Forwarded builds
-/// inherit it from `statsai-dev`'s own environment, so both read the same value.
-const PRICING_REFRESH_ENV: &str = "STATSAI_PRICING_REFRESH";
-
-/// True when `STATSAI_PRICING_REFRESH` turns the pricing refresh off.
-pub(crate) fn refresh_disabled_by_env() -> bool {
-    std::env::var(PRICING_REFRESH_ENV).is_ok_and(|value| refresh_value_disables(&value))
-}
-
-fn refresh_value_disables(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "0" | "off" | "false" | "no"
-    )
-}
+/// True when `STATSAI_PRICING_REFRESH` turns the pricing refresh off. Forwarded
+/// builds inherit the variable from `statsai-dev`'s own environment, and both
+/// read it with this same function.
+pub(crate) use statsai_store::refresh_disabled_by_env;
 
 /// Whether a build that reads pricing files would use `store`'s stored copy.
 pub(crate) fn refresh_on(store: &DatabasePricingState, refresh_disabled_by_env: bool) -> bool {
-    !refresh_disabled_by_env && store.refresh_setting_on
+    PricingRefreshState::resolve(refresh_disabled_by_env, store.refresh_setting_on).is_on()
 }
 
 /// The pricing version the selected build would price `store` with.
@@ -83,11 +72,13 @@ mod tests {
 
     #[test]
     fn the_refresh_variable_accepts_the_usual_spellings_of_off() {
+        // `refresh_disabled_by_env` reads the variable with this function, the
+        // one every StatsAI binary uses.
         for value in ["0", "off", "OFF", " false ", "No", "no\n"] {
-            assert!(refresh_value_disables(value), "{value:?}");
+            assert!(statsai_store::refresh_value_disables(value), "{value:?}");
         }
         for value in ["", "1", "on", "true", "yes", "disabled", "of f"] {
-            assert!(!refresh_value_disables(value), "{value:?}");
+            assert!(!statsai_store::refresh_value_disables(value), "{value:?}");
         }
     }
 

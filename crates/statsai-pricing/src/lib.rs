@@ -34,7 +34,7 @@ pub use normalize::{
 };
 pub use table::{
     active_pricing, embedded_pricing, embedded_pricing_text, install_pricing,
-    refresh_disabled_by_env, PricingTable, PRICING_REFRESH_ENV,
+    refresh_disabled_by_env, refresh_value_disables, PricingTable, PRICING_REFRESH_ENV,
 };
 
 #[cfg(test)]

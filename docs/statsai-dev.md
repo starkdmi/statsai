@@ -384,6 +384,10 @@ statsai-dev service uninstall
 development daemon support requires a separate label, endpoint, token, store,
 and log layout and is intentionally outside v1.
 
+Under `env prod`, `statsai-dev pricing refresh` and `statsai-dev pricing
+auto-refresh` are refused as well, because they write production's pricing
+state; they run under `env dev` and `env local`.
+
 ## Inspect state
 
 ```sh

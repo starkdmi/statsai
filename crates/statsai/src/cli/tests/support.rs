@@ -476,3 +476,44 @@ pub(super) fn test_unattributed_quota_record(source_id: &str) -> QuotaObservatio
         raw_rate_limits: json!({}),
     }
 }
+
+/// A server on 127.0.0.1 that answers one request for a pricing file with
+/// `status`, `body` and `etag`, then stops.
+pub(super) struct PricingFileServer {
+    pub(super) url: String,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl PricingFileServer {
+    pub(super) fn start(status: u16, body: String, etag: Option<&'static str>) -> Self {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind pricing server");
+        let address = server.server_addr().to_ip().expect("ip address");
+        let url = format!("http://{address}/crates/statsai-pricing/pricing.json");
+        let thread = std::thread::spawn(move || {
+            let Ok(Some(request)) = server.recv_timeout(StdDuration::from_secs(10)) else {
+                return;
+            };
+            let mut response = tiny_http::Response::from_string(body).with_status_code(status);
+            if let Some(etag) = etag {
+                response
+                    .add_header(tiny_http::Header::from_bytes("ETag", etag).expect("etag header"));
+            }
+            let _ = request.respond(response);
+        });
+        Self { url, thread }
+    }
+
+    /// Waits until the one reply was sent.
+    pub(super) fn finish(self) {
+        self.thread.join().expect("pricing server thread");
+    }
+}
+
+/// The embedded pricing file at `version`, with `edit` applied.
+pub(super) fn pricing_file_at(version: u64, edit: impl FnOnce(&mut Value)) -> String {
+    let mut file: Value = serde_json::from_str(statsai_store::embedded_pricing().source_text())
+        .expect("embedded pricing json");
+    file["version"] = json!(version);
+    edit(&mut file);
+    serde_json::to_string_pretty(&file).expect("serialize pricing file")
+}

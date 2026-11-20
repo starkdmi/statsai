@@ -15,8 +15,8 @@ use statsai_core::{
 use statsai_store::{
     find_existing_provider_account, gone_scan_files, reconcile_verified_source_state,
     try_acquire_scan_lock, upsert_provider_account, verified_source_observation_hash,
-    ActivityPersistMode, ActivityScanCursor, ScanFileReplacement, ScanFileStateEntry, Store,
-    UpsertProviderAccountInput,
+    ActivityPersistMode, ActivityScanCursor, PricingRefreshState, ScanFileReplacement,
+    ScanFileStateEntry, Store, UnsupportedPricingFormat, UpsertProviderAccountInput,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -134,6 +134,53 @@ fn requeue_background_scan(
         .unwrap_or_else(|error| error.into_inner())
         .restore_failed(notice);
     let _ = signal.try_send(());
+}
+
+/// Brings the store's estimates to the newest pricing this process can use
+/// before a scan pass, so a pricing file a refresh stored since the last pass
+/// reprices the store and prices what the pass scans.
+///
+/// Returns whether the pass may scan. A stored pricing file whose format this
+/// binary cannot read skips the pass and keeps the daemon running; it is said
+/// once while it lasts, tracked in `last_unsupported`. Any other error fails
+/// the pass so it is retried.
+pub(super) fn bring_pricing_up_to_date(
+    store: &Store,
+    last_unsupported: &mut Option<UnsupportedPricingFormat>,
+) -> Result<bool> {
+    let refresh = store
+        .pricing_refresh_state()
+        .context("read the pricing refresh state")?;
+    bring_pricing_up_to_date_with(store, refresh, last_unsupported, &mut |line| {
+        eprintln!("{line}");
+    })
+}
+
+pub(super) fn bring_pricing_up_to_date_with(
+    store: &Store,
+    refresh: PricingRefreshState,
+    last_unsupported: &mut Option<UnsupportedPricingFormat>,
+    report: &mut dyn FnMut(String),
+) -> Result<bool> {
+    match store.ensure_current_pricing_with(refresh) {
+        Ok(repricing) => {
+            *last_unsupported = None;
+            if repricing.did_work() {
+                report(format!("daemon: {repricing}"));
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            let Some(unsupported) = error.downcast_ref::<UnsupportedPricingFormat>() else {
+                return Err(error.context("bring pricing up to date before the scan"));
+            };
+            if last_unsupported.as_ref() != Some(unsupported) {
+                report(format!("daemon: not scanning: {unsupported}"));
+                *last_unsupported = Some(*unsupported);
+            }
+            Ok(false)
+        }
+    }
 }
 
 pub(super) fn rescan_changed_sources(

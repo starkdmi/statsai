@@ -274,7 +274,10 @@ pub fn refresh_disabled_by_env() -> bool {
         .is_some_and(|value| value.to_str().is_some_and(refresh_value_disables))
 }
 
-pub(crate) fn refresh_value_disables(value: &str) -> bool {
+/// True when `value`, a value of `STATSAI_PRICING_REFRESH`, turns the refresh
+/// off: `0`, `off`, `false` or `no`, trimmed and in any case.
+#[must_use]
+pub fn refresh_value_disables(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "0" | "off" | "false" | "no"

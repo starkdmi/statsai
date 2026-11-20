@@ -174,8 +174,14 @@ pub fn database_pricing_state(path: impl AsRef<Path>) -> Result<Option<DatabaseP
         applied_version: parse_applied_pricing_ruleset_value(applied.as_deref())?,
         stored_file: stored_file.flatten(),
         stored_file_unreadable: stored_file.is_some_and(|header| header.is_none()),
-        refresh_setting_on: refresh.as_deref() != Some("off"),
+        refresh_setting_on: pricing_refresh_setting_is_on(refresh.as_deref()),
     }))
+}
+
+/// Whether a `pricing.refresh` setting value leaves the refresh on: only `off`
+/// turns it off, and an absent setting means on.
+pub(crate) fn pricing_refresh_setting_is_on(value: Option<&str>) -> bool {
+    value != Some("off")
 }
 
 /// Reads the integer `format` and `version` of a stored pricing file, ignoring

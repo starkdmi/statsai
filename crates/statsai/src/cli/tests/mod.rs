@@ -6,6 +6,7 @@ mod args;
 mod conversation;
 mod format;
 mod import;
+mod pricing;
 mod quota;
 mod report;
 mod scan;

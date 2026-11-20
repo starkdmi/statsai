@@ -85,6 +85,7 @@ fn describe_status(status: ExitStatus) -> String {
 
 pub(crate) fn forward(paths: &Paths, state: &State, arguments: &[OsString]) -> Result<ExitCode> {
     validate_forward_arguments(arguments)?;
+    validate_forward_for_environment(arguments, state.environment)?;
     let (selected, installed) = selected_installed_build(paths, state)?;
 
     let _data_lock = paths.lock_data_shared()?;
@@ -288,6 +289,33 @@ fn validate_forward_arguments(arguments: &[OsString]) -> Result<()> {
     }
 }
 
+/// Refuses commands that exist only to change a store's pricing state when the
+/// store is production's: `statsai pricing refresh` fetches and stores a pricing
+/// file and reprices, and `statsai pricing auto-refresh` changes production's
+/// refresh setting. Both run under `env dev` and `env local`.
+fn validate_forward_for_environment(
+    arguments: &[OsString],
+    environment: Environment,
+) -> Result<()> {
+    if !matches!(environment, Environment::Prod) {
+        return Ok(());
+    }
+    let semantic_arguments = without_global_device_id(arguments)?;
+    let mut words = semantic_arguments
+        .iter()
+        .map(|argument| argument.to_str())
+        .filter(|argument| !argument.is_some_and(|value| value.starts_with('-')));
+    if words.next() != Some(Some("pricing")) {
+        return Ok(());
+    }
+    match words.next().flatten() {
+        Some(subcommand @ ("refresh" | "auto-refresh")) => bail!(
+            "`statsai pricing {subcommand}` is disabled in the prod environment because it changes production's pricing state; run it under `statsai-dev env dev`, or with the released `statsai`"
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn without_global_device_id(arguments: &[OsString]) -> Result<Vec<&OsStr>> {
     let mut semantic = Vec::with_capacity(arguments.len());
     let mut index = 0;
@@ -415,6 +443,41 @@ mod tests {
             "uninstall"
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn pricing_commands_that_change_pricing_state_are_blocked_under_prod_only() {
+        for forwarded in [
+            &["pricing", "refresh"][..],
+            &["pricing", "auto-refresh", "off"][..],
+            &["pricing", "auto-refresh", "on"][..],
+            &["--device-id", "development", "pricing", "refresh"][..],
+            &["pricing", "--device-id=development", "auto-refresh", "on"][..],
+        ] {
+            let error = validate_forward_for_environment(&arguments(forwarded), Environment::Prod)
+                .expect_err("prod must refuse a command that changes its pricing state");
+            assert!(
+                error.to_string().contains("prod environment"),
+                "{forwarded:?}: {error}"
+            );
+            for environment in [Environment::Dev, Environment::Local] {
+                assert!(
+                    validate_forward_for_environment(&arguments(forwarded), environment).is_ok(),
+                    "{forwarded:?} under {environment:?}"
+                );
+            }
+        }
+        for forwarded in [
+            &["pricing", "status"][..],
+            &["pricing", "status", "--json"][..],
+            &["report", "monthly"][..],
+            &["store", "supported-pricing-format"][..],
+        ] {
+            assert!(
+                validate_forward_for_environment(&arguments(forwarded), Environment::Prod).is_ok(),
+                "{forwarded:?}"
+            );
+        }
     }
 
     #[test]

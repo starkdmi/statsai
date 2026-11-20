@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod pricing_refresh;
 pub mod privacy;
 pub mod privacy_cli;
 pub mod service;
@@ -28,7 +29,11 @@ pub use statsai_store::{
 };
 
 /// Opens a store for a command that reads or publishes price-derived data and
-/// applies the compiled pricing ruleset first.
+/// first reprices it with the newest pricing file this process can use: the
+/// embedded file, or the store's newer copy while the pricing refresh is on.
+///
+/// A store priced with a newer version is used as it is. A store whose stored
+/// pricing file has a format this binary cannot read is refused.
 pub fn open_operational_store(path: &Path) -> Result<Store> {
     let store = Store::open(path)?;
     let report = store.ensure_current_pricing()?;
@@ -36,8 +41,11 @@ pub fn open_operational_store(path: &Path) -> Result<Store> {
     Ok(store)
 }
 
+/// Prints a report that repriced the store. A store that was already current,
+/// or already priced with a newer version, is not worth a line on every
+/// command.
 pub fn log_repricing_report(report: &RepricingReport) {
-    if !report.already_current {
+    if !report.already_current && report.store_ahead.is_none() {
         eprintln!("{report}");
     }
 }
@@ -412,25 +420,81 @@ mod tests {
     }
 
     #[test]
-    fn open_operational_store_refuses_a_newer_pricing_ruleset() {
+    fn open_operational_store_uses_a_store_at_a_newer_pricing_version_unchanged() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("statsai.sqlite");
         let store = Store::open(&path).expect("create store");
         store
             .set_metadata_value(statsai_store::APPLIED_PRICING_RULESET_VERSION_KEY, "99")
             .expect("future ruleset");
+        store
+            .set_metadata_value(statsai_store::APPLIED_PRICING_CATALOG_VERSION_KEY, "future")
+            .expect("future catalog");
         drop(store);
 
-        let error = match open_operational_store(&path) {
-            Ok(_) => panic!("forward pricing must refuse"),
-            Err(error) => error,
-        };
-        assert!(error
-            .to_string()
-            .contains("pricing ruleset version 99 is newer than this StatsAI binary supports"));
+        let store = open_operational_store(&path).expect("a newer store is used, not refused");
+        assert_eq!(
+            store.applied_pricing_ruleset_version().expect("applied"),
+            Some(99)
+        );
+        assert_eq!(
+            store
+                .metadata_value(statsai_store::APPLIED_PRICING_CATALOG_VERSION_KEY)
+                .expect("catalog"),
+            Some("future".to_string())
+        );
+        assert_eq!(
+            store
+                .metadata_value(statsai_store::STORED_PRICING_FILE_KEY)
+                .expect("stored file"),
+            None
+        );
+        drop(store);
         assert_eq!(
             statsai_store::database_applied_pricing_ruleset_version(&path).expect("unchanged"),
             Some(99)
+        );
+    }
+
+    #[test]
+    fn open_operational_store_refuses_a_stored_pricing_file_in_an_unknown_format() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("statsai.sqlite");
+        let future = r#"{"format": 2, "version": 99, "models": {}}"#;
+        let store = Store::open(&path).expect("create store");
+        store
+            .set_metadata_value(statsai_store::STORED_PRICING_FILE_KEY, future)
+            .expect("future pricing file");
+        drop(store);
+
+        let error = match open_operational_store(&path) {
+            Ok(_) => panic!("an unknown pricing file format must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "this store's prices come from pricing file format 2, which this StatsAI binary cannot read (it reads format {}); upgrade StatsAI",
+                statsai_store::PRICING_FORMAT
+            )
+        );
+        let state = statsai_store::database_pricing_state(&path)
+            .expect("read pricing state")
+            .expect("store exists");
+        assert_eq!(state.applied_version, None);
+        assert_eq!(
+            state.stored_file,
+            Some(statsai_store::StoredPricingFileHeader {
+                format: 2,
+                version: 99
+            })
+        );
+        let store = Store::open(&path).expect("reopen");
+        assert_eq!(
+            store
+                .metadata_value(statsai_store::STORED_PRICING_FILE_KEY)
+                .expect("stored file"),
+            Some(future.to_string())
         );
     }
 

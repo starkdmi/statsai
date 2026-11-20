@@ -8,6 +8,7 @@ pub(super) mod daemon;
 mod dispatch;
 pub(super) mod format;
 pub(super) mod import;
+pub(super) mod pricing;
 pub(super) mod quota;
 pub(super) mod report;
 pub(super) mod scan;
@@ -32,6 +33,7 @@ pub(crate) use dispatch::*;
 #[cfg(test)]
 pub(crate) use format::*;
 pub(crate) use import::*;
+pub(crate) use pricing::*;
 pub(crate) use quota::*;
 pub(crate) use report::*;
 pub(crate) use scan::*;

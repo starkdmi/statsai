@@ -20,6 +20,7 @@ Commands:
   sync          Export a sync batch to a sink
   schema        Print JSON schemas for backend-facing contracts
   store         Manage the local SQLite store
+  pricing       Inspect and refresh the pricing file used for cost estimates
   daemon        Start the loopback API daemon
   status        Show stored event and token counts
   doctor        Check environment and source paths
@@ -1180,7 +1181,8 @@ Usage: statsai store [OPTIONS] <COMMAND>
 Commands:
   clone-to                           Create a consistent APFS clone of the SQLite store
   supported-schema-version           Print the store schema version supported by this binary
-  supported-pricing-ruleset-version  Print the pricing ruleset version supported by this binary
+  supported-pricing-ruleset-version  Print the version of the pricing file built into this binary
+  supported-pricing-format           Print the newest pricing file format this binary reads
   migrate                            Migrate the store to this binary's schema and apply its pricing ruleset
   help                               Print this message or the help of the given subcommand(s)
 
@@ -1210,9 +1212,18 @@ Options:
       --device-id <DEVICE_ID>  Device identifier for multi-device sync
   -h, --help                   Print help
 ===== statsai store supported-pricing-ruleset-version --help =====
-Print the pricing ruleset version supported by this binary
+Print the version of the pricing file built into this binary
 
 Usage: statsai store supported-pricing-ruleset-version [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai store supported-pricing-format --help =====
+Print the newest pricing file format this binary reads
+
+Usage: statsai store supported-pricing-format [OPTIONS]
 
 Options:
       --store <STORE>          Path to SQLite store
@@ -1222,6 +1233,52 @@ Options:
 Migrate the store to this binary's schema and apply its pricing ruleset
 
 Usage: statsai store migrate [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai pricing --help =====
+Inspect and refresh the pricing file used for cost estimates
+
+Usage: statsai pricing [OPTIONS] <COMMAND>
+
+Commands:
+  status        Show the pricing files this binary and the store hold, and the refresh state
+  refresh       Fetch the pricing file from GitHub now, ignoring the daily schedule, and reprice the store with it
+  auto-refresh  Turn the daily pricing refresh on or off for this store
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai pricing status --help =====
+Show the pricing files this binary and the store hold, and the refresh state
+
+Usage: statsai pricing status [OPTIONS]
+
+Options:
+      --json                   Output as JSON
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai pricing refresh --help =====
+Fetch the pricing file from GitHub now, ignoring the daily schedule, and reprice the store with it
+
+Usage: statsai pricing refresh [OPTIONS]
+
+Options:
+      --store <STORE>          Path to SQLite store
+      --device-id <DEVICE_ID>  Device identifier for multi-device sync
+  -h, --help                   Print help
+===== statsai pricing auto-refresh --help =====
+Turn the daily pricing refresh on or off for this store
+
+Usage: statsai pricing auto-refresh [OPTIONS] <STATE>
+
+Arguments:
+  <STATE>  Whether StatsAI refreshes the pricing file for this store [possible values: on, off]
 
 Options:
       --store <STORE>          Path to SQLite store

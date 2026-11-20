@@ -2,8 +2,9 @@
 
 use super::{
     configure_read_cache, migrations::existing_schema_version, snapshot, ActivityStatus,
-    CacheReportQuery, QuotaQuery, QuotaStatus, SessionFilter, SessionSort, SessionStats, Store,
-    SyncState, WeeklyResetAnchor, CURRENT_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT,
+    CacheReportQuery, PricingFileHeader, PricingTable, QuotaQuery, QuotaStatus, SessionFilter,
+    SessionSort, SessionStats, Store, SyncState, WeeklyResetAnchor, CURRENT_SCHEMA_VERSION,
+    SQLITE_BUSY_TIMEOUT, STORED_PRICING_FILE_KEY,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -222,6 +223,21 @@ impl ReadStore {
     /// writer such as `statsai scan` next opens the store.
     pub fn applied_pricing_ruleset_version(&self) -> Result<Option<u64>> {
         self.read(|store| store.applied_pricing_ruleset_version())
+    }
+
+    /// The `format` and `version` of the pricing file kept in the store.
+    ///
+    /// `None` when no file is stored, or when the stored copy's `format` and
+    /// `version` cannot be read; binaries ignore such a copy. Only the header
+    /// is read, so a format this binary cannot parse is still reported.
+    pub fn stored_pricing_header(&self) -> Result<Option<PricingFileHeader>> {
+        let text = self.read(|store| store.metadata_value(STORED_PRICING_FILE_KEY))?;
+        Ok(text.and_then(|text| PricingTable::header(&text).ok()))
+    }
+
+    /// The store's pricing refresh setting. See [`Store::pricing_refresh_setting`].
+    pub fn pricing_refresh_setting(&self) -> Result<bool> {
+        self.read(|store| store.pricing_refresh_setting())
     }
 
     pub fn event_count(&self) -> Result<u64> {
@@ -532,6 +548,46 @@ mod tests {
         assert!(
             !message.contains("open database read-only at"),
             "the snapshot open's context repeats the path: {message}"
+        );
+    }
+
+    #[test]
+    fn stored_pricing_header_reads_only_format_and_version() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("statsai.sqlite");
+        let writer = Store::open(&path).expect("create store");
+        let reader = Store::open_read_only(&path).expect("open read-only");
+        assert_eq!(
+            reader.stored_pricing_header().expect("nothing stored"),
+            None
+        );
+        assert!(reader.pricing_refresh_setting().expect("default setting"));
+
+        // A format this binary cannot parse is still reported by its header.
+        writer
+            .set_metadata_value(
+                STORED_PRICING_FILE_KEY,
+                r#"{"format": 2, "version": 99, "anything": "new"}"#,
+            )
+            .expect("store a future file");
+        writer
+            .set_pricing_refresh_setting(false)
+            .expect("turn the refresh off");
+        assert_eq!(
+            reader.stored_pricing_header().expect("future header"),
+            Some(PricingFileHeader {
+                format: 2,
+                version: 99
+            })
+        );
+        assert!(!reader.pricing_refresh_setting().expect("setting off"));
+
+        writer
+            .set_metadata_value(STORED_PRICING_FILE_KEY, "not json")
+            .expect("store garbage");
+        assert_eq!(
+            reader.stored_pricing_header().expect("unreadable header"),
+            None
         );
     }
 

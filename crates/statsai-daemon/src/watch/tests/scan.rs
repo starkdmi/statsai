@@ -155,6 +155,179 @@ fn a_background_scan_runs_without_a_scan_lock_it_cannot_use() {
     );
 }
 
+/// A GPT-5.5 event with one million input tokens and no estimate yet.
+fn unpriced_event(source: &SourceLocation) -> UsageEvent {
+    let at = Utc
+        .with_ymd_and_hms(2026, 9, 1, 12, 0, 0)
+        .single()
+        .expect("event time");
+    serde_json::from_value(serde_json::json!({
+        "schema_version": "usage_event.v1",
+        "event_id": "event-unpriced",
+        "device_id": "device-test",
+        "provider": "codex",
+        "source_id": source.source_id.clone(),
+        "provider_account_id": null,
+        "subscription_id": null,
+        "source": {
+            "adapter_id": "test",
+            "adapter_version": "0",
+            "source_kind": "local_adapter",
+            "location_origin": "configured",
+            "source_type": "jsonl",
+            "source_path_hash": null,
+            "source_record_id": "record-unpriced",
+            "parse_confidence": "high"
+        },
+        "session": {
+            "session_id": "session-unpriced",
+            "local_session_id_hash": null,
+            "title": null,
+            "started_at": at,
+            "ended_at": null,
+            "duration_seconds": null
+        },
+        "model": {
+            "name": "gpt-5.5",
+            "normalized_name": "gpt-5.5",
+            "provider_model_id": "gpt-5.5"
+        },
+        "usage": { "input_tokens": 1_000_000, "total_tokens": 1_000_000 },
+        "runtime": null,
+        "cost": {
+            "currency": "USD",
+            "estimated_api_equivalent_usd": null,
+            "provider_reported_usd": null,
+            "pricing_source": "unknown",
+            "pricing_version": null,
+            "confidence": "low"
+        },
+        "parse_evidence": null,
+        "project": null,
+        "git": null,
+        "privacy": {
+            "mode": "metadata_only",
+            "contains_prompt_text": false,
+            "contains_response_text": false,
+            "contains_file_paths": false
+        },
+        "created_at": at,
+        "imported_at": at
+    }))
+    .expect("event")
+}
+
+fn store_with_unpriced_event() -> Store {
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/statsai-watch-pricing"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    assert!(store
+        .insert_event(&unpriced_event(&source))
+        .expect("insert event"));
+    store
+}
+
+#[test]
+fn a_pass_reprices_the_store_before_it_scans() {
+    let store = store_with_unpriced_event();
+    let mut unsupported = None;
+    let mut lines = Vec::new();
+
+    // Nothing is stored, so the embedded file prices whatever the refresh.
+    let scan = bring_pricing_up_to_date_with(
+        &store,
+        statsai_store::PricingRefreshState::On,
+        &mut unsupported,
+        &mut |line| lines.push(line),
+    )
+    .expect("pricing");
+
+    assert!(scan);
+    let embedded = statsai_store::embedded_pricing();
+    assert_eq!(
+        store.applied_pricing_ruleset_version().expect("applied"),
+        Some(embedded.version())
+    );
+    let events = store.events().expect("events");
+    assert!(events[0].cost.estimated_api_equivalent_usd.is_some());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with(&format!(
+            "daemon: repriced store to pricing version {} ",
+            embedded.version()
+        )),
+        "{lines:?}"
+    );
+
+    // The next pass finds the store current and says nothing.
+    assert!(bring_pricing_up_to_date_with(
+        &store,
+        statsai_store::PricingRefreshState::On,
+        &mut unsupported,
+        &mut |line| lines.push(line),
+    )
+    .expect("pricing"));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+}
+
+#[test]
+fn a_store_whose_pricing_file_this_binary_cannot_read_skips_the_pass() {
+    let store = store_with_unpriced_event();
+    store
+        .set_metadata_value(
+            statsai_store::STORED_PRICING_FILE_KEY,
+            r#"{"format": 2, "version": 99}"#,
+        )
+        .expect("future pricing file");
+    let mut unsupported = None;
+    let mut lines = Vec::new();
+
+    for _ in 0..2 {
+        let scan = bring_pricing_up_to_date_with(
+            &store,
+            statsai_store::PricingRefreshState::On,
+            &mut unsupported,
+            &mut |line| lines.push(line),
+        )
+        .expect("a skipped pass, not a failed one");
+        assert!(!scan);
+    }
+
+    assert_eq!(lines.len(), 1, "said once while it lasts: {lines:?}");
+    assert!(
+        lines[0].starts_with(
+            "daemon: not scanning: this store's prices come from pricing file format 2"
+        ),
+        "{lines:?}"
+    );
+    assert!(lines[0].ends_with("upgrade StatsAI"), "{lines:?}");
+    assert_eq!(store.applied_pricing_ruleset_version().expect("meta"), None);
+    let events = store.events().expect("events");
+    assert!(events[0].cost.estimated_api_equivalent_usd.is_none());
+
+    // Once the store holds a file this binary reads, passes scan again.
+    store
+        .set_metadata_value(
+            statsai_store::STORED_PRICING_FILE_KEY,
+            statsai_store::embedded_pricing().source_text(),
+        )
+        .expect("readable pricing file");
+    assert!(bring_pricing_up_to_date_with(
+        &store,
+        statsai_store::PricingRefreshState::On,
+        &mut unsupported,
+        &mut |line| lines.push(line),
+    )
+    .expect("pricing"));
+    assert_eq!(unsupported, None);
+}
+
 pub(super) struct TestAdapter {
     pub(super) provider: &'static str,
     pub(super) verified_observation: VerifiedSourceObservation,

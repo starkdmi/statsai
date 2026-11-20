@@ -1,17 +1,21 @@
 //! Versioned automatic repricing of persisted normalized usage.
 
+mod source;
+
+pub use source::{PricingOffer, PricingRefreshState, StoredPricing, UnsupportedPricingFormat};
+
 use super::{is_daily_rollup_summary, summary_period_bounds, Store, SyncRollupBucketKey};
 use anyhow::Result;
 use rusqlite::params;
 use serde::de::DeserializeOwned;
 use statsai_core::{CostAccumulator, CostInfo, ModelInfo, UsageEvent, UsageSummary};
 use statsai_pricing::{
-    embedded_pricing, estimate_cost_at, estimate_priced_from_source_records,
-    model_with_refreshed_normalization, overlay_estimated_cost, pricing_changes_between,
-    unknown_cost,
+    active_pricing, estimate_priced_from_source_records, install_pricing, overlay_estimated_cost,
+    unknown_cost, PricingTable,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
 pub const APPLIED_PRICING_RULESET_VERSION_KEY: &str = "pricing.applied_ruleset_version";
 pub const APPLIED_PRICING_CATALOG_VERSION_KEY: &str = "pricing.applied_catalog_version";
@@ -20,9 +24,16 @@ const EVENT_PAGE_SIZE: usize = 256;
 const SUMMARY_PAGE_SIZE: usize = 128;
 const TASK_SPAN_PAGE_SIZE: usize = 128;
 
-/// Counts produced by one automatic pricing-ruleset application.
+/// What one application of a pricing table to a store did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RepricingReport {
+    /// The `version` of the pricing table that was applied.
+    pub version: u64,
+    /// That table's `catalog`.
+    pub catalog: String,
+    /// The higher version the store was already priced with, when it was.
+    /// Repricing never goes backward, so nothing changed.
+    pub store_ahead: Option<u64>,
     pub examined_events: u64,
     pub changed_events: u64,
     pub skipped_unreadable_events: u64,
@@ -33,10 +44,19 @@ pub struct RepricingReport {
     pub changed_task_spans: u64,
     pub skipped_unreadable_spans: u64,
     pub rebuilt_work_items: u64,
+    /// The store was already priced with this table's version.
     pub already_current: bool,
 }
 
 impl RepricingReport {
+    fn for_table(table: &PricingTable) -> Self {
+        Self {
+            version: table.version(),
+            catalog: table.catalog().to_string(),
+            ..Self::default()
+        }
+    }
+
     #[must_use]
     pub fn did_work(&self) -> bool {
         self.changed_events > 0
@@ -49,20 +69,25 @@ impl RepricingReport {
 
 impl fmt::Display for RepricingReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let pricing = embedded_pricing();
+        if let Some(applied) = self.store_ahead {
+            return write!(
+                formatter,
+                "store already priced with pricing version {applied}; this binary prices with {} and does not reprice backward",
+                self.version
+            );
+        }
         if self.already_current {
             return write!(
                 formatter,
-                "pricing already at ruleset {} ({})",
-                pricing.version(),
-                pricing.catalog()
+                "pricing already at version {} ({})",
+                self.version, self.catalog
             );
         }
         write!(
             formatter,
-            "repriced store to ruleset {} ({}): examined_events={} changed_events={} skipped_unreadable_events={} changed_summaries={} refreshed_rollups={}",
-            pricing.version(),
-            pricing.catalog(),
+            "repriced store to pricing version {} ({}): examined_events={} changed_events={} skipped_unreadable_events={} changed_summaries={} refreshed_rollups={}",
+            self.version,
+            self.catalog,
             self.examined_events,
             self.changed_events,
             self.skipped_unreadable_events,
@@ -84,14 +109,36 @@ impl fmt::Display for RepricingReport {
 }
 
 impl Store {
-    /// Ensures persisted estimated prices match this binary's pricing ruleset.
+    /// Brings persisted estimated prices to the newest pricing this process
+    /// can use with this store, and makes that table the process's active
+    /// table. The refresh state comes from [`Store::pricing_refresh_state`].
     ///
     /// This is not called from [`Store::open`]. The selected StatsAI binary
     /// owns the decision so development launchers compiled against a different
     /// catalog cannot reprice a store they did not select.
     pub fn ensure_current_pricing(&self) -> Result<RepricingReport> {
-        let pricing = embedded_pricing();
-        self.ensure_pricing_ruleset(pricing.version(), pricing.catalog())
+        self.ensure_current_pricing_with(self.pricing_refresh_state()?)
+    }
+
+    /// [`Store::ensure_current_pricing`] with an explicit refresh state:
+    /// resolves the table ([`Store::current_pricing_table_with`]), installs it
+    /// as the process's active table, and applies it to the store
+    /// ([`Store::apply_pricing_table`]).
+    ///
+    /// The table is installed first, so the rollups the repricing rebuilds
+    /// derive their cache figures from the same prices.
+    ///
+    /// # Errors
+    ///
+    /// Refuses, changing nothing, when the store keeps a pricing file whose
+    /// format this binary cannot read.
+    pub fn ensure_current_pricing_with(
+        &self,
+        refresh: PricingRefreshState,
+    ) -> Result<RepricingReport> {
+        let table = self.current_pricing_table_with(refresh)?;
+        install_pricing(Arc::clone(&table));
+        self.apply_pricing_table(&table)
     }
 
     /// Returns the last successfully applied pricing ruleset, if recorded.
@@ -102,62 +149,67 @@ impl Store {
         )
     }
 
-    pub(crate) fn ensure_pricing_ruleset(
-        &self,
-        current_ruleset: u64,
-        catalog_version: &str,
-    ) -> Result<RepricingReport> {
-        match self.applied_pricing_ruleset_version()? {
-            Some(applied) if applied > current_ruleset => {
-                return Err(forward_pricing_version_error(applied, current_ruleset));
-            }
-            Some(applied) if applied == current_ruleset => {
-                return Ok(RepricingReport {
-                    already_current: true,
-                    ..RepricingReport::default()
-                });
-            }
-            _ => {}
+    /// Reprices the store's estimates with `table` when the store was last
+    /// priced with a lower version, or never.
+    ///
+    /// Events, summaries, sync rollups (changed ones are marked dirty for the
+    /// next incremental sync), session rollups and task spans are repriced in
+    /// one transaction that also records the table's version and catalog.
+    /// When the table is newer than the store's pricing file, or the store has
+    /// no usable one, its text becomes the store's pricing file, so other
+    /// binaries sharing the store price with it too.
+    ///
+    /// A store already at the table's version is left alone. So is a store
+    /// priced with a higher version: repricing never goes backward, and the
+    /// report says so in [`RepricingReport::store_ahead`].
+    ///
+    /// This does not change the process's active table.
+    pub fn apply_pricing_table(&self, table: &Arc<PricingTable>) -> Result<RepricingReport> {
+        if let Some(report) = self.settled_pricing_report(table)? {
+            return Ok(report);
         }
 
         self.with_immediate_transaction(|| {
-            match self.applied_pricing_ruleset_version()? {
-                Some(applied) if applied > current_ruleset => {
-                    return Err(forward_pricing_version_error(applied, current_ruleset));
-                }
-                Some(applied) if applied == current_ruleset => {
-                    return Ok(RepricingReport {
-                        already_current: true,
-                        ..RepricingReport::default()
-                    });
-                }
-                _ => {}
+            if let Some(report) = self.settled_pricing_report(table)? {
+                return Ok(report);
             }
 
-            let mut report = RepricingReport::default();
+            let mut report = RepricingReport::for_table(table);
             let mut dirty_keys = BTreeSet::new();
             let mut session_ids = BTreeSet::new();
 
-            self.reprice_events_in_tx(&mut report, &mut dirty_keys, &mut session_ids)?;
-            self.reprice_summaries_in_tx(&mut report)?;
+            self.reprice_events_in_tx(table, &mut report, &mut dirty_keys, &mut session_ids)?;
+            self.reprice_summaries_in_tx(table, &mut report)?;
             report.refreshed_rollups = self.refresh_sync_rollups_for_keys_counted(&dirty_keys)?;
             self.refresh_session_rollups_for_keys(&session_ids)?;
             self.reprice_task_spans_in_tx(&mut report)?;
 
             self.set_metadata_value(
                 APPLIED_PRICING_RULESET_VERSION_KEY,
-                &current_ruleset.to_string(),
+                &table.version().to_string(),
             )?;
-            self.set_metadata_value(APPLIED_PRICING_CATALOG_VERSION_KEY, catalog_version)?;
+            self.set_metadata_value(APPLIED_PRICING_CATALOG_VERSION_KEY, table.catalog())?;
+            self.store_pricing_file_if_newer(table)?;
             Ok(report)
         })
     }
-}
 
-fn forward_pricing_version_error(applied: u64, supported: u64) -> anyhow::Error {
-    anyhow::anyhow!(
-        "database pricing ruleset version {applied} is newer than this StatsAI binary supports ({supported}); upgrade StatsAI or use a compatible database"
-    )
+    /// The report for a store that `table` would not change: one already at
+    /// its version, or one priced with a higher version.
+    fn settled_pricing_report(&self, table: &PricingTable) -> Result<Option<RepricingReport>> {
+        let applied = self.applied_pricing_ruleset_version()?;
+        Ok(match applied {
+            Some(applied) if applied > table.version() => Some(RepricingReport {
+                store_ahead: Some(applied),
+                ..RepricingReport::for_table(table)
+            }),
+            Some(applied) if applied == table.version() => Some(RepricingReport {
+                already_current: true,
+                ..RepricingReport::for_table(table)
+            }),
+            _ => None,
+        })
+    }
 }
 
 struct RepricePage<T> {
@@ -191,6 +243,7 @@ fn decode_id_payload_page<T: DeserializeOwned>(
 impl Store {
     fn reprice_events_in_tx(
         &self,
+        table: &PricingTable,
         report: &mut RepricingReport,
         dirty_keys: &mut BTreeSet<SyncRollupBucketKey>,
         session_ids: &mut BTreeSet<String>,
@@ -206,7 +259,7 @@ impl Store {
             for event in page.items {
                 report.examined_events += 1;
                 maybe_fail_after_event_writes(report.changed_events)?;
-                if let Some(updated) = reprice_event(&event) {
+                if let Some(updated) = reprice_event(table, &event) {
                     dirty_keys.insert(self.update_event_cost_payload(&updated)?);
                     session_ids.insert(updated.session.session_id.clone());
                     report.changed_events += 1;
@@ -243,7 +296,11 @@ impl Store {
         }
     }
 
-    fn reprice_summaries_in_tx(&self, report: &mut RepricingReport) -> Result<()> {
+    fn reprice_summaries_in_tx(
+        &self,
+        table: &PricingTable,
+        report: &mut RepricingReport,
+    ) -> Result<()> {
         let mut after: Option<String> = None;
         loop {
             let page = self.summary_page_after(after.as_deref(), SUMMARY_PAGE_SIZE)?;
@@ -257,7 +314,7 @@ impl Store {
                 if is_daily_rollup_summary(&summary) {
                     continue;
                 }
-                if let Some(updated) = reprice_summary(&summary) {
+                if let Some(updated) = reprice_summary(table, &summary) {
                     self.upsert_summary(&updated)?;
                     report.changed_summaries += 1;
                 }
@@ -427,12 +484,15 @@ fn estimated_cost_for_loaded_events(
     Some((estimated.cents_rounded(), estimated.micro_usd()))
 }
 
-fn reprice_event(event: &UsageEvent) -> Option<UsageEvent> {
+fn reprice_event(table: &PricingTable, event: &UsageEvent) -> Option<UsageEvent> {
     // The stored `normalized_name` caches a derivation of the observed name, so
     // a ruleset that teaches the normalizer a new model leaves it stale. It
     // feeds grouping as well as pricing, so refresh it here rather than only
     // working around it at lookup time.
-    let model = event.model.as_ref().map(model_with_refreshed_normalization);
+    let model = event
+        .model
+        .as_ref()
+        .map(|model| table.model_with_refreshed_normalization(model));
     let usage = usage_without_stale_request_count(event);
     // An adapter that priced from per-request rows beat what this event's
     // aggregate can express, so only the model normalization is refreshed here.
@@ -440,7 +500,7 @@ fn reprice_event(event: &UsageEvent) -> Option<UsageEvent> {
     let cost = if estimate_priced_from_source_records(&event.cost) {
         event.cost.clone()
     } else {
-        let estimated = estimate_cost_at(
+        let estimated = table.estimate_cost_at(
             &event.provider,
             model.as_ref(),
             &usage,
@@ -480,7 +540,7 @@ fn usage_without_stale_request_count(event: &UsageEvent) -> statsai_core::UsageC
     usage
 }
 
-/// Overlays this binary's estimated pricing onto a summary.
+/// Overlays the process's active pricing onto a summary.
 ///
 /// Daily rollups are left unchanged. Returns the original summary when
 /// estimated fields already match.
@@ -489,24 +549,26 @@ pub fn apply_current_estimated_pricing(summary: UsageSummary) -> UsageSummary {
     if is_daily_rollup_summary(&summary) {
         return summary;
     }
-    reprice_summary(&summary).unwrap_or(summary)
+    reprice_summary(&active_pricing(), &summary).unwrap_or(summary)
 }
 
-fn reprice_summary(summary: &UsageSummary) -> Option<UsageSummary> {
+fn reprice_summary(table: &PricingTable, summary: &UsageSummary) -> Option<UsageSummary> {
     let (period_start, period_end) = summary_period_bounds(summary);
-    let pricing_at = summary.period_end.unwrap_or(summary.observed_at);
     let mut updated = summary.clone();
     let mut changed = clear_stats_cache_request_counts(&mut updated);
+    let pricing = SummaryPricing {
+        table,
+        provider: &summary.provider,
+        period_start: period_start.date_naive(),
+        period_end: period_end.date_naive(),
+        pricing_at: summary.period_end.unwrap_or(summary.observed_at),
+    };
 
     if !updated.models.is_empty() {
         for model_usage in &mut updated.models {
-            let next = estimated_summary_cost(
-                &updated.provider,
+            let next = pricing.estimated_cost(
                 Some(&model_usage.model),
                 &model_usage.usage,
-                period_start.date_naive(),
-                period_end.date_naive(),
-                pricing_at,
                 &model_usage.cost,
             );
             if next != model_usage.cost {
@@ -516,15 +578,7 @@ fn reprice_summary(summary: &UsageSummary) -> Option<UsageSummary> {
         }
     }
 
-    let next = estimated_summary_cost(
-        &updated.provider,
-        updated.model.as_ref(),
-        &updated.usage,
-        period_start.date_naive(),
-        period_end.date_naive(),
-        pricing_at,
-        &updated.cost,
-    );
+    let next = pricing.estimated_cost(updated.model.as_ref(), &updated.usage, &updated.cost);
     if next != updated.cost {
         updated.cost = next;
         changed = true;
@@ -548,38 +602,47 @@ fn clear_stats_cache_request_counts(summary: &mut UsageSummary) -> bool {
     changed
 }
 
-fn estimated_summary_cost(
-    provider: &str,
-    model: Option<&ModelInfo>,
-    usage: &statsai_core::UsageCounts,
+/// How one summary's estimates are priced: with which table, for which
+/// provider, over which period.
+struct SummaryPricing<'a> {
+    table: &'a PricingTable,
+    provider: &'a str,
     period_start: chrono::NaiveDate,
     period_end: chrono::NaiveDate,
     pricing_at: chrono::DateTime<chrono::Utc>,
-    existing: &CostInfo,
-) -> CostInfo {
-    // An adapter that priced from per-request records beat what this aggregate
-    // can express, so recomputing here would replace a better number with a
-    // worse one. Left untouched, including its catalog version: the estimate
-    // really was produced under that catalog, and a rescan is what refreshes it.
-    if estimate_priced_from_source_records(existing) {
-        return existing.clone();
-    }
-    let estimated = if summary_crosses_pricing_boundary(model, period_start, period_end) {
-        unknown_cost()
-    } else {
-        estimate_cost_at(provider, model, usage, &pricing_at)
-    };
-    overlay_estimated_cost(existing, estimated)
 }
 
-fn summary_crosses_pricing_boundary(
-    model: Option<&ModelInfo>,
-    period_start: chrono::NaiveDate,
-    period_end: chrono::NaiveDate,
-) -> bool {
-    model_pricing_names(model)
-        .into_iter()
-        .any(|name| pricing_changes_between(&name, period_start, period_end))
+impl SummaryPricing<'_> {
+    fn estimated_cost(
+        &self,
+        model: Option<&ModelInfo>,
+        usage: &statsai_core::UsageCounts,
+        existing: &CostInfo,
+    ) -> CostInfo {
+        // An adapter that priced from per-request records beat what this aggregate
+        // can express, so recomputing here would replace a better number with a
+        // worse one. Left untouched, including its catalog version: the estimate
+        // really was produced under that catalog, and a rescan is what refreshes it.
+        if estimate_priced_from_source_records(existing) {
+            return existing.clone();
+        }
+        let estimated = if self.crosses_pricing_boundary(model) {
+            unknown_cost()
+        } else {
+            self.table
+                .estimate_cost_at(self.provider, model, usage, &self.pricing_at)
+        };
+        overlay_estimated_cost(existing, estimated)
+    }
+
+    /// Whether the table changes this model's price inside the period, so the
+    /// aggregate's tokens cannot be split between the rates.
+    fn crosses_pricing_boundary(&self, model: Option<&ModelInfo>) -> bool {
+        model_pricing_names(model).into_iter().any(|name| {
+            self.table
+                .pricing_changes_between(&name, self.period_start, self.period_end)
+        })
+    }
 }
 
 fn model_pricing_names(model: Option<&ModelInfo>) -> Vec<String> {

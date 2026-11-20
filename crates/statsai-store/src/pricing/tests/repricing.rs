@@ -312,7 +312,7 @@ fn changed_sync_rollups_are_refreshed_and_marked_dirty() {
 }
 
 #[test]
-fn older_ruleset_refuses_a_newer_store_and_does_not_mutate_it() {
+fn an_older_pricing_version_leaves_a_newer_store_unchanged() {
     let (store, source) = store_with_source("/tmp/codex-forward-pricing");
     let started_at = parse_utc("2026-07-29T12:00:00Z");
     let event = test_event(
@@ -333,13 +333,21 @@ fn older_ruleset_refuses_a_newer_store_and_does_not_mutate_it() {
     let payload_before =
         serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize");
 
-    let error = store
-        .ensure_pricing_ruleset(1, embedded_pricing().catalog())
-        .expect_err("forward pricing must refuse");
+    let report = store
+        .apply_pricing_table(&embedded_pricing())
+        .expect("a newer store is used, not refused");
 
-    assert!(error
-        .to_string()
-        .contains("pricing ruleset version 99 is newer than this StatsAI binary supports (1)"));
+    assert_eq!(report.store_ahead, Some(99));
+    assert!(!report.already_current);
+    assert!(!report.did_work());
+    assert_eq!(report.examined_events, 0);
+    assert_eq!(
+        report.to_string(),
+        format!(
+            "store already priced with pricing version 99; this binary prices with {} and does not reprice backward",
+            embedded_pricing().version()
+        )
+    );
     assert_eq!(
         serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize"),
         payload_before
@@ -347,6 +355,12 @@ fn older_ruleset_refuses_a_newer_store_and_does_not_mutate_it() {
     assert_eq!(
         store.applied_pricing_ruleset_version().expect("unchanged"),
         Some(99)
+    );
+    assert_eq!(
+        store
+            .metadata_value(APPLIED_PRICING_CATALOG_VERSION_KEY)
+            .expect("catalog"),
+        Some("future".to_string())
     );
 }
 

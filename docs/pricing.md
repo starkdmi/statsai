@@ -201,8 +201,10 @@ taking new files from `main` until they upgrade. Raise `format` only together
 with the code that reads it.
 
 A binary refuses a store whose stored file has a format it cannot read, and
-asks you to upgrade. It never refuses a store because its file has a newer
-`version`; it uses that file.
+asks you to upgrade, whether or not the refresh is on. Commands that use
+price-derived data stop with that message, and the watch daemon skips its scan
+passes until the store holds a file it can read. It never refuses a store
+because its file has a newer `version`; it uses that file.
 
 ## Editing the file
 
@@ -256,31 +258,61 @@ scripts/check-pricing-file.sh origin/main
 
 ## How clients refresh
 
-- `statsai scan`, `statsai sync` and the watch daemon start a refresh on a
-  background thread when one is due. The command never waits for it; a scan
-  never waits on the network. The daemon checks hourly whether one is due.
+- `statsai scan` and `statsai sync` (every mode) start a refresh on a
+  background thread, with its own connection to the store, once the store is
+  open. The command never waits for it; a scan never waits on the network. If
+  the command finishes first, the attempt ends with it and is retried once the
+  10-minute claim below runs out.
+- The watch daemon (`statsai daemon --watch`) starts a refresher thread that
+  checks every hour whether a refresh is due.
 - A refresh is due at most once a day per store: when the last check is at
-  least 24 hours old and no attempt started in the last 10 minutes.
-- The request sends the stored ETag, so an unchanged file costs a `304` and no
-  body. It times out after 10 seconds and reads at most 1 MiB. A failed attempt
+  least 24 hours old and no attempt started in the last 10 minutes. A check or
+  attempt time more than that far in the future, left by a clock that was set
+  wrong, counts as absent. The schedule lives in the store's metadata, so every
+  process sharing a store shares it:
+  - `pricing.refresh.attempt_at` is written before the request, which keeps
+    other processes from fetching at the same time;
+  - `pricing.refresh.checked_at` is written after every completed attempt,
+    whatever its result;
+  - `pricing.refresh.etag` holds the `ETag` of the last file that was stored
+    or was not newer.
+- The request is a `GET` with `User-Agent: statsai/<version>` and, when an
+  `ETag` is stored, `If-None-Match`, so an unchanged file costs a `304` and no
+  body. It times out after 10 seconds overall, connecting and reading
+  included, and reads at most 1 MiB. Any status other than `200` and `304` is a
+  failure. Only `https` URLs are fetched; `STATSAI_PRICING_URL` may also be a
+  plain `http` URL to `127.0.0.1` or `localhost`, for testing. A failed attempt
   counts as the day's check; `statsai pricing refresh` tries again at once.
 - A fetched file is adopted only when it parses and passes validation (so no
   rate is negative or out of bounds), its `format` is one the binary reads, and
   its `version` is higher than any copy the process already has.
 - An adopted file is stored in the SQLite store under the `pricing.file`
-  metadata key.
+  metadata key. Only a valid file of a known format with a higher `version`
+  than the stored copy replaces it. A stored copy that is invalid in a format
+  the binary reads is ignored with a warning, and the next file stored
+  replaces it.
 - Every command uses the newest copy it can read: the file embedded in the
   binary or the stored copy, whichever has the higher `version`. When a binary
   reprices the store with an embedded file newer than the stored copy, it also
   stores its embedded file, so older binaries sharing the store use it.
 - The next command that uses price-derived data reprices stored estimates with
-  the newer version. Changed rollups are marked dirty, so the next incremental
+  the newer version, and so does the watch daemon before its next scan pass.
+  Changed rollups are marked dirty, so the next incremental
   `statsai sync --sink http` uploads the corrected costs. Neither `--full`,
   `--rebuild-rollups` nor a raw rescan is needed. Provider-reported costs are
   never replaced.
 - Repricing never goes backward. When the store was last repriced with a higher
   version than the copy a binary uses, that binary leaves the stored estimates
   as they are.
+- Commands that open the store without repricing it, such as
+  `statsai quota` and `statsai status`, use the newest copy they can read for
+  any estimate they make.
+- A background refresh is silent unless it stores a file. Then it prints one
+  line to stderr:
+  `pricing: stored pricing file version N from GitHub; it applies the next time prices are read`.
+  The daemon logs
+  `daemon: pricing: stored pricing file version N from GitHub; it applies at the next scan pass`,
+  and logs a refused file or a failed request, at most once per daily check.
 
 ## Turning the refresh off
 
@@ -303,17 +335,49 @@ their costs come from the embedded file.
 ## Commands
 
 ```sh
-statsai pricing status              # the pricing file in use and the refresh state
+statsai pricing status              # the pricing files, the refresh state and the last check
+statsai pricing status --json
 statsai pricing refresh             # fetch now, ignoring the daily schedule
 statsai pricing auto-refresh off    # or on
 ```
 
-`statsai pricing refresh` refuses when the refresh is off. When it adopts a
-file, it reprices the store immediately.
+`statsai pricing status` reports:
+
+- the embedded file's version, format and catalog;
+- the stored copy's version, format and catalog, or that there is none, that
+  it is unreadable and ignored, or that its format is one this binary cannot
+  read;
+- the version and catalog the store's estimates were last repriced with;
+- the version price-derived commands use, and whether it is the embedded file
+  or the stored copy, or that they refuse the store because of an unknown
+  format;
+- whether the refresh is on, and if not, whether the store's setting or
+  `STATSAI_PRICING_REFRESH` turned it off;
+- when the last check completed and the last attempt started;
+- whether an `ETag` is stored, and the URL the refresh fetches.
+
+It works on a store whose stored copy has an unknown format.
+
+`statsai pricing refresh` fetches the file at once, even when a check ran in
+the last day. When the refresh is off it refuses and exits non-zero, naming
+the cause: run `statsai pricing auto-refresh on` for the setting, or unset
+`STATSAI_PRICING_REFRESH` for the variable. When it stores a newer file, it
+reprices the store immediately and prints the repricing report. When the file
+is unchanged or not newer, it brings the store's estimates to the newest
+version it can use and prints `Pricing is current at version N`. A refused file
+or a failed request prints the reason and exits non-zero.
+
+`statsai pricing auto-refresh on|off` sets the store's `pricing.refresh`
+setting and says what it means. When `STATSAI_PRICING_REFRESH` turns the
+refresh off for the process, it says that the variable overrides the setting.
+
+Under `statsai-dev env prod`, `statsai-dev pricing refresh` and
+`statsai-dev pricing auto-refresh` are refused, because they change
+production's pricing state. They run under `env dev` and `env local`.
 
 `statsai store supported-pricing-format` prints the newest format the binary
 reads. `statsai store supported-pricing-ruleset-version` prints the `version`
-of the embedded file.
+of the embedded file. Neither opens a store.
 
 ## What stays in Rust
 

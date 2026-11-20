@@ -81,7 +81,8 @@ pub use activity::{
 };
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use pricing::{
-    apply_current_estimated_pricing, RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY,
+    apply_current_estimated_pricing, PricingOffer, PricingRefreshState, RepricingReport,
+    StoredPricing, UnsupportedPricingFormat, APPLIED_PRICING_CATALOG_VERSION_KEY,
     APPLIED_PRICING_RULESET_VERSION_KEY,
 };
 pub use project_identity::LocationIdentities;
@@ -97,8 +98,9 @@ pub use snapshot::{
     PRICING_REFRESH_SETTING_KEY, STORED_PRICING_FILE_KEY,
 };
 pub use statsai_pricing::{
-    active_pricing, embedded_pricing, install_pricing, PricingFileError, PricingFileHeader,
-    PricingTable, PRICING_FORMAT,
+    active_pricing, embedded_pricing, install_pricing, refresh_disabled_by_env,
+    refresh_value_disables, PricingFileError, PricingFileHeader, PricingTable, PRICING_FORMAT,
+    PRICING_REFRESH_ENV,
 };
 use std::time::Duration;
 

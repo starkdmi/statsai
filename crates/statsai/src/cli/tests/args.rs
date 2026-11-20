@@ -98,6 +98,82 @@ fn supported_pricing_ruleset_version_is_available_without_opening_a_store() {
 }
 
 #[test]
+fn supported_pricing_format_is_available_without_opening_a_store() {
+    let cli = Cli::try_parse_from(["statsai", "store", "supported-pricing-format"])
+        .expect("parse supported pricing format query");
+
+    assert!(matches!(
+        cli.command,
+        Command::Store(StoreAdminCommand {
+            command: StoreAdminSubcommand::SupportedPricingFormat,
+        })
+    ));
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store_path = directory.path().join("must-not-be-created.sqlite");
+    store_admin(
+        StoreAdminCommand {
+            command: StoreAdminSubcommand::SupportedPricingFormat,
+        },
+        &store_path,
+    )
+    .expect("print supported pricing format");
+    assert!(!store_path.exists());
+}
+
+#[test]
+fn pricing_commands_parse() {
+    let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+
+    assert!(matches!(
+        parse(&["statsai", "pricing", "status"]),
+        Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::Status { json: false }
+        }))
+    ));
+    assert!(matches!(
+        parse(&["statsai", "pricing", "status", "--json"]),
+        Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::Status { json: true }
+        }))
+    ));
+    assert!(matches!(
+        parse(&["statsai", "pricing", "refresh"]),
+        Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::Refresh
+        }))
+    ));
+    for (word, state) in [("on", OnOff::On), ("off", OnOff::Off)] {
+        let Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::AutoRefresh { state: parsed },
+        })) = parse(&["statsai", "pricing", "auto-refresh", word])
+        else {
+            panic!("auto-refresh {word} must parse");
+        };
+        assert_eq!(parsed, state);
+    }
+    assert!(parse(&["statsai", "pricing", "auto-refresh"]).is_err());
+    assert!(parse(&["statsai", "pricing", "auto-refresh", "sometimes"]).is_err());
+}
+
+#[test]
+fn scan_and_every_sync_start_a_background_pricing_refresh() {
+    let starts = |args: &[&str]| {
+        let cli = Cli::try_parse_from(args).expect("parse");
+        command_starts_pricing_refresh(&cli.command)
+    };
+    assert!(starts(&["statsai", "scan"]));
+    assert!(starts(&["statsai", "scan", "--preview"]));
+    assert!(starts(&["statsai", "sync"]));
+    assert!(starts(&["statsai", "sync", "--sink", "http"]));
+    assert!(starts(&["statsai", "sync", "--status"]));
+    assert!(!starts(&["statsai", "report", "monthly"]));
+    assert!(!starts(&["statsai", "status"]));
+    assert!(!starts(&["statsai", "daemon", "--watch"]));
+    assert!(!starts(&["statsai", "pricing", "status"]));
+}
+
+#[test]
 fn price_derived_commands_reprice_and_diagnostic_commands_do_not() {
     let reprice = |args: &[&str]| {
         let cli = Cli::try_parse_from(args).expect("parse");

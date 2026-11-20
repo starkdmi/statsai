@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 mod account;
 mod activity;
+mod pricing;
 mod quota;
 mod report;
 mod scan;
@@ -16,6 +17,7 @@ mod task;
 
 pub(crate) use account::*;
 pub(crate) use activity::*;
+pub(crate) use pricing::*;
 pub(crate) use quota::*;
 pub(crate) use report::*;
 pub(crate) use scan::*;
@@ -76,6 +78,8 @@ pub(crate) enum Command {
     Schema(SchemaCommand),
     #[command(about = "Manage the local SQLite store")]
     Store(StoreAdminCommand),
+    #[command(about = "Inspect and refresh the pricing file used for cost estimates")]
+    Pricing(PricingCommand),
     #[command(about = "Start the loopback API daemon")]
     Daemon(DaemonCommand),
     #[command(about = "Show stored event and token counts")]
@@ -276,8 +280,10 @@ pub(crate) enum StoreAdminSubcommand {
     },
     #[command(about = "Print the store schema version supported by this binary")]
     SupportedSchemaVersion,
-    #[command(about = "Print the pricing ruleset version supported by this binary")]
+    #[command(about = "Print the version of the pricing file built into this binary")]
     SupportedPricingRulesetVersion,
+    #[command(about = "Print the newest pricing file format this binary reads")]
+    SupportedPricingFormat,
     #[command(about = "Migrate the store to this binary's schema and apply its pricing ruleset")]
     Migrate,
 }

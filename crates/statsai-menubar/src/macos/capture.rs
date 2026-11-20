@@ -10,7 +10,13 @@ use std::time::{Duration, Instant};
 
 fn statsai_command(binary: &Path) -> Command {
     let mut command = Command::new(binary);
-    for key in ["STATSAI_API_URL", "STATSAI_WEB_URL", "STATSAI_SYNC_TOKEN"] {
+    for key in [
+        "STATSAI_API_URL",
+        "STATSAI_WEB_URL",
+        "STATSAI_SYNC_TOKEN",
+        "STATSAI_PRICING_REFRESH",
+        "STATSAI_PRICING_URL",
+    ] {
         if let Ok(value) = std::env::var(key) {
             command.env(key, value);
         }
