@@ -4,6 +4,7 @@ mod accounts;
 mod cache;
 mod dedupe;
 mod events;
+mod metadata;
 mod open;
 mod project_identity;
 mod rollups;

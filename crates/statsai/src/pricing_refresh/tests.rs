@@ -557,18 +557,134 @@ fn a_failed_fetch_still_counts_as_the_days_check() {
 }
 
 #[test]
+fn a_claim_lets_exactly_one_of_two_processes_that_found_the_refresh_due_through() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("statsai.sqlite");
+    let first = Store::open(&path).expect("first connection");
+    let second = Store::open(&path).expect("second connection");
+    let earlier = (now() - hours(30)).to_rfc3339();
+    first
+        .set_metadata_value(ATTEMPT_AT_KEY, &earlier)
+        .expect("attempt_at");
+
+    // Both read the same schedule and find the refresh due before either
+    // claims it.
+    let read_by_first = RefreshSchedule::read(&first).expect("first schedule");
+    let read_by_second = RefreshSchedule::read(&second).expect("second schedule");
+    assert_eq!(read_by_first, read_by_second);
+    assert!(read_by_first.is_due(now()));
+
+    let first_stamp = now().to_rfc3339();
+    let second_stamp = (now() + TimeDelta::seconds(1)).to_rfc3339();
+    assert!(read_by_first
+        .claim(&first, &first_stamp)
+        .expect("first claim"));
+    assert!(!read_by_second
+        .claim(&second, &second_stamp)
+        .expect("second claim"));
+    assert_eq!(
+        second.metadata_value(ATTEMPT_AT_KEY).expect("attempt_at"),
+        Some(first_stamp)
+    );
+}
+
+#[test]
+fn an_unreadable_attempt_time_is_claimed_from_the_text_stored() {
+    let store = store();
+    store
+        .set_metadata_value(ATTEMPT_AT_KEY, "yesterday")
+        .expect("attempt_at");
+    let schedule = RefreshSchedule::read(&store).expect("schedule");
+    assert!(schedule.is_due(now()));
+
+    assert!(schedule.claim(&store, &now().to_rfc3339()).expect("claim"));
+    assert_eq!(bookkeeping(&store).attempt_at, Some(now()));
+}
+
+#[test]
+fn of_several_processes_refreshing_at_once_exactly_one_fetches() {
+    const PROCESSES: usize = 6;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("statsai.sqlite");
+    drop(Store::open(&path).expect("create store"));
+    // One reply, then the server stops: a second request would fail rather
+    // than be not due.
+    let server = TestServer::start(vec![Reply::status(304)]);
+    let barrier = std::sync::Barrier::new(PROCESSES);
+
+    let outcomes = thread::scope(|scope| {
+        let handles: Vec<_> = (0..PROCESSES)
+            .map(|_| {
+                scope.spawn(|| {
+                    let store = Store::open(&path).expect("own connection");
+                    barrier.wait();
+                    refresh(&store, &server.url, false)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("refresh thread"))
+            .collect::<Vec<_>>()
+    });
+
+    assert_eq!(server.requests().len(), 1);
+    let fetched = outcomes
+        .iter()
+        .filter(|outcome| **outcome != RefreshOutcome::NotDue)
+        .collect::<Vec<_>>();
+    assert_eq!(fetched, [&RefreshOutcome::NotModified], "{outcomes:?}");
+}
+
+#[test]
+fn a_scan_starts_a_background_refresh_only_when_one_is_on_and_due() {
+    let fresh = store();
+    assert!(background_refresh_wanted(&fresh, false, now()).expect("wanted"));
+    assert!(!background_refresh_wanted(&fresh, true, now()).expect("wanted"));
+    assert_eq!(
+        bookkeeping(&fresh),
+        RefreshBookkeeping::default(),
+        "deciding claims nothing; the process it starts claims"
+    );
+
+    let off = store();
+    off.set_pricing_refresh_setting(false).expect("setting");
+    assert!(!background_refresh_wanted(&off, false, now()).expect("wanted"));
+
+    let checked_recently = store();
+    checked_recently
+        .set_metadata_value(CHECKED_AT_KEY, &(now() - hours(1)).to_rfc3339())
+        .expect("checked_at");
+    assert!(!background_refresh_wanted(&checked_recently, false, now()).expect("wanted"));
+
+    let attempt_running = store();
+    attempt_running
+        .set_metadata_value(ATTEMPT_AT_KEY, &(now() - minutes(5)).to_rfc3339())
+        .expect("attempt_at");
+    assert!(!background_refresh_wanted(&attempt_running, false, now()).expect("wanted"));
+
+    let due_again = store();
+    due_again
+        .set_metadata_value(CHECKED_AT_KEY, &(now() - hours(25)).to_rfc3339())
+        .expect("checked_at");
+    due_again
+        .set_metadata_value(ATTEMPT_AT_KEY, &(now() - minutes(11)).to_rfc3339())
+        .expect("attempt_at");
+    assert!(background_refresh_wanted(&due_again, false, now()).expect("wanted"));
+}
+
+#[test]
 fn a_background_refresh_turned_off_by_the_environment_opens_nothing() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("statsai.sqlite");
 
-    let handle = spawn_background_refresh_with(
-        &path,
-        true,
-        UNREACHABLE_URL.to_string(),
-        Duration::from_secs(1),
-    );
+    let outcome = run_background_refresh_with(&path, true, UNREACHABLE_URL, Duration::from_secs(1))
+        .expect("background refresh");
 
-    assert!(handle.is_none());
+    assert_eq!(
+        outcome,
+        RefreshOutcome::Disabled(PricingRefreshState::OffByEnvironment)
+    );
     assert!(!path.exists());
 }
 
@@ -580,15 +696,26 @@ fn a_background_refresh_adopts_a_newer_file_on_its_own_connection() {
     let text = newer_pricing_text();
     let server = TestServer::start(vec![Reply::ok(text.clone(), Some("\"v2\""))]);
 
-    spawn_background_refresh_with(&path, false, server.url.clone(), Duration::from_secs(5))
-        .expect("background refresh started")
-        .join()
+    let outcome = run_background_refresh_with(&path, false, &server.url, Duration::from_secs(5))
         .expect("background refresh");
 
+    assert_eq!(
+        outcome,
+        RefreshOutcome::Adopted {
+            version: embedded_version() + 1
+        }
+    );
     server.requests();
     let store = Store::open(&path).expect("reopen");
     assert_eq!(stored_file(&store), Some(text));
     assert_eq!(bookkeeping(&store).etag.as_deref(), Some("\"v2\""));
+    // Adopting only stores the file; repricing is left to the next command.
+    assert_eq!(
+        store
+            .applied_pricing_ruleset_version()
+            .expect("applied version"),
+        None
+    );
 }
 
 #[test]
@@ -601,18 +728,39 @@ fn a_background_refresh_respects_the_stores_setting() {
         .expect("turn the refresh off");
     drop(store);
 
-    spawn_background_refresh_with(
-        &path,
-        false,
-        UNREACHABLE_URL.to_string(),
-        Duration::from_secs(1),
-    )
-    .expect("background refresh started")
-    .join()
-    .expect("background refresh");
+    let outcome =
+        run_background_refresh_with(&path, false, UNREACHABLE_URL, Duration::from_secs(1))
+            .expect("background refresh");
 
+    assert_eq!(
+        outcome,
+        RefreshOutcome::Disabled(PricingRefreshState::OffBySetting)
+    );
     let store = Store::open(&path).expect("reopen");
     assert_eq!(bookkeeping(&store), RefreshBookkeeping::default());
+}
+
+#[test]
+fn a_background_refresh_keeps_to_the_daily_schedule() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("statsai.sqlite");
+    let store = Store::open(&path).expect("create store");
+    let checked_at = (Utc::now() - hours(1)).to_rfc3339();
+    store
+        .set_metadata_value(CHECKED_AT_KEY, &checked_at)
+        .expect("checked_at");
+    drop(store);
+
+    let outcome =
+        run_background_refresh_with(&path, false, UNREACHABLE_URL, Duration::from_secs(1))
+            .expect("background refresh");
+
+    assert_eq!(outcome, RefreshOutcome::NotDue);
+    let store = Store::open(&path).expect("reopen");
+    assert_eq!(
+        store.metadata_value(ATTEMPT_AT_KEY).expect("attempt_at"),
+        None
+    );
 }
 
 #[test]

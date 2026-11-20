@@ -301,13 +301,31 @@ Run the same check locally before you push:
 scripts/check-pricing-file.sh origin/main
 ```
 
+A pricing pull request changes only `pricing.json`, so the tests must pass
+whatever periods it adds. A test must not assume that a model has no period
+after the ones it has today: one that prices at the current time, or on a day
+after the newest period, fails as soon as a new period starts. Take expected
+rates from the embedded table (`embedded_pricing().pricing_for_model_on(model,
+day)`), price on a past day inside an existing period, or build the test's own
+table. No CI job simulates such an edit; the simulation used to check the
+suite (append a period to every model and run the tests) is not part of CI.
+
 ## How clients refresh
 
-- `statsai scan` and `statsai sync` (every mode) start a refresh on a
-  background thread, with its own connection to the store, once the store is
-  open. The command never waits for it; a scan never waits on the network. If
-  the command finishes first, the attempt ends with it and is retried once the
-  10-minute claim below runs out.
+- `statsai scan` and `statsai sync` (every mode) check, once the store is
+  open, whether the refresh is on and due. Only then do they start a short
+  background process, `statsai pricing refresh --background` (a hidden mode of
+  `statsai pricing refresh`), with its own connection to the store. The
+  command never waits for it, so a scan never waits on the network, and the
+  process finishes its attempt even when the command exits first. It prints
+  nothing, always exits successfully, and never reprices: the next command
+  that reads prices uses a file it stored. It runs the same `statsai` binary
+  with the same environment, has no standard input or output, so a program
+  that reads the command's output is not held open by it, and runs in its own
+  process group (detached from the console on Windows), so a Ctrl-C that stops
+  the command does not stop it. It inherits no open file from the command, so
+  it holds neither the scan lock nor the command's store connection, and it
+  never starts another process.
 - The watch daemon (`statsai daemon --watch`) starts a refresher thread that
   checks every hour whether a refresh is due.
 - A refresh is due at most once a day per store: when the last check is at
@@ -316,7 +334,11 @@ scripts/check-pricing-file.sh origin/main
   wrong, counts as absent. The schedule lives in the store's metadata, so every
   process sharing a store shares it:
   - `pricing.refresh.attempt_at` is written before the request, which keeps
-    other processes from fetching at the same time;
+    other processes from fetching at the same time. The write is an atomic
+    compare-and-set from the value read when the refresh was found due, so of
+    several processes that find it due at once, exactly one claims the attempt
+    and fetches; the others skip it. `statsai pricing refresh` claims
+    unconditionally, since it ignores the schedule;
   - `pricing.refresh.checked_at` is written after every completed attempt,
     whatever its result;
   - `pricing.refresh.etag` holds the `ETag` of the last file that was stored
@@ -363,9 +385,8 @@ scripts/check-pricing-file.sh origin/main
 - Commands that open the store without repricing it, such as
   `statsai quota` and `statsai status`, use the newest copy they can read for
   any estimate they make.
-- A background refresh is silent unless it stores a file. Then it prints one
-  line to stderr:
-  `pricing: stored pricing file version N from GitHub; it applies the next time prices are read`.
+- The background refresh of `scan` and `sync` is silent, whatever its result;
+  `statsai pricing status` shows the stored file and when the last check ran.
   The daemon logs
   `daemon: pricing: stored pricing file version N from GitHub; it applies at the next scan pass`,
   and logs a refused file or a failed request, at most once per daily check.
@@ -393,7 +414,9 @@ Tests and `cargo run` started inside this repository run with the refresh off:
 [`.cargo/config.toml`](../.cargo/config.toml) sets
 `STATSAI_PRICING_REFRESH=off`. A value set in your shell, such as `on`, takes
 precedence, except in tests that start the `statsai` binary: they set
-`STATSAI_PRICING_REFRESH=off` on it themselves, so a test never fetches. The
+`STATSAI_PRICING_REFRESH=off` on it themselves, so a test never fetches from
+GitHub. The tests of the background refresh set it to `on` on the binary they
+start, with `STATSAI_PRICING_URL` pointing at a server on `127.0.0.1`. The
 desktop golden captures in statsai-ui also run with it off, so their costs come
 from the embedded file.
 

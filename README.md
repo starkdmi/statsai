@@ -598,13 +598,14 @@ values, and leaves cost unknown when a source does not prove the billable model.
 
 Prices live in a data file, `crates/statsai-pricing/pricing.json`, that every
 binary embeds. `scan`, `sync`, and the watch daemon also check the copy on
-`main` at most once a day, on a background thread that a scan never waits for,
-and save a newer copy in the local store. Every command prices with the newest
-copy it can read, embedded or stored. See [Pricing file](docs/pricing.md) for the
-format, the editing rules, and how to turn the refresh off
-(`statsai pricing auto-refresh off` or `STATSAI_PRICING_REFRESH=off`). With the
-refresh off, StatsAI prices with the embedded file, except that a store already
-priced with a newer stored copy keeps that copy.
+`main` at most once a day, in a short background process (a thread in the
+daemon) that a scan never waits for, and save a newer copy in the local store.
+Every command prices with the newest copy it can read, embedded or stored. See
+[Pricing file](docs/pricing.md) for the format, the editing rules, and how to
+turn the refresh off (`statsai pricing auto-refresh off` or
+`STATSAI_PRICING_REFRESH=off`). With the refresh off, StatsAI prices with the
+embedded file, except that a store already priced with a newer stored copy
+keeps that copy.
 
 Pricing updates are version-driven and automatic. The selected `statsai` binary
 reprices persisted normalized events when the pricing file it uses has a newer

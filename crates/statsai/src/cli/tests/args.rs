@@ -140,7 +140,15 @@ fn pricing_commands_parse() {
     assert!(matches!(
         parse(&["statsai", "pricing", "refresh"]),
         Ok(Command::Pricing(PricingCommand {
-            command: PricingSubcommand::Refresh
+            command: PricingSubcommand::Refresh { background: false }
+        }))
+    ));
+    let mut background = vec!["statsai", "--store", "statsai.sqlite"];
+    background.extend(statsai::pricing_refresh::BACKGROUND_REFRESH_ARGS);
+    assert!(matches!(
+        parse(&background),
+        Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::Refresh { background: true }
         }))
     ));
     for (word, state) in [("on", OnOff::On), ("off", OnOff::Off)] {
@@ -171,6 +179,10 @@ fn scan_and_every_sync_start_a_background_pricing_refresh() {
     assert!(!starts(&["statsai", "status"]));
     assert!(!starts(&["statsai", "daemon", "--watch"]));
     assert!(!starts(&["statsai", "pricing", "status"]));
+    // The process a scan or sync starts never starts another one.
+    let mut background = vec!["statsai", "--store", "statsai.sqlite"];
+    background.extend(statsai::pricing_refresh::BACKGROUND_REFRESH_ARGS);
+    assert!(!starts(&background));
 }
 
 #[test]

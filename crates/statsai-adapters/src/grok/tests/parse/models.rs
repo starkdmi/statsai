@@ -678,7 +678,12 @@ fn grok_inference_model_resolution_distinguishes_grok_4_7_fast_by_timestamp() {
     assert_eq!(standard.name.as_deref(), Some("grok-4.7"));
     assert_eq!(fast.name.as_deref(), Some("grok-4.7-build-fast"));
 
-    let standard_cost = statsai_pricing::estimate_cost(
+    // Priced on 2026-11-18, the catalog date of pricing version 7, so a later
+    // period in pricing.json leaves the expected costs as they are.
+    let catalog_day = DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+        .expect("catalog day")
+        .with_timezone(&Utc);
+    let standard_cost = statsai_pricing::estimate_cost_at(
         GROK_BUILD_PROVIDER,
         Some(&standard),
         &UsageCounts {
@@ -686,8 +691,9 @@ fn grok_inference_model_resolution_distinguishes_grok_4_7_fast_by_timestamp() {
             requests: Some(1),
             ..UsageCounts::default()
         },
+        &catalog_day,
     );
-    let fast_cost = statsai_pricing::estimate_cost(
+    let fast_cost = statsai_pricing::estimate_cost_at(
         GROK_BUILD_PROVIDER,
         Some(&fast),
         &UsageCounts {
@@ -695,6 +701,7 @@ fn grok_inference_model_resolution_distinguishes_grok_4_7_fast_by_timestamp() {
             requests: Some(1),
             ..UsageCounts::default()
         },
+        &catalog_day,
     );
 
     assert_eq!(

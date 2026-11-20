@@ -11,7 +11,15 @@
 //! The schedule is kept in the store's metadata, so every process sharing a
 //! store shares it: [`CHECKED_AT_KEY`] records the last completed attempt and
 //! [`ATTEMPT_AT_KEY`] the last started one, which keeps two processes from
-//! fetching at once for [`ATTEMPT_LEASE`]. See `docs/pricing.md`.
+//! fetching at once for [`ATTEMPT_LEASE`]. An attempt is claimed with a
+//! compare-and-set of [`ATTEMPT_AT_KEY`], so of two processes that find a
+//! refresh due at the same moment, only one fetches.
+//!
+//! `statsai scan` and `statsai sync` start a refresh that is due as a short,
+//! detached `statsai pricing refresh --background` process
+//! ([`start_background_refresh`]), so it finishes even when the command exits
+//! first. The watch daemon runs its own refresher thread
+//! ([`spawn_daemon_refresher`]). See `docs/pricing.md`.
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -20,6 +28,7 @@ use statsai_store::{
 };
 use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -220,11 +229,56 @@ impl RefreshBookkeeping {
 }
 
 fn stored_time(store: &Store, key: &str) -> Result<Option<DateTime<Utc>>> {
-    Ok(store.metadata_value(key)?.and_then(|value| {
-        DateTime::parse_from_rfc3339(value.trim())
-            .ok()
-            .map(|time| time.with_timezone(&Utc))
-    }))
+    Ok(store
+        .metadata_value(key)?
+        .as_deref()
+        .and_then(parse_stored_time))
+}
+
+fn parse_stored_time(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+/// The refresh schedule of a store as one process read it: what it decides
+/// whether a refresh is due from, and claims an attempt against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefreshSchedule {
+    /// The last completed attempt, if recorded and readable.
+    checked_at: Option<DateTime<Utc>>,
+    /// [`ATTEMPT_AT_KEY`] exactly as stored, readable or not. A claim
+    /// succeeds only while the store still holds this value.
+    attempt_at: Option<String>,
+}
+
+impl RefreshSchedule {
+    /// Reads both times from `store` at one point in time.
+    fn read(store: &Store) -> Result<Self> {
+        store.with_read_snapshot(|store| {
+            Ok(Self {
+                checked_at: stored_time(store, CHECKED_AT_KEY)?,
+                attempt_at: store.metadata_value(ATTEMPT_AT_KEY)?,
+            })
+        })
+    }
+
+    /// Whether a refresh is due at `now` ([`refresh_due`]). An unreadable
+    /// attempt time counts as absent.
+    fn is_due(&self, now: DateTime<Utc>) -> bool {
+        refresh_due(
+            now,
+            self.checked_at,
+            self.attempt_at.as_deref().and_then(parse_stored_time),
+        )
+    }
+
+    /// Claims an attempt by writing `stamp` to [`ATTEMPT_AT_KEY`], only if
+    /// it still holds the value this schedule read. Returns `false`, writing
+    /// nothing, when another process claimed an attempt since.
+    fn claim(&self, store: &Store, stamp: &str) -> Result<bool> {
+        store.compare_and_set_metadata_value(ATTEMPT_AT_KEY, self.attempt_at.as_deref(), stamp)
+    }
 }
 
 /// What one refresh did.
@@ -232,8 +286,9 @@ fn stored_time(store: &Store, key: &str) -> Result<Option<DateTime<Utc>>> {
 pub enum RefreshOutcome {
     /// The refresh is off, for the reason given. Nothing was fetched.
     Disabled(PricingRefreshState),
-    /// The last check is less than a day old, or another attempt started in
-    /// the last ten minutes. Nothing was fetched.
+    /// The last check is less than a day old, another attempt started in the
+    /// last ten minutes, or another process claimed this attempt first.
+    /// Nothing was fetched.
     NotDue,
     /// The file has not changed since the last check.
     NotModified,
@@ -260,6 +315,12 @@ pub enum RefreshOutcome {
 /// is kept only when the file was stored or was not newer, so a refused file
 /// is fetched again on the next check.
 ///
+/// The claim is a compare-and-set of [`ATTEMPT_AT_KEY`] from the value this
+/// call read when it found the refresh due
+/// ([`Store::compare_and_set_metadata_value`]), so when several processes
+/// find it due at once, one fetches and the others return
+/// [`RefreshOutcome::NotDue`]. A forced refresh claims unconditionally.
+///
 /// # Errors
 ///
 /// Only store errors. A failed request is [`RefreshOutcome::Failed`].
@@ -274,13 +335,17 @@ pub fn refresh_pricing_with(
     if !refresh.is_on() {
         return Ok(RefreshOutcome::Disabled(refresh));
     }
-    let bookkeeping = RefreshBookkeeping::read(store)?;
-    if !force && !refresh_due(now, bookkeeping.checked_at, bookkeeping.attempt_at) {
-        return Ok(RefreshOutcome::NotDue);
-    }
     let stamp = now.to_rfc3339();
-    store.set_metadata_value(ATTEMPT_AT_KEY, &stamp)?;
-    let outcome = match fetch_pricing_file(url, bookkeeping.etag.as_deref(), timeout) {
+    if force {
+        store.set_metadata_value(ATTEMPT_AT_KEY, &stamp)?;
+    } else {
+        let schedule = RefreshSchedule::read(store)?;
+        if !schedule.is_due(now) || !schedule.claim(store, &stamp)? {
+            return Ok(RefreshOutcome::NotDue);
+        }
+    }
+    let etag = RefreshBookkeeping::read(store)?.etag;
+    let outcome = match fetch_pricing_file(url, etag.as_deref(), timeout) {
         Err(error) => RefreshOutcome::Failed(format!("{error:#}")),
         Ok(FetchOutcome::NotModified) => RefreshOutcome::NotModified,
         Ok(FetchOutcome::Fetched { text, etag }) => {
@@ -324,60 +389,154 @@ pub fn refresh_pricing(store: &Store, now: DateTime<Utc>, force: bool) -> Result
     )
 }
 
-/// The one line printed when a background refresh stored a newer file.
-#[must_use]
-pub fn adopted_message(version: u64) -> String {
-    format!(
-        "pricing: stored pricing file version {version} from GitHub; it applies the next time prices are read"
-    )
+/// The arguments, after `--store=<path>`, of the process
+/// [`start_background_refresh`] starts: the hidden
+/// `statsai pricing refresh --background`, which does what
+/// [`run_background_refresh`] does.
+pub const BACKGROUND_REFRESH_ARGS: [&str; 3] = ["pricing", "refresh", "--background"];
+
+/// Whether `statsai scan` or `statsai sync` starts a background refresh for
+/// `store` at `now`: neither the environment (`disabled_by_env`) nor the
+/// store's setting turns the refresh off, and a refresh is due
+/// ([`refresh_due`]).
+///
+/// Only reads. The process it leads to claims the attempt, so a refresh that
+/// never starts holds no other process off.
+///
+/// # Errors
+///
+/// Only store errors.
+pub fn background_refresh_wanted(
+    store: &Store,
+    disabled_by_env: bool,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if disabled_by_env || !store.pricing_refresh_setting()? {
+        return Ok(false);
+    }
+    Ok(RefreshSchedule::read(store)?.is_due(now))
 }
 
-/// Starts a refresh on a background thread with its own connection to the
-/// store at `store_path`, for `statsai scan` and `statsai sync`.
+/// Starts a due refresh for `statsai scan` and `statsai sync`, and returns
+/// whether it started one.
 ///
-/// Returns `None`, opening nothing, when `STATSAI_PRICING_REFRESH` turns the
-/// refresh off. The caller does not wait for the thread: it ends with the
-/// process if the command finishes first, and the attempt it claimed is
-/// retried once the lease runs out. It prints one line, and only when it
-/// stored a newer file.
-pub fn spawn_background_refresh(store_path: &Path) -> Option<JoinHandle<()>> {
-    spawn_background_refresh_with(
+/// `store` is the command's open connection to the store at `store_path`. It
+/// is only read ([`background_refresh_wanted`]), so nothing starts when
+/// `STATSAI_PRICING_REFRESH` or the store's setting turns the refresh off, or
+/// no refresh is due. Otherwise it runs this binary again as
+/// `statsai --store=<store_path> pricing refresh --background`, a short
+/// process that claims the attempt, fetches, offers the file to the store and
+/// exits, printing nothing.
+///
+/// The command never waits for it, and it finishes even when the command
+/// exits first. It inherits the environment and the working directory. Its
+/// standard input, output and error are null, so a caller that reads the
+/// command's output until it closes, such as the menu bar or desktop app, is
+/// not held open by it. On Unix it runs in its own process group, so a Ctrl-C
+/// in the terminal, which signals the foreground group, does not stop it; on
+/// Windows it is detached from the console, in its own process group, and has
+/// no window. It inherits no open file: Rust opens files and SQLite opens the
+/// store close-on-exec, so it holds neither the command's scan lock nor its
+/// store connection. Failing to start it is silent.
+pub fn start_background_refresh(store: &Store, store_path: &Path) -> bool {
+    if !matches!(
+        background_refresh_wanted(store, refresh_disabled_by_env(), Utc::now()),
+        Ok(true)
+    ) {
+        return false;
+    }
+    let Ok(program) = std::env::current_exe() else {
+        return false;
+    };
+    spawn_background_refresh_process(&program, store_path).is_ok()
+}
+
+/// Spawns `program --store=<store_path> pricing refresh --background`,
+/// detached as [`start_background_refresh`] describes, and does not wait for
+/// it.
+fn spawn_background_refresh_process(program: &Path, store_path: &Path) -> std::io::Result<()> {
+    // `--store=<path>` in one argument, so a path that starts with `-` is not
+    // read as another option.
+    let mut store_argument = std::ffi::OsString::from("--store=");
+    store_argument.push(store_path);
+    let mut command = Command::new(program);
+    command
+        .arg(store_argument)
+        .args(BACKGROUND_REFRESH_ARGS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach_from_terminal(&mut command);
+    // Dropping the handle neither waits for the process nor stops it.
+    command.spawn().map(drop)
+}
+
+/// Its own process group: a Ctrl-C in the terminal signals only the
+/// foreground group, which the command that started it belongs to.
+#[cfg(unix)]
+fn detach_from_terminal(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+/// No console shared with the command, its own Ctrl-C group, and no window.
+#[cfg(windows)]
+fn detach_from_terminal(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    // The values of `windows_sys::Win32::System::Threading`'s constants,
+    // whose feature this crate does not enable.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn detach_from_terminal(_command: &mut Command) {}
+
+/// What `statsai pricing refresh --background` does: one refresh of the store
+/// at `store_path` on the daily schedule, on its own connection, with the
+/// environment's refresh state, [`pricing_url`] and [`FETCH_TIMEOUT`].
+///
+/// See [`run_background_refresh_with`].
+///
+/// # Errors
+///
+/// Only store errors, which the caller ignores.
+pub fn run_background_refresh(store_path: &Path) -> Result<RefreshOutcome> {
+    run_background_refresh_with(
         store_path,
         refresh_disabled_by_env(),
-        pricing_url(),
+        &pricing_url(),
         FETCH_TIMEOUT,
     )
 }
 
-/// [`spawn_background_refresh`] with the environment's answer, the URL and
-/// the timeout given.
-pub fn spawn_background_refresh_with(
+/// [`run_background_refresh`] with the environment's answer, the URL and the
+/// timeout given.
+///
+/// Opens nothing when `disabled_by_env` is set. Otherwise it opens the store,
+/// reads its setting, and runs [`refresh_pricing_with`] without `force`, so
+/// the daily schedule and the attempt claim hold. It prints nothing and never
+/// reprices: the next command that reads prices applies a file it stored.
+///
+/// # Errors
+///
+/// Only store errors.
+pub fn run_background_refresh_with(
     store_path: &Path,
     disabled_by_env: bool,
-    url: String,
+    url: &str,
     timeout: Duration,
-) -> Option<JoinHandle<()>> {
+) -> Result<RefreshOutcome> {
     if disabled_by_env {
-        return None;
+        return Ok(RefreshOutcome::Disabled(
+            PricingRefreshState::OffByEnvironment,
+        ));
     }
-    let store_path = store_path.to_path_buf();
-    std::thread::Builder::new()
-        .name("statsai-pricing-refresh".to_string())
-        .spawn(move || {
-            let Ok(store) = Store::open(&store_path) else {
-                return;
-            };
-            let Ok(setting_on) = store.pricing_refresh_setting() else {
-                return;
-            };
-            let refresh = PricingRefreshState::resolve(false, setting_on);
-            if let Ok(RefreshOutcome::Adopted { version }) =
-                refresh_pricing_with(&store, &url, Utc::now(), false, refresh, timeout)
-            {
-                eprintln!("{}", adopted_message(version));
-            }
-        })
-        .ok()
+    let store = Store::open(store_path)?;
+    let refresh = PricingRefreshState::resolve(false, store.pricing_refresh_setting()?);
+    refresh_pricing_with(&store, url, Utc::now(), false, refresh, timeout)
 }
 
 /// Starts the watch daemon's refresher: a detached thread that checks every

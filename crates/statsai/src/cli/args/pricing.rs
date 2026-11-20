@@ -18,7 +18,13 @@ pub(crate) enum PricingSubcommand {
     #[command(
         about = "Fetch the pricing file from GitHub now, ignoring the daily schedule, and reprice the store with it"
     )]
-    Refresh,
+    Refresh {
+        /// The process `statsai scan` and `statsai sync` start: refresh only
+        /// when due, print nothing, always succeed, and leave repricing to
+        /// the next command that reads prices.
+        #[arg(long, hide = true)]
+        background: bool,
+    },
     #[command(about = "Turn the daily pricing refresh on or off for this store")]
     AutoRefresh {
         #[arg(

@@ -870,6 +870,7 @@ fn incremental_http_sync_includes_repriced_passthrough_summaries_without_full() 
 #[test]
 fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
     use statsai::pricing_refresh::{refresh_pricing_with, RefreshOutcome};
+    use statsai_core::micro_usd_to_cents_rounded;
     use statsai_store::{embedded_pricing, PricingRefreshState};
 
     let store = Store::in_memory().expect("store");
@@ -916,8 +917,19 @@ fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
     store.insert_event(&event).expect("event");
     store.rebuild_sync_rollups().expect("rebuild");
 
-    // Priced with the embedded file: GPT-5.4 at 2.5 USD input and 15 USD
-    // output per million tokens.
+    // Priced with the embedded file's GPT-5.4 rates on that day: 2.5 USD
+    // input and 15 USD output per million tokens in pricing version 7. The
+    // event has a million tokens of each.
+    let embedded_rates = embedded_pricing()
+        .pricing_for_model_on("gpt-5.4", started_at.date_naive())
+        .expect("GPT-5.4 is priced");
+    let micro_usd = |input: f64, output: f64| {
+        (input * 1_000_000.0).round() as i64 + (output * 1_000_000.0).round() as i64
+    };
+    let embedded_micro_usd = micro_usd(
+        embedded_rates.input_per_million,
+        embedded_rates.output_per_million,
+    );
     let embedded_version = embedded_pricing().version();
     let report = store
         .ensure_current_pricing_with(PricingRefreshState::On)
@@ -938,13 +950,13 @@ fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
     assert_eq!(initial_batch.summaries.len(), 1);
     assert_eq!(
         initial_batch.summaries[0].cost.estimated_api_equivalent_usd,
-        Some(1_750)
+        Some(micro_usd_to_cents_rounded(embedded_micro_usd))
     );
     assert_eq!(
         initial_batch.summaries[0]
             .cost
             .estimated_api_equivalent_micro_usd,
-        Some(17_500_000)
+        Some(embedded_micro_usd)
     );
     record_rollup_sync_success(&store, "http", &target, &initial_batch)
         .expect("record initial sync");
@@ -952,8 +964,14 @@ fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
         build_sync_batch(&command, &store, "device", &target).expect("repeat batch");
     assert!(repeat_batch.summaries.is_empty());
 
-    // `main` publishes a newer file: from `raise_from`, GPT-5.4 costs 3 USD
-    // input and 18 USD output per million tokens.
+    // `main` publishes a newer file: from `raise_from`, every GPT-5.4 rate is
+    // 20% higher (3 USD input and 18 USD output in pricing version 7).
+    let raise = |rate: f64| (rate * 1.2 * 10_000.0).round() / 10_000.0;
+    let raised_micro_usd = micro_usd(
+        raise(embedded_rates.input_per_million),
+        raise(embedded_rates.output_per_million),
+    );
+    assert_ne!(raised_micro_usd, embedded_micro_usd);
     let newer = pricing_file_at(embedded_version + 1, |file| {
         file["catalog"] = json!("test:gpt-5.4-raise");
         file["models"]["gpt-5.4"]["prices"]
@@ -961,10 +979,10 @@ fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
             .expect("gpt-5.4 periods")
             .push(json!({
                 "from": raise_from.format("%Y-%m-%d").to_string(),
-                "input": 3,
-                "cache_write": 3,
-                "cache_read": 0.3,
-                "output": 18
+                "input": raise(embedded_rates.input_per_million),
+                "cache_write": raise(embedded_rates.cache_creation_per_million),
+                "cache_read": raise(embedded_rates.cached_input_per_million),
+                "output": raise(embedded_rates.output_per_million)
             }));
     });
     let server = PricingFileServer::start(200, newer, Some("\"v2\""));
@@ -1006,10 +1024,13 @@ fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
     assert_eq!(incremental_batch.summaries.len(), 1);
     let rollup = &incremental_batch.summaries[0];
     assert!(is_daily_rollup_summary(rollup));
-    assert_eq!(rollup.cost.estimated_api_equivalent_usd, Some(2_100));
+    assert_eq!(
+        rollup.cost.estimated_api_equivalent_usd,
+        Some(micro_usd_to_cents_rounded(raised_micro_usd))
+    );
     assert_eq!(
         rollup.cost.estimated_api_equivalent_micro_usd,
-        Some(21_000_000)
+        Some(raised_micro_usd)
     );
     let repriced = store
         .events()

@@ -45,18 +45,21 @@ fn raise_gpt_5_5_input(file: &mut Value) {
     }
 }
 
-/// The first day after every period `model` has in `file`, and no earlier
-/// than `at_least`. A period a test adds there keeps the model's periods in
-/// order whatever periods later edits to pricing.json give it.
+/// The first day after every standard and fast period `model` has in `file`,
+/// and no earlier than `at_least`. A period a test adds there keeps the
+/// model's periods in order, and `file` has no price change for the model on
+/// that day or later, whatever periods later edits to pricing.json give it.
 fn day_after_last_period(
     file: &Value,
     model: &str,
     at_least: chrono::NaiveDate,
 ) -> chrono::NaiveDate {
-    file["models"][model]["prices"]
-        .as_array()
-        .expect("periods")
-        .iter()
+    let entry = &file["models"][model];
+    assert!(entry["prices"].is_array(), "{model} has periods");
+    [&entry["prices"], &entry["fast"]["prices"]]
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
         .filter_map(|period| period["from"].as_str())
         .map(|from| {
             chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d").expect("period date")

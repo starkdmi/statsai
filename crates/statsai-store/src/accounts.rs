@@ -341,6 +341,33 @@ impl Store {
         Ok(())
     }
 
+    /// Sets the metadata value at `key` to `new` only when it is still
+    /// `expected` (`None`: absent), and returns whether it did.
+    ///
+    /// The read and the write run in one immediate transaction, so of several
+    /// connections, in any processes, that read the same value and try to
+    /// replace it, exactly one succeeds. Inside a transaction the caller
+    /// already holds, it joins that transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be started or committed, or
+    /// the value cannot be read or written.
+    pub fn compare_and_set_metadata_value(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        new: &str,
+    ) -> Result<bool> {
+        self.with_immediate_transaction(|| {
+            if self.metadata_value(key)?.as_deref() != expected {
+                return Ok(false);
+            }
+            self.set_metadata_value(key, new)?;
+            Ok(true)
+        })
+    }
+
     pub fn sync_preferences(&self) -> Result<SyncPreferences> {
         let include_projects = self
             .metadata_value(SYNC_INCLUDE_PROJECTS_METADATA_KEY)?

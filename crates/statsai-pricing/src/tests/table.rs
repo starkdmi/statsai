@@ -54,19 +54,27 @@ fn insert_period(value: &mut Value, model: &str, period: Value) {
     periods.insert(index, period);
 }
 
-/// The first day after every period `model` has in `value`, and no earlier
-/// than `at_least`. A period a test appends there keeps the model's periods
-/// in order whatever periods later edits to pricing.json give it.
-fn day_after_last_period(value: &Value, model: &str, at_least: NaiveDate) -> NaiveDate {
-    value["models"][model]["prices"]
+/// The dates of `periods` (a `prices`, `fast.prices` or `equivalents` list),
+/// or none when `periods` is absent.
+fn period_dates(periods: &Value) -> impl Iterator<Item = NaiveDate> + '_ {
+    periods
         .as_array()
-        .expect("prices")
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(|period| period["from"].as_str())
-        .map(|from| {
-            NaiveDate::parse_from_str(from, "%Y-%m-%d").expect("period date")
-                + chrono::Duration::days(1)
-        })
+        .map(|from| NaiveDate::parse_from_str(from, "%Y-%m-%d").expect("period date"))
+}
+
+/// The first day after every standard and fast period `model` has in
+/// `value`, and no earlier than `at_least`. A period a test appends there
+/// keeps the model's periods in order whatever periods later edits to
+/// pricing.json give it.
+fn day_after_last_period(value: &Value, model: &str, at_least: NaiveDate) -> NaiveDate {
+    let entry = &value["models"][model];
+    assert!(entry["prices"].is_array(), "{model} has prices");
+    period_dates(&entry["prices"])
+        .chain(period_dates(&entry["fast"]["prices"]))
+        .map(|from| from + chrono::Duration::days(1))
         .fold(at_least, NaiveDate::max)
 }
 
@@ -119,7 +127,12 @@ fn an_event_is_priced_with_the_last_period_starting_on_or_before_its_day() {
 #[test]
 fn a_middle_period_covers_the_days_up_to_the_next_start() {
     let mut value = embedded_json();
-    let middle = day_after_last_period(&value, "claude-opus-5", date(2027, 2, 1));
+    // The test's own periods for Claude Opus 5, so a period a later edit to
+    // pricing.json adds cannot change the rates it expects.
+    value["models"]["claude-opus-5"]["prices"] = json!([
+        { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 25 }
+    ]);
+    let middle = date(2027, 2, 1);
     let last = middle + chrono::Duration::days(28);
     append_period(
         &mut value,
@@ -152,13 +165,35 @@ fn an_appended_price_period_reprices_later_events_without_touching_the_global() 
     let mut value = embedded_json();
     value["version"] = json!(embedded_pricing().version() + 1);
     let boundary = day_after_last_period(&value, "claude-opus-5", date(2027, 1, 1));
+    let day_before = boundary - chrono::Duration::days(1);
+    // The embedded rates on the day before the boundary (5 USD input per
+    // million tokens in pricing version 7). The embedded file has no period
+    // starting on the boundary, so it bills the boundary at them too.
+    let embedded = embedded_pricing()
+        .pricing_for_model_on("claude-opus-5", day_before)
+        .expect("priced");
+    assert_eq!(
+        embedded_pricing().pricing_for_model_on("claude-opus-5", boundary),
+        Some(embedded)
+    );
+    // The new period cuts every rate to a fifth: 1 USD input in version 7.
+    let cut = |rate: f64| rate / 5.0;
     append_period(
         &mut value,
         "claude-opus-5",
-        json!({ "from": day(boundary), "input": 1, "cache_write": 1.25, "cache_read": 0.1, "output": 5 }),
+        json!({
+            "from": day(boundary),
+            "input": cut(embedded.input_per_million),
+            "cache_write": cut(embedded.cache_creation_per_million),
+            "cache_read": cut(embedded.cached_input_per_million),
+            "output": cut(embedded.output_per_million)
+        }),
     );
     let table = parse_value(&value);
-    let day_before = boundary - chrono::Duration::days(1);
+    let micro_usd_per_million = |rate: f64| (rate * 1_000_000.0).round() as i64;
+    let old_micro_usd = micro_usd_per_million(embedded.input_per_million);
+    let new_micro_usd = micro_usd_per_million(cut(embedded.input_per_million));
+    assert_ne!(old_micro_usd, new_micro_usd);
 
     let model = statsai_core::ModelInfo {
         name: Some("claude-opus-5".to_string()),
@@ -177,8 +212,14 @@ fn an_appended_price_period_reprices_later_events_without_touching_the_global() 
 
     let old_rate = table.estimate_cost_at("claude_code", Some(&model), &usage, &before);
     let new_rate = table.estimate_cost_at("claude_code", Some(&model), &usage, &after);
-    assert_eq!(old_rate.estimated_api_equivalent_micro_usd, Some(5_000_000));
-    assert_eq!(new_rate.estimated_api_equivalent_micro_usd, Some(1_000_000));
+    assert_eq!(
+        old_rate.estimated_api_equivalent_micro_usd,
+        Some(old_micro_usd)
+    );
+    assert_eq!(
+        new_rate.estimated_api_equivalent_micro_usd,
+        Some(new_micro_usd)
+    );
     assert_eq!(new_rate.pricing_version.as_deref(), Some(table.catalog()));
 
     assert!(table.pricing_changes_between("claude-opus-5", day_before, boundary));
@@ -203,7 +244,7 @@ fn an_appended_price_period_reprices_later_events_without_touching_the_global() 
     assert_eq!(
         estimate_cost_at("claude_code", Some(&model), &usage, &after)
             .estimated_api_equivalent_micro_usd,
-        Some(5_000_000)
+        Some(old_micro_usd)
     );
 }
 
@@ -252,13 +293,27 @@ fn equivalent_boundaries_include_target_changes_only_inside_their_window() {
         date(2026, 1, 1),
         date(2026, 7, 29)
     ));
-    assert!(!embedded.pricing_changes_between(
-        "codex-auto-review",
-        date(2026, 7, 30),
-        date(2027, 6, 1)
-    ));
+    // From the switch to GPT-5.6 Luna up to the day before the next dated
+    // change the embedded file has for either (none in pricing version 7).
+    let file = embedded_json();
+    let switch = date(2026, 7, 30);
+    let luna_window_end = period_dates(&file["equivalents"]["codex-auto-review"])
+        .chain(period_dates(&file["models"]["gpt-5.6-luna"]["prices"]))
+        .chain(period_dates(
+            &file["models"]["gpt-5.6-luna"]["fast"]["prices"],
+        ))
+        .filter(|from| *from > switch)
+        .map(|from| from - chrono::Duration::days(1))
+        .fold(date(2027, 6, 1), NaiveDate::min);
+    assert!(!embedded.pricing_changes_between("codex-auto-review", switch, luna_window_end));
 
-    let mut value = embedded_json();
+    let mut value = file;
+    // The test's own mapping: GPT-5.4 until 2026-07-30, then GPT-5.6 Luna
+    // with no end, whatever later edits to pricing.json add.
+    value["equivalents"]["codex-auto-review"] = json!([
+        { "from": null, "model": "gpt-5.4" },
+        { "from": "2026-07-30", "model": "gpt-5.6-luna" }
+    ]);
     // Inside codex-auto-review's GPT-5.4 window, which closed on 2026-07-30:
     // a boundary for it too.
     insert_period(
@@ -267,14 +322,22 @@ fn equivalent_boundaries_include_target_changes_only_inside_their_window() {
         json!({ "from": "2026-05-01", "input": 2, "cache_write": 2, "cache_read": 0.2, "output": 12 }),
     );
     // After the window closes: GPT-5.4 changes, codex-auto-review does not.
-    let gpt_5_4_change = day_after_last_period(&value, "gpt-5.4", date(2026, 9, 1));
+    // The change comes after every GPT-5.6 Luna period too, so no Luna
+    // boundary falls on it.
+    let after_luna = day_after_last_period(&value, "gpt-5.6-luna", date(2026, 9, 1));
+    let gpt_5_4_change = day_after_last_period(&value, "gpt-5.4", after_luna);
     append_period(
         &mut value,
         "gpt-5.4",
         json!({ "from": day(gpt_5_4_change), "input": 1, "cache_write": 1, "cache_read": 0.1, "output": 6 }),
     );
-    // Inside the GPT-5.6 Luna window, which has no end.
-    let luna_change = day_after_last_period(&value, "gpt-5.6-luna", date(2027, 1, 1));
+    // Inside the GPT-5.6 Luna window, which has no end, after the GPT-5.4
+    // change.
+    let luna_change = day_after_last_period(
+        &value,
+        "gpt-5.6-luna",
+        date(2027, 1, 1).max(gpt_5_4_change + chrono::Duration::days(1)),
+    );
     append_period(
         &mut value,
         "gpt-5.6-luna",

@@ -6,7 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use statsai::log_repricing_report;
 use statsai::pricing_refresh::{
-    pricing_url, refresh_pricing_with, RefreshBookkeeping, RefreshOutcome, FETCH_TIMEOUT,
+    pricing_url, refresh_pricing_with, run_background_refresh, RefreshBookkeeping, RefreshOutcome,
+    FETCH_TIMEOUT,
 };
 use statsai_store::{
     embedded_pricing, refresh_disabled_by_env, PricingRefreshState, Store, StoredPricing,
@@ -19,6 +20,10 @@ use super::args::{PricingCommand, PricingSubcommand};
 use super::format::format_local_timestamp;
 
 pub(crate) fn pricing(command: PricingCommand, store_path: &Path) -> Result<()> {
+    if let PricingSubcommand::Refresh { background: true } = command.command {
+        run_background_pricing_refresh(store_path);
+        return Ok(());
+    }
     let store = Store::open(store_path)?;
     match command.command {
         PricingSubcommand::Status { json } => {
@@ -32,7 +37,8 @@ pub(crate) fn pricing(command: PricingCommand, store_path: &Path) -> Result<()> 
             }
             Ok(())
         }
-        PricingSubcommand::Refresh => {
+        // `--background` returned above.
+        PricingSubcommand::Refresh { .. } => {
             let refresh = store.pricing_refresh_state()?;
             for line in run_pricing_refresh(&store, refresh, &pricing_url(), FETCH_TIMEOUT)? {
                 println!("{line}");
@@ -46,6 +52,17 @@ pub(crate) fn pricing(command: PricingCommand, store_path: &Path) -> Result<()> 
             Ok(())
         }
     }
+}
+
+/// `statsai pricing refresh --background`, the process `statsai scan` and
+/// `statsai sync` start ([`start_background_refresh`]): one refresh on the
+/// daily schedule that prints nothing and never fails, a panic included, and
+/// never reprices. It starts no other process.
+///
+/// [`start_background_refresh`]: statsai::pricing_refresh::start_background_refresh
+fn run_background_pricing_refresh(store_path: &Path) {
+    std::panic::set_hook(Box::new(|_| {}));
+    let _ = std::panic::catch_unwind(|| run_background_refresh(store_path));
 }
 
 /// What `statsai pricing status` reports.

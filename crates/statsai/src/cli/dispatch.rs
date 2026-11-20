@@ -62,10 +62,10 @@ pub(crate) fn run() -> Result<()> {
             let priced_with = statsai_store::active_pricing().version();
             let settles_pricing = command_settles_pricing(&command);
             if command_starts_pricing_refresh(&command) {
-                // Never joined: the command does not wait for the network.
-                drop(statsai::pricing_refresh::spawn_background_refresh(
-                    &store_path,
-                ));
+                // A detached process when a refresh is due. The command never
+                // waits for it, and it finishes even if the command exits
+                // first.
+                statsai::pricing_refresh::start_background_refresh(&store, &store_path);
             }
             let result = match command {
                 Command::Scan(command) => scan(command, &store, &device_id),
