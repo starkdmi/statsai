@@ -42,7 +42,9 @@ pub(crate) struct ProdVersions {
 }
 
 impl ProdVersions {
-    /// The pricing version the store's estimates were last repriced with.
+    /// The store's applied pricing version: the one its estimates were last
+    /// repriced with, or a lower one set by a command that priced with an
+    /// older file.
     pub(crate) fn applied_pricing(&self) -> Option<u64> {
         self.pricing.applied_version
     }

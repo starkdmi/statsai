@@ -34,9 +34,15 @@ pub struct RepricingReport {
     pub version: u64,
     /// That table's `catalog`.
     pub catalog: String,
-    /// The higher version the store was already priced with, when it was.
-    /// Repricing never goes backward, so nothing changed.
+    /// The store's applied version, when it was higher than this table's.
+    /// A store stamped with a higher version is not repriced, so nothing
+    /// changed.
     pub store_ahead: Option<u64>,
+    /// The higher version the store was stamped with when a command that
+    /// priced with this table finished, when no table at that version was
+    /// readable ([`Store::settle_pricing`]). The stamp was lowered to this
+    /// table's version and catalog, and nothing was repriced.
+    pub lowered_from: Option<u64>,
     pub examined_events: u64,
     pub changed_events: u64,
     pub skipped_unreadable_events: u64,
@@ -72,6 +78,13 @@ impl RepricingReport {
 
 impl fmt::Display for RepricingReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(lowered_from) = self.lowered_from {
+            return write!(
+                formatter,
+                "lowered the store's applied pricing version from {lowered_from} to {} ({}): this process prices with version {} and can read no pricing file at version {lowered_from}; a process with a newer pricing file reprices the store",
+                self.version, self.catalog, self.version
+            );
+        }
         if let Some(applied) = self.store_ahead {
             return write!(
                 formatter,
@@ -144,7 +157,11 @@ impl Store {
         self.apply_pricing_table(&table)
     }
 
-    /// Returns the last successfully applied pricing ruleset, if recorded.
+    /// The store's applied pricing version, if recorded: the version its
+    /// estimates were last repriced with, or a lower one, that of a command
+    /// that priced with an older table and could not reprice the store when it
+    /// finished ([`Store::settle_pricing`]). No estimate in the store is
+    /// priced with a version older than it.
     pub fn applied_pricing_ruleset_version(&self) -> Result<Option<u64>> {
         super::snapshot::parse_applied_pricing_ruleset_value(
             self.metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY)?
@@ -152,8 +169,8 @@ impl Store {
         )
     }
 
-    /// Reprices the store's estimates with `table` when the store was last
-    /// priced with a lower version, or never.
+    /// Reprices the store's estimates with `table` when the store's applied
+    /// version is lower than `table`'s, or the store was never priced.
     ///
     /// Events, summaries, sync rollups (changed ones are marked dirty for the
     /// next incremental sync), session rollups and task spans are repriced in
@@ -164,9 +181,12 @@ impl Store {
     /// other binaries sharing the store price with it too. A stored copy at the
     /// same or a higher version is kept.
     ///
-    /// A store already at the table's version is left alone. So is a store
-    /// priced with a higher version: repricing never goes backward, and the
-    /// report says so in [`RepricingReport::store_ahead`].
+    /// A store whose applied version is the table's is left alone. So is one
+    /// whose applied version is higher, and the report says so in
+    /// [`RepricingReport::store_ahead`]. The applied version is a stamp, not
+    /// the newest prices in the store: when [`Store::settle_pricing`] lowered
+    /// it below `table`'s version, this reprices every estimate with `table`,
+    /// including estimates priced with a version higher than `table`'s.
     ///
     /// This does not change the process's active table.
     pub fn apply_pricing_table(&self, table: &Arc<PricingTable>) -> Result<RepricingReport> {
@@ -205,37 +225,56 @@ impl Store {
         Ok(report)
     }
 
-    /// Repairs estimates a command wrote while another process repriced the
-    /// store. Call it when a command that writes priced data (a scan, a sync,
-    /// an import, a watch pass) finishes, with `priced_with`, the version of
-    /// the process's active table when the command started pricing.
+    /// Settles the store's applied version after a command that writes
+    /// priced estimates, whether or not it wrote any. Call it when such a
+    /// command (a scan, a sync, an import, a watch pass) finishes, with
+    /// `priced_with`, the process's active table when the command started
+    /// pricing.
     ///
-    /// The applied version is one stamp for the whole store. When another
-    /// process moved it past `priced_with` while this command ran, whatever
-    /// this command wrote afterwards carries older prices that no later
-    /// command would reprice, because the store already reads as current. So
-    /// when the store's applied version is now higher than `priced_with`, this
-    /// reprices the whole store again with the table for the applied version,
-    /// even though the store is already stamped with it, and makes that table
-    /// the process's active table. Otherwise, or when this process has no
-    /// table at the applied version, it does nothing and returns `None`.
+    /// The applied version is one stamp for the whole store: the oldest
+    /// version any of its estimates may be priced with. A store stamped with
+    /// a version higher than `priced_with`'s can hold rows this command wrote
+    /// with older prices, and no later command at the stamp's version would
+    /// reprice them, because the store already reads as current. So when the
+    /// stamp is higher than `priced_with`'s version:
     ///
-    /// It holds the store's write lock only for the repricing itself.
-    pub fn settle_pricing(&self, priced_with: u64) -> Result<Option<RepricingReport>> {
+    /// - When this process can read a table at the stamp's version (the
+    ///   store's copy, the embedded file or the active table), it reprices
+    ///   the whole store with that table, even though the store is already
+    ///   stamped with it, and makes that table the process's active table.
+    ///   This is the case of another process repricing the store while the
+    ///   command ran.
+    /// - Otherwise it lowers the stamp to `priced_with`'s version and catalog
+    ///   without repricing anything ([`RepricingReport::lowered_from`]). The
+    ///   next process that prices with a newer table, such as one with the
+    ///   refresh on or a newer binary, then reprices every row to its
+    ///   version, rows priced with a version above its own included, and a
+    ///   process at `priced_with`'s version finds the store current.
+    ///
+    /// It returns `None`, changing nothing, when the store was never priced
+    /// or its stamp is not higher than `priced_with`'s version. It holds the
+    /// store's write lock only for the repricing or the lowering.
+    pub fn settle_pricing(
+        &self,
+        priced_with: &Arc<PricingTable>,
+    ) -> Result<Option<RepricingReport>> {
         let Some((table, report)) = self.settle_pricing_in_store(priced_with)? else {
             return Ok(None);
         };
-        install_pricing(table);
+        if report.lowered_from.is_none() {
+            install_pricing(table);
+        }
         Ok(Some(report))
     }
 
     /// [`Store::settle_pricing`] without changing the process's active table:
-    /// returns the table it repriced with, beside the report. For callers
-    /// that must not change what the process prices with, such as tests that
-    /// share one process-wide table.
+    /// returns the table the store is now stamped with (the one it repriced
+    /// with, or `priced_with` when it lowered the stamp), beside the report.
+    /// For callers that must not change what the process prices with, such
+    /// as tests that share one process-wide table.
     pub fn settle_pricing_in_store(
         &self,
-        priced_with: u64,
+        priced_with: &Arc<PricingTable>,
     ) -> Result<Option<(Arc<PricingTable>, RepricingReport)>> {
         // Another process can move the applied version again between reading
         // it and taking the write lock; try again with the newer one.
@@ -243,23 +282,48 @@ impl Store {
             let Some(applied) = self.applied_pricing_ruleset_version()? else {
                 return Ok(None);
             };
-            if applied <= priced_with {
+            if applied <= priced_with.version() {
                 return Ok(None);
             }
-            let Some(table) = self.pricing_table_at_version(applied)? else {
-                return Ok(None);
-            };
-            let report = self.with_immediate_transaction(|| {
+            let settled = self.with_immediate_transaction(|| {
                 if self.applied_pricing_ruleset_version()? != Some(applied) {
                     return Ok(None);
                 }
-                self.reprice_store_in_tx(&table).map(Some)
+                Ok(Some(match self.pricing_table_at_version(applied)? {
+                    Some(table) => {
+                        let report = self.reprice_store_in_tx(&table)?;
+                        (table, report)
+                    }
+                    None => {
+                        let report = self.lower_applied_pricing_in_tx(priced_with, applied)?;
+                        (Arc::clone(priced_with), report)
+                    }
+                }))
             })?;
-            if let Some(report) = report {
-                return Ok(Some((table, report)));
+            if settled.is_some() {
+                return Ok(settled);
             }
         }
         Ok(None)
+    }
+
+    /// Stamps the store with `table`'s version and catalog, lower than
+    /// `applied`, the version it was stamped with, without repricing
+    /// anything. Runs inside the caller's transaction.
+    fn lower_applied_pricing_in_tx(
+        &self,
+        table: &PricingTable,
+        applied: u64,
+    ) -> Result<RepricingReport> {
+        self.set_metadata_value(
+            APPLIED_PRICING_RULESET_VERSION_KEY,
+            &table.version().to_string(),
+        )?;
+        self.set_metadata_value(APPLIED_PRICING_CATALOG_VERSION_KEY, table.catalog())?;
+        Ok(RepricingReport {
+            lowered_from: Some(applied),
+            ..RepricingReport::for_table(table)
+        })
     }
 
     /// The report for a store that `table` would not change: one already at

@@ -27,6 +27,11 @@ const MAX_CATALOG_CHARS: usize = 100;
 const MAX_RATE: f64 = 1000.0;
 const MAX_MULTIPLIER: f64 = 20.0;
 const MAX_TOKEN_THRESHOLD: u64 = 100_000_000;
+/// The highest `version` a file may have. Versions go up by one per change,
+/// so this is never reached in practice; it keeps a typo such as
+/// `18446744073709551615` from being adopted, after which no real file could
+/// ever be newer.
+const MAX_VERSION: u64 = 1_000_000;
 
 /// Why a pricing file cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,8 +238,11 @@ impl PricingTable {
 }
 
 fn build_table(text: &str, format: u32, raw: RawFile) -> Result<PricingTable, String> {
-    if raw.version < 1 {
-        return Err("`version` must be at least 1".to_string());
+    if !(1..=MAX_VERSION).contains(&raw.version) {
+        return Err(format!(
+            "`version` {} must be within 1 to {MAX_VERSION}",
+            raw.version
+        ));
     }
     check_catalog(&raw.catalog)?;
 

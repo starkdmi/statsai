@@ -118,7 +118,7 @@ fn status_of_a_new_store_prices_with_the_embedded_file() {
     );
     let lines = status.lines();
     assert!(lines.contains(&"stored pricing file: none".to_string()));
-    assert!(lines.contains(&"store priced with: not priced yet".to_string()));
+    assert!(lines.contains(&"store's applied pricing: not priced yet".to_string()));
     assert!(lines.contains(&"last check: never".to_string()));
     assert!(lines.contains(&format!("url: {UNREACHABLE_URL}")));
 }

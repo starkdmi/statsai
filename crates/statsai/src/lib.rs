@@ -9,10 +9,11 @@ use anyhow::Result;
 use chrono::Utc;
 use getrandom::getrandom;
 use statsai_core::{hash_text, home_dir};
-use statsai_store::{RepricingReport, Store};
+use statsai_store::{PricingTable, RepricingReport, Store};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The lock that keeps scanners of one store from running at once.
 ///
@@ -42,10 +43,12 @@ pub fn open_operational_store(path: &Path) -> Result<Store> {
     Ok(store)
 }
 
-/// Settles the store's pricing after a command that wrote priced estimates
-/// with the table at version `priced_with` ([`Store::settle_pricing`]), and
-/// prints the repricing it did, if any.
-pub fn settle_pricing(store: &Store, priced_with: u64) -> Result<()> {
+/// Settles the store's pricing after a command that writes priced estimates,
+/// whether or not it wrote any, with the table `priced_with`
+/// ([`Store::settle_pricing`]): reprices the store with the table at its
+/// applied version, or lowers that version to `priced_with`'s when this
+/// process has no table at it. Prints what it did, if anything.
+pub fn settle_pricing(store: &Store, priced_with: &Arc<PricingTable>) -> Result<()> {
     if let Some(report) = store
         .settle_pricing(priced_with)
         .map_err(|error| error.context("reprice what this command wrote"))?

@@ -16,8 +16,8 @@ use statsai_store::{
     active_pricing, find_existing_provider_account, gone_scan_files,
     reconcile_verified_source_state, try_acquire_scan_lock, upsert_provider_account,
     verified_source_observation_hash, ActivityPersistMode, ActivityScanCursor, PricingRefreshState,
-    RepricingReport, ScanFileReplacement, ScanFileStateEntry, Store, UnsupportedPricingFormat,
-    UpsertProviderAccountInput,
+    PricingTable, RepricingReport, ScanFileReplacement, ScanFileStateEntry, Store,
+    UnsupportedPricingFormat, UpsertProviderAccountInput,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -146,9 +146,11 @@ fn requeue_background_scan(
 /// skips the pass and keeps the daemon running.
 ///
 /// After `scan`, even a failed one, it settles the store's pricing with the
-/// version the pass priced with ([`Store::settle_pricing`]): when another
+/// table the pass priced with ([`Store::settle_pricing`]): when another
 /// process repriced the store while the pass ran, what the pass wrote with the
-/// older table is repriced too.
+/// older table is repriced too, and when the store is stamped with a newer
+/// version this process has no table for, the stamp is lowered to the pass's
+/// version so a process with a newer table reprices what the pass wrote.
 pub(super) fn scan_with_current_pricing(
     store: &Store,
     last_unsupported: &mut Option<UnsupportedPricingFormat>,
@@ -167,6 +169,11 @@ pub(super) fn scan_with_current_pricing(
     )
 }
 
+/// The settle step of a scan pass: given the table the pass priced with, it
+/// settles the store's pricing and returns what it did, if anything.
+pub(super) type SettlePricing<'a> =
+    dyn FnMut(&Store, &Arc<PricingTable>) -> Result<Option<RepricingReport>> + 'a;
+
 /// [`scan_with_current_pricing`] with an explicit refresh state, a sink for
 /// its log lines, and the settle step, which production passes as
 /// [`Store::settle_pricing`].
@@ -175,16 +182,16 @@ pub(super) fn scan_with_current_pricing_with(
     refresh: PricingRefreshState,
     last_unsupported: &mut Option<UnsupportedPricingFormat>,
     report: &mut dyn FnMut(String),
-    settle: &mut dyn FnMut(&Store, u64) -> Result<Option<RepricingReport>>,
+    settle: &mut SettlePricing<'_>,
     scan: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     if !bring_pricing_up_to_date_with(store, refresh, last_unsupported, report)? {
         return Ok(());
     }
     // What the adapters price this pass's events with.
-    let priced_with = active_pricing().version();
+    let priced_with = active_pricing();
     let scanned = scan();
-    let settled = settle(store, priced_with).context("reprice what the scan pass wrote");
+    let settled = settle(store, &priced_with).context("reprice what the scan pass wrote");
     if let Ok(Some(repricing)) = &settled {
         report(format!("daemon: {repricing}"));
     }

@@ -57,9 +57,9 @@ pub(crate) fn run() -> Result<()> {
                 store.use_current_pricing()?;
                 store
             };
-            // The version this command prices what it writes with, captured
+            // The table this command prices what it writes with, captured
             // before anything is written or a background refresh starts.
-            let priced_with = statsai_store::active_pricing().version();
+            let priced_with = statsai_store::active_pricing();
             let settles_pricing = command_settles_pricing(&command);
             if command_starts_pricing_refresh(&command) {
                 // A detached process when a refresh is due. The command never
@@ -101,7 +101,7 @@ pub(crate) fn run() -> Result<()> {
             if settles_pricing {
                 // Also after a failure: the command may have written some
                 // estimates before it stopped.
-                let settled = statsai::settle_pricing(&store, priced_with);
+                let settled = statsai::settle_pricing(&store, &priced_with);
                 result?;
                 settled?;
                 return Ok(());

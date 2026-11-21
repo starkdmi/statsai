@@ -72,7 +72,8 @@ pub(crate) struct PricingStatus {
     pub(crate) embedded: PricingFileStatus,
     /// The file kept in the store.
     pub(crate) stored: StoredPricingStatus,
-    /// The version the store's estimates were last repriced with.
+    /// The store's applied pricing version
+    /// ([`statsai_store::Store::applied_pricing_ruleset_version`]).
     pub(crate) applied_version: Option<u64>,
     /// That version's catalog.
     pub(crate) applied_catalog: Option<String>,
@@ -262,7 +263,7 @@ impl PricingStatus {
                 embedded.version, embedded.format, embedded.catalog
             ),
             format!("stored pricing file: {stored}"),
-            format!("store priced with: {applied}"),
+            format!("store's applied pricing: {applied}"),
             format!("commands price with: {prices_with}"),
             format!("refresh: {refresh}"),
             format!("last check: {}", time(self.last_checked_at)),

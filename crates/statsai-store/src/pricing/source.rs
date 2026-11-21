@@ -8,7 +8,12 @@
 //! binary and that stored copy. While it is off, it prices with the embedded
 //! file, unless the store's estimates were already priced with a newer version
 //! and the stored copy is that version: then it keeps pricing with that copy,
-//! so a store never mixes two versions and nothing moves backward.
+//! so the store does not mix two versions and nothing moves backward. When the
+//! store is stamped with a newer version that no table the process can read
+//! has, the process prices what it writes with the embedded file and, when the
+//! command finishes, lowers the stamp to the embedded version
+//! ([`Store::settle_pricing`]), so the next process with a newer table
+//! reprices those rows.
 
 use crate::{Store, PRICING_REFRESH_SETTING_KEY, STORED_PRICING_FILE_KEY};
 use anyhow::Result;
@@ -292,7 +297,9 @@ impl Store {
     /// file's and the usable stored copy is exactly that version. Then that
     /// copy, so the process neither writes older prices into the store nor
     /// leaves it priced with two versions. A store priced with a newer version
-    /// that it holds no copy of is used as it is, with the embedded file.
+    /// that it holds no copy of is used as it is, with the embedded file; a
+    /// command that writes priced rows with it then lowers the store's stamp
+    /// to the embedded version when it finishes ([`Store::settle_pricing`]).
     ///
     /// # Errors
     ///

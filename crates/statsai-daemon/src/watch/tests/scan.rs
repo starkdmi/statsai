@@ -365,7 +365,10 @@ fn file_store_with_unpriced_event(directory: &Path) -> (Store, PathBuf) {
 
 /// Settles like [`Store::settle_pricing`], without installing the changed
 /// table every test in this binary shares.
-fn settle_without_installing(store: &Store, priced_with: u64) -> Result<Option<RepricingReport>> {
+fn settle_without_installing(
+    store: &Store,
+    priced_with: &Arc<statsai_store::PricingTable>,
+) -> Result<Option<RepricingReport>> {
     Ok(store
         .settle_pricing_in_store(priced_with)?
         .map(|(_, report)| report))
@@ -496,6 +499,49 @@ fn a_failed_pass_still_settles_and_then_reports_its_failure() {
         );
     }
     assert_eq!(lines.len(), 2, "{lines:?}");
+}
+
+#[test]
+fn a_pass_on_a_store_stamped_ahead_of_every_readable_table_lowers_the_stamp_once() {
+    let store = store_with_unpriced_event();
+    // Stamped with a version this process has no table for.
+    store
+        .set_metadata_value(statsai_store::APPLIED_PRICING_RULESET_VERSION_KEY, "99")
+        .expect("store ahead");
+    let embedded = statsai_store::embedded_pricing();
+    let mut unsupported = None;
+    let mut lines = Vec::new();
+    let mut scans = 0;
+
+    for _ in 0..2 {
+        scan_with_current_pricing_with(
+            &store,
+            statsai_store::PricingRefreshState::OffBySetting,
+            &mut unsupported,
+            &mut |line| lines.push(line),
+            &mut settle_without_installing,
+            || {
+                scans += 1;
+                Ok(())
+            },
+        )
+        .expect("pass");
+    }
+
+    assert_eq!(scans, 2);
+    assert_eq!(
+        store.applied_pricing_ruleset_version().expect("applied"),
+        Some(embedded.version())
+    );
+    assert_eq!(lines.len(), 1, "only the first pass lowered it: {lines:?}");
+    assert!(
+        lines[0].starts_with(&format!(
+            "daemon: lowered the store's applied pricing version from 99 to {} ({})",
+            embedded.version(),
+            embedded.catalog()
+        )),
+        "{lines:?}"
+    );
 }
 
 #[test]

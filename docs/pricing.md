@@ -85,7 +85,7 @@ A short example, trimmed from the real file:
 | Field | Type | Meaning |
 |---|---|---|
 | `format` | integer | Structure version of the file. See [`format` and `version`](#format-and-version). |
-| `version` | integer, at least 1 | Goes up on every change to the file. |
+| `version` | integer, 1 to 1,000,000 | Goes up on every change to the file. |
 | `catalog` | string | Written into each estimate's `pricing_version`. Non-empty, at most 100 characters, contains `:`, for example `official:2026-11-18`. |
 | `models` | object | Prices, keyed by lowercase catalog model name. |
 | `equivalents` | object | Names priced as another model, by date. |
@@ -190,6 +190,8 @@ stays as observed, lowercased.
 - Multipliers (`fast.multiplier`, `long_context.input` and `output`): finite,
   greater than 0 and at most 20.
 - Token thresholds (`above`, `at_least`, `max_prompt`): from 1 to 100,000,000.
+- `version`: from 1 to 1,000,000. CI also fails a change that raises it by
+  more than 10 (see [Editing the file](#editing-the-file)).
 - The whole file: at most 1 MiB.
 
 ## `format` and `version`
@@ -214,8 +216,13 @@ format too. A running watch daemon restarts when its executable is replaced,
 and scans every watched source again when it starts.
 
 A binary never refuses a store because its stored file or its estimates have a
-newer `version`. While the refresh is on it uses a newer stored file; either
-way it leaves estimates priced with a newer version as they are.
+newer `version`. While the refresh is on it uses a newer stored file. It does
+not reprice a store whose applied version is higher than its own. When a scan,
+sync, import or watch pass ends in such a store and the binary can read no file
+at the applied version, it lowers the applied version to its own. After that,
+a binary with a higher version reprices every estimate to its version,
+including estimates priced with a newer one (see
+[How clients refresh](#how-clients-refresh)).
 
 ### Releases before pricing files
 
@@ -253,6 +260,11 @@ binary until they are all upgraded.
   `version` first, update your branch and raise it again. Two open pull
   requests that raise it to the same number can each pass CI; whichever merges
   second must be updated and raise it again (see below).
+- **Raise `version` by one.** CI fails a change that raises it by more than
+  10, such as `80` typed for `8`, and clients reject a file whose `version` is
+  above 1,000,000. A version set too high cannot be taken back: every client
+  that adopts that file ignores each later file with a lower version, and
+  only editing its store by hand would recover it.
 - **Set `catalog` to the date of the change**, for example
   `official:2026-11-24`.
 - **Add a model** by adding a `models` entry, plus whatever `names`,
@@ -281,10 +293,19 @@ The check described below enforces most of these rules.
   On every push to `main` it compares the new tip with the one the push
   replaced. It fails when:
   - the file changed and `version` did not go up;
+  - `version` went up by more than 10, or is above 1,000,000;
   - `format` went down;
   - a `models` or `equivalents` entry was removed;
   - a period whose `from` is `null` or on or before today's UTC date was
     changed or removed. This covers `prices`, `fast.prices` and `equivalents`.
+
+  The same job first runs
+  [`scripts/test-check-pricing-file.sh`](../scripts/test-check-pricing-file.sh),
+  which runs the check on edited copies of `pricing.json`, one for each rule
+  above and for edits it must accept, such as one to a period that has not
+  started, and also against a git ref in a scratch repository, as the job
+  runs it. It fails when the check's exit status or message is not the one
+  expected.
 
 `main` does not require pull requests to be up to date before they merge. Two
 pull requests that both raise `version` from 7 to 8 each pass against the base
@@ -373,15 +394,33 @@ suite (append a period to every model and run the tests) is not part of CI.
   records are the exception. Repricing keeps them, since the stored aggregate
   cannot reproduce them, so they keep the older rates until their sources are
   scanned again; `statsai scan --no-cache` re-reads them all.
-- Repricing never goes backward. When the store was last repriced with a higher
-  version than the copy a binary uses, that binary leaves the stored estimates
-  as they are.
-- The store records one applied version for all its estimates. Another process
-  can reprice the store while a scan, sync, import or watch pass is writing
-  estimates priced with the older version. So when such a command or pass
-  finishes and finds the store priced with a newer version than it priced with,
-  it reprices the whole store again with that version, which the store holds a
-  copy of, and logs the repricing report.
+- The store records one applied version for all its estimates, in
+  `pricing.applied_ruleset_version` (its catalog in
+  `pricing.applied_catalog_version`): the oldest version any of them may be
+  priced with. `statsai pricing status` shows it as `store's applied pricing`.
+  A process that prices with a higher version reprices the store when it opens
+  it; a process at that version or a lower one does not.
+- Repricing goes backward only after a lowering (below). A binary whose copy
+  has a lower version than the store's applied version leaves the stored
+  estimates as they are. But once a process has lowered the applied version, a
+  process whose version is above the lowered one reprices every estimate to its
+  own version, including estimates priced with a newer version.
+- A scan, sync, import or watch pass can write estimates priced with an older
+  version than the store's applied version: another process repriced the store
+  while it ran, or the store was already ahead of every file the process can
+  read. So when such a command or pass finishes, whether or not it wrote
+  anything, and finds the store's applied version higher than the version it
+  priced with:
+  - when it can read a file at the applied version (the store's copy, or the
+    file built into the binary), it reprices the whole store again with that
+    file and logs the repricing report;
+  - otherwise, for example with the refresh off when the stored copy is newer
+    than the applied version, it lowers the applied version and catalog to the
+    ones it priced with, reprices nothing, and logs
+    `lowered the store's applied pricing version from N to M`. The next process
+    that prices with a newer file, one with the refresh on or a newer binary,
+    then reprices every estimate, those this command wrote included. A process
+    at the lowered version finds the store current and reprices nothing.
 - Commands that open the store without repricing it, such as
   `statsai quota` and `statsai status`, use the newest copy they can read for
   any estimate they make.
@@ -403,9 +442,16 @@ Either of these turns it off:
 With the refresh off, StatsAI never fetches the file and prices with the file
 embedded in the binary. The one exception is a store whose estimates were
 already repriced with a newer stored copy: StatsAI keeps pricing with that copy,
-so the store never mixes two versions and no price goes back. A store priced
-with a newer version it holds no copy of keeps its estimates, and new ones use
-the embedded file.
+so the store does not mix two versions and no price goes back. A store priced
+with a newer version it holds no copy of, or whose copy is newer still and not
+yet applied, keeps its estimates, and new ones use the embedded file. When a
+scan, sync, import or watch pass finishes in such a store, whether or not it
+wrote anything, it lowers the store's applied version to the embedded file's,
+without repricing anything. The store then reads as current to every process
+that prices with that file, and the first process with a newer file, such as
+one with the refresh on, reprices all of it to its version: the estimates
+written with the embedded file, and also any priced with a version newer than
+its own.
 
 This also holds for a watch daemon that is running when the setting changes:
 it checks the setting before every pass, and its prices stay the store's.

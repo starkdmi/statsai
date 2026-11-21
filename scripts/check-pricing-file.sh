@@ -7,6 +7,13 @@ set -euo pipefail
 # tip the push replaced.
 
 pricing_path=crates/statsai-pricing/pricing.json
+# Clients reject a file whose version is above this (MAX_VERSION in
+# crates/statsai-pricing/src/file.rs).
+max_version=1000000
+# The most one change may raise `version` by. A version raised too far can
+# never be followed: a client that took it ignores every lower one. Ten is
+# small enough to catch a slip such as 80 typed for 8.
+max_version_step=10
 
 usage() {
   cat <<'EOF' >&2
@@ -17,7 +24,9 @@ Compares crates/statsai-pricing/pricing.json at <base-ref> with the working
 tree, or compares two files. Fails when the file changed and:
 
   - it is not valid JSON with integer `format` and `version`;
-  - `version` did not go up, or `format` went down;
+  - `version` did not go up, went up by more than 10, or is above
+    1000000;
+  - `format` went down;
   - a `models` or `equivalents` entry was removed;
   - a period that has started (`from` is null or on or before today's UTC
     date) was changed or removed, in `prices`, `fast.prices` or `equivalents`.
@@ -89,7 +98,8 @@ fi
 today=$(date -u +%F)
 
 # Prints one violation per output string.
-violations=$(jq -r --slurpfile base "$base_file" --arg today "$today" '
+violations=$(jq -r --slurpfile base "$base_file" --arg today "$today" \
+  --argjson max_version "$max_version" --argjson max_step "$max_version_step" '
   def isint: type == "number" and . == floor;
   def obj: if type == "object" then . else {} end;
   def arr: if type == "array" then . else [] end;
@@ -124,6 +134,10 @@ violations=$(jq -r --slurpfile base "$base_file" --arg today "$today" '
         "version: must be an integer."
       elif ($base.version | isint) and $head.version <= $base.version then
         "version: is \($head.version), not higher than the base version \($base.version). Every change to the file raises it; set it to \($base.version + 1) or higher."
+      elif ($base.version | isint) and $head.version > $base.version + $max_step then
+        "version: is \($head.version), more than \($max_step) above the base version \($base.version). Raise it by one, to \($base.version + 1): a client never takes a file with a lower version than one it has, so a version raised too far cannot be undone."
+      elif $head.version > $max_version then
+        "version: is \($head.version), above \($max_version). Clients reject a file with a higher version."
       else empty end
     ),
     (

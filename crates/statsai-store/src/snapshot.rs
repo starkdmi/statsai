@@ -121,7 +121,9 @@ pub struct StoredPricingFileHeader {
 /// given binary would price it with, read without opening it as a store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatabasePricingState {
-    /// The pricing version the store's estimates were last repriced with.
+    /// The store's applied pricing version: the one its estimates were last
+    /// repriced with, or a lower one set by a command that priced with an
+    /// older file ([`crate::Store::settle_pricing`]).
     pub applied_version: Option<u64>,
     /// The header of the stored pricing file, when one is stored and readable.
     pub stored_file: Option<StoredPricingFileHeader>,

@@ -196,6 +196,28 @@ fn rejects_version_zero() {
 }
 
 #[test]
+fn rejects_a_version_above_one_million() {
+    // A client that adopted such a file would find every later real file
+    // not newer, so it is refused like any other out-of-bounds number.
+    for bad in [json!(1_000_001), json!(u64::MAX)] {
+        let mut value = embedded_json();
+        value["version"] = bad;
+        assert_invalid(&value, "`version`");
+        assert_invalid(&value, "1000000");
+    }
+
+    // The ceiling itself is allowed.
+    let mut value = embedded_json();
+    value["version"] = json!(1_000_000);
+    assert_eq!(
+        parse_value(&value)
+            .expect("1000000 is within bounds")
+            .version(),
+        1_000_000
+    );
+}
+
+#[test]
 fn rejects_negative_and_out_of_bounds_rates() {
     let mut value = embedded_json();
     value["models"]["claude-opus-5"]["prices"][0]["input"] = json!(-0.01);
