@@ -1,5 +1,6 @@
 use crate::{
-    ScanCandidateFile, CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, GROK_BUILD_PROVIDER, OPENCODE_PROVIDER,
+    ScanCandidateFile, ANTIGRAVITY_PROVIDER, CLAUDE_CODE_PROVIDER, CODEX_PROVIDER,
+    GROK_BUILD_PROVIDER, OPENCODE_PROVIDER,
 };
 use statsai_core::{canonical_display, hash_text, SourceLocation};
 use std::path::{Path, PathBuf};
@@ -41,6 +42,7 @@ pub(crate) const OPENCODE_SCAN_CACHE_PARSER_REVISION: &str = "branch-label.v22";
 // instead of taking the checkout's HEAD at scan time, and archived
 // conversations carry the branch and remote their summary records.
 pub(crate) const GROK_BUILD_SCAN_CACHE_PARSER_REVISION: &str = "branch-label.v24";
+pub(crate) const ANTIGRAVITY_SCAN_CACHE_PARSER_REVISION: &str = "conversation-sqlite.v1";
 
 pub(crate) fn scan_candidate(
     path: PathBuf,
@@ -152,6 +154,7 @@ pub(crate) fn scan_cache_parser_revision(source: &SourceLocation) -> &'static st
         CLAUDE_CODE_PROVIDER => CLAUDE_SCAN_CACHE_PARSER_REVISION,
         OPENCODE_PROVIDER => OPENCODE_SCAN_CACHE_PARSER_REVISION,
         GROK_BUILD_PROVIDER => GROK_BUILD_SCAN_CACHE_PARSER_REVISION,
+        ANTIGRAVITY_PROVIDER => ANTIGRAVITY_SCAN_CACHE_PARSER_REVISION,
         _ => "default",
     }
 }

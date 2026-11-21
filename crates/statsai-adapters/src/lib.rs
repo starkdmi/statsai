@@ -36,6 +36,7 @@ use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
 mod activity;
+mod antigravity;
 mod archive;
 mod cache;
 mod claude;
@@ -80,6 +81,7 @@ pub(crate) use sqlite::{
     open_sqlite_readonly, sqlite_column_exists, sqlite_nonzero_u64, sqlite_table_exists,
 };
 
+pub use antigravity::AntigravityAdapter;
 pub(crate) use claude::claude_usage_counts_from_value;
 pub use claude::{
     claude_denied_project_settings_folders, ClaudeCodeAdapter, ClaudeProjectPathMemo,
@@ -107,6 +109,7 @@ pub const CLAUDE_CODE_PROVIDER: &str = "claude_code";
 pub const CODEX_PROVIDER: &str = "codex";
 pub const OPENCODE_PROVIDER: &str = "opencode";
 pub const GROK_BUILD_PROVIDER: &str = "grok_build";
+pub const ANTIGRAVITY_PROVIDER: &str = "antigravity";
 
 pub use archive::{ArchiveScan, ArchiveScanDiagnostics};
 pub use statsai_core::{
@@ -160,6 +163,9 @@ pub struct ScanDiagnostics {
     /// from `invalid_rows` because the two call for different responses, and a
     /// single number cannot say which one a scan hit.
     pub oversized_rows: u64,
+    /// History files found but not readable offline, such as Antigravity's
+    /// encrypted legacy conversations. Their usage is missing from the scan.
+    pub unreadable_history_files: u64,
     pub timestamp_fallbacks: u64,
     pub model_fallbacks: u64,
     pub activity_rows: u64,
@@ -353,6 +359,9 @@ pub fn adapter_for_provider(provider: &str) -> Option<Box<dyn ProviderAdapter>> 
         CODEX_PROVIDER => Some(Box::new(CodexAdapter)),
         OPENCODE_PROVIDER | "open-code" | "open_code" => Some(Box::new(OpenCodeAdapter)),
         GROK_BUILD_PROVIDER | "grok-build" | "grok" => Some(Box::new(GrokBuildAdapter)),
+        ANTIGRAVITY_PROVIDER | "google-antigravity" | "google_antigravity" => {
+            Some(Box::new(AntigravityAdapter))
+        }
         _ => None,
     }
 }
@@ -363,6 +372,7 @@ pub fn default_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(CodexAdapter),
         Box::new(OpenCodeAdapter),
         Box::new(GrokBuildAdapter),
+        Box::new(AntigravityAdapter),
     ]
 }
 

@@ -3,7 +3,8 @@ use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use statsai_adapters::{
-    default_adapters, CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, GROK_BUILD_PROVIDER, OPENCODE_PROVIDER,
+    default_adapters, ANTIGRAVITY_PROVIDER, CLAUDE_CODE_PROVIDER, CODEX_PROVIDER,
+    GROK_BUILD_PROVIDER, OPENCODE_PROVIDER,
 };
 use statsai_core::home_dir;
 use statsai_store::{SourceUsageTotals, Store};
@@ -380,6 +381,7 @@ fn provider_order() -> Vec<&'static str> {
         CLAUDE_CODE_PROVIDER,
         OPENCODE_PROVIDER,
         GROK_BUILD_PROVIDER,
+        ANTIGRAVITY_PROVIDER,
     ]
 }
 
@@ -448,6 +450,7 @@ fn provider_display_name(provider: &str) -> &'static str {
         CLAUDE_CODE_PROVIDER => "Claude Code",
         OPENCODE_PROVIDER => "OpenCode",
         GROK_BUILD_PROVIDER => "Grok Build",
+        ANTIGRAVITY_PROVIDER => "Antigravity",
         _ => "Other",
     }
 }

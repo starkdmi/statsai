@@ -69,6 +69,7 @@ pub(crate) fn scan_with_adapters(
     let mut total_sources = 0u64;
     let mut total_log_rows = 0u64;
     let mut total_diagnostics = ScanDiagnostics::default();
+    let mut unreadable_history = BTreeMap::<String, u64>::new();
     let mut total_usage = UsageTotals::default();
     let mut total_summary_usage = UsageTotals::default();
     let mut adapter_scan_duration_ms = 0u64;
@@ -352,6 +353,11 @@ pub(crate) fn scan_with_adapters(
             total_usage.add_totals(&source_usage);
             total_summary_usage.add_totals(&source_summary_usage);
             add_diagnostics(&mut total_diagnostics, &scan.diagnostics);
+            if scan.diagnostics.unreadable_history_files > 0 {
+                *unreadable_history
+                    .entry(adapter.provider().to_string())
+                    .or_default() += scan.diagnostics.unreadable_history_files;
+            }
 
             if suppress_source_processing {
                 continue;
@@ -828,8 +834,19 @@ pub(crate) fn scan_with_adapters(
         }
         print_scan_diagnostics_total(&total_diagnostics);
     }
+    for (provider, files) in &unreadable_history {
+        println!("{}", unreadable_history_warning_line(provider, *files));
+    }
     print_denied_project_settings_folders();
     Ok(())
+}
+
+/// The `scan warning:` line for history a provider keeps in a form the scan
+/// cannot read, such as Antigravity's encrypted legacy conversations, without
+/// a newline: `scan warning: unreadable_history provider=antigravity files=3`.
+/// Usage in those files is missing from the totals.
+pub(crate) fn unreadable_history_warning_line(provider: &str, files: u64) -> String {
+    format!("scan warning: unreadable_history provider={provider} files={files}")
 }
 
 /// One `scan warning:` line per folder whose Claude Code project settings a

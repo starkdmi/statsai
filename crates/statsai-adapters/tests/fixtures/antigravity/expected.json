@@ -1,0 +1,169 @@
+{
+  "conversations": {
+    "00000000-0000-4000-8000-000000000002": {
+      "agent": "research",
+      "branch": "fixture/main",
+      "checkpoint": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 0,
+        "input": 0,
+        "response": 0,
+        "thinking": 0
+      },
+      "models": {
+        "claude-opus-4-6-thinking|claude-opus-4-6-thinking": 1
+      },
+      "parent": "00000000-0000-4000-8000-000000000005",
+      "planner": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 1,
+        "input": 14800,
+        "response": 402,
+        "thinking": 0
+      },
+      "planner_without_usage": 0
+    },
+    "00000000-0000-4000-8000-000000000005": {
+      "agent": null,
+      "branch": "fixture/main",
+      "checkpoint": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 0,
+        "input": 0,
+        "response": 0,
+        "thinking": 0
+      },
+      "models": {
+        "claude-opus-4-6-thinking|claude-opus-4-6-thinking": 1
+      },
+      "parent": null,
+      "planner": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 1,
+        "input": 16002,
+        "response": 640,
+        "thinking": 0
+      },
+      "planner_without_usage": 1
+    },
+    "00000000-0000-4000-8000-000000000011": {
+      "agent": null,
+      "branch": "fixture/main",
+      "checkpoint": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 0,
+        "input": 0,
+        "response": 0,
+        "thinking": 0
+      },
+      "models": {
+        "gpt-oss-120b-medium|gpt-oss-120b-medium": 1
+      },
+      "parent": null,
+      "planner": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 1,
+        "input": 7330,
+        "response": 158,
+        "thinking": 0
+      },
+      "planner_without_usage": 0
+    },
+    "00000000-0000-4000-8000-000000000015": {
+      "agent": null,
+      "branch": "fixture/main",
+      "checkpoint": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 0,
+        "input": 0,
+        "response": 0,
+        "thinking": 0
+      },
+      "models": {
+        "gemini-3.5-flash-low|gemini-3-flash-a": 1
+      },
+      "parent": null,
+      "planner": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 1,
+        "input": 3100,
+        "response": 44,
+        "thinking": 120
+      },
+      "planner_without_usage": 0
+    },
+    "00000000-0000-4000-8000-000000000019": {
+      "agent": null,
+      "branch": "fixture/main",
+      "checkpoint": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 1,
+        "input": 9120,
+        "response": 140,
+        "thinking": 0
+      },
+      "models": {
+        "antigravity-model-1050|": 1,
+        "claude-opus-4-6-thinking|claude-opus-4-6-thinking": 2
+      },
+      "parent": null,
+      "planner": {
+        "cache_read": 18400,
+        "cache_write": 0,
+        "calls": 2,
+        "input": 18822,
+        "response": 1516,
+        "thinking": 0
+      },
+      "planner_without_usage": 0
+    },
+    "00000000-0000-4000-8000-000000000023": {
+      "agent": null,
+      "branch": "fixture/main",
+      "checkpoint": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "calls": 1,
+        "input": 3900,
+        "response": 210,
+        "thinking": 0
+      },
+      "models": {
+        "gemini-3-flash-agent|gemini-3-flash-a": 2,
+        "gemini-3.5-flash-low|gemini-3-flash-a": 1,
+        "|": 1
+      },
+      "parent": null,
+      "planner": {
+        "cache_read": 12800,
+        "cache_write": 0,
+        "calls": 3,
+        "input": 6523,
+        "response": 238,
+        "thinking": 615
+      },
+      "planner_without_usage": 1
+    }
+  },
+  "covers": [
+    "checkpoint",
+    "claude-vertex",
+    "gemini-thinking",
+    "gpt-oss",
+    "label-elsewhere",
+    "planner-without-usage",
+    "retried-request",
+    "subagent"
+  ],
+  "schema": "statsai-antigravity-expected.v1",
+  "unreadable_history_files": 1
+}

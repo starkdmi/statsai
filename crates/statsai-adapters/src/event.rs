@@ -180,6 +180,10 @@ pub(crate) fn merge_adapter_scan(
         .diagnostics
         .oversized_rows
         .saturating_add(source.diagnostics.oversized_rows);
+    target.diagnostics.unreadable_history_files = target
+        .diagnostics
+        .unreadable_history_files
+        .saturating_add(source.diagnostics.unreadable_history_files);
     target.diagnostics.timestamp_fallbacks = target
         .diagnostics
         .timestamp_fallbacks

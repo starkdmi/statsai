@@ -10,7 +10,7 @@
 
 <p align="center">
   Local-first analytics for AI-assisted development. Bring usage from Claude Code,
-  Codex, OpenCode, and Grok Build into one private, consistent view.
+  Codex, OpenCode, Grok Build, and Antigravity into one private, consistent view.
 </p>
 
 <p align="center">
@@ -228,6 +228,7 @@ treated as pseudonymized rather than anonymous.
 | Codex | `~/.codex` |
 | OpenCode | `~/.local/share/opencode` |
 | Grok Build | `~/.grok` |
+| Antigravity | `~/.gemini/antigravity` |
 
 Add non-default locations explicitly:
 
@@ -236,8 +237,17 @@ statsai source add --provider codex --path "$HOME/.codex-work"
 statsai source list
 ```
 
-OpenCode and Grok Build also support `OPENCODE_DATA_DIRS`,
-`GROK_DATA_DIRS`, and `GROK_HOME` for automation.
+OpenCode, Grok Build, and Antigravity also support `OPENCODE_DATA_DIRS`,
+`GROK_DATA_DIRS`, `GROK_HOME`, and `ANTIGRAVITY_DATA_DIRS` for automation.
+
+Antigravity is read from its local conversation databases, offline, with no
+Google sign-in. Older conversations are encrypted `.pb` files that cannot be
+read; a scan that finds them prints
+`scan warning: unreadable_history provider=antigravity files=<n>`, and their
+usage is missing. Copies under `~/.gemini/antigravity-ide` and
+`~/.gemini/antigravity-backup` are not read, so nothing is counted twice. The
+`agy` CLI's `~/.gemini/antigravity-cli` is read when it exists. Gemini and
+GPT-OSS requests are counted without a cost until their prices are added.
 
 ### Cursor: manual CSV import
 
@@ -577,7 +587,7 @@ Rust applications. The backend-facing sync boundary begins at
 | Crate | Responsibility |
 |---|---|
 | `statsai-core` | Normalized types, stable IDs, schemas, and privacy metadata |
-| `statsai-adapters` | Claude Code, Codex, OpenCode, and Grok Build adapters |
+| `statsai-adapters` | Claude Code, Codex, OpenCode, Grok Build, and Antigravity adapters |
 | `statsai-store` | Local SQLite persistence |
 | `statsai-pricing` | Time-aware provider pricing and API-equivalent estimates |
 | `statsai-privacy` | Local privacy filtering and pseudonymization |
