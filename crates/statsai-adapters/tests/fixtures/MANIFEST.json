@@ -1,9 +1,49 @@
 {
   "files": [
     {
-      "bytes": 1291,
+      "bytes": 2143,
       "path": "README.md",
-      "sha256": "5ff24bbc9310bd128cd3f8419aaac646449dbd8c9ca9c1f02d4f2dd1eec13cc4"
+      "sha256": "d1bf094775479509f1f37d09f41475f60fd874feef75ce28aa4e216ea83e444d"
+    },
+    {
+      "bytes": 3953,
+      "path": "antigravity/expected.json",
+      "sha256": "2901aa347d663ce50009757e87245718304538f396b4a424a165cc354cf286f5"
+    },
+    {
+      "bytes": 14336,
+      "path": "antigravity/store/conversations/00000000-0000-4000-8000-000000000002.db",
+      "sha256": "2b6fb2c78e93ba0bbfb365e4e9afc89b04236b9678374967e7da1bf2bcd564be"
+    },
+    {
+      "bytes": 14336,
+      "path": "antigravity/store/conversations/00000000-0000-4000-8000-000000000005.db",
+      "sha256": "934a7e712f7d20dd2911986068e6c6ea6f4844b3936857fcd0f1e9ce8fe8daea"
+    },
+    {
+      "bytes": 14336,
+      "path": "antigravity/store/conversations/00000000-0000-4000-8000-000000000011.db",
+      "sha256": "0a2a693ad9997e29dbaf48f50e98fdd88e8a6ee02ac4ae26cba9954a7fd14b2e"
+    },
+    {
+      "bytes": 14336,
+      "path": "antigravity/store/conversations/00000000-0000-4000-8000-000000000015.db",
+      "sha256": "3230ec4b2ecc4e27ddca528ef94259c66d4611484edb38c7804146e62ee84a8a"
+    },
+    {
+      "bytes": 14336,
+      "path": "antigravity/store/conversations/00000000-0000-4000-8000-000000000019.db",
+      "sha256": "e2b75f5b6370a659b7fe368293e22e7d71a7ea7685ef17bf282f9522184b1422"
+    },
+    {
+      "bytes": 19456,
+      "path": "antigravity/store/conversations/00000000-0000-4000-8000-000000000024.db",
+      "sha256": "89d1a533b2b62468f10be7c761c262dab772fc318b33405c793819b7a21815d7"
+    },
+    {
+      "bytes": 512,
+      "path": "antigravity/store/conversations/00000000-0000-4000-8000-000000000027.pb",
+      "sha256": "79a7eaab9154958ead7bf905768132b77a55095527b5a7a6d85b43817b9a79ed"
     },
     {
       "bytes": 685,
@@ -243,6 +283,21 @@
   },
   "privacy": "synthetic identities/content; real provider shapes and numeric telemetry",
   "scenarios": {
+    "antigravity": {
+      "conversations": 6,
+      "covers": [
+        "checkpoint",
+        "claude-vertex",
+        "gemini-thinking",
+        "gpt-oss",
+        "label-elsewhere",
+        "planner-without-usage",
+        "retried-request",
+        "subagent"
+      ],
+      "derived_from_local_store": false,
+      "encrypted": 1
+    },
     "claude": {
       "basic": 17,
       "cache-write": 17,

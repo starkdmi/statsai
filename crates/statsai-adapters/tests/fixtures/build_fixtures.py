@@ -29,6 +29,7 @@ DEFAULT_CLAUDE = HOME / ".claude"
 DEFAULT_CODEX = HOME / ".codex"
 DEFAULT_OPENCODE = HOME / ".local/share/opencode"
 DEFAULT_GROK = HOME / ".grok"
+DEFAULT_ANTIGRAVITY = HOME / ".gemini/antigravity"
 
 SAFE_ENUM_KEYS = {
     "type", "role", "stop_reason", "stop_sequence", "entrypoint", "origin",
@@ -736,6 +737,648 @@ def build_grok(root: Path, output: Path, sanitizer: Sanitizer, sources: set[Path
     return {"basic": counts}
 
 
+# --- Antigravity -------------------------------------------------------------
+#
+# Antigravity keeps one SQLite file per conversation, with its records as
+# protobuf blobs. Every blob is parsed and re-serialized: it must round-trip
+# byte-exactly first, so the tree shape, field numbers, varints, and fixed-width
+# fields stay as they were, and then every string leaf is rewritten. Numbers,
+# timestamps, and enums are varints and stay; long numeric ids such as the
+# `sessionID` value are strings and are replaced.
+
+ANTIGRAVITY_PLANNER_RESPONSE = 15
+ANTIGRAVITY_CHECKPOINT = 23
+# Metadata keys and literals that identify nothing.
+ANTIGRAVITY_KEEP_STRINGS = {
+    "", "main", "true", "false", "sessionID", "model_enum", "trajectory_id", "request_id",
+    "cascade_id", "root_cascade_id", "last_step_index", "last_execution_id",
+    "used_claude", "used_claude_conservative", "used_non_gemini_model",
+}
+# Built-in sub-agent names. A custom agent's name is the user's text.
+ANTIGRAVITY_AGENT_NAMES = {"research"}
+ANTIGRAVITY_COVERAGE = [
+    "gemini-thinking", "claude-vertex", "gpt-oss", "checkpoint",
+    "retried-request", "planner-without-usage", "subagent",
+]
+# Strings the export writes itself: the synthetic stand-ins, the adapter's
+# fallback model name, and expected.json's schema, keys and scenario names.
+ANTIGRAVITY_WRITTEN_STRINGS = {
+    "file:///workspace/sample-project", "https://example.invalid/acme/sample-project.git",
+    "acme/sample-project", "fixture/main", "fixture-agent", "text_fixture_",
+    "00000000-0000-4000-8000-", "antigravity-model-", "statsai-antigravity-expected.v1",
+    "schema", "covers", "unreadable_history_files", "conversations", "planner",
+    "checkpoint", "planner_without_usage", "models", "parent", "agent", "branch",
+    "calls", "input", "cache_write", "cache_read", "thinking", "response",
+    "gemini-thinking", "claude-vertex", "gpt-oss", "retried-request",
+    "planner-without-usage", "subagent", "label-elsewhere",
+}
+# Steps a conversation named elsewhere may add, with its namers, to the fixtures.
+ANTIGRAVITY_LABEL_ELSEWHERE_STEP_BUDGET = 120
+ANTIGRAVITY_FAKE_URI = "file:///workspace/sample-project"
+ANTIGRAVITY_FAKE_REMOTE = "https://example.invalid/acme/sample-project.git"
+ANTIGRAVITY_FAKE_SLUG = "acme/sample-project"
+ANTIGRAVITY_SYNTHETIC_MARKER = "STATSAI_SYNTHETIC_STORE"
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Names a request was served under or selected with, such as `gemini-3-flash-a`
+# or `gpt-oss-120b-medium`. Only names seen in those two places are kept; the
+# same shape elsewhere can be an internal codename.
+ANTIGRAVITY_MODEL_NAME_RE = re.compile(r"^(?:gemini|claude|gpt)-[A-Za-z0-9._\-]*[0-9][A-Za-z0-9._\-]*$")
+
+
+def pb_varint(data: bytes, index: int) -> tuple[int, int]:
+    value = 0
+    for shift in range(0, 64, 7):
+        byte = data[index]
+        index += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, index
+    raise ValueError("varint too long")
+
+
+def pb_parse(data: bytes) -> list[tuple[int, int, Any]] | None:
+    """(field, wire type, value) for each field, or None if `data` is not a message."""
+    fields = []
+    index = 0
+    try:
+        while index < len(data):
+            key, index = pb_varint(data, index)
+            field, wire_type = key >> 3, key & 7
+            if field == 0:
+                return None
+            if wire_type == 0:
+                value, index = pb_varint(data, index)
+            elif wire_type in (1, 5):
+                width = 8 if wire_type == 1 else 4
+                if index + width > len(data):
+                    return None
+                value, index = data[index:index + width], index + width
+            elif wire_type == 2:
+                length, index = pb_varint(data, index)
+                if index + length > len(data):
+                    return None
+                value, index = data[index:index + length], index + length
+            else:
+                return None
+            fields.append((field, wire_type, value))
+    except (IndexError, ValueError):
+        return None
+    return fields
+
+
+def pb_encode_varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def pb_text(value: bytes) -> str | None:
+    """`value` as text, when it is UTF-8 with no control characters but whitespace."""
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if any(ord(ch) < 32 and ch not in "\n\r\t" for ch in text):
+        return None
+    return text
+
+
+def pb_sub(data: bytes, number: int) -> list[bytes]:
+    return [value for field, wire_type, value in (pb_parse(data) or []) if field == number and wire_type == 2]
+
+
+def pb_ints(data: bytes) -> dict[int, int]:
+    return {field: value for field, wire_type, value in (pb_parse(data) or []) if wire_type == 0}
+
+
+def pb_string(data: bytes, number: int) -> str | None:
+    values = pb_sub(data, number)
+    text = pb_text(values[-1]) if values else None
+    return text.strip() or None if text is not None else None
+
+
+class AntigravityRewriter:
+    """Rewrites every string in Antigravity blobs and text columns.
+
+    Ids map to fake ids consistently across files, so a parent link and the
+    conversation id in each step still hold. Model names are kept only when
+    they name a request: the request settings also carry internal codenames.
+    """
+
+    def __init__(self, sanitizer: Sanitizer, keep_models: set[str]) -> None:
+        self.sanitizer = sanitizer
+        self.keep_models = keep_models
+        self.uuids: dict[str, str] = {}
+        self.numbers: dict[str, str] = {}
+        # Everything the output may say on purpose, in lower case: what is
+        # kept, the synthetic stand-ins, and expected.json's own vocabulary.
+        self.written = {
+            text.lower()
+            for text in ANTIGRAVITY_KEEP_STRINGS | ANTIGRAVITY_AGENT_NAMES | keep_models | ANTIGRAVITY_WRITTEN_STRINGS
+        }
+
+    def fake_uuid(self, value: str) -> str:
+        if value not in self.uuids:
+            self.uuids[value] = f"00000000-0000-4000-8000-{len(self.uuids) + 1:012d}"
+        return self.uuids[value]
+
+    def fake_number(self, value: str) -> str:
+        digits = value.lstrip("-")
+        if value not in self.numbers:
+            seed = str(len(self.numbers) + 1)
+            self.numbers[value] = ("-" if value.startswith("-") else "") + ("9" * len(digits))[: len(digits) - len(seed)] + seed
+        return self.numbers[value]
+
+    def string(self, text: str, table: str, path: tuple[int, ...]) -> str:
+        if text in ANTIGRAVITY_KEEP_STRINGS or text in self.keep_models:
+            return text
+        if table == "trajectory_metadata_blob":
+            if path[:2] == (1, 3):
+                return ANTIGRAVITY_FAKE_REMOTE if looks_like_git_remote(text) else ANTIGRAVITY_FAKE_SLUG
+            if path == (1, 4):
+                return "fixture/main"
+            if path in {(4, 1), (8, 1)}:
+                return text if text in ANTIGRAVITY_AGENT_NAMES else "fixture-agent"
+        if UUID_RE.fullmatch(text):
+            return self.fake_uuid(text)
+        if ISO_DATE_RE.fullmatch(text.strip()):
+            return text
+        if re.fullmatch(r"-?\d+", text):
+            return text if len(text.lstrip("-")) <= 6 else self.fake_number(text)
+        if text.startswith("file://"):
+            self.remember(text)
+            return ANTIGRAVITY_FAKE_URI
+        if text.startswith('["file://'):
+            try:
+                return json.dumps([ANTIGRAVITY_FAKE_URI for _ in json.loads(text)])
+            except ValueError:
+                pass
+        self.remember(text)
+        return self.sanitizer.fake_id("text", text)
+
+    def remember(self, text: str) -> None:
+        """Forbids a rewritten original from appearing anywhere in the output.
+
+        Short originals are too likely to occur by chance to check. So is one
+        the output contains on purpose: `ANTIGRAVITY` in executor metadata is
+        rewritten, yet expected.json names unlabeled models
+        `antigravity-model-<id>`, and a settings codename such as
+        `gemini-3-flash` is rewritten while the served name `gemini-3-flash-a`
+        stays. `validate_antigravity_strings` still checks every string left.
+        """
+        lowered = text.lower()
+        if len(text) >= 8 and not any(lowered in written for written in self.written):
+            self.sanitizer.forbidden_tokens.add(text)
+
+    def rebuild(self, data: bytes, table: str | None, path: tuple[int, ...] = ()) -> bytes | None:
+        """Re-serializes `data`; with `table` None, unchanged (the round trip)."""
+        fields = pb_parse(data)
+        if fields is None or len(path) > 40:
+            return None
+        out = bytearray()
+        for field, wire_type, value in fields:
+            out += pb_encode_varint((field << 3) | wire_type)
+            if wire_type == 0:
+                out += pb_encode_varint(value)
+            elif wire_type in (1, 5):
+                out += value
+            else:
+                inner = self.rebuild_value(value, table, path + (field,))
+                out += pb_encode_varint(len(inner)) + inner
+        return bytes(out)
+
+    def rebuild_value(self, value: bytes, table: str | None, path: tuple[int, ...]) -> bytes:
+        text = pb_text(value)
+        if text is not None and (text.isprintable() or pb_parse(value) is None):
+            return value if table is None else self.string(text, table, path).encode("utf-8")
+        nested = self.rebuild(value, table, path) if value else None
+        if nested is not None:
+            return nested
+        # Opaque bytes: the length class stays, the content does not.
+        return value if table is None else b"\0" * min(len(value), 16)
+
+    def blob(self, value: bytes, table: str) -> bytes:
+        if self.rebuild(value, None) != value:
+            raise RuntimeError("an Antigravity blob does not round-trip; refusing to rewrite it")
+        rewritten = self.rebuild(value, table)
+        return rewritten if rewritten is not None else b"\0" * min(len(value), 16)
+
+    def cell(self, value: Any, table: str) -> Any:
+        if isinstance(value, bytes) and value:
+            return self.blob(value, table)
+        if isinstance(value, str):
+            return self.string(value, table, ())
+        return value
+
+
+def looks_like_git_remote(value: str) -> bool:
+    if "://" in value:
+        return True
+    match = re.match(r"^[^@\s]+@([^:/\s]+):\S+$", value)
+    return match is not None
+
+
+def sqlite_live_ro(path: Path) -> sqlite3.Connection:
+    """Read-only, without `immutable`: Antigravity may be writing the file."""
+    quoted = str(path).replace("?", "%3f").replace("#", "%23")
+    connection = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True)
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
+def antigravity_usage(usage: bytes) -> dict[str, int]:
+    """`ModelUsageStats` as the adapter counts it: output is the response
+    alone (field 10), or the total output (3) less thinking (9) without it."""
+    values = pb_ints(usage)
+    thinking = values.get(9, 0)
+    response = values.get(10, 0) or max(values.get(3, 0) - thinking, 0)
+    return {
+        "input": values.get(2, 0), "cache_write": values.get(4, 0),
+        "cache_read": values.get(5, 0), "thinking": thinking, "response": response,
+    }
+
+
+def antigravity_calls(connection: sqlite3.Connection) -> tuple[list[dict[str, Any]], int]:
+    """Every model request with usage, and the planner steps without any."""
+    calls = []
+    without_usage = 0
+    rows = connection.execute(
+        "SELECT idx, step_type, metadata FROM steps WHERE step_type IN (?, ?) ORDER BY idx",
+        (ANTIGRAVITY_PLANNER_RESPONSE, ANTIGRAVITY_CHECKPOINT),
+    )
+    for _, step_type, metadata in rows:
+        metadata = metadata or b""
+        if pb_parse(metadata) is None:
+            continue
+        if step_type == ANTIGRAVITY_PLANNER_RESPONSE:
+            usages = pb_sub(metadata, 9)
+            if not usages or pb_parse(usages[-1]) is None:
+                without_usage += 1
+                continue
+            calls.append({"kind": "planner", "usage": usages[-1]})
+            continue
+        retries = pb_sub(metadata, 28)
+        for retry in retries:
+            for usage in pb_sub(retry, 2)[-1:]:
+                calls.append({"kind": "checkpoint", "usage": usage})
+        if not retries:
+            for usage in pb_sub(metadata, 9)[-1:]:
+                calls.append({"kind": "checkpoint", "usage": usage})
+    return calls, without_usage
+
+
+def antigravity_gen_names(connection: sqlite3.Connection) -> tuple[list[tuple[int, str]], list[tuple[int, str]], int]:
+    """(model id, served name) and (model id, selected label) pairs, and the
+    number of requests that were retried. Only fields 1 and 3 are opened."""
+    served, labels, retried = [], [], 0
+    for (data,) in connection.execute("SELECT data FROM gen_metadata"):
+        data = data or b""
+        requests = pb_sub(data, 1)
+        for request in requests:
+            if len(pb_sub(request, 17)) > 1:
+                retried += 1
+            model = pb_ints(request).get(3)
+            name = pb_string(request, 19)
+            if model and name:
+                served.append((model, name))
+        for settings in pb_sub(data, 3):
+            model = pb_ints(settings).get(1) or next((pb_ints(r).get(3) for r in requests if pb_ints(r).get(3)), None)
+            label = pb_string(settings, 28)
+            if model and label:
+                labels.append((model, label))
+    return served, labels, retried
+
+
+def antigravity_trajectory(connection: sqlite3.Connection) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT data FROM trajectory_metadata_blob ORDER BY (id = 'main') DESC, rowid LIMIT 1"
+    ).fetchone()
+    data = (row[0] if row else b"") or b""
+    workspace = (pb_sub(data, 1) or [b""])[-1]
+    agent = None
+    for number in (8, 4):
+        for message in pb_sub(data, number)[-1:]:
+            agent = agent or pb_string(message, 1)
+    return {
+        "parent": pb_string(data, 5),
+        "agent": agent,
+        "branch": pb_string(workspace, 4),
+        "workspace": pb_string(workspace, 1) or pb_string(data, 7) or pb_string(workspace, 2),
+    }
+
+
+def antigravity_conversation_id(connection: sqlite3.Connection, path: Path) -> str:
+    ids = [row[0] for row in connection.execute(
+        "SELECT DISTINCT cascade_id FROM trajectory_meta WHERE cascade_id IS NOT NULL AND cascade_id <> '' LIMIT 2"
+    )]
+    return ids[0].strip() if len(ids) == 1 else path.stem
+
+
+def antigravity_features(connection: sqlite3.Connection) -> set[str]:
+    calls, without_usage = antigravity_calls(connection)
+    _, _, retried = antigravity_gen_names(connection)
+    features = set()
+    for call in calls:
+        values = pb_ints(call["usage"])
+        if call["kind"] == "checkpoint":
+            features.add("checkpoint")
+            continue
+        provider = values.get(6)
+        if provider == 24 and values.get(9, 0) > 0:
+            features.add("gemini-thinking")
+        elif provider == 26:
+            features.add("claude-vertex")
+        elif provider == 31:
+            features.add("gpt-oss")
+    if without_usage:
+        features.add("planner-without-usage")
+    if retried:
+        features.add("retried-request")
+    if antigravity_trajectory(connection)["parent"]:
+        features.add("subagent")
+    return features
+
+
+def build_antigravity(root: Path, output: Path, sanitizer: Sanitizer, sources: set[Path]) -> dict[str, Any]:
+    conversations = root / "conversations"
+    db_paths = sorted(path for path in conversations.glob("*.db") if path.is_file())
+    if not db_paths:
+        raise RuntimeError("Antigravity conversation databases are unavailable")
+    staging = Path(tempfile.mkdtemp(prefix="antigravity-copies-"))
+    try:
+        # Consistent private copies first: the live files may be written to
+        # while they are read.
+        copies: dict[Path, Path] = {}
+        info: dict[Path, dict[str, Any]] = {}
+        for path in db_paths:
+            copy = staging / path.name
+            source = sqlite_live_ro(path)
+            target = sqlite3.connect(copy)
+            source.backup(target)
+            source.close()
+            target.close()
+            connection = sqlite3.connect(copy)
+            _, labels, _ = antigravity_gen_names(connection)
+            calls, _ = antigravity_calls(connection)
+            info[path] = {
+                "id": antigravity_conversation_id(connection, path),
+                "features": antigravity_features(connection),
+                "parent": antigravity_trajectory(connection)["parent"],
+                "steps": connection.execute("SELECT count(*) FROM steps").fetchone()[0],
+                "labeled": {model for model, _ in labels},
+                "models": {pb_ints(call["usage"]).get(1) for call in calls} - {None, 0},
+            }
+            connection.close()
+            copies[path] = copy
+
+        # A conversation that switched models names only its latest one; the
+        # adapter names the others from conversations that selected them.
+        for path, value in info.items():
+            elsewhere = {
+                model for model in value["models"] - value["labeled"]
+                if any(model in other["labeled"] for other_path, other in info.items() if other_path != path)
+            }
+            if elsewhere:
+                value["features"].add("label-elsewhere")
+            value["elsewhere"] = elsewhere
+
+        # The fewest, smallest conversations that cover every scenario. A
+        # sub-agent comes with its parent.
+        by_id = {value["id"]: path for path, value in info.items()}
+        selected: list[Path] = []
+        covered: set[str] = set()
+
+        def select(path: Path) -> None:
+            if path not in selected:
+                selected.append(path)
+                covered.update(info[path]["features"] - {"label-elsewhere"})
+
+        subagents = sorted(
+            (path for path, value in info.items() if value["parent"] in by_id),
+            key=lambda path: (info[path]["steps"], path.name),
+        )
+        if subagents:
+            select(subagents[0])
+            select(by_id[info[subagents[0]]["parent"]])
+        for path in sorted(db_paths, key=lambda path: (info[path]["steps"], path.name)):
+            if info[path]["features"] - covered - {"subagent", "label-elsewhere"}:
+                select(path)
+
+        # Optional: a conversation whose model is named only elsewhere, with
+        # the conversations that name it, when that adds little.
+        best: tuple[int, list[Path]] | None = None
+        for path in sorted(db_paths, key=lambda path: (info[path]["steps"], path.name)):
+            if not info[path]["elsewhere"]:
+                continue
+            extra = [] if path in selected else [path]
+            for model in sorted(info[path]["elsewhere"]):
+                if any(model in info[chosen]["labeled"] for chosen in selected + extra):
+                    continue
+                extra.append(min(
+                    (other for other in db_paths if other != path and model in info[other]["labeled"]),
+                    key=lambda other: (info[other]["steps"], other.name),
+                ))
+            cost = sum(info[chosen]["steps"] for chosen in extra)
+            if best is None or cost < best[0]:
+                best = (cost, extra)
+        if best is not None and best[0] <= ANTIGRAVITY_LABEL_ELSEWHERE_STEP_BUDGET:
+            for path in best[1]:
+                select(path)
+        missing = [scenario for scenario in ANTIGRAVITY_COVERAGE if scenario not in covered]
+        if missing:
+            raise RuntimeError("Antigravity store lacks fixture scenarios: " + ", ".join(missing))
+
+        keep_models: set[str] = set()
+        for path in selected:
+            connection = sqlite3.connect(copies[path])
+            served, labels, _ = antigravity_gen_names(connection)
+            connection.close()
+            keep_models.update(
+                name for _, name in served + labels if ANTIGRAVITY_MODEL_NAME_RE.fullmatch(name)
+            )
+        rewriter = AntigravityRewriter(sanitizer, keep_models)
+        target_dir = output / "antigravity/store/conversations"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for path in selected:
+            sources.add(path)
+            connection = sqlite3.connect(copies[path])
+            connection.execute("PRAGMA journal_mode=DELETE")
+            tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            for table in tables:
+                columns = [row[1] for row in connection.execute(f"PRAGMA table_info(`{table}`)")]
+                rows = connection.execute(f"SELECT * FROM `{table}`").fetchall()
+                connection.execute(f"DELETE FROM `{table}`")
+                marks = ", ".join("?" for _ in columns)
+                names = ", ".join(f"`{column}`" for column in columns)
+                for row in rows:
+                    cells = [rewriter.cell(cell, table) for cell in row]
+                    if table == "gen_metadata" and "size" in columns and "data" in columns:
+                        data = cells[columns.index("data")]
+                        cells[columns.index("size")] = len(data) if isinstance(data, bytes) else 0
+                    connection.execute(f"INSERT INTO `{table}` ({names}) VALUES ({marks})", cells)
+            connection.commit()
+            # A fresh file: no page of the original survives as free space.
+            connection.execute("PRAGMA page_size=1024")
+            connection.execute("VACUUM")
+            connection.close()
+            fake_id = rewriter.fake_uuid(info[path]["id"])
+            shutil.copyfile(copies[path], target_dir / f"{fake_id}.db")
+
+        # A stand-in for a legacy encrypted conversation: invented bytes, never
+        # a real file, even an encrypted one.
+        encrypted = target_dir / f"{rewriter.fake_uuid('encrypted-legacy-conversation')}.pb"
+        stream = b""
+        while len(stream) < 512:
+            stream += hashlib.sha256(b"statsai-antigravity-fixture" + len(stream).to_bytes(4, "big")).digest()
+        encrypted.write_bytes(stream[:512])
+
+        expected = antigravity_expected(output / "antigravity/store")
+        write_json(output / "antigravity/expected.json", expected)
+        return {
+            "conversations": len(selected),
+            "encrypted": 1,
+            "covers": expected["covers"],
+            "derived_from_local_store": not (root / ANTIGRAVITY_SYNTHETIC_MARKER).exists(),
+        }
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def most_common_name(names: dict[str, int]) -> str | None:
+    if not names:
+        return None
+    return min(names.items(), key=lambda item: (-item[1], item[0]))[0]
+
+
+def antigravity_expected(store: Path) -> dict[str, Any]:
+    """What the adapter must read from the exported store, from this decoder."""
+    conversations = {}
+    global_served: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    global_labels: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    per_file = []
+    covers: set[str] = set()
+    for path in sorted((store / "conversations").glob("*.db")):
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        served, labels, _ = antigravity_gen_names(connection)
+        local_served: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        local_labels: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for model, name in served:
+            local_served[model][name] += 1
+            global_served[model][name] += 1
+        for model, name in labels:
+            local_labels[model][name] += 1
+            global_labels[model][name] += 1
+        calls, without_usage = antigravity_calls(connection)
+        covers.update(antigravity_features(connection))
+        per_file.append((
+            antigravity_conversation_id(connection, path), calls, without_usage,
+            antigravity_trajectory(connection), local_served, local_labels,
+        ))
+        connection.close()
+    for conversation_id, calls, without_usage, trajectory, local_served, local_labels in per_file:
+        totals = {kind: {"calls": 0, "input": 0, "cache_write": 0, "cache_read": 0, "thinking": 0, "response": 0} for kind in ("planner", "checkpoint")}
+        models: dict[str, int] = defaultdict(int)
+        for call in calls:
+            usage = antigravity_usage(call["usage"])
+            if sum(usage.values()) == 0:
+                continue
+            bucket = totals[call["kind"]]
+            bucket["calls"] += 1
+            for key, value in usage.items():
+                bucket[key] += value
+            model = pb_ints(call["usage"]).get(1)
+            if not model:
+                models["|"] += 1
+                continue
+            label = most_common_name(local_labels.get(model, {})) or most_common_name(global_labels.get(model, {}))
+            served = most_common_name(local_served.get(model, {})) or most_common_name(global_served.get(model, {}))
+            name = label or served or f"antigravity-model-{model}"
+            models[f"{name}|{served or ''}"] += 1
+        conversations[conversation_id] = {
+            **totals,
+            "planner_without_usage": without_usage,
+            "models": dict(sorted(models.items())),
+            "parent": trajectory["parent"],
+            "agent": trajectory["agent"] if trajectory["parent"] else None,
+            "branch": trajectory["branch"],
+        }
+    unreadable = sum(
+        1 for path in (store / "conversations").glob("*.pb") if not path.with_suffix(".db").exists()
+    )
+    for conversation_id, calls, _, _, _, local_labels in per_file:
+        for call in calls:
+            model = pb_ints(call["usage"]).get(1)
+            if model and model not in local_labels and model in global_labels:
+                covers.add("label-elsewhere")
+    return {
+        "schema": "statsai-antigravity-expected.v1",
+        "covers": sorted(covers),
+        "unreadable_history_files": unreadable,
+        "conversations": dict(sorted(conversations.items())),
+    }
+
+
+def antigravity_string_leaves(data: bytes, depth: int = 0) -> Iterable[str]:
+    for _, wire_type, value in pb_parse(data) or []:
+        if wire_type != 2:
+            continue
+        text = pb_text(value)
+        if text is not None and (text.isprintable() or pb_parse(value) is None):
+            yield text
+        elif depth < 40:
+            yield from antigravity_string_leaves(value, depth + 1)
+
+
+ANTIGRAVITY_SAFE_STRING_RE = re.compile(
+    r"^(?:text_fixture_\d{3,}|fixture/main|fixture-agent|"
+    + re.escape(ANTIGRAVITY_FAKE_URI) + "|" + re.escape(ANTIGRAVITY_FAKE_REMOTE) + "|"
+    + re.escape(ANTIGRAVITY_FAKE_SLUG) + r"|00000000-0000-4000-8000-\d{12}|-?\d+|"
+    r"\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+\-Z]+)?)$"
+)
+
+
+def validate_antigravity_strings(root: Path) -> None:
+    """Every string left in the Antigravity fixtures is a known-safe form.
+
+    A model name passes only where requests are named (`1.19`, `3.28`); the
+    same name anywhere else, such as a codename in the request settings, has
+    to have been rewritten like any other string.
+    """
+    paths = sorted((root / "antigravity").rglob("*.db"))
+    model_names: set[str] = set()
+    for path in paths:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        served, labels, _ = antigravity_gen_names(connection)
+        connection.close()
+        model_names.update(name for _, name in served + labels if ANTIGRAVITY_MODEL_NAME_RE.fullmatch(name))
+    allowed = ANTIGRAVITY_KEEP_STRINGS | ANTIGRAVITY_AGENT_NAMES | model_names
+    stray: set[str] = set()
+    for path in paths:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        for (table,) in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+            for row in connection.execute(f"SELECT * FROM `{table}`"):
+                for cell in row:
+                    if isinstance(cell, bytes):
+                        strings = list(antigravity_string_leaves(cell))
+                    else:
+                        strings = [cell] if isinstance(cell, str) else []
+                    for text in strings:
+                        if text in allowed or ANTIGRAVITY_SAFE_STRING_RE.fullmatch(text):
+                            continue
+                        if text.startswith("[") and text == json.dumps([ANTIGRAVITY_FAKE_URI] * text.count(ANTIGRAVITY_FAKE_URI)):
+                            continue
+                        stray.add(text[:40])
+        connection.close()
+    if stray:
+        raise RuntimeError(f"Antigravity fixtures keep {len(stray)} unexpected strings")
+
+
 CURSOR_CSV_HEADER = (
     "Date,Cloud Agent ID,Automation ID,Kind,Model,Max Mode,"
     "Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,"
@@ -868,6 +1511,9 @@ def validate_privacy(root: Path, forbidden_tokens: set[str]) -> None:
     violations: list[str] = []
     for path in fixture_files(root):
         relative = path.relative_to(root)
+        if path.suffix == ".pb":
+            # Invented stand-ins for encrypted conversations: random bytes, no text.
+            continue
         if path.suffix in {".db", ".sqlite"}:
             blobs = []
             connection = sqlite3.connect(path)
@@ -875,6 +1521,10 @@ def validate_privacy(root: Path, forbidden_tokens: set[str]) -> None:
                 try:
                     for row in connection.execute(f'SELECT * FROM "{table}"'):
                         blobs.extend(str(value) for value in row if isinstance(value, str))
+                        # Antigravity keeps its text inside protobuf blobs.
+                        for value in row:
+                            if isinstance(value, bytes):
+                                blobs.extend(antigravity_string_leaves(value))
                 except sqlite3.DatabaseError:
                     continue
             connection.close()
@@ -901,8 +1551,7 @@ def validate_privacy(root: Path, forbidden_tokens: set[str]) -> None:
         raise RuntimeError("privacy validation failed: " + "; ".join(sorted(set(violations))))
 
 
-def write_readme(root: Path) -> None:
-    text = """# StatsAI cloud fixtures
+README_TEXT = """# StatsAI cloud fixtures
 
 Generated by `build_fixtures.py` from local provider trace *schemas*. Original
 stores are read-only and are checked for size/mtime/inode changes after export.
@@ -913,8 +1562,29 @@ Timestamps, numeric usage/cost/latency fields, public model names, enum values,
 JSON shapes, and SQLite table layouts are retained.
 
 `malformed-record` and `malformed` each add one intentionally invalid JSONL row.
+Hand-authored `activity-*` fixtures cover tool/MCP/skill extraction for Codex,
+Claude Code, OpenCode, and Grok Build. They are synthetic; regenerate them with
+`write_activity_fixtures.py` rather than `build_fixtures.py`.
 `opencode/sqlite-v1` is the supported aggregate-session shape; `sqlite-v2`
 uses the current local session/message/part/todo schemas with sanitized rows.
+
+`antigravity/store` holds Antigravity conversation databases whose protobuf
+blobs were re-serialized after a byte-exact round trip, with every string
+rewritten. Model names survive only where a request is named. The `.pb` file
+is invented bytes standing in for an encrypted legacy conversation.
+`antigravity/expected.json` is what the export's own decoder reads from those
+files; the adapter test must agree with it. `scenarios.antigravity` in
+`MANIFEST.json` records whether the export ran over a real store
+(`derived_from_local_store`) or over the invented one that
+`write_antigravity_store.py` writes, whose values are all made up. Refresh just
+this provider with:
+
+```sh
+./build_fixtures.py --only antigravity --antigravity-root ~/.gemini/antigravity
+```
+
+Quit Antigravity first: the export checks that the store did not change while
+it was read.
 
 `cursor/` is the exception: those CSVs are hand-authored rather than derived
 from a local store, because Cursor keeps no local usage trace. They reproduce
@@ -927,41 +1597,71 @@ Rerun from this directory:
 ./build_fixtures.py
 ```
 """
-    (root / "README.md").write_text(text, encoding="utf-8")
+
+
+def write_readme(root: Path) -> None:
+    (root / "README.md").write_text(README_TEXT, encoding="utf-8")
+
+
+PROVIDER_DIRS = ["claude", "codex", "opencode", "grok", "cursor", "antigravity"]
 
 
 def parse_args() -> argparse.Namespace:
-    script_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=script_root / "tests/fixtures")
+    parser.add_argument(
+        "--output", type=Path, default=None,
+        help="default: tests/fixtures below this directory, or this directory with --only",
+    )
     parser.add_argument("--claude-root", type=Path, default=DEFAULT_CLAUDE)
     parser.add_argument("--codex-root", type=Path, default=DEFAULT_CODEX)
     parser.add_argument("--opencode-root", type=Path, default=DEFAULT_OPENCODE)
     parser.add_argument("--grok-root", type=Path, default=DEFAULT_GROK)
+    parser.add_argument("--antigravity-root", type=Path, default=DEFAULT_ANTIGRAVITY)
+    parser.add_argument(
+        "--only", choices=PROVIDER_DIRS, action="append",
+        help="rebuild only these providers' fixtures, keeping the others and updating MANIFEST.json",
+    )
     return parser.parse_args()
+
+
+def run_builders(args: argparse.Namespace, names: list[str], staging: Path, sanitizer: Sanitizer, sources: set[Path]) -> dict[str, Any]:
+    builders: dict[str, Callable[[], dict[str, Any]]] = {
+        "claude": lambda: build_claude(args.claude_root.resolve(), staging, sanitizer, sources),
+        "codex": lambda: build_codex(args.codex_root.resolve(), staging, sanitizer, sources),
+        "opencode": lambda: build_opencode(args.opencode_root.resolve(), staging, sanitizer, sources),
+        "grok": lambda: build_grok(args.grok_root.resolve(), staging, sanitizer, sources),
+        "cursor": lambda: build_cursor(staging),
+        "antigravity": lambda: build_antigravity(args.antigravity_root.resolve(), staging, sanitizer, sources),
+    }
+    return {name: builders[name]() for name in names}
+
+
+def manifest_entry(path: Path, root: Path) -> dict[str, Any]:
+    return {"path": path.relative_to(root).as_posix(), "bytes": path.stat().st_size, "sha256": checksum(path)}
 
 
 def main() -> int:
     args = parse_args()
-    output = args.output.resolve()
-    if output == Path("/") or output == HOME or output in {args.claude_root.resolve(), args.codex_root.resolve(), args.opencode_root.resolve(), args.grok_root.resolve()}:
+    script_root = Path(__file__).resolve().parent
+    only = sorted(set(args.only or []), key=PROVIDER_DIRS.index)
+    output = (args.output or (script_root if only else script_root / "tests/fixtures")).resolve()
+    roots = {args.claude_root, args.codex_root, args.opencode_root, args.grok_root, args.antigravity_root}
+    if output == Path("/") or output == HOME or output in {root.resolve() for root in roots}:
         raise RuntimeError("refusing unsafe output path")
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix="fixtures-staging-", dir=output.parent))
     sources: set[Path] = set()
     sanitizer = Sanitizer()
     try:
-        stats = {
-            "claude": build_claude(args.claude_root.resolve(), staging, sanitizer, sources),
-            "codex": build_codex(args.codex_root.resolve(), staging, sanitizer, sources),
-            "opencode": build_opencode(args.opencode_root.resolve(), staging, sanitizer, sources),
-            "grok": build_grok(args.grok_root.resolve(), staging, sanitizer, sources),
-            "cursor": build_cursor(staging),
-        }
+        stats = run_builders(args, only or PROVIDER_DIRS, staging, sanitizer, sources)
         snapshot = readonly_snapshot(sources)
         forbidden = {HOME.name, str(HOME), *sanitizer.forbidden_tokens}
         validate_privacy(staging, forbidden)
+        if "antigravity" in stats:
+            validate_antigravity_strings(staging)
         assert_unchanged(snapshot)
+        if only:
+            return merge_partial_build(output, staging, only, stats, sources)
         write_readme(staging)
         files = fixture_files(staging)
         manifest = {
@@ -969,10 +1669,7 @@ def main() -> int:
             "privacy": "synthetic identities/content; real provider shapes and numeric telemetry",
             "original_sources": {"mode": "read-only", "files_read": len(sources), "paths_recorded": False},
             "scenarios": stats,
-            "files": [
-                {"path": str(path.relative_to(staging)), "bytes": path.stat().st_size, "sha256": checksum(path)}
-                for path in files
-            ],
+            "files": [manifest_entry(path, staging) for path in files],
         }
         write_json(staging / "MANIFEST.json", manifest)
         validate_privacy(staging, forbidden)
@@ -992,6 +1689,38 @@ def main() -> int:
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def merge_partial_build(output: Path, staging: Path, only: list[str], stats: dict[str, Any], sources: set[Path]) -> int:
+    """Replaces the rebuilt providers' directories in `output` and their
+    entries in its MANIFEST.json, leaving every other fixture as it is."""
+    manifest_path = output / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {
+        "schema": "statsai-cloud-fixtures.v1",
+        "privacy": "synthetic identities/content; real provider shapes and numeric telemetry",
+        "original_sources": {"mode": "read-only", "files_read": 0, "paths_recorded": False},
+        "scenarios": {},
+        "files": [],
+    }
+    for name in only:
+        target = output / name
+        if target.exists():
+            shutil.rmtree(target)
+        built = staging / name
+        if built.exists():
+            shutil.copytree(built, target)
+    shutil.rmtree(staging, ignore_errors=True)
+    write_readme(output)
+    rebuilt = tuple(f"{name}/" for name in only)
+    files = [entry for entry in manifest.get("files", []) if not entry["path"].startswith(rebuilt) and entry["path"] != "README.md"]
+    files.append(manifest_entry(output / "README.md", output))
+    for name in only:
+        files.extend(manifest_entry(path, output) for path in fixture_files(output / name))
+    manifest["files"] = sorted(files, key=lambda entry: entry["path"])
+    manifest.setdefault("scenarios", {}).update(stats)
+    write_json(manifest_path, manifest)
+    print(json.dumps({"output": str(output), "rebuilt": only, "original_files_read_only": len(sources)}, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":

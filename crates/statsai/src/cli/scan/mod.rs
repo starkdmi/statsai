@@ -42,7 +42,15 @@ pub(crate) fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Resu
             default_adapters()
         };
 
-    scan_with_adapters(command, store, device_id, adapters)
+    scan_with_adapters(command, store, device_id, adapters).map(|_| ())
+}
+
+/// What a scan reports beside its printed summary.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScanReport {
+    /// History files each provider keeps but no scan can read, summed over
+    /// its sources, as the `scan warning: unreadable_history` lines print them.
+    pub(crate) unreadable_history: BTreeMap<String, u64>,
 }
 
 pub(crate) fn scan_with_adapters(
@@ -50,7 +58,7 @@ pub(crate) fn scan_with_adapters(
     store: &Store,
     device_id: &str,
     adapters: Vec<Box<dyn ProviderAdapter>>,
-) -> Result<()> {
+) -> Result<ScanReport> {
     let scan_started_at = Instant::now();
     let mut preview_task_rebuild = PreviewTaskRebuild::default();
     let mut preview_work_item_rebuild_count = 0u64;
@@ -69,6 +77,7 @@ pub(crate) fn scan_with_adapters(
     let mut total_sources = 0u64;
     let mut total_log_rows = 0u64;
     let mut total_diagnostics = ScanDiagnostics::default();
+    let mut unreadable_history = BTreeMap::<String, u64>::new();
     let mut total_usage = UsageTotals::default();
     let mut total_summary_usage = UsageTotals::default();
     let mut adapter_scan_duration_ms = 0u64;
@@ -249,6 +258,15 @@ pub(crate) fn scan_with_adapters(
                 } else {
                     adapter.probe_verified_source_state(&source)?
                 };
+            // Asked on every scan, like the verified state: these files are
+            // never scan candidates, so a scan that reads nothing would
+            // otherwise lose the warning.
+            let unreadable_history_files = adapter.unreadable_history_files(&source)?;
+            if unreadable_history_files > 0 {
+                *unreadable_history
+                    .entry(adapter.provider().to_string())
+                    .or_default() += unreadable_history_files;
+            }
             let mut scan = if should_run_adapter_scan {
                 let started_at = Instant::now();
                 let scan = adapter.scan(&source, &options)?;
@@ -266,6 +284,7 @@ pub(crate) fn scan_with_adapters(
                     ..statsai_adapters::AdapterScan::default()
                 }
             };
+            scan.diagnostics.unreadable_history_files = unreadable_history_files;
             if !command.include_tasks {
                 scan.task_spans.clear();
             }
@@ -323,7 +342,10 @@ pub(crate) fn scan_with_adapters(
                 || log_rows > 0
                 || account_evidence_count > 0
                 || account_evidence_checkpoint_count > 0
-                || verified_state_changed;
+                || verified_state_changed
+                // A store of only unreadable history still has that to report,
+                // so its line and the totals agree.
+                || unreadable_history_files > 0;
             let suppress_source_processing = !command.verbose
                 && !command.explain
                 && source_event_count == 0
@@ -828,8 +850,19 @@ pub(crate) fn scan_with_adapters(
         }
         print_scan_diagnostics_total(&total_diagnostics);
     }
+    for (provider, files) in &unreadable_history {
+        println!("{}", unreadable_history_warning_line(provider, *files));
+    }
     print_denied_project_settings_folders();
-    Ok(())
+    Ok(ScanReport { unreadable_history })
+}
+
+/// The `scan warning:` line for history a provider keeps in a form the scan
+/// cannot read, such as Antigravity's encrypted legacy conversations, without
+/// a newline: `scan warning: unreadable_history provider=antigravity files=3`.
+/// Usage in those files is missing from the totals.
+pub(crate) fn unreadable_history_warning_line(provider: &str, files: u64) -> String {
+    format!("scan warning: unreadable_history provider={provider} files={files}")
 }
 
 /// One `scan warning:` line per folder whose Claude Code project settings a

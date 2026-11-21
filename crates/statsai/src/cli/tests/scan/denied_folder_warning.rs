@@ -47,3 +47,12 @@ fn denied_folder_warning_line_is_one_line_with_a_json_folder() {
         assert_eq!(parsed, expected_label, "{folder:?} round-trips");
     }
 }
+
+// STA-175: the same contract for history the scan cannot read.
+#[test]
+fn unreadable_history_warning_line_names_provider_and_file_count() {
+    assert_eq!(
+        unreadable_history_warning_line("antigravity", 3),
+        "scan warning: unreadable_history provider=antigravity files=3"
+    );
+}

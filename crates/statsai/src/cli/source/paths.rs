@@ -33,6 +33,13 @@ pub(crate) fn normalize_configured_source_path(provider: &str, path: &Path) -> R
             path = parent.to_path_buf();
         }
     }
+    if provider_matches(provider, "antigravity")
+        && path.file_name().is_some_and(|name| name == "conversations")
+    {
+        if let Some(parent) = path.parent() {
+            path = parent.to_path_buf();
+        }
+    }
     Ok(std::fs::canonicalize(&path).unwrap_or(path))
 }
 

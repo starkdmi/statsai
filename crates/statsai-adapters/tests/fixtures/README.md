@@ -15,6 +15,24 @@ Claude Code, OpenCode, and Grok Build. They are synthetic; regenerate them with
 `opencode/sqlite-v1` is the supported aggregate-session shape; `sqlite-v2`
 uses the current local session/message/part/todo schemas with sanitized rows.
 
+`antigravity/store` holds Antigravity conversation databases whose protobuf
+blobs were re-serialized after a byte-exact round trip, with every string
+rewritten. Model names survive only where a request is named. The `.pb` file
+is invented bytes standing in for an encrypted legacy conversation.
+`antigravity/expected.json` is what the export's own decoder reads from those
+files; the adapter test must agree with it. `scenarios.antigravity` in
+`MANIFEST.json` records whether the export ran over a real store
+(`derived_from_local_store`) or over the invented one that
+`write_antigravity_store.py` writes, whose values are all made up. Refresh just
+this provider with:
+
+```sh
+./build_fixtures.py --only antigravity --antigravity-root ~/.gemini/antigravity
+```
+
+Quit Antigravity first: the export checks that the store did not change while
+it was read.
+
 `cursor/` is the exception: those CSVs are hand-authored rather than derived
 from a local store, because Cursor keeps no local usage trace. They reproduce
 the dashboard export's header, quoting, and enum values, and every value in
