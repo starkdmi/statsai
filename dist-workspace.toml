@@ -12,6 +12,10 @@ ci = "github"
 installers = ["shell", "homebrew"]
 # Per-arch mac builds; release workflow also publishes a lipo universal artifact.
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+# GitHub no longer accepts macos-14, dist's default runner for
+# aarch64-apple-darwin ("The configuration 'macos-14-arm64-us-default' is not
+# supported"), so that build runs on macos-15, as dev-build.yml does.
+github-custom-runners = { aarch64-apple-darwin = "macos-15" }
 tap = "starkdmi/homebrew-tap"
 formula = "statsai"
 publish-jobs = ["homebrew"]
