@@ -1,5 +1,5 @@
 //! Third-party models Cursor serves at their published per-token prices:
-//! DeepSeek V4.1 Flash 1017, Kimi K3, GLM 5.3 and Muse.
+//! DeepSeek V4.1 Flash 1017, Kimi K3, GLM 5.3, Muse and the Gemini 4 line.
 
 use super::*;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -151,6 +151,47 @@ fn cursor_models_have_no_long_context_tier() {
                 )
                 .estimated_api_equivalent_micro_usd,
             Some(micro_usd),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn gemini_4_models_reach_their_own_rates() {
+    let table = embedded_pricing();
+    let usage = UsageCounts {
+        input_tokens: Some(1_000_000),
+        cache_creation_tokens: Some(1_000_000),
+        cache_read_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        ..UsageCounts::default()
+    };
+    // input + cache write (billed as input) + cache read + output. Carbon
+    // and Argon are at Google's introductory price on the catalog day.
+    for (name, micro_usd, model) in [
+        ("gemini-4-neon", 21_150_000, "gemini-4-neon"),
+        ("gemini-4-neon-high", 21_150_000, "gemini-4-neon"),
+        ("gemini-4-hydrogen", 10_575_000, "gemini-4-hydrogen"),
+        ("gemini-4-hydrogen-low", 10_575_000, "gemini-4-hydrogen"),
+        ("gemini-4-carbon", 14_100_000, "gemini-4-carbon"),
+        (
+            "google/gemini-4-carbon-medium",
+            14_100_000,
+            "gemini-4-carbon",
+        ),
+        ("gemini-4-argon", 14_100_000, "gemini-4-argon"),
+        ("gemini-4-argon-max", 14_100_000, "gemini-4-argon"),
+    ] {
+        assert_eq!(normalize_qualified_model_name(name), model, "{name}");
+        let cost = table.estimate_cost_at("cursor", Some(&observed(name)), &usage, &catalog_time());
+        assert_eq!(
+            cost.estimated_api_equivalent_micro_usd,
+            Some(micro_usd),
+            "{name}"
+        );
+        assert_eq!(
+            cost.pricing_source,
+            Some(format!("vertex_ai_pricing:{model}")),
             "{name}"
         );
     }
