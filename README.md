@@ -596,16 +596,43 @@ Cost figures are API-equivalent estimates, not subscription invoices. StatsAI
 selects published pricing by usage timestamp, preserves integer micro-USD
 values, and leaves cost unknown when a source does not prove the billable model.
 
+Prices live in a data file, `crates/statsai-pricing/pricing.json`, that every
+binary embeds. `scan`, `sync`, and the watch daemon also check the copy on
+`main` at most once a day, in a short background process (a thread in the
+daemon) that a scan never waits for, and save a newer copy in the local store.
+Every command prices with the newest copy it can read, embedded or stored. See
+[Pricing file](docs/pricing.md) for the format, the editing rules, and how to
+turn the refresh off (`statsai pricing auto-refresh off` or
+`STATSAI_PRICING_REFRESH=off`). With the refresh off, StatsAI prices with the
+embedded file, except that a store already priced with a newer stored copy
+keeps that copy.
+
 Pricing updates are version-driven and automatic. The selected `statsai` binary
-reprices persisted normalized events when its compiled ruleset is newer than
-the store's last applied ruleset, before scan, report, sync, snapshot, task,
-export, import, or daemon use price-derived data. Diagnostic commands such as
-`status`, `doctor`, `quota`, `conversation`, and `account` do not trigger that
-pass. A raw provider rescan (`--no-cache`) is not required. Ordinary incremental
+reprices persisted normalized events when the pricing file it uses has a newer
+`version` than the store's last applied one, before scan, report, sync,
+snapshot, task, export, import, or daemon use price-derived data. Diagnostic
+commands such as `status`, `doctor`, `quota`, `conversation`, and `account` do
+not trigger that pass. A raw provider rescan (`--no-cache`) is not required,
+except for estimates that adapters such as Grok Build and OpenCode sum from
+per-request records, which only a rescan refreshes. Ordinary incremental
 `statsai sync --sink http` then uploads the corrected dirty rollups;
-`--rebuild-rollups` and `--full` are unnecessary just because prices changed. A
-store already processed by a newer ruleset is refused rather than silently
-repriced backward.
+`--rebuild-rollups` and `--full` are unnecessary just because prices changed.
+When another process reprices the store while a scan, sync, import or watch
+pass is writing, that command reprices the store again when it finishes, so
+nothing it wrote keeps the older prices. A store whose applied pricing version
+is newer than the binary's is used as it is, not repriced. When a scan, sync,
+import or watch pass ends in such a store and cannot read a pricing file at the
+store's version, it lowers that version to its own, and the next binary with a
+newer file reprices every estimate, even ones priced with a newer version; see
+[How clients refresh](docs/pricing.md#how-clients-refresh). A store whose
+stored pricing file has a `format` the binary cannot read is refused with a
+message to upgrade StatsAI.
+
+Releases from before pricing files refuse a store priced past their compiled
+ruleset version (7 in the last of them), and that happens as soon as a newer
+binary adopts a file from `main`. Upgrade every binary that shares the store
+(the CLI, the watch daemon, and StatsAI for Mac) and restart the daemon; see
+[Releases before pricing files](docs/pricing.md#releases-before-pricing-files).
 
 ## Develop locally
 

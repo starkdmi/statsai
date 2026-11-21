@@ -127,8 +127,10 @@ Each download is checked before selection:
 4. `build.json.repository` is `starkdmi/statsai`;
 5. `build.json.sha` is the exact resolved SHA;
 6. workflow run ID and attempt match the downloaded run;
-7. the supported store schema version and pricing ruleset version are recorded
-   in the manifest (`build.json` schema 2);
+7. the manifest records the store schema version the build supports, the
+   version of its embedded pricing file, and the newest pricing file format it
+   reads (`build.json` schema 3). Schema 2 manifests come from builds that
+   predate pricing files: they record no format and are still accepted;
 8. the target and Mach-O header are ARM64 macOS.
 
 Selection is an atomic state-file replacement. The cache retains the current
@@ -151,7 +153,9 @@ statsai-dev env prod
 
 The profiles set the existing `STATSAI_API_URL` and `STATSAI_WEB_URL` variables
 for the launched process, and select the store (see
-[Forward StatsAI commands](#forward-statsai-commands)):
+[Forward StatsAI commands](#forward-statsai-commands)). Under `prod` they also
+remove `STATSAI_PRICING_URL`, a testing override, so a forwarded build can only
+fetch the pricing file from `main`:
 
 | Profile | API | Web | Store |
 |---|---|---|---|
@@ -207,13 +211,65 @@ clone". It is reset to `dev` on first read, with a note, so the old selection is
 never silently reinterpreted as permission to open the production database; run
 `statsai-dev env prod` to opt in to the new meaning.
 
-The prod environment is allowed only when the production database schema **and**
-applied pricing ruleset exactly match the versions supported by the selected
-build; it prints a warning when it proceeds. Missing, older, or newer production
-pricing metadata is refused. A development build never migrates or reprices
-production data as a side effect of a forwarded command, so a schema-changing or
-pricing-changing PR can only be tested under `env dev` against the isolated
-clone.
+The prod environment is allowed only when the production database schema exactly
+matches the one the selected build supports, **and** the build's
+[pricing target](#pricing-versions-and-formats) equals the pricing version
+production's estimates were priced with. It prints a warning naming that version
+when it proceeds. A higher target is refused because the build would reprice
+production. A lower one is refused because the build would price new events with
+an older version than the events already stored. A production database with no
+applied pricing version is refused too, and so is one whose stored pricing file
+has a format the build cannot read. A development build never migrates or
+reprices production data as a side effect of a forwarded command, so a
+schema-changing or pricing-changing PR can only be tested under `env dev` against
+the isolated clone.
+
+## Pricing versions and formats
+
+Prices come from a pricing file with two numbers: `format`, the structure of the
+file, and `version`, which goes up with every price change. Each build embeds one
+pricing file and reads every format up to its own. Its `build.json` records both:
+`pricing_ruleset_version` is the embedded file's version, and `pricing_format` is
+the newest format the build reads. A build with a schema 2 manifest predates
+pricing files. It prices only with the version compiled into it and never reads a
+stored file.
+
+A store keeps three pricing values in its metadata:
+
+- `pricing.applied_ruleset_version`: the version its estimates were last
+  repriced with;
+- `pricing.file`: a newer pricing file that a refresh adopted, if any;
+- `pricing.refresh`: the refresh setting. Only `off` turns the refresh off.
+
+`statsai-dev` works out the version the selected build would price production
+with, its *pricing target*:
+
+- A build that predates pricing files: its own version.
+- Any other build while the refresh is on: the newer of its embedded version and
+  the stored file's version.
+- Any other build while the refresh is off: its embedded version, unless
+  production's estimates are already priced with a newer version and the stored
+  file is that version; then that version, because the build keeps pricing with
+  the stored file rather than mix in older prices. The refresh is off when
+  production's setting is `off`, or when `STATSAI_PRICING_REFRESH` is `0`,
+  `off`, `false` or `no` in `statsai-dev`'s environment. Forwarded builds
+  inherit that variable, so they see the same value.
+
+A newer pricing version never makes a build that reads pricing files refuse a
+store. Only a stored file in a format the build cannot read does: `env prod` and
+`data upgrade-prod` both refuse it and ask for a newer build. A stored file whose
+`format` and `version` cannot be read is ignored, as the builds ignore it.
+
+So production that a refresh has moved past a build's embedded prices still works
+with that build under `env prod`, once production has been repriced to the stored
+file, whether the refresh is on or off. A build that predates pricing files is
+refused there.
+
+A forwarded build with the refresh on can itself adopt a newer pricing file from
+`main` into production, as a released binary would. Until production is repriced
+to that file, `env prod` refuses builds with the refresh on, because they would
+do the repricing. Set `STATSAI_PRICING_REFRESH=off` to keep a forwarded build
+from fetching, and from using a stored file production is not yet priced with.
 
 ## Upgrade production to a merged build
 
@@ -243,21 +299,30 @@ The check runs twice: once up front, and again after the confirmation prompt,
 immediately before the migration. The prompt waits as long as you do, and main
 can advance — or revert this very migration — while it waits.
 
-It also refuses to move backwards: a build behind production's schema or pricing
-ruleset has nothing to offer it. A build level with production reports that
-there is nothing to do.
+It also refuses a build behind production's schema: migrations only go forward.
+A build behind production's pricing is not refused. Repricing never goes
+backward, so production keeps its newer prices. Only a stored pricing file in a
+format the build cannot read refuses the upgrade. A build that predates pricing
+files keeps the older rule and refuses production with a newer applied pricing
+version than its own.
+
+Pricing needs the upgrade when production has no applied pricing version, or one
+below the build's [pricing target](#pricing-versions-and-formats). When the schema
+matches and the pricing needs nothing, the command reports that there is nothing
+to do.
 
 Before migrating, it clones production to
 `~/.statsai/backups/statsai-schema<N>-<timestamp>.sqlite`. The clone is
 copy-on-write, so backing up a multi-gigabyte database costs almost no time and
 almost no space. The migration itself runs as the selected build's `statsai
-store migrate`, which applies the schema and the compiled pricing ruleset and
-nothing else.
+store migrate`, which applies the schema and reprices production up to the
+build's pricing target, and nothing else.
 
-Afterwards it reads production back. A migration that exits zero without leaving
-production at the schema and pricing ruleset the build declares fails the command
-and names the backup, so a `--yes` caller that restarts the daemon or resumes
-syncing on success never does so over a half-finished upgrade.
+Afterwards it reads production back. Production must then be at the build's
+schema, and at the newer of its previous applied pricing version and the build's
+pricing target. A migration that exits zero without leaving production there
+fails the command and names the backup, so a `--yes` caller that restarts the
+daemon or resumes syncing on success never does so over a half-finished upgrade.
 
 Nothing else may hold the database. Both the upgrade and the restore refuse when
 
@@ -271,7 +336,7 @@ the one that matters most: `statsai daemon --api` accepts any loopback address,
 so a daemon started by hand can hold the store while the first two say nothing,
 and it is also the only check that does not depend on which binary started the
 daemon. A daemon from an older release keeps its own long-lived connection, and
-left running across an upgrade it writes events priced by its older catalog while
+left running across an upgrade it writes events priced with its older pricing while
 the metadata now says the database is current — so nothing reprices them
 afterwards. A restore would meanwhile replace the file underneath that
 connection.
@@ -303,11 +368,14 @@ that swap. It also backs up the database it replaces first, so a rollback is
 itself reversible.
 
 Ordinary isolated `statsai-dev` stores are opened by the selected exact-SHA
-`statsai` binary. That binary applies its own pricing ruleset automatically
-before scan, report, sync, snapshot, and other price-derived commands. Status,
-doctor, quota, and conversation do not trigger a reprice. A pricing catalog
-change does not require a raw rescan; a later incremental sync publishes
-corrected dirty rollups.
+`statsai` binary. Before scan, report, sync, snapshot, and other price-derived
+commands, that binary reprices the store to its pricing target, the same one
+described in [Pricing versions and formats](#pricing-versions-and-formats), and
+never to a version older than the store already has. A build that predates
+pricing files refuses a store whose applied version is newer than its own.
+Status, doctor, quota, and conversation do not trigger a reprice. A price change
+does not require a raw rescan; a later incremental sync publishes corrected dirty
+rollups.
 
 Development daemon commands and mutating service commands are blocked:
 
@@ -320,6 +388,10 @@ statsai-dev service uninstall
 `statsai-dev service status` remains read-only and is allowed. Parallel
 development daemon support requires a separate label, endpoint, token, store,
 and log layout and is intentionally outside v1.
+
+Under `env prod`, `statsai-dev pricing refresh` and `statsai-dev pricing
+auto-refresh` are refused as well, because they write production's pricing
+state; they run under `env dev` and `env local`.
 
 ## Inspect state
 

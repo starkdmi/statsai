@@ -1,5 +1,21 @@
 use super::*;
 use statsai_core::{Confidence, CostInfo, UsageCounts};
+
+/// Prices `usage` on 2026-11-18, the catalog date of pricing version 7.
+///
+/// The tests that use it check rates and pricing mechanics, not the clock.
+/// Pricing at the current time would make them fail as soon as pricing.json
+/// gains a period that has started (see docs/pricing.md).
+fn estimate_cost_on_catalog_day(
+    provider: &str,
+    model: Option<&statsai_core::ModelInfo>,
+    usage: &UsageCounts,
+) -> CostInfo {
+    let catalog_day = chrono::DateTime::parse_from_rfc3339("2026-11-18T12:00:00Z")
+        .expect("catalog day")
+        .with_timezone(&chrono::Utc);
+    estimate_cost_at(provider, model, usage, &catalog_day)
+}
 #[test]
 fn estimates_cost_for_known_model() {
     let model = statsai_core::ModelInfo {
@@ -40,7 +56,7 @@ fn estimates_cost_for_provider_prefixed_model() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("opencode", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("opencode", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(200));
     assert_eq!(
@@ -66,7 +82,7 @@ fn estimates_grok_4_5_cost_with_cached_input() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("grok_build", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("grok_build", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(830));
     assert_eq!(
@@ -92,7 +108,7 @@ fn estimates_grok_4_3_cost_with_discounted_cached_input() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("grok_build", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("grok_build", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(395));
     assert_eq!(
@@ -118,7 +134,7 @@ fn estimates_cost_for_proxy_wrapped_claude_model() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("opencode", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("opencode", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(3050));
     assert_eq!(
@@ -144,7 +160,7 @@ fn estimates_cost_for_claude_family_alias() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("claude_code", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("claude_code", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(3050));
     assert_eq!(
@@ -177,8 +193,8 @@ fn claude_fast_mode_prices_all_token_categories_at_premium_rates() {
         ..UsageCounts::default()
     };
 
-    let standard = estimate_cost("claude_code", Some(&standard_model), &usage);
-    let fast = estimate_cost("claude_code", Some(&fast_model), &usage);
+    let standard = estimate_cost_on_catalog_day("claude_code", Some(&standard_model), &usage);
+    let fast = estimate_cost_on_catalog_day("claude_code", Some(&fast_model), &usage);
 
     assert_eq!(standard.estimated_api_equivalent_usd, Some(4_675));
     assert_eq!(
@@ -213,8 +229,8 @@ fn historical_claude_fast_mode_uses_the_six_times_opus_rate() {
         ..UsageCounts::default()
     };
 
-    let standard = estimate_cost("claude_code", Some(&standard_model), &usage);
-    let fast = estimate_cost("claude_code", Some(&fast_model), &usage);
+    let standard = estimate_cost_on_catalog_day("claude_code", Some(&standard_model), &usage);
+    let fast = estimate_cost_on_catalog_day("claude_code", Some(&fast_model), &usage);
 
     assert_eq!(standard.estimated_api_equivalent_usd, Some(3_000));
     assert_eq!(fast.estimated_api_equivalent_usd, Some(18_000));
@@ -248,8 +264,8 @@ fn cursor_grok_fast_mode_doubles_every_rate() {
         ..UsageCounts::default()
     };
 
-    let standard = estimate_cost("cursor", Some(&standard_model), &usage);
-    let fast = estimate_cost("cursor", Some(&fast_model), &usage);
+    let standard = estimate_cost_on_catalog_day("cursor", Some(&standard_model), &usage);
+    let fast = estimate_cost_on_catalog_day("cursor", Some(&fast_model), &usage);
 
     // 2.00 input + 2.00 cache write + 0.50 cache read + 6.00 output.
     assert_eq!(
@@ -291,7 +307,7 @@ fn cursor_grok_4_5_fast_doubles_input_and_triples_output() {
     let cached_only = usage(0, 1_000_000, 0);
     let output_only = usage(0, 0, 1_000_000);
     let rate = |model, usage: &UsageCounts| {
-        estimate_cost("cursor", Some(model), usage)
+        estimate_cost_on_catalog_day("cursor", Some(model), usage)
             .estimated_api_equivalent_micro_usd
             .expect("cost")
     };
@@ -353,9 +369,11 @@ fn mythos_5_1_prices_cache_reads_below_mythos_5() {
         reasoning_level_raw: None,
     };
 
-    let mythos_5 = estimate_cost("claude_code", Some(&model("claude-mythos-5")), &usage);
-    let mythos_5_1 = estimate_cost("claude_code", Some(&model("claude-mythos-5-1")), &usage);
-    let wrapped = estimate_cost(
+    let mythos_5 =
+        estimate_cost_on_catalog_day("claude_code", Some(&model("claude-mythos-5")), &usage);
+    let mythos_5_1 =
+        estimate_cost_on_catalog_day("claude_code", Some(&model("claude-mythos-5-1")), &usage);
+    let wrapped = estimate_cost_on_catalog_day(
         "claude_code",
         Some(&model("anthropic/claude-mythos-5.1")),
         &usage,
@@ -395,38 +413,39 @@ fn fable_5_2_and_mythos_5_2_use_the_november_9_launch_price() {
         reasoning_level_raw: None,
     };
 
-    let fable_5_2 = estimate_cost(
+    let fable_5_2 = estimate_cost_on_catalog_day(
         "claude_code",
         Some(&model("claude-fable-5-2", None)),
         &usage,
     );
-    let mythos_5_2 = estimate_cost(
+    let mythos_5_2 = estimate_cost_on_catalog_day(
         "claude_code",
         Some(&model("anthropic/claude-mythos-5.2", None)),
         &usage,
     );
-    let fable_5 = estimate_cost("claude_code", Some(&model("claude-fable-5", None)), &usage);
-    let dated_fable_5 = estimate_cost(
+    let fable_5 =
+        estimate_cost_on_catalog_day("claude_code", Some(&model("claude-fable-5", None)), &usage);
+    let dated_fable_5 = estimate_cost_on_catalog_day(
         "claude_code",
         Some(&model("claude-fable-5-20260610", None)),
         &usage,
     );
-    let fast = estimate_cost(
+    let fast = estimate_cost_on_catalog_day(
         "claude_code",
         Some(&model("claude-fable-5-2-fast", None)),
         &usage,
     );
-    let fast_speed = estimate_cost(
+    let fast_speed = estimate_cost_on_catalog_day(
         "cursor",
         Some(&model("claude-mythos-5-2", Some("fast"))),
         &usage,
     );
-    let hour = estimate_cost(
+    let hour = estimate_cost_on_catalog_day(
         "claude_code",
         Some(&model("claude-fable-5-2", None)),
         &one_hour,
     );
-    let long = estimate_cost(
+    let long = estimate_cost_on_catalog_day(
         "claude_code",
         Some(&model("claude-fable-5-2", None)),
         &long_context,
@@ -480,12 +499,13 @@ fn gpt_5_4_nano_uses_its_own_rates() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("codex", Some(&nano), &usage);
+    let cost = estimate_cost_on_catalog_day("codex", Some(&nano), &usage);
     // 0.20 input + 0.20 cache write + 0.02 cached input + 1.25 output.
     assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(1_670_000));
     assert_ne!(
         cost.estimated_api_equivalent_micro_usd,
-        estimate_cost("codex", Some(&gpt_5_4), &usage).estimated_api_equivalent_micro_usd
+        estimate_cost_on_catalog_day("codex", Some(&gpt_5_4), &usage)
+            .estimated_api_equivalent_micro_usd
     );
 }
 
@@ -566,7 +586,7 @@ fn published_openai_fast_rates_that_are_not_a_flat_2x() {
         ..test_model(name)
     };
     let cost = |model: &statsai_core::ModelInfo, usage: &UsageCounts| {
-        estimate_cost("codex", Some(model), usage).estimated_api_equivalent_micro_usd
+        estimate_cost_on_catalog_day("codex", Some(model), usage).estimated_api_equivalent_micro_usd
     };
 
     // GPT-5 mini is 1.8x: 0.45 input + 0.45 cache write + 0.045 cached input
@@ -578,7 +598,7 @@ fn published_openai_fast_rates_that_are_not_a_flat_2x() {
     // GPT-5.5 is 2.5x: 12.50 + 12.50 + 1.25 + 75.
     assert_eq!(cost(&fast("gpt-5.5"), &usage), Some(101_250_000));
     assert_eq!(
-        estimate_cost("codex", Some(&fast("gpt-5.5")), &usage)
+        estimate_cost_on_catalog_day("codex", Some(&fast("gpt-5.5")), &usage)
             .pricing_source
             .as_deref(),
         Some("codex_api_pricing:gpt-5.5:fast")
@@ -609,7 +629,7 @@ fn fast_mode_without_long_context_bills_a_long_request_at_standard() {
         ..test_model(name)
     };
     let estimate = |model: &statsai_core::ModelInfo, usage: &UsageCounts| {
-        estimate_cost("codex", Some(model), usage)
+        estimate_cost_on_catalog_day("codex", Some(model), usage)
     };
 
     // GPT-5.5, GPT-5.4 and GPT-5.4 mini fast mode excludes long context, so a
@@ -692,7 +712,7 @@ fn gpt_6_2_astra_and_sol_use_the_november_17_launch_price() {
         ..test_model(name)
     };
     let estimate = |model: &statsai_core::ModelInfo, usage: &UsageCounts| {
-        estimate_cost("codex", Some(model), usage)
+        estimate_cost_on_catalog_day("codex", Some(model), usage)
     };
 
     let astra = estimate(&test_model("gpt-6.2-astra"), &usage);
@@ -779,9 +799,9 @@ fn gpt_5_5_long_context_matches_the_272k_tier() {
         ..long_usage.clone()
     };
 
-    let boundary = estimate_cost("codex", Some(&model), &boundary_usage);
-    let long = estimate_cost("codex", Some(&model), &long_usage);
-    let aggregate = estimate_cost("codex", Some(&model), &aggregate_usage);
+    let boundary = estimate_cost_on_catalog_day("codex", Some(&model), &boundary_usage);
+    let long = estimate_cost_on_catalog_day("codex", Some(&model), &long_usage);
+    let aggregate = estimate_cost_on_catalog_day("codex", Some(&model), &aggregate_usage);
 
     // 272k input at $5/M plus 1M output at $30/M.
     assert_eq!(
@@ -812,9 +832,10 @@ fn fable_5_1_prices_cache_reads_below_fable_5() {
         reasoning_level_raw: None,
     };
 
-    let fable_5 = estimate_cost("cursor", Some(&model("claude-fable-5")), &usage);
-    let fable_5_1 = estimate_cost("cursor", Some(&model("claude-fable-5-1")), &usage);
-    let cursor_variant = estimate_cost(
+    let fable_5 = estimate_cost_on_catalog_day("cursor", Some(&model("claude-fable-5")), &usage);
+    let fable_5_1 =
+        estimate_cost_on_catalog_day("cursor", Some(&model("claude-fable-5-1")), &usage);
+    let cursor_variant = estimate_cost_on_catalog_day(
         "cursor",
         Some(&model("claude-fable-5-1-thinking-max")),
         &usage,
@@ -845,7 +866,7 @@ fn estimates_cost_for_gpt_6_astra() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("codex", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("codex", Some(&model), &usage);
 
     // 10.00 input + 1.00 cached input + 50.00 output.
     assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(61_000_000));
@@ -872,14 +893,14 @@ fn gpt_6_astra_reprices_a_whole_request_above_the_context_threshold() {
     };
 
     // 200k prompt, default rate: 1.00 + 0.625 + 0.05 + 50.00.
-    let standard = estimate_cost("codex", Some(&model), &usage(100_000));
+    let standard = estimate_cost_on_catalog_day("codex", Some(&model), &usage(100_000));
     assert_eq!(
         standard.estimated_api_equivalent_micro_usd,
         Some(51_675_000)
     );
 
     // 400k prompt reprices every token: 6.00 + 1.25 + 0.10 + 75.00.
-    let long_context = estimate_cost("codex", Some(&model), &usage(300_000));
+    let long_context = estimate_cost_on_catalog_day("codex", Some(&model), &usage(300_000));
     assert_eq!(
         long_context.estimated_api_equivalent_micro_usd,
         Some(82_350_000)
@@ -892,7 +913,8 @@ fn gpt_6_astra_reprices_a_whole_request_above_the_context_threshold() {
         ..usage(300_000)
     };
     assert_eq!(
-        estimate_cost("cursor", Some(&model), &meter).estimated_api_equivalent_micro_usd,
+        estimate_cost_on_catalog_day("cursor", Some(&model), &meter)
+            .estimated_api_equivalent_micro_usd,
         Some(53_675_000)
     );
 }
@@ -913,7 +935,7 @@ fn cursor_reversed_claude_name_prices_like_the_canonical_name() {
         reasoning_level_raw: None,
     };
 
-    let cost = estimate_cost("cursor", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("cursor", Some(&model), &usage);
 
     // 3.00 input + 15.00 output.
     assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(18_000_000));
@@ -967,7 +989,7 @@ fn estimates_cost_for_legacy_claude_opus_4() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("claude_code", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("claude_code", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(9150));
     assert_eq!(
@@ -992,7 +1014,7 @@ fn estimates_cost_for_provider_prefixed_openai_models() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("opencode", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("opencode", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(875));
     assert_eq!(
@@ -1008,7 +1030,7 @@ fn estimates_cost_for_provider_prefixed_openai_models() {
         reasoning_level: None,
         reasoning_level_raw: None,
     };
-    let cost = estimate_cost("opencode", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("opencode", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(1000));
     assert_eq!(
@@ -1048,9 +1070,9 @@ fn gpt_5_4_long_context_pricing_requires_one_explicit_request() {
         ..UsageCounts::default()
     };
 
-    let boundary_cost = estimate_cost("codex", Some(&model), &boundary_usage);
-    let long_cached_cost = estimate_cost("codex", Some(&model), &long_cached_usage);
-    let aggregate_cost = estimate_cost("codex", Some(&model), &aggregate_usage);
+    let boundary_cost = estimate_cost_on_catalog_day("codex", Some(&model), &boundary_usage);
+    let long_cached_cost = estimate_cost_on_catalog_day("codex", Some(&model), &long_cached_usage);
+    let aggregate_cost = estimate_cost_on_catalog_day("codex", Some(&model), &aggregate_usage);
 
     assert_eq!(boundary_cost.estimated_api_equivalent_usd, Some(1568));
     assert_eq!(long_cached_cost.estimated_api_equivalent_usd, Some(2310));
@@ -1102,7 +1124,7 @@ fn cached_input_reduces_billable() {
         output_tokens: Some(0),
         ..UsageCounts::default()
     };
-    let cost = estimate_cost("codex", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("codex", Some(&model), &usage);
     // Uncached input = 200K at $1.25/M, cached input = 800K at $0.125/M -> 35 cents.
     assert_eq!(cost.estimated_api_equivalent_usd, Some(35));
 }
@@ -1122,7 +1144,7 @@ fn reasoning_tokens_are_billed_as_output() {
         reasoning_tokens: Some(50_000),
         ..UsageCounts::default()
     };
-    let cost = estimate_cost("codex", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("codex", Some(&model), &usage);
     assert_eq!(cost.estimated_api_equivalent_usd, Some(150));
 }
 
@@ -1166,7 +1188,7 @@ fn cache_creation_tokens_are_billed_separately() {
         output_tokens: Some(1_000_000),
         ..UsageCounts::default()
     };
-    let cost = estimate_cost("codex", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("codex", Some(&model), &usage);
     assert_eq!(cost.estimated_api_equivalent_usd, Some(1263));
     assert_eq!(
         cost.pricing_source.as_deref(),
@@ -1191,7 +1213,7 @@ fn claude_one_hour_cache_writes_use_the_extended_ttl_rate() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("claude_code", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("claude_code", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(510));
 }
@@ -1211,7 +1233,7 @@ fn unclassified_claude_cache_writes_keep_the_legacy_five_minute_rate() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("claude_code", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("claude_code", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(375));
 }
@@ -1267,7 +1289,7 @@ fn preserves_sub_cent_cost_in_micro_usd() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("codex", Some(&model), &usage);
+    let cost = estimate_cost_on_catalog_day("codex", Some(&model), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(2_250));
     assert_eq!(cost.estimated_api_equivalent_usd, Some(0));
@@ -1295,8 +1317,9 @@ fn applies_verified_xai_cached_and_long_context_rates() {
         ..UsageCounts::default()
     };
 
-    let cached_cost = estimate_cost("grok_build", Some(&model), &cached_usage);
-    let long_context_cost = estimate_cost("grok_build", Some(&model), &long_context_usage);
+    let cached_cost = estimate_cost_on_catalog_day("grok_build", Some(&model), &cached_usage);
+    let long_context_cost =
+        estimate_cost_on_catalog_day("grok_build", Some(&model), &long_context_usage);
 
     assert_eq!(cached_cost.estimated_api_equivalent_micro_usd, Some(30_000));
     assert_eq!(
@@ -1573,7 +1596,7 @@ fn codex_auto_review_reuses_gpt_5_4_rates_before_july_30() {
     assert_eq!(review_cost.confidence, Confidence::Medium);
     assert_eq!(
         review_cost.pricing_version.as_deref(),
-        Some(PRICING_CATALOG_VERSION)
+        Some(embedded_pricing().catalog())
     );
 }
 
@@ -1750,7 +1773,7 @@ fn overlay_preserves_provider_reported_provenance() {
     );
     assert_eq!(
         overlaid.pricing_version.as_deref(),
-        Some(PRICING_CATALOG_VERSION)
+        Some(embedded_pricing().catalog())
     );
     assert_eq!(overlaid.confidence, Confidence::High);
 }
@@ -1791,11 +1814,14 @@ fn grok_4_6_uses_official_short_context_rates_without_rewriting_identity() {
         ..UsageCounts::default()
     };
 
-    let grok_4_6_cost = estimate_cost("grok_build", Some(&grok_4_6), &usage);
-    let grok_4_6_build_cost = estimate_cost("grok_build", Some(&grok_4_6_build), &usage);
-    let grok_4_5_cost = estimate_cost("grok_build", Some(&grok_4_5), &usage);
-    let grok_4_6_million = estimate_cost("grok_build", Some(&grok_4_6), &million_token_usage);
-    let grok_4_5_million = estimate_cost("grok_build", Some(&grok_4_5), &million_token_usage);
+    let grok_4_6_cost = estimate_cost_on_catalog_day("grok_build", Some(&grok_4_6), &usage);
+    let grok_4_6_build_cost =
+        estimate_cost_on_catalog_day("grok_build", Some(&grok_4_6_build), &usage);
+    let grok_4_5_cost = estimate_cost_on_catalog_day("grok_build", Some(&grok_4_5), &usage);
+    let grok_4_6_million =
+        estimate_cost_on_catalog_day("grok_build", Some(&grok_4_6), &million_token_usage);
+    let grok_4_5_million =
+        estimate_cost_on_catalog_day("grok_build", Some(&grok_4_5), &million_token_usage);
 
     assert_eq!(grok_4_6_cost.estimated_api_equivalent_usd, Some(20));
     assert_eq!(
@@ -1830,7 +1856,7 @@ fn grok_4_6_uses_official_short_context_rates_without_rewriting_identity() {
     );
     assert_eq!(
         grok_4_6_cost.pricing_version.as_deref(),
-        Some(PRICING_CATALOG_VERSION)
+        Some(embedded_pricing().catalog())
     );
 }
 
@@ -1844,7 +1870,7 @@ fn grok_4_6_wrapped_ids_keep_observed_identity() {
     };
     let wrapped = test_model("openrouter/x-ai/grok-4.6");
 
-    let cost = estimate_cost("opencode", Some(&wrapped), &usage);
+    let cost = estimate_cost_on_catalog_day("opencode", Some(&wrapped), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_usd, Some(26));
     assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(260_000));
@@ -1872,8 +1898,8 @@ fn grok_4_6_xai_long_context_boundary_includes_cached_tokens() {
         ..UsageCounts::default()
     };
 
-    let short = estimate_cost("grok_build", Some(&model), &just_below);
-    let long = estimate_cost("grok_build", Some(&model), &on_threshold);
+    let short = estimate_cost_on_catalog_day("grok_build", Some(&model), &just_below);
+    let long = estimate_cost_on_catalog_day("grok_build", Some(&model), &on_threshold);
 
     assert_eq!(short.estimated_api_equivalent_micro_usd, Some(339_998));
     assert_eq!(long.estimated_api_equivalent_micro_usd, Some(680_000));
@@ -1903,8 +1929,8 @@ fn grok_4_6_reasoning_tokens_use_the_output_rate() {
         ..UsageCounts::default()
     };
 
-    let output_cost = estimate_cost("grok_build", Some(&model), &with_output);
-    let reasoning_cost = estimate_cost("grok_build", Some(&model), &with_reasoning);
+    let output_cost = estimate_cost_on_catalog_day("grok_build", Some(&model), &with_output);
+    let reasoning_cost = estimate_cost_on_catalog_day("grok_build", Some(&model), &with_reasoning);
 
     assert_eq!(output_cost.estimated_api_equivalent_micro_usd, Some(80_000));
     assert_eq!(
@@ -1938,9 +1964,9 @@ fn grok_4_6_mixed_requests_sum_short_and_long_context_costs() {
         ..UsageCounts::default()
     };
 
-    let short = estimate_cost("grok_build", Some(&model), &short_request);
-    let long = estimate_cost("grok_build", Some(&model), &long_request);
-    let aggregate = estimate_cost("grok_build", Some(&model), &aggregated);
+    let short = estimate_cost_on_catalog_day("grok_build", Some(&model), &short_request);
+    let long = estimate_cost_on_catalog_day("grok_build", Some(&model), &long_request);
+    let aggregate = estimate_cost_on_catalog_day("grok_build", Some(&model), &aggregated);
     let mut combined = statsai_core::CostAccumulator::default();
     combined.add_estimated(&short);
     combined.add_estimated(&long);
@@ -1968,8 +1994,8 @@ fn grok_4_7_build_uses_standard_and_fast_rates() {
         ..UsageCounts::default()
     };
 
-    let standard_cost = estimate_cost("grok_build", Some(&standard), &usage);
-    let fast_cost = estimate_cost("grok_build", Some(&fast), &usage);
+    let standard_cost = estimate_cost_on_catalog_day("grok_build", Some(&standard), &usage);
+    let fast_cost = estimate_cost_on_catalog_day("grok_build", Some(&fast), &usage);
 
     assert_eq!(
         standard_cost.estimated_api_equivalent_micro_usd,
@@ -2003,9 +2029,9 @@ fn grok_4_7_build_long_context_starts_at_200k_prompt_tokens() {
         ..usage.clone()
     };
 
-    let standard_cost = estimate_cost("grok_build", Some(&standard), &usage);
-    let fast_at = estimate_cost("grok_build", Some(&fast), &usage);
-    let fast_above = estimate_cost("grok_build", Some(&fast), &above);
+    let standard_cost = estimate_cost_on_catalog_day("grok_build", Some(&standard), &usage);
+    let fast_at = estimate_cost_on_catalog_day("grok_build", Some(&fast), &usage);
+    let fast_above = estimate_cost_on_catalog_day("grok_build", Some(&fast), &above);
 
     assert_eq!(
         standard_cost.estimated_api_equivalent_micro_usd,
@@ -2049,10 +2075,10 @@ fn cursor_grok_4_7_uses_256k_boundary_and_three_times_fast_long_context_rates() 
         ..UsageCounts::default()
     };
 
-    let standard_at = estimate_cost("cursor", Some(&standard), &at_threshold);
-    let standard_above = estimate_cost("cursor", Some(&standard), &above_threshold);
-    let fast_at = estimate_cost("cursor", Some(&fast), &at_threshold);
-    let fast_above = estimate_cost("cursor", Some(&fast), &above_threshold);
+    let standard_at = estimate_cost_on_catalog_day("cursor", Some(&standard), &at_threshold);
+    let standard_above = estimate_cost_on_catalog_day("cursor", Some(&standard), &above_threshold);
+    let fast_at = estimate_cost_on_catalog_day("cursor", Some(&fast), &at_threshold);
+    let fast_above = estimate_cost_on_catalog_day("cursor", Some(&fast), &above_threshold);
 
     assert_eq!(
         standard_at.estimated_api_equivalent_micro_usd,
@@ -2094,7 +2120,7 @@ fn a_stale_cached_normalization_does_not_shadow_the_observed_name() {
         ..UsageCounts::default()
     };
 
-    let cost = estimate_cost("cursor", Some(&stale), &usage);
+    let cost = estimate_cost_on_catalog_day("cursor", Some(&stale), &usage);
 
     assert_eq!(cost.estimated_api_equivalent_micro_usd, Some(250_000));
     assert_eq!(

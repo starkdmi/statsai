@@ -868,6 +868,183 @@ fn incremental_http_sync_includes_repriced_passthrough_summaries_without_full() 
 }
 
 #[test]
+fn incremental_http_sync_carries_costs_repriced_by_a_refreshed_pricing_file() {
+    use statsai::pricing_refresh::{refresh_pricing_with, RefreshOutcome};
+    use statsai_core::micro_usd_to_cents_rounded;
+    use statsai_store::{embedded_pricing, PricingRefreshState};
+
+    let store = Store::in_memory().expect("store");
+    let source = SourceLocation::local_adapter(
+        "codex",
+        "test",
+        "0",
+        Path::new("/tmp/codex-http-refreshed-pricing"),
+        LocationOrigin::Configured,
+    );
+    store.upsert_source(&source).expect("source");
+    // The newer file below starts a GPT-5.4 period after every period the
+    // embedded file has; the event falls four weeks into it.
+    let raise_from = day_after_last_embedded_period(
+        "gpt-5.4",
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 1).expect("date"),
+    );
+    let started_at = (raise_from + Duration::days(28))
+        .and_hms_opt(12, 0, 0)
+        .expect("started_at")
+        .and_utc();
+    let mut event = test_event(
+        "codex",
+        &source,
+        started_at,
+        None,
+        TokenParts {
+            input: 1_000_000,
+            cached_input: 0,
+            output: 1_000_000,
+            reasoning: 0,
+            total: 2_000_000,
+            cost: None,
+        },
+    );
+    event.model = Some(ModelInfo {
+        name: Some("gpt-5.4".to_string()),
+        normalized_name: Some("gpt-5.4".to_string()),
+        provider_model_id: Some("gpt-5.4".to_string()),
+        speed: None,
+        reasoning_level: None,
+        reasoning_level_raw: None,
+    });
+    store.insert_event(&event).expect("event");
+    store.rebuild_sync_rollups().expect("rebuild");
+
+    // Priced with the embedded file's GPT-5.4 rates on that day: 2.5 USD
+    // input and 15 USD output per million tokens in pricing version 7. The
+    // event has a million tokens of each.
+    let embedded_rates = embedded_pricing()
+        .pricing_for_model_on("gpt-5.4", started_at.date_naive())
+        .expect("GPT-5.4 is priced");
+    let micro_usd = |input: f64, output: f64| {
+        (input * 1_000_000.0).round() as i64 + (output * 1_000_000.0).round() as i64
+    };
+    let embedded_micro_usd = micro_usd(
+        embedded_rates.input_per_million,
+        embedded_rates.output_per_million,
+    );
+    let embedded_version = embedded_pricing().version();
+    let report = store
+        .ensure_current_pricing_with(PricingRefreshState::On)
+        .expect("price with the embedded file");
+    assert_eq!(report.version, embedded_version);
+    assert_eq!(report.changed_events, 1);
+
+    let command = SyncCommand {
+        endpoint: Some("https://api.example.com/api/sync/batches".to_string()),
+        ..test_sync_command("http")
+    };
+    assert!(!command.full);
+    assert!(!command.rebuild_rollups);
+    let target = sync_target(&command).expect("target");
+    let (initial_batch, initial_mode) =
+        build_sync_batch(&command, &store, "device", &target).expect("initial batch");
+    assert_eq!(initial_mode, SyncPayloadMode::Rollups);
+    assert_eq!(initial_batch.summaries.len(), 1);
+    assert_eq!(
+        initial_batch.summaries[0].cost.estimated_api_equivalent_usd,
+        Some(micro_usd_to_cents_rounded(embedded_micro_usd))
+    );
+    assert_eq!(
+        initial_batch.summaries[0]
+            .cost
+            .estimated_api_equivalent_micro_usd,
+        Some(embedded_micro_usd)
+    );
+    record_rollup_sync_success(&store, "http", &target, &initial_batch)
+        .expect("record initial sync");
+    let (repeat_batch, _) =
+        build_sync_batch(&command, &store, "device", &target).expect("repeat batch");
+    assert!(repeat_batch.summaries.is_empty());
+
+    // `main` publishes a newer file: from `raise_from`, every GPT-5.4 rate is
+    // 20% higher (3 USD input and 18 USD output in pricing version 7).
+    let raise = |rate: f64| (rate * 1.2 * 10_000.0).round() / 10_000.0;
+    let raised_micro_usd = micro_usd(
+        raise(embedded_rates.input_per_million),
+        raise(embedded_rates.output_per_million),
+    );
+    assert_ne!(raised_micro_usd, embedded_micro_usd);
+    let newer = pricing_file_at(embedded_version + 1, |file| {
+        file["catalog"] = json!("test:gpt-5.4-raise");
+        file["models"]["gpt-5.4"]["prices"]
+            .as_array_mut()
+            .expect("gpt-5.4 periods")
+            .push(json!({
+                "from": raise_from.format("%Y-%m-%d").to_string(),
+                "input": raise(embedded_rates.input_per_million),
+                "cache_write": raise(embedded_rates.cache_creation_per_million),
+                "cache_read": raise(embedded_rates.cached_input_per_million),
+                "output": raise(embedded_rates.output_per_million)
+            }));
+    });
+    let server = PricingFileServer::start(200, newer, Some("\"v2\""));
+    let outcome = refresh_pricing_with(
+        &store,
+        &server.url,
+        Utc::now(),
+        true,
+        PricingRefreshState::On,
+        StdDuration::from_secs(5),
+    )
+    .expect("refresh");
+    server.finish();
+    assert_eq!(
+        outcome,
+        RefreshOutcome::Adopted {
+            version: embedded_version + 1
+        }
+    );
+
+    // The next price-derived command reprices with the stored file. Its prices
+    // differ from the embedded file's, so it is applied to this store only,
+    // never installed as the process's active table.
+    let table = store
+        .current_pricing_table_with(PricingRefreshState::On)
+        .expect("the stored file prices this store");
+    assert_eq!(table.version(), embedded_version + 1);
+    let report = store.apply_pricing_table(&table).expect("reprice");
+    assert_eq!(report.changed_events, 1);
+    assert_eq!(report.refreshed_rollups, 1);
+    assert_eq!(
+        store.applied_pricing_ruleset_version().expect("applied"),
+        Some(embedded_version + 1)
+    );
+
+    let (incremental_batch, incremental_mode) =
+        build_sync_batch(&command, &store, "device", &target).expect("incremental batch");
+    assert_eq!(incremental_mode, SyncPayloadMode::Rollups);
+    assert_eq!(incremental_batch.summaries.len(), 1);
+    let rollup = &incremental_batch.summaries[0];
+    assert!(is_daily_rollup_summary(rollup));
+    assert_eq!(
+        rollup.cost.estimated_api_equivalent_usd,
+        Some(micro_usd_to_cents_rounded(raised_micro_usd))
+    );
+    assert_eq!(
+        rollup.cost.estimated_api_equivalent_micro_usd,
+        Some(raised_micro_usd)
+    );
+    let repriced = store
+        .events()
+        .expect("events")
+        .into_iter()
+        .next()
+        .expect("one event");
+    assert_eq!(
+        repriced.cost.pricing_version.as_deref(),
+        Some("test:gpt-5.4-raise")
+    );
+}
+
+#[test]
 fn http_incremental_rollups_are_tracked_per_target() {
     let store = Store::in_memory().expect("store");
     let source = SourceLocation::local_adapter(

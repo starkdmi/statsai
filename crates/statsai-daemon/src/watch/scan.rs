@@ -13,10 +13,11 @@ use statsai_core::{
     UsageSummary, ACTIVITY_PARSER_REVISION,
 };
 use statsai_store::{
-    find_existing_provider_account, gone_scan_files, reconcile_verified_source_state,
-    try_acquire_scan_lock, upsert_provider_account, verified_source_observation_hash,
-    ActivityPersistMode, ActivityScanCursor, ScanFileReplacement, ScanFileStateEntry, Store,
-    UpsertProviderAccountInput,
+    active_pricing, find_existing_provider_account, gone_scan_files,
+    reconcile_verified_source_state, try_acquire_scan_lock, upsert_provider_account,
+    verified_source_observation_hash, ActivityPersistMode, ActivityScanCursor, PricingRefreshState,
+    PricingTable, RepricingReport, ScanFileReplacement, ScanFileStateEntry, Store,
+    UnsupportedPricingFormat, UpsertProviderAccountInput,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -134,6 +135,100 @@ fn requeue_background_scan(
         .unwrap_or_else(|error| error.into_inner())
         .restore_failed(notice);
     let _ = signal.try_send(());
+}
+
+/// Runs one scan pass with its pricing settled on both sides.
+///
+/// Before `scan`, it brings the store's estimates to the newest pricing this
+/// process can use ([`bring_pricing_up_to_date_with`]), so a pricing file a
+/// refresh stored since the last pass reprices the store and prices what the
+/// pass scans. A stored pricing file whose format this binary cannot read
+/// skips the pass and keeps the daemon running.
+///
+/// After `scan`, even a failed one, it settles the store's pricing with the
+/// table the pass priced with ([`Store::settle_pricing`]): when another
+/// process repriced the store while the pass ran, what the pass wrote with the
+/// older table is repriced too, and when the store is stamped with a newer
+/// version this process has no table for, the stamp is lowered to the pass's
+/// version so a process with a newer table reprices what the pass wrote.
+pub(super) fn scan_with_current_pricing(
+    store: &Store,
+    last_unsupported: &mut Option<UnsupportedPricingFormat>,
+    scan: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let refresh = store
+        .pricing_refresh_state()
+        .context("read the pricing refresh state")?;
+    scan_with_current_pricing_with(
+        store,
+        refresh,
+        last_unsupported,
+        &mut |line| eprintln!("{line}"),
+        &mut |store, priced_with| store.settle_pricing(priced_with),
+        scan,
+    )
+}
+
+/// The settle step of a scan pass: given the table the pass priced with, it
+/// settles the store's pricing and returns what it did, if anything.
+pub(super) type SettlePricing<'a> =
+    dyn FnMut(&Store, &Arc<PricingTable>) -> Result<Option<RepricingReport>> + 'a;
+
+/// [`scan_with_current_pricing`] with an explicit refresh state, a sink for
+/// its log lines, and the settle step, which production passes as
+/// [`Store::settle_pricing`].
+pub(super) fn scan_with_current_pricing_with(
+    store: &Store,
+    refresh: PricingRefreshState,
+    last_unsupported: &mut Option<UnsupportedPricingFormat>,
+    report: &mut dyn FnMut(String),
+    settle: &mut SettlePricing<'_>,
+    scan: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if !bring_pricing_up_to_date_with(store, refresh, last_unsupported, report)? {
+        return Ok(());
+    }
+    // What the adapters price this pass's events with.
+    let priced_with = active_pricing();
+    let scanned = scan();
+    let settled = settle(store, &priced_with).context("reprice what the scan pass wrote");
+    if let Ok(Some(repricing)) = &settled {
+        report(format!("daemon: {repricing}"));
+    }
+    scanned?;
+    settled.map(|_| ())
+}
+
+/// Brings the store's estimates to the newest pricing this process can use.
+///
+/// Returns whether the pass may scan. A stored pricing file whose format this
+/// binary cannot read skips the pass; it is said once while it lasts, tracked
+/// in `last_unsupported`. Any other error fails the pass so it is retried.
+pub(super) fn bring_pricing_up_to_date_with(
+    store: &Store,
+    refresh: PricingRefreshState,
+    last_unsupported: &mut Option<UnsupportedPricingFormat>,
+    report: &mut dyn FnMut(String),
+) -> Result<bool> {
+    match store.ensure_current_pricing_with(refresh) {
+        Ok(repricing) => {
+            *last_unsupported = None;
+            if repricing.did_work() {
+                report(format!("daemon: {repricing}"));
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            let Some(unsupported) = error.downcast_ref::<UnsupportedPricingFormat>() else {
+                return Err(error.context("bring pricing up to date before the scan"));
+            };
+            if last_unsupported.as_ref() != Some(unsupported) {
+                report(format!("daemon: not scanning: {unsupported}"));
+                *last_unsupported = Some(*unsupported);
+            }
+            Ok(false)
+        }
+    }
 }
 
 pub(super) fn rescan_changed_sources(

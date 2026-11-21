@@ -1,0 +1,6 @@
+[env]
+# Tests and `cargo run` in this repository never fetch pricing: they price with
+# the pricing.json compiled into the binary (see docs/pricing.md). The entry
+# does not force, so a value already set in the shell wins, for example
+# `STATSAI_PRICING_REFRESH=on cargo run -p statsai -- pricing refresh`.
+STATSAI_PRICING_REFRESH = "off"

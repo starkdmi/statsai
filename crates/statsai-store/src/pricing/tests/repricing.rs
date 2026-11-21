@@ -48,13 +48,13 @@ fn legacy_codex_auto_review_event_is_repriced_without_source_files() {
     assert_eq!(stored.session.started_at, event.session.started_at);
     assert_eq!(
         store.applied_pricing_ruleset_version().expect("applied"),
-        Some(PRICING_RULESET_VERSION)
+        Some(embedded_pricing().version())
     );
     assert_eq!(
         store
             .metadata_value(APPLIED_PRICING_CATALOG_VERSION_KEY)
             .expect("catalog"),
-        Some(PRICING_CATALOG_VERSION.to_string())
+        Some(embedded_pricing().catalog().to_string())
     );
 }
 
@@ -118,7 +118,7 @@ fn applied_metadata_advances_only_after_success() {
     store.ensure_current_pricing().expect("reprice");
     assert_eq!(
         store.applied_pricing_ruleset_version().expect("after"),
-        Some(PRICING_RULESET_VERSION)
+        Some(embedded_pricing().version())
     );
 }
 
@@ -182,7 +182,7 @@ fn provider_reported_cost_and_provenance_survive_repricing() {
     );
     assert_eq!(
         stored.cost.pricing_version.as_deref(),
-        Some(PRICING_CATALOG_VERSION)
+        Some(embedded_pricing().catalog())
     );
 }
 
@@ -207,7 +207,7 @@ fn unknown_model_stays_unknown_while_ruleset_is_marked_applied() {
     assert_eq!(stored.cost.pricing_source.as_deref(), Some("unknown"));
     assert_eq!(
         store.applied_pricing_ruleset_version().expect("applied"),
-        Some(PRICING_RULESET_VERSION)
+        Some(embedded_pricing().version())
     );
 }
 
@@ -312,7 +312,7 @@ fn changed_sync_rollups_are_refreshed_and_marked_dirty() {
 }
 
 #[test]
-fn older_ruleset_refuses_a_newer_store_and_does_not_mutate_it() {
+fn an_older_pricing_version_leaves_a_newer_store_unchanged() {
     let (store, source) = store_with_source("/tmp/codex-forward-pricing");
     let started_at = parse_utc("2026-07-29T12:00:00Z");
     let event = test_event(
@@ -333,13 +333,21 @@ fn older_ruleset_refuses_a_newer_store_and_does_not_mutate_it() {
     let payload_before =
         serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize");
 
-    let error = store
-        .ensure_pricing_ruleset(1, PRICING_CATALOG_VERSION)
-        .expect_err("forward pricing must refuse");
+    let report = store
+        .apply_pricing_table(&embedded_pricing())
+        .expect("a newer store is used, not refused");
 
-    assert!(error
-        .to_string()
-        .contains("pricing ruleset version 99 is newer than this StatsAI binary supports (1)"));
+    assert_eq!(report.store_ahead, Some(99));
+    assert!(!report.already_current);
+    assert!(!report.did_work());
+    assert_eq!(report.examined_events, 0);
+    assert_eq!(
+        report.to_string(),
+        format!(
+            "store already priced with pricing version 99; this binary prices with {} and does not reprice backward",
+            embedded_pricing().version()
+        )
+    );
     assert_eq!(
         serde_json::to_string(&stored_event(&store, &event.event_id.0)).expect("serialize"),
         payload_before
@@ -347,6 +355,12 @@ fn older_ruleset_refuses_a_newer_store_and_does_not_mutate_it() {
     assert_eq!(
         store.applied_pricing_ruleset_version().expect("unchanged"),
         Some(99)
+    );
+    assert_eq!(
+        store
+            .metadata_value(APPLIED_PRICING_CATALOG_VERSION_KEY)
+            .expect("catalog"),
+        Some("future".to_string())
     );
 }
 
@@ -456,7 +470,7 @@ fn stale_task_spans_are_repriced_when_events_already_match() {
     );
     assert_eq!(
         store.applied_pricing_ruleset_version().expect("applied"),
-        Some(PRICING_RULESET_VERSION)
+        Some(embedded_pricing().version())
     );
 }
 
@@ -549,7 +563,7 @@ fn unreadable_usage_payloads_are_skipped_without_blocking_repricing() {
     );
     assert_eq!(
         store.applied_pricing_ruleset_version().expect("applied"),
-        Some(PRICING_RULESET_VERSION)
+        Some(embedded_pricing().version())
     );
     let corrupt = store
         .conn
@@ -936,7 +950,7 @@ fn a_store_left_on_an_older_ruleset_repairs_stale_and_missing_catalog_costs() {
     );
     assert_eq!(
         store.applied_pricing_ruleset_version().expect("applied"),
-        Some(PRICING_RULESET_VERSION)
+        Some(embedded_pricing().version())
     );
 }
 
@@ -1102,7 +1116,7 @@ fn repricing_still_updates_a_summary_the_generic_estimator_owns() {
     assert_ne!(stored.cost, generic);
     assert_eq!(
         stored.cost.pricing_version.as_deref(),
-        Some(PRICING_CATALOG_VERSION)
+        Some(embedded_pricing().catalog())
     );
 }
 

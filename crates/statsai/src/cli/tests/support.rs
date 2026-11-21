@@ -476,3 +476,69 @@ pub(super) fn test_unattributed_quota_record(source_id: &str) -> QuotaObservatio
         raw_rate_limits: json!({}),
     }
 }
+
+/// A server on 127.0.0.1 that answers one request for a pricing file with
+/// `status`, `body` and `etag`, then stops.
+pub(super) struct PricingFileServer {
+    pub(super) url: String,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl PricingFileServer {
+    pub(super) fn start(status: u16, body: String, etag: Option<&'static str>) -> Self {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind pricing server");
+        let address = server.server_addr().to_ip().expect("ip address");
+        let url = format!("http://{address}/crates/statsai-pricing/pricing.json");
+        let thread = std::thread::spawn(move || {
+            let Ok(Some(request)) = server.recv_timeout(StdDuration::from_secs(10)) else {
+                return;
+            };
+            let mut response = tiny_http::Response::from_string(body).with_status_code(status);
+            if let Some(etag) = etag {
+                response
+                    .add_header(tiny_http::Header::from_bytes("ETag", etag).expect("etag header"));
+            }
+            let _ = request.respond(response);
+        });
+        Self { url, thread }
+    }
+
+    /// Waits until the one reply was sent.
+    pub(super) fn finish(self) {
+        self.thread.join().expect("pricing server thread");
+    }
+}
+
+/// The first day after every standard and fast period `model` has in the
+/// embedded pricing file, and no earlier than `at_least`. A period a test adds
+/// there keeps the model's periods in order whatever periods later edits to
+/// pricing.json give it, and the embedded file prices every later day with its
+/// last period.
+pub(super) fn day_after_last_embedded_period(
+    model: &str,
+    at_least: chrono::NaiveDate,
+) -> chrono::NaiveDate {
+    let file: Value = serde_json::from_str(statsai_store::embedded_pricing().source_text())
+        .expect("embedded pricing json");
+    let entry = &file["models"][model];
+    assert!(entry["prices"].is_array(), "{model} has prices");
+    [&entry["prices"], &entry["fast"]["prices"]]
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|period| period["from"].as_str())
+        .map(|from| {
+            chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d").expect("period date")
+                + chrono::Duration::days(1)
+        })
+        .fold(at_least, chrono::NaiveDate::max)
+}
+
+/// The embedded pricing file at `version`, with `edit` applied.
+pub(super) fn pricing_file_at(version: u64, edit: impl FnOnce(&mut Value)) -> String {
+    let mut file: Value = serde_json::from_str(statsai_store::embedded_pricing().source_text())
+        .expect("embedded pricing json");
+    file["version"] = json!(version);
+    edit(&mut file);
+    serde_json::to_string_pretty(&file).expect("serialize pricing file")
+}

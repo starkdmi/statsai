@@ -1,7 +1,9 @@
 use crate::artifact::{load_cached, InstalledBuild};
+use crate::pricing::{build_pricing_target, refresh_disabled_by_env};
 use crate::state::{Environment, Paths, SelectedBuild, State};
 use anyhow::{bail, Context, Result};
-use statsai_store::{database_applied_pricing_ruleset_version, database_schema_version};
+use statsai_store::{database_pricing_state, database_schema_version, DatabasePricingState};
+use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{Command, ExitCode, ExitStatus};
@@ -83,6 +85,7 @@ fn describe_status(status: ExitStatus) -> String {
 
 pub(crate) fn forward(paths: &Paths, state: &State, arguments: &[OsString]) -> Result<ExitCode> {
     validate_forward_arguments(arguments)?;
+    validate_forward_for_environment(arguments, state.environment)?;
     let (selected, installed) = selected_installed_build(paths, state)?;
 
     let _data_lock = paths.lock_data_shared()?;
@@ -122,17 +125,20 @@ pub(crate) fn forward(paths: &Paths, state: &State, arguments: &[OsString]) -> R
             production_schema,
             installed.manifest.store_schema_version,
         )?;
-        let production_pricing = database_applied_pricing_ruleset_version(store)?;
-        ensure_production_pricing_compatible(
-            production_pricing,
+        let production_pricing = database_pricing_state(store)?
+            .context("production database disappeared while checking its pricing")?;
+        let applied_pricing = ensure_production_pricing_compatible(
+            &production_pricing,
             installed.manifest.pricing_ruleset_version,
+            installed.manifest.pricing_format,
+            refresh_disabled_by_env(),
         )?;
         eprintln!(
-            "WARNING: prod environment: running development build {} against the production database {} (schema {}, pricing ruleset {})",
+            "WARNING: prod environment: running development build {} against the production database {} (schema {}, pricing version {})",
             &selected.sha[..8],
             paths.display(&paths.prod_store),
             production_schema,
-            installed.manifest.pricing_ruleset_version
+            applied_pricing
         );
     }
 
@@ -167,19 +173,51 @@ fn ensure_production_schema_compatible(production_schema: i64, build_schema: i64
     Ok(())
 }
 
+/// Allows the prod environment only when the selected build would price
+/// production with exactly the version its estimates were priced with, so that it
+/// neither reprices production nor prices new events with a different version.
+/// Returns that version.
 fn ensure_production_pricing_compatible(
-    production_ruleset: Option<u64>,
-    build_ruleset: u64,
-) -> Result<()> {
-    match production_ruleset {
-        Some(applied) if applied == build_ruleset => Ok(()),
-        Some(applied) => bail!(
-            "refusing the prod environment: selected build supports pricing ruleset {build_ruleset}, but production uses pricing ruleset {applied}; development builds may not reprice an incompatible production database. Run `statsai-dev env dev` to use the isolated clone instead"
+    production: &DatabasePricingState,
+    build_version: u64,
+    build_format: Option<u32>,
+    refresh_disabled_by_env: bool,
+) -> Result<u64> {
+    const USE_THE_CLONE: &str = "Run `statsai-dev env dev` to use the isolated clone instead";
+    let target = build_pricing_target(
+        build_version,
+        build_format,
+        production,
+        refresh_disabled_by_env,
+    )
+    .map_err(|error| anyhow::anyhow!("refusing the prod environment: {error}. {USE_THE_CLONE}"))?;
+    let Some(applied) = production.applied_version else {
+        bail!(
+            "refusing the prod environment: production database has no applied pricing version, and the selected build would price it with pricing version {target}; development builds may not reprice production data. {USE_THE_CLONE}"
+        );
+    };
+    match target.cmp(&applied) {
+        Ordering::Equal => Ok(applied),
+        Ordering::Greater => bail!(
+            "refusing the prod environment: the selected build would price production with pricing version {target}, but production's estimates were priced with pricing version {applied}, so the build would reprice production; development builds may not reprice production data. {USE_THE_CLONE}"
         ),
-        None => bail!(
-            "refusing the prod environment: production database has no applied pricing ruleset, but the selected build requires pricing ruleset {build_ruleset}; development builds may not reprice an incompatible production database. Run `statsai-dev env dev` to use the isolated clone instead"
+        Ordering::Less => bail!(
+            "refusing the prod environment: the selected build would price new events with pricing version {target}, older than the pricing version {applied} production's estimates were priced with; {}. {USE_THE_CLONE}",
+            older_target_remedy(build_format)
         ),
     }
+}
+
+/// What would let a build that is behind production's pricing run against it.
+///
+/// A build that reads pricing files keeps pricing with a stored copy at
+/// production's applied version whether or not the refresh is on, so only a
+/// newer build helps.
+fn older_target_remedy(build_format: Option<u32>) -> &'static str {
+    if build_format.is_none() {
+        return "the selected build predates pricing files and prices only with its own, so select a newer build";
+    }
+    "select a build whose pricing is at least that version"
 }
 
 fn apply_environment(command: &mut Command, environment: Environment) {
@@ -191,9 +229,15 @@ fn apply_environment(command: &mut Command, environment: Environment) {
         Environment::Prod => {
             command.env_remove("STATSAI_API_URL");
             command.env_remove("STATSAI_WEB_URL");
+            // A testing override: a file adopted from it would stay in
+            // production's store for good, since versions never go down.
+            command.env_remove(PRICING_URL_ENV);
         }
     }
 }
+
+/// The variable that points the pricing refresh at another URL, for testing.
+const PRICING_URL_ENV: &str = "STATSAI_PRICING_URL";
 
 fn validate_forward_arguments(arguments: &[OsString]) -> Result<()> {
     if arguments.is_empty() {
@@ -240,6 +284,33 @@ fn validate_forward_arguments(arguments: &[OsString]) -> Result<()> {
     }
 }
 
+/// Refuses commands that exist only to change a store's pricing state when the
+/// store is production's: `statsai pricing refresh` fetches and stores a pricing
+/// file and reprices, and `statsai pricing auto-refresh` changes production's
+/// refresh setting. Both run under `env dev` and `env local`.
+fn validate_forward_for_environment(
+    arguments: &[OsString],
+    environment: Environment,
+) -> Result<()> {
+    if !matches!(environment, Environment::Prod) {
+        return Ok(());
+    }
+    let semantic_arguments = without_global_device_id(arguments)?;
+    let mut words = semantic_arguments
+        .iter()
+        .map(|argument| argument.to_str())
+        .filter(|argument| !argument.is_some_and(|value| value.starts_with('-')));
+    if words.next() != Some(Some("pricing")) {
+        return Ok(());
+    }
+    match words.next().flatten() {
+        Some(subcommand @ ("refresh" | "auto-refresh")) => bail!(
+            "`statsai pricing {subcommand}` is disabled in the prod environment because it changes production's pricing state; run it under `statsai-dev env dev`, or with the released `statsai`"
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn without_global_device_id(arguments: &[OsString]) -> Result<Vec<&OsStr>> {
     let mut semantic = Vec::with_capacity(arguments.len());
     let mut index = 0;
@@ -273,11 +344,61 @@ mod tests {
     use crate::state::{BuildSource, SelectedBuild};
     use sha2::{Digest, Sha256};
     use statsai_store::{
-        APPLIED_PRICING_RULESET_VERSION_KEY, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION,
+        StoredPricingFileHeader, APPLIED_PRICING_RULESET_VERSION_KEY, CURRENT_SCHEMA_VERSION,
+        STORED_PRICING_FILE_KEY,
     };
+
+    /// Any pricing version: these builds are fixtures, never run.
+    const BUILD_PRICING: u64 = 7;
+    /// The pricing format of a build that reads pricing files.
+    const READS_FORMAT_1: Option<u32> = Some(1);
+    /// A build that predates pricing files.
+    const LEGACY: Option<u32> = None;
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    /// The variables `apply_environment` sets (`Some`) or removes (`None`).
+    fn environment_changes(environment: Environment) -> Vec<(String, Option<String>)> {
+        let mut command = Command::new("statsai");
+        apply_environment(&mut command, environment);
+        let mut changes = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        changes.sort();
+        changes
+    }
+
+    #[test]
+    fn the_prod_environment_removes_url_overrides_including_the_pricing_url() {
+        assert_eq!(
+            environment_changes(Environment::Prod),
+            vec![
+                ("STATSAI_API_URL".to_string(), None),
+                ("STATSAI_PRICING_URL".to_string(), None),
+                ("STATSAI_WEB_URL".to_string(), None),
+            ]
+        );
+        for environment in [Environment::Local, Environment::Dev] {
+            let changes = environment_changes(environment);
+            assert!(
+                changes.iter().all(|(key, _)| key != "STATSAI_PRICING_URL"),
+                "{changes:?}"
+            );
+            assert!(
+                changes
+                    .iter()
+                    .any(|(key, value)| key == "STATSAI_API_URL" && value.is_some()),
+                "{changes:?}"
+            );
+        }
     }
 
     fn in_prod_environment(state: State) -> State {
@@ -291,6 +412,7 @@ mod tests {
         paths: &Paths,
         store_schema_version: i64,
         pricing_ruleset_version: u64,
+        pricing_format: Option<u32>,
     ) -> (State, artifact::InstalledBuild) {
         let sha = "a".repeat(40);
         let mut binary = vec![0u8; 64];
@@ -301,7 +423,7 @@ mod tests {
             paths,
             &VerifiedArtifact {
                 manifest: BuildManifest {
-                    schema: 2,
+                    schema: if pricing_format.is_some() { 3 } else { 2 },
                     repository: REPOSITORY.to_string(),
                     sha: sha.clone(),
                     target: TARGET.to_string(),
@@ -310,6 +432,7 @@ mod tests {
                     workflow_attempt: 1,
                     store_schema_version,
                     pricing_ruleset_version,
+                    pricing_format,
                 },
                 binary,
                 binary_sha256: binary_sha256.clone(),
@@ -360,6 +483,41 @@ mod tests {
     }
 
     #[test]
+    fn pricing_commands_that_change_pricing_state_are_blocked_under_prod_only() {
+        for forwarded in [
+            &["pricing", "refresh"][..],
+            &["pricing", "auto-refresh", "off"][..],
+            &["pricing", "auto-refresh", "on"][..],
+            &["--device-id", "development", "pricing", "refresh"][..],
+            &["pricing", "--device-id=development", "auto-refresh", "on"][..],
+        ] {
+            let error = validate_forward_for_environment(&arguments(forwarded), Environment::Prod)
+                .expect_err("prod must refuse a command that changes its pricing state");
+            assert!(
+                error.to_string().contains("prod environment"),
+                "{forwarded:?}: {error}"
+            );
+            for environment in [Environment::Dev, Environment::Local] {
+                assert!(
+                    validate_forward_for_environment(&arguments(forwarded), environment).is_ok(),
+                    "{forwarded:?} under {environment:?}"
+                );
+            }
+        }
+        for forwarded in [
+            &["pricing", "status"][..],
+            &["pricing", "status", "--json"][..],
+            &["report", "monthly"][..],
+            &["store", "supported-pricing-format"][..],
+        ] {
+            assert!(
+                validate_forward_for_environment(&arguments(forwarded), Environment::Prod).is_ok(),
+                "{forwarded:?}"
+            );
+        }
+    }
+
+    #[test]
     fn forwarded_store_override_is_blocked() {
         assert!(validate_forward_arguments(&arguments(&[
             "--store=/tmp/production.sqlite",
@@ -388,8 +546,12 @@ mod tests {
     fn the_environment_selects_the_store() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = Paths::for_test(directory.path());
-        let (mut state, _) =
-            install_selected_build(&paths, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION);
+        let (mut state, _) = install_selected_build(
+            &paths,
+            CURRENT_SCHEMA_VERSION,
+            BUILD_PRICING,
+            READS_FORMAT_1,
+        );
 
         // Neither store exists, so the store the launcher chose is named in the error
         // it fails with. Dev and local must never reach production data, and prod
@@ -422,23 +584,183 @@ mod tests {
         assert!(ensure_production_schema_compatible(18, 17).is_err());
     }
 
+    fn production(applied: Option<u64>, stored: Option<(u64, u64)>) -> DatabasePricingState {
+        DatabasePricingState {
+            applied_version: applied,
+            stored_file: stored
+                .map(|(format, version)| StoredPricingFileHeader { format, version }),
+            stored_file_unreadable: false,
+            refresh_setting_on: true,
+        }
+    }
+
+    fn refusal(
+        production: &DatabasePricingState,
+        build_version: u64,
+        build_format: Option<u32>,
+        refresh_disabled_by_env: bool,
+    ) -> String {
+        ensure_production_pricing_compatible(
+            production,
+            build_version,
+            build_format,
+            refresh_disabled_by_env,
+        )
+        .expect_err("the prod environment must be refused")
+        .to_string()
+    }
+
     #[test]
-    fn production_data_requires_an_exact_pricing_match() {
-        assert!(ensure_production_pricing_compatible(Some(1), 1).is_ok());
-        assert!(ensure_production_pricing_compatible(None, 1).is_err());
-        assert!(ensure_production_pricing_compatible(Some(1), 2).is_err());
-        assert!(ensure_production_pricing_compatible(Some(2), 1).is_err());
+    fn production_data_requires_the_build_to_price_with_the_applied_version() {
+        for format in [READS_FORMAT_1, LEGACY] {
+            assert_eq!(
+                ensure_production_pricing_compatible(&production(Some(7), None), 7, format, false)
+                    .expect("same pricing version"),
+                7
+            );
+        }
+
+        let missing = refusal(&production(None, None), 7, READS_FORMAT_1, false);
+        assert!(missing.contains("no applied pricing version"), "{missing}");
+
+        // A newer build would reprice every stored estimate.
+        let newer = refusal(&production(Some(7), None), 8, READS_FORMAT_1, false);
+        assert!(newer.contains("pricing version 8"), "{newer}");
+        assert!(newer.contains("pricing version 7"), "{newer}");
+        assert!(newer.contains("would reprice production"), "{newer}");
+
+        // An older build would price new events differently from the stored ones.
+        let older = refusal(&production(Some(8), None), 7, READS_FORMAT_1, false);
+        assert!(older.contains("pricing version 7"), "{older}");
+        assert!(older.contains("pricing version 8"), "{older}");
+        assert!(older.contains("would price new events"), "{older}");
+        assert!(older.contains("statsai-dev env dev"), "{older}");
+    }
+
+    #[test]
+    fn a_stored_pricing_file_brings_a_build_up_to_production() {
+        // Production adopted pricing version 9 from a refresh; the build embeds 7.
+        let refreshed = production(Some(9), Some((1, 9)));
+        assert_eq!(
+            ensure_production_pricing_compatible(&refreshed, 7, READS_FORMAT_1, false)
+                .expect("a build that reads the stored copy prices with version 9"),
+            9
+        );
+
+        let legacy = refusal(&refreshed, 7, LEGACY, false);
+        assert!(legacy.contains("pricing version 7"), "{legacy}");
+        assert!(legacy.contains("pricing version 9"), "{legacy}");
+        assert!(legacy.contains("predates pricing files"), "{legacy}");
+
+        // With the refresh off, the build keeps pricing with the stored copy
+        // production is priced with, as StatsAI does.
+        assert_eq!(
+            ensure_production_pricing_compatible(&refreshed, 7, READS_FORMAT_1, true)
+                .expect("variable off"),
+            9
+        );
+        assert_eq!(
+            ensure_production_pricing_compatible(
+                &DatabasePricingState {
+                    refresh_setting_on: false,
+                    ..refreshed
+                },
+                7,
+                READS_FORMAT_1,
+                false,
+            )
+            .expect("setting off"),
+            9
+        );
+
+        // Production holds no copy of the version it is priced with: only a
+        // newer build helps, whatever the refresh.
+        for stored in [None, Some((1, 8))] {
+            for refresh_disabled_by_env in [false, true] {
+                let older = refusal(
+                    &production(Some(9), stored),
+                    7,
+                    READS_FORMAT_1,
+                    refresh_disabled_by_env,
+                );
+                assert!(older.contains("would price new events"), "{older}");
+                assert!(
+                    older.contains("select a build whose pricing is at least that version"),
+                    "{older}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_pricing_file_newer_than_the_applied_version_is_refused() {
+        // A refresh adopted version 10, and nothing has repriced production yet: the
+        // build would be the one to do it.
+        let adopted = production(Some(9), Some((1, 10)));
+        for build_version in [7, 9, 10, 11] {
+            let error = refusal(&adopted, build_version, READS_FORMAT_1, false);
+            assert!(error.contains("would reprice production"), "{error}");
+            assert!(error.contains("pricing version 9"), "{error}");
+        }
+        // With the refresh off the build ignores a stored copy production is not
+        // priced with, so only its own version counts.
+        assert_eq!(
+            ensure_production_pricing_compatible(&adopted, 9, READS_FORMAT_1, true)
+                .expect("the stored copy is ignored"),
+            9
+        );
+        let older = refusal(&adopted, 7, READS_FORMAT_1, true);
+        assert!(older.contains("would price new events"), "{older}");
+    }
+
+    #[test]
+    fn a_stored_pricing_format_the_build_cannot_read_is_refused() {
+        let unreadable = production(Some(9), Some((2, 9)));
+        for refresh_disabled_by_env in [false, true] {
+            let error = refusal(&unreadable, 9, READS_FORMAT_1, refresh_disabled_by_env);
+            assert!(
+                error.starts_with("refusing the prod environment"),
+                "{error}"
+            );
+            assert!(error.contains("pricing file format 2"), "{error}");
+            assert!(error.contains("it reads format 1"), "{error}");
+            assert!(error.contains("statsai-dev env dev"), "{error}");
+        }
+        assert_eq!(
+            ensure_production_pricing_compatible(&unreadable, 9, Some(2), false)
+                .expect("a build that reads format 2"),
+            9
+        );
+    }
+
+    fn create_production(paths: &Paths, values: &[(&str, &str)]) {
+        let production = statsai_store::Store::open(&paths.prod_store)
+            .expect("create production store at current schema");
+        for (key, value) in values {
+            production
+                .set_metadata_value(key, value)
+                .expect("record production metadata");
+        }
+    }
+
+    fn production_pricing(paths: &Paths) -> DatabasePricingState {
+        database_pricing_state(&paths.prod_store)
+            .expect("read production pricing")
+            .expect("production exists")
     }
 
     #[test]
     fn production_data_refuses_a_build_that_would_migrate_the_store() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = Paths::for_test(directory.path());
-        let production = statsai_store::Store::open(&paths.prod_store)
-            .expect("create production store at current schema");
-        drop(production);
+        create_production(&paths, &[]);
 
-        let (state, _) = install_selected_build(&paths, CURRENT_SCHEMA_VERSION + 1, 1);
+        let (state, _) = install_selected_build(
+            &paths,
+            CURRENT_SCHEMA_VERSION + 1,
+            BUILD_PRICING,
+            READS_FORMAT_1,
+        );
         let state = in_prod_environment(state);
 
         let error = forward(&paths, &state, &arguments(&["status"]))
@@ -452,61 +774,91 @@ mod tests {
     }
 
     #[test]
-    fn production_data_refuses_a_missing_applied_pricing_ruleset() {
+    fn production_data_refuses_a_missing_applied_pricing_version() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = Paths::for_test(directory.path());
-        drop(
-            statsai_store::Store::open(&paths.prod_store)
-                .expect("create production store at current schema"),
+        create_production(&paths, &[]);
+        let (state, _) = install_selected_build(
+            &paths,
+            CURRENT_SCHEMA_VERSION,
+            BUILD_PRICING,
+            READS_FORMAT_1,
         );
-        let (state, _) =
-            install_selected_build(&paths, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION);
         let state = in_prod_environment(state);
 
         let error = forward(&paths, &state, &arguments(&["status"]))
             .expect_err("unpriced production store must not run against development builds");
 
-        assert!(error.to_string().contains("no applied pricing ruleset"));
-        assert_eq!(
-            database_applied_pricing_ruleset_version(&paths.prod_store)
-                .expect("read unchanged production pricing"),
-            None
-        );
+        assert!(error.to_string().contains("no applied pricing version"));
+        assert_eq!(production_pricing(&paths).applied_version, None);
     }
 
     #[test]
-    fn production_data_refuses_older_and_newer_pricing_rulesets() {
+    fn production_data_refuses_older_and_newer_pricing_versions() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let paths = Paths::for_test(directory.path());
-        let production = statsai_store::Store::open(&paths.prod_store)
-            .expect("create production store at current schema");
-        production
-            .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "1")
-            .expect("record older applied ruleset");
-        drop(production);
-        let (older_state, _) = install_selected_build(&paths, CURRENT_SCHEMA_VERSION, 2);
+        create_production(&paths, &[(APPLIED_PRICING_RULESET_VERSION_KEY, "1")]);
+        let (older_state, _) =
+            install_selected_build(&paths, CURRENT_SCHEMA_VERSION, 2, READS_FORMAT_1);
         let older_state = in_prod_environment(older_state);
         let older = forward(&paths, &older_state, &arguments(&["status"]))
-            .expect_err("older production ruleset must refuse");
-        assert!(older.to_string().contains("pricing ruleset 2"));
-        assert!(older.to_string().contains("pricing ruleset 1"));
+            .expect_err("older production pricing must refuse");
+        assert!(older.to_string().contains("pricing version 2"), "{older}");
+        assert!(older.to_string().contains("pricing version 1"), "{older}");
 
-        let production =
-            statsai_store::Store::open(&paths.prod_store).expect("reopen production store");
-        production
-            .set_metadata_value(APPLIED_PRICING_RULESET_VERSION_KEY, "99")
-            .expect("record newer applied ruleset");
-        drop(production);
-        let (newer_state, _) =
-            install_selected_build(&paths, CURRENT_SCHEMA_VERSION, PRICING_RULESET_VERSION);
-        let newer_state = in_prod_environment(newer_state);
-        let newer = forward(&paths, &newer_state, &arguments(&["status"]))
-            .expect_err("newer production ruleset must refuse");
-        assert!(newer.to_string().contains("pricing ruleset 99"));
+        create_production(&paths, &[(APPLIED_PRICING_RULESET_VERSION_KEY, "99")]);
+        for format in [READS_FORMAT_1, LEGACY] {
+            let (newer_state, _) =
+                install_selected_build(&paths, CURRENT_SCHEMA_VERSION, BUILD_PRICING, format);
+            let newer_state = in_prod_environment(newer_state);
+            let newer = forward(&paths, &newer_state, &arguments(&["status"]))
+                .expect_err("newer production pricing must refuse");
+            assert!(newer.to_string().contains("pricing version 99"), "{newer}");
+        }
+        assert_eq!(production_pricing(&paths).applied_version, Some(99));
+    }
+
+    #[test]
+    fn production_data_reads_the_stored_pricing_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = Paths::for_test(directory.path());
+        let (state, _) = install_selected_build(
+            &paths,
+            CURRENT_SCHEMA_VERSION,
+            BUILD_PRICING,
+            READS_FORMAT_1,
+        );
+        let state = in_prod_environment(state);
+
+        create_production(
+            &paths,
+            &[
+                (APPLIED_PRICING_RULESET_VERSION_KEY, "9"),
+                (STORED_PRICING_FILE_KEY, r#"{"format": 2, "version": 9}"#),
+            ],
+        );
+        let unknown_format = forward(&paths, &state, &arguments(&["status"]))
+            .expect_err("a format the build cannot read must refuse");
+        assert!(
+            unknown_format.to_string().contains("pricing file format 2"),
+            "{unknown_format}"
+        );
+
+        // Whether or not the refresh is on where this test runs, a build embedding 7
+        // cannot price a store applied at 9 with a stored copy at 10 with version 9.
+        create_production(
+            &paths,
+            &[(STORED_PRICING_FILE_KEY, r#"{"format": 1, "version": 10}"#)],
+        );
+        let newer_copy = forward(&paths, &state, &arguments(&["status"]))
+            .expect_err("a stored copy newer than the applied version must refuse");
+        assert!(
+            newer_copy.to_string().contains("pricing version 9"),
+            "{newer_copy}"
+        );
         assert_eq!(
-            database_applied_pricing_ruleset_version(&paths.prod_store)
-                .expect("read unchanged production pricing"),
-            Some(99)
+            production_pricing(&paths),
+            production(Some(9), Some((1, 10)))
         );
     }
 }

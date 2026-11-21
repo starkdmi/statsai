@@ -271,11 +271,23 @@ Cost payloads may include `provider_reported_micro_usd`,
 `estimated_cost_micro_usd`. Receivers prefer these integer micro-USD values and
 fall back to legacy rounded-cent fields when they are absent.
 
-When a local pricing ruleset advances, StatsAI reprices persisted normalized
-events and refreshes the affected `sync_rollups` in place. Changed rollups are
-marked dirty so a later incremental HTTP sync publishes the corrected values
-without `--rebuild-rollups` or `--full`. Provider-reported cost fields are
-never replaced by estimates.
+When the local pricing file advances to a newer `version`, whether from a new
+binary or from the daily refresh, StatsAI reprices persisted normalized events
+and refreshes the affected `sync_rollups` in place. Changed rollups are marked
+dirty so a later incremental HTTP sync publishes the corrected values without
+`--rebuild-rollups` or `--full`. Provider-reported cost fields are never
+replaced by estimates. A store whose applied pricing version is newer than the
+binary's is used as it is, not refused, and not repriced. A scan, sync, import
+or watch pass that finishes after another process repriced the store reprices
+it again, so the rollups it wrote are corrected and marked dirty too. When it
+has no pricing file at the store's applied version, it lowers that version to
+the one it priced with instead, and the next process with a newer file
+reprices every estimate to its version, even estimates priced with a newer
+one, so their rollups can go back to older prices. Estimates that adapters sum
+from per-request records are kept as they are and refreshed only by a rescan
+of their sources. A store whose stored pricing file has a `format` the binary
+cannot read is refused with a message to upgrade. See
+[Pricing file](pricing.md).
 
 User-defined aliases are still retained in `ProviderAccount.account_label` for
 display, but they are no longer the primary account key.

@@ -98,6 +98,117 @@ fn supported_pricing_ruleset_version_is_available_without_opening_a_store() {
 }
 
 #[test]
+fn supported_pricing_format_is_available_without_opening_a_store() {
+    let cli = Cli::try_parse_from(["statsai", "store", "supported-pricing-format"])
+        .expect("parse supported pricing format query");
+
+    assert!(matches!(
+        cli.command,
+        Command::Store(StoreAdminCommand {
+            command: StoreAdminSubcommand::SupportedPricingFormat,
+        })
+    ));
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store_path = directory.path().join("must-not-be-created.sqlite");
+    store_admin(
+        StoreAdminCommand {
+            command: StoreAdminSubcommand::SupportedPricingFormat,
+        },
+        &store_path,
+    )
+    .expect("print supported pricing format");
+    assert!(!store_path.exists());
+}
+
+#[test]
+fn pricing_commands_parse() {
+    let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+
+    assert!(matches!(
+        parse(&["statsai", "pricing", "status"]),
+        Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::Status { json: false }
+        }))
+    ));
+    assert!(matches!(
+        parse(&["statsai", "pricing", "status", "--json"]),
+        Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::Status { json: true }
+        }))
+    ));
+    assert!(matches!(
+        parse(&["statsai", "pricing", "refresh"]),
+        Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::Refresh { background: false }
+        }))
+    ));
+    let mut background = vec!["statsai", "--store", "statsai.sqlite"];
+    background.extend(statsai::pricing_refresh::BACKGROUND_REFRESH_ARGS);
+    assert!(matches!(
+        parse(&background),
+        Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::Refresh { background: true }
+        }))
+    ));
+    for (word, state) in [("on", OnOff::On), ("off", OnOff::Off)] {
+        let Ok(Command::Pricing(PricingCommand {
+            command: PricingSubcommand::AutoRefresh { state: parsed },
+        })) = parse(&["statsai", "pricing", "auto-refresh", word])
+        else {
+            panic!("auto-refresh {word} must parse");
+        };
+        assert_eq!(parsed, state);
+    }
+    assert!(parse(&["statsai", "pricing", "auto-refresh"]).is_err());
+    assert!(parse(&["statsai", "pricing", "auto-refresh", "sometimes"]).is_err());
+}
+
+#[test]
+fn scan_and_every_sync_start_a_background_pricing_refresh() {
+    let starts = |args: &[&str]| {
+        let cli = Cli::try_parse_from(args).expect("parse");
+        command_starts_pricing_refresh(&cli.command)
+    };
+    assert!(starts(&["statsai", "scan"]));
+    assert!(starts(&["statsai", "scan", "--preview"]));
+    assert!(starts(&["statsai", "sync"]));
+    assert!(starts(&["statsai", "sync", "--sink", "http"]));
+    assert!(starts(&["statsai", "sync", "--status"]));
+    assert!(!starts(&["statsai", "report", "monthly"]));
+    assert!(!starts(&["statsai", "status"]));
+    assert!(!starts(&["statsai", "daemon", "--watch"]));
+    assert!(!starts(&["statsai", "pricing", "status"]));
+    // The process a scan or sync starts never starts another one.
+    let mut background = vec!["statsai", "--store", "statsai.sqlite"];
+    background.extend(statsai::pricing_refresh::BACKGROUND_REFRESH_ARGS);
+    assert!(!starts(&background));
+}
+
+#[test]
+fn commands_that_write_priced_estimates_settle_pricing_when_they_finish() {
+    let settles = |args: &[&str]| {
+        let cli = Cli::try_parse_from(args).expect("parse");
+        command_settles_pricing(&cli.command)
+    };
+    assert!(settles(&["statsai", "scan"]));
+    assert!(settles(&["statsai", "sync"]));
+    assert!(settles(&["statsai", "sync", "--sink", "http"]));
+    assert!(settles(&[
+        "statsai",
+        "import",
+        "cursor",
+        "--path",
+        "usage.csv"
+    ]));
+    assert!(!settles(&["statsai", "report", "monthly"]));
+    assert!(!settles(&["statsai", "export", "--json"]));
+    assert!(!settles(&["statsai", "status"]));
+    // The watch daemon settles after each pass instead.
+    assert!(!settles(&["statsai", "daemon", "--watch"]));
+}
+
+#[test]
 fn price_derived_commands_reprice_and_diagnostic_commands_do_not() {
     let reprice = |args: &[&str]| {
         let cli = Cli::try_parse_from(args).expect("parse");

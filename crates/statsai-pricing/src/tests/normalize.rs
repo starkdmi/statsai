@@ -336,8 +336,11 @@ fn normalizes_cursor_composer_aliases() {
         "composer-2.5-fast"
     );
     assert_eq!(normalize_model_name("grok-composer-2.5"), "composer-2.5");
+    // Priced on 2026-11-18, the catalog date of pricing version 7, so a later
+    // period in pricing.json leaves the expected rates as they are.
+    let catalog_day = chrono::NaiveDate::from_ymd_opt(2026, 11, 18).expect("catalog day");
     assert_eq!(
-        pricing_for_model("composer-2.5-fast").map(|pricing| (
+        crate::catalog::pricing_for_model_on("composer-2.5-fast", catalog_day).map(|pricing| (
             pricing.input_per_million,
             pricing.cached_input_per_million,
             pricing.output_per_million

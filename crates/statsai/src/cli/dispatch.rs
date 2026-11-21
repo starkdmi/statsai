@@ -19,6 +19,7 @@ pub(crate) fn run() -> Result<()> {
     match cli.command {
         Command::Schema(command) => schema(command),
         Command::Store(command) => store_admin(command, &store_path),
+        Command::Pricing(command) => pricing(command, &store_path),
         Command::Doctor => doctor(&store_path),
         Command::Auth(command) => auth(command),
         Command::Service(command) => service(command),
@@ -50,9 +51,23 @@ pub(crate) fn run() -> Result<()> {
             let store = if command_reprices_persisted_usage(&command) {
                 statsai::open_operational_store(&store_path)?
             } else {
-                Store::open(&store_path)?
+                let store = Store::open(&store_path)?;
+                // Costs these commands read are priced with the newest
+                // pricing file this process can use, without repricing.
+                store.use_current_pricing()?;
+                store
             };
-            match command {
+            // The table this command prices what it writes with, captured
+            // before anything is written or a background refresh starts.
+            let priced_with = statsai_store::active_pricing();
+            let settles_pricing = command_settles_pricing(&command);
+            if command_starts_pricing_refresh(&command) {
+                // A detached process when a refresh is due. The command never
+                // waits for it, and it finishes even if the command exits
+                // first.
+                statsai::pricing_refresh::start_background_refresh(&store, &store_path);
+            }
+            let result = match command {
                 Command::Scan(command) => scan(command, &store, &device_id),
                 Command::Report(command) => report(command, &store),
                 Command::Sessions(command) => sessions(command, &store),
@@ -69,17 +84,29 @@ pub(crate) fn run() -> Result<()> {
                     statsai::privacy_cli::run(command, &store, &store_path)
                 }
                 Command::Sync(command) => sync(command, &store, &device_id),
-                Command::Daemon(command) => daemon(command, store, &device_id, &store_path),
+                Command::Daemon(command) => {
+                    return daemon(command, store, &device_id, &store_path);
+                }
                 Command::Status => status(&store),
                 Command::Schema(_)
                 | Command::Store(_)
+                | Command::Pricing(_)
                 | Command::Doctor
                 | Command::Auth(_)
                 | Command::Service(_)
                 | Command::Snapshot(_) => {
                     unreachable!("handled before store open")
                 }
+            };
+            if settles_pricing {
+                // Also after a failure: the command may have written some
+                // estimates before it stopped.
+                let settled = statsai::settle_pricing(&store, &priced_with);
+                result?;
+                settled?;
+                return Ok(());
             }
+            result
         }
     }
 }
@@ -96,6 +123,22 @@ pub(crate) fn command_reprices_persisted_usage(command: &Command) -> bool {
             | Command::Sync(_)
             | Command::Daemon(_)
     )
+}
+
+/// Whether a command writes priced estimates, and so settles the store's
+/// pricing when it finishes ([`statsai::settle_pricing`]): `scan`, `sync` and
+/// `import`. The watch daemon settles after each pass instead.
+pub(crate) fn command_settles_pricing(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Scan(_) | Command::Sync(_) | Command::Import(_)
+    )
+}
+
+/// Whether a command starts a background pricing refresh once its store is
+/// open: `scan` and every `sync`. The watch daemon runs its own refresher.
+pub(crate) fn command_starts_pricing_refresh(command: &Command) -> bool {
+    matches!(command, Command::Scan(_) | Command::Sync(_))
 }
 
 /// Whether a command scans into the store and so must hold the scan lock.

@@ -81,7 +81,8 @@ pub use activity::{
 };
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use pricing::{
-    apply_current_estimated_pricing, RepricingReport, APPLIED_PRICING_CATALOG_VERSION_KEY,
+    apply_current_estimated_pricing, PricingOffer, PricingRefreshState, RepricingReport,
+    StoredPricing, UnsupportedPricingFormat, APPLIED_PRICING_CATALOG_VERSION_KEY,
     APPLIED_PRICING_RULESET_VERSION_KEY,
 };
 pub use project_identity::LocationIdentities;
@@ -92,10 +93,15 @@ pub use scan_lock::{
     SCAN_LOCK_FILE_NAME,
 };
 pub use snapshot::{
-    clone_database_to, database_applied_pricing_ruleset_version, database_schema_version,
-    DatabaseClone,
+    clone_database_to, database_applied_pricing_ruleset_version, database_pricing_state,
+    database_schema_version, DatabaseClone, DatabasePricingState, StoredPricingFileHeader,
+    PRICING_REFRESH_SETTING_KEY, STORED_PRICING_FILE_KEY,
 };
-pub use statsai_pricing::{PRICING_CATALOG_VERSION, PRICING_RULESET_VERSION};
+pub use statsai_pricing::{
+    active_pricing, embedded_pricing, install_pricing, refresh_disabled_by_env,
+    refresh_value_disables, PricingFileError, PricingFileHeader, PricingTable, PRICING_FORMAT,
+    PRICING_REFRESH_ENV,
+};
 use std::time::Duration;
 
 #[cfg(test)]

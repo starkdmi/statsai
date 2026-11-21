@@ -43,6 +43,35 @@ jobs:
       - run: ./scripts/rust-ci.sh clippy
       - run: ./scripts/rust-ci.sh test
 
+  pricing-file:
+    name: Pricing file
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Runs the check below on edited copies of pricing.json, with --files
+      # and with a git ref, so a check that could no longer fail fails here.
+      - name: Test the pricing file check
+        run: scripts/test-check-pricing-file.sh
+      # A pull request run checks out the merge commit GitHub built for the
+      # event. Its first parent is the base tip it was merged onto, so this
+      # checks only the pull request's own change, even on a re-run after
+      # main moved.
+      - name: Check the pull request's change
+        if: github.event_name == 'pull_request'
+        run: scripts/check-pricing-file.sh HEAD^1
+      # Two pull requests can each pass against the base they saw and still
+      # merge into a main whose file changed without a higher version. Checking
+      # each push to main against the tip it replaced fails main loudly then.
+      - name: Check the change pushed to main
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        run: scripts/check-pricing-file.sh "$BEFORE"
+        env:
+          BEFORE: ${{ github.event.before }}
+
   dependency-review:
     name: Dependency Review
     if: github.event_name == 'pull_request'

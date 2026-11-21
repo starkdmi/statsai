@@ -1,9 +1,9 @@
-use chrono::{Datelike, Utc};
+use chrono::{NaiveDate, Utc};
 use statsai_core::ModelInfo;
 
-use crate::normalize::normalize_model_name;
+use crate::table::{active_pricing, FastRates, ModelEntry, PricingTable};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPricing {
     pub input_per_million: f64,
     pub cache_creation_per_million: f64,
@@ -11,100 +11,40 @@ pub struct ModelPricing {
     pub output_per_million: f64,
 }
 
-/// Sonnet 5.5 cache reads dropped from $0.20/M to $0.10/M; its other rates held.
-const CLAUDE_SONNET_5_5_CACHE_READ_CUT_START: (i32, u32, u32) = (2026, 10, 7);
-const GPT_5_6_LUNA_TERRA_PRICE_CUT_START: (i32, u32, u32) = (2026, 7, 30);
-/// Promotional, announced to hold at least through 2026-11-21. When it lapses,
-/// add an end date here rather than reverting: usage priced under the promotion
-/// must keep its rate.
-const GPT_5_6_SOL_PROMO_START: (i32, u32, u32) = (2026, 8, 21);
-
-fn pricing(
-    input_per_million: f64,
-    cached_input_per_million: f64,
-    output_per_million: f64,
-) -> ModelPricing {
-    ModelPricing {
-        input_per_million,
-        cache_creation_per_million: input_per_million,
-        cached_input_per_million,
-        output_per_million,
+impl ModelPricing {
+    fn scaled(self, multiplier: f64) -> Self {
+        Self {
+            input_per_million: self.input_per_million * multiplier,
+            cache_creation_per_million: self.cache_creation_per_million * multiplier,
+            cached_input_per_million: self.cached_input_per_million * multiplier,
+            output_per_million: self.output_per_million * multiplier,
+        }
     }
 }
 
-fn pricing_with_cache_creation(
-    input_per_million: f64,
-    cache_creation_per_million: f64,
-    cached_input_per_million: f64,
-    output_per_million: f64,
-) -> ModelPricing {
-    ModelPricing {
-        input_per_million,
-        cache_creation_per_million,
-        cached_input_per_million,
-        output_per_million,
-    }
-}
-
+/// The rates `entry` bills on `date` at the effective `speed`, and whether
+/// they are fast-mode rates.
+///
+/// Effective `usage.speed` is authoritative: unsupported fast requests either
+/// failed or reported `standard` after fallback, so a model with no fast rates
+/// prices a fast request at standard.
 pub(crate) fn pricing_for_effective_speed(
-    model_name: &str,
+    entry: &ModelEntry,
     speed: Option<&str>,
-    standard: ModelPricing,
+    date: NaiveDate,
 ) -> (ModelPricing, bool) {
+    let standard = *entry.prices.on(date);
     let is_fast = speed.is_some_and(|speed| speed.trim().eq_ignore_ascii_case("fast"));
-    if !is_fast {
-        return (standard, false);
+    match (&entry.fast, is_fast) {
+        (Some(fast), true) => {
+            let rates = match &fast.rates {
+                FastRates::Multiplier(multiplier) => standard.scaled(*multiplier),
+                FastRates::Prices(prices) => *prices.on(date),
+            };
+            (rates, true)
+        }
+        _ => (standard, false),
     }
-
-    let fast = match model_name {
-        // Fast input and output are 2x. Prompt-cache multipliers apply on top
-        // of that fast input rate: 1.25x 5-minute writes and 0.025x cache reads.
-        // https://platform.claude.com/docs/en/about-claude/pricing
-        "claude-fable-5-2" | "claude-mythos-5-2" => {
-            pricing_with_cache_creation(16.0, 20.0, 0.4, 80.0)
-        }
-        "claude-opus-5-5" => pricing_with_cache_creation(8.0, 10.0, 0.4, 40.0),
-        "claude-opus-5" | "claude-opus-4-8" => pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0),
-        // Fast mode is twice the standard rates in effect that day, including
-        // cache writes and cached input. Models that also have a >272k tier
-        // publish that same multiple on the long-context rates.
-        // https://developers.openai.com/api/docs/pricing
-        "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-sol"
-        | "gpt-6-luna" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
-        | "gpt-5" | "gpt-5.1" | "gpt-5.2" | "gpt-5.3-codex" | "gpt-5.4-mini" => {
-            pricing_with_cache_creation(
-                standard.input_per_million * 2.0,
-                standard.cache_creation_per_million * 2.0,
-                standard.cached_input_per_million * 2.0,
-                standard.output_per_million * 2.0,
-            )
-        }
-        // Published fast rates that are not a flat 2x. GPT-5.5 is 2.5x and
-        // GPT-5 mini is 1.8x. GPT-5.4 is 2x but, like GPT-5.5, has no fast
-        // long-context rate: `estimate_cost_at` prices a fast request over 272k
-        // as standard (see `fast_mode_covers`). Cache writes bill as input.
-        // https://developers.openai.com/api/docs/pricing
-        // https://openai.com/api-fast-mode/
-        "gpt-5.5" => pricing(12.5, 1.25, 75.0),
-        "gpt-5.4" => pricing(5.0, 0.5, 30.0),
-        "gpt-5-mini" => pricing(0.45, 0.045, 3.6),
-        // Historical fast-mode rates. Effective `usage.speed` is authoritative:
-        // unsupported requests either failed or reported `standard` after fallback.
-        "claude-opus-4-6" | "claude-opus-4-7" => {
-            pricing_with_cache_creation(30.0, 37.5, 3.0, 150.0)
-        }
-        // Grok 4.6/4.7 Fast is 2x the standard short-context token rates.
-        // Grok 4.7 Fast above 200k is 1.5x these rates, not another 2x.
-        // https://docs.x.ai/developers/pricing
-        "grok-4.6" | "grok-4.7" => pricing(4.0, 1.0, 12.0),
-        // Grok 4.5 fast doubles input and cached input but triples output.
-        // Applied as multipliers against the standard rates above rather than as
-        // absolutes: xAI documents 4.5 cached input at $0.30/M, not 4.6's $0.50/M
-        // (https://docs.x.ai/developers/models/grok-4.5), so 2x lands at $0.60/M.
-        "grok-4.5" => pricing(4.0, 0.6, 18.0),
-        _ => return (standard, false),
-    };
-    (fast, true)
 }
 
 #[must_use]
@@ -112,162 +52,11 @@ pub fn pricing_for_model(model_name: &str) -> Option<ModelPricing> {
     pricing_for_model_on(model_name, Utc::now().date_naive())
 }
 
-fn date_tuple(date: chrono::NaiveDate) -> (i32, u32, u32) {
-    (date.year(), date.month(), date.day())
-}
-
-/// Maps an observed model to the catalog model whose rates should be reused.
-///
-/// Observed identity stays unchanged; this mapping is pricing-only.
-pub(crate) fn api_equivalent_pricing_model(
-    model_name: &str,
-    usage_date: chrono::NaiveDate,
-) -> Option<&'static str> {
-    match model_name {
-        "codex-auto-review" => {
-            if date_tuple(usage_date) >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START {
-                Some("gpt-5.6-luna")
-            } else {
-                Some("gpt-5.4")
-            }
-        }
-        _ => None,
-    }
-}
-
-fn claude_sonnet_5_5_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
-    if date_tuple(usage_date) >= CLAUDE_SONNET_5_5_CACHE_READ_CUT_START {
-        pricing_with_cache_creation(2.0, 2.5, 0.1, 10.0)
-    } else {
-        pricing_with_cache_creation(2.0, 2.5, 0.2, 10.0)
-    }
-}
-
-fn gpt_5_6_luna_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
-    if date_tuple(usage_date) >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START {
-        pricing_with_cache_creation(0.2, 0.25, 0.02, 1.2)
-    } else {
-        pricing_with_cache_creation(1.0, 1.25, 0.1, 6.0)
-    }
-}
-
-fn gpt_5_6_sol_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
-    if date_tuple(usage_date) >= GPT_5_6_SOL_PROMO_START {
-        pricing_with_cache_creation(4.0, 5.0, 0.4, 20.0)
-    } else {
-        pricing_with_cache_creation(5.0, 6.25, 0.5, 30.0)
-    }
-}
-
-fn gpt_5_6_terra_pricing(usage_date: chrono::NaiveDate) -> ModelPricing {
-    if date_tuple(usage_date) >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START {
-        pricing_with_cache_creation(2.0, 2.5, 0.2, 12.0)
-    } else {
-        pricing_with_cache_creation(2.5, 3.125, 0.25, 15.0)
-    }
-}
-
 pub(crate) fn pricing_for_model_on(
     model_name: &str,
-    usage_date: chrono::NaiveDate,
+    usage_date: NaiveDate,
 ) -> Option<ModelPricing> {
-    let normalized = model_name.to_ascii_lowercase();
-    if let Some(mapped) = api_equivalent_pricing_model(&normalized, usage_date) {
-        return pricing_for_model_on(mapped, usage_date);
-    }
-    match normalized.as_str() {
-        // Launch price, 2026-11-09. Mythos 5.2 uses the same rates. Cache reads
-        // are 0.025x input. The 1M window has no long-context surcharge.
-        // https://platform.claude.com/docs/en/about-claude/pricing
-        // https://platform.claude.com/docs/en/models/fable-5-2/overview
-        // https://www.anthropic.com/claude-fable-and-mythos-5-2
-        "claude-fable-5-2" | "claude-mythos-5-2" => {
-            Some(pricing_with_cache_creation(8.0, 10.0, 0.2, 40.0))
-        }
-        // Fable 5.1 matches Fable 5 except for cache reads, which dropped to $0.25/M.
-        "claude-fable-5-1" => Some(pricing_with_cache_creation(10.0, 12.5, 0.25, 50.0)),
-        // Mythos 5.1 matches Mythos 5 except cache reads at $0.25/M.
-        // https://platform.claude.com/docs/en/about-claude/pricing
-        "claude-mythos-5-1" => Some(pricing_with_cache_creation(10.0, 12.5, 0.25, 50.0)),
-        "claude-fable-5" | "claude-mythos-5" => {
-            Some(pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0))
-        }
-        "claude-opus-5-5" => Some(pricing_with_cache_creation(4.0, 5.0, 0.2, 20.0)),
-        "claude-opus-5" => Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 25.0)),
-        "claude-sonnet-5-5" => Some(claude_sonnet_5_5_pricing(usage_date)),
-        // The $2/$10 launch price became standard; the rise to $3/$15 scheduled
-        // for 2026-09-01 was cancelled.
-        "claude-sonnet-5" => Some(pricing_with_cache_creation(2.0, 2.5, 0.2, 10.0)),
-        "claude-opus-4" | "claude-opus-4-1" => {
-            Some(pricing_with_cache_creation(15.0, 18.75, 1.5, 75.0))
-        }
-        "claude-opus-4-5" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" => {
-            Some(pricing_with_cache_creation(5.0, 6.25, 0.5, 25.0))
-        }
-        "claude-sonnet-4" | "claude-sonnet-4-5" | "claude-sonnet-4-6" => {
-            Some(pricing_with_cache_creation(3.0, 3.75, 0.3, 15.0))
-        }
-        // The rate for prompts up to 100k tokens. A larger prompt reprices the
-        // whole request at 5x, applied by `pricing_multipliers` where a record
-        // is one known request.
-        "claude-haiku-5-5" => Some(pricing_with_cache_creation(0.1, 0.125, 0.01, 0.5)),
-        "claude-haiku-4-5" => Some(pricing_with_cache_creation(1.0, 1.25, 0.1, 5.0)),
-        // Launch price, 2026-11-17. Cache writes are the 30-minute rate. Prompts
-        // over 272k use the shared long-context multiplier; fast is 2x.
-        // https://developers.openai.com/api/docs/pricing
-        // https://developers.openai.com/api/docs/models/gpt-6.2-astra
-        // https://developers.openai.com/api/docs/models/gpt-6.2-sol
-        "gpt-6.2-astra" => Some(pricing_with_cache_creation(8.0, 10.0, 0.4, 40.0)),
-        "gpt-6.2-sol" => Some(pricing_with_cache_creation(2.0, 2.5, 0.1, 10.0)),
-        // The default rate, covering the 272k context window Codex runs by
-        // default. A larger prompt reprices the whole request at 20/25/2/75,
-        // applied by `pricing_multipliers` where a record is one known request.
-        "gpt-6-astra" => Some(pricing_with_cache_creation(10.0, 12.5, 1.0, 50.0)),
-        // Same input, cache-write and output rates as GPT-6 Sol; cached input
-        // is 5% of input rather than 10%.
-        "gpt-6.1-sol" => Some(pricing_with_cache_creation(2.0, 2.5, 0.1, 10.0)),
-        // Launch price, 2026-10-26. Cache writes are the 30-minute rate.
-        // Prompts over 272k use the shared long-context multiplier; fast is 2x.
-        // https://developers.openai.com/api/docs/models/gpt-6.1-terra
-        // https://developers.openai.com/api/docs/pricing
-        "gpt-6.1-terra" => Some(pricing_with_cache_creation(1.0, 1.25, 0.05, 5.0)),
-        "gpt-6-sol" => Some(pricing_with_cache_creation(2.0, 2.5, 0.2, 10.0)),
-        "gpt-6-luna" => Some(pricing_with_cache_creation(0.1, 0.125, 0.01, 0.5)),
-        // GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount.
-        "gpt-5.6-sol" => Some(gpt_5_6_sol_pricing(usage_date)),
-        "gpt-5.6-terra" => Some(gpt_5_6_terra_pricing(usage_date)),
-        "gpt-5.6-luna" => Some(gpt_5_6_luna_pricing(usage_date)),
-        "gpt-5.5" => Some(pricing(5.0, 0.5, 30.0)),
-        "gpt-5.4" => Some(pricing(2.5, 0.25, 15.0)),
-        "gpt-5.4-mini" => Some(pricing(0.75, 0.075, 4.5)),
-        // No long-context tier. Cache writes are billed as input.
-        // https://developers.openai.com/api/docs/pricing
-        "gpt-5.4-nano" => Some(pricing(0.2, 0.02, 1.25)),
-        "gpt-5.3-codex" | "gpt-5.2" | "gpt-5.2-chat-latest" | "gpt-5.2-codex" => {
-            Some(pricing(1.75, 0.175, 14.0))
-        }
-        "gpt-5-codex"
-        | "gpt-5.1-codex"
-        | "gpt-5.1-codex-max"
-        | "gpt-5"
-        | "gpt-5.1"
-        | "gpt-5-chat-latest"
-        | "gpt-5.1-chat-latest" => Some(pricing(1.25, 0.125, 10.0)),
-        "gpt-5-mini" | "gpt-5.1-codex-mini" => Some(pricing(0.25, 0.025, 2.0)),
-        "gpt-5-nano" => Some(pricing(0.05, 0.005, 0.4)),
-        "composer-2.5" => Some(pricing(0.5, 0.2, 2.5)),
-        "composer-2.5-fast" => Some(pricing(3.0, 0.5, 15.0)),
-        "grok-build-0.1" => Some(pricing(1.0, 0.2, 2.0)),
-        "grok-4.3"
-        | "grok-4.20-multi-agent-0309"
-        | "grok-4.20-0309-reasoning"
-        | "grok-4.20-0309-non-reasoning" => Some(pricing(1.25, 0.2, 2.5)),
-        "grok-4.5" => Some(pricing(2.0, 0.3, 6.0)),
-        // Official Grok 4.6/4.7 short-context rates are $2/M input,
-        // $0.50/M cached input, and $6/M output.
-        "grok-4.6" | "grok-4.7" => Some(pricing(2.0, 0.5, 6.0)),
-        _ => None,
-    }
+    active_pricing().pricing_for_model_on(model_name, usage_date)
 }
 
 /// Reports whether an aggregate usage period spans a known model-price change.
@@ -277,57 +66,67 @@ pub(crate) fn pricing_for_model_on(
 #[must_use]
 pub fn pricing_changes_between(
     model_name: &str,
-    period_start: chrono::NaiveDate,
-    period_end: chrono::NaiveDate,
+    period_start: NaiveDate,
+    period_end: NaiveDate,
 ) -> bool {
-    let (period_start, period_end) = if period_start <= period_end {
-        (period_start, period_end)
-    } else {
-        (period_end, period_start)
-    };
-    let start = date_tuple(period_start);
-    let end = date_tuple(period_end);
-
-    match normalize_model_name(model_name).as_str() {
-        "claude-sonnet-5-5" => {
-            start < CLAUDE_SONNET_5_5_CACHE_READ_CUT_START
-                && end >= CLAUDE_SONNET_5_5_CACHE_READ_CUT_START
-        }
-        "gpt-5.6-luna" | "gpt-5.6-terra" | "codex-auto-review" => {
-            start < GPT_5_6_LUNA_TERRA_PRICE_CUT_START && end >= GPT_5_6_LUNA_TERRA_PRICE_CUT_START
-        }
-        "gpt-5.6-sol" => start < GPT_5_6_SOL_PROMO_START && end >= GPT_5_6_SOL_PROMO_START,
-        _ => false,
-    }
+    active_pricing().pricing_changes_between(model_name, period_start, period_end)
 }
 
-pub(crate) fn priced_model_name(
-    model: &ModelInfo,
-    usage_date: chrono::NaiveDate,
-) -> Option<String> {
-    // The observed name comes first because `normalized_name` only caches a
-    // derivation of it. That cache is written once at scan time and goes stale
-    // whenever the normalizer learns a name it used to fold into a coarser one,
-    // and a stale cache that still resolves to a priced model would otherwise
-    // shadow the correct match forever.
-    let candidates = [
-        model.name.as_deref(),
-        model.provider_model_id.as_deref(),
-        model.normalized_name.as_deref(),
-    ];
-
-    for candidate in candidates.into_iter().flatten() {
-        let normalized = normalize_model_name(candidate);
-        if pricing_for_model_on(&normalized, usage_date).is_some() {
-            return Some(normalized);
-        }
-        if let Some((_, suffix)) = normalized.rsplit_once('/') {
-            let suffix = normalize_model_name(suffix);
-            if pricing_for_model_on(&suffix, usage_date).is_some() {
-                return Some(suffix);
-            }
-        }
+impl PricingTable {
+    /// The standard rates for `model` on the UTC day `date`, following an
+    /// `equivalents` mapping when one applies.
+    #[must_use]
+    pub fn pricing_for_model_on(&self, model: &str, date: NaiveDate) -> Option<ModelPricing> {
+        let lower = model.to_ascii_lowercase();
+        self.priced_entry(&lower, date)
+            .map(|(_, entry)| *entry.prices.on(date))
     }
 
-    None
+    /// Reports whether an aggregate usage period spans a known model-price change.
+    ///
+    /// Aggregates without daily token allocation cannot be priced accurately
+    /// across these boundaries because the token share on each side is unknown.
+    #[must_use]
+    pub fn pricing_changes_between(&self, model: &str, start: NaiveDate, end: NaiveDate) -> bool {
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        self.price_boundaries(&self.normalize_model_name(model))
+            .into_iter()
+            .any(|boundary| start < boundary && boundary <= end)
+    }
+
+    pub(crate) fn priced_model_name(
+        &self,
+        model: &ModelInfo,
+        usage_date: NaiveDate,
+    ) -> Option<String> {
+        // The observed name comes first because `normalized_name` only caches a
+        // derivation of it. That cache is written once at scan time and goes stale
+        // whenever the normalizer learns a name it used to fold into a coarser one,
+        // and a stale cache that still resolves to a priced model would otherwise
+        // shadow the correct match forever.
+        let candidates = [
+            model.name.as_deref(),
+            model.provider_model_id.as_deref(),
+            model.normalized_name.as_deref(),
+        ];
+
+        for candidate in candidates.into_iter().flatten() {
+            let normalized = self.normalize_model_name(candidate);
+            if self.pricing_for_model_on(&normalized, usage_date).is_some() {
+                return Some(normalized);
+            }
+            if let Some((_, suffix)) = normalized.rsplit_once('/') {
+                let suffix = self.normalize_model_name(suffix);
+                if self.pricing_for_model_on(&suffix, usage_date).is_some() {
+                    return Some(suffix);
+                }
+            }
+        }
+
+        None
+    }
 }

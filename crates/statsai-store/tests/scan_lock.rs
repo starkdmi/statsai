@@ -102,6 +102,9 @@ fn a_lock_held_by_another_process_is_busy_until_it_exits() {
             "--test-threads=1",
         ])
         .env(CHILD_LOCK_PATH_ENV, &lock)
+        // Never price with a refreshed file, whatever the developer's shell
+        // exports.
+        .env("STATSAI_PRICING_REFRESH", "off")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

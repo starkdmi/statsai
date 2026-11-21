@@ -1,16 +1,12 @@
 use chrono::{DateTime, Utc};
 use statsai_core::{micro_usd_to_cents_rounded, Confidence, CostInfo, ModelInfo, UsageCounts};
 
-use crate::catalog::{
-    api_equivalent_pricing_model, priced_model_name, pricing_for_effective_speed,
-    pricing_for_model_on, ModelPricing,
-};
-use crate::PRICING_CATALOG_VERSION;
+use crate::catalog::{pricing_for_effective_speed, ModelPricing};
+use crate::table::{active_pricing, LongContext, ModelEntry, PricingTable};
 
 const MICRO_USD_PER_USD: i128 = 1_000_000;
 const TOKENS_PER_MILLION: i128 = 1_000_000;
 const MULTIPLIER_SCALE: i128 = 10_000;
-const OPENAI_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
 #[must_use]
 pub fn estimate_cost(provider: &str, model: Option<&ModelInfo>, usage: &UsageCounts) -> CostInfo {
@@ -25,94 +21,105 @@ pub fn estimate_cost_at(
     usage: &UsageCounts,
     occurred_at: &DateTime<Utc>,
 ) -> CostInfo {
-    let usage_date = occurred_at.date_naive();
-    let Some(model) = model else {
-        return unknown_cost();
-    };
-    let Some(observed_name) = priced_model_name(model, usage_date) else {
-        return unknown_cost();
-    };
-    let model_name = api_equivalent_pricing_model(&observed_name, usage_date)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| observed_name.clone());
-    let Some(standard_pricing) = pricing_for_model_on(&model_name, usage_date) else {
-        return unknown_cost();
-    };
-    let effective_speed = model.speed.as_deref().or_else(|| {
-        [model.name.as_deref(), model.provider_model_id.as_deref()]
-            .into_iter()
-            .flatten()
-            .any(|name| name.trim().to_ascii_lowercase().ends_with("-fast"))
-            .then_some("fast")
-    });
-    let effective_speed = effective_speed.filter(|_| fast_mode_covers(&model_name, usage));
-    let (pricing, uses_fast_mode_pricing) =
-        pricing_for_effective_speed(&model_name, effective_speed, standard_pricing);
+    active_pricing().estimate_cost_at(provider, model, usage, occurred_at)
+}
 
-    let (input_multiplier, output_multiplier) =
-        pricing_multipliers(provider, &model_name, usage, uses_fast_mode_pricing);
-    let mut numerator = component_cost_numerator(
-        i128::from(usage.input_tokens.unwrap_or(0)),
-        pricing.input_per_million,
-        input_multiplier,
-    );
-    numerator = numerator.saturating_add(cache_creation_cost_numerator(
-        &model_name,
-        pricing,
-        usage,
-        input_multiplier,
-    ));
-    numerator = numerator.saturating_add(component_cost_numerator(
-        i128::from(usage.cache_read_tokens.unwrap_or(0)),
-        pricing.cached_input_per_million,
-        input_multiplier,
-    ));
-    let generated_tokens = i128::from(usage.output_tokens.unwrap_or(0))
-        .saturating_add(i128::from(usage.reasoning_tokens.unwrap_or(0)));
-    numerator = numerator.saturating_add(component_cost_numerator(
-        generated_tokens,
-        pricing.output_per_million,
-        output_multiplier,
-    ));
-    let denominator = TOKENS_PER_MILLION.saturating_mul(MULTIPLIER_SCALE);
-    let cost_micro_usd = rounded_i128_to_i64(numerator, denominator);
-    let cost_cents = micro_usd_to_cents_rounded(cost_micro_usd);
+impl PricingTable {
+    /// Estimates the API-equivalent cost of `usage` at the rates in effect on
+    /// the UTC day of `occurred_at`.
+    #[must_use]
+    pub fn estimate_cost_at(
+        &self,
+        provider: &str,
+        model: Option<&ModelInfo>,
+        usage: &UsageCounts,
+        occurred_at: &DateTime<Utc>,
+    ) -> CostInfo {
+        let usage_date = occurred_at.date_naive();
+        let Some(model) = model else {
+            return unknown_cost();
+        };
+        let Some(observed_name) = self.priced_model_name(model, usage_date) else {
+            return unknown_cost();
+        };
+        let Some((model_name, entry)) = self.priced_entry(&observed_name, usage_date) else {
+            return unknown_cost();
+        };
+        let effective_speed = model.speed.as_deref().or_else(|| {
+            [model.name.as_deref(), model.provider_model_id.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|name| name.trim().to_ascii_lowercase().ends_with("-fast"))
+                .then_some("fast")
+        });
+        let effective_speed = effective_speed.filter(|_| fast_mode_covers(entry, usage));
+        let (pricing, uses_fast_mode_pricing) =
+            pricing_for_effective_speed(entry, effective_speed, usage_date);
 
-    let mut pricing_source = match model_name.as_str() {
-        "composer-2.5" | "composer-2.5-fast" => format!("cursor_model_pricing:{observed_name}"),
-        "grok-4.7" if provider.eq_ignore_ascii_case("cursor") => {
+        let (input_multiplier, output_multiplier) =
+            pricing_multipliers(provider, model_name, entry, usage, uses_fast_mode_pricing);
+        let mut numerator = component_cost_numerator(
+            i128::from(usage.input_tokens.unwrap_or(0)),
+            pricing.input_per_million,
+            input_multiplier,
+        );
+        numerator = numerator.saturating_add(cache_creation_cost_numerator(
+            model_name,
+            pricing,
+            usage,
+            input_multiplier,
+        ));
+        numerator = numerator.saturating_add(component_cost_numerator(
+            i128::from(usage.cache_read_tokens.unwrap_or(0)),
+            pricing.cached_input_per_million,
+            input_multiplier,
+        ));
+        let generated_tokens = i128::from(usage.output_tokens.unwrap_or(0))
+            .saturating_add(i128::from(usage.reasoning_tokens.unwrap_or(0)));
+        numerator = numerator.saturating_add(component_cost_numerator(
+            generated_tokens,
+            pricing.output_per_million,
+            output_multiplier,
+        ));
+        let denominator = TOKENS_PER_MILLION.saturating_mul(MULTIPLIER_SCALE);
+        let cost_micro_usd = rounded_i128_to_i64(numerator, denominator);
+        let cost_cents = micro_usd_to_cents_rounded(cost_micro_usd);
+
+        let mut pricing_source = if is_cursor_grok_4_7(provider, model_name) {
             format!("cursor_model_pricing:{observed_name}")
+        } else if let Some(source) = &entry.source {
+            format!("{source}:{observed_name}")
+        } else {
+            format!("{provider}_api_pricing:{observed_name}")
+        };
+        if uses_fast_mode_pricing {
+            pricing_source.push_str(":fast");
         }
-        "grok-build-0.1"
-        | "grok-4.3"
-        | "grok-4.5"
-        | "grok-4.6"
-        | "grok-4.7"
-        | "grok-4.20-multi-agent-0309"
-        | "grok-4.20-0309-reasoning"
-        | "grok-4.20-0309-non-reasoning" => {
-            format!("xai_api_pricing:{observed_name}")
-        }
-        _ => format!("{provider}_api_pricing:{observed_name}"),
-    };
-    if uses_fast_mode_pricing {
-        pricing_source.push_str(":fast");
-    }
 
-    CostInfo {
-        currency: "USD".to_string(),
-        estimated_api_equivalent_usd: Some(cost_cents),
-        provider_reported_usd: None,
-        estimated_api_equivalent_micro_usd: Some(cost_micro_usd),
-        provider_reported_micro_usd: None,
-        pricing_source: Some(pricing_source),
-        pricing_version: Some(PRICING_CATALOG_VERSION.to_string()),
-        confidence: Confidence::Medium,
+        CostInfo {
+            currency: "USD".to_string(),
+            estimated_api_equivalent_usd: Some(cost_cents),
+            provider_reported_usd: None,
+            estimated_api_equivalent_micro_usd: Some(cost_micro_usd),
+            provider_reported_micro_usd: None,
+            pricing_source: Some(pricing_source),
+            pricing_version: Some(self.catalog.clone()),
+            confidence: Confidence::Medium,
+        }
     }
+}
+
+/// Grok 4.7 used through Cursor follows Cursor's published prices, not xAI's.
+fn is_cursor_grok_4_7(provider: &str, model_name: &str) -> bool {
+    model_name == "grok-4.7" && provider.eq_ignore_ascii_case("cursor")
 }
 
 fn dollars_per_million_to_micro_usd(rate: f64) -> i128 {
     (rate * MICRO_USD_PER_USD as f64).round() as i128
+}
+
+fn scaled_multiplier(multiplier: f64) -> i128 {
+    (multiplier * MULTIPLIER_SCALE as f64).round() as i128
 }
 
 fn component_cost_numerator(tokens: i128, rate: f64, multiplier: i128) -> i128 {
@@ -170,33 +177,30 @@ fn prompt_tokens(usage: &UsageCounts) -> u64 {
 
 /// Whether fast mode can serve this request at all.
 ///
-/// GPT-5.5, GPT-5.4 and GPT-5.4 mini fast mode excludes long context: the fast
-/// card leaves their >272k cells blank, and only GPT-5.6 runs long prompts in
-/// fast mode. OpenAI serves a request fast mode does not cover at the standard
-/// tier and bills it at standard rates, so one request over 272k is priced as
-/// standard, with any standard long-context tier. An aggregate whose request
-/// count is not 1 cannot be split by size and keeps the fast rate.
-/// https://openai.com/api-fast-mode/
-/// https://developers.openai.com/api/docs/guides/fast-mode
-fn fast_mode_covers(model_name: &str, usage: &UsageCounts) -> bool {
-    !(matches!(model_name, "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini")
-        && usage.requests == Some(1)
-        && prompt_tokens(usage) > OPENAI_LONG_CONTEXT_THRESHOLD)
+/// A model whose fast mode excludes long context (its fast rates carry a
+/// `max_prompt`) is served at the standard tier for a request fast mode does
+/// not cover, and billed at standard rates, so one request over that prompt
+/// size is priced as standard, with any standard long-context tier. An
+/// aggregate whose request count is not 1 cannot be split by size and keeps
+/// the fast rate.
+fn fast_mode_covers(entry: &ModelEntry, usage: &UsageCounts) -> bool {
+    let max_prompt = entry.fast.as_ref().and_then(|fast| fast.max_prompt);
+    max_prompt
+        .is_none_or(|max_prompt| !(usage.requests == Some(1) && prompt_tokens(usage) > max_prompt))
 }
 
 fn pricing_multipliers(
     provider: &str,
     model_name: &str,
+    entry: &ModelEntry,
     usage: &UsageCounts,
     uses_fast_mode_pricing: bool,
 ) -> (i128, i128) {
-    const XAI_LONG_CONTEXT_THRESHOLD: u64 = 200_000;
     const CURSOR_GROK_4_7_LONG_CONTEXT_THRESHOLD: u64 = 256_000;
-    const CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD: u64 = 100_000;
 
     let prompt_tokens = prompt_tokens(usage);
 
-    if model_name == "grok-4.7" && provider.eq_ignore_ascii_case("cursor") {
+    if is_cursor_grok_4_7(provider, model_name) {
         if usage.requests == Some(1) && prompt_tokens > CURSOR_GROK_4_7_LONG_CONTEXT_THRESHOLD {
             // Cursor publishes 2x standard rates above 256k, while Fast is 3x the
             // short-context standard rate. Fast base pricing is already 2x here,
@@ -211,70 +215,22 @@ fn pricing_multipliers(
         return (MULTIPLIER_SCALE, MULTIPLIER_SCALE);
     }
 
-    if model_name == "claude-haiku-5-5" {
-        // Every Haiku 5.5 rate, cache writes and reads included, is 5x above 100k.
-        return if usage.requests == Some(1)
-            && prompt_tokens > CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD
-        {
-            (50_000, 50_000)
-        } else {
-            (MULTIPLIER_SCALE, MULTIPLIER_SCALE)
-        };
-    }
-
-    let is_openai_long_context_model = matches!(
-        model_name,
-        // GPT-5.5 uses the same >272k tier: 2x input and cached input, 1.5x output.
-        // https://developers.openai.com/api/docs/models/gpt-5.5
-        "gpt-5.4"
-            | "gpt-5.5"
-            | "gpt-5.6-sol"
-            | "gpt-5.6-terra"
-            | "gpt-5.6-luna"
-            | "gpt-6-astra"
-            | "gpt-6.2-astra"
-            | "gpt-6.2-sol"
-            | "gpt-6.1-sol"
-            | "gpt-6.1-terra"
-            | "gpt-6-sol"
-            | "gpt-6-luna"
-    );
-    let is_xai_long_context_model = matches!(
-        model_name,
-        "grok-build-0.1"
-            | "grok-4.3"
-            | "grok-4.5"
-            | "grok-4.6"
-            | "grok-4.7"
-            | "grok-4.20-multi-agent-0309"
-            | "grok-4.20-0309-reasoning"
-            | "grok-4.20-0309-non-reasoning"
-    );
-    if is_openai_long_context_model
-        && usage.requests == Some(1)
-        && prompt_tokens > OPENAI_LONG_CONTEXT_THRESHOLD
-    {
-        (20_000, 15_000)
-    } else if is_xai_long_context_model && usage.requests == Some(1) {
-        // Grok 4.7 Fast long context is 1.5x the fast rate once the prompt
-        // exceeds 200k ($6 / $1.50 / $18), not a second 2x on the fast rate.
-        // At exactly 200k the fast card stays on the short-context rate.
-        // Cursor keeps its own >256k tier above. Standard Grok 4.7 still
-        // doubles at >=200k.
-        // https://docs.x.ai/developers/pricing
-        if model_name == "grok-4.7" && uses_fast_mode_pricing {
-            if prompt_tokens > XAI_LONG_CONTEXT_THRESHOLD {
-                (15_000, 15_000)
-            } else {
-                (MULTIPLIER_SCALE, MULTIPLIER_SCALE)
-            }
-        } else if prompt_tokens >= XAI_LONG_CONTEXT_THRESHOLD {
-            (20_000, 20_000)
-        } else {
-            (MULTIPLIER_SCALE, MULTIPLIER_SCALE)
+    // A fast-mode long-context tier replaces the model's own while fast rates
+    // apply; otherwise the model's tier applies on top of whichever rates do.
+    let fast_long_context = entry
+        .fast
+        .as_ref()
+        .and_then(|fast| fast.long_context.as_ref())
+        .filter(|_| uses_fast_mode_pricing);
+    match fast_long_context.or(entry.long_context.as_ref()) {
+        Some(LongContext {
+            threshold,
+            input,
+            output,
+        }) if usage.requests == Some(1) && threshold.reached_by(prompt_tokens) => {
+            (scaled_multiplier(*input), scaled_multiplier(*output))
         }
-    } else {
-        (MULTIPLIER_SCALE, MULTIPLIER_SCALE)
+        _ => (MULTIPLIER_SCALE, MULTIPLIER_SCALE),
     }
 }
 

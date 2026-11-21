@@ -2875,6 +2875,7 @@ dependencies = [
  "statsai-store",
  "statsai-sync",
  "tempfile",
+ "tiny_http",
  "ureq",
  "url",
  "windows-sys 0.61.2",
@@ -2984,6 +2985,8 @@ name = "statsai-pricing"
 version = "0.7.3"
 dependencies = [
  "chrono",
+ "serde",
+ "serde_json",
  "statsai-core",
 ]
 

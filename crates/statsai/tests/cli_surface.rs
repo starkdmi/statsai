@@ -2,6 +2,8 @@ use std::process::Command;
 
 fn run_statsai(args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_statsai"))
+        // Never fetch pricing, whatever the developer's shell exports.
+        .env("STATSAI_PRICING_REFRESH", "off")
         .args(args)
         .env("COLUMNS", "80")
         .env("NO_COLOR", "1")
