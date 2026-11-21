@@ -1,7 +1,7 @@
 {
   "format": 1,
-  "version": 7,
-  "catalog": "official:2026-11-18",
+  "version": 8,
+  "catalog": "official:2026-11-21",
   "models": {
     "claude-fable-5-2": {
       "note": "Launch price, 2026-11-09. Mythos 5.2 uses the same rates. Cache reads are 0.025x input. The 1M window has no long-context surcharge. Fast input and output are 2x; prompt-cache multipliers apply on top of that fast input rate: 1.25x 5-minute writes and 0.025x cache reads. https://platform.claude.com/docs/en/about-claude/pricing https://platform.claude.com/docs/en/models/fable-5-2/overview https://www.anthropic.com/claude-fable-and-mythos-5-2",
@@ -440,6 +440,50 @@
         ],
         "long_context": { "above": 200000, "input": 1.5, "output": 1.5 }
       }
+    },
+    "gemini-3-flash": {
+      "note": "Gemini 3 Flash Preview at Vertex AI Global endpoint rates; Antigravity does not record the endpoint. No prompt-size tier: the <=200K and >200K columns match. Google lists no cache-write rate, so cache writes bill as input; thinking bills as output. The card's standard table has no text-output row; its Priority (1.8x) and Batch (0.5x) rows both imply $3/M, the Gemini API card's rate. https://cloud.google.com/model-garden/pricing https://ai.google.dev/gemini-api/docs/pricing",
+      "source": "vertex_ai_pricing",
+      "prices": [
+        { "from": null, "input": 0.5, "cache_write": 0.5, "cache_read": 0.05, "output": 3 }
+      ]
+    },
+    "gemini-3.5-flash": {
+      "note": "Vertex AI Global endpoint rates; Antigravity does not record the endpoint. No prompt-size tier. Google lists no cache-write rate, so cache writes bill as input; thinking bills as output. https://cloud.google.com/model-garden/pricing",
+      "source": "vertex_ai_pricing",
+      "prices": [
+        { "from": null, "input": 1.5, "cache_write": 1.5, "cache_read": 0.15, "output": 9 }
+      ]
+    },
+    "gemini-3.5-flash-lite": {
+      "note": "Vertex AI Global endpoint rates. No prompt-size tier. Google lists no cache-write rate, so cache writes bill as input; thinking bills as output. https://cloud.google.com/model-garden/pricing",
+      "source": "vertex_ai_pricing",
+      "prices": [
+        { "from": null, "input": 0.3, "cache_write": 0.3, "cache_read": 0.03, "output": 2.5 }
+      ]
+    },
+    "gemini-3.8-flash": {
+      "note": "Introductory price through 2026-12-31, then Google's standard price from 2027-01-01. Vertex AI Global endpoint rates; Antigravity does not record the endpoint. No prompt-size tier. Google lists no cache-write rate, so cache writes bill as input; thinking bills as output. https://cloud.google.com/model-garden/pricing",
+      "source": "vertex_ai_pricing",
+      "prices": [
+        { "from": null, "input": 0.75, "cache_write": 0.75, "cache_read": 0.075, "output": 3.75 },
+        { "from": "2027-01-01", "input": 1.5, "cache_write": 1.5, "cache_read": 0.15, "output": 7.5, "note": "Standard price once the introductory price ends. If Google moves that date before it arrives, correct this period." }
+      ]
+    },
+    "gemini-4-neon": {
+      "note": "Vertex AI Global endpoint rates; Antigravity does not record the endpoint. No prompt-size tier. Google's cache-write rate, $3.75/M, takes effect on 2027-01-12; until then cache writes bill as input. Output includes reasoning. https://cloud.google.com/model-garden/pricing",
+      "source": "vertex_ai_pricing",
+      "prices": [
+        { "from": null, "input": 3, "cache_write": 3, "cache_read": 0.15, "output": 15 },
+        { "from": "2027-01-12", "input": 3, "cache_write": 3.75, "cache_read": 0.15, "output": 15, "note": "Google's cache-write rate takes effect." }
+      ]
+    },
+    "gpt-oss-120b": {
+      "note": "OpenAI's open-weight model as Antigravity serves it: on Vertex AI, from the Model Garden partner-models card. OpenAI's own API does not sell it. The card lists no cached-input rate, so cache reads and writes bill as input. https://cloud.google.com/model-garden/partner-models/pricing",
+      "source": "vertex_ai_pricing",
+      "prices": [
+        { "from": null, "input": 0.09, "cache_write": 0.09, "cache_read": 0.09, "output": 0.36 }
+      ]
     }
   },
   "equivalents": {
@@ -505,7 +549,14 @@
     "grok-4.3": ["grok-4.3-latest"],
     "grok-4.20-multi-agent-0309": [],
     "grok-4.20-0309-reasoning": [],
-    "grok-4.20-0309-non-reasoning": []
+    "grok-4.20-0309-non-reasoning": [],
+    "gemini-3-flash": ["gemini-3-flash-preview"],
+    "gemini-3-flash-a": [],
+    "gemini-3.5-flash": [],
+    "gemini-3.5-flash-lite": [],
+    "gemini-3.8-flash": [],
+    "gemini-4-neon": [],
+    "gpt-oss-120b": []
   },
   "patterns": [
     { "contains": ["claude-fable-5-2", "claude-fable-5.2"], "model": "claude-fable-5-2", "whole_version": true, "note": "5.2 must precede 5.1 and 5: claude-fable-5-2 contains claude-fable-5. It must also not take a dated Fable 5 id such as claude-fable-5-20260610: Anthropic snapshot ids end in an eight-digit date, so the match must not be followed by a digit." },
@@ -565,7 +616,13 @@
     { "contains": ["grok-4.3-latest", "grok-4.3"], "model": "grok-4.3" },
     { "contains": ["grok-4.20-multi-agent-0309"], "model": "grok-4.20-multi-agent-0309" },
     { "contains": ["grok-4.20-0309-reasoning"], "model": "grok-4.20-0309-reasoning" },
-    { "contains": ["grok-4.20-0309-non-reasoning"], "model": "grok-4.20-0309-non-reasoning" }
+    { "contains": ["grok-4.20-0309-non-reasoning"], "model": "grok-4.20-0309-non-reasoning" },
+    { "contains": ["gemini-3.5-flash-lite"], "model": "gemini-3.5-flash-lite", "note": "Must precede gemini-3.5-flash, which would otherwise bill Flash-Lite at Flash rates." },
+    { "contains": ["gemini-3.5-flash"], "model": "gemini-3.5-flash" },
+    { "contains": ["gemini-3.8-flash"], "model": "gemini-3.8-flash" },
+    { "contains": ["gemini-3-flash"], "model": "gemini-3-flash", "note": "gemini-3-flash does not occur in gemini-3.5-flash or gemini-3.8-flash. Antigravity serves both Gemini 3 Flash and 3.5 Flash requests as gemini-3-flash-a, which this rule would match: the exact names key gemini-3-flash-a, checked before patterns, keeps that served name unpriced." },
+    { "contains": ["gemini-4-neon"], "model": "gemini-4-neon" },
+    { "contains": ["gpt-oss-120b"], "model": "gpt-oss-120b" }
   ],
   "reversed": {
     "claude-5.5-opus": "claude-opus-5-5",
