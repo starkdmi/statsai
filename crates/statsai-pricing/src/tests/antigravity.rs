@@ -185,13 +185,24 @@ fn gemini_3_3_5_and_3_8_flash_and_lite_variants_do_not_fold_into_each_other() {
         // Gemini 3.1 Flash-Lite has no catalog entry and is not Gemini 3 Flash.
         ("gemini-3.1-flash-lite", "gemini-3.1-flash-lite"),
         ("gemini-3.1-pro", "gemini-3.1-pro"),
+        // Google's 3.8 speech models contain "gemini-3.8-flash" but have
+        // no text price: rules ahead of 3.8 Flash keep them unpriced.
+        ("gemini-3.8-flash-lite-tts", "gemini-3.8-flash-lite"),
+        ("gemini-3.8-flash-tts", "gemini-3.8-flash-tts"),
     ] {
         assert_eq!(normalize_model_name(name), expected, "{name}");
     }
-    assert_eq!(
-        crate::catalog::pricing_for_model_on("gemini-3.1-flash-lite", catalog_day()),
-        None
-    );
+    for unpriced in [
+        "gemini-3.1-flash-lite",
+        "gemini-3.8-flash-lite",
+        "gemini-3.8-flash-tts",
+    ] {
+        assert_eq!(
+            crate::catalog::pricing_for_model_on(unpriced, catalog_day()),
+            None,
+            "{unpriced}"
+        );
+    }
 
     let table = embedded_pricing();
     let output_rate = |name: &str| {
