@@ -342,7 +342,10 @@ pub(crate) fn scan_with_adapters(
                 || log_rows > 0
                 || account_evidence_count > 0
                 || account_evidence_checkpoint_count > 0
-                || verified_state_changed;
+                || verified_state_changed
+                // A store of only unreadable history still has that to report,
+                // so its line and the totals agree.
+                || unreadable_history_files > 0;
             let suppress_source_processing = !command.verbose
                 && !command.explain
                 && source_event_count == 0
@@ -727,8 +730,6 @@ pub(crate) fn scan_with_adapters(
         }
     }
 
-    // Sources with nothing else to report still count toward the total.
-    total_diagnostics.unreadable_history_files = unreadable_history.values().sum();
     if command.preview {
         if command.verbose {
             println!(

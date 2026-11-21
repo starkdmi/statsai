@@ -192,7 +192,7 @@ pub(crate) fn scan_antigravity_source(
             &candidate.path,
             conversation,
             &mut store_names,
-        );
+        )?;
     }
     Ok(scan)
 }
@@ -215,7 +215,7 @@ fn emit_conversation(
     db_path: &Path,
     conversation: ConversationScan,
     store_names: &mut StoreModelNames,
-) {
+) -> Result<()> {
     let diagnostics = &mut context.scan.diagnostics;
     diagnostics.raw_rows += conversation.request_steps;
     diagnostics.invalid_rows += conversation.invalid_steps;
@@ -240,7 +240,7 @@ fn emit_conversation(
             continue;
         }
         context.scan.diagnostics.candidate_usage_rows += 1;
-        let event = call_event(context, db_path, &conversation, call, store_names);
+        let event = call_event(context, db_path, &conversation, call, store_names)?;
         push_deduped(
             context.scan,
             context.seen,
@@ -248,6 +248,7 @@ fn emit_conversation(
             DuplicateSelection::KeepFirst,
         );
     }
+    Ok(())
 }
 
 fn call_event(
@@ -256,10 +257,10 @@ fn call_event(
     conversation: &ConversationScan,
     call: &ModelCall,
     store_names: &mut StoreModelNames,
-) -> UsageEvent {
+) -> Result<UsageEvent> {
     let (model, model_named) = match call.model_id {
         Some(model_id) => {
-            let (model, synthetic) = model_info_for(model_id, &conversation.names, store_names);
+            let (model, synthetic) = model_info_for(model_id, &conversation.names, store_names)?;
             (Some(model), !synthetic)
         }
         None => (None, false),
@@ -306,7 +307,7 @@ fn call_event(
             ),
         ),
     };
-    usage_event(
+    Ok(usage_event(
         context.adapter,
         context.source,
         context.options,
@@ -331,7 +332,7 @@ fn call_event(
             deduplication: EventDeduplication::ProviderRecord(record),
             dedupe_salt: None,
         },
-    )
+    ))
 }
 
 /// The model a request used: from the conversation's own names when they name
@@ -340,11 +341,11 @@ fn model_info_for(
     model_id: u64,
     local: &ModelNames,
     store_names: &mut StoreModelNames,
-) -> (ModelInfo, bool) {
+) -> Result<(ModelInfo, bool)> {
     if local.resolves(model_id) {
-        resolve_model_info(model_id, &[local])
+        Ok(resolve_model_info(model_id, &[local]))
     } else {
-        resolve_model_info(model_id, &[local, store_names.get()])
+        Ok(resolve_model_info(model_id, &[local, store_names.get()?]))
     }
 }
 

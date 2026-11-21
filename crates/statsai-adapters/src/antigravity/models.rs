@@ -238,25 +238,40 @@ pub(crate) fn remember_file_names(db_path: &Path, signature: String, names: Arc<
     }
 }
 
-fn file_names(db_path: &Path) -> Arc<ModelNames> {
+/// A conversation's names, read again only when the file changed.
+///
+/// Only a read that succeeds is remembered. A file Antigravity holds
+/// mid-commit fails the scan, as reading its usage would, so nothing is named
+/// from a store that was only partly read. A damaged file contributes no names
+/// and is tried again on the next scan.
+fn file_names(db_path: &Path) -> Result<Arc<ModelNames>> {
     let key = canonical_display(db_path);
     let signature = conversation_file_signature(db_path);
     if let Ok(memo) = names_memo().lock() {
         if let Some((known, names)) = memo.get(&key) {
             if *known == signature {
-                return names.clone();
+                return Ok(names.clone());
             }
         }
     }
-    // A file that cannot be read contributes no names; reading its usage
-    // reports the failure.
-    let names = Arc::new(
-        open_sqlite_readonly(db_path)
-            .and_then(|connection| read_model_names(&connection))
-            .unwrap_or_default(),
-    );
-    remember_file_names(db_path, signature, names.clone());
-    names
+    match open_sqlite_readonly(db_path).and_then(|connection| read_model_names(&connection)) {
+        Ok(names) => {
+            let names = Arc::new(names);
+            remember_file_names(db_path, signature, names.clone());
+            Ok(names)
+        }
+        Err(error) if super::sqlite_busy(&error) => Err(error),
+        Err(_) => Ok(Arc::new(ModelNames::default())),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn remembered_file_names(db_path: &Path) -> Option<Arc<ModelNames>> {
+    names_memo()
+        .lock()
+        .ok()?
+        .get(&canonical_display(db_path))
+        .map(|(_, names)| names.clone())
 }
 
 /// The names of every conversation in a store, built the first time a scan
@@ -274,13 +289,14 @@ impl StoreModelNames {
         }
     }
 
-    pub(crate) fn get(&mut self) -> &ModelNames {
-        self.names.get_or_insert_with(|| {
+    pub(crate) fn get(&mut self) -> Result<&ModelNames> {
+        if self.names.is_none() {
             let mut names = ModelNames::default();
             for path in &self.db_paths {
-                names.merge(&file_names(path));
+                names.merge(file_names(path)?.as_ref());
             }
-            names
-        })
+            self.names = Some(names);
+        }
+        Ok(self.names.get_or_insert_with(ModelNames::default))
     }
 }

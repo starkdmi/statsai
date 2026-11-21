@@ -931,3 +931,102 @@ fn sqlite_busy_matches_only_busy_and_locked_errors() {
     assert!(sqlite_busy(&anyhow::Error::new(locked)));
     assert!(!sqlite_busy(&anyhow::Error::new(damaged)));
 }
+
+/// Holds an exclusive lock on a rollback-journal conversation, as Antigravity
+/// does while it commits, until dropped.
+fn hold_mid_commit(path: &Path) -> Connection {
+    let writer = Connection::open(path).expect("writer");
+    writer
+        .execute_batch("BEGIN EXCLUSIVE;")
+        .expect("exclusive lock");
+    writer
+}
+
+/// One conversation that used 1035 without selecting it, so naming it needs
+/// the rest of the store, and one that selected it.
+fn write_conversation_named_elsewhere(root: &Path) -> (PathBuf, PathBuf) {
+    let unnamed = conversation_id(20);
+    let usage = Usage::new(1035, 26, 100, 0, 0, 10);
+    ConversationDb::create(&db_path(root, &unnamed), &unnamed, &Trajectory::default())
+        .step(
+            1,
+            STEP_PLANNER,
+            planner_metadata(&unnamed, 1, Some(usage), T0),
+        )
+        .gen(
+            0,
+            gen_row(1035, Some("claude-sonnet-4-6"), None, &[Some(usage)]),
+        );
+    let namer = conversation_id(21);
+    ConversationDb::create(&db_path(root, &namer), &namer, &Trajectory::default()).gen(
+        0,
+        gen_row(
+            1035,
+            Some("claude-sonnet-4-6"),
+            Some("claude-sonnet-4-6-low"),
+            &[None],
+        ),
+    );
+    (db_path(root, &unnamed), db_path(root, &namer))
+}
+
+fn scan_only(root: &Path, path: &Path) -> Result<AdapterScan> {
+    scan_antigravity_source(
+        &AntigravityAdapter,
+        &source_for(root),
+        &ScanOptions {
+            selected_cache_keys: Some(HashSet::from([statsai_core::canonical_display(path)])),
+            ..options()
+        },
+    )
+}
+
+#[test]
+fn a_conversation_held_mid_commit_fails_the_scan_so_it_is_read_again() {
+    let (_dir, root) = store();
+    let conversation = conversation_id(22);
+    write_gemini_conversation(&root, &conversation);
+    let writer = hold_mid_commit(&db_path(&root, &conversation));
+
+    let busy = scan_antigravity_source(&AntigravityAdapter, &source_for(&root), &options());
+
+    assert!(busy.is_err_and(|error| sqlite_busy(&error)));
+    drop(writer);
+    assert_eq!(scan_root(&root).events.len(), 2);
+}
+
+#[test]
+fn a_conversation_held_mid_commit_while_read_for_its_names_fails_the_scan_and_is_not_remembered() {
+    let (_dir, root) = store();
+    let (unnamed, namer) = write_conversation_named_elsewhere(&root);
+    let writer = hold_mid_commit(&namer);
+
+    // Only the unnamed conversation is read for usage; the other is read only
+    // for the names it holds.
+    let busy = scan_only(&root, &unnamed);
+
+    assert!(busy.is_err_and(|error| sqlite_busy(&error)));
+    assert!(models::remembered_file_names(&namer).is_none());
+    drop(writer);
+    let scan = scan_only(&root, &unnamed).expect("scan");
+    let model = scan.events[0].model.as_ref().expect("model");
+    assert_eq!(model.name.as_deref(), Some("claude-sonnet-4-6-low"));
+    assert!(models::remembered_file_names(&namer).is_some());
+}
+
+#[test]
+fn a_damaged_conversation_names_nothing_and_is_read_again_next_time() {
+    let (_dir, root) = store();
+    let (unnamed, namer) = write_conversation_named_elsewhere(&root);
+    std::fs::write(&namer, b"not a sqlite database at all").expect("damage");
+
+    let scan = scan_only(&root, &unnamed).expect("scan");
+
+    let model = scan.events[0].model.as_ref().expect("model");
+    assert_eq!(
+        model.name.as_deref(),
+        Some("claude-sonnet-4-6"),
+        "the served name"
+    );
+    assert!(models::remembered_file_names(&namer).is_none());
+}
