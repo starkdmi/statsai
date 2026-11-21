@@ -226,19 +226,22 @@ including estimates priced with a newer one (see
 
 ### Releases before pricing files
 
-Releases before pricing files compare the store's
+Releases before pricing files (0.7.3 and earlier) compare the store's
 `pricing.applied_ruleset_version` with the ruleset version compiled into them
-(7 in the last of them), and refuse a store priced with a higher one:
-`database pricing ruleset version 8 is newer than this StatsAI binary supports (7)`.
-Once any newer binary with the refresh on adopts a file from `main`, which
-needs nothing from you, every older release that shares the store stops there:
-an older CLI on your `PATH`, the CLI bundled with an older StatsAI for Mac, and
-an older watch daemon the next time it starts. An older daemon that is already
-running checks prices only when it starts, so it keeps writing estimates at its
-own prices that nothing reprices until the next version. Upgrade every binary
-that shares the store (the CLI, the watch daemon or its LaunchAgent, and the
-desktop app) and restart the daemon, or turn the refresh off in the newer
-binary until they are all upgraded.
+(5 in 0.7.3), and refuse a store priced with a higher one:
+`database pricing ruleset version 7 is newer than this StatsAI binary supports (5)`.
+Releases with pricing files embed version 7 or higher. The first time one of
+them runs a command that uses price-derived data on a store, it reprices the
+store to its version, whether or not the refresh is on. From then on, every
+older release that shares the store stops there: an older CLI on your `PATH`,
+an older StatsAI for Mac and the CLI bundled with it, and an older watch daemon
+the next time it starts. An older daemon that is already running checks prices
+only when it starts, so it keeps writing estimates at its own prices that
+nothing reprices until the next version. Turning the refresh off in the newer
+binary does not prevent this, because its embedded file is already newer than
+any older release's ruleset. Upgrade every binary that shares the store (the
+CLI, the watch daemon or its LaunchAgent, and the desktop app) together, and
+restart the daemon.
 
 ## Editing the file
 

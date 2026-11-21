@@ -628,10 +628,12 @@ newer file reprices every estimate, even ones priced with a newer version; see
 stored pricing file has a `format` the binary cannot read is refused with a
 message to upgrade StatsAI.
 
-Releases from before pricing files refuse a store priced past their compiled
-ruleset version (7 in the last of them), and that happens as soon as a newer
-binary adopts a file from `main`. Upgrade every binary that shares the store
-(the CLI, the watch daemon, and StatsAI for Mac) and restart the daemon; see
+Releases from before pricing files (0.7.3 and earlier) refuse a store priced
+past their compiled ruleset version (5 in 0.7.3). Releases from 0.8.0 embed
+version 7 or higher, so that happens the first time one of them reprices a
+shared store, whether or not the refresh is on. Upgrade every binary that
+shares the store (the CLI, the watch daemon, and StatsAI for Mac) together and
+restart the daemon; see
 [Releases before pricing files](docs/pricing.md#releases-before-pricing-files).
 
 ## Develop locally
