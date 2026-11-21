@@ -1,3 +1,9 @@
+# Machine-specific cargo settings, such as `build.target-dir`, go in
+# `.cargo/config.local.toml` beside this file. Git ignores that file, so a pull
+# never replaces it, and cargo skips it when it does not exist. This file takes
+# precedence over it.
+include = [{ path = "config.local.toml", optional = true }]
+
 [env]
 # Tests and `cargo run` in this repository never fetch pricing: they price with
 # the pricing.json compiled into the binary (see docs/pricing.md). The entry
