@@ -185,26 +185,33 @@ fn gemini_3_3_5_and_3_8_flash_and_lite_variants_do_not_fold_into_each_other() {
         // Gemini 3.1 Flash-Lite has no catalog entry and is not Gemini 3 Flash.
         ("gemini-3.1-flash-lite", "gemini-3.1-flash-lite"),
         ("gemini-3.1-pro", "gemini-3.1-pro"),
-        // Google's 3.8 speech models contain "gemini-3.8-flash" but have
-        // no text price: rules ahead of 3.8 Flash keep them unpriced.
-        ("gemini-3.8-flash-lite-tts", "gemini-3.8-flash-lite"),
+        // Google's 3.8 speech models contain "gemini-3.8-flash" but bill
+        // audio rates: rules ahead of 3.8 Flash give each its own name, so
+        // neither takes a text price, even a future 3.8 Flash-Lite one.
+        ("gemini-3.8-flash-lite-tts", "gemini-3.8-flash-lite-tts"),
         ("gemini-3.8-flash-tts", "gemini-3.8-flash-tts"),
+        ("gemini-3.8-flash-lite", "gemini-3.8-flash-lite"),
     ] {
         assert_eq!(normalize_model_name(name), expected, "{name}");
     }
-    for unpriced in [
-        "gemini-3.1-flash-lite",
-        "gemini-3.8-flash-lite",
-        "gemini-3.8-flash-tts",
+
+    let table = embedded_pricing();
+    // Some of these have published prices of their own, so the test only
+    // rules out the Flash model each would otherwise fall into.
+    for (name, not_model) in [
+        ("gemini-3.1-flash-lite", "gemini-3-flash"),
+        ("gemini-3.5-flash-lite", "gemini-3.5-flash"),
+        ("gemini-3.8-flash-lite", "gemini-3.8-flash"),
+        ("gemini-3.8-flash-lite-tts", "gemini-3.8-flash"),
+        ("gemini-3.8-flash-tts", "gemini-3.8-flash"),
     ] {
-        assert_eq!(
-            crate::catalog::pricing_for_model_on(unpriced, catalog_day()),
-            None,
-            "{unpriced}"
+        assert_ne!(
+            priced_as(&table, Some(name), None).as_deref(),
+            Some(not_model),
+            "{name}"
         );
     }
 
-    let table = embedded_pricing();
     let output_rate = |name: &str| {
         table
             .pricing_for_model_on(name, catalog_day())

@@ -40,6 +40,8 @@ fn spellings_and_effort_suffixes_reach_their_models() {
         ("moonshotai/kimi-k3", "kimi-k3"),
         ("kimi-k3.1-pro", "kimi-k3.1-pro"),
         ("kimi-k3.1-pro-max", "kimi-k3.1-pro"),
+        ("kimi-k3.1-pro-highspeed", "kimi-k3.1-pro-highspeed"),
+        ("kimi-k3.1-pro-highspeed-max", "kimi-k3.1-pro-highspeed"),
         ("glm-5.3", "glm-5.3"),
         ("GLM-5.3", "glm-5.3"),
         ("glm-5.3-high", "glm-5.3"),
@@ -57,29 +59,38 @@ fn spellings_and_effort_suffixes_reach_their_models() {
     }
 }
 
+/// Each name and a model it must not be priced as. Many of these have
+/// published prices of their own, so the test only rules out the wrong
+/// model: a later pricing change may price them.
 #[test]
 fn neighbouring_models_are_not_priced_as_the_new_ones() {
     let table = embedded_pricing();
-    for name in [
+    for (name, not_model) in [
         // DeepSeek-V4.1-Flash without 1017 has a different cache-hit rate,
         // and deepseek-flash is an alias DeepSeek moves between versions.
-        "deepseek-v4.1-flash",
-        "deepseek-flash",
-        "kimi-k2.7-code",
-        "kimi-k30",
-        "glm-5.2",
-        "glm-5.30",
+        ("deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"),
+        ("deepseek-flash", "deepseek-v4.1-flash-1017"),
+        ("kimi-k2.7-code", "kimi-k3"),
+        ("kimi-k30", "kimi-k3"),
+        ("kimi-k3.1-pro", "kimi-k3"),
+        ("kimi-k3.1-pro-highspeed", "kimi-k3.1-pro"),
+        ("glm-5.2", "glm-5.3"),
+        ("glm-5.30", "glm-5.3"),
+        ("glm-5.3-flash", "glm-5.3"),
+        ("glm-5.3-flashx", "glm-5.3-flash"),
         // Other Muse versions may have other prices.
-        "muse-spark",
-        "muse-spark-1.2",
-        "muse-spark-1.30",
-        "muse-wonder",
-        "muse-wonder-full",
+        ("muse-spark", "muse-spark-1.3"),
+        ("muse-spark-1.2", "muse-spark-1.3"),
+        ("muse-spark-1.30", "muse-spark-1.3"),
+        ("muse-wonder", "muse-wonder-1.0"),
+        ("muse-wonder-full", "muse-wonder-1.0"),
     ] {
-        assert_eq!(normalize_model_name(name), name, "{name}");
-        assert_eq!(
-            table.priced_model_name(&observed(name), catalog_day()),
-            None,
+        assert_ne!(normalize_model_name(name), not_model, "{name}");
+        assert_ne!(
+            table
+                .priced_model_name(&observed(name), catalog_day())
+                .as_deref(),
+            Some(not_model),
             "{name}"
         );
     }
@@ -104,6 +115,11 @@ fn cursor_models_use_their_published_rates() {
         ),
         ("kimi-k3", 21_300_000, "kimi-k3"),
         ("kimi-k3.1-pro", 14_200_000, "kimi-k3.1-pro"),
+        (
+            "kimi-k3.1-pro-highspeed",
+            28_200_000,
+            "kimi-k3.1-pro-highspeed",
+        ),
         ("glm-5.3", 7_460_000, "glm-5.3"),
         ("glm-5.3-flash", 830_000, "glm-5.3-flash"),
         ("glm-5.3-flashx", 2_065_000, "glm-5.3-flashx"),

@@ -527,6 +527,12 @@
         { "from": null, "input": 2, "cache_write": 2, "cache_read": 0.2, "output": 10 }
       ]
     },
+    "kimi-k3.1-pro-highspeed": {
+      "note": "Priced so the kimi-k3.1 rule cannot bill Highspeed at K3.1 Pro rates. Moonshot bills 5-minute cache writes at the input rate and 1-hour writes at $8/M. No long-context tier. https://platform.kimi.ai/docs/pricing/chat",
+      "prices": [
+        { "from": null, "input": 4, "cache_write": 4, "cache_read": 0.2, "output": 20 }
+      ]
+    },
     "glm-5.3": {
       "note": "Z.ai's card and Cursor's model page agree; the same rates as GLM-5.2. Cached-input storage is free for a limited time, and there is no cache-write fee, so cache writes bill as input. No long-context tier. https://docs.z.ai/guides/overview/pricing https://cursor.com/docs/models/glm-5-3",
       "prices": [
@@ -635,6 +641,7 @@
     "deepseek-v4.1-flash-1017": ["deepseek-v41-flash-1017"],
     "kimi-k3": [],
     "kimi-k3.1-pro": [],
+    "kimi-k3.1-pro-highspeed": [],
     "glm-5.3": [],
     "glm-5.3-flash": [],
     "glm-5.3-flashx": [],
@@ -702,8 +709,9 @@
     { "contains": ["grok-4.20-0309-non-reasoning"], "model": "grok-4.20-0309-non-reasoning" },
     { "contains": ["gemini-3.5-flash-lite"], "model": "gemini-3.5-flash-lite", "note": "Must precede gemini-3.5-flash, which would otherwise bill Flash-Lite at Flash rates." },
     { "contains": ["gemini-3.5-flash"], "model": "gemini-3.5-flash" },
-    { "contains": ["gemini-3.8-flash-lite"], "model": "gemini-3.8-flash-lite", "note": "Unpriced on purpose: Google publishes no 3.8 Flash-Lite text price, only the Gemini 3.8 Flash-Lite TTS speech model. Must precede gemini-3.8-flash." },
+    { "contains": ["gemini-3.8-flash-lite-tts"], "model": "gemini-3.8-flash-lite-tts", "note": "Unpriced on purpose: a speech model billed at audio rates. Must precede gemini-3.8-flash-lite and gemini-3.8-flash, so it keeps its own name even if a 3.8 Flash-Lite text model is priced later." },
     { "contains": ["gemini-3.8-flash-tts"], "model": "gemini-3.8-flash-tts", "note": "Unpriced on purpose: a speech model billed at audio rates. Must precede gemini-3.8-flash." },
+    { "contains": ["gemini-3.8-flash-lite"], "model": "gemini-3.8-flash-lite", "note": "Google publishes no Gemini 3.8 Flash-Lite text price yet. This rule keeps such a model off the gemini-3.8-flash rate; price it here once Google does. Must precede gemini-3.8-flash." },
     { "contains": ["gemini-3.8-flash"], "model": "gemini-3.8-flash" },
     { "contains": ["gemini-3-flash"], "model": "gemini-3-flash", "note": "gemini-3-flash does not occur in gemini-3.5-flash or gemini-3.8-flash. Antigravity serves both Gemini 3 Flash and 3.5 Flash requests as gemini-3-flash-a, which this rule would match: the exact names key gemini-3-flash-a, checked before patterns, keeps that served name unpriced." },
     { "contains": ["gemini-4-neon"], "model": "gemini-4-neon" },
@@ -712,7 +720,8 @@
     { "contains": ["gemini-4-argon"], "model": "gemini-4-argon" },
     { "contains": ["gpt-oss-120b"], "model": "gpt-oss-120b" },
     { "contains": ["deepseek-v4.1-flash-1017", "deepseek-v41-flash-1017"], "model": "deepseek-v4.1-flash-1017", "note": "Cursor's model id, plus the dotless spelling deepseek-v41-flash-1017, with or without an effort suffix such as -high (Cursor offers None, Low, Medium, High and Max at one price)." },
-    { "contains": ["kimi-k3.1"], "model": "kimi-k3.1-pro", "note": "Must precede kimi-k3, which every K3.1 name contains. K3.1 Pro is the only K3.1 model Moonshot sells." },
+    { "contains": ["kimi-k3.1-pro-highspeed"], "model": "kimi-k3.1-pro-highspeed", "note": "Must precede kimi-k3.1, which would otherwise bill Highspeed at half its price." },
+    { "contains": ["kimi-k3.1"], "model": "kimi-k3.1-pro", "note": "Must precede kimi-k3, which every K3.1 name contains. Moonshot sells K3.1 Pro and K3.1 Pro Highspeed, which has its own rule above." },
     { "contains": ["kimi-k3"], "model": "kimi-k3", "whole_version": true },
     { "contains": ["glm-5.3-flashx"], "model": "glm-5.3-flashx", "note": "Must precede glm-5.3-flash, which glm-5.3-flashx contains." },
     { "contains": ["glm-5.3-flash"], "model": "glm-5.3-flash", "note": "Must precede glm-5.3." },
