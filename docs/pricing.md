@@ -105,7 +105,7 @@ Two models with the same rates are still two entries.
 | Field | Required | Meaning |
 |---|---|---|
 | `prices` | yes | List of price periods, oldest first. |
-| `source` | no | Pricing-source prefix: `cursor_model_pricing` or `xai_api_pricing`. Lowercase letters, digits and `_`. Absent means `{provider}_api_pricing`. Estimates record `{source}:{observed name}`. |
+| `source` | no | Pricing-source prefix, such as `cursor_model_pricing`, `xai_api_pricing` or `vertex_ai_pricing`. Lowercase letters, digits and `_`. Absent means `{provider}_api_pricing`. Estimates record `{source}:{observed name}`. |
 | `long_context` | no | A higher tier for long prompts. |
 | `fast` | no | Fast-mode pricing. |
 | `note` | no | Free text. |
