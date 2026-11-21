@@ -58,6 +58,10 @@ impl ProviderAdapter for AntigravityAdapter {
         antigravity_scan_candidates(source, self.version())
     }
 
+    fn unreadable_history_files(&self, source: &SourceLocation) -> Result<u64> {
+        source_root_path(source).map_or(Ok(0), |root| encrypted_conversation_count(&root))
+    }
+
     fn scan(&self, source: &SourceLocation, options: &ScanOptions) -> Result<AdapterScan> {
         scan_antigravity_source(self, source, options)
     }
@@ -144,10 +148,10 @@ pub(crate) fn scan_antigravity_source(
     options: &ScanOptions,
 ) -> Result<AdapterScan> {
     let mut scan = AdapterScan::default();
-    let Some(root) = source_root_path(source) else {
+    if source_root_path(source).is_none() {
         return Ok(scan);
-    };
-    scan.diagnostics.unreadable_history_files = encrypted_conversation_count(&root)?;
+    }
+    scan.diagnostics.unreadable_history_files = adapter.unreadable_history_files(source)?;
     let candidates = antigravity_scan_candidates(source, adapter.version())?;
     let mut store_names = StoreModelNames::new(candidates.iter().map(|c| c.path.clone()).collect());
     let mut projects = ProjectContextCache::new();

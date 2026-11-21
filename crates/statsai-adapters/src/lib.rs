@@ -314,6 +314,17 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> Result<VerifiedSourceObservation> {
         Ok(VerifiedSourceObservation::Unavailable)
     }
+    /// History files in the source that cannot be read offline, such as
+    /// Antigravity's encrypted legacy conversations, whose usage no scan can
+    /// count.
+    ///
+    /// Callers ask on every scan of a source, including scans that read no
+    /// file because every candidate is unchanged: such files are never scan
+    /// candidates, so a count taken inside [`scan`](Self::scan) would be
+    /// missing whenever nothing else changed.
+    fn unreadable_history_files(&self, _source: &SourceLocation) -> Result<u64> {
+        Ok(0)
+    }
     fn verification_dependency_paths(&self, _source: &SourceLocation) -> Vec<PathBuf> {
         Vec::new()
     }

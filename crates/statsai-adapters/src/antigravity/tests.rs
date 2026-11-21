@@ -758,6 +758,14 @@ fn encrypted_history_is_counted_and_skipped() {
 
     assert_eq!(candidates.len(), 1);
     assert_eq!(scan.diagnostics.unreadable_history_files, 1);
+    // Counted without reading any conversation, so a scan that skips every
+    // unchanged file still reports it.
+    assert_eq!(
+        AntigravityAdapter
+            .unreadable_history_files(&source_for(&root))
+            .expect("count"),
+        1
+    );
     assert_eq!(scan.diagnostics.invalid_rows, 0);
     assert_eq!(scan.events.len(), 2);
 }
@@ -905,7 +913,7 @@ fn fixture_store_matches_the_independent_decoder() {
 }
 
 #[test]
-fn a_conversation_held_mid_commit_fails_the_scan_so_it_is_read_again() {
+fn sqlite_busy_matches_only_busy_and_locked_errors() {
     let busy =
         rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None);
     let locked = rusqlite::Error::SqliteFailure(

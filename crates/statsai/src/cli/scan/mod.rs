@@ -42,7 +42,15 @@ pub(crate) fn scan(command: ScanCommand, store: &Store, device_id: &str) -> Resu
             default_adapters()
         };
 
-    scan_with_adapters(command, store, device_id, adapters)
+    scan_with_adapters(command, store, device_id, adapters).map(|_| ())
+}
+
+/// What a scan reports beside its printed summary.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScanReport {
+    /// History files each provider keeps but no scan can read, summed over
+    /// its sources, as the `scan warning: unreadable_history` lines print them.
+    pub(crate) unreadable_history: BTreeMap<String, u64>,
 }
 
 pub(crate) fn scan_with_adapters(
@@ -50,7 +58,7 @@ pub(crate) fn scan_with_adapters(
     store: &Store,
     device_id: &str,
     adapters: Vec<Box<dyn ProviderAdapter>>,
-) -> Result<()> {
+) -> Result<ScanReport> {
     let scan_started_at = Instant::now();
     let mut preview_task_rebuild = PreviewTaskRebuild::default();
     let mut preview_work_item_rebuild_count = 0u64;
@@ -250,6 +258,15 @@ pub(crate) fn scan_with_adapters(
                 } else {
                     adapter.probe_verified_source_state(&source)?
                 };
+            // Asked on every scan, like the verified state: these files are
+            // never scan candidates, so a scan that reads nothing would
+            // otherwise lose the warning.
+            let unreadable_history_files = adapter.unreadable_history_files(&source)?;
+            if unreadable_history_files > 0 {
+                *unreadable_history
+                    .entry(adapter.provider().to_string())
+                    .or_default() += unreadable_history_files;
+            }
             let mut scan = if should_run_adapter_scan {
                 let started_at = Instant::now();
                 let scan = adapter.scan(&source, &options)?;
@@ -267,6 +284,7 @@ pub(crate) fn scan_with_adapters(
                     ..statsai_adapters::AdapterScan::default()
                 }
             };
+            scan.diagnostics.unreadable_history_files = unreadable_history_files;
             if !command.include_tasks {
                 scan.task_spans.clear();
             }
@@ -353,11 +371,6 @@ pub(crate) fn scan_with_adapters(
             total_usage.add_totals(&source_usage);
             total_summary_usage.add_totals(&source_summary_usage);
             add_diagnostics(&mut total_diagnostics, &scan.diagnostics);
-            if scan.diagnostics.unreadable_history_files > 0 {
-                *unreadable_history
-                    .entry(adapter.provider().to_string())
-                    .or_default() += scan.diagnostics.unreadable_history_files;
-            }
 
             if suppress_source_processing {
                 continue;
@@ -714,6 +727,8 @@ pub(crate) fn scan_with_adapters(
         }
     }
 
+    // Sources with nothing else to report still count toward the total.
+    total_diagnostics.unreadable_history_files = unreadable_history.values().sum();
     if command.preview {
         if command.verbose {
             println!(
@@ -838,7 +853,7 @@ pub(crate) fn scan_with_adapters(
         println!("{}", unreadable_history_warning_line(provider, *files));
     }
     print_denied_project_settings_folders();
-    Ok(())
+    Ok(ScanReport { unreadable_history })
 }
 
 /// The `scan warning:` line for history a provider keeps in a form the scan

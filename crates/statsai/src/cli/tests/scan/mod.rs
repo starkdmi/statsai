@@ -6,6 +6,7 @@ mod files;
 mod preview;
 mod project_identity;
 mod project_settings_deferral;
+mod unreadable_history;
 
 #[derive(Clone)]
 struct AttributionBlockedTestAdapter {
