@@ -126,7 +126,7 @@
       },
       "planner_without_usage": 0
     },
-    "00000000-0000-4000-8000-000000000023": {
+    "00000000-0000-4000-8000-000000000024": {
       "agent": null,
       "branch": "fixture/main",
       "checkpoint": {

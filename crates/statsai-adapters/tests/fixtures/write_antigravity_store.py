@@ -186,7 +186,9 @@ class Conversation:
             # Request settings name internal model codenames; none may survive.
             settings.message(13, Pb().message(2, Pb().string(1, "Be concise.")).message(
                 39, Pb().message(10, Pb().message(1, Pb().string(3, "router").message(5, Pb().message(2, Pb().string(1, "gemini-9-codename-tier2")))))
-            ))
+            # A codename that a served name begins with: rewritten here, while
+            # the served name stays where it names a request.
+            ).message(39, Pb().message(10, Pb().message(1, Pb().message(5, Pb().message(2, Pb().string(1, "gemini-3-flash")))))))
             settings.message(15, Pb().varint(1, model)).string(28, label)
             row.message(3, settings)
         row.string(4, self.execution).bytes(8, hashlib.sha256(self.id.encode()).digest()[:16])
@@ -194,6 +196,16 @@ class Conversation:
         data = row.done()
         self.db.execute("INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)", (self.gen_index, data, len(data)))
         self.gen_index += 1
+
+    def executor(self, at: int) -> None:
+        # The product name in upper case, as Antigravity 2.34 writes it in
+        # executor metadata (10.3.18.2.15). It must not be mistaken for a leak
+        # of the adapter's own `antigravity-model-<id>` names.
+        config = Pb().message(18, Pb().message(2, Pb().string(15, "ANTIGRAVITY").varint(16, 1)))
+        data = Pb().varint(1, 4).varint(2, 10).varint(3, 23).string(9, uid(self.id + "/executor")).message(
+            10, Pb().message(1, Pb().varint(1, 1026)).message(3, config).message(4, ts(at))
+        ).done()
+        self.db.execute("INSERT INTO executor_metadata (idx, data) VALUES (0, ?)", (data,))
 
     def trajectory_blob(self, parent: "Conversation | None" = None, agent: str | None = None) -> None:
         workspace = (
@@ -242,6 +254,7 @@ def write_store(root: Path) -> None:
     # Claude on Vertex, an older file whose checkpoint is copied into field 9.
     claude = Conversation(root, "claude-vertex")
     claude.trajectory_blob()
+    claude.executor(T0 + 3_600)
     claude.planner(T0 + 3_600, 1026, ANTHROPIC_VERTEX, (18_420, 0, 0, 312), 2_460, 3_800)
     claude.gen(1026, "claude-opus-4-6-thinking", [(18_420, 0, 0, 312, ANTHROPIC_VERTEX)])
     claude.checkpoint(T0 + 3_620, [(9_120, 0, 0, 140)], 1050, True)

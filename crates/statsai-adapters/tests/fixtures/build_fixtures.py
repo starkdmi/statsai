@@ -760,6 +760,18 @@ ANTIGRAVITY_COVERAGE = [
     "gemini-thinking", "claude-vertex", "gpt-oss", "checkpoint",
     "retried-request", "planner-without-usage", "subagent",
 ]
+# Strings the export writes itself: the synthetic stand-ins, the adapter's
+# fallback model name, and expected.json's schema, keys and scenario names.
+ANTIGRAVITY_WRITTEN_STRINGS = {
+    "file:///workspace/sample-project", "https://example.invalid/acme/sample-project.git",
+    "acme/sample-project", "fixture/main", "fixture-agent", "text_fixture_",
+    "00000000-0000-4000-8000-", "antigravity-model-", "statsai-antigravity-expected.v1",
+    "schema", "covers", "unreadable_history_files", "conversations", "planner",
+    "checkpoint", "planner_without_usage", "models", "parent", "agent", "branch",
+    "calls", "input", "cache_write", "cache_read", "thinking", "response",
+    "gemini-thinking", "claude-vertex", "gpt-oss", "retried-request",
+    "planner-without-usage", "subagent", "label-elsewhere",
+}
 # Steps a conversation named elsewhere may add, with its namers, to the fixtures.
 ANTIGRAVITY_LABEL_ELSEWHERE_STEP_BUDGET = 120
 ANTIGRAVITY_FAKE_URI = "file:///workspace/sample-project"
@@ -864,6 +876,12 @@ class AntigravityRewriter:
         self.keep_models = keep_models
         self.uuids: dict[str, str] = {}
         self.numbers: dict[str, str] = {}
+        # Everything the output may say on purpose, in lower case: what is
+        # kept, the synthetic stand-ins, and expected.json's own vocabulary.
+        self.written = {
+            text.lower()
+            for text in ANTIGRAVITY_KEEP_STRINGS | ANTIGRAVITY_AGENT_NAMES | keep_models | ANTIGRAVITY_WRITTEN_STRINGS
+        }
 
     def fake_uuid(self, value: str) -> str:
         if value not in self.uuids:
@@ -905,10 +923,17 @@ class AntigravityRewriter:
         return self.sanitizer.fake_id("text", text)
 
     def remember(self, text: str) -> None:
-        # Long originals must not survive anywhere in the output. Short ones
-        # are too likely to occur by chance in synthetic text to check, and a
-        # string kept in one place (an agent name) may be rewritten in another.
-        if len(text) >= 8 and text not in ANTIGRAVITY_AGENT_NAMES | ANTIGRAVITY_KEEP_STRINGS | self.keep_models:
+        """Forbids a rewritten original from appearing anywhere in the output.
+
+        Short originals are too likely to occur by chance to check. So is one
+        the output contains on purpose: `ANTIGRAVITY` in executor metadata is
+        rewritten, yet expected.json names unlabeled models
+        `antigravity-model-<id>`, and a settings codename such as
+        `gemini-3-flash` is rewritten while the served name `gemini-3-flash-a`
+        stays. `validate_antigravity_strings` still checks every string left.
+        """
+        lowered = text.lower()
+        if len(text) >= 8 and not any(lowered in written for written in self.written):
             self.sanitizer.forbidden_tokens.add(text)
 
     def rebuild(self, data: bytes, table: str | None, path: tuple[int, ...] = ()) -> bytes | None:
