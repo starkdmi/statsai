@@ -1,7 +1,7 @@
 {
   "format": 1,
-  "version": 8,
-  "catalog": "official:2026-11-21",
+  "version": 9,
+  "catalog": "official:2026-11-23",
   "models": {
     "claude-fable-5-2": {
       "note": "Launch price, 2026-11-09. Mythos 5.2 uses the same rates. Cache reads are 0.025x input. The 1M window has no long-context surcharge. Fast input and output are 2x; prompt-cache multipliers apply on top of that fast input rate: 1.25x 5-minute writes and 0.025x cache reads. https://platform.claude.com/docs/en/about-claude/pricing https://platform.claude.com/docs/en/models/fable-5-2/overview https://www.anthropic.com/claude-fable-and-mythos-5-2",
@@ -209,10 +209,11 @@
       "fast": { "multiplier": 2 }
     },
     "gpt-5.6-sol": {
-      "note": "GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount. Fast mode is twice the standard rates in effect that day, including cache writes and cached input. https://developers.openai.com/api/docs/pricing",
+      "note": "GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount. Fast mode is twice the standard rates in effect that day, including cache writes and cached input. The unsuffixed id gpt-5.6 routes to this model, and so does every other gpt-5.6 id that names no other variant. https://developers.openai.com/api/docs/pricing https://developers.openai.com/api/docs/models/gpt-5.6-sol",
       "prices": [
         { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 30 },
-        { "from": "2026-08-21", "input": 4, "cache_write": 5, "cache_read": 0.4, "output": 20, "note": "Promotional, announced to hold at least through 2026-11-21. When it lapses, add a period rather than editing this one: usage priced under the promotion must keep its rate." }
+        { "from": "2026-08-21", "input": 4, "cache_write": 5, "cache_read": 0.4, "output": 20, "note": "Promotional, announced to hold at least through 2026-11-21. When it lapses, add a period rather than editing this one: usage priced under the promotion must keep its rate." },
+        { "from": "2026-12-01", "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 30, "note": "List rates resume the UTC day after the promotion. The page prices the promotion at $4 input and $20 output, a 20% and 33% reduction from these rates, through November 30, 2026. https://developers.openai.com/api/docs/models/gpt-5.6-sol https://developers.openai.com/api/docs/pricing" }
       ],
       "long_context": { "above": 272000, "input": 2, "output": 1.5 },
       "fast": { "multiplier": 2 }
@@ -234,6 +235,18 @@
       ],
       "long_context": { "above": 272000, "input": 2, "output": 1.5 },
       "fast": { "multiplier": 2 }
+    },
+    "gpt-5.6-cyber": {
+      "note": "Daybreak trusted-access rate. Cache writes are the 30-minute rate; the 12-hour write is $31.25/M. Long-context cells are blank, so there is no long-context tier. https://developers.openai.com/api/docs/pricing",
+      "prices": [
+        { "from": null, "input": 12.5, "cache_write": 15.625, "cache_read": 1.25, "output": 75 }
+      ]
+    },
+    "gpt-5.5-cyber-preview": {
+      "note": "Daybreak trusted-access rate. The 30-minute cache-write cell is blank, so cache writes bill as input. Long-context cells are blank, so there is no long-context tier. https://developers.openai.com/api/docs/pricing",
+      "prices": [
+        { "from": null, "input": 12.5, "cache_write": 12.5, "cache_read": 1.25, "output": 75 }
+      ]
     },
     "gpt-5.5": {
       "note": "Uses the same >272k tier as the other OpenAI models: 2x input and cached input, 1.5x output (https://developers.openai.com/api/docs/models/gpt-5.5). Fast is 2.5x and has no long-context rate: the fast card leaves the >272k cells blank, so one request over 272k is served and billed at standard. Cache writes bill as input. https://developers.openai.com/api/docs/pricing https://openai.com/api-fast-mode/ https://developers.openai.com/api/docs/guides/fast-mode",
@@ -613,9 +626,11 @@
     "gpt-6.1-terra": [],
     "gpt-6-sol": [],
     "gpt-6-luna": [],
-    "gpt-5.6-sol": [],
+    "gpt-5.6-sol": ["gpt-5.6"],
     "gpt-5.6-terra": [],
     "gpt-5.6-luna": [],
+    "gpt-5.6-cyber": [],
+    "gpt-5.5-cyber-preview": [],
     "gpt-5.5": [],
     "gpt-5-nano": [],
     "composer-2.5": ["grok-composer-2.5"],
@@ -683,6 +698,9 @@
     { "contains": ["gpt-5.6-sol"], "model": "gpt-5.6-sol" },
     { "contains": ["gpt-5.6-terra"], "model": "gpt-5.6-terra" },
     { "contains": ["gpt-5.6-luna"], "model": "gpt-5.6-luna" },
+    { "contains": ["gpt-5.6-cyber"], "model": "gpt-5.6-cyber", "whole_version": true, "note": "Above the gpt-5 rule, which gpt-5.6-cyber contains. https://developers.openai.com/api/docs/pricing" },
+    { "contains": ["gpt-5.6"], "model": "gpt-5.6-sol", "whole_version": true, "note": "The unsuffixed gpt-5.6 routes to Sol, so effort, dated and proxy-wrapped spellings of it do too. Below the Sol, Terra, Luna and cyber rules, whose names contain gpt-5.6, and above the gpt-5 rule. https://developers.openai.com/api/docs/models/gpt-5.6-sol" },
+    { "contains": ["gpt-5.5-cyber"], "model": "gpt-5.5-cyber-preview", "whole_version": true, "note": "Above the gpt-5.5 rule, which gpt-5.5-cyber-preview contains. https://developers.openai.com/api/docs/pricing" },
     { "contains": ["gpt-5.5"], "model": "gpt-5.5" },
     { "contains": ["gpt-5.4-mini"], "model": "gpt-5.4-mini" },
     { "contains": ["gpt-5.4-nano"], "model": "gpt-5.4-nano" },
