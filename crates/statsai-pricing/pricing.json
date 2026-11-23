@@ -209,7 +209,7 @@
       "fast": { "multiplier": 2 }
     },
     "gpt-5.6-sol": {
-      "note": "GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount. Fast mode is twice the standard rates in effect that day, including cache writes and cached input. The unsuffixed id gpt-5.6 routes to this model. https://developers.openai.com/api/docs/pricing https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+      "note": "GPT-5.6 uses a 1.25x cache-write multiplier and a 90% cache-read discount. Fast mode is twice the standard rates in effect that day, including cache writes and cached input. The unsuffixed id gpt-5.6 routes to this model, and so does every other gpt-5.6 id that names no other variant. https://developers.openai.com/api/docs/pricing https://developers.openai.com/api/docs/models/gpt-5.6-sol",
       "prices": [
         { "from": null, "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 30 },
         { "from": "2026-08-21", "input": 4, "cache_write": 5, "cache_read": 0.4, "output": 20, "note": "Promotional, announced to hold at least through 2026-11-21. When it lapses, add a period rather than editing this one: usage priced under the promotion must keep its rate." },
@@ -699,6 +699,7 @@
     { "contains": ["gpt-5.6-terra"], "model": "gpt-5.6-terra" },
     { "contains": ["gpt-5.6-luna"], "model": "gpt-5.6-luna" },
     { "contains": ["gpt-5.6-cyber"], "model": "gpt-5.6-cyber", "whole_version": true, "note": "Above the gpt-5 rule, which gpt-5.6-cyber contains. https://developers.openai.com/api/docs/pricing" },
+    { "contains": ["gpt-5.6"], "model": "gpt-5.6-sol", "whole_version": true, "note": "The unsuffixed gpt-5.6 routes to Sol, so effort, dated and proxy-wrapped spellings of it do too. Below the Sol, Terra, Luna and cyber rules, whose names contain gpt-5.6, and above the gpt-5 rule. https://developers.openai.com/api/docs/models/gpt-5.6-sol" },
     { "contains": ["gpt-5.5-cyber"], "model": "gpt-5.5-cyber-preview", "whole_version": true, "note": "Above the gpt-5.5 rule, which gpt-5.5-cyber-preview contains. https://developers.openai.com/api/docs/pricing" },
     { "contains": ["gpt-5.5"], "model": "gpt-5.5" },
     { "contains": ["gpt-5.4-mini"], "model": "gpt-5.4-mini" },
